@@ -120,10 +120,7 @@ class _EmptyCarousel extends StatelessWidget {
         gradient: LinearGradient(
           begin: Alignment.topLeft,
           end: Alignment.bottomRight,
-          colors: [
-            scheme.surfaceContainerHigh,
-            scheme.surfaceContainer,
-          ],
+          colors: [scheme.surfaceContainerHigh, scheme.surfaceContainer],
         ),
       ),
       child: Column(
@@ -131,10 +128,7 @@ class _EmptyCarousel extends StatelessWidget {
         children: [
           Icon(Icons.music_note, size: 44, color: scheme.onSurfaceVariant),
           const SizedBox(height: 12),
-          Text(
-            '暂无播放',
-            style: TextStyle(color: scheme.onSurfaceVariant),
-          ),
+          Text('暂无播放', style: TextStyle(color: scheme.onSurfaceVariant)),
         ],
       ),
     );
@@ -189,8 +183,7 @@ class _CarouselCard extends StatelessWidget {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  if (isCurrent)
-                    _PlayingBadge(eq: eq, isPlaying: isPlaying),
+                  if (isCurrent) _PlayingBadge(eq: eq, isPlaying: isPlaying),
                   const SizedBox(height: 10),
                   Text(
                     item.title,
@@ -251,11 +244,7 @@ class _PlayingBadge extends StatelessWidget {
                 return Row(
                   mainAxisAlignment: MainAxisAlignment.center,
                   crossAxisAlignment: CrossAxisAlignment.end,
-                  children: [
-                    _bar(t, 0),
-                    _bar(t, 0.25),
-                    _bar(t, 0.5),
-                  ],
+                  children: [_bar(t, 0), _bar(t, 0.25), _bar(t, 0.5)],
                 );
               },
             ),

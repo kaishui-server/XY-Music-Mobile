@@ -35,7 +35,9 @@ pub(crate) fn set_secret_store(store: Box<dyn SecretStore>) {
 }
 
 fn secret_store() -> &'static dyn SecretStore {
-    SECRET_STORE.get_or_init(|| Box::new(NoopSecretStore)).as_ref()
+    SECRET_STORE
+        .get_or_init(|| Box::new(NoopSecretStore))
+        .as_ref()
 }
 
 fn read_password_from_store(source_id: &str) -> Option<String> {

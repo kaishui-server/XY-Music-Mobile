@@ -1,9 +1,9 @@
 @echo off
 setlocal
-title XianYu Music Mobile - Cache Clean
+title XY Music Mobile - Cache Clean
 
 echo ============================================
-echo   XianYu Music Mobile - Cache Clean
+echo   XY Music Mobile - Cache Clean
 echo ============================================
 echo.
 

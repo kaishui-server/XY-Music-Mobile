@@ -1,7 +1,9 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:go_router/go_router.dart';
 
 import '../../src/auth/auth_provider.dart';
+import '../../src/widgets/top_notice.dart';
 
 /// 账号认证页：未登录时展示登录/注册，已登录时展示个人资料。
 class AccountPage extends ConsumerStatefulWidget {
@@ -84,8 +86,17 @@ class _AccountPageState extends ConsumerState<AccountPage>
   }
 
   void _toast(String msg) {
-    ScaffoldMessenger.of(context)
-        .showSnackBar(SnackBar(content: Text(msg), duration: const Duration(seconds: 2)));
+    XyNotice.show(context, message: msg, duration: const Duration(seconds: 2));
+  }
+
+  void _goBack() {
+    // 账号页既可从设置进入，也可从侧边栏直接打开。有历史路由时正常返回，
+    // 侧边栏直接打开时回到首页，避免无历史路由时被错带到设置页。
+    if (context.canPop()) {
+      context.pop();
+    } else {
+      context.go('/home');
+    }
   }
 
   Future<void> _submit() async {
@@ -145,6 +156,11 @@ class _AccountPageState extends ConsumerState<AccountPage>
     final auth = ref.watch(authProvider);
     return Scaffold(
       appBar: AppBar(
+        leading: IconButton(
+          tooltip: '返回',
+          icon: const Icon(Icons.arrow_back_rounded),
+          onPressed: _goBack,
+        ),
         title: Text(auth.isLoggedIn ? '我的' : '账号'),
         centerTitle: true,
       ),
@@ -158,6 +174,7 @@ class _AccountPageState extends ConsumerState<AccountPage>
   }
 
   Future<void> _confirmLogout(BuildContext context) async {
+    final router = GoRouter.of(context);
     final ok = await showDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
@@ -177,6 +194,9 @@ class _AccountPageState extends ConsumerState<AccountPage>
     );
     if (ok == true) {
       await ref.read(authProvider.notifier).logout();
+      // 从侧边栏直达账号页时，退出登录只应清空账号状态，不应让外层 StatefulShell 把路由切回设置。
+      // 显式保持在账号页，让用户可直接切换到登录/注册。
+      if (mounted) router.go('/account');
     }
   }
 
@@ -194,7 +214,10 @@ class _AccountPageState extends ConsumerState<AccountPage>
                 height: 64,
                 decoration: BoxDecoration(
                   gradient: LinearGradient(
-                    colors: [scheme.primary, scheme.primary.withValues(alpha: 0.7)],
+                    colors: [
+                      scheme.primary,
+                      scheme.primary.withValues(alpha: 0.7),
+                    ],
                     begin: Alignment.topLeft,
                     end: Alignment.bottomRight,
                   ),
@@ -207,14 +230,22 @@ class _AccountPageState extends ConsumerState<AccountPage>
                     ),
                   ],
                 ),
-                child: Icon(Icons.music_note, size: 34, color: scheme.onPrimary),
+                child: Icon(
+                  Icons.music_note,
+                  size: 34,
+                  color: scheme.onPrimary,
+                ),
               ),
               const SizedBox(height: 12),
-              const Text('弦予音乐',
-                  style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
+              const Text(
+                'XY Music',
+                style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
+              ),
               const SizedBox(height: 2),
-              Text('登录后同步你的音乐与设置',
-                  style: TextStyle(fontSize: 13, color: scheme.onSurfaceVariant)),
+              Text(
+                '登录后同步你的音乐与设置',
+                style: TextStyle(fontSize: 13, color: scheme.onSurfaceVariant),
+              ),
             ],
           ),
         ),
@@ -238,17 +269,17 @@ class _AccountPageState extends ConsumerState<AccountPage>
               labelColor: scheme.onPrimary,
               unselectedLabelColor: scheme.onSurfaceVariant,
               labelStyle: const TextStyle(fontWeight: FontWeight.w600),
-              tabs: const [Tab(text: '登录'), Tab(text: '注册')],
+              tabs: const [
+                Tab(text: '登录'),
+                Tab(text: '注册'),
+              ],
             ),
           ),
         ),
         Expanded(
           child: TabBarView(
             controller: _tab,
-            children: [
-              _loginForm(context, auth),
-              _registerForm(context, auth),
-            ],
+            children: [_loginForm(context, auth), _registerForm(context, auth)],
           ),
         ),
       ],
@@ -258,11 +289,14 @@ class _AccountPageState extends ConsumerState<AccountPage>
   Widget _loginForm(BuildContext context, AuthState auth) {
     return _formScroll(
       children: [
-        _field(_idCtrl, '弦予号', hint: '请输入弦予号', icon: Icons.tag),
-        _field(_passwordCtrl, '密码',
-            hint: '请输入密码',
-            icon: Icons.lock,
-            obscure: _obscure),
+        _field(_idCtrl, 'XY Music 账号', hint: '请输入账号', icon: Icons.tag),
+        _field(
+          _passwordCtrl,
+          '密码',
+          hint: '请输入密码',
+          icon: Icons.lock,
+          obscure: _obscure,
+        ),
         _errorBanner(context, auth),
         _submitButton(context, auth, '登录'),
       ],
@@ -272,16 +306,39 @@ class _AccountPageState extends ConsumerState<AccountPage>
   Widget _registerForm(BuildContext context, AuthState auth) {
     return _formScroll(
       children: [
-        _field(_idCtrl, '弦予号', hint: '6-20 位数字/字母', icon: Icons.tag),
+        _field(_idCtrl, 'XY Music 账号', hint: '6-20 位数字/字母', icon: Icons.tag),
         _field(_nicknameCtrl, '昵称（可选）', hint: '留空使用默认昵称', icon: Icons.badge),
-        _field(_passwordCtrl, '密码', hint: '设置登录密码', icon: Icons.lock, obscure: _obscure),
-        _field(_confirmCtrl, '确认密码', hint: '再次输入密码', icon: Icons.lock, obscure: _obscure),
-        _field(_emailCtrl, '邮箱', hint: '用于接收验证码', icon: Icons.mail, keyboard: TextInputType.emailAddress),
+        _field(
+          _passwordCtrl,
+          '密码',
+          hint: '设置登录密码',
+          icon: Icons.lock,
+          obscure: _obscure,
+        ),
+        _field(
+          _confirmCtrl,
+          '确认密码',
+          hint: '再次输入密码',
+          icon: Icons.lock,
+          obscure: _obscure,
+        ),
+        _field(
+          _emailCtrl,
+          '邮箱',
+          hint: '用于接收验证码',
+          icon: Icons.mail,
+          keyboard: TextInputType.emailAddress,
+        ),
         Row(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             Expanded(
-              child: _field(_codeCtrl, '邮箱验证码', hint: '请输入验证码', icon: Icons.verified),
+              child: _field(
+                _codeCtrl,
+                '邮箱验证码',
+                hint: '请输入验证码',
+                icon: Icons.verified,
+              ),
             ),
             const SizedBox(width: 8),
             Padding(
@@ -361,9 +418,7 @@ class _AccountPageState extends ConsumerState<AccountPage>
           hintText: hint,
           filled: true,
           prefixIcon: icon == null ? null : Icon(icon, size: 20),
-          border: OutlineInputBorder(
-            borderRadius: BorderRadius.circular(12),
-          ),
+          border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
           enabledBorder: OutlineInputBorder(
             borderRadius: BorderRadius.circular(12),
             borderSide: BorderSide(
@@ -379,7 +434,9 @@ class _AccountPageState extends ConsumerState<AccountPage>
           ),
           suffixIcon: obscure
               ? IconButton(
-                  icon: Icon(_obscure ? Icons.visibility : Icons.visibility_off),
+                  icon: Icon(
+                    _obscure ? Icons.visibility : Icons.visibility_off,
+                  ),
                   onPressed: () => setState(() => _obscure = !_obscure),
                 )
               : null,
@@ -393,9 +450,7 @@ class _AccountPageState extends ConsumerState<AccountPage>
       onPressed: auth.loading ? null : _submit,
       style: FilledButton.styleFrom(
         padding: const EdgeInsets.symmetric(vertical: 16),
-        shape: RoundedRectangleBorder(
-          borderRadius: BorderRadius.circular(12),
-        ),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
       ),
       child: auth.loading
           ? const SizedBox(
@@ -403,7 +458,10 @@ class _AccountPageState extends ConsumerState<AccountPage>
               height: 20,
               child: CircularProgressIndicator(strokeWidth: 2),
             )
-          : Text(label, style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w600)),
+          : Text(
+              label,
+              style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w600),
+            ),
     );
   }
 }
@@ -461,7 +519,7 @@ class _ProfileView extends StatelessWidget {
             if (user.ciyuanxiId != null && user.ciyuanxiId!.isNotEmpty)
               _InfoTile(
                 icon: Icons.tag,
-                label: '弦予号',
+                label: 'XY Music 账号',
                 value: user.ciyuanxiId!,
               ),
           ],
@@ -530,7 +588,10 @@ class _Avatar extends StatelessWidget {
       child: Text(
         char,
         style: TextStyle(
-            fontSize: 40, fontWeight: FontWeight.bold, color: color),
+          fontSize: 40,
+          fontWeight: FontWeight.bold,
+          color: color,
+        ),
       ),
     );
   }
@@ -578,10 +639,7 @@ class _InfoTile extends StatelessWidget {
     return ListTile(
       leading: Icon(icon, color: scheme.primary),
       title: Text(label),
-      trailing: Text(
-        value,
-        style: TextStyle(color: scheme.onSurfaceVariant),
-      ),
+      trailing: Text(value, style: TextStyle(color: scheme.onSurfaceVariant)),
     );
   }
 }
@@ -707,10 +765,12 @@ class _HumanCaptchaDialogState extends State<_HumanCaptchaDialog> {
                     _loading
                         ? '正在加载验证题…'
                         : (_captcha?.question.isNotEmpty == true
-                            ? _captcha!.question
-                            : '验证题加载失败'),
+                              ? _captcha!.question
+                              : '验证题加载失败'),
                     style: const TextStyle(
-                        fontSize: 18, fontWeight: FontWeight.w700),
+                      fontSize: 18,
+                      fontWeight: FontWeight.w700,
+                    ),
                   ),
                 ),
                 TextButton(
@@ -737,10 +797,7 @@ class _HumanCaptchaDialogState extends State<_HumanCaptchaDialog> {
           ),
           if (_error != null && _error!.isNotEmpty) ...[
             const SizedBox(height: 10),
-            Text(
-              _error!,
-              style: TextStyle(fontSize: 13, color: scheme.error),
-            ),
+            Text(_error!, style: TextStyle(fontSize: 13, color: scheme.error)),
           ],
         ],
       ),
@@ -750,7 +807,9 @@ class _HumanCaptchaDialogState extends State<_HumanCaptchaDialog> {
           child: const Text('取消'),
         ),
         FilledButton(
-          onPressed: (_loading || _verifying || _captcha == null) ? null : _submit,
+          onPressed: (_loading || _verifying || _captcha == null)
+              ? null
+              : _submit,
           child: _verifying
               ? const SizedBox(
                   width: 18,

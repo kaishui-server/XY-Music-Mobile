@@ -1,7 +1,7 @@
 //! 常功率 PCM 交叉淡入混音器（constant-power crossfade）。
 //!
 //! 算法参考 RawS 的 `PcmCrossfadeMixer.kt`。
-//! 弦予音频管道全程 f32 交错 PCM，故只实现 f32 路径，无需 RawS 的 S16/S24/S32 分支。
+//! XY Music 音频管道全程 f32 交错 PCM，故只实现 f32 路径，无需 RawS 的 S16/S24/S32 分支。
 //!
 //! 增益曲线：gainOut = cos(p·π/2)，gainIn = sin(p·π/2)，按 (out+in) 归一化。
 //! 这保证总功率恒定（无淡入淡出时的音量凹陷），适合无缝衔接。
@@ -37,12 +37,7 @@ impl PcmCrossfadeMixer {
     /// 在重叠区原地混合：result[i] = current[i]*gainOut + next[i]*gainIn。
     /// `current` 和 `next` 为交错 f32 PCM，长度应相同。
     /// `gain_out` / `gain_in` 为本块对应的增益（对整块恒定，逐块递进）。
-    pub fn mix_in_place(
-        current: &mut [f32],
-        next: &[f32],
-        gain_out: f32,
-        gain_in: f32,
-    ) {
+    pub fn mix_in_place(current: &mut [f32], next: &[f32], gain_out: f32, gain_in: f32) {
         let len = current.len().min(next.len());
         for i in 0..len {
             let mixed = current[i] * gain_out + next[i] * gain_in;
@@ -97,10 +92,7 @@ mod tests {
             let go = PcmCrossfadeMixer::gain_out(p);
             let gi = PcmCrossfadeMixer::gain_in(p);
             let sum = go + gi;
-            assert!(
-                (sum - 1.0).abs() < 0.01,
-                "sum={sum} at p={p}"
-            );
+            assert!((sum - 1.0).abs() < 0.01, "sum={sum} at p={p}");
         }
     }
 

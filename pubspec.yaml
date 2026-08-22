@@ -1,5 +1,5 @@
-name: xianyu_music_mobile
-description: "A new Flutter project."
+name: xy_music
+description: "XY Music mobile application."
 # The following line prevents the package from being accidentally published to
 # pub.dev using `flutter pub publish`. This is preferred for private packages.
 publish_to: 'none' # Remove this line if you wish to publish to pub.dev
@@ -50,9 +50,22 @@ dependencies:
 
   # 音频播放
   just_audio: ^0.9.0
+  # 听歌识曲：采集 8000Hz/16bit/单声道麦克风 PCM 流
+  record: ^7.1.1
+  # 系统媒体会话、后台播放、通知栏与锁屏播放控件
+  just_audio_background: ^0.0.1-beta.17
+  audio_session: ^0.1.25
+  # just_audio 的 Windows 平台实现；桌面调试时必须显式接入
+  just_audio_windows: ^0.2.3
 
   # 轻量本地存储（设置项）
   shared_preferences: ^2.3.0
+
+  # 本地沙箱执行 MusicFree 插件（搜索、音源解析）
+  quickjs_engine: ^0.1.3
+  http: ^1.6.0
+  # 网易云 picId 生成官方 CDN 封面路径所需的 MD5。
+  crypto: ^3.0.7
 
   # 文件夹选择与存储权限（本地音乐扫描）
   file_picker: ^8.1.0
@@ -90,6 +103,13 @@ flutter_launcher_icons:
   adaptive_icon_background: "#FFFFFF"
   adaptive_icon_foreground: "assets/icon/app_icon_foreground.png"
   min_sdk_android: 21
+  windows:
+    generate: true
+    image_path: "assets/icon/app_icon_bg.png"
+    icon_size: 256
+  macos:
+    generate: true
+    image_path: "assets/icon/app_icon_bg.png"
 
 # For information on the generic Dart part of this file, see the
 # following page: https://dart.dev/tools/pub/pubspec
@@ -101,6 +121,10 @@ flutter:
   # included with your application, so that you can use the icons in
   # the material Icons class.
   uses-material-design: true
+
+  assets:
+    - assets/icon/app_icon.png
+    - assets/plugin_runtime.js
 
   # To add assets to your application, add an assets section, like this:
   # assets:

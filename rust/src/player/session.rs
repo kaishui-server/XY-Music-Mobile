@@ -3,7 +3,7 @@
 //! 将播放队列、当前歌曲、进度、播放模式等状态持久化到 SQLite，
 //! 实现跨重启恢复。运行时播放编排权威在前端（Flutter），本模块仅负责存储与分发。
 
-use super::types::PlaybackSessionData;
+use super::types::{normalize_play_mode, PlaybackSessionData};
 use rusqlite::Connection;
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, UNIX_EPOCH};
@@ -30,9 +30,11 @@ impl PlaybackSessionState {
     /// 从 SQLite 加载持久化的会话状态（启动时调用）
     pub fn load_from_db(&self, conn: &Connection) -> Result<(), String> {
         let result: Result<Option<String>, rusqlite::Error> = conn
-            .query_row("SELECT data FROM playback_session WHERE id = 1", [], |row| {
-                row.get(0)
-            })
+            .query_row(
+                "SELECT data FROM playback_session WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
             .map(Some)
             .or_else(|e| {
                 if matches!(e, rusqlite::Error::QueryReturnedNoRows) {
@@ -44,8 +46,9 @@ impl PlaybackSessionState {
 
         match result {
             Ok(Some(json_str)) => {
-                let data: PlaybackSessionData = serde_json::from_str(&json_str)
+                let mut data: PlaybackSessionData = serde_json::from_str(&json_str)
                     .map_err(|e| format!("反序列化播放会话失败: {}", e))?;
+                data.play_mode = normalize_play_mode(data.play_mode);
                 let mut inner = self.inner.lock().map_err(|e| e.to_string())?;
                 *inner = data;
             }
@@ -82,6 +85,7 @@ impl PlaybackSessionState {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
+        session.play_mode = normalize_play_mode(session.play_mode);
         session.updated_at = now;
 
         {
@@ -222,9 +226,32 @@ mod tests {
         state.flush_playback_session(&conn).expect("flush empty ok");
 
         let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM playback_session", [], |row| row.get(0))
+            .query_row("SELECT COUNT(*) FROM playback_session", [], |row| {
+                row.get(0)
+            })
             .expect("count");
         assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn test_legacy_play_mode_is_normalized_on_save_and_load() {
+        let conn = setup_db();
+        let state = PlaybackSessionState::new();
+        let session = PlaybackSessionData {
+            current_song_path: Some("/music/song.flac".into()),
+            play_queue_paths: vec!["/music/song.flac".into()],
+            play_mode: 3,
+            ..PlaybackSessionData::default()
+        };
+
+        state
+            .save_playback_session(&conn, session)
+            .expect("save legacy session");
+        assert_eq!(state.get_playback_session().play_mode, 1);
+
+        let restored = PlaybackSessionState::new();
+        restored.load_from_db(&conn).expect("load legacy session");
+        assert_eq!(restored.get_playback_session().play_mode, 1);
     }
 
     #[test]
@@ -245,7 +272,9 @@ mod tests {
         assert_eq!(state.get_playback_session().current_position_secs, 10.0);
 
         let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM playback_session", [], |row| row.get(0))
+            .query_row("SELECT COUNT(*) FROM playback_session", [], |row| {
+                row.get(0)
+            })
             .expect("count");
         assert_eq!(count, 1);
     }

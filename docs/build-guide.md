@@ -1,4 +1,4 @@
-# 弦予音乐移动端 · IDEA 构建指南
+# XY Music 移动端 · IDEA 构建指南
 
 在 IntelliJ IDEA / Android Studio 中构建与运行本项目的完整流程。
 
@@ -15,7 +15,7 @@
 
 ## 关键坑：中文路径
 
-项目路径 `d:\Program Files\MC\开发端\开发组\弦予音乐\XianYu-Music-Mobile` 含中文：
+项目路径 `d:\Program Files\MC\开发端\开发组\XY Music\XianYu-Music-Mobile` 含空格：
 
 - **Debug 构建（JIT）** → 中文路径可用 ✓
 - **Release 构建（AOT）** → 会失败 ✗（`gen_snapshot` 无法读取含中文路径，见 flutter/flutter#149194），必须用 `scripts/build-release.ps1`
@@ -54,7 +54,7 @@ flutter pub get
 
 ```powershell
 ./scripts/build-release.ps1
-# 产物：releases/弦予音乐_1.0.0_arm64.apk（约 14MB，按 ABI 拆包）
+# 产物：releases/XY Music_1.0.0_arm64.apk（约 14MB，按 ABI 拆包）
 ```
 
 IDEA 终端里也能直接调这个脚本。脚本逻辑：

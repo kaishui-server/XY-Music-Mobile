@@ -13,9 +13,11 @@
 use crate::player::buffered_source::{BlockProducer, BufferedSource};
 use crate::player::equalizer::{Equalizer, EqualizerHandle, EqualizerSettings};
 use crate::player::loudness::VolumeNormalizer;
+use crate::player::qmc2::{
+    extract_ekey_from_footer, looks_like_qmc_encrypted, QmcCrypto, QmcDecryptReader,
+};
 use crate::player::sound_effect::{SoundEffectBlockProcessor, SoundEffectSettings};
 use crate::player::types::global_visualizer;
-use crate::player::qmc2::{looks_like_qmc_encrypted, extract_ekey_from_footer, QmcCrypto, QmcDecryptReader};
 use std::io::{Read, Seek, SeekFrom};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
@@ -55,24 +57,22 @@ type FnBuilderSetSharingMode = unsafe extern "C" fn(*mut AAudioStreamBuilder, i3
 type FnBuilderSetPerformanceMode = unsafe extern "C" fn(*mut AAudioStreamBuilder, i32);
 type FnBuilderSetBufferCapacity = unsafe extern "C" fn(*mut AAudioStreamBuilder, i32);
 type FnBuilderSetDirection = unsafe extern "C" fn(*mut AAudioStreamBuilder, i32);
-type FnBuilderOpenStream = unsafe extern "C" fn(*mut AAudioStreamBuilder, *mut *mut AAudioStream) -> i32;
+type FnBuilderOpenStream =
+    unsafe extern "C" fn(*mut AAudioStreamBuilder, *mut *mut AAudioStream) -> i32;
 type FnStreamRequestStart = unsafe extern "C" fn(*mut AAudioStream) -> i32;
 type FnStreamRequestPause = unsafe extern "C" fn(*mut AAudioStream) -> i32;
 type FnStreamRequestStop = unsafe extern "C" fn(*mut AAudioStream) -> i32;
 type FnStreamClose = unsafe extern "C" fn(*mut AAudioStream) -> i32;
-type FnStreamWrite = unsafe extern "C" fn(*mut AAudioStream, *const std::os::raw::c_void, i32, i64) -> i64;
+type FnStreamWrite =
+    unsafe extern "C" fn(*mut AAudioStream, *const std::os::raw::c_void, i32, i64) -> i64;
 type FnStreamGetAvailableFrames = unsafe extern "C" fn(*mut AAudioStream) -> i32;
 type FnStreamGetXRunCount = unsafe extern "C" fn(*mut AAudioStream) -> i32;
 type FnStreamGetSampleRate = unsafe extern "C" fn(*mut AAudioStream) -> i32;
 type FnStreamGetChannelCount = unsafe extern "C" fn(*mut AAudioStream) -> i32;
 type FnStreamGetFormat = unsafe extern "C" fn(*mut AAudioStream) -> i32;
 type FnStreamGetBufferSize = unsafe extern "C" fn(*mut AAudioStream) -> i32;
-type FnStreamGetTimestamp = unsafe extern "C" fn(
-    *mut AAudioStream,
-    *mut std::os::raw::c_int,
-    *mut i64,
-    *mut i64,
-) -> i32;
+type FnStreamGetTimestamp =
+    unsafe extern "C" fn(*mut AAudioStream, *mut std::os::raw::c_int, *mut i64, *mut i64) -> i32;
 type FnConvertResultToText = unsafe extern "C" fn(i32) -> *const std::os::raw::c_char;
 
 /// 动态加载的 AAudio 函数表。
@@ -117,43 +117,71 @@ impl AAudioLib {
             }
 
             macro_rules! sym {
-                ($name:expr, $type:ty) => {
-                    {
-                        let sym_name = concat!($name, "\0").as_ptr();
-                        let ptr = libc::dlsym(handle, sym_name as *const _);
-                        if ptr.is_null() {
-                            libc::dlclose(handle);
-                            return None;
-                        }
-                        std::mem::transmute::<*mut std::os::raw::c_void, $type>(ptr)
+                ($name:expr, $type:ty) => {{
+                    let sym_name = concat!($name, "\0").as_ptr();
+                    let ptr = libc::dlsym(handle, sym_name as *const _);
+                    if ptr.is_null() {
+                        libc::dlclose(handle);
+                        return None;
                     }
-                };
+                    std::mem::transmute::<*mut std::os::raw::c_void, $type>(ptr)
+                }};
             }
 
             let lib = Self {
                 _handle: handle,
                 create_stream_builder: sym!("AAudio_createStreamBuilder", FnCreateStreamBuilder),
                 builder_delete: sym!("AAudioStreamBuilder_delete", FnBuilderDelete),
-                builder_set_device_id: sym!("AAudioStreamBuilder_setDeviceId", FnBuilderSetDeviceId),
-                builder_set_sample_rate: sym!("AAudioStreamBuilder_setSampleRate", FnBuilderSetSampleRate),
-                builder_set_channel_count: sym!("AAudioStreamBuilder_setChannelCount", FnBuilderSetChannelCount),
+                builder_set_device_id: sym!(
+                    "AAudioStreamBuilder_setDeviceId",
+                    FnBuilderSetDeviceId
+                ),
+                builder_set_sample_rate: sym!(
+                    "AAudioStreamBuilder_setSampleRate",
+                    FnBuilderSetSampleRate
+                ),
+                builder_set_channel_count: sym!(
+                    "AAudioStreamBuilder_setChannelCount",
+                    FnBuilderSetChannelCount
+                ),
                 builder_set_format: sym!("AAudioStreamBuilder_setFormat", FnBuilderSetFormat),
-                builder_set_sharing_mode: sym!("AAudioStreamBuilder_setSharingMode", FnBuilderSetSharingMode),
-                builder_set_performance_mode: sym!("AAudioStreamBuilder_setPerformanceMode", FnBuilderSetPerformanceMode),
-                builder_set_buffer_capacity: sym!("AAudioStreamBuilder_setBufferCapacityInFrames", FnBuilderSetBufferCapacity),
-                builder_set_direction: sym!("AAudioStreamBuilder_setDirection", FnBuilderSetDirection),
+                builder_set_sharing_mode: sym!(
+                    "AAudioStreamBuilder_setSharingMode",
+                    FnBuilderSetSharingMode
+                ),
+                builder_set_performance_mode: sym!(
+                    "AAudioStreamBuilder_setPerformanceMode",
+                    FnBuilderSetPerformanceMode
+                ),
+                builder_set_buffer_capacity: sym!(
+                    "AAudioStreamBuilder_setBufferCapacityInFrames",
+                    FnBuilderSetBufferCapacity
+                ),
+                builder_set_direction: sym!(
+                    "AAudioStreamBuilder_setDirection",
+                    FnBuilderSetDirection
+                ),
                 builder_open_stream: sym!("AAudioStreamBuilder_openStream", FnBuilderOpenStream),
                 stream_request_start: sym!("AAudioStream_requestStart", FnStreamRequestStart),
                 stream_request_pause: sym!("AAudioStream_requestPause", FnStreamRequestPause),
                 stream_request_stop: sym!("AAudioStream_requestStop", FnStreamRequestStop),
                 stream_close: sym!("AAudioStream_close", FnStreamClose),
                 stream_write: sym!("AAudioStream_write", FnStreamWrite),
-                stream_get_available_frames: sym!("AAudioStream_getAvailableFrames", FnStreamGetAvailableFrames),
+                stream_get_available_frames: sym!(
+                    "AAudioStream_getAvailableFrames",
+                    FnStreamGetAvailableFrames
+                ),
                 stream_get_xrun_count: sym!("AAudioStream_getXRunCount", FnStreamGetXRunCount),
                 stream_get_sample_rate: sym!("AAudioStream_getSampleRate", FnStreamGetSampleRate),
-                stream_get_channel_count: sym!("AAudioStream_getChannelCount", FnStreamGetChannelCount),
+                stream_get_channel_count: sym!(
+                    "AAudioStream_getChannelCount",
+                    FnStreamGetChannelCount
+                ),
                 stream_get_format: sym!("AAudioStream_getFormat", FnStreamGetFormat),
-                stream_get_buffer_size: sym!("AAudioStream_getBufferSizeInFrames", FnStreamGetBufferSize),
+                stream_get_buffer_size: sym!(
+                    "AAudioStream_getBufferSizeInFrames",
+                    FnStreamGetBufferSize
+                ),
                 stream_get_timestamp: sym!("AAudioStream_getTimestamp", FnStreamGetTimestamp),
                 convert_result_to_text: sym!("AAudio_convertResultToText", FnConvertResultToText),
             };
@@ -230,7 +258,7 @@ struct SymphoniaDecoder {
 
 impl SymphoniaDecoder {
     fn open(path: &str) -> Result<Self, String> {
-        use symphonia::core::codecs::{CODEC_TYPE_NULL, DecoderOptions};
+        use symphonia::core::codecs::{DecoderOptions, CODEC_TYPE_NULL};
         use symphonia::core::formats::FormatOptions;
         use symphonia::core::io::MediaSourceStream;
         use symphonia::core::meta::MetadataOptions;
@@ -250,7 +278,8 @@ impl SymphoniaDecoder {
             // 读取文件末尾 1024 字节提取 ekey
             let file_size = file.seek(SeekFrom::End(0)).map_err(|e| e.to_string())?;
             let tail_size = (file_size.min(1024)) as usize;
-            file.seek(SeekFrom::End(-(tail_size as i64))).map_err(|e| e.to_string())?;
+            file.seek(SeekFrom::End(-(tail_size as i64)))
+                .map_err(|e| e.to_string())?;
             let mut tail = vec![0u8; tail_size];
             file.read_exact(&mut tail).ok();
             file.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
@@ -267,12 +296,20 @@ impl SymphoniaDecoder {
         };
 
         let mut hint = Hint::new();
-        if let Some(ext) = std::path::Path::new(path).extension().and_then(|e| e.to_str()) {
+        if let Some(ext) = std::path::Path::new(path)
+            .extension()
+            .and_then(|e| e.to_str())
+        {
             hint.with_extension(ext);
         }
 
         let probed = symphonia::default::get_probe()
-            .format(&hint, mss, &FormatOptions::default(), &MetadataOptions::default())
+            .format(
+                &hint,
+                mss,
+                &FormatOptions::default(),
+                &MetadataOptions::default(),
+            )
             .map_err(|e| e.to_string())?;
 
         let track = probed
@@ -284,11 +321,7 @@ impl SymphoniaDecoder {
 
         let track_id = track.id;
         let sample_rate = track.codec_params.sample_rate.unwrap_or(44100);
-        let channels = track
-            .codec_params
-            .channels
-            .map(|c| c.count())
-            .unwrap_or(2) as u16;
+        let channels = track.codec_params.channels.map(|c| c.count()).unwrap_or(2) as u16;
 
         let total_duration = track
             .codec_params
@@ -422,10 +455,7 @@ impl ExclusiveProgress {
 // =========================================================================
 
 enum ExclusiveCommand {
-    Seek {
-        time_secs: f64,
-        is_playing: bool,
-    },
+    Seek { time_secs: f64, is_playing: bool },
     Stop,
     SetVolume(f32),
     SetEqualizer(EqualizerSettings),
@@ -466,9 +496,7 @@ fn instance() -> &'static Mutex<Option<AndroidExclusivePlayback>> {
 // 公共 API
 // =========================================================================
 
-pub fn start_exclusive_playback(
-    request: super::ExclusivePlayRequest,
-) -> Result<String, String> {
+pub fn start_exclusive_playback(request: super::ExclusivePlayRequest) -> Result<String, String> {
     // 先停止已有实例
     stop_exclusive_playback();
 
@@ -628,7 +656,9 @@ fn run_exclusive_playback(
     let lib = match AAudioLib::load() {
         Some(l) => l,
         None => {
-            let _ = init_tx.send(Err("无法加载 libaaudio.so（需要 Android API 26+）".to_string()));
+            let _ = init_tx.send(Err(
+                "无法加载 libaaudio.so（需要 Android API 26+）".to_string()
+            ));
             return;
         }
     };
@@ -647,12 +677,8 @@ fn run_exclusive_playback(
     let total_duration = decoder.total_duration;
 
     // 3. 创建 BufferedSource（后台预读取）
-    let mut buffered = BufferedSource::new(
-        decoder,
-        source_sample_rate,
-        source_channels,
-        total_duration,
-    );
+    let mut buffered =
+        BufferedSource::new(decoder, source_sample_rate, source_channels, total_duration);
 
     // 4. 跳到起始位置
     if request.start_time_secs > 0.0 {
@@ -663,8 +689,12 @@ fn run_exclusive_playback(
     }
 
     // 5. 装配 DSP 链
-    let (mut normalizer, _normalizer_handle) =
-        VolumeNormalizer::new(request.volume_balance_gain, source_sample_rate, source_channels, 100);
+    let (mut normalizer, _normalizer_handle) = VolumeNormalizer::new(
+        request.volume_balance_gain,
+        source_sample_rate,
+        source_channels,
+        100,
+    );
 
     let eq_settings: EqualizerSettings = if request.equalizer_settings_json.is_empty() {
         EqualizerSettings::default()
@@ -676,7 +706,9 @@ fn run_exclusive_playback(
 
     let mut sound_effect = SoundEffectBlockProcessor::new(source_sample_rate, source_channels);
     if !request.sound_effect_settings_json.is_empty() {
-        if let Ok(se_settings) = serde_json::from_str::<SoundEffectSettings>(&request.sound_effect_settings_json) {
+        if let Ok(se_settings) =
+            serde_json::from_str::<SoundEffectSettings>(&request.sound_effect_settings_json)
+        {
             sound_effect.set_settings(se_settings);
         }
     }
@@ -695,8 +727,12 @@ fn run_exclusive_playback(
         };
 
     let effective_rate = sound_effect.effective_sample_rate();
-    progress.sample_rate.store(effective_rate, Ordering::Relaxed);
-    progress.channels.store(stream_channels as u32, Ordering::Relaxed);
+    progress
+        .sample_rate
+        .store(effective_rate, Ordering::Relaxed);
+    progress
+        .channels
+        .store(stream_channels as u32, Ordering::Relaxed);
     progress.samples_played.store(
         (request.start_time_secs * source_sample_rate as f64 * source_channels as f64) as u64,
         Ordering::Relaxed,
@@ -735,7 +771,10 @@ fn run_exclusive_playback(
         // 检查命令
         match cmd_rx.try_recv() {
             Ok(ExclusiveCommand::Stop) => break,
-            Ok(ExclusiveCommand::Seek { time_secs, is_playing }) => {
+            Ok(ExclusiveCommand::Seek {
+                time_secs,
+                is_playing,
+            }) => {
                 let _ = unsafe { (lib.stream_request_pause)(stream) };
                 if let Err(e) = buffered.try_seek(Duration::from_secs_f64(time_secs)) {
                     let _ = e;

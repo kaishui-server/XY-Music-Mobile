@@ -23,9 +23,7 @@ const CACHE_ALIAS_EXT: &str = "ref";
 /// 缩略图并发信号量（全局共享，限制解码/缩放时的内存占用）。
 fn thumbnail_semaphore() -> &'static tokio::sync::Semaphore {
     static SEM: OnceLock<tokio::sync::Semaphore> = OnceLock::new();
-    SEM.get_or_init(|| {
-        tokio::sync::Semaphore::new(super::types::THUMBNAIL_IMAGE_CONCURRENCY_LIMIT)
-    })
+    SEM.get_or_init(|| tokio::sync::Semaphore::new(super::types::THUMBNAIL_IMAGE_CONCURRENCY_LIMIT))
 }
 
 /// 高清封面并发信号量（全局共享）。
@@ -386,8 +384,7 @@ pub fn get_or_create_full_cover(path: &Path, cache_dir: &Path) -> Option<String>
                     img
                 };
 
-                let cache_path =
-                    cache_dir.join(format!("{cache_stem}.{FULL_COVER_FALLBACK_EXT}"));
+                let cache_path = cache_dir.join(format!("{cache_stem}.{FULL_COVER_FALLBACK_EXT}"));
                 let persisted =
                     persist_image_atomically(&display_img, ImageFormat::Png, &cache_path)?;
                 let _ = persist_alias_target(&alias_path, &cache_path);

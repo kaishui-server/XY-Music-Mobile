@@ -124,8 +124,10 @@ fn evict_url_cache(cache: &mut HashMap<String, CacheEntry>, now: Instant) {
         return;
     }
     // 收集并按访问时间排序，淘汰最久未访问的 excess 项
-    let mut keys: Vec<(String, Instant)> =
-        cache.iter().map(|(k, e)| (k.clone(), e.last_access)).collect();
+    let mut keys: Vec<(String, Instant)> = cache
+        .iter()
+        .map(|(k, e)| (k.clone(), e.last_access))
+        .collect();
     keys.sort_unstable_by_key(|(_, t)| *t);
     for (k, _) in keys.into_iter().take(excess) {
         cache.remove(&k);
@@ -230,9 +232,7 @@ pub async fn resolve_lx_music_url_inner(
                 quality: quality.to_string(),
             })
         }
-        Err(_) => {
-            None
-        }
+        Err(_) => None,
     }
 }
 

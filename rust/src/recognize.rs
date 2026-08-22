@@ -156,6 +156,8 @@ pub async fn recognize_with_pcm(pcm: Vec<u8>) -> Result<RecognizeResponse, Strin
     if pcm.is_empty() {
         return Err("PCM 数据为空".to_string());
     }
+    // 上一次主动取消不应污染下一次识别。
+    RECOGNIZE_CANCELLED.store(false, Ordering::SeqCst);
     recognize_with_pcm_internal(&pcm).await
 }
 
@@ -221,7 +223,7 @@ async fn recognize_with_pcm_internal(pcm: &[u8]) -> Result<RecognizeResponse, St
 
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::limited(10))
-        .timeout(std::time::Duration::from_secs(30))
+        .timeout(std::time::Duration::from_secs(20))
         .build()
         .map_err(|e| format!("构建 HTTP 客户端失败: {}", e))?;
 

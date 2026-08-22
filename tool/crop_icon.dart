@@ -12,13 +12,15 @@ import 'dart:math' as math;
 
 import 'package:image/image.dart' as img;
 
-const int whiteThreshold = 244; // 高于该亮度视为白底
+const int contentThreshold = 180;
+const int transparentThreshold = 242;
 
-bool _isWhitish(img.Pixel p) {
-  return p.r >= whiteThreshold &&
-      p.g >= whiteThreshold &&
-      p.b >= whiteThreshold;
-}
+int _luminance(img.Pixel p) =>
+    ((p.r * 299 + p.g * 587 + p.b * 114) / 1000).round();
+
+/// 新图标是白底黑色字形。用亮度而非“是否纯白”识别主体，可忽略 JPEG
+/// 背景纹理及角落里的浅色噪点。
+bool _isLogoPixel(img.Pixel p) => _luminance(p) < contentThreshold;
 
 void main() {
   final srcFile = File('assets/icon/source.jpg');
@@ -32,13 +34,15 @@ void main() {
     stderr.writeln('源图解码失败');
     exit(1);
   }
-  final src = decoded.convert(numChannels: 4); // 确保有 alpha 通道
+  // 手机导出的 JPG 可能通过 EXIF 记录朝向；先实际旋转像素，否则生成的
+  // PNG/ICO 不再携带 EXIF 后会出现方向错误或主体偏移。
+  final src = img.bakeOrientation(decoded).convert(numChannels: 4);
 
   // 1) 检测内容边界框（非白色像素）
   int minX = src.width, minY = src.height, maxX = -1, maxY = -1;
   for (var y = 0; y < src.height; y++) {
     for (var x = 0; x < src.width; x++) {
-      if (!_isWhitish(src.getPixel(x, y))) {
+      if (_isLogoPixel(src.getPixel(x, y))) {
         if (x < minX) minX = x;
         if (y < minY) minY = y;
         if (x > maxX) maxX = x;
@@ -52,40 +56,76 @@ void main() {
   }
   final contentW = maxX - minX + 1;
   final contentH = maxY - minY + 1;
-  stdout.writeln('内容边界: ($minX,$minY) - ($maxX,$maxY), 尺寸 ${contentW}x$contentH');
+  stdout.writeln(
+    '内容边界: ($minX,$minY) - ($maxX,$maxY), 尺寸 ${contentW}x$contentH',
+  );
 
-  // 2) 裁出内容区，并把白底像素转为透明
-  final content = img.copyCrop(src, x: minX, y: minY, width: contentW, height: contentH);
+  // 2) 裁出内容区，并把白底转为透明。按亮度计算 alpha，既清除 JPEG
+  //    噪点，也保留黑色字形边缘的抗锯齿。
+  final content = img.copyCrop(
+    src,
+    x: minX,
+    y: minY,
+    width: contentW,
+    height: contentH,
+  );
   for (var y = 0; y < content.height; y++) {
     for (var x = 0; x < content.width; x++) {
       final p = content.getPixel(x, y);
-      if (_isWhitish(p)) {
-        content.setPixelRgba(x, y, p.r, p.g, p.b, 0);
-      }
+      final luminance = _luminance(p);
+      final alpha = luminance >= transparentThreshold
+          ? 0
+          : (((transparentThreshold - luminance) * 255) / transparentThreshold)
+                .round()
+                .clamp(0, 255);
+      content.setPixelRgba(x, y, 0, 0, 0, alpha);
     }
   }
 
-  // 3) 生成透明方形图（内容占比约 88%，四周仅留少量边距）
-  _composeSquare(content, marginRatio: 0.06, output: 'assets/icon/app_icon.png', background: null);
+  // 3) 生成透明方形图（内容占比约 82%，让桌面图标主体稍微小一点）
+  _composeSquare(
+    content,
+    marginRatio: 0.09,
+    output: 'assets/icon/app_icon.png',
+    background: null,
+  );
 
   // 4) 白底方形图（同布局，填白背景）
-  _composeSquare(content, marginRatio: 0.06, output: 'assets/icon/app_icon_bg.png',
-      background: img.ColorRgba8(255, 255, 255, 255));
+  _composeSquare(
+    content,
+    marginRatio: 0.09,
+    output: 'assets/icon/app_icon_bg.png',
+    background: img.ColorRgba8(255, 255, 255, 255),
+  );
 
-  // 5) 自适应图标前景层：留边距约 18%，配合 xml 的 16% inset 仍在安全区内，
-  //    同时让 logo 明显放大（避免叠加后过小）
-  _composeSquare(content, marginRatio: 0.18, output: 'assets/icon/app_icon_foreground.png', background: null);
+  // 5) 自适应图标前景层：比旧版再多留少量边距，适配系统圆形/圆角蒙版。
+  _composeSquare(
+    content,
+    marginRatio: 0.20,
+    output: 'assets/icon/app_icon_foreground.png',
+    background: null,
+  );
 
-  stdout.writeln('完成：已生成 app_icon.png / app_icon_bg.png / app_icon_foreground.png');
+  stdout.writeln(
+    '完成：已生成 app_icon.png / app_icon_bg.png / app_icon_foreground.png',
+  );
 }
 
-void _composeSquare(img.Image content,
-    {required double marginRatio, required String output, img.Color? background}) {
+void _composeSquare(
+  img.Image content, {
+  required double marginRatio,
+  required String output,
+  img.Color? background,
+}) {
   final longSide = math.max(content.width, content.height);
   // 画布边长 = 内容长边 / (1 - 2*margin)
   final canvasSize = (longSide / (1 - 2 * marginRatio)).round();
 
-  final canvas = img.Image(width: canvasSize, height: canvasSize, numChannels: 4);
+  final canvas = img.Image(
+    width: canvasSize,
+    height: canvasSize,
+    numChannels: 4,
+  );
   if (background != null) {
     img.fill(canvas, color: background);
   } else {

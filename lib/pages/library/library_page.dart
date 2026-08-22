@@ -1,12 +1,21 @@
+import 'dart:io';
+
+import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:permission_handler/permission_handler.dart';
 
 import '../../src/library/library_provider.dart';
+import '../../src/library/scan_settings_provider.dart';
+import '../../src/navigation/sidebar_controller.dart';
 import '../../src/widgets/song_list_view.dart';
+import '../../src/widgets/top_notice.dart';
 import 'song_list_page.dart';
 
 class LibraryPage extends ConsumerStatefulWidget {
-  const LibraryPage({super.key});
+  const LibraryPage({super.key, this.initialTab});
+
+  final int? initialTab;
 
   @override
   ConsumerState<LibraryPage> createState() => _LibraryPageState();
@@ -15,12 +24,22 @@ class LibraryPage extends ConsumerStatefulWidget {
 class _LibraryPageState extends ConsumerState<LibraryPage>
     with SingleTickerProviderStateMixin {
   late final TabController _tab;
+  late int _visibleTab;
+  bool _addingFolder = false;
 
   @override
   void initState() {
     super.initState();
     _tab = TabController(length: 4, vsync: this);
-    _tab.index = ref.read(libraryTabProvider);
+    _tab.index = widget.initialTab ?? ref.read(libraryTabProvider);
+    _visibleTab = _tab.index;
+    _tab.addListener(_handleTabChanged);
+    // Riverpod 不允许在 initState 中同步修改 Provider。独立侧栏路由需要
+    // 更新当前音乐库分区时，延后到首帧完成后再同步。
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || ref.read(libraryTabProvider) == _tab.index) return;
+      ref.read(libraryTabProvider.notifier).state = _tab.index;
+    });
     ref.listenManual(libraryTabProvider, (prev, next) {
       if (next != prev && _tab.index != next) {
         _tab.animateTo(next);
@@ -30,8 +49,80 @@ class _LibraryPageState extends ConsumerState<LibraryPage>
 
   @override
   void dispose() {
+    _tab.removeListener(_handleTabChanged);
     _tab.dispose();
     super.dispose();
+  }
+
+  void _handleTabChanged() {
+    if (_visibleTab == _tab.index) return;
+    setState(() => _visibleTab = _tab.index);
+    Future<void>.microtask(() {
+      if (mounted && ref.read(libraryTabProvider) != _tab.index) {
+        ref.read(libraryTabProvider.notifier).state = _tab.index;
+      }
+    });
+  }
+
+  Future<bool> _ensureStoragePermission() async {
+    if (!Platform.isAndroid) return true;
+    if (await Permission.manageExternalStorage.isGranted) return true;
+    if ((await Permission.manageExternalStorage.request()).isGranted) {
+      return true;
+    }
+    if ((await Permission.audio.request()).isGranted) return true;
+    return (await Permission.storage.request()).isGranted;
+  }
+
+  Future<void> _addFolder() async {
+    if (_addingFolder) return;
+    setState(() => _addingFolder = true);
+    try {
+      if (!await _ensureStoragePermission()) {
+        throw Exception('未授予存储权限，无法扫描本地文件夹');
+      }
+      final directory = await FilePicker.platform.getDirectoryPath();
+      if (directory == null) return;
+      if (directory.startsWith('content://')) {
+        throw Exception('请授予“所有文件访问”权限后重新选择文件夹');
+      }
+      await ref.read(scanFoldersProvider.notifier).addFolder(directory);
+      final count = await ref.read(libraryProvider.notifier).scanAllFolders();
+      if (!mounted) return;
+      XyNotice.show(
+        context,
+        message: '文件夹已添加，当前共扫描到 $count 首歌曲',
+        type: XyNoticeType.success,
+      );
+    } catch (error) {
+      if (!mounted) return;
+      XyNotice.show(
+        context,
+        message: error.toString().replaceFirst('Exception: ', ''),
+        type: XyNoticeType.error,
+      );
+    } finally {
+      if (mounted) setState(() => _addingFolder = false);
+    }
+  }
+
+  Future<void> _searchFolders() async {
+    final root = ref.read(libraryProvider).folderRoot;
+    final selected = await showSearch<FolderNodeData?>(
+      context: context,
+      delegate: _FolderSearchDelegate(root),
+    );
+    if (!mounted || selected == null || selected.songCount <= 0) return;
+    await Navigator.push<void>(
+      context,
+      MaterialPageRoute(
+        builder: (_) => SongListPage(
+          title: selected.name,
+          loader: () =>
+              ref.read(libraryProvider.notifier).songsByFolder(selected.path),
+        ),
+      ),
+    );
   }
 
   @override
@@ -40,8 +131,27 @@ class _LibraryPageState extends ConsumerState<LibraryPage>
 
     return Scaffold(
       appBar: AppBar(
-        title: const Text('音乐库'),
+        leading: const AppSidebarMenuButton(),
+        title: const Text('本地音乐'),
         actions: [
+          if (_visibleTab == 3)
+            IconButton(
+              tooltip: '添加文件夹',
+              onPressed: _addingFolder ? null : _addFolder,
+              icon: _addingFolder
+                  ? const SizedBox(
+                      width: 20,
+                      height: 20,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    )
+                  : const Icon(Icons.create_new_folder_outlined),
+            ),
+          if (_visibleTab == 3)
+            IconButton(
+              tooltip: '搜索文件夹',
+              onPressed: _searchFolders,
+              icon: const Icon(Icons.search_rounded),
+            ),
           IconButton(
             icon: const Icon(Icons.refresh),
             onPressed: () => ref.read(libraryProvider.notifier).load(),
@@ -50,7 +160,7 @@ class _LibraryPageState extends ConsumerState<LibraryPage>
         bottom: TabBar(
           controller: _tab,
           tabs: const [
-            Tab(text: '全部'),
+            Tab(text: '歌曲'),
             Tab(text: '歌手'),
             Tab(text: '专辑'),
             Tab(text: '文件夹'),
@@ -58,20 +168,23 @@ class _LibraryPageState extends ConsumerState<LibraryPage>
         ),
       ),
       body: Padding(
-        padding: const EdgeInsets.only(bottom: 150),
+        padding: const EdgeInsets.only(bottom: 90),
         child: lib.loading
             ? const Center(child: CircularProgressIndicator())
             : lib.error != null
-                ? _ErrorView(message: lib.error!, onRetry: () => ref.read(libraryProvider.notifier).load())
-                : TabBarView(
-                    controller: _tab,
-                    children: [
-                      _AllSongsTab(),
-                      _ArtistsTab(),
-                      _AlbumsTab(),
-                      _FoldersTab(),
-                    ],
-                  ),
+            ? _ErrorView(
+                message: lib.error!,
+                onRetry: () => ref.read(libraryProvider.notifier).load(),
+              )
+            : TabBarView(
+                controller: _tab,
+                children: [
+                  _AllSongsTab(),
+                  _ArtistsTab(),
+                  _AlbumsTab(),
+                  _FoldersTab(),
+                ],
+              ),
       ),
     );
   }
@@ -116,11 +229,13 @@ class _AllSongsTabState extends ConsumerState<_AllSongsTab> {
     final songs = _query.isEmpty
         ? lib.songs
         : lib.songs
-            .where((s) =>
-                s.title.toLowerCase().contains(_query) ||
-                s.artist.toLowerCase().contains(_query) ||
-                s.album.toLowerCase().contains(_query))
-            .toList();
+              .where(
+                (s) =>
+                    s.title.toLowerCase().contains(_query) ||
+                    s.artist.toLowerCase().contains(_query) ||
+                    s.album.toLowerCase().contains(_query),
+              )
+              .toList();
     return Column(
       children: [
         Padding(
@@ -168,12 +283,16 @@ class _ArtistsTab extends ConsumerWidget {
             child: Text(
               a.name.isEmpty ? '?' : String.fromCharCode(a.name.runes.first),
               style: TextStyle(
-                  color: Theme.of(context).colorScheme.onPrimaryContainer),
+                color: Theme.of(context).colorScheme.onPrimaryContainer,
+              ),
             ),
           ),
           title: Text(a.name, maxLines: 1, overflow: TextOverflow.ellipsis),
           subtitle: Text('${a.count} 首'),
-          trailing: Icon(Icons.chevron_right, color: Theme.of(context).colorScheme.outline),
+          trailing: Icon(
+            Icons.chevron_right,
+            color: Theme.of(context).colorScheme.outline,
+          ),
           onTap: () => Navigator.push(
             context,
             MaterialPageRoute(
@@ -218,7 +337,10 @@ class _AlbumsTab extends ConsumerWidget {
             maxLines: 1,
             overflow: TextOverflow.ellipsis,
           ),
-          trailing: Icon(Icons.chevron_right, color: Theme.of(context).colorScheme.outline),
+          trailing: Icon(
+            Icons.chevron_right,
+            color: Theme.of(context).colorScheme.outline,
+          ),
           onTap: () => Navigator.push(
             context,
             MaterialPageRoute(
@@ -243,42 +365,88 @@ class _FoldersTab extends ConsumerStatefulWidget {
 
 class _FoldersTabState extends ConsumerState<_FoldersTab> {
   final Set<String> _expanded = {};
+  final Set<String> _loadingChildren = {};
+  final Map<String, List<FolderNodeData>> _loadedChildren = {};
+
+  Future<void> _toggleNode(
+    FolderNodeData node,
+    List<FolderNodeData> visibleChildren,
+  ) async {
+    if (_expanded.contains(node.path)) {
+      setState(() => _expanded.remove(node.path));
+      return;
+    }
+    if (visibleChildren.isNotEmpty || node.childCount == 0) {
+      setState(() => _expanded.add(node.path));
+      return;
+    }
+    if (_loadingChildren.contains(node.path)) return;
+    setState(() => _loadingChildren.add(node.path));
+    try {
+      final children = await ref
+          .read(libraryProvider.notifier)
+          .folderChildren(node.path);
+      if (!mounted) return;
+      setState(() {
+        _loadedChildren[node.path] = children;
+        if (children.isNotEmpty) _expanded.add(node.path);
+      });
+      if (children.isEmpty && mounted) {
+        XyNotice.show(
+          context,
+          message: '该文件夹中没有可展开的子文件夹',
+          duration: const Duration(seconds: 2),
+        );
+      }
+    } catch (error) {
+      if (!mounted) return;
+      XyNotice.show(
+        context,
+        message: '读取子文件夹失败：$error',
+        type: XyNoticeType.error,
+      );
+    } finally {
+      if (mounted) setState(() => _loadingChildren.remove(node.path));
+    }
+  }
 
   void _buildNodes(
-      BuildContext context, List<FolderNodeData> nodes, List<Widget> out) {
+    BuildContext context,
+    List<FolderNodeData> nodes,
+    List<Widget> out, [
+    int depth = 0,
+  ]) {
     for (final n in nodes) {
-      final hasChildren = n.children.isNotEmpty || n.childCount > 0;
+      final children = _loadedChildren[n.path] ?? n.children;
+      final hasChildren = children.isNotEmpty || n.childCount > 0;
       final isExpanded = _expanded.contains(n.path);
-      out.add(_FolderTile(
-        node: n,
-        hasChildren: hasChildren,
-        isExpanded: isExpanded,
-        onToggle: () {
-          setState(() {
-            if (isExpanded) {
-              _expanded.remove(n.path);
-            } else {
-              _expanded.add(n.path);
-            }
-          });
-        },
-        onOpen: () {
-          if (n.songCount > 0) {
-            Navigator.push(
-              context,
-              MaterialPageRoute(
-                builder: (_) => SongListPage(
-                  title: n.name,
-                  loader: () =>
-                      ref.read(libraryProvider.notifier).songsByFolder(n.path),
+      out.add(
+        _FolderTile(
+          node: n,
+          depth: depth,
+          hasChildren: hasChildren,
+          isExpanded: isExpanded,
+          isLoading: _loadingChildren.contains(n.path),
+          onToggle: () => _toggleNode(n, children),
+          onOpen: () {
+            if (n.songCount > 0) {
+              Navigator.push(
+                context,
+                MaterialPageRoute(
+                  builder: (_) => SongListPage(
+                    title: n.name,
+                    loader: () => ref
+                        .read(libraryProvider.notifier)
+                        .songsByFolder(n.path),
+                  ),
                 ),
-              ),
-            );
-          }
-        },
-      ));
-      if (isExpanded && n.children.isNotEmpty) {
-        _buildNodes(context, n.children, out);
+              );
+            }
+          },
+        ),
+      );
+      if (isExpanded && children.isNotEmpty) {
+        _buildNodes(context, children, out, depth + 1);
       }
     }
   }
@@ -291,17 +459,19 @@ class _FoldersTabState extends ConsumerState<_FoldersTab> {
     try {
       final count = await ref.read(libraryProvider.notifier).scanAllFolders();
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text('扫描完成，共 $count 首'),
-          duration: const Duration(seconds: 2),
-        ),
+      setState(() {
+        _expanded.clear();
+        _loadedChildren.clear();
+      });
+      XyNotice.show(
+        context,
+        message: '扫描完成，共 $count 首',
+        type: XyNoticeType.success,
+        duration: const Duration(seconds: 2),
       );
     } catch (e) {
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('扫描失败：$e')),
-      );
+      XyNotice.show(context, message: '扫描失败：$e', type: XyNoticeType.error);
     } finally {
       if (mounted) setState(() => _scanning = false);
     }
@@ -325,7 +495,7 @@ class _FoldersTabState extends ConsumerState<_FoldersTab> {
                     child: Padding(
                       padding: EdgeInsets.all(24),
                       child: Text(
-                        '暂无文件夹\n请先在「设置 → 扫描文件夹」添加音乐目录，\n然后在此下拉刷新开始扫描',
+                        '暂无文件夹\n点击右上角“添加文件夹”选择音乐目录，\n添加后会自动开始扫描',
                         textAlign: TextAlign.center,
                       ),
                     ),
@@ -343,14 +513,18 @@ class _FoldersTabState extends ConsumerState<_FoldersTab> {
 
 class _FolderTile extends StatelessWidget {
   final FolderNodeData node;
+  final int depth;
   final bool hasChildren;
   final bool isExpanded;
+  final bool isLoading;
   final VoidCallback onToggle;
   final VoidCallback onOpen;
   const _FolderTile({
     required this.node,
+    required this.depth,
     required this.hasChildren,
     required this.isExpanded,
+    required this.isLoading,
     required this.onToggle,
     required this.onOpen,
   });
@@ -358,6 +532,7 @@ class _FolderTile extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return ListTile(
+      contentPadding: EdgeInsets.only(left: 16 + depth * 18, right: 8),
       leading: const Icon(Icons.folder),
       // 标题只显示文件夹名，完整路径放副标题（从右侧省略，保留末级目录）。
       title: Text(
@@ -375,18 +550,107 @@ class _FolderTile extends StatelessWidget {
         children: [
           if (hasChildren)
             IconButton(
-              icon: AnimatedRotation(
-                turns: isExpanded ? 0.5 : 0,
-                duration: const Duration(milliseconds: 200),
-                child: const Icon(Icons.expand_more),
-              ),
-              onPressed: onToggle,
+              icon: isLoading
+                  ? const SizedBox.square(
+                      dimension: 18,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    )
+                  : AnimatedRotation(
+                      turns: isExpanded ? 0.5 : 0,
+                      duration: const Duration(milliseconds: 200),
+                      child: const Icon(Icons.expand_more),
+                    ),
+              onPressed: isLoading ? null : onToggle,
             ),
           if (node.songCount > 0)
             IconButton(icon: const Icon(Icons.play_arrow), onPressed: onOpen),
         ],
       ),
-      onTap: hasChildren ? onToggle : onOpen,
+      onTap: isLoading ? null : (hasChildren ? onToggle : onOpen),
     );
+  }
+}
+
+class _FolderSearchDelegate extends SearchDelegate<FolderNodeData?> {
+  _FolderSearchDelegate(List<FolderNodeData> root) : _folders = _flatten(root);
+
+  final List<FolderNodeData> _folders;
+
+  static List<FolderNodeData> _flatten(List<FolderNodeData> nodes) {
+    final result = <FolderNodeData>[];
+    for (final node in nodes) {
+      result.add(node);
+      result.addAll(_flatten(node.children));
+    }
+    return result;
+  }
+
+  @override
+  String get searchFieldLabel => '搜索文件夹名称或路径';
+
+  @override
+  List<Widget>? buildActions(BuildContext context) => [
+    if (query.isNotEmpty)
+      IconButton(
+        tooltip: '清空',
+        onPressed: () => query = '',
+        icon: const Icon(Icons.clear_rounded),
+      ),
+  ];
+
+  @override
+  Widget? buildLeading(BuildContext context) => IconButton(
+    tooltip: '返回',
+    onPressed: () => close(context, null),
+    icon: const Icon(Icons.arrow_back_rounded),
+  );
+
+  @override
+  Widget buildResults(BuildContext context) => _buildMatches(context);
+
+  @override
+  Widget buildSuggestions(BuildContext context) => _buildMatches(context);
+
+  Widget _buildMatches(BuildContext context) {
+    final keyword = query.trim().toLowerCase();
+    final matches = keyword.isEmpty
+        ? _folders
+        : _folders
+              .where(
+                (folder) =>
+                    folder.name.toLowerCase().contains(keyword) ||
+                    folder.path.toLowerCase().contains(keyword),
+              )
+              .toList();
+    if (matches.isEmpty) return const Center(child: Text('没有找到匹配的文件夹'));
+    return ListView.builder(
+      itemCount: matches.length,
+      itemBuilder: (context, index) {
+        final folder = matches[index];
+        return ListTile(
+          leading: const Icon(Icons.folder_outlined),
+          title: Text(
+            folder.name.isEmpty ? _folderName(folder.path) : folder.name,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+          ),
+          subtitle: Text(
+            '${folder.path}\n${folder.songCount} 首',
+            maxLines: 2,
+            overflow: TextOverflow.ellipsis,
+          ),
+          enabled: folder.songCount > 0,
+          trailing: folder.songCount > 0
+              ? const Icon(Icons.chevron_right)
+              : null,
+          onTap: folder.songCount > 0 ? () => close(context, folder) : null,
+        );
+      },
+    );
+  }
+
+  static String _folderName(String path) {
+    final parts = path.split(RegExp(r'[\\/]'));
+    return parts.where((part) => part.isNotEmpty).lastOrNull ?? path;
   }
 }

@@ -40,12 +40,47 @@ fn sanitize_stream_url(raw: &str) -> String {
     let candidate = &trimmed[start..];
     // 从 URL 起始处截断到第一个出现的包装符/空白
     let end = candidate
-        .find(|c: char| matches!(c, '`' | '\'' | '"' | '<' | '>' | ' ' | '\t' | '\n' | '\r' | '\u{2018}' | '\u{2019}' | '\u{201c}' | '\u{201d}' | '\u{ff02}' | '\u{ff07}'))
+        .find(|c: char| {
+            matches!(
+                c,
+                '`' | '\''
+                    | '"'
+                    | '<'
+                    | '>'
+                    | ' '
+                    | '\t'
+                    | '\n'
+                    | '\r'
+                    | '\u{2018}'
+                    | '\u{2019}'
+                    | '\u{201c}'
+                    | '\u{201d}'
+                    | '\u{ff02}'
+                    | '\u{ff07}'
+            )
+        })
         .unwrap_or(candidate.len());
     let mut result = candidate[..end].to_string();
     // 循环移除尾部逗号、分号、反引号等
     loop {
-        let trimmed_end = result.trim_end_matches(|c: char| matches!(c, ',' | '，' | ';' | '；' | '`' | '\'' | '"' | ' ' | '\u{2018}' | '\u{2019}' | '\u{201c}' | '\u{201d}' | '\u{ff02}' | '\u{ff07}'));
+        let trimmed_end = result.trim_end_matches(|c: char| {
+            matches!(
+                c,
+                ',' | '，'
+                    | ';'
+                    | '；'
+                    | '`'
+                    | '\''
+                    | '"'
+                    | ' '
+                    | '\u{2018}'
+                    | '\u{2019}'
+                    | '\u{201c}'
+                    | '\u{201d}'
+                    | '\u{ff02}'
+                    | '\u{ff07}'
+            )
+        });
         if trimmed_end.len() == result.len() {
             break;
         }
@@ -117,9 +152,7 @@ impl Seek for StreamingTempFileReader {
             SeekFrom::Start(n) => n,
             SeekFrom::Current(n) => (self.pos as i64 + n).max(0) as u64,
             SeekFrom::End(n) => {
-                if self.total_bytes.is_some()
-                    || self.download_complete.load(Ordering::Relaxed)
-                {
+                if self.total_bytes.is_some() || self.download_complete.load(Ordering::Relaxed) {
                     return self.file.seek(SeekFrom::End(n)).map(|p| {
                         self.pos = p;
                         p
@@ -183,11 +216,7 @@ impl std::fmt::Debug for StreamingTempFileState {
             .field("total_bytes", &self.total_bytes)
             .field(
                 "ekey",
-                &self
-                    .ekey
-                    .lock()
-                    .map(|e| e.is_some())
-                    .unwrap_or(false),
+                &self.ekey.lock().map(|e| e.is_some()).unwrap_or(false),
             )
             .finish()
     }
@@ -221,14 +250,10 @@ impl StreamingTempFileState {
         let ekey = self.ekey();
         if let Some(ekey_str) = ekey {
             match crate::player::qmc2::QmcCrypto::from_ekey(&ekey_str) {
-                Ok(crypto) => {
-                    Ok(Box::new(crate::player::qmc2::QmcDecryptReader::new(
-                        reader, crypto,
-                    )))
-                }
-                Err(_) => {
-                    Ok(Box::new(reader))
-                }
+                Ok(crypto) => Ok(Box::new(crate::player::qmc2::QmcDecryptReader::new(
+                    reader, crypto,
+                ))),
+                Err(_) => Ok(Box::new(reader)),
             }
         } else {
             Ok(Box::new(reader))
@@ -484,7 +509,8 @@ pub fn start_streaming_download(
     let download_failed = Arc::new(AtomicBool::new(false));
     let post_check_pending = Arc::new(AtomicBool::new(false));
     let shared_ekey = Arc::new(std::sync::Mutex::new(ekey.map(|s| s.to_string())));
-    let download_error: Arc<std::sync::Mutex<Option<String>>> = Arc::new(std::sync::Mutex::new(None));
+    let download_error: Arc<std::sync::Mutex<Option<String>>> =
+        Arc::new(std::sync::Mutex::new(None));
 
     // 启动后台下载线程
     let url_clone = url.to_string();
@@ -566,12 +592,35 @@ fn extract_audio_info_from_json(body: &str) -> Option<(String, Option<String>)> 
 
     // 优先字段名列表（按常见 API 返回格式排序）
     let priority_keys = [
-        "url", "musicUrl", "audioUrl", "playUrl", "play_url", "music_url",
-        "link", "src", "file", "fileUrl", "file_url",
-        "data", "result", "music", "audio",
-        "source", "sourceUrl", "source_url", "media", "mediaUrl",
-        "stream", "streamUrl", "stream_url", "cdn", "cdnUrl",
-        "play", "download", "downloadUrl", "download_url",
+        "url",
+        "musicUrl",
+        "audioUrl",
+        "playUrl",
+        "play_url",
+        "music_url",
+        "link",
+        "src",
+        "file",
+        "fileUrl",
+        "file_url",
+        "data",
+        "result",
+        "music",
+        "audio",
+        "source",
+        "sourceUrl",
+        "source_url",
+        "media",
+        "mediaUrl",
+        "stream",
+        "streamUrl",
+        "stream_url",
+        "cdn",
+        "cdnUrl",
+        "play",
+        "download",
+        "downloadUrl",
+        "download_url",
     ];
 
     // 第一轮：检查优先字段名（接受任何 http/https URL，不检查音频特征）
@@ -825,7 +874,15 @@ fn extract_url_from_raw_text(text: &str) -> Option<String> {
             // 从起始位置截取到下一个空白字符或引号
             let rest = &text[start..];
             let end = rest
-                .find(|c: char| c.is_whitespace() || c == '"' || c == '\'' || c == '<' || c == '>' || c == ',' || c == '}')
+                .find(|c: char| {
+                    c.is_whitespace()
+                        || c == '"'
+                        || c == '\''
+                        || c == '<'
+                        || c == '>'
+                        || c == ','
+                        || c == '}'
+                })
                 .unwrap_or(rest.len());
             let url = &rest[..end];
             if url.len() > 10 && !is_obviously_non_audio_url(url) {
@@ -929,7 +986,10 @@ fn apply_stream_request_headers(
     user_agent: Option<&str>,
 ) -> reqwest::blocking::RequestBuilder {
     let has_plugin_user_agent = headers
-        .map(|hdrs| hdrs.keys().any(|key| key.eq_ignore_ascii_case("user-agent")))
+        .map(|hdrs| {
+            hdrs.keys()
+                .any(|key| key.eq_ignore_ascii_case("user-agent"))
+        })
         .unwrap_or(false);
 
     // 插件提供的 User-Agent 必须优先。JOOX 等音源会严格校验 UA；
@@ -1037,7 +1097,8 @@ fn download_thread(
                 }
             }
             // 用提取到的 URL 重新请求
-            let retry_req = apply_stream_request_headers(client.get(&real_url), headers, user_agent);
+            let retry_req =
+                apply_stream_request_headers(client.get(&real_url), headers, user_agent);
             match retry_req.send() {
                 Ok(retry_resp) if retry_resp.status().is_success() => {
                     let retry_ct = retry_resp
@@ -1092,10 +1153,7 @@ fn download_thread(
                                     return;
                                 }
                                 Err(e) => {
-                                    fail_download(
-                                        &format!("二次提取的 URL 请求失败: {}", e),
-                                        0,
-                                    );
+                                    fail_download(&format!("二次提取的 URL 请求失败: {}", e), 0);
                                     return;
                                 }
                             }
@@ -1115,10 +1173,7 @@ fn download_thread(
                     }
                 }
                 Ok(retry_resp) => {
-                    fail_download(
-                        &format!("提取的 URL 返回 HTTP {}", retry_resp.status()),
-                        0,
-                    );
+                    fail_download(&format!("提取的 URL 返回 HTTP {}", retry_resp.status()), 0);
                     return;
                 }
                 Err(e) => {
@@ -1128,7 +1183,10 @@ fn download_thread(
             }
         } else {
             fail_download(
-                &format!("服务器返回非音频内容 (Content-Type: {})，URL提取失败", content_type),
+                &format!(
+                    "服务器返回非音频内容 (Content-Type: {})，URL提取失败",
+                    content_type
+                ),
                 0,
             );
             return;

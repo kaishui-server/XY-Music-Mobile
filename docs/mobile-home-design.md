@@ -1,4 +1,4 @@
-# 弦予音乐 · 移动主页设计稿
+# XY Music · 移动主页设计稿
 
 > 融合 **桌面版视觉风格** + **RawS 布局**，作为 Flutter 移动端主页重构的基线。
 > 高保真预览见同目录 `mobile-home-mockup.html`。
@@ -9,13 +9,13 @@
 |------|---------|
 | 桌面版（XianYu-Music-Desktop） | 网易云红 `#EC4141`、暗色 `#262626`、Inter 字体、毛玻璃材质、频谱/旋转/淡入动效、"播放中"红色徽章 |
 | RawS（XY-Music-Mobile） | 主页自上而下编排：顶部栏 → 搜索 → 封面轮播 → 音乐库网格 → 听过最多 → 工具网格；液态玻璃浮动底栏；旋转封面+环形进度迷你播放器 |
-| 弦予 Flutter 端 | 沿用 `go_router` + Riverpod 架构，把当前"音乐库即主页"升级为独立"主界面"首页 |
+| XY Music Flutter 端 | 沿用 `go_router` + Riverpod 架构，把当前"音乐库即主页"升级为独立"主界面"首页 |
 
 ## 二、主页布局结构（自上而下）
 
 ```
 ┌───────────────────────────┐
-│ 1 顶部栏（48dp）            │  ☰ 弦予音乐  ◐背景切换 ⚙设置
+│ 1 顶部栏（48dp）            │  ☰ XY Music  ◐背景切换 ⚙设置
 │ 2 毛玻璃搜索栏（44dp）       │  胶囊形，点击进全局搜索
 │ 3 封面轮播 ★焦点（~312dp）   │  当前播放队列封面横滑 + 歌曲信息遮罩 + 红色"播放中"徽章
 │ 4 「音乐库」标题 + 全部 ›     │
@@ -113,7 +113,7 @@
 | `XY-Music-Mobile/.../widget/bottombar/LiquidBottomTabs.kt` | 液态玻璃底栏 |
 | `XY-Music-Mobile/.../widget/MiniPlayerView.kt` | 旋转封面+环形进度迷你播放器 |
 
-| 弦予 Flutter 待改 | 作用 |
+| XY Music Flutter 待改 | 作用 |
 |-------------------|------|
 | `lib/src/navigation/routes.dart` | 路由 + 底栏 Tab 定义 |
 | `lib/src/navigation/shell.dart` | AppShell + NavigationBar |

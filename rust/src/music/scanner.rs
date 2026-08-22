@@ -47,10 +47,7 @@ impl ScanOptions {
 
     /// 同时指定最小时长与扩展名白名单。
     /// `allowed` 中的扩展名会转为小写去点；空 Vec 视为不限制（None 语义）。
-    pub(crate) fn new(
-        minimum_duration_seconds: Option<u32>,
-        allowed: Option<Vec<String>>,
-    ) -> Self {
+    pub(crate) fn new(minimum_duration_seconds: Option<u32>, allowed: Option<Vec<String>>) -> Self {
         let allowed_extensions = allowed.and_then(|list| {
             let normalized: Vec<String> = list
                 .into_iter()

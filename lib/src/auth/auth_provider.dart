@@ -11,7 +11,7 @@ import '../rust/api.dart';
 const defaultAuthBaseUrl = 'https://back.xymusic.cc/api';
 const defaultAuthApiSecret = 'bf027fedb4d1b4f969c10495f12f17042bf0de02de128200';
 
-/// 认证用户（弦予号登录）。
+/// 认证用户（XY Music 账号登录）。
 class AuthUser {
   final String id;
   final String username;
@@ -49,14 +49,14 @@ class AuthUser {
   }
 
   Map<String, dynamic> toJson() => {
-        'id': id,
-        'username': username,
-        'nickname': nickname,
-        'email': email,
-        'avatar': avatar,
-        'ciyuanxi_id': ciyuanxiId,
-        'role': role,
-      };
+    'id': id,
+    'username': username,
+    'nickname': nickname,
+    'email': email,
+    'avatar': avatar,
+    'ciyuanxi_id': ciyuanxiId,
+    'role': role,
+  };
 }
 
 class AuthState {
@@ -99,10 +99,10 @@ class HumanCaptcha {
   });
 
   factory HumanCaptcha.fromJson(Map<String, dynamic> j) => HumanCaptcha(
-        captchaId: (j['captcha_id'] ?? '').toString(),
-        question: (j['question'] ?? '').toString(),
-        expireSeconds: (j['expire_seconds'] as num?)?.toInt(),
-      );
+    captchaId: (j['captcha_id'] ?? '').toString(),
+    question: (j['question'] ?? '').toString(),
+    expireSeconds: (j['expire_seconds'] as num?)?.toInt(),
+  );
 }
 
 /// 人机验证结果载荷（算术题：id + 答案）。
@@ -116,9 +116,9 @@ class HumanCaptchaPayload {
 
   /// 并入请求体的 captcha 字段（与桌面端 withCaptcha 一致）。
   Map<String, dynamic> toBodyFields() => {
-        'captcha_id': captchaId,
-        'captcha_answer': captchaAnswer,
-      };
+    'captcha_id': captchaId,
+    'captcha_answer': captchaAnswer,
+  };
 }
 
 class AuthNotifier extends StateNotifier<AuthState> {
@@ -172,22 +172,37 @@ class AuthNotifier extends StateNotifier<AuthState> {
 
   /// 发送带签名的账号请求，校验 code===200 并返回 data。
   Future<Map<String, dynamic>> _requestAction(
-      String action, Map<String, dynamic> body) async {
+    String action,
+    Map<String, dynamic> body, {
+    int? fetchTimeoutMs,
+  }) async {
     final dir = await _dataDir();
     final res = await authAuthedRequest(
       dataDir: dir,
       action: action,
       bodyJson: jsonEncode(body),
+      fetchTimeoutMs: fetchTimeoutMs == null
+          ? null
+          : BigInt.from(fetchTimeoutMs),
     );
     final j = jsonDecode(res) as Map<String, dynamic>;
     final code = (j['code'] as num?)?.toInt() ?? -1;
     if (code != 200) {
-      throw AuthException((j['msg'] as String?)?.isNotEmpty == true
-          ? j['msg'] as String
-          : '请求失败（code $code）');
+      throw AuthException(
+        (j['msg'] as String?)?.isNotEmpty == true
+            ? j['msg'] as String
+            : '请求失败（code $code）',
+      );
     }
     return (j['data'] as Map<String, dynamic>?) ?? const {};
   }
+
+  /// 供排行榜、同步等非账号页面复用同一套后端签名请求。
+  Future<Map<String, dynamic>> requestBackendAction(
+    String action,
+    Map<String, dynamic> body, {
+    int? fetchTimeoutMs,
+  }) => _requestAction(action, body, fetchTimeoutMs: fetchTimeoutMs);
 
   Future<void> _saveAuth(String token, Map<String, dynamic> data) async {
     final dir = await _dataDir();
@@ -217,8 +232,11 @@ class AuthNotifier extends StateNotifier<AuthState> {
   }
 
   /// 发送邮箱验证码（注册/找回密码等场景），需先通过人机验证。
-  Future<String> sendCode(String email, String type,
-      {HumanCaptchaPayload? captcha}) async {
+  Future<String> sendCode(
+    String email,
+    String type, {
+    HumanCaptchaPayload? captcha,
+  }) async {
     final data = await _requestAction('send_verify_code', {
       'email': email,
       'type': type,
@@ -229,7 +247,7 @@ class AuthNotifier extends StateNotifier<AuthState> {
         '验证码已发送到邮箱';
   }
 
-  /// 弦予号登录。
+  /// XY Music 账号登录。
   Future<void> login({
     required String ciyuanxiId,
     required String password,

@@ -106,8 +106,10 @@ fn evict_search_cache(cache: &mut HashMap<String, SearchCacheEntry>, now: Instan
     if excess == 0 {
         return;
     }
-    let mut keys: Vec<(String, Instant)> =
-        cache.iter().map(|(k, e)| (k.clone(), e.last_access)).collect();
+    let mut keys: Vec<(String, Instant)> = cache
+        .iter()
+        .map(|(k, e)| (k.clone(), e.last_access))
+        .collect();
     keys.sort_unstable_by_key(|(_, t)| *t);
     for (k, _) in keys.into_iter().take(excess) {
         cache.remove(&k);
@@ -767,10 +769,7 @@ fn tx_handle_result(raw_list: &serde_json::Value) -> Vec<LxSearchItem> {
         // 放宽过滤：仅要求 mid 或 id 存在即可（与前端 txHandleResult、parseTxSong 对齐）。
         // 原 media_mid 非空过滤过严：QQ 音乐响应中 file/media_mid 可能为空或缺失，
         // 导致搜索结果被全部静默过滤 → 列表为空。
-        let songmid = tx_string_field(
-            item,
-            &["mid", "songmid", "songMid", "strMediaMid", "id"],
-        );
+        let songmid = tx_string_field(item, &["mid", "songmid", "songMid", "strMediaMid", "id"]);
         let has_mid = !songmid.is_empty();
         let has_id = item.get("id").is_some();
         if !has_mid && !has_id {
@@ -869,9 +868,7 @@ fn tx_handle_result(raw_list: &serde_json::Value) -> Vec<LxSearchItem> {
             .get("mid")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
-            .unwrap_or_else(|| {
-                tx_string_field(item, &["albumMid", "albummid", "albumid"])
-            });
+            .unwrap_or_else(|| tx_string_field(item, &["albumMid", "albummid", "albumid"]));
         let album_name = album
             .get("name")
             .and_then(|v| v.as_str())
@@ -981,14 +978,15 @@ async fn search_tx(keyword: &str, limit: u32) -> Result<Vec<LxSearchItem>, Strin
     }
 
     // Desktop 接口通常返回 body.song.list；部分环境会返回 body.songlist 或 item_song。
-    let data = body.pointer("/req/data").unwrap_or(&serde_json::Value::Null);
+    let data = body
+        .pointer("/req/data")
+        .unwrap_or(&serde_json::Value::Null);
     let mut result = tx_pick_search_raw_list(data)
         .map(tx_handle_result)
         .unwrap_or_default();
     if !result.is_empty() {
         return Ok(result);
     }
-
 
     let mobile_request_data = serde_json::json!({
         "comm": {
@@ -1013,10 +1011,7 @@ async fn search_tx(keyword: &str, limit: u32) -> Result<Vec<LxSearchItem>, Strin
     let mobile_request_str =
         serde_json::to_string(&mobile_request_data).map_err(|e| e.to_string())?;
     let mobile_sign = zzc_sign(&mobile_request_str);
-    let mobile_url = format!(
-        "https://u.y.qq.com/cgi-bin/musics.fcg?sign={}",
-        mobile_sign
-    );
+    let mobile_url = format!("https://u.y.qq.com/cgi-bin/musics.fcg?sign={}", mobile_sign);
     let mobile_body = http_post_json(
         &mobile_url,
         &mobile_request_str,

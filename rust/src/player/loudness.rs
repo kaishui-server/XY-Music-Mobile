@@ -179,7 +179,12 @@ pub struct VolumeNormalizer {
 }
 
 impl VolumeNormalizer {
-    pub fn new(initial_gain: f32, sample_rate: u32, channels: u16, ramp_ms: u32) -> (Self, VolumeNormalizerHandle) {
+    pub fn new(
+        initial_gain: f32,
+        sample_rate: u32,
+        channels: u16,
+        ramp_ms: u32,
+    ) -> (Self, VolumeNormalizerHandle) {
         let ramp = GainRamp::new(initial_gain, sample_rate, ramp_ms);
         let handle = ramp.get_handle();
 

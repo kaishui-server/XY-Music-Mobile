@@ -21,9 +21,7 @@ class SongListPage extends ConsumerWidget {
             return const Center(child: CircularProgressIndicator());
           }
           if (snap.hasError) {
-            return Center(
-              child: Text('加载失败：${snap.error}'),
-            );
+            return Center(child: Text('加载失败：${snap.error}'));
           }
           final songs = snap.data ?? const <Song>[];
           return SongsListView(

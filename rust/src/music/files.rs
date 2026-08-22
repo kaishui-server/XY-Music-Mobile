@@ -16,7 +16,6 @@ use crate::remote::repository::{get_song_cache_path, get_source_for_remote_uri};
 use crate::remote::webdav;
 use crate::security::path_validator;
 use encoding_rs::{GBK, UTF_16BE, UTF_16LE};
-use std::sync::{Arc, Mutex};
 use lofty::config::WriteOptions;
 use lofty::file::{AudioFile, TaggedFileExt};
 use lofty::picture::{MimeType, Picture, PictureType};
@@ -26,6 +25,7 @@ use serde::Serialize;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
 #[derive(Serialize)]
@@ -356,10 +356,7 @@ struct RemoteLyricsCtx {
     local_lyrics: Option<String>,
 }
 
-fn resolve_remote_lyrics_ctx(
-    path: &str,
-    conn: &rusqlite::Connection,
-) -> Option<RemoteLyricsCtx> {
+fn resolve_remote_lyrics_ctx(path: &str, conn: &rusqlite::Connection) -> Option<RemoteLyricsCtx> {
     let lookup = get_source_for_remote_uri(conn, path).ok()?;
     let cache_path = get_song_cache_path(conn, lookup.3.as_deref().unwrap_or(path))
         .ok()
@@ -1116,7 +1113,8 @@ mod tests {
         )
         .unwrap();
 
-        let ctx = resolve_remote_lyrics_ctx("remote://source/Artist/Album/Demo.flac", &conn).unwrap();
+        let ctx =
+            resolve_remote_lyrics_ctx("remote://source/Artist/Album/Demo.flac", &conn).unwrap();
         let lyrics = read_remote_song_lyrics_raw(ctx).await;
 
         assert_eq!(lyrics, "[00:01.00]cached lyric");

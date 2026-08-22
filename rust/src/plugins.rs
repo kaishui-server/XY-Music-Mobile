@@ -217,10 +217,7 @@ pub fn save_plugin_script(data_dir: &Path, id: String, script: String) -> Result
     let sanitized_id = path_validator::sanitize_filename_component(&id)
         .map_err(|e| format!("无效的插件 id: {}", e))?;
     if script.len() > 2 * 1024 * 1024 {
-        return Err(format!(
-            "插件脚本过大: {} bytes (上限 2MB)",
-            script.len()
-        ));
+        return Err(format!("插件脚本过大: {} bytes (上限 2MB)", script.len()));
     }
     let plugins_dir = data_dir.join("plugins");
     fs::create_dir_all(&plugins_dir).map_err(|e| format!("创建插件目录失败: {e}"))?;

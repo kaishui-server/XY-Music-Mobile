@@ -58,7 +58,10 @@ fn custom_fonts_dir(data_root: &Path) -> Result<PathBuf, String> {
 }
 
 /// 导入歌词字体（复制到 `{data_root}/custom-lyrics-fonts`）。
-pub fn import_lyrics_font(data_root: &Path, source_path: String) -> Result<ImportedLyricsFont, String> {
+pub fn import_lyrics_font(
+    data_root: &Path,
+    source_path: String,
+) -> Result<ImportedLyricsFont, String> {
     let source = PathBuf::from(source_path);
     if !source.is_file() {
         return Err("Selected font file does not exist".to_string());

@@ -1,4 +1,4 @@
-use super::{PROGRESS_EMIT_INTERVAL_MS};
+use super::PROGRESS_EMIT_INTERVAL_MS;
 use crate::music::types::Song;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -20,12 +20,7 @@ pub(crate) trait ScanProgressSink: Send + Sync {
         done: bool,
         failed: bool,
     );
-    fn on_batch(
-        &self,
-        songs: Vec<Song>,
-        deleted_paths: Vec<String>,
-        folder_path: &str,
-    );
+    fn on_batch(&self, songs: Vec<Song>, deleted_paths: Vec<String>, folder_path: &str);
 }
 
 fn now_millis() -> u64 {

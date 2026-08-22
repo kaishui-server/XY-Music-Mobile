@@ -1,18 +1,34 @@
 import 'dart:convert';
+import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart'
     show ExternalLibrary;
 import 'package:flutter_test/flutter_test.dart';
-import 'package:xianyu_music_mobile/src/rust/frb_generated.dart' show RustLib;
-import 'package:xianyu_music_mobile/src/rust/lib.dart';
+import 'package:path/path.dart' as p;
+import 'package:xy_music/src/rust/frb_generated.dart' show RustLib;
+import 'package:xy_music/src/rust/lib.dart';
 
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
 
+  final dllPath = p.join(
+    Directory.current.path,
+    'rust',
+    'target',
+    'debug',
+    'xianyu_core.dll',
+  );
+  if (!File(dllPath).existsSync()) {
+    test(
+      'Rust API 测试需要预先编译的 xianyu_core.dll',
+      () {},
+      skip: '请先运行 cargo build --manifest-path rust/Cargo.toml',
+    );
+    return;
+  }
+
   setUpAll(() async {
-    final dllPath =
-        r'D:\Program Files\MC\开发端\开发组\弦予音乐\XianYu-Music-Mobile\rust\target\debug\xianyu_core.dll';
     await RustLib.init(externalLibrary: ExternalLibrary.open(dllPath));
   });
 
@@ -59,8 +75,11 @@ void main() {
 
     expect(out.length, samples.length, reason: '直通时样本数应保持不变');
     for (var i = 0; i < samples.length; i++) {
-      expect((out[i] - samples[i]).abs(), lessThan(1e-4),
-          reason: '所有音效关闭时应无损直通');
+      expect(
+        (out[i] - samples[i]).abs(),
+        lessThan(1e-4),
+        reason: '所有音效关闭时应无损直通',
+      );
     }
   });
 
@@ -113,12 +132,32 @@ void main() {
     final jsonStr = await parseLyrics(rawLyrics: raw);
     final decoded = jsonDecode(jsonStr) as Map<String, dynamic>;
 
-    expect(decoded['displayLines'], isA<List<dynamic>>(),
-        reason: '应包含 displayLines 展示行');
+    expect(
+      decoded['displayLines'],
+      isA<List<dynamic>>(),
+      reason: '应包含 displayLines 展示行',
+    );
     final lines = decoded['displayLines'] as List<dynamic>;
     expect(lines, isNotEmpty, reason: 'LRC 应解析出至少一行');
-    expect((lines.first as Map<String, dynamic>)['text'], isNotEmpty,
-        reason: '首行应包含歌词文本');
+    expect(
+      (lines.first as Map<String, dynamic>)['text'],
+      isNotEmpty,
+      reason: '首行应包含歌词文本',
+    );
+  });
+
+  test('YRC 逐字歌词解析返回 words 时间轴', () async {
+    const raw = '[1000,1200](1000,400,0)网(1400,400,0)易(1800,400,0)云';
+    final jsonStr = await parseLyrics(rawLyrics: raw);
+    final decoded = jsonDecode(jsonStr) as Map<String, dynamic>;
+    final lines = decoded['displayLines'] as List<dynamic>;
+    final first = lines.first as Map<String, dynamic>;
+    final words = first['words'] as List<dynamic>;
+
+    expect(first['text'], '网易云');
+    expect(words, hasLength(3));
+    expect((words.first as Map<String, dynamic>)['start'], 1.0);
+    expect((words.last as Map<String, dynamic>)['end'], 2.2);
   });
 
   test('有状态音效处理器逐块处理且可复用', () async {
@@ -141,9 +180,11 @@ void main() {
     expect(out.length, samples.length, reason: '直通时样本数一致');
 
     // 开启低音增强后有输出
-    await proc.setSettings(settingsJson: jsonEncode({
-      'bassBoost': {'enabled': true, 'gain': 9.0, 'dynamic': false},
-    }));
+    await proc.setSettings(
+      settingsJson: jsonEncode({
+        'bassBoost': {'enabled': true, 'gain': 9.0, 'dynamic': false},
+      }),
+    );
     final out2 = await proc.processBlock(samples: samples);
     expect(out2.length, greaterThan(0), reason: '低音增强后仍应输出');
 
@@ -180,16 +221,17 @@ void main() {
     final out1 = await eq.processBlock(samples: samples);
     expect(out1.length, samples.length, reason: '旁路时样本数不变');
     for (var i = 0; i < samples.length; i++) {
-      expect((out1[i] - samples[i]).abs(), lessThan(1e-4),
-          reason: '旁路直通应无损');
+      expect((out1[i] - samples[i]).abs(), lessThan(1e-4), reason: '旁路直通应无损');
     }
 
     // 启用 + preamp 6dB → 增益后输出幅度增大
-    await eq.setSettings(settingsJson: jsonEncode({
-      'enabled': true,
-      'preamp': 6.0,
-      'gains': List.filled(10, 0.0),
-    }));
+    await eq.setSettings(
+      settingsJson: jsonEncode({
+        'enabled': true,
+        'preamp': 6.0,
+        'gains': List.filled(10, 0.0),
+      }),
+    );
     final out2 = await eq.processBlock(samples: samples);
     final sum1 = out1.fold<double>(0, (a, b) => a + b.abs());
     final sum2 = out2.fold<double>(0, (a, b) => a + b.abs());
@@ -206,12 +248,42 @@ void main() {
 
   test('音频元数据写入对不存在的文件优雅失败', () async {
     await expectLater(
-      writeAudioMetadata(requestJson: jsonEncode({
-        'filePath': 'Z:\\\\nonexistent\\\\write_test.mp3',
-        'title': '测试',
-      })),
+      writeAudioMetadata(
+        requestJson: jsonEncode({
+          'filePath': 'Z:\\\\nonexistent\\\\write_test.mp3',
+          'title': '测试',
+        }),
+      ),
       throwsA(anything),
       reason: '不存在的文件应抛异常而非崩溃',
     );
+  });
+
+  test('听歌统计接口可在全新数据库中依次初始化和读取', () async {
+    final tempDir = await Directory.systemTemp.createTemp('xy_stats_test_');
+    final dbPath = p.join(tempDir.path, 'library.db');
+    try {
+      final responses = <String>[
+        await statsGetListenDurations(dbPath: dbPath),
+        await statsGetLibraryStats(dbPath: dbPath),
+        await statsGetBehaviorStats(
+          dbPath: dbPath,
+          timeRangeJson: '{"type":"Days30"}',
+        ),
+        await statsGetFormatDistribution(dbPath: dbPath),
+        await statsGetQualityDistribution(dbPath: dbPath),
+      ];
+
+      final decoded = responses
+          .map((response) => jsonDecode(response) as Map<String, dynamic>)
+          .toList();
+      expect(decoded[0], contains('daily'));
+      expect(decoded[1], contains('total_songs'));
+      expect(decoded[2], contains('recent_activity'));
+      expect(decoded[3], contains('other'));
+      expect(decoded[4], contains('other'));
+    } finally {
+      await tempDir.delete(recursive: true);
+    }
   });
 }

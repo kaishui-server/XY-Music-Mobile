@@ -1,7 +1,7 @@
 [package]
 name = "xianyu_core"
 version = "0.1.0"
-description = "弦予音乐移动端复用核心（从桌面端抽取的纯逻辑，不依赖 Tauri）"
+description = "XY Music 移动端复用核心（从桌面端抽取的纯逻辑，不依赖 Tauri）"
 authors = ["lyc"]
 license = "AGPL-3.0-only"
 edition = "2021"

@@ -14,7 +14,7 @@ param(
     1. 用 robocopy 将源码增量同步到 ASCII 构建目录（D:\build\XianYuMusicSrc）
     2. 在该目录执行 `flutter build apk --release --split-per-abi`
        （按 ABI 拆包，交付 arm64 单架构包，避免通用包把所有 ABI 引擎都打进 42MB）
-    3. 将 arm64 分架构的 APK 复制到项目根目录 releases/，命名格式：弦予音乐_<version>_arm64.apk
+    3. 将 arm64 分架构的 APK 复制到项目根目录 releases/，命名格式：XY Music_<version>_arm64.apk
        （arm64 单包约 14MB）
 
 .PARAMETER SkipBuild
@@ -91,8 +91,8 @@ if (Test-Path $pubspec) {
     if ($line) { $version = ($line.Line -replace "^version:\s*", "" -split "\+")[0] }
 }
 
-# 目标文件名：弦予音乐_<version>_arm64.apk（releases 下用中文原名，与桌面版一致）
-$destName = "弦予音乐_${version}_arm64.apk"
+# 目标文件名：XY Music_<version>_arm64.apk
+$destName = "XY Music_${version}_arm64.apk"
 $destPath = Join-Path $releasesDir $destName
 
 # 优先 rename（同盘原子），失败回退复制。源文件删除为尽力而为：

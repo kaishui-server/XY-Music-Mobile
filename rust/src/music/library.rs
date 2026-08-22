@@ -702,7 +702,9 @@ pub fn get_library_song_paths_for_folder_view(
                     title: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
                     artist: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
                     artist_names: deserialize_string_list(row.get::<_, Option<String>>(3)?),
-                    effective_artist_names: deserialize_string_list(row.get::<_, Option<String>>(4)?),
+                    effective_artist_names: deserialize_string_list(
+                        row.get::<_, Option<String>>(4)?,
+                    ),
                     album: row.get::<_, Option<String>>(5)?.unwrap_or_default(),
                     album_artist: row.get::<_, Option<String>>(6)?.unwrap_or_default(),
                     added_at: i64_to_u64_opt(row.get::<_, Option<i64>>(7)?),
@@ -769,22 +771,23 @@ pub fn get_library_song_paths_for_folder_view(
                 (Some(l), Some(r)) => l.cmp(&r),
                 (None, None) => std::cmp::Ordering::Equal,
             };
-            disc_cmp.then_with(|| {
-                let left_track = parse_track_or_disc_number(&left.track_number);
-                let right_track = parse_track_or_disc_number(&right.track_number);
-                match (left_track, right_track) {
-                    (None, Some(_)) => std::cmp::Ordering::Greater,
-                    (Some(_), None) => std::cmp::Ordering::Less,
-                    (Some(l), Some(r)) => l.cmp(&r),
-                    (None, None) => std::cmp::Ordering::Equal,
-                }
-            }).then_with(|| {
-                song_title_label(&left.title, &left.path)
-                    .to_lowercase()
-                    .cmp(&song_title_label(&right.title, &right.path).to_lowercase())
-            }).then_with(|| {
-                left.path.cmp(&right.path)
-            })
+            disc_cmp
+                .then_with(|| {
+                    let left_track = parse_track_or_disc_number(&left.track_number);
+                    let right_track = parse_track_or_disc_number(&right.track_number);
+                    match (left_track, right_track) {
+                        (None, Some(_)) => std::cmp::Ordering::Greater,
+                        (Some(_), None) => std::cmp::Ordering::Less,
+                        (Some(l), Some(r)) => l.cmp(&r),
+                        (None, None) => std::cmp::Ordering::Equal,
+                    }
+                })
+                .then_with(|| {
+                    song_title_label(&left.title, &left.path)
+                        .to_lowercase()
+                        .cmp(&song_title_label(&right.title, &right.path).to_lowercase())
+                })
+                .then_with(|| left.path.cmp(&right.path))
         }
     });
 

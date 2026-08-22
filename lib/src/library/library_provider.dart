@@ -17,6 +17,10 @@ class Song {
   final int duration;
   final String format;
   final String? coverThumbPath;
+  final String? coverUrl;
+  final String? pluginId;
+  final Map<String, dynamic>? pluginData;
+  final String? lyricsRaw;
   const Song({
     required this.path,
     required this.title,
@@ -26,26 +30,35 @@ class Song {
     required this.duration,
     required this.format,
     this.coverThumbPath,
+    this.coverUrl,
+    this.pluginId,
+    this.pluginData,
+    this.lyricsRaw,
   });
 
   factory Song.fromJson(Map<String, dynamic> j) => Song(
-        path: j['path'] as String? ?? '',
-        title: j['title'] as String? ?? '',
-        artist: j['artist'] as String? ?? '',
-        album: j['album'] as String? ?? '',
-        albumKey: j['album_key'] as String? ?? '',
-        duration: (j['duration'] as num?)?.toInt() ?? 0,
-        format: j['format'] as String? ?? '',
-        coverThumbPath: j['cover_thumb_path'] as String?,
-      );
+    path: j['path'] as String? ?? '',
+    title: j['title'] as String? ?? '',
+    artist: j['artist'] as String? ?? '',
+    album: j['album'] as String? ?? '',
+    albumKey: j['album_key'] as String? ?? '',
+    duration: (j['duration'] as num?)?.toInt() ?? 0,
+    format: j['format'] as String? ?? '',
+    coverThumbPath: j['cover_thumb_path'] as String?,
+    coverUrl: j['cover_url'] as String?,
+  );
 
   QueueItem toQueueItem() => QueueItem(
-        path: path,
-        title: title,
-        artist: artist,
-        album: album,
-        durationMs: duration * 1000,
-      );
+    path: path,
+    title: title,
+    artist: artist,
+    album: album,
+    durationMs: duration * 1000,
+    pluginId: pluginId,
+    pluginData: pluginData,
+    coverUrl: coverUrl,
+    lyricsRaw: lyricsRaw,
+  );
 }
 
 /// 歌手目录项。
@@ -63,11 +76,11 @@ class ArtistInfo {
 
   // Rust ArtistCatalogItem 为 snake_case，兼容 camelCase。
   factory ArtistInfo.fromJson(Map<String, dynamic> j) => ArtistInfo(
-        id: (j['id'] as num?)?.toInt() ?? 0,
-        name: j['name'] as String? ?? '',
-        count: (j['count'] as num?)?.toInt() ?? 0,
-        avatarPath: (j['avatar_path'] ?? j['avatarPath']) as String?,
-      );
+    id: (j['id'] as num?)?.toInt() ?? 0,
+    name: j['name'] as String? ?? '',
+    count: (j['count'] as num?)?.toInt() ?? 0,
+    avatarPath: (j['avatar_path'] ?? j['avatarPath']) as String?,
+  );
 }
 
 /// 专辑目录项。
@@ -87,13 +100,13 @@ class AlbumInfo {
 
   // Rust AlbumCatalogItem 为 snake_case，兼容 camelCase。
   factory AlbumInfo.fromJson(Map<String, dynamic> j) => AlbumInfo(
-        key: j['key'] as String? ?? '',
-        name: j['name'] as String? ?? '',
-        count: (j['count'] as num?)?.toInt() ?? 0,
-        artist: j['artist'] as String? ?? '',
-        firstSongPath:
-            ((j['first_song_path'] ?? j['firstSongPath']) as String?) ?? '',
-      );
+    key: j['key'] as String? ?? '',
+    name: j['name'] as String? ?? '',
+    count: (j['count'] as num?)?.toInt() ?? 0,
+    artist: j['artist'] as String? ?? '',
+    firstSongPath:
+        ((j['first_song_path'] ?? j['firstSongPath']) as String?) ?? '',
+  );
 }
 
 /// 文件夹树节点。
@@ -113,16 +126,14 @@ class FolderNodeData {
 
   // Rust FolderNode 序列化为 snake_case，兼容读取 camelCase 以防上游改动。
   factory FolderNodeData.fromJson(Map<String, dynamic> j) => FolderNodeData(
-        name: j['name'] as String? ?? '',
-        path: j['path'] as String? ?? '',
-        children: (j['children'] as List? ?? [])
-            .map((e) => FolderNodeData.fromJson(e as Map<String, dynamic>))
-            .toList(),
-        childCount:
-            ((j['child_count'] ?? j['childCount']) as num?)?.toInt() ?? 0,
-        songCount:
-            ((j['song_count'] ?? j['songCount']) as num?)?.toInt() ?? 0,
-      );
+    name: j['name'] as String? ?? '',
+    path: j['path'] as String? ?? '',
+    children: (j['children'] as List? ?? [])
+        .map((e) => FolderNodeData.fromJson(e as Map<String, dynamic>))
+        .toList(),
+    childCount: ((j['child_count'] ?? j['childCount']) as num?)?.toInt() ?? 0,
+    songCount: ((j['song_count'] ?? j['songCount']) as num?)?.toInt() ?? 0,
+  );
 }
 
 class LibraryState {
@@ -207,6 +218,17 @@ class LibraryNotifier extends StateNotifier<LibraryState> {
       .map((e) => Song.fromJson(e as Map<String, dynamic>))
       .toList();
 
+  Future<List<FolderNodeData>> folderChildren(String path) async {
+    final dbPath = await _ref.read(dbPathProvider.future);
+    final childrenJson = await getFolderChildren(
+      dbPath: dbPath,
+      folderPath: path,
+    );
+    return (jsonDecode(childrenJson) as List)
+        .map((e) => FolderNodeData.fromJson(e as Map<String, dynamic>))
+        .toList();
+  }
+
   /// 格式大类 → 实际扩展名白名单（与 Rust is_ext_allowed 对应）。
   static const _formatExtensions = <String, List<String>>{
     'flac': ['flac'],
@@ -264,21 +286,29 @@ class LibraryNotifier extends StateNotifier<LibraryState> {
   Future<List<Song>> songsByArtist(String name) async {
     final dbPath = await _ref.read(dbPathProvider.future);
     final pathsJson = await getLibrarySongPathsByArtist(
-        dbPath: dbPath, artistName: name);
+      dbPath: dbPath,
+      artistName: name,
+    );
     final paths = (jsonDecode(pathsJson) as List).cast<String>();
-    final songsJson =
-        await getLibrarySongsByPaths(dbPath: dbPath, paths: paths);
+    final songsJson = await getLibrarySongsByPaths(
+      dbPath: dbPath,
+      paths: paths,
+    );
     return _parseSongs(songsJson);
   }
 
   /// 按专辑 key 取歌曲列表。
   Future<List<Song>> songsByAlbum(String key) async {
     final dbPath = await _ref.read(dbPathProvider.future);
-    final pathsJson =
-        await getLibrarySongPathsByAlbum(dbPath: dbPath, albumKey: key);
+    final pathsJson = await getLibrarySongPathsByAlbum(
+      dbPath: dbPath,
+      albumKey: key,
+    );
     final paths = (jsonDecode(pathsJson) as List).cast<String>();
-    final songsJson =
-        await getLibrarySongsByPaths(dbPath: dbPath, paths: paths);
+    final songsJson = await getLibrarySongsByPaths(
+      dbPath: dbPath,
+      paths: paths,
+    );
     return _parseSongs(songsJson);
   }
 
@@ -286,10 +316,16 @@ class LibraryNotifier extends StateNotifier<LibraryState> {
   Future<List<Song>> songsByFolder(String path) async {
     final dbPath = await _ref.read(dbPathProvider.future);
     final pathsJson = await getLibrarySongPathsForFolderView(
-        dbPath: dbPath, folderPath: path, query: null, sortMode: 'title');
+      dbPath: dbPath,
+      folderPath: path,
+      query: null,
+      sortMode: 'title',
+    );
     final paths = (jsonDecode(pathsJson) as List).cast<String>();
-    final songsJson =
-        await getLibrarySongsByPaths(dbPath: dbPath, paths: paths);
+    final songsJson = await getLibrarySongsByPaths(
+      dbPath: dbPath,
+      paths: paths,
+    );
     return _parseSongs(songsJson);
   }
 
@@ -299,8 +335,10 @@ class LibraryNotifier extends StateNotifier<LibraryState> {
   Future<List<Song>> songsByPaths(List<String> paths) async {
     if (paths.isEmpty) return const [];
     final dbPath = await _ref.read(dbPathProvider.future);
-    final songsJson =
-        await getLibrarySongsByPaths(dbPath: dbPath, paths: paths);
+    final songsJson = await getLibrarySongsByPaths(
+      dbPath: dbPath,
+      paths: paths,
+    );
     return _parseSongs(songsJson);
   }
 

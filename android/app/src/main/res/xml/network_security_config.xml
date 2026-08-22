@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<network-security-config>
+    <!-- just_audio 使用本机代理为插件音源附加 Referer/Cookie 等请求头。 -->
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="false">127.0.0.1</domain>
+    </domain-config>
+    <!-- 酷狗旧版公开歌单详情接口没有可用的 HTTPS 证书，仅对此域名放行 HTTP。 -->
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="false">www2.kugou.kugou.com</domain>
+    </domain-config>
+</network-security-config>

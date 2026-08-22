@@ -115,8 +115,7 @@ fn read_base_url(data_dir: &Path) -> String {
                 if saved.is_empty() {
                     return DEFAULT_AUTH_BASE_URL.to_string();
                 }
-                let upgraded =
-                    saved.replace("http://back.xymusic.cc", "https://back.xymusic.cc");
+                let upgraded = saved.replace("http://back.xymusic.cc", "https://back.xymusic.cc");
                 if upgraded != saved {
                     let _ = fs::write(&path, &upgraded);
                 }

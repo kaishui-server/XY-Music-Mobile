@@ -7,7 +7,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 /// 应用数据目录（small & beautiful：仅存库与缓存，不拉大文件）。
 Future<String> _resolveAppDataDir() async {
   final base = await getApplicationSupportDirectory();
-  final dir = p.join(base.path, 'xianyu');
+  final dir = p.join(base.path, 'xy_music');
   final d = Directory(dir);
   if (!d.existsSync()) d.createSync(recursive: true);
   return dir;

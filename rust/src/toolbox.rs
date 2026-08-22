@@ -168,7 +168,10 @@ fn process_file(path: &Path, config: &RenameConfig) -> RenamePreview {
     }
 }
 
-pub fn preview_rename(root_path: String, config: RenameConfig) -> Result<Vec<RenamePreview>, String> {
+pub fn preview_rename(
+    root_path: String,
+    config: RenameConfig,
+) -> Result<Vec<RenamePreview>, String> {
     let validated_root = path_validator::validate_path(&root_path, None)?;
     let root_path = validated_root.to_string_lossy().to_string();
     let mut results = Vec::new();
@@ -597,7 +600,8 @@ fn try_extract_ekey_from_file(path: &Path) -> Option<String> {
     let tail_size = (file_size.min(4096)) as usize;
     let mut file = fs::File::open(path).ok()?;
     use std::io::{Read, Seek, SeekFrom};
-    file.seek(SeekFrom::Start(file_size - tail_size as u64)).ok()?;
+    file.seek(SeekFrom::Start(file_size - tail_size as u64))
+        .ok()?;
     let mut tail = vec![0u8; tail_size];
     file.read_exact(&mut tail).ok()?;
 
@@ -618,35 +622,36 @@ fn decrypt_qmc_file_inplace(path: &Path, ekey: &str) -> Result<u64, String> {
     let temp_path = path.with_extension("qmc_tmp_dec");
 
     {
-        let mut input = fs::File::open(path)
-            .map_err(|e| format!("打开加密文件失败: {e}"))?;
-        let mut output = fs::File::create(&temp_path)
-            .map_err(|e| format!("创建临时解密文件失败: {e}"))?;
+        let mut input = fs::File::open(path).map_err(|e| format!("打开加密文件失败: {e}"))?;
+        let mut output =
+            fs::File::create(&temp_path).map_err(|e| format!("创建临时解密文件失败: {e}"))?;
 
         let mut offset: u64 = 0;
         let mut buf = vec![0u8; 64 * 1024];
 
         loop {
-            let n = input.read(&mut buf)
+            let n = input
+                .read(&mut buf)
                 .map_err(|e| format!("读取加密数据失败: {e}"))?;
             if n == 0 {
                 break;
             }
             crypto.decrypt(offset as usize, &mut buf[..n]);
-            output.write_all(&buf[..n])
+            output
+                .write_all(&buf[..n])
                 .map_err(|e| format!("写入解密数据失败: {e}"))?;
             offset += n as u64;
         }
 
-        output.flush()
+        output
+            .flush()
             .map_err(|e| format!("刷新解密文件失败: {e}"))?;
     }
 
-    fs::rename(&temp_path, path)
-        .map_err(|e| {
-            let _ = fs::remove_file(&temp_path);
-            format!("替换原文件失败: {e}")
-        })?;
+    fs::rename(&temp_path, path).map_err(|e| {
+        let _ = fs::remove_file(&temp_path);
+        format!("替换原文件失败: {e}")
+    })?;
 
     Ok(file_size)
 }
@@ -1131,10 +1136,10 @@ pub async fn delete_wallpaper_file(data_dir: &Path, local_path: String) -> Resul
     if !target.is_file() {
         return Err("目标不是可删除的壁纸文件".to_string());
     }
-    let canonical_dir = std::fs::canonicalize(&wallpaper_dir)
-        .map_err(|e| format!("读取壁纸目录失败: {e}"))?;
-    let canonical_target = std::fs::canonicalize(&target)
-        .map_err(|e| format!("读取壁纸文件失败: {e}"))?;
+    let canonical_dir =
+        std::fs::canonicalize(&wallpaper_dir).map_err(|e| format!("读取壁纸目录失败: {e}"))?;
+    let canonical_target =
+        std::fs::canonicalize(&target).map_err(|e| format!("读取壁纸文件失败: {e}"))?;
     if !canonical_target.starts_with(&canonical_dir) {
         return Err("只能删除应用壁纸目录中的文件".to_string());
     }
@@ -1170,7 +1175,10 @@ mod tests {
 
         assert_eq!(request.lyrics_text.as_deref(), Some("[00:00.00]测试歌词"));
         assert_eq!(request.lyrics_path.as_deref(), Some("/Music/song.lrc"));
-        assert_eq!(request.cover_url.as_deref(), Some("https://example.com/cover.jpg"));
+        assert_eq!(
+            request.cover_url.as_deref(),
+            Some("https://example.com/cover.jpg")
+        );
         assert_eq!(request.cover_path.as_deref(), Some("/Music/song.jpg"));
         assert!(request.embed_cover);
 

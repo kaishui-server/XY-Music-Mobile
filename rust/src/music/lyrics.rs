@@ -1011,10 +1011,12 @@ fn strip_xml_tags(raw: &str) -> String {
 }
 
 fn parse_ttml(raw: &str) -> Vec<ParsedLine> {
-    let paragraph_re = TTML_PARAGRAPH_RE.get_or_init(|| Regex::new(r#"(?s)<p\b([^>]*)>(.*?)</p>"#).unwrap());
+    let paragraph_re =
+        TTML_PARAGRAPH_RE.get_or_init(|| Regex::new(r#"(?s)<p\b([^>]*)>(.*?)</p>"#).unwrap());
     let begin_re = TTML_BEGIN_RE.get_or_init(|| Regex::new(r#"(?i)\bbegin="([^"]+)""#).unwrap());
     let end_re = TTML_END_RE.get_or_init(|| Regex::new(r#"(?i)\bend="([^"]+)""#).unwrap());
-    let span_re = TTML_SPAN_RE.get_or_init(|| Regex::new(r#"(?s)<span\b([^>]*)>(.*?)</span>"#).unwrap());
+    let span_re =
+        TTML_SPAN_RE.get_or_init(|| Regex::new(r#"(?s)<span\b([^>]*)>(.*?)</span>"#).unwrap());
     let role_re = TTML_ROLE_RE.get_or_init(|| Regex::new(r#"(?i)\bttm:role="([^"]+)""#).unwrap());
 
     let mut lines = Vec::new();

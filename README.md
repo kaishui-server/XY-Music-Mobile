@@ -1,8 +1,8 @@
-# 弦予音乐 · 移动端（XianYu-Music-Mobile）
+# XY-Music · 移动端
 
-弦予音乐的移动端，基于 **Flutter + Rust** 跨平台架构。Rust 核心（`xianyu_core`）从桌面端抽取为纯逻辑库（不依赖 Tauri），通过 [flutter_rust_bridge](https://github.com/fzyzcjy/flutter_rust_bridge) 暴露给 Flutter 调用，实现音频解码、DSP 处理、音乐库管理、USB 独占播放等能力跨平台复用。
+XY-Music 的移动端，基于 **Flutter + Rust** 跨平台架构。Rust 核心（`xianyu_core`）从桌面端抽取为纯逻辑库（不依赖 Tauri），通过 [flutter_rust_bridge](https://github.com/fzyzcjy/flutter_rust_bridge) 暴露给 Flutter 调用，实现音频解码、DSP 处理、音乐库管理、USB 独占播放等能力跨平台复用。
 
-> 仓库：`github.com/TaXiaoQi/XianYu-Music-Mobile`  
+> 仓库：`github.com/kaishui-server/XY-Music-Mobile`  
 > 版本：`1.0.0+1` · Rust 核心 `0.1.0` · 许可证 `AGPL-3.0-only`
 
 ## 技术栈
@@ -44,7 +44,7 @@
 ## 项目结构
 
 ```
-XianYu-Music-Mobile/
+XY-Music-Mobile/
 ├── lib/                          # Flutter 侧
 │   ├── app.dart / main.dart      # 应用入口、主题与路由装配
 │   ├── pages/                    # 页面：library / player / favorites / recent / settings / account
@@ -117,29 +117,28 @@ flutter run
 使用 `scripts/build-release.ps1`，自动同步源码到 ASCII 构建目录（规避 Dart AOT 对非 ASCII 路径的 bug），按 ABI 拆包并交付 arm64 单架构产物（约 14MB）：
 ```powershell
 ./scripts/build-release.ps1
-# 产物：releases/弦予音乐_<version>_arm64.apk
+# 产物：releases/XY-Music_<version>_arm64.apk
 ```
-> 中文路径会导致 `gen_snapshot` AOT 编译失败，故脚本先 robocopy 到 `D:\build\XianYuMusicSrc` 再构建。
+> 中文路径会导致 `gen_snapshot` AOT 编译失败，故脚本先 robocopy 到 `D:\build\XYMusicSrc` 再构建。
 
 ## 开发约定
 
 - Rust 核心使用 `rustls-tls`（非 `native-tls`），保证移动端无系统 OpenSSL 依赖
 - 平台相关模块用 `#[cfg(target_os)]` 分流：`output/`、窗口材质、字体、音频环回、凭据存储等
 - Linux/macOS 音频回退 `rodio`（ALSA/PulseAudio/CoreAudio），独占模式不可用时降级共享模式
-- 验证码、账号、反馈、审核等业务规则与桌面端/服务端保持一致（见 `project_memory` 约束）
+- 验证码、账号、反馈、审核等业务规则与桌面端/服务端保持一致
 - 移动端 UI 采用平台原生手势（Android Predictive Back），避免自定义转场耗电
 
 ## 相关项目
 
-| 仓库 | 说明 |
-|------|------|
-| `XianYu-Music-Desktop` | 桌面端，Vue 3 + Tauri 2 + Rust，本端 Rust 核心的上游 |
-| `XianYu-Music-Server` | 服务端，Rust 纯 API 服务（`/api` `/admin/api` `/uploads`） |
-| `XianYu-Music-Website` | 官网，含隐藏后台入口 |
-| `XY-Music-Mobile` | RawS 原生安卓端（Kotlin + C++），算法参考来源 |
+（暂无）
 
 ## 文档
 
 - IDEA 构建指南：[`docs/build-guide.md`](docs/build-guide.md)
 - 移动主页高保真稿：[`docs/mobile-home-mockup.html`](docs/mobile-home-mockup.html)
 - 移动主页设计说明：[`docs/mobile-home-design.md`](docs/mobile-home-design.md)
+
+## 许可证
+
+本项目基于 [AGPL-3.0-only](LICENSE) 许可证开源。

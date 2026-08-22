@@ -217,7 +217,8 @@ impl RealtimeSpectrumAnalyzer {
         self.fft.process(&mut self.fft_buffer);
 
         // 计算目标频段
-        let max_freq = ((REALTIME_ANALYSIS_SAMPLE_RATE as f32) * 0.5).min(MAX_VISUALIZER_FREQUENCY_HZ);
+        let max_freq =
+            ((REALTIME_ANALYSIS_SAMPLE_RATE as f32) * 0.5).min(MAX_VISUALIZER_FREQUENCY_HZ);
         if max_freq <= MIN_VISUALIZER_FREQUENCY_HZ {
             return;
         }
@@ -255,7 +256,9 @@ impl RealtimeSpectrumAnalyzer {
 
         // 时间平滑
         let now = Instant::now();
-        let dt = self.last_analyze.map_or(0.016, |t| now.duration_since(t).as_secs_f32());
+        let dt = self
+            .last_analyze
+            .map_or(0.016, |t| now.duration_since(t).as_secs_f32());
         self.last_analyze = Some(now);
         self.update_smoothed(dt);
     }

@@ -1,6 +1,6 @@
 import 'package:flutter/material.dart';
 
-/// 底部导航分支容器：带淡入淡出 + 轻微缩放的过渡。
+/// 一级页面分支容器：带淡入淡出 + 轻微缩放的过渡。
 ///
 /// 替代 `StatefulShellRoute.indexedStack` 默认的 `IndexedStack`（瞬间切换、
 /// 无动画）。所有分支始终保留在 widget 树中以维持各 tab 的滚动位置与状态；

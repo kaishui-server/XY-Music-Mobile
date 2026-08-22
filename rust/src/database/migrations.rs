@@ -5,7 +5,8 @@ use std::time::UNIX_EPOCH;
 
 fn get_table_columns(conn: &Connection, table_name: &str) -> Result<Vec<String>, String> {
     let query = format!("PRAGMA table_info({table_name})");
-    let result = conn.prepare(&query)
+    let result = conn
+        .prepare(&query)
         .map_err(|e| e.to_string())?
         .query_map([], |row| row.get::<_, String>(1))
         .map_err(|e| e.to_string())?

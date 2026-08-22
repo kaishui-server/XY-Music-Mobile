@@ -226,9 +226,15 @@ async fn cache_and_parse_remote_song(
     file: &RemoteFileEntry,
 ) -> (Song, Option<String>) {
     let remote_uri = file.remote_uri(&source.id);
-    let cache_path =
-        cache::cache_remote_file(cache_root, source, &file.remote_path, &remote_uri, file.etag.as_deref(), None)
-            .await;
+    let cache_path = cache::cache_remote_file(
+        cache_root,
+        source,
+        &file.remote_path,
+        &remote_uri,
+        file.etag.as_deref(),
+        None,
+    )
+    .await;
 
     match cache_path {
         Ok(cache_path) => {
@@ -479,7 +485,16 @@ pub(crate) async fn sync_source(
             if let Ok(conn) = db_conn.lock() {
                 let _ = update_sync_status(&conn, &source.id, Some(&error));
             }
-            emit_sync_progress(sink_ref, &source.id, "error", 0, 0, error.clone(), true, true);
+            emit_sync_progress(
+                sink_ref,
+                &source.id,
+                "error",
+                0,
+                0,
+                error.clone(),
+                true,
+                true,
+            );
             return Err(error);
         }
     };
@@ -489,7 +504,16 @@ pub(crate) async fn sync_source(
             Ok(snapshots) => snapshots,
             Err(error) => {
                 let _ = update_sync_status(&conn, &source.id, Some(&error));
-                emit_sync_progress(sink_ref, &source.id, "error", 0, 0, error.clone(), true, true);
+                emit_sync_progress(
+                    sink_ref,
+                    &source.id,
+                    "error",
+                    0,
+                    0,
+                    error.clone(),
+                    true,
+                    true,
+                );
                 return Err(error);
             }
         }

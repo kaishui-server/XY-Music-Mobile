@@ -183,7 +183,16 @@ where
 
         let thread_handle = thread::Builder::new()
             .name("xy-buffered-source".to_string())
-            .spawn(move || producer_loop(producer, cmd_rx, sample_tx, ack_tx, stop_flag_clone, monitor_clone))
+            .spawn(move || {
+                producer_loop(
+                    producer,
+                    cmd_rx,
+                    sample_tx,
+                    ack_tx,
+                    stop_flag_clone,
+                    monitor_clone,
+                )
+            })
             .ok();
 
         let mut source = Self {
@@ -572,7 +581,8 @@ mod tests {
         let mut none_count = 0;
         for _ in 0..2000 {
             match buf.next_block() {
-                Some(b) if b.iter().all(|&s| s == 0.0) => { /* 罕见：预填充超时兜底静音，可接受 */ }
+                Some(b) if b.iter().all(|&s| s == 0.0) => { /* 罕见：预填充超时兜底静音，可接受 */
+                }
                 Some(_) => panic!("空源不应产生非零样本"),
                 None => {
                     none_count += 1;

@@ -170,7 +170,9 @@ impl ConvolverKernel {
                     -1
                 }
             }
-            RoutingMode::FullMatrix => (input_channel * self.stream_channels + output_channel) as isize,
+            RoutingMode::FullMatrix => {
+                (input_channel * self.stream_channels + output_channel) as isize
+            }
         }
     }
 
@@ -253,8 +255,7 @@ impl Convolver {
 
         self.max_predelay_frames = (kernel.sample_rate as usize / 2 + 1).max(1);
         self.wet_delay = vec![0.0; self.max_predelay_frames * ch];
-        self.limiter_release =
-            1.0 - (-1.0 / (0.160 * kernel.sample_rate.max(8000) as f32)).exp();
+        self.limiter_release = 1.0 - (-1.0 / (0.160 * kernel.sample_rate.max(8000) as f32)).exp();
 
         self.kernel = Some(kernel);
         self.reset_state();
@@ -387,8 +388,7 @@ impl Convolver {
                     let read_frame = if self.wet_delay_write_frame >= self.predelay_frames {
                         self.wet_delay_write_frame - self.predelay_frames
                     } else {
-                        self.max_predelay_frames + self.wet_delay_write_frame
-                            - self.predelay_frames
+                        self.max_predelay_frames + self.wet_delay_write_frame - self.predelay_frames
                     };
                     let read_idx = read_frame * ch + c;
                     if read_idx < self.wet_delay.len() {
@@ -466,10 +466,8 @@ impl Convolver {
                         {
                             let x = self.input_history[x_off + bin];
                             let h = kernel.spectra[h_off + bin];
-                            self.fft_output[bin] += Complex::new(
-                                x.re * h.re - x.im * h.im,
-                                x.re * h.im + x.im * h.re,
-                            );
+                            self.fft_output[bin] +=
+                                Complex::new(x.re * h.re - x.im * h.im, x.re * h.im + x.im * h.re);
                         }
                     }
                 }
@@ -479,13 +477,12 @@ impl Convolver {
 
             let overlap_off = output_channel * block;
             for frame in 0..block {
-                let convolved = if frame + overlap_off < self.overlap.len()
-                    && frame < self.fft_output.len()
-                {
-                    self.fft_output[frame].re + self.overlap[overlap_off + frame]
-                } else {
-                    0.0
-                };
+                let convolved =
+                    if frame + overlap_off < self.overlap.len() && frame < self.fft_output.len() {
+                        self.fft_output[frame].re + self.overlap[overlap_off + frame]
+                    } else {
+                        0.0
+                    };
                 let wet_idx = frame * ch + output_channel;
                 if wet_idx < self.wet_block.len() {
                     self.wet_block[wet_idx] = if convolved.is_finite() {
@@ -497,12 +494,11 @@ impl Convolver {
                 // 保存尾部用于下一块重叠相加
                 let tail = frame + block;
                 if tail < self.fft_output.len() && overlap_off + frame < self.overlap.len() {
-                    self.overlap[overlap_off + frame] =
-                        if self.fft_output[tail].re.is_finite() {
-                            self.fft_output[tail].re
-                        } else {
-                            0.0
-                        };
+                    self.overlap[overlap_off + frame] = if self.fft_output[tail].re.is_finite() {
+                        self.fft_output[tail].re
+                    } else {
+                        0.0
+                    };
                 }
             }
         }
@@ -525,8 +521,7 @@ impl Convolver {
             }
         }
         // 释放
-        self.limiter_gain = self.limiter_gain
-            + (1.0 - self.limiter_gain) * self.limiter_release;
+        self.limiter_gain = self.limiter_gain + (1.0 - self.limiter_gain) * self.limiter_release;
         sample * self.limiter_gain
     }
 }
@@ -573,6 +568,9 @@ mod tests {
         // 禁用时 activation_mix → 0，输出为 dry × dry_gain × (1-mix) ≈ 0
         // 因为 dry_gain=0，所以接近静音
         let max_val = pcm.iter().cloned().fold(0.0_f32, f32::max);
-        assert!(max_val < 0.01, "disabled convolver should be near-silent, got {max_val}");
+        assert!(
+            max_val < 0.01,
+            "disabled convolver should be near-silent, got {max_val}"
+        );
     }
 }

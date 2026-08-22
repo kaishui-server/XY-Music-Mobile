@@ -12,9 +12,9 @@ class ScanFolder {
   const ScanFolder({required this.path, required this.songCount});
 
   factory ScanFolder.fromJson(Map<String, dynamic> j) => ScanFolder(
-        path: (j['path'] as String?) ?? '',
-        songCount: (j['song_count'] as num?)?.toInt() ?? 0,
-      );
+    path: (j['path'] as String?) ?? '',
+    songCount: (j['song_count'] as num?)?.toInt() ?? 0,
+  );
 }
 
 /// 扫描目录列表（读 SQLite）。增删后调用 refresh 刷新。
@@ -53,5 +53,5 @@ class ScanFoldersNotifier extends AsyncNotifier<List<ScanFolder>> {
 
 final scanFoldersProvider =
     AsyncNotifierProvider<ScanFoldersNotifier, List<ScanFolder>>(
-  ScanFoldersNotifier.new,
-);
+      ScanFoldersNotifier.new,
+    );

@@ -6,6 +6,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:permission_handler/permission_handler.dart';
 
 import '../../src/library/scan_settings_provider.dart';
+import '../../src/widgets/top_notice.dart';
 
 /// 扫描目录管理页：添加/删除本地音乐扫描目录。
 class ScanFoldersPage extends ConsumerStatefulWidget {
@@ -20,9 +21,7 @@ class _ScanFoldersPageState extends ConsumerState<ScanFoldersPage> {
 
   void _toast(String msg) {
     if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text(msg), duration: const Duration(seconds: 2)),
-    );
+    XyNotice.show(context, message: msg, duration: const Duration(seconds: 2));
   }
 
   /// 申请存储权限：Android 11+ 优先「所有文件访问」，回退媒体/存储权限。
@@ -118,17 +117,24 @@ class _ScanFoldersPageState extends ConsumerState<ScanFoldersPage> {
                 child: Column(
                   mainAxisSize: MainAxisSize.min,
                   children: [
-                    Icon(Icons.folder_off,
-                        size: 48, color: scheme.onSurfaceVariant),
+                    Icon(
+                      Icons.folder_off,
+                      size: 48,
+                      color: scheme.onSurfaceVariant,
+                    ),
                     const SizedBox(height: 12),
-                    const Text('还没有扫描目录',
-                        style: TextStyle(fontWeight: FontWeight.w600)),
+                    const Text(
+                      '还没有扫描目录',
+                      style: TextStyle(fontWeight: FontWeight.w600),
+                    ),
                     const SizedBox(height: 4),
                     Text(
                       '点击右下角「添加目录」选择本地音乐文件夹，\n然后到「音乐库 → 文件夹」下拉刷新开始扫描',
                       textAlign: TextAlign.center,
                       style: TextStyle(
-                          fontSize: 13, color: scheme.onSurfaceVariant),
+                        fontSize: 13,
+                        color: scheme.onSurfaceVariant,
+                      ),
                     ),
                   ],
                 ),
@@ -136,15 +142,18 @@ class _ScanFoldersPageState extends ConsumerState<ScanFoldersPage> {
             );
           }
           return ListView.separated(
-            padding: const EdgeInsets.only(bottom: 88),
+            padding: const EdgeInsets.only(bottom: 24),
             itemCount: folders.length,
             separatorBuilder: (_, _) => const Divider(height: 1),
             itemBuilder: (context, i) {
               final f = folders[i];
               return ListTile(
                 leading: Icon(Icons.folder, color: scheme.primary),
-                title: Text(f.path,
-                    maxLines: 1, overflow: TextOverflow.ellipsis),
+                title: Text(
+                  f.path,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                ),
                 subtitle: Text('${f.songCount} 首'),
                 trailing: IconButton(
                   icon: Icon(Icons.delete_outline, color: scheme.error),

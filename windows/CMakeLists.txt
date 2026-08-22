@@ -1,10 +1,10 @@
 # Project-level configuration.
 cmake_minimum_required(VERSION 3.14)
-project(xianyu_music_mobile LANGUAGES CXX)
+project(xy_music LANGUAGES CXX)
 
 # The name of the executable created for the application. Change this to change
 # the on-disk name of your application.
-set(BINARY_NAME "xianyu_music_mobile")
+set(BINARY_NAME "xy_music")
 
 # Explicitly opt in to modern CMake behaviors to avoid warnings with recent
 # versions of CMake.
@@ -31,6 +31,8 @@ set(CMAKE_CXX_FLAGS_PROFILE "${CMAKE_CXX_FLAGS_RELEASE}")
 
 # Use Unicode for all projects.
 add_definitions(-DUNICODE -D_UNICODE)
+# 压制 MSVC 2026/14.51 对 /await + <experimental/coroutine> 的废弃错误（permission_handler_windows 等插件仍用旧式协程）
+add_definitions(-D_SILENCE_EXPERIMENTAL_COROUTINE_DEPRECATION_WARNINGS)
 
 # Compilation settings that should be applied to most targets.
 #
@@ -39,7 +41,9 @@ add_definitions(-DUNICODE -D_UNICODE)
 # of modifying this function.
 function(APPLY_STANDARD_SETTINGS TARGET)
   target_compile_features(${TARGET} PUBLIC cxx_std_17)
-  target_compile_options(${TARGET} PRIVATE /W4 /WX /wd"4100")
+  # 插件源码统一按 UTF-8 读取，避免中文系统代码页触发 C4819；工程启用
+  # /WX 时该编码警告会直接中断 QuickJS 等第三方插件的构建。
+  target_compile_options(${TARGET} PRIVATE /W4 /WX /wd"4100" /utf-8)
   target_compile_options(${TARGET} PRIVATE /EHsc)
   target_compile_definitions(${TARGET} PRIVATE "_HAS_EXCEPTIONS=0")
   target_compile_definitions(${TARGET} PRIVATE "$<$<CONFIG:Debug>:_DEBUG>")
@@ -51,6 +55,11 @@ add_subdirectory(${FLUTTER_MANAGED_DIR})
 
 # Application build; see runner/CMakeLists.txt.
 add_subdirectory("runner")
+
+# quickjs_engine 0.1.3 的 Windows 清单仍填写旧式 pluginClass，但导出的
+# 实际入口带 CApi 后缀。给 runner 做精确别名，避免修改 Flutter 生成文件。
+target_compile_definitions(${BINARY_NAME} PRIVATE
+  QuickjsEnginePluginRegisterWithRegistrar=QuickjsEnginePluginCApiRegisterWithRegistrar)
 
 
 # Generated plugin build rules, which manage building the plugins and adding

@@ -90,12 +90,12 @@ BEGIN
         BLOCK "040904e4"
         BEGIN
             VALUE "CompanyName", "com.example" "\0"
-            VALUE "FileDescription", "xianyu_music_mobile" "\0"
+            VALUE "FileDescription", "XY Music" "\0"
             VALUE "FileVersion", VERSION_AS_STRING "\0"
-            VALUE "InternalName", "xianyu_music_mobile" "\0"
+            VALUE "InternalName", "xy_music" "\0"
             VALUE "LegalCopyright", "Copyright (C) 2026 com.example. All rights reserved." "\0"
-            VALUE "OriginalFilename", "xianyu_music_mobile.exe" "\0"
-            VALUE "ProductName", "xianyu_music_mobile" "\0"
+            VALUE "OriginalFilename", "xy_music.exe" "\0"
+            VALUE "ProductName", "XY Music" "\0"
             VALUE "ProductVersion", VERSION_AS_STRING "\0"
         END
     END

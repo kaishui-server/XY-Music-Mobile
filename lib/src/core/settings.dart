@@ -2,11 +2,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 /// 主题模式
-enum ThemeModePreference {
-  system,
-  light,
-  dark,
-}
+enum ThemeModePreference { system, light, dark }
 
 /// 扫描支持的主流音频格式大类（与 Rust 白名单展开对应）。
 const kSupportedScanFormats = <String>[
@@ -18,6 +14,15 @@ const kSupportedScanFormats = <String>[
   'ogg',
   'aiff',
 ];
+
+/// 移动端只使用 0=列表循环、1=单曲循环、2=随机播放。
+///
+/// 旧版 Rust/桌面端会话曾允许用 3 表示单曲循环；升级或导入旧数据库时
+/// 必须迁移为 1，其他损坏值回退为列表循环，避免播放页按图标下标取值崩溃。
+int normalizePlayMode(int value) {
+  if (value == 3) return 1;
+  return value >= 0 && value <= 2 ? value : 0;
+}
 
 /// 全局设置（小而美：仅移动端必需项，key 语义与桌面端一致）。
 class AppSettings {
@@ -104,25 +109,22 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
     final prefs = await _prefs();
     return AppSettings(
       volume: prefs.getDouble('volume') ?? 1.0,
-      playMode: prefs.getInt('playMode') ?? 0,
+      playMode: normalizePlayMode(prefs.getInt('playMode') ?? 0),
       lastTab: prefs.getInt('lastTab') ?? 0,
       keepScreenOn: prefs.getBool('keepScreenOn') ?? true,
       themeMode: _themeFromInt(prefs.getInt('themeMode') ?? 0),
       accentColor: prefs.getInt('accentColor') ?? 0xFFEC4141,
       showQualityBadges: prefs.getBool('showQualityBadges') ?? true,
-      onlineDefaultQuality:
-          prefs.getString('onlineDefaultQuality') ?? '320k',
-      libraryMinDurationSeconds:
-          prefs.getInt('libraryMinDurationSeconds') ?? 0,
-      showLyricsTranslation:
-          prefs.getBool('showLyricsTranslation') ?? true,
+      onlineDefaultQuality: prefs.getString('onlineDefaultQuality') ?? '320k',
+      libraryMinDurationSeconds: prefs.getInt('libraryMinDurationSeconds') ?? 0,
+      showLyricsTranslation: prefs.getBool('showLyricsTranslation') ?? true,
       enableWordEffect: prefs.getBool('enableWordEffect') ?? true,
       downloadPath: prefs.getString('downloadPath') ?? '',
       downloadQuality: prefs.getString('downloadQuality') ?? '320k',
       downloadLyrics: prefs.getBool('downloadLyrics') ?? true,
-      organizeRule: prefs.getString('organizeRule') ?? '{Artist}/{Album}/{Title}',
-      scanFormats:
-          prefs.getStringList('scanFormats') ?? kSupportedScanFormats,
+      organizeRule:
+          prefs.getString('organizeRule') ?? '{Artist}/{Album}/{Title}',
+      scanFormats: prefs.getStringList('scanFormats') ?? kSupportedScanFormats,
     );
   }
 
@@ -151,8 +153,7 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
       prefs.setInt('accentColor', next.accentColor),
       prefs.setBool('showQualityBadges', next.showQualityBadges),
       prefs.setString('onlineDefaultQuality', next.onlineDefaultQuality),
-      prefs.setInt(
-          'libraryMinDurationSeconds', next.libraryMinDurationSeconds),
+      prefs.setInt('libraryMinDurationSeconds', next.libraryMinDurationSeconds),
       prefs.setBool('showLyricsTranslation', next.showLyricsTranslation),
       prefs.setBool('enableWordEffect', next.enableWordEffect),
       prefs.setString('downloadPath', next.downloadPath),
@@ -163,22 +164,59 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
     ]);
   }
 
-  Future<void> setVolume(double v) => _save((state.valueOrNull ?? const AppSettings()).copyWith(volume: v));
-  Future<void> setPlayMode(int m) => _save((state.valueOrNull ?? const AppSettings()).copyWith(playMode: m));
-  Future<void> setLastTab(int t) => _save((state.valueOrNull ?? const AppSettings()).copyWith(lastTab: t));
-  Future<void> setKeepScreenOn(bool v) => _save((state.valueOrNull ?? const AppSettings()).copyWith(keepScreenOn: v));
-  Future<void> setThemeMode(ThemeModePreference m) => _save((state.valueOrNull ?? const AppSettings()).copyWith(themeMode: m));
-  Future<void> setAccentColor(int c) => _save((state.valueOrNull ?? const AppSettings()).copyWith(accentColor: c));
-  Future<void> setShowQualityBadges(bool v) => _save((state.valueOrNull ?? const AppSettings()).copyWith(showQualityBadges: v));
-  Future<void> setOnlineDefaultQuality(String q) => _save((state.valueOrNull ?? const AppSettings()).copyWith(onlineDefaultQuality: q));
-  Future<void> setLibraryMinDurationSeconds(int s) => _save((state.valueOrNull ?? const AppSettings()).copyWith(libraryMinDurationSeconds: s));
-  Future<void> setShowLyricsTranslation(bool v) => _save((state.valueOrNull ?? const AppSettings()).copyWith(showLyricsTranslation: v));
-  Future<void> setEnableWordEffect(bool v) => _save((state.valueOrNull ?? const AppSettings()).copyWith(enableWordEffect: v));
-  Future<void> setDownloadPath(String p) => _save((state.valueOrNull ?? const AppSettings()).copyWith(downloadPath: p));
-  Future<void> setDownloadQuality(String q) => _save((state.valueOrNull ?? const AppSettings()).copyWith(downloadQuality: q));
-  Future<void> setDownloadLyrics(bool v) => _save((state.valueOrNull ?? const AppSettings()).copyWith(downloadLyrics: v));
-  Future<void> setOrganizeRule(String r) => _save((state.valueOrNull ?? const AppSettings()).copyWith(organizeRule: r));
-  Future<void> setScanFormats(List<String> f) => _save((state.valueOrNull ?? const AppSettings()).copyWith(scanFormats: f));
+  Future<void> setVolume(double v) =>
+      _save((state.valueOrNull ?? const AppSettings()).copyWith(volume: v));
+  Future<void> setPlayMode(int m) => _save(
+    (state.valueOrNull ?? const AppSettings()).copyWith(
+      playMode: normalizePlayMode(m),
+    ),
+  );
+  Future<void> setLastTab(int t) =>
+      _save((state.valueOrNull ?? const AppSettings()).copyWith(lastTab: t));
+  Future<void> setKeepScreenOn(bool v) => _save(
+    (state.valueOrNull ?? const AppSettings()).copyWith(keepScreenOn: v),
+  );
+  Future<void> setThemeMode(ThemeModePreference m) =>
+      _save((state.valueOrNull ?? const AppSettings()).copyWith(themeMode: m));
+  Future<void> setAccentColor(int c) => _save(
+    (state.valueOrNull ?? const AppSettings()).copyWith(accentColor: c),
+  );
+  Future<void> setShowQualityBadges(bool v) => _save(
+    (state.valueOrNull ?? const AppSettings()).copyWith(showQualityBadges: v),
+  );
+  Future<void> setOnlineDefaultQuality(String q) => _save(
+    (state.valueOrNull ?? const AppSettings()).copyWith(
+      onlineDefaultQuality: q,
+    ),
+  );
+  Future<void> setLibraryMinDurationSeconds(int s) => _save(
+    (state.valueOrNull ?? const AppSettings()).copyWith(
+      libraryMinDurationSeconds: s,
+    ),
+  );
+  Future<void> setShowLyricsTranslation(bool v) => _save(
+    (state.valueOrNull ?? const AppSettings()).copyWith(
+      showLyricsTranslation: v,
+    ),
+  );
+  Future<void> setEnableWordEffect(bool v) => _save(
+    (state.valueOrNull ?? const AppSettings()).copyWith(enableWordEffect: v),
+  );
+  Future<void> setDownloadPath(String p) => _save(
+    (state.valueOrNull ?? const AppSettings()).copyWith(downloadPath: p),
+  );
+  Future<void> setDownloadQuality(String q) => _save(
+    (state.valueOrNull ?? const AppSettings()).copyWith(downloadQuality: q),
+  );
+  Future<void> setDownloadLyrics(bool v) => _save(
+    (state.valueOrNull ?? const AppSettings()).copyWith(downloadLyrics: v),
+  );
+  Future<void> setOrganizeRule(String r) => _save(
+    (state.valueOrNull ?? const AppSettings()).copyWith(organizeRule: r),
+  );
+  Future<void> setScanFormats(List<String> f) => _save(
+    (state.valueOrNull ?? const AppSettings()).copyWith(scanFormats: f),
+  );
 }
 
 final settingsProvider = AsyncNotifierProvider<SettingsNotifier, AppSettings>(

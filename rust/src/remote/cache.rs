@@ -1,4 +1,4 @@
-use super::repository::{get_source_for_remote_uri, get_song_cache_path, update_song_cache_path};
+use super::repository::{get_song_cache_path, get_source_for_remote_uri, update_song_cache_path};
 use super::types::{RemoteCacheUsage, RemoteSourceCredentials};
 use super::webdav;
 use sha2::{Digest, Sha256};
@@ -251,9 +251,15 @@ pub(crate) async fn ensure_cached_path(
         get_source_for_remote_uri(&conn, remote_uri)?
     };
     let normalized_uri = stored_remote_uri.unwrap_or_else(|| remote_uri.to_string());
-    let cache_path_str =
-        cache_remote_file(cache_root, &source, &remote_path, &normalized_uri, etag.as_deref(), sink)
-            .await?;
+    let cache_path_str = cache_remote_file(
+        cache_root,
+        &source,
+        &remote_path,
+        &normalized_uri,
+        etag.as_deref(),
+        sink,
+    )
+    .await?;
     if let Ok(conn) = db_conn.lock() {
         let _ = update_song_cache_path(&conn, &normalized_uri, &cache_path_str);
     }

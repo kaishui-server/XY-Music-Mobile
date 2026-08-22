@@ -82,7 +82,7 @@ pub struct PlaybackSessionData {
     pub play_queue_paths: Vec<String>,
     /// 源歌单路径数组（当前播放上下文的完整歌曲列表）
     pub source_song_paths: Vec<String>,
-    /// 播放模式 (0=顺序, 1=循环, 2=随机, 3=单曲循环)
+    /// 播放模式 (0=列表循环, 1=单曲循环, 2=随机)
     pub play_mode: u32,
     /// 音量 (0-100)
     pub volume: f32,
@@ -96,6 +96,15 @@ pub struct PlaybackSessionData {
     pub queue_song_meta: HashMap<String, serde_json::Value>,
     /// 最后更新时间戳（毫秒）
     pub updated_at: i64,
+}
+
+/// 兼容旧会话中以 3 表示单曲循环的格式，并阻断损坏的超范围值。
+pub fn normalize_play_mode(value: u32) -> u32 {
+    match value {
+        0..=2 => value,
+        3 => 1,
+        _ => 0,
+    }
 }
 
 #[cfg(test)]
@@ -216,5 +225,13 @@ mod tests {
         );
         assert_eq!(restored.queue_song_meta.len(), 1);
         assert_eq!(restored.queue_song_meta["remote://song1"], song_meta);
+    }
+
+    #[test]
+    fn test_normalize_legacy_and_invalid_play_mode() {
+        assert_eq!(normalize_play_mode(0), 0);
+        assert_eq!(normalize_play_mode(2), 2);
+        assert_eq!(normalize_play_mode(3), 1);
+        assert_eq!(normalize_play_mode(99), 0);
     }
 }
