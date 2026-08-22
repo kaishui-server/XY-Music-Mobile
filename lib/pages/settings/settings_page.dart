@@ -11,6 +11,7 @@ enum SettingsSection {
   account,
   appearance,
   playback,
+  playbackDetail,
   lyrics,
   library,
   download,
@@ -37,11 +38,11 @@ class SettingsSearchEntry {
 
 const settingsSearchEntries = <SettingsSearchEntry>[
   SettingsSearchEntry(
-    title: '账号与服务',
-    path: ['账号与服务'],
-    route: '/settings/account-services',
+    title: '账号',
+    path: ['账号'],
+    route: '/account',
     icon: Icons.manage_accounts_outlined,
-    keywords: '登录 注册 账号安全 插件管理',
+    keywords: '登录 注册 账号安全 退出',
   ),
   SettingsSearchEntry(
     title: '外观',
@@ -58,11 +59,18 @@ const settingsSearchEntries = <SettingsSearchEntry>[
     keywords: '音量 音质 屏幕常亮',
   ),
   SettingsSearchEntry(
-    title: '歌词',
-    path: ['歌词'],
-    route: '/settings/lyrics',
-    icon: Icons.lyrics_outlined,
-    keywords: '翻译 逐字 动效',
+    title: '播放详情页',
+    path: ['播放详情页'],
+    route: '/settings/playback-detail',
+    icon: Icons.queue_music_outlined,
+    keywords: '歌词 播放详情 封面 歌词显示',
+  ),
+  SettingsSearchEntry(
+    title: '插件管理',
+    path: ['插件管理'],
+    route: '/settings/plugins',
+    icon: Icons.extension_outlined,
+    keywords: '插件 安装 启用 卸载 更新',
   ),
   SettingsSearchEntry(
     title: '音乐库',
@@ -87,17 +95,17 @@ const settingsSearchEntries = <SettingsSearchEntry>[
   ),
   SettingsSearchEntry(
     title: '账号与安全',
-    path: ['账号与服务', '账号与安全'],
+    path: ['账号', '账号与安全'],
     route: '/account',
     icon: Icons.account_circle_outlined,
     keywords: '登录 注册 验证码 退出',
   ),
   SettingsSearchEntry(
-    title: '插件管理',
-    path: ['账号与服务', '插件管理'],
-    route: '/settings/plugins',
-    icon: Icons.extension_outlined,
-    keywords: '插件 安装 启用 卸载 更新',
+    title: '歌词',
+    path: ['播放详情页', '歌词'],
+    route: '/settings/lyrics',
+    icon: Icons.lyrics_outlined,
+    keywords: '翻译 逐字 动效',
   ),
   SettingsSearchEntry(
     title: '主题模式',
@@ -141,13 +149,13 @@ const settingsSearchEntries = <SettingsSearchEntry>[
   ),
   SettingsSearchEntry(
     title: '显示翻译',
-    path: ['歌词', '显示翻译'],
+    path: ['播放详情页', '歌词', '显示翻译'],
     route: '/settings/lyrics',
     icon: Icons.translate_outlined,
   ),
   SettingsSearchEntry(
     title: '逐字动效',
-    path: ['歌词', '逐字动效'],
+    path: ['播放详情页', '歌词', '逐字动效'],
     route: '/settings/lyrics',
     icon: Icons.spellcheck_outlined,
     keywords: '逐字歌词 动画',
@@ -216,14 +224,14 @@ const settingsSearchEntries = <SettingsSearchEntry>[
   ),
   SettingsSearchEntry(
     title: '在线安装',
-    path: ['账号与服务', '插件管理', '在线安装'],
+    path: ['插件管理', '在线安装'],
     route: '/settings/plugins',
     icon: Icons.public_outlined,
     keywords: '插件地址 网络安装',
   ),
   SettingsSearchEntry(
     title: '本地导入插件',
-    path: ['账号与服务', '插件管理', '本地导入插件'],
+    path: ['插件管理', '本地导入插件'],
     route: '/settings/plugins',
     icon: Icons.upload_file_outlined,
     keywords: 'js 文件 插件',
@@ -310,9 +318,16 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
         _categoryTile(
           context,
           icon: Icons.manage_accounts_outlined,
-          title: '账号与服务',
-          subtitle: auth.isLoggedIn ? auth.user!.nickname : '账号安全与插件管理',
-          route: '/settings/account-services',
+          title: '账号',
+          subtitle: auth.isLoggedIn ? auth.user!.nickname : '登录、注册与账号安全',
+          route: '/account',
+        ),
+        _categoryTile(
+          context,
+          icon: Icons.extension_outlined,
+          title: '插件管理',
+          subtitle: '安装、启用与管理音乐插件',
+          route: '/settings/plugins',
         ),
         _categoryTile(
           context,
@@ -330,10 +345,10 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
         ),
         _categoryTile(
           context,
-          icon: Icons.lyrics_outlined,
-          title: '歌词',
-          subtitle: '翻译与逐字动效',
-          route: '/settings/lyrics',
+          icon: Icons.queue_music_outlined,
+          title: '播放详情页',
+          subtitle: '播放详情页中的歌词显示设置',
+          route: '/settings/playback-detail',
         ),
         _categoryTile(
           context,
@@ -370,13 +385,6 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
             ),
           ),
           onTap: () => context.push('/account'),
-        ),
-        _tile(
-          context,
-          icon: Icons.extension_outlined,
-          title: '插件管理',
-          trailing: const Text(''),
-          onTap: () => context.push('/settings/plugins'),
         ),
       ],
       SettingsSection.appearance => [
@@ -424,6 +432,15 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
           title: '保持屏幕常亮',
           value: settings?.keepScreenOn ?? true,
           onChanged: (v) => notifier.setKeepScreenOn(v),
+        ),
+      ],
+      SettingsSection.playbackDetail => [
+        _tile(
+          context,
+          icon: Icons.lyrics_outlined,
+          title: '歌词',
+          trailing: const Text(''),
+          onTap: () => context.push('/settings/lyrics'),
         ),
       ],
       SettingsSection.lyrics => [
@@ -636,9 +653,10 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
 
   String get _pageTitle => switch (section) {
     SettingsSection.root => '设置',
-    SettingsSection.account => '账号与服务',
+    SettingsSection.account => '账号',
     SettingsSection.appearance => '外观',
     SettingsSection.playback => '播放',
+    SettingsSection.playbackDetail => '播放详情页',
     SettingsSection.lyrics => '歌词',
     SettingsSection.library => '音乐库',
     SettingsSection.download => '下载',

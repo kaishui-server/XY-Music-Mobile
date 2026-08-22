@@ -131,6 +131,12 @@ final appRouter = GoRouter(
                       const SettingsPage(section: SettingsSection.playback),
                 ),
                 GoRoute(
+                  path: 'playback-detail',
+                  builder: (context, state) => const SettingsPage(
+                    section: SettingsSection.playbackDetail,
+                  ),
+                ),
+                GoRoute(
                   path: 'lyrics',
                   builder: (context, state) =>
                       const SettingsPage(section: SettingsSection.lyrics),
