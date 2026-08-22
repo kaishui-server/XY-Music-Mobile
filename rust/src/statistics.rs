@@ -1301,14 +1301,15 @@ fn rebuild_statistics_aggregates(conn: &rusqlite::Connection) -> Result<(), Stri
     clear_aggregate_statistics(conn)?;
 
     {
-        // 使用 LEFT JOIN 以包含在线歌曲（song_id 为 NULL 的记录）
+        // 使用路径关联以兼容尚未迁移出 song_id 列的旧播放历史表，
+        // LEFT JOIN 同时保留不在本地曲库中的在线歌曲。
         // 对于在线歌曲，s.title/s.artist/s.album 等字段为 NULL，
         // resolve_song_identity 会用 song_path 作为 fallback 提取标题
         let mut stmt = conn
             .prepare(
                 "SELECT ph.song_path, s.title, s.artist, s.album, s.duration, s.track_number, ph.played_at, ph.played_seconds, ph.event
                  FROM play_history ph
-                 LEFT JOIN songs s ON ph.song_id = s.id
+                 LEFT JOIN songs s ON s.path = ph.song_path
                  WHERE ph.event IN ('play', 'play_time')
                  ORDER BY ph.played_at ASC, ph.id ASC",
             )
@@ -1690,14 +1691,29 @@ fn insert_history_event(
     played_seconds: i64,
     event: &str,
 ) -> Result<(), String> {
-    let song_id = match lookup_song_id(conn, normalized_path) {
-        Some(id) => id,
-        None => return Ok(()),
-    };
+    if let Some(song_id) = lookup_song_id(conn, normalized_path) {
+        let inserted = conn.execute(
+            "INSERT INTO play_history (song_path, song_id, played_at, played_seconds, event) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![normalized_path, song_id, played_at, played_seconds, event],
+        );
+        if inserted.is_ok() {
+            return Ok(());
+        }
+        // 极旧数据库可能仍没有 song_id；下面用最早版本字段回退写入。
+    }
 
+    let inserted = conn.execute(
+        "INSERT INTO play_history (song_path, played_at, played_seconds, event) VALUES (?1, ?2, ?3, ?4)",
+        rusqlite::params![normalized_path, played_at, played_seconds, event],
+    );
+    if inserted.is_ok() {
+        return Ok(());
+    }
+
+    // 最早期表还没有 played_seconds。
     conn.execute(
-        "INSERT INTO play_history (song_path, song_id, played_at, played_seconds, event) VALUES (?1, ?2, ?3, ?4, ?5)",
-        rusqlite::params![normalized_path, song_id, played_at, played_seconds, event],
+        "INSERT INTO play_history (song_path, played_at, event) VALUES (?1, ?2, ?3)",
+        rusqlite::params![normalized_path, played_at, event],
     )
     .map_err(|e| e.to_string())?;
 
@@ -1750,13 +1766,19 @@ pub fn get_recent_history(
 ) -> Result<Vec<RecentHistoryEntry>, String> {
     let max_rows = limit.unwrap_or(1000).clamp(1, 5000) as i64;
 
+    // song_path / played_at / event 是最早版本播放历史表就有的字段。
+    // 不再依赖后续迁移才加入的 song_id，也不与 songs 表做 INNER JOIN：
+    // 部分升级用户的旧记录 song_id 为空，迁移中断时甚至可能暂时没有该列，
+    // 旧查询会让整个“最近播放”页面直接报错。
     let mut stmt = conn
         .prepare(
-            "SELECT s.path, MAX(ph.played_at) AS played_at
-             FROM play_history ph
-             INNER JOIN songs s ON ph.song_id = s.id
-             WHERE ph.event = 'recent'
-             GROUP BY ph.song_id
+            "SELECT TRIM(CAST(song_path AS TEXT)) AS song_path,
+                    CAST(MAX(CAST(played_at AS INTEGER)) AS INTEGER) AS played_at
+             FROM play_history
+             WHERE event = 'recent'
+               AND song_path IS NOT NULL
+               AND TRIM(CAST(song_path AS TEXT)) != ''
+             GROUP BY TRIM(CAST(song_path AS TEXT))
              ORDER BY played_at DESC
              LIMIT ?1",
         )
@@ -1764,9 +1786,17 @@ pub fn get_recent_history(
 
     let rows = stmt
         .query_map([max_rows], |row| {
+            let raw_timestamp = row.get::<_, i64>(1)?;
+            // 正常播放记录保存秒；导入自旧版/桌面版的少量记录可能已经是毫秒。
+            // 避免重复乘 1000，并使用饱和运算防止损坏数据溢出。
+            let played_at = if raw_timestamp.unsigned_abs() >= 100_000_000_000 {
+                raw_timestamp
+            } else {
+                raw_timestamp.saturating_mul(1000)
+            };
             Ok(RecentHistoryEntry {
                 song_path: row.get(0)?,
-                played_at: row.get::<_, i64>(1)? * 1000,
+                played_at,
             })
         })
         .map_err(|e| e.to_string())?;
@@ -2450,12 +2480,12 @@ pub fn get_behavior_stats(
         None => String::new(),
     };
 
-    // 只统计 song_id 非空且在 songs 表中存在的记录
-    let base_join = "FROM play_history ph INNER JOIN songs s ON ph.song_id = s.id";
+    // 通过所有历史版本都具备的 song_path 关联曲库，避免旧库缺少 song_id 时整页报错。
+    let base_join = "FROM play_history ph INNER JOIN songs s ON s.path = ph.song_path";
 
     // 指标 A1: 播放次数
     let sql_plays = format!(
-        "SELECT COUNT(*) {} WHERE ph.event = 'play' AND ph.song_id IS NOT NULL {}",
+        "SELECT COUNT(*) {} WHERE ph.event = 'play' {}",
         base_join, time_condition
     );
     let total_plays: i64 = conn
@@ -2464,7 +2494,7 @@ pub fn get_behavior_stats(
 
     // 指标 A2: 播放总时长
     let sql_duration = format!(
-        "SELECT COALESCE(SUM(ph.played_seconds), 0) {} WHERE ph.event IN ('play', 'play_time') AND ph.song_id IS NOT NULL {}",
+        "SELECT COALESCE(SUM(ph.played_seconds), 0) {} WHERE ph.event IN ('play', 'play_time') {}",
         base_join, time_condition
     );
     let total_duration: i64 = conn
@@ -2475,8 +2505,8 @@ pub fn get_behavior_stats(
     let sql_top_plays = format!(
         "SELECT s.path, COUNT(*) as cnt 
          {} 
-         WHERE ph.event = 'play' AND ph.song_id IS NOT NULL {} 
-         GROUP BY ph.song_id 
+         WHERE ph.event = 'play' {}
+         GROUP BY s.path
          ORDER BY cnt DESC 
          LIMIT 5",
         base_join, time_condition
@@ -2503,8 +2533,8 @@ pub fn get_behavior_stats(
     let sql_top_duration = format!(
         "SELECT s.path, COALESCE(SUM(ph.played_seconds), 0) as duration 
          {} 
-         WHERE ph.event IN ('play', 'play_time') AND ph.song_id IS NOT NULL {}
-         GROUP BY ph.song_id 
+         WHERE ph.event IN ('play', 'play_time') {}
+         GROUP BY s.path
          ORDER BY duration DESC 
          LIMIT 5",
         base_join, time_condition
@@ -2532,7 +2562,7 @@ pub fn get_behavior_stats(
         "SELECT CAST(strftime('%H', ph.played_at, 'unixepoch', 'localtime') AS INTEGER) as hour, 
                 COUNT(*) as cnt 
          {} 
-         WHERE ph.event = 'play' AND ph.song_id IS NOT NULL {} 
+         WHERE ph.event = 'play' {}
          GROUP BY hour",
         base_join, time_condition
     );
@@ -2553,7 +2583,7 @@ pub fn get_behavior_stats(
     let sql_top_artists = format!(
         "SELECT TRIM(s.artist) as artist, COUNT(*) as cnt 
          {} 
-         WHERE ph.event = 'play' AND ph.song_id IS NOT NULL {} 
+         WHERE ph.event = 'play' {}
            AND s.artist IS NOT NULL 
            AND TRIM(s.artist) != '' 
            AND LOWER(TRIM(s.artist)) NOT IN ('未知', '未知歌手', 'unknown', 'unknown artist') 
@@ -2582,7 +2612,7 @@ pub fn get_behavior_stats(
     let sql_top_albums = format!(
         "SELECT TRIM(s.album) as album, COUNT(*) as cnt 
          {} 
-         WHERE ph.event = 'play' AND ph.song_id IS NOT NULL {} 
+         WHERE ph.event = 'play' {}
            AND s.album IS NOT NULL 
            AND TRIM(s.album) != '' 
            AND LOWER(TRIM(s.album)) NOT IN ('未知', '未知专辑', 'unknown', 'unknown album') 
@@ -2625,8 +2655,8 @@ pub fn get_behavior_stats(
             "SELECT CAST((ph.played_at - {}) / {} AS INTEGER) as day_offset, 
                     COALESCE(SUM(ph.played_seconds), 0) as duration 
              FROM play_history ph 
-             INNER JOIN songs s ON ph.song_id = s.id 
-             WHERE ph.played_at >= {} AND ph.event IN ('play', 'play_time') AND ph.song_id IS NOT NULL
+             INNER JOIN songs s ON s.path = ph.song_path
+             WHERE ph.played_at >= {} AND ph.event IN ('play', 'play_time')
              GROUP BY day_offset",
             start_time, day_seconds, start_time
         );
@@ -2750,5 +2780,65 @@ mod playback_count_tests {
             .query_row("SELECT COUNT(*) FROM recent_plays", [], |row| row.get(0))
             .expect("read recent plays");
         assert_eq!(recent_count, 1);
+    }
+
+    #[test]
+    fn recent_history_supports_legacy_rows_without_song_id() {
+        let conn = rusqlite::Connection::open_in_memory().expect("open in-memory database");
+        conn.execute_batch(
+            "CREATE TABLE play_history (
+                id INTEGER PRIMARY KEY,
+                song_path TEXT NOT NULL,
+                played_at INTEGER NOT NULL,
+                event TEXT DEFAULT 'play'
+             );
+             INSERT INTO play_history (song_path, played_at, event)
+             VALUES ('/music/seconds.mp3', 1700000000, 'recent');
+             INSERT INTO play_history (song_path, played_at, event)
+             VALUES ('/music/millis.mp3', 1700000001000, 'recent');
+             INSERT INTO play_history (song_path, played_at, event)
+             VALUES ('/music/seconds.mp3', 1699999999, 'recent');",
+        )
+        .expect("create legacy history");
+
+        let rows = get_recent_history(&conn, Some(20)).expect("read legacy history");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].song_path, "/music/millis.mp3");
+        assert_eq!(rows[0].played_at, 1_700_000_001_000);
+        assert_eq!(rows[1].song_path, "/music/seconds.mp3");
+        assert_eq!(rows[1].played_at, 1_700_000_000_000);
+    }
+
+    #[test]
+    fn aggregate_backfill_supports_play_history_without_song_id() {
+        let conn = rusqlite::Connection::open_in_memory().expect("open in-memory database");
+        crate::database::schema::ensure_base_schema(&conn).expect("create base schema");
+        conn.execute(
+            "ALTER TABLE play_history ADD COLUMN played_seconds INTEGER DEFAULT 0",
+            [],
+        )
+        .expect("add legacy played seconds");
+        conn.execute(
+            "INSERT INTO songs (path, title, artist, album, duration)
+             VALUES ('/music/legacy.mp3', 'Legacy', 'Artist', 'Album', 180)",
+            [],
+        )
+        .expect("insert library song");
+        conn.execute(
+            "INSERT INTO play_history (song_path, played_at, played_seconds, event)
+             VALUES ('/music/legacy.mp3', 1700000000, 30, 'play')",
+            [],
+        )
+        .expect("insert legacy play");
+
+        ensure_statistics_aggregates(&conn).expect("backfill legacy aggregates");
+        let total_plays: i64 = conn
+            .query_row(
+                "SELECT total_play_count FROM global_stats WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read aggregate count");
+        assert_eq!(total_plays, 1);
     }
 }

@@ -12,6 +12,7 @@ import 'package:permission_handler/permission_handler.dart';
 import '../core/db_path.dart';
 import '../core/settings.dart';
 import '../plugins/plugin_runtime.dart';
+import '../recent/recent_store.dart';
 import '../rust/api.dart';
 
 /// 播放中的单曲信息（小而美：仅保留 UI 需要的最小字段）。
@@ -623,7 +624,7 @@ class PlayerNotifier extends StateNotifier<PlaybackState> {
       await _player.setVolume(_ref.read(volumeProvider));
       // 最近播放是“开始播放”即记录，与桌面端行为一致。统计写入失败不应
       // 阻断音频播放，因此放到独立异步任务中执行。
-      if (item.pluginId == null) unawaited(_addToRecentHistory(item.path));
+      unawaited(_addToRecentHistory(item));
       _manualPause = false;
       _startPlayback(requestId, item.path);
       if (requestId != _playRequestId) return;
@@ -1138,10 +1139,29 @@ class PlayerNotifier extends StateNotifier<PlaybackState> {
     return message.isEmpty ? '歌曲播放失败，请重试' : message;
   }
 
-  Future<void> _addToRecentHistory(String path) async {
+  Future<void> _addToRecentHistory(QueueItem item) async {
+    try {
+      await rememberRecentSongSnapshot(
+        RecentSongSnapshot(
+          path: item.path,
+          title: item.title,
+          artist: item.artist,
+          album: item.album,
+          durationMs: item.durationMs,
+          playedAt: DateTime.now().millisecondsSinceEpoch,
+          pluginId: item.pluginId,
+          pluginData: item.pluginData,
+          coverUrl: item.coverUrl,
+        ),
+      );
+    } catch (_) {
+      // 快照写入失败时，本地歌曲仍可依靠曲库记录显示。
+    }
+
     try {
       final dbPath = await _ref.read(dbPathProvider.future);
-      await statsAddToHistory(dbPath: dbPath, songPath: path);
+      await statsAddToHistory(dbPath: dbPath, songPath: item.path);
+      _ref.read(recentHistoryRevisionProvider.notifier).state++;
     } catch (_) {
       // 播放历史属于附加能力，数据库异常时保持播放器可用。
     }
@@ -1628,6 +1648,9 @@ final volumeProvider = Provider<double>((ref) {
   return ref.watch(settingsProvider.select((s) => s.valueOrNull?.volume)) ??
       1.0;
 });
+
+/// 最近播放写入成功后的修订号，让已打开的最近播放页在异步落库完成后刷新。
+final recentHistoryRevisionProvider = StateProvider<int>((ref) => 0);
 
 final playerProvider = StateNotifierProvider<PlayerNotifier, PlaybackState>((
   ref,

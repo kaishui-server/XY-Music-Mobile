@@ -135,6 +135,240 @@ class _AccountPageState extends ConsumerState<AccountPage>
     // 错误已通过 authProvider.error 反映到内联错误条，无需再弹 SnackBar。
   }
 
+  Future<void> _forgotPassword() async {
+    final emailCtrl = TextEditingController(text: _emailCtrl.text.trim());
+    final email = await showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('找回密码'),
+        content: TextField(
+          controller: emailCtrl,
+          keyboardType: TextInputType.emailAddress,
+          autofocus: true,
+          decoration: const InputDecoration(
+            labelText: '注册邮箱',
+            prefixIcon: Icon(Icons.mail_outline),
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, emailCtrl.text.trim()),
+            child: const Text('发送验证码'),
+          ),
+        ],
+      ),
+    );
+    emailCtrl.dispose();
+    if (email == null || !email.contains('@') || !mounted) return;
+
+    final sendCaptcha = await _requestHumanCaptcha(
+      title: '发送验证码前验证',
+      description: '完成验证后将向注册邮箱发送找回密码验证码。',
+    );
+    if (sendCaptcha == null || !mounted) return;
+    try {
+      await ref
+          .read(authProvider.notifier)
+          .sendCode(email, 'reset_password', captcha: sendCaptcha);
+      if (!mounted) return;
+      _toast('验证码已发送，请查收邮件');
+    } catch (error) {
+      if (mounted) _toast(error.toString());
+      return;
+    }
+
+    final codeCtrl = TextEditingController();
+    final passwordCtrl = TextEditingController();
+    final confirmCtrl = TextEditingController();
+    final values = await showDialog<List<String>>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('设置新密码'),
+        content: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              TextField(
+                controller: codeCtrl,
+                keyboardType: TextInputType.number,
+                decoration: const InputDecoration(labelText: '邮箱验证码'),
+              ),
+              const SizedBox(height: 12),
+              TextField(
+                controller: passwordCtrl,
+                obscureText: true,
+                decoration: const InputDecoration(labelText: '新密码（至少 6 位）'),
+              ),
+              const SizedBox(height: 12),
+              TextField(
+                controller: confirmCtrl,
+                obscureText: true,
+                decoration: const InputDecoration(labelText: '确认新密码'),
+              ),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, [
+              codeCtrl.text.trim(),
+              passwordCtrl.text,
+              confirmCtrl.text,
+            ]),
+            child: const Text('重置密码'),
+          ),
+        ],
+      ),
+    );
+    codeCtrl.dispose();
+    passwordCtrl.dispose();
+    confirmCtrl.dispose();
+    if (values == null || !mounted) return;
+    if (values[1] != values[2]) {
+      _toast('两次输入的密码不一致');
+      return;
+    }
+    final resetCaptcha = await _requestHumanCaptcha(
+      title: '重置密码前验证',
+      description: '完成最后一次验证后将修改账号密码。',
+    );
+    if (resetCaptcha == null || !mounted) return;
+    try {
+      final message = await ref
+          .read(authProvider.notifier)
+          .resetPassword(
+            email: email,
+            code: values[0],
+            newPassword: values[1],
+            captcha: resetCaptcha,
+          );
+      if (mounted) _toast(message);
+    } catch (error) {
+      if (mounted) _toast(error.toString());
+    }
+  }
+
+  Future<void> _editNickname() async {
+    final current = ref.read(authProvider).user;
+    if (current == null) return;
+    final controller = TextEditingController(text: current.nickname);
+    final nickname = await showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('修改昵称'),
+        content: TextField(
+          controller: controller,
+          autofocus: true,
+          maxLength: 20,
+          decoration: const InputDecoration(labelText: '新昵称'),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, controller.text.trim()),
+            child: const Text('提交'),
+          ),
+        ],
+      ),
+    );
+    controller.dispose();
+    if (nickname == null || nickname.isEmpty || !mounted) return;
+    try {
+      final message = await ref
+          .read(authProvider.notifier)
+          .updateNickname(nickname);
+      if (mounted) _toast(message);
+    } catch (error) {
+      if (mounted) _toast(error.toString());
+    }
+  }
+
+  Future<void> _changePassword() async {
+    final oldCtrl = TextEditingController();
+    final nextCtrl = TextEditingController();
+    final confirmCtrl = TextEditingController();
+    final values = await showDialog<List<String>>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('修改密码'),
+        content: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              TextField(
+                controller: oldCtrl,
+                obscureText: true,
+                decoration: const InputDecoration(labelText: '原密码'),
+              ),
+              const SizedBox(height: 12),
+              TextField(
+                controller: nextCtrl,
+                obscureText: true,
+                decoration: const InputDecoration(labelText: '新密码（至少 6 位）'),
+              ),
+              const SizedBox(height: 12),
+              TextField(
+                controller: confirmCtrl,
+                obscureText: true,
+                decoration: const InputDecoration(labelText: '确认新密码'),
+              ),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, [
+              oldCtrl.text,
+              nextCtrl.text,
+              confirmCtrl.text,
+            ]),
+            child: const Text('确认修改'),
+          ),
+        ],
+      ),
+    );
+    oldCtrl.dispose();
+    nextCtrl.dispose();
+    confirmCtrl.dispose();
+    if (values == null || !mounted) return;
+    if (values[1] != values[2]) {
+      _toast('两次输入的新密码不一致');
+      return;
+    }
+    try {
+      final message = await ref
+          .read(authProvider.notifier)
+          .changePassword(oldPassword: values[0], newPassword: values[1]);
+      if (mounted) _toast(message);
+    } catch (error) {
+      if (mounted) _toast(error.toString());
+    }
+  }
+
+  Future<void> _refreshProfile() async {
+    try {
+      await ref.read(authProvider.notifier).refreshProfile();
+      if (mounted) _toast('资料已刷新');
+    } catch (error) {
+      if (mounted) _toast(error.toString());
+    }
+  }
+
   /// 弹出人机验证弹窗，返回验证通过的 payload；取消返回 null。
   Future<HumanCaptchaPayload?> _requestHumanCaptcha({
     required String title,
@@ -167,6 +401,9 @@ class _AccountPageState extends ConsumerState<AccountPage>
       body: auth.isLoggedIn
           ? _ProfileView(
               user: auth.user!,
+              onRefresh: _refreshProfile,
+              onEditNickname: _editNickname,
+              onChangePassword: _changePassword,
               onLogout: () => _confirmLogout(context),
             )
           : _buildAuthForm(context, auth),
@@ -299,6 +536,13 @@ class _AccountPageState extends ConsumerState<AccountPage>
         ),
         _errorBanner(context, auth),
         _submitButton(context, auth, '登录'),
+        Align(
+          alignment: Alignment.centerRight,
+          child: TextButton(
+            onPressed: auth.loading ? null : _forgotPassword,
+            child: const Text('忘记密码？'),
+          ),
+        ),
       ],
     );
   }
@@ -468,8 +712,17 @@ class _AccountPageState extends ConsumerState<AccountPage>
 
 /// 已登录资料视图。
 class _ProfileView extends StatelessWidget {
-  const _ProfileView({required this.user, required this.onLogout});
+  const _ProfileView({
+    required this.user,
+    required this.onRefresh,
+    required this.onEditNickname,
+    required this.onChangePassword,
+    required this.onLogout,
+  });
   final AuthUser user;
+  final VoidCallback onRefresh;
+  final VoidCallback onEditNickname;
+  final VoidCallback onChangePassword;
   final VoidCallback onLogout;
 
   @override
@@ -522,6 +775,30 @@ class _ProfileView extends StatelessWidget {
                 label: 'XY Music 账号',
                 value: user.ciyuanxiId!,
               ),
+          ],
+        ),
+        const SizedBox(height: 16),
+        _InfoCard(
+          children: [
+            ListTile(
+              leading: Icon(Icons.refresh_rounded, color: scheme.primary),
+              title: const Text('刷新账号资料'),
+              trailing: const Icon(Icons.chevron_right_rounded),
+              onTap: onRefresh,
+            ),
+            ListTile(
+              leading: Icon(Icons.edit_outlined, color: scheme.primary),
+              title: const Text('修改昵称'),
+              subtitle: const Text('修改后可能需要审核'),
+              trailing: const Icon(Icons.chevron_right_rounded),
+              onTap: onEditNickname,
+            ),
+            ListTile(
+              leading: Icon(Icons.lock_outline_rounded, color: scheme.primary),
+              title: const Text('修改密码'),
+              trailing: const Icon(Icons.chevron_right_rounded),
+              onTap: onChangePassword,
+            ),
           ],
         ),
         const SizedBox(height: 24),

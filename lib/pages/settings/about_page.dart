@@ -1,13 +1,32 @@
 import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
 
-class AboutPage extends StatelessWidget {
+import '../../src/auth/auth_provider.dart';
+
+final _serverReleaseProvider = FutureProvider.autoDispose<BackendRelease?>((
+  ref,
+) {
+  return ref.read(authProvider.notifier).fetchLatestRelease();
+});
+
+class AboutPage extends ConsumerWidget {
   const AboutPage({super.key});
 
   @override
-  Widget build(BuildContext context) {
+  Widget build(BuildContext context, WidgetRef ref) {
     final scheme = Theme.of(context).colorScheme;
+    final release = ref.watch(_serverReleaseProvider);
     return Scaffold(
-      appBar: AppBar(title: const Text('关于')),
+      appBar: AppBar(
+        title: const Text('关于'),
+        actions: [
+          IconButton(
+            tooltip: '检查服务器版本',
+            onPressed: () => ref.invalidate(_serverReleaseProvider),
+            icon: const Icon(Icons.refresh_rounded),
+          ),
+        ],
+      ),
       body: ListView(
         padding: const EdgeInsets.fromLTRB(20, 18, 20, 40),
         children: [
@@ -84,6 +103,29 @@ class AboutPage extends StatelessWidget {
               ),
               const Divider(height: 1),
               _row(context, Icons.shield_outlined, '隐私与数据', '音乐库和听歌统计默认保存在本机'),
+            ],
+          ),
+          const SizedBox(height: 14),
+          _AboutCard(
+            children: [
+              release.when(
+                loading: () =>
+                    _row(context, Icons.cloud_sync_outlined, '服务器服务', '正在检查…'),
+                error: (_, _) => _row(
+                  context,
+                  Icons.cloud_off_outlined,
+                  '服务器服务',
+                  '连接失败，点击右上角重试',
+                ),
+                data: (item) => _row(
+                  context,
+                  Icons.cloud_done_outlined,
+                  '服务器服务',
+                  item == null
+                      ? '已连接 · 暂无服务端版本公告'
+                      : '最新版本 ${item.version}${item.content.isEmpty ? '' : ' · ${item.content}'}',
+                ),
+              ),
             ],
           ),
           const SizedBox(height: 14),

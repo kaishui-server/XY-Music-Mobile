@@ -5,7 +5,9 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../core/db_path.dart';
 import '../library/library_provider.dart';
 import '../player/player_provider.dart';
+import '../plugins/plugin_runtime.dart';
 import '../rust/api.dart';
+import 'recent_store.dart';
 
 class RecentSongEntry {
   const RecentSongEntry({required this.song, required this.playedAt});
@@ -43,40 +45,37 @@ int recentHistoryPlayedAt(Map<String, dynamic> row) {
       0;
 }
 
-/// 最近播放记录。监听当前曲目变化，让用户从迷你播放器切歌后回到本页时
-/// 能立即看到新记录；排序严格沿用 Rust 统计库返回的播放时间。
+/// 最近播放记录。等待播放历史真正写入后再刷新，避免当前歌曲已经切换、
+/// SQLite 记录尚未落库时提前读取，导致页面一直保留旧结果。
 final recentSongsProvider = FutureProvider<List<RecentSongEntry>>((ref) async {
-  ref.watch(playerProvider.select((state) => state.current?.path));
+  ref.watch(recentHistoryRevisionProvider);
   final dbPath = await ref.watch(dbPathProvider.future);
-  final raw = await statsGetRecentHistory(
-    dbPath: dbPath,
-    limit: BigInt.from(500),
-  );
+  final results = await Future.wait([
+    statsGetRecentHistory(dbPath: dbPath, limit: BigInt.from(500)),
+    loadRecentSongSnapshots(),
+  ]);
+  final raw = results[0] as String;
+  final snapshots = results[1] as Map<String, RecentSongSnapshot>;
   final rows = decodeRecentHistoryRows(raw);
   if (rows.isEmpty) return const [];
 
-  final paths = rows
-      .map(recentHistorySongPath)
-      .where((path) => path.isNotEmpty)
-      // 最近播放表主要保存本地曲库路径；插件/网络虚拟路径不在 SQLite songs 表中，
-      // 不传入本地查询，避免旧数据触发数据库错误。
-      .where(
-        (path) =>
-            !path.startsWith('plugin://') &&
-            !path.startsWith('lx://') &&
-            !path.startsWith('http://') &&
-            !path.startsWith('https://'),
-      )
-      .toList();
-  if (paths.isEmpty) return const [];
-  final songs = await ref.read(libraryProvider.notifier).songsByPaths(paths);
+  final paths = <String>{
+    for (final row in rows)
+      if (recentHistorySongPath(row).isNotEmpty) recentHistorySongPath(row),
+  };
+  final localPaths = paths
+      .where((path) => !_isNetworkRecentPath(path, snapshots[path]))
+      .toList(growable: false);
+  final songs = localPaths.isEmpty
+      ? const <Song>[]
+      : await ref.read(libraryProvider.notifier).songsByPaths(localPaths);
   final byPath = {for (final song in songs) song.path: song};
 
   return rows
       .map((row) {
         final path = recentHistorySongPath(row);
         final playedAt = recentHistoryPlayedAt(row);
-        final song = byPath[path];
+        final song = byPath[path] ?? _snapshotSong(snapshots[path]);
         if (song == null) return null;
         return RecentSongEntry(
           song: song,
@@ -91,6 +90,38 @@ final recentSongsProvider = FutureProvider<List<RecentSongEntry>>((ref) async {
 
 Future<void> clearRecentSongs(WidgetRef ref) async {
   final dbPath = await ref.read(dbPathProvider.future);
-  await statsClearRecentHistory(dbPath: dbPath);
+  await Future.wait([
+    statsClearRecentHistory(dbPath: dbPath),
+    clearRecentSongSnapshots(),
+  ]);
   ref.invalidate(recentSongsProvider);
+}
+
+bool _isNetworkRecentPath(String path, RecentSongSnapshot? snapshot) =>
+    snapshot?.pluginId?.trim().isNotEmpty == true ||
+    path.startsWith('plugin://') ||
+    path.startsWith('lx://') ||
+    path.startsWith('http://') ||
+    path.startsWith('https://');
+
+Song? _snapshotSong(RecentSongSnapshot? snapshot) {
+  if (snapshot == null) return null;
+  final savedCover = snapshot.coverUrl?.trim() ?? '';
+  final recoveredCover = snapshot.pluginData == null
+      ? ''
+      : extractPluginCoverUrl(snapshot.pluginData!);
+  return Song(
+    path: snapshot.path,
+    title: snapshot.title,
+    artist: snapshot.artist,
+    album: snapshot.album,
+    albumKey: snapshot.album,
+    duration: (snapshot.durationMs / 1000).round(),
+    format: snapshot.pluginId?.trim().isNotEmpty == true ? '插件' : '网络',
+    coverUrl: savedCover.isNotEmpty
+        ? savedCover
+        : (recoveredCover.isEmpty ? null : recoveredCover),
+    pluginId: snapshot.pluginId,
+    pluginData: snapshot.pluginData,
+  );
 }

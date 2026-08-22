@@ -1,15 +1,18 @@
 import 'dart:convert';
 import 'dart:math';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:flutter/services.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../core/db_path.dart';
 import '../rust/api.dart';
 
 /// 默认后端地址与签名密钥（与桌面端一致）。
-const defaultAuthBaseUrl = 'https://back.xymusic.cc/api';
-const defaultAuthApiSecret = 'bf027fedb4d1b4f969c10495f12f17042bf0de02de128200';
+const defaultAuthBaseUrl = 'http://156.233.228.213:8081/api';
+const defaultAuthApiSecret =
+    '53dab6e42c380c4502f73b40fc2e9af9c2ee523ecb92b6884ad17156c9c762af';
 
 /// 认证用户（XY Music 账号登录）。
 class AuthUser {
@@ -121,6 +124,60 @@ class HumanCaptchaPayload {
   };
 }
 
+class BackendAnnouncement {
+  const BackendAnnouncement({
+    required this.id,
+    required this.title,
+    required this.content,
+    required this.updatedAt,
+    this.type = 'info',
+    this.actionUrl = '',
+    this.actionText = '',
+  });
+
+  final String id;
+  final String title;
+  final String content;
+  final String updatedAt;
+  final String type;
+  final String actionUrl;
+  final String actionText;
+}
+
+class BackendRelease {
+  const BackendRelease({
+    required this.version,
+    required this.downloadUrl,
+    required this.content,
+    required this.status,
+  });
+
+  final String version;
+  final String downloadUrl;
+  final String content;
+  final String status;
+}
+
+class _ClientMetadata {
+  const _ClientMetadata({
+    required this.appVersion,
+    required this.osVersion,
+    required this.deviceModel,
+  });
+
+  final String appVersion;
+  final String osVersion;
+  final String deviceModel;
+
+  Map<String, dynamic> toRequestFields() => {
+    'client_type': 'mobile',
+    'app_version': appVersion,
+    'os_version': osVersion,
+    'device_model': deviceModel,
+    'platform': defaultTargetPlatform.name,
+  };
+}
+
 class AuthNotifier extends StateNotifier<AuthState> {
   AuthNotifier(this._ref) : super(const AuthState()) {
     init();
@@ -128,6 +185,41 @@ class AuthNotifier extends StateNotifier<AuthState> {
 
   final Ref _ref;
   final Random _rand = Random();
+  Future<_ClientMetadata>? _clientMetadataFuture;
+
+  Future<_ClientMetadata> _clientMetadata() =>
+      _clientMetadataFuture ??= _loadClientMetadata();
+
+  Future<_ClientMetadata> _loadClientMetadata() async {
+    if (!kIsWeb && defaultTargetPlatform == TargetPlatform.android) {
+      try {
+        const channel = MethodChannel('com.xymusic.mobile/device_info');
+        final info = await channel.invokeMapMethod<String, dynamic>(
+          'getDeviceInfo',
+        );
+        final manufacturer = info?['manufacturer']?.toString().trim() ?? '';
+        final model = info?['model']?.toString().trim() ?? '';
+        final lowerManufacturer = manufacturer.toLowerCase();
+        final deviceModel =
+            model.toLowerCase().startsWith(lowerManufacturer) ||
+                manufacturer.isEmpty
+            ? model
+            : '$manufacturer $model'.trim();
+        return _ClientMetadata(
+          appVersion: info?['appVersion']?.toString().trim() ?? '1.0.0',
+          osVersion: 'Android ${info?['osVersion'] ?? ''}'.trim(),
+          deviceModel: deviceModel.isEmpty ? 'Android 手机' : deviceModel,
+        );
+      } catch (_) {
+        // 单元测试或旧宿主没有原生通道时使用可识别的回退值。
+      }
+    }
+    return _ClientMetadata(
+      appVersion: '1.0.0',
+      osVersion: defaultTargetPlatform.name,
+      deviceModel: '${defaultTargetPlatform.name} 设备',
+    );
+  }
 
   Future<String> _dataDir() => _ref.read(appDataDirProvider.future);
 
@@ -155,6 +247,16 @@ class AuthNotifier extends StateNotifier<AuthState> {
   Future<void> init() async {
     try {
       final dir = await _dataDir();
+      final previousBaseUrl = await authGetBaseUrl(dataDir: dir);
+      final previousApiSecret = await authGetApiSecret(dataDir: dir);
+      final backendChanged =
+          previousBaseUrl.trim() != defaultAuthBaseUrl ||
+          previousApiSecret.trim() != defaultAuthApiSecret;
+      if (backendChanged) {
+        // 旧服务与新服务的用户库、token 空间彼此独立。迁移后继续沿用旧用户
+        // 会造成界面显示“已登录”，但排行榜和资料实际属于另一台服务器。
+        await authClearCredentials(dataDir: dir);
+      }
       await authSetBaseUrl(dataDir: dir, baseUrl: defaultAuthBaseUrl);
       await authSetApiSecret(dataDir: dir, apiSecret: defaultAuthApiSecret);
       final credsJson = await authGetCredentials(dataDir: dir);
@@ -194,7 +296,10 @@ class AuthNotifier extends StateNotifier<AuthState> {
             : '请求失败（code $code）',
       );
     }
-    return (j['data'] as Map<String, dynamic>?) ?? const {};
+    final data = j['data'];
+    if (data is Map) return Map<String, dynamic>.from(data);
+    if (data is List) return {'items': data};
+    return const {};
   }
 
   /// 供排行榜、同步等非账号页面复用同一套后端签名请求。
@@ -203,6 +308,75 @@ class AuthNotifier extends StateNotifier<AuthState> {
     Map<String, dynamic> body, {
     int? fetchTimeoutMs,
   }) => _requestAction(action, body, fetchTimeoutMs: fetchTimeoutMs);
+
+  /// 上报移动端启动事件，供服务端后台统计活跃设备。
+  Future<void> reportAppOpen() async {
+    final metadata = await _clientMetadata();
+    await _requestAction('open', {
+      'device_id': await _deviceId(),
+      'ciyuanxi_id': state.user?.ciyuanxiId ?? '',
+      ...metadata.toRequestFields(),
+    }, fetchTimeoutMs: 8000);
+  }
+
+  /// 上报每个插件的网络搜索结果，不影响实际搜索流程。
+  Future<void> reportSearch({
+    required String keyword,
+    required String source,
+    required int resultCount,
+  }) async {
+    await _requestAction('search', {
+      'device_id': await _deviceId(),
+      'keyword': keyword.trim(),
+      'source': source,
+      'result_count': resultCount,
+    }, fetchTimeoutMs: 8000);
+  }
+
+  Future<BackendAnnouncement?> fetchAnnouncement() async {
+    final data = await _requestAction('get_announcement', {
+      'ciyuanxi_id': state.user?.ciyuanxiId ?? '',
+      'device_id': await _deviceId(),
+    }, fetchTimeoutMs: 15000);
+    final id = data['id']?.toString() ?? '';
+    final title = data['title']?.toString() ?? '';
+    final content = data['content']?.toString() ?? '';
+    if (id.isEmpty || title.isEmpty || content.isEmpty) return null;
+    return BackendAnnouncement(
+      id: id,
+      title: title,
+      content: content,
+      updatedAt: data['updatedAt']?.toString() ?? '',
+      type: data['type']?.toString() ?? 'info',
+      actionUrl: data['actionUrl']?.toString() ?? '',
+      actionText: data['actionText']?.toString() ?? '',
+    );
+  }
+
+  Future<void> confirmAnnouncement(BackendAnnouncement announcement) async {
+    await _requestAction('confirm_announcement', {
+      'announcement_id': announcement.id,
+      'announcement_updated_at': announcement.updatedAt,
+      'ciyuanxi_id': state.user?.ciyuanxiId ?? '',
+      'device_id': await _deviceId(),
+    }, fetchTimeoutMs: 15000);
+  }
+
+  Future<BackendRelease?> fetchLatestRelease() async {
+    final data = await _requestAction(
+      'get_latest_version',
+      const {},
+      fetchTimeoutMs: 15000,
+    );
+    final version = data['version']?.toString() ?? '';
+    if (version.isEmpty) return null;
+    return BackendRelease(
+      version: version,
+      downloadUrl: data['download_url']?.toString() ?? '',
+      content: data['content']?.toString() ?? '',
+      status: data['status']?.toString() ?? '',
+    );
+  }
 
   Future<void> _saveAuth(String token, Map<String, dynamic> data) async {
     final dir = await _dataDir();
@@ -236,10 +410,13 @@ class AuthNotifier extends StateNotifier<AuthState> {
     String email,
     String type, {
     HumanCaptchaPayload? captcha,
+    String? ciyuanxiId,
   }) async {
     final data = await _requestAction('send_verify_code', {
       'email': email,
       'type': type,
+      if (ciyuanxiId != null && ciyuanxiId.trim().isNotEmpty)
+        'ciyuanxi_id': ciyuanxiId.trim(),
       if (captcha != null) ...captcha.toBodyFields(),
     });
     return (data['message'] as String?) ??
@@ -255,10 +432,12 @@ class AuthNotifier extends StateNotifier<AuthState> {
   }) async {
     state = state.copyWith(loading: true, clearError: true);
     try {
+      final metadata = await _clientMetadata();
       final data = await _requestAction('user_login', {
         'ciyuanxi_id': ciyuanxiId.trim(),
         'password': password,
         'device_id': await _deviceId(),
+        ...metadata.toRequestFields(),
         if (captcha != null) ...captcha.toBodyFields(),
       });
       final token = data['token'];
@@ -282,6 +461,7 @@ class AuthNotifier extends StateNotifier<AuthState> {
   }) async {
     state = state.copyWith(loading: true, clearError: true);
     try {
+      final metadata = await _clientMetadata();
       final data = await _requestAction('register', {
         'ciyuanxi_id': ciyuanxiId.trim(),
         'nickname': nickname.trim(),
@@ -289,6 +469,7 @@ class AuthNotifier extends StateNotifier<AuthState> {
         'email': email.trim(),
         'verify_code': code.trim(),
         'device_id': await _deviceId(),
+        ...metadata.toRequestFields(),
         if (captcha != null) ...captcha.toBodyFields(),
       });
       final token = data['token'];
@@ -299,6 +480,91 @@ class AuthNotifier extends StateNotifier<AuthState> {
     } catch (e) {
       state = state.copyWith(loading: false, error: _msg(e, '注册失败'));
     }
+  }
+
+  /// 从目标服务器刷新当前用户资料，避免审核通过后的昵称/头像长期停留在旧缓存。
+  Future<void> refreshProfile() async {
+    final current = state.user;
+    final ciyuanxiId = current?.ciyuanxiId?.trim() ?? '';
+    if (current == null || ciyuanxiId.isEmpty) return;
+    final data = await _requestAction('get_user_info', {
+      'ciyuanxi_id': ciyuanxiId,
+    }, fetchTimeoutMs: 15000);
+    await _replaceStoredUser(AuthUser.fromJson(data));
+  }
+
+  /// 提交昵称修改。服务端可能立即机审通过，也可能进入人工审核。
+  Future<String> updateNickname(String nickname) async {
+    final current = state.user;
+    final ciyuanxiId = current?.ciyuanxiId?.trim() ?? '';
+    if (current == null || ciyuanxiId.isEmpty) throw AuthException('请先登录');
+    if (nickname.trim().isEmpty) throw AuthException('昵称不能为空');
+    final token = await _storedToken();
+    final data = await _requestAction('update_profile', {
+      'token': token,
+      'ciyuanxi_id': ciyuanxiId,
+      'username': nickname.trim(),
+      'nickname': nickname.trim(),
+      'avatar': '',
+    });
+    final status = data['status']?.toString() ?? '';
+    if (status == 'approved') {
+      await refreshProfile();
+      return '昵称已修改';
+    }
+    return status == 'pending' ? '昵称已提交审核' : '昵称修改已提交';
+  }
+
+  /// 修改当前账号密码。
+  Future<String> changePassword({
+    required String oldPassword,
+    required String newPassword,
+  }) async {
+    final ciyuanxiId = state.user?.ciyuanxiId?.trim() ?? '';
+    if (ciyuanxiId.isEmpty) throw AuthException('请先登录');
+    if (newPassword.length < 6) throw AuthException('新密码长度不能少于 6 位');
+    await _requestAction('change_password', {
+      'ciyuanxi_id': ciyuanxiId,
+      'old_password': oldPassword,
+      'new_password': newPassword,
+    });
+    return '密码修改成功';
+  }
+
+  /// 使用邮箱验证码找回密码。
+  Future<String> resetPassword({
+    required String email,
+    required String code,
+    required String newPassword,
+    HumanCaptchaPayload? captcha,
+  }) async {
+    if (newPassword.length < 6) throw AuthException('新密码长度不能少于 6 位');
+    await _requestAction('reset_password', {
+      'email': email.trim(),
+      'verify_code': code.trim(),
+      'new_password': newPassword,
+      if (captcha != null) ...captcha.toBodyFields(),
+    });
+    return '密码修改成功，请使用新密码登录';
+  }
+
+  Future<String> _storedToken() async {
+    final raw = await authGetCredentials(dataDir: await _dataDir());
+    if (raw.trim().isEmpty || raw == 'null') return '';
+    final decoded = jsonDecode(raw);
+    if (decoded is! Map) return '';
+    return decoded['token']?.toString() ?? '';
+  }
+
+  Future<void> _replaceStoredUser(AuthUser user) async {
+    final token = await _storedToken();
+    if (token.isEmpty) throw AuthException('登录状态已失效，请重新登录');
+    await authSaveCredentials(
+      dataDir: await _dataDir(),
+      token: token,
+      userJson: jsonEncode(user.toJson()),
+    );
+    state = AuthState(user: user);
   }
 
   /// 设置内联错误信息（供 UI 展示本地校验错误，如两次密码不一致）。

@@ -14,6 +14,7 @@ class MainActivity : AudioServiceActivity() {
     companion object {
         private const val CHANNEL = "com.xymusic.mobile/system_audio_capture"
         private const val EVENTS = "com.xymusic.mobile/system_audio_capture/events"
+        private const val DEVICE_INFO_CHANNEL = "com.xymusic.mobile/device_info"
         private const val CAPTURE_REQUEST = 4217
     }
 
@@ -21,6 +22,27 @@ class MainActivity : AudioServiceActivity() {
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, DEVICE_INFO_CHANNEL)
+            .setMethodCallHandler { call, result ->
+                if (call.method != "getDeviceInfo") {
+                    result.notImplemented()
+                    return@setMethodCallHandler
+                }
+                val versionName = try {
+                    packageManager.getPackageInfo(packageName, 0).versionName ?: ""
+                } catch (_: Exception) {
+                    ""
+                }
+                result.success(
+                    mapOf(
+                        "manufacturer" to Build.MANUFACTURER,
+                        "model" to Build.MODEL,
+                        "osVersion" to Build.VERSION.RELEASE,
+                        "sdkInt" to Build.VERSION.SDK_INT,
+                        "appVersion" to versionName,
+                    ),
+                )
+            }
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL)
             .setMethodCallHandler { call, result ->
                 when (call.method) {

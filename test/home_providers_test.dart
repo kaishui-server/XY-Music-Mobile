@@ -29,4 +29,18 @@ void main() {
     expect(result.leaderboard.single.nickname, 'Alice');
     expect(result.leaderboard.single.isMe, isTrue);
   });
+
+  test('排行榜上报同时包含累计、今日和本周听歌时长', () {
+    final payload = buildListenStatsReportPayload(
+      ciyuanxiId: 'XY123',
+      totalDuration: 7200,
+      dailyDuration: 600,
+      weeklyDuration: 1800,
+    );
+
+    expect(payload['duration'], 7200);
+    expect(payload['daily_duration'], 600);
+    expect(payload['weekly_duration'], 1800);
+    expect(payload['unique_songs_count'], 0);
+  });
 }

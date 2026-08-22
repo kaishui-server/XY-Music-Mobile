@@ -15,12 +15,12 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 /// 默认 API 签名密钥。自建后端可在客户端账号设置页覆盖。
-const DEFAULT_API_SECRET: &str = "bf027fedb4d1b4f969c10495f12f17042bf0de02de128200";
+const DEFAULT_API_SECRET: &str = "53dab6e42c380c4502f73b40fc2e9af9c2ee523ecb92b6884ad17156c9c762af";
 
 /// 官方后端地址
-const OFFICIAL_AUTH_BASE_URL: &str = "https://back.xymusic.cc/api";
+const OFFICIAL_AUTH_BASE_URL: &str = "http://156.233.228.213:8081/api";
 
-/// 默认后端地址：仅支持 HTTPS，避免 Nginx 重定向丢失 POST 请求体
+/// 默认后端地址：与桌面端当前使用的官方服务保持一致。
 const DEFAULT_AUTH_BASE_URL: &str = OFFICIAL_AUTH_BASE_URL;
 
 /// token 文件名
@@ -103,7 +103,8 @@ fn token_file_path(data_dir: &Path) -> Result<PathBuf, String> {
 }
 
 /// 从文件读取 base_url，不存在时返回默认值。
-/// 自动将旧版 http://back.xymusic.cc 升级为 https，避免 Nginx 重定向丢失 POST 请求体。
+/// 读取持久化的后端地址。Flutter 启动时会写入当前官方地址，
+/// 因而已安装旧版本也会从旧服务平滑迁移到新服务。
 fn read_base_url(data_dir: &Path) -> String {
     match base_url_file_path(data_dir) {
         Ok(path) => {
@@ -115,11 +116,7 @@ fn read_base_url(data_dir: &Path) -> String {
                 if saved.is_empty() {
                     return DEFAULT_AUTH_BASE_URL.to_string();
                 }
-                let upgraded = saved.replace("http://back.xymusic.cc", "https://back.xymusic.cc");
-                if upgraded != saved {
-                    let _ = fs::write(&path, &upgraded);
-                }
-                upgraded
+                saved
             } else {
                 DEFAULT_AUTH_BASE_URL.to_string()
             }

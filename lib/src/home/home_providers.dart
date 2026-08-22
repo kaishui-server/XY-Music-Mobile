@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 import '../auth/auth_provider.dart';
 import '../core/db_path.dart';
@@ -120,6 +121,8 @@ class HomeStatisticsData {
     required this.totalFileSize,
     required this.losslessCount,
     required this.listenDuration,
+    required this.dailyListenDuration,
+    required this.weeklyListenDuration,
     required this.playCount,
     this.mostPlayed,
     this.mostPlayedCount = 0,
@@ -130,6 +133,8 @@ class HomeStatisticsData {
   final int totalFileSize;
   final int losslessCount;
   final int listenDuration;
+  final int dailyListenDuration;
+  final int weeklyListenDuration;
   final int playCount;
   final Song? mostPlayed;
   final int mostPlayedCount;
@@ -139,6 +144,8 @@ class HomeStatisticsData {
 }
 
 final homeStatisticsProvider = FutureProvider<HomeStatisticsData>((ref) async {
+  final refreshTimer = Timer(const Duration(minutes: 1), ref.invalidateSelf);
+  ref.onDispose(refreshTimer.cancel);
   final songs = ref.watch(libraryProvider.select((state) => state.songs));
   final dbPath = await ref.read(dbPathProvider.future);
   // 首次进入时统计接口可能执行数据库迁移，串行请求避免 SQLite 写锁冲突。
@@ -147,8 +154,10 @@ final homeStatisticsProvider = FutureProvider<HomeStatisticsData>((ref) async {
     dbPath: dbPath,
     timeRangeJson: '{"type":"All"}',
   );
+  final listenRaw = await statsGetListenDurations(dbPath: dbPath);
   final library = Map<String, dynamic>.from(jsonDecode(libraryRaw) as Map);
   final behavior = Map<String, dynamic>.from(jsonDecode(behaviorRaw) as Map);
+  final listen = Map<String, dynamic>.from(jsonDecode(listenRaw) as Map);
   final top = behavior['top_songs'] is List
       ? behavior['top_songs'] as List
       : const [];
@@ -160,7 +169,12 @@ final homeStatisticsProvider = FutureProvider<HomeStatisticsData>((ref) async {
     libraryDuration: (library['total_duration'] as num?)?.toInt() ?? 0,
     totalFileSize: (library['total_file_size'] as num?)?.toInt() ?? 0,
     losslessCount: (library['lossless_count'] as num?)?.toInt() ?? 0,
-    listenDuration: (behavior['total_duration'] as num?)?.toInt() ?? 0,
+    listenDuration:
+        (listen['total'] as num?)?.toInt() ??
+        (behavior['total_duration'] as num?)?.toInt() ??
+        0,
+    dailyListenDuration: (listen['daily'] as num?)?.toInt() ?? 0,
+    weeklyListenDuration: (listen['weekly'] as num?)?.toInt() ?? 0,
     playCount: (behavior['total_plays'] as num?)?.toInt() ?? 0,
     mostPlayed: mostPlayed,
     mostPlayedCount: (first?['play_count'] as num?)?.toInt() ?? 0,
@@ -249,11 +263,39 @@ final homeLeaderboardProvider = FutureProvider.autoDispose
 
       if (ciyuanxiId.isNotEmpty) {
         try {
-          await notifier.requestBackendAction('report_listen_stats', {
-            'ciyuanxi_id': ciyuanxiId,
-            'duration': stats.listenDuration,
-            'unique_songs_count': 0,
-          }, fetchTimeoutMs: 8000);
+          final report = await notifier.requestBackendAction(
+            'report_listen_stats',
+            buildListenStatsReportPayload(
+              ciyuanxiId: ciyuanxiId,
+              totalDuration: stats.listenDuration,
+              dailyDuration: stats.dailyListenDuration,
+              weeklyDuration: stats.weeklyListenDuration,
+            ),
+            fetchTimeoutMs: 8000,
+          );
+          final resetAt = report['reset_at']?.toString().trim() ?? '';
+          if (resetAt.isNotEmpty) {
+            const resetKey = 'listen_stats_last_reset_at';
+            final prefs = await SharedPreferences.getInstance();
+            final lastResetAt = prefs.getString(resetKey) ?? '';
+            if (lastResetAt.isEmpty || resetAt.compareTo(lastResetAt) > 0) {
+              await statsResetLocalStatistics(
+                dbPath: await ref.read(dbPathProvider.future),
+              );
+              await prefs.setString(resetKey, resetAt);
+              ref.invalidate(homeStatisticsProvider);
+              await notifier.requestBackendAction(
+                'report_listen_stats',
+                buildListenStatsReportPayload(
+                  ciyuanxiId: ciyuanxiId,
+                  totalDuration: 0,
+                  dailyDuration: 0,
+                  weeklyDuration: 0,
+                ),
+                fetchTimeoutMs: 8000,
+              );
+            }
+          }
         } catch (_) {
           // 上报失败不影响公共排行榜读取。
         }
@@ -266,3 +308,17 @@ final homeLeaderboardProvider = FutureProvider.autoDispose
       }, fetchTimeoutMs: 12000);
       return decodeLeaderboardData(data);
     });
+
+Map<String, dynamic> buildListenStatsReportPayload({
+  required String ciyuanxiId,
+  required int totalDuration,
+  required int dailyDuration,
+  required int weeklyDuration,
+}) => {
+  'ciyuanxi_id': ciyuanxiId,
+  'duration': totalDuration.clamp(0, 0x7FFFFFFFFFFFFFFF),
+  'daily_duration': dailyDuration.clamp(0, 0x7FFFFFFFFFFFFFFF),
+  // 服务端周榜由每日记录汇总；保留该字段便于服务端日志和后续兼容。
+  'weekly_duration': weeklyDuration.clamp(0, 0x7FFFFFFFFFFFFFFF),
+  'unique_songs_count': 0,
+};

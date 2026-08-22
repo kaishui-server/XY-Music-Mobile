@@ -10,49 +10,110 @@ import '../../src/ui/xy_surface.dart';
 import '../../src/ui/xy_theme.dart';
 
 /// 按电脑端首页顺序组织四个模块，并针对窄屏改为单列纵向布局。
-class HomePage extends ConsumerWidget {
+class HomePage extends ConsumerStatefulWidget {
   const HomePage({super.key});
 
   @override
-  Widget build(BuildContext context, WidgetRef ref) {
+  ConsumerState<HomePage> createState() => _HomePageState();
+}
+
+class _HomePageState extends ConsumerState<HomePage> {
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addPostFrameCallback((_) => _bootstrapBackend());
+  }
+
+  Future<void> _bootstrapBackend() async {
+    final backend = ref.read(authProvider.notifier);
+    try {
+      await backend.reportAppOpen();
+    } catch (_) {
+      // 统计失败不能阻止首页使用。
+    }
+    BackendAnnouncement? announcement;
+    try {
+      announcement = await backend.fetchAnnouncement();
+    } catch (_) {
+      return;
+    }
+    if (!mounted || announcement == null) return;
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        icon: Icon(
+          announcement!.type == 'warning'
+              ? Icons.warning_amber_rounded
+              : Icons.campaign_outlined,
+        ),
+        title: Text(announcement.title),
+        content: SingleChildScrollView(child: Text(announcement.content)),
+        actions: [
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('我知道了'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed == true) {
+      try {
+        await backend.confirmAnnouncement(announcement);
+      } catch (_) {
+        // 下次启动会再次展示，避免把未成功确认的公告误标为已读。
+      }
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
     return Scaffold(
       body: XyPageBackground(
         child: SafeArea(
           bottom: false,
-          child: RefreshIndicator(
-            onRefresh: () async {
-              ref.invalidate(hotCommentProvider);
-              ref.invalidate(homeStatisticsProvider);
-              for (final period in LeaderboardPeriod.values) {
-                ref.invalidate(homeLeaderboardProvider(period));
-              }
-              await Future.wait([
-                ref.read(hotCommentProvider.future),
-                ref.read(homeStatisticsProvider.future),
-              ]);
-            },
-            child: ListView(
-              physics: const AlwaysScrollableScrollPhysics(),
-              padding: const EdgeInsets.fromLTRB(16, 12, 16, 100),
-              children: const [
-                _HomeHeader(),
-                SizedBox(height: 14),
-                _HomeSearchBar(),
-                SizedBox(height: 22),
-                _NowPlayingModule(),
-                Padding(
-                  padding: EdgeInsets.symmetric(vertical: 18),
-                  child: Center(
-                    child: SizedBox(width: 44, child: Divider(height: 1)),
+          child: Column(
+            children: [
+              // 首页 logo 栏固定在滚动内容之外；其他页面不使用此布局。
+              const Padding(
+                padding: EdgeInsets.fromLTRB(16, 12, 16, 0),
+                child: _HomeHeader(),
+              ),
+              Expanded(
+                child: RefreshIndicator(
+                  onRefresh: () async {
+                    ref.invalidate(hotCommentProvider);
+                    ref.invalidate(homeStatisticsProvider);
+                    for (final period in LeaderboardPeriod.values) {
+                      ref.invalidate(homeLeaderboardProvider(period));
+                    }
+                    await Future.wait([
+                      ref.read(hotCommentProvider.future),
+                      ref.read(homeStatisticsProvider.future),
+                    ]);
+                  },
+                  child: ListView(
+                    physics: const AlwaysScrollableScrollPhysics(),
+                    padding: const EdgeInsets.fromLTRB(16, 14, 16, 100),
+                    children: const [
+                      _HomeSearchBar(),
+                      SizedBox(height: 22),
+                      _NowPlayingModule(),
+                      Padding(
+                        padding: EdgeInsets.symmetric(vertical: 18),
+                        child: Center(
+                          child: SizedBox(width: 44, child: Divider(height: 1)),
+                        ),
+                      ),
+                      _HotCommentModule(),
+                      SizedBox(height: 22),
+                      _ListeningStatisticsModule(),
+                      SizedBox(height: 22),
+                      _LeaderboardModule(),
+                    ],
                   ),
                 ),
-                _HotCommentModule(),
-                SizedBox(height: 22),
-                _ListeningStatisticsModule(),
-                SizedBox(height: 22),
-                _LeaderboardModule(),
-              ],
-            ),
+              ),
+            ],
           ),
         ),
       ),
@@ -595,16 +656,26 @@ class _StatisticsPanel extends StatelessWidget {
                   ],
                 ),
               ),
-              Column(
-                crossAxisAlignment: CrossAxisAlignment.end,
-                children: [
-                  _CompactMetric(
-                    label: '总听歌时长',
-                    value: _formatLongDuration(data.listenDuration),
-                  ),
-                  const SizedBox(height: 10),
-                  _CompactMetric(label: '播放次数', value: '${data.playCount} 次'),
-                ],
+              Expanded(
+                flex: 2,
+                child: Row(
+                  crossAxisAlignment: CrossAxisAlignment.end,
+                  children: [
+                    Expanded(
+                      child: _CompactMetric(
+                        label: '总听歌时长',
+                        value: _formatLongDuration(data.listenDuration),
+                      ),
+                    ),
+                    const SizedBox(width: 14),
+                    Expanded(
+                      child: _CompactMetric(
+                        label: '播放次数',
+                        value: '${data.playCount} 次',
+                      ),
+                    ),
+                  ],
+                ),
               ),
             ],
           ),
@@ -617,7 +688,7 @@ class _StatisticsPanel extends StatelessWidget {
             physics: const NeverScrollableScrollPhysics(),
             crossAxisSpacing: 10,
             mainAxisSpacing: 10,
-            childAspectRatio: 1.8,
+            childAspectRatio: 2.25,
             children: [
               _StatMetricTile(
                 label: '曲库总时长',
@@ -666,9 +737,16 @@ class _CompactMetric extends StatelessWidget {
           ),
         ),
         const SizedBox(height: 3),
-        Text(
-          value,
-          style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w800),
+        Align(
+          alignment: Alignment.centerRight,
+          child: FittedBox(
+            fit: BoxFit.scaleDown,
+            child: Text(
+              value,
+              maxLines: 1,
+              style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w800),
+            ),
+          ),
         ),
       ],
     );
@@ -689,12 +767,8 @@ class _StatMetricTile extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 13, vertical: 11),
-      decoration: BoxDecoration(
-        color: theme.colorScheme.surfaceContainerHigh.withValues(alpha: 0.68),
-        borderRadius: BorderRadius.circular(14),
-      ),
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 6),
       child: Column(
         mainAxisAlignment: MainAxisAlignment.center,
         crossAxisAlignment: CrossAxisAlignment.start,

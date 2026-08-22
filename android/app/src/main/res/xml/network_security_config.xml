@@ -8,4 +8,8 @@
     <domain-config cleartextTrafficPermitted="true">
         <domain includeSubdomains="false">www2.kugou.kugou.com</domain>
     </domain-config>
+    <!-- XY Music 官方服务当前与桌面端一致，直接监听 HTTP 8081。仅对此 IP 放行明文请求。 -->
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="false">156.233.228.213</domain>
+    </domain-config>
 </network-security-config>

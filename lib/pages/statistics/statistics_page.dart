@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 
 import 'package:flutter/material.dart';
@@ -29,6 +30,8 @@ class _StatisticsData {
 final _statisticsProvider = FutureProvider.autoDispose<_StatisticsData>((
   ref,
 ) async {
+  final refreshTimer = Timer(const Duration(minutes: 1), ref.invalidateSelf);
+  ref.onDispose(refreshTimer.cancel);
   final dbPath = await ref.watch(dbPathProvider.future);
   // 这些接口首次打开数据库时会执行 schema 检查和旧版本迁移。串行读取可
   // 避免多个连接同时抢占 SQLite 写锁，尤其是首次进入统计页时。

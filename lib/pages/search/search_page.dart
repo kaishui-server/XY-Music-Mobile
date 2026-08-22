@@ -5,6 +5,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import '../../src/auth/auth_provider.dart';
 import '../../src/library/library_provider.dart';
 import '../../src/player/player_provider.dart';
 import '../../src/plugins/plugin_runtime.dart';
@@ -201,6 +202,16 @@ class _SearchPageState extends ConsumerState<SearchPage> {
       setState(() {
         _states[plugin.id] = _PluginSearchState(songs: songs, searched: true);
       });
+      unawaited(
+        ref
+            .read(authProvider.notifier)
+            .reportSearch(
+              keyword: keyword,
+              source: plugin.id,
+              resultCount: songs.length,
+            )
+            .catchError((_) {}),
+      );
     } catch (error) {
       if (!mounted || token != _queryToken) return;
       setState(() {
