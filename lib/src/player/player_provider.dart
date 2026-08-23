@@ -851,6 +851,15 @@ class PlayerNotifier extends StateNotifier<PlaybackState> {
           headers: source.headers,
           tag: mediaItem,
         );
+        if (!(state.current?.lyricsAttempted ?? false)) {
+          unawaited(
+            _loadLxLyrics(
+              queueIndex,
+              item.path,
+              Map<String, dynamic>.from(rawLx),
+            ),
+          );
+        }
         if (source.plugin != null && source.pluginData != null) {
           _cacheRecognizedPluginSource(
             queueIndex,
@@ -1764,6 +1773,41 @@ class PlayerNotifier extends StateNotifier<PlaybackState> {
         _markLyricsAttempted(index);
         unawaited(_persistSession());
       }
+    }
+  }
+
+  Future<void> _loadLxLyrics(
+    int index,
+    String path,
+    Map<String, dynamic> songInfo,
+  ) async {
+    try {
+      final source = songInfo['source']?.toString().trim() ?? '';
+      if (source.isEmpty) return;
+      final response = await fetchLyricFromSource(
+        source: source,
+        songInfoJson: jsonEncode(songInfo),
+      ).timeout(const Duration(seconds: 20));
+      if (response.trim().isEmpty || response.trim() == 'null') return;
+      final decoded = jsonDecode(response);
+      if (decoded is! Map) return;
+      var lyrics = '';
+      for (final key in const ['lxlyric', 'lyric', 'tlyric']) {
+        final value = decoded[key]?.toString().trim() ?? '';
+        if (value.isNotEmpty) {
+          lyrics = value;
+          break;
+        }
+      }
+      if (lyrics.isEmpty) return;
+      if (index >= 0 &&
+          index < state.queue.length &&
+          state.queue[index].path == path) {
+        _updateQueueLyrics(index, lyrics);
+        unawaited(_persistSession());
+      }
+    } catch (_) {
+      // LX 歌词属于附加能力，失败时不影响已经开始的音频播放。
     }
   }
 

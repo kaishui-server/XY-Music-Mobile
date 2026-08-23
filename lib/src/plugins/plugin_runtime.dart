@@ -21,11 +21,15 @@ class EnabledMusicPlugin {
     required this.id,
     required this.name,
     required this.path,
+    this.isLx = false,
+    this.lxSources = const [],
   });
 
   final String id;
   final String name;
   final String path;
+  final bool isLx;
+  final List<String> lxSources;
 }
 
 class PluginSearchSong {
@@ -73,6 +77,13 @@ class PluginMediaSource {
   final String lyrics;
 }
 
+String pluginSongPath(EnabledMusicPlugin plugin, PluginSearchSong song) {
+  final explicit = song.rawData['_sourcePath']?.toString().trim() ?? '';
+  if (explicit.isNotEmpty) return explicit;
+  return 'plugin://${Uri.encodeComponent(plugin.id)}/'
+      '${Uri.encodeComponent(song.id)}';
+}
+
 List<String> pluginQualityCandidates(String? preferredQuality) => <String>{
   if (preferredQuality?.trim().isNotEmpty == true) preferredQuality!.trim(),
   '320k',
@@ -97,12 +108,16 @@ Future<List<EnabledMusicPlugin>> loadEnabledMusicPlugins(Ref ref) async {
     final id = p.basenameWithoutExtension(file.path);
     if (!enabled.contains(id)) continue;
     final source = await file.readAsString();
-    // 当前移动端执行桥实现 MusicFree/CommonJS 协议。LX 插件由其事件协议
-    // 驱动，不能伪装成 MusicFree 插件放进搜索 Tab。
-    if (_looksLikeLxPlugin(source)) continue;
+    final isLx = _looksLikeLxPlugin(source);
     final metadata = PluginMetadata.parse(source);
     plugins.add(
-      EnabledMusicPlugin(id: id, name: metadata.name ?? id, path: file.path),
+      EnabledMusicPlugin(
+        id: id,
+        name: metadata.name ?? id,
+        path: file.path,
+        isLx: isLx,
+        lxSources: isLx ? _detectLxSources(source) : const [],
+      ),
     );
   }
   plugins.sort((a, b) => a.name.compareTo(b.name));
@@ -131,7 +146,21 @@ bool _looksLikeLxPlugin(String source) {
   final lower = source.toLowerCase();
   return lower.contains('lx.event.request') ||
       lower.contains('lx.event.on') ||
-      lower.contains('globalthis.lx');
+      lower.contains('globalthis.lx') ||
+      lower.contains('event_names.request') ||
+      lower.contains('server_script_config');
+}
+
+List<String> _detectLxSources(String source) {
+  const supported = ['kw', 'kg', 'tx', 'wy', 'mg'];
+  final found = <String>[];
+  for (final id in supported) {
+    if (RegExp("(?:['\"])?$id(?:['\"])?\\s*[:=]").hasMatch(source) ||
+        RegExp("['\"]$id['\"]").hasMatch(source)) {
+      found.add(id);
+    }
+  }
+  return found.isEmpty ? supported : found;
 }
 
 final enabledMusicPluginsProvider = FutureProvider<List<EnabledMusicPlugin>>(
@@ -283,6 +312,7 @@ class PluginRuntimeService {
     EnabledMusicPlugin plugin,
     String keyword,
   ) async {
+    if (plugin.isLx) return _searchLxPlugin(plugin, keyword);
     dynamic response;
     Object? pluginError;
     try {
@@ -317,6 +347,82 @@ class PluginRuntimeService {
       list = await _backfillNeteaseTrackMeta(list);
     }
     return list.map((raw) => _toSearchSong(plugin.id, raw)).toList();
+  }
+
+  Future<List<PluginSearchSong>> _searchLxPlugin(
+    EnabledMusicPlugin plugin,
+    String keyword,
+  ) async {
+    final sources = plugin.lxSources.isEmpty
+        ? const ['kw', 'kg', 'tx', 'wy', 'mg']
+        : plugin.lxSources;
+    final results = <PluginSearchSong>[];
+    final seen = <String>{};
+    Object? lastError;
+    for (final source in sources) {
+      try {
+        final rawJson = await lxSearch(
+          source: source,
+          keyword: keyword,
+          limit: 30,
+        ).timeout(const Duration(seconds: 20));
+        final decoded = jsonDecode(rawJson);
+        if (decoded is! List) continue;
+        for (final value in decoded.whereType<Map>()) {
+          final raw = _normalizeLxSearchSong(
+            source,
+            Map<String, dynamic>.from(value),
+          );
+          final path = raw['_sourcePath']?.toString() ?? '';
+          if (path.isEmpty || !seen.add(path)) continue;
+          results.add(_toSearchSong(plugin.id, raw));
+        }
+      } catch (error) {
+        lastError = error;
+      }
+    }
+    if (results.isEmpty && lastError != null) {
+      throw Exception('LX 搜索失败：${_friendlyError(lastError.toString())}');
+    }
+    return results;
+  }
+
+  static Map<String, dynamic> _normalizeLxSearchSong(
+    String fallbackSource,
+    Map<String, dynamic> raw,
+  ) {
+    final source = (raw['source'] ?? fallbackSource).toString();
+    final songmid = (raw['songmid'] ?? raw['song_mid'] ?? raw['id'] ?? '')
+        .toString();
+    final name = (raw['name'] ?? raw['title'] ?? '').toString();
+    final singer = (raw['singer'] ?? raw['artist'] ?? '').toString();
+    final album = (raw['album_name'] ?? raw['albumName'] ?? raw['album'] ?? '')
+        .toString();
+    final lx = <String, dynamic>{
+      'songmid': songmid,
+      'source': source,
+      'hash': raw['hash'],
+      'name': name,
+      'singer': singer,
+      'albumName': album,
+      'albumId': raw['album_id'] ?? raw['albumId'],
+      'strMediaMid': raw['str_media_mid'] ?? raw['strMediaMid'],
+      'songId': raw['song_id'] ?? raw['songId'],
+      'albumMid': raw['album_mid'] ?? raw['albumMid'],
+      'copyrightId': raw['copyright_id'] ?? raw['copyrightId'],
+      '_types': raw['lx_types'] ?? raw['_types'],
+    };
+    return {
+      ...raw,
+      'id': songmid,
+      'title': name,
+      'artist': singer,
+      'album': album,
+      'duration': raw['interval'] ?? raw['duration'] ?? 0,
+      'artwork': raw['img'] ?? raw['artwork'] ?? '',
+      'lx': lx,
+      '_sourcePath': 'lx://$source/${Uri.encodeComponent(songmid)}',
+    };
   }
 
   /// 按歌单 ID 或分享链接导入插件歌单。
@@ -735,6 +841,9 @@ class PluginRuntimeService {
     Map<String, dynamic> rawData, {
     String? preferredQuality,
   }) async {
+    if (plugin.isLx) {
+      return _resolveLxMediaSource(rawData, preferredQuality: preferredQuality);
+    }
     if (_runsPluginsInBackground) {
       final response = await _runPluginOperation(plugin, 'resolveMediaSource', {
         'rawData': rawData,
@@ -749,6 +858,32 @@ class PluginRuntimeService {
       rawData,
       preferredQuality: preferredQuality,
     );
+  }
+
+  Future<PluginMediaSource> _resolveLxMediaSource(
+    Map<String, dynamic> rawData, {
+    String? preferredQuality,
+  }) async {
+    final value = rawData['lx'];
+    if (value is! Map) throw Exception('LX 歌曲缺少音源元数据');
+    final songInfo = Map<String, dynamic>.from(value);
+    Object? lastError;
+    for (final quality in pluginQualityCandidates(preferredQuality)) {
+      try {
+        final response = await lxResolveUrl(
+          songInfoJson: jsonEncode(songInfo),
+          quality: quality,
+        ).timeout(const Duration(seconds: 15));
+        final decoded = jsonDecode(response);
+        final url = decoded is Map
+            ? decoded['url']?.toString().trim() ?? ''
+            : '';
+        if (url.isNotEmpty) return PluginMediaSource(url: url);
+      } catch (error) {
+        lastError = error;
+      }
+    }
+    throw Exception(lastError ?? 'LX 没有返回可播放地址');
   }
 
   Future<PluginMediaSource> _resolveMediaSourceOnCurrentIsolate(
@@ -779,11 +914,32 @@ class PluginRuntimeService {
     EnabledMusicPlugin plugin,
     Map<String, dynamic> rawData,
   ) async {
+    if (plugin.isLx) return _getLxLyrics(rawData);
     if (_runsPluginsInBackground) {
       final response = await _runPluginOperation(plugin, 'getLyrics', rawData);
       return response?.toString() ?? '';
     }
     return _getLyricsOnCurrentIsolate(plugin, rawData);
+  }
+
+  Future<String> _getLxLyrics(Map<String, dynamic> rawData) async {
+    final value = rawData['lx'];
+    if (value is! Map) return '';
+    final info = Map<String, dynamic>.from(value);
+    final source = info['source']?.toString().trim() ?? '';
+    if (source.isEmpty) return '';
+    final response = await fetchLyricFromSource(
+      source: source,
+      songInfoJson: jsonEncode(info),
+    ).timeout(const Duration(seconds: 20));
+    if (response.trim().isEmpty || response.trim() == 'null') return '';
+    final decoded = jsonDecode(response);
+    if (decoded is! Map) return '';
+    for (final key in const ['lxlyric', 'lyric', 'tlyric']) {
+      final lyrics = decoded[key]?.toString().trim() ?? '';
+      if (lyrics.isNotEmpty) return lyrics;
+    }
+    return '';
   }
 
   Future<String> _getLyricsOnCurrentIsolate(

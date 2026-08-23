@@ -180,7 +180,10 @@ class _PluginsNotifier extends AsyncNotifier<List<_PluginInfo>> {
         lower.contains('export default') ||
         lower.contains('platform') ||
         lower.contains('musicfree') ||
-        lower.contains('lx.');
+        lower.contains('lx.') ||
+        lower.contains('globalthis.lx') ||
+        lower.contains('event_names.request') ||
+        lower.contains('server_script_config');
     if (!looksLikePlugin) throw Exception('无法识别受支持的插件格式');
   }
 

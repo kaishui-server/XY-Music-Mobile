@@ -182,9 +182,7 @@ class _SearchPageState extends ConsumerState<SearchPage> {
           .where((item) => item.title.trim().isNotEmpty)
           .map(
             (item) => Song(
-              path:
-                  'plugin://${Uri.encodeComponent(plugin.id)}/'
-                  '${Uri.encodeComponent(item.id)}',
+              path: pluginSongPath(plugin, item),
               title: item.title,
               artist: item.artist,
               album: item.album,
