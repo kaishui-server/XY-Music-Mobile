@@ -1850,6 +1850,49 @@ class PlayerNotifier extends StateNotifier<PlaybackState> {
     }
   }
 
+  /// 进入播放详情页时主动完成一次歌词探测，不依赖歌词页是否已经滑到。
+  /// 网络歌曲、LX 音源和本地歌曲分别走各自的歌词来源；没有歌词时也会
+  /// 标记为已探测，交给详情页提示用户从右上角关联歌词。
+  Future<void> ensureCurrentLyricsChecked() async {
+    final index = state.queueIndex;
+    final item = state.current;
+    if (item == null ||
+        index < 0 ||
+        item.lyricsRaw?.trim().isNotEmpty == true) {
+      return;
+    }
+    if (item.lyricsAttempted) return;
+
+    switch (playbackSourceTypeFor(item)) {
+      case PlaybackSourceType.localFile:
+        await _loadLocalLyrics(index, item.path);
+      case PlaybackSourceType.plugin:
+        final pluginData = item.pluginData;
+        if (pluginData == null || pluginData.isEmpty) {
+          _markLyricsAttemptedForPath(index, item.path);
+          return;
+        }
+        final plugins = await _ref.read(enabledMusicPluginsProvider.future);
+        final plugin = plugins
+            .where((candidate) => candidate.id == item.pluginId)
+            .firstOrNull;
+        if (plugin == null) {
+          _markLyricsAttemptedForPath(index, item.path);
+          return;
+        }
+        await _loadPluginLyrics(index, plugin, item);
+      case PlaybackSourceType.lx:
+        final raw = item.pluginData?['lx'];
+        if (raw is Map) {
+          await _loadLxLyrics(index, item.path, Map<String, dynamic>.from(raw));
+        } else {
+          _markLyricsAttemptedForPath(index, item.path);
+        }
+      case PlaybackSourceType.networkUrl:
+        _markLyricsAttemptedForPath(index, item.path);
+    }
+  }
+
   void _markLyricsAttemptedForPath(int index, String path) {
     if (index < 0 ||
         index >= state.queue.length ||
