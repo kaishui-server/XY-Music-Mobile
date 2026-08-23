@@ -2390,6 +2390,7 @@ class _LyricsViewState extends ConsumerState<_LyricsView>
   bool _userScrolling = false;
   Timer? _resumeAutoScrollTimer;
   List<_LyricLine> _latestLines = const [];
+  String? _noLyricsNoticePath;
 
   @override
   bool get wantKeepAlive => true;
@@ -2398,6 +2399,7 @@ class _LyricsViewState extends ConsumerState<_LyricsView>
   void didUpdateWidget(_LyricsView oldWidget) {
     super.didUpdateWidget(oldWidget);
     if (oldWidget.item.path != widget.item.path) {
+      _noLyricsNoticePath = null;
       _coarseScrollTarget = -1;
       _lastScrollTarget = -1;
       _pendingScrollTarget = -1;
@@ -2435,18 +2437,18 @@ class _LyricsViewState extends ConsumerState<_LyricsView>
       final lyrics = ref.watch(_embeddedLyricsProvider(embedded));
       content = lyrics.when(
         loading: () => const Center(child: CircularProgressIndicator()),
-        error: (_, _) => _lyricsEmpty(context, '歌词解析失败'),
+        error: (_, _) => _lyricsEmpty(context, '歌词解析失败', notifyNoLyrics: true),
         data: (lines) => _buildLines(lines, position, effectMode),
       );
     } else if (widget.item.pluginId != null && !widget.item.lyricsAttempted) {
       content = _lyricsEmpty(context, '正在获取歌词…');
     } else if (widget.item.pluginId != null) {
-      content = _lyricsEmpty(context, '暂无歌词');
+      content = _lyricsEmpty(context, '暂无歌词', notifyNoLyrics: true);
     } else {
       final lyrics = ref.watch(_lyricsProvider(widget.item.path));
       content = lyrics.when(
         loading: () => const Center(child: CircularProgressIndicator()),
-        error: (_, _) => _lyricsEmpty(context, '暂无歌词'),
+        error: (_, _) => _lyricsEmpty(context, '暂无歌词', notifyNoLyrics: true),
         data: (lines) => _buildLines(lines, position, effectMode),
       );
     }
@@ -2458,7 +2460,9 @@ class _LyricsViewState extends ConsumerState<_LyricsView>
     double position,
     LyricWordEffectMode effectMode,
   ) {
-    if (lines.isEmpty) return _lyricsEmpty(context, '暂无歌词');
+    if (lines.isEmpty) {
+      return _lyricsEmpty(context, '暂无歌词', notifyNoLyrics: true);
+    }
     _latestLines = lines;
     var active = lines.lastIndexWhere((line) => line.time <= position);
     if (active < 0) active = 0;
@@ -2670,23 +2674,49 @@ class _LyricsViewState extends ConsumerState<_LyricsView>
     );
   }
 
-  Widget _lyricsEmpty(BuildContext context, String message) => Center(
-    child: Column(
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        Icon(
-          Icons.lyrics_outlined,
-          size: 52,
-          color: Colors.white.withValues(alpha: .3),
-        ),
-        const SizedBox(height: 12),
-        Text(
-          message,
-          style: TextStyle(color: Colors.white.withValues(alpha: .5)),
-        ),
-      ],
-    ),
-  );
+  Widget _lyricsEmpty(
+    BuildContext context,
+    String message, {
+    bool notifyNoLyrics = false,
+  }) {
+    if (notifyNoLyrics) _scheduleNoLyricsNotice();
+    return Center(
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(
+            Icons.lyrics_outlined,
+            size: 52,
+            color: Colors.white.withValues(alpha: .3),
+          ),
+          const SizedBox(height: 12),
+          Text(
+            message,
+            style: TextStyle(color: Colors.white.withValues(alpha: .5)),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _scheduleNoLyricsNotice() {
+    final path = widget.item.path;
+    if (path.isEmpty || _noLyricsNoticePath == path) return;
+    _noLyricsNoticePath = path;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      final current = ref.read(playerProvider).current;
+      if (current?.path != path ||
+          current?.lyricsRaw?.trim().isNotEmpty == true) {
+        return;
+      }
+      XyNotice.show(
+        context,
+        message: '未检测到歌词，可点击右上角关联歌词',
+        type: XyNoticeType.warning,
+      );
+    });
+  }
 }
 
 class _TimedLyricText extends StatelessWidget {

@@ -747,6 +747,12 @@ class PlayerNotifier extends StateNotifier<PlaybackState> {
       state = state.copyWith(isLoading: false, errorMessage: null);
       if (plugin != null && !(state.current?.lyricsAttempted ?? false)) {
         unawaited(_loadPluginLyrics(index, plugin, item));
+      } else if (plugin == null &&
+          playbackSourceTypeFor(item) == PlaybackSourceType.localFile &&
+          !(state.current?.lyricsAttempted ?? false)) {
+        // 本地歌曲没有嵌入歌词时也要完成一次探测，避免详情页一直显示
+        // “正在获取歌词”，并让界面可以明确提示用户手动关联歌词。
+        unawaited(_loadLocalLyrics(index, item.path));
       }
     } catch (error, stackTrace) {
       if (requestId != _playRequestId) return;
@@ -1783,14 +1789,23 @@ class PlayerNotifier extends StateNotifier<PlaybackState> {
   ) async {
     try {
       final source = songInfo['source']?.toString().trim() ?? '';
-      if (source.isEmpty) return;
+      if (source.isEmpty) {
+        _markLyricsAttemptedForPath(index, path);
+        return;
+      }
       final response = await fetchLyricFromSource(
         source: source,
         songInfoJson: jsonEncode(songInfo),
       ).timeout(const Duration(seconds: 20));
-      if (response.trim().isEmpty || response.trim() == 'null') return;
+      if (response.trim().isEmpty || response.trim() == 'null') {
+        _markLyricsAttemptedForPath(index, path);
+        return;
+      }
       final decoded = jsonDecode(response);
-      if (decoded is! Map) return;
+      if (decoded is! Map) {
+        _markLyricsAttemptedForPath(index, path);
+        return;
+      }
       var lyrics = '';
       for (final key in const ['lxlyric', 'lyric', 'tlyric']) {
         final value = decoded[key]?.toString().trim() ?? '';
@@ -1799,7 +1814,10 @@ class PlayerNotifier extends StateNotifier<PlaybackState> {
           break;
         }
       }
-      if (lyrics.isEmpty) return;
+      if (lyrics.isEmpty) {
+        _markLyricsAttemptedForPath(index, path);
+        return;
+      }
       if (index >= 0 &&
           index < state.queue.length &&
           state.queue[index].path == path) {
@@ -1808,7 +1826,38 @@ class PlayerNotifier extends StateNotifier<PlaybackState> {
       }
     } catch (_) {
       // LX 歌词属于附加能力，失败时不影响已经开始的音频播放。
+      _markLyricsAttemptedForPath(index, path);
     }
+  }
+
+  Future<void> _loadLocalLyrics(int index, String path) async {
+    try {
+      final dbPath = await _ref.read(dbPathProvider.future);
+      final lyrics = await getSongLyrics(dbPath: dbPath, path: path);
+      if (index < 0 ||
+          index >= state.queue.length ||
+          state.queue[index].path != path) {
+        return;
+      }
+      if (lyrics.trim().isNotEmpty) {
+        _updateQueueLyrics(index, lyrics);
+      } else {
+        _markLyricsAttempted(index);
+      }
+      unawaited(_persistSession());
+    } catch (_) {
+      _markLyricsAttemptedForPath(index, path);
+    }
+  }
+
+  void _markLyricsAttemptedForPath(int index, String path) {
+    if (index < 0 ||
+        index >= state.queue.length ||
+        state.queue[index].path != path) {
+      return;
+    }
+    _markLyricsAttempted(index);
+    unawaited(_persistSession());
   }
 
   void _markLyricsAttempted(int index) {
