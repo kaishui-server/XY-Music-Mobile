@@ -296,11 +296,6 @@ class _SearchPageState extends ConsumerState<SearchPage> {
               ),
               onTap: () => _searchFromHistory(_history[index]),
             ),
-            if (index != _history.length - 1)
-              Divider(
-                height: 1,
-                color: scheme.outlineVariant.withValues(alpha: .45),
-              ),
           ],
           const SizedBox(height: 34),
         ],
