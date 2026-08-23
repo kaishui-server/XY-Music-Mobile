@@ -957,13 +957,16 @@ class _Avatar extends StatelessWidget {
     final fallbackChar = user.nickname.isEmpty
         ? '?'
         : String.fromCharCode(user.nickname.runes.first);
+    // 头像必须始终在一个正方形约束内按比例裁剪，否则服务端返回的
+    // 竖图/横图会按自身尺寸参与布局，导致圆形框四周留白不一致。
+    // 外层白色圆环固定为 3px，内层再单独裁成圆形，保证上下左右一致。
     return Container(
       width: 96,
       height: 96,
+      padding: const EdgeInsets.all(3),
       decoration: BoxDecoration(
         shape: BoxShape.circle,
-        color: scheme.primary,
-        border: Border.all(color: scheme.surface, width: 3),
+        color: Colors.white,
         boxShadow: [
           BoxShadow(
             color: Colors.black.withValues(alpha: 0.2),
@@ -972,15 +975,21 @@ class _Avatar extends StatelessWidget {
           ),
         ],
       ),
-      clipBehavior: Clip.antiAlias,
-      child: hasAvatar
-          ? UserAvatarImage(
-              source: avatar,
-              fit: BoxFit.cover,
-              errorBuilder: (_, _, _) =>
-                  _fallback(fallbackChar, scheme.onPrimary),
-            )
-          : _fallback(fallbackChar, scheme.onPrimary),
+      child: ClipOval(
+        child: SizedBox.expand(
+          child: hasAvatar
+              ? UserAvatarImage(
+                  source: avatar,
+                  fit: BoxFit.cover,
+                  errorBuilder: (_, _, _) =>
+                      _fallback(fallbackChar, scheme.onPrimary),
+                )
+              : ColoredBox(
+                  color: scheme.primary,
+                  child: _fallback(fallbackChar, scheme.onPrimary),
+                ),
+        ),
+      ),
     );
   }
 
