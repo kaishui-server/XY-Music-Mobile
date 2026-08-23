@@ -343,16 +343,36 @@ class _PluginsNotifier extends AsyncNotifier<List<_PluginInfo>> {
   }
 
   Future<void> remove(_PluginInfo plugin) async {
-    final file = File(plugin.path);
-    if (file.existsSync()) await file.delete();
+    await removeMany([plugin]);
+  }
+
+  Future<void> removeMany(Iterable<_PluginInfo> plugins) async {
+    final targets = plugins.toList(growable: false);
+    if (targets.isEmpty) return;
+    for (final plugin in targets) {
+      try {
+        final file = File(plugin.path);
+        if (file.existsSync()) await file.delete();
+      } catch (_) {
+        // 继续删除其它插件，最后以刷新后的实际列表为准。
+      }
+    }
     final prefs = await SharedPreferences.getInstance();
+    final ids = targets.map((plugin) => plugin.id).toSet();
     final enabled = (prefs.getStringList(_enabledKey) ?? const []).toSet()
-      ..remove(plugin.id);
+      ..removeAll(ids);
     await prefs.setStringList(_enabledKey, enabled.toList());
-    final sources = _readSourceUrls(prefs)..remove(plugin.id);
+    final sources = _readSourceUrls(prefs);
+    for (final id in ids) {
+      sources.remove(id);
+    }
     await prefs.setString(_sourceUrlsKey, jsonEncode(sources));
     state = AsyncData(await _load());
     ref.invalidate(enabledMusicPluginsProvider);
+  }
+
+  Future<void> removeAll() async {
+    await removeMany(state.valueOrNull ?? const []);
   }
 }
 
@@ -372,6 +392,8 @@ class _PluginsPageState extends ConsumerState<PluginsPage> {
   final TextEditingController _installUrlController = TextEditingController();
   String _query = '';
   bool _busy = false;
+  bool _selectionMode = false;
+  final Set<String> _selectedIds = <String>{};
 
   @override
   void dispose() {
@@ -578,6 +600,79 @@ class _PluginsPageState extends ConsumerState<PluginsPage> {
     }
   }
 
+  Future<void> _removeSelected(List<_PluginInfo> items) async {
+    final selected = items
+        .where((plugin) => _selectedIds.contains(plugin.id))
+        .toList();
+    if (selected.isEmpty) return;
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('批量删除插件'),
+        content: Text('确定删除选中的 ${selected.length} 个插件吗？'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext, false),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(dialogContext, true),
+            child: const Text('删除'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) return;
+    setState(() => _busy = true);
+    try {
+      await ref.read(_pluginsProvider.notifier).removeMany(selected);
+      if (mounted) {
+        setState(() {
+          _selectedIds.clear();
+          _selectionMode = false;
+        });
+        XyNotice.show(context, message: '已删除 ${selected.length} 个插件');
+      }
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  Future<void> _removeAll(List<_PluginInfo> items) async {
+    if (items.isEmpty) return;
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('删除全部插件'),
+        content: Text('确定删除全部 ${items.length} 个插件吗？此操作不可恢复。'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext, false),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(dialogContext, true),
+            child: const Text('全部删除'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) return;
+    setState(() => _busy = true);
+    try {
+      await ref.read(_pluginsProvider.notifier).removeAll();
+      if (mounted) {
+        setState(() {
+          _selectedIds.clear();
+          _selectionMode = false;
+        });
+        XyNotice.show(context, message: '已删除全部插件');
+      }
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     final plugins = ref.watch(_pluginsProvider);
@@ -588,6 +683,9 @@ class _PluginsPageState extends ConsumerState<PluginsPage> {
           loading: () => const Center(child: CircularProgressIndicator()),
           error: (error, _) => Center(child: Text('插件加载失败：$error')),
           data: (items) {
+            _selectedIds.removeWhere(
+              (id) => !items.any((plugin) => plugin.id == id),
+            );
             final query = _query.trim().toLowerCase();
             final filtered = query.isEmpty
                 ? items
@@ -630,6 +728,61 @@ class _PluginsPageState extends ConsumerState<PluginsPage> {
                         ),
                       ],
                     ),
+                    if (items.isNotEmpty) ...[
+                      const SizedBox(height: 8),
+                      Wrap(
+                        spacing: 8,
+                        runSpacing: 8,
+                        children: [
+                          OutlinedButton.icon(
+                            onPressed: _busy
+                                ? null
+                                : () => setState(() {
+                                    _selectionMode = !_selectionMode;
+                                    if (!_selectionMode) _selectedIds.clear();
+                                  }),
+                            icon: Icon(
+                              _selectionMode
+                                  ? Icons.close_rounded
+                                  : Icons.checklist_rounded,
+                            ),
+                            label: Text(_selectionMode ? '退出选择' : '批量管理'),
+                          ),
+                          if (_selectionMode)
+                            OutlinedButton.icon(
+                              onPressed: _busy
+                                  ? null
+                                  : () => setState(() {
+                                      final visibleIds = filtered
+                                          .map((plugin) => plugin.id)
+                                          .toSet();
+                                      if (visibleIds.every(
+                                        _selectedIds.contains,
+                                      )) {
+                                        _selectedIds.removeAll(visibleIds);
+                                      } else {
+                                        _selectedIds.addAll(visibleIds);
+                                      }
+                                    }),
+                              icon: const Icon(Icons.select_all_rounded),
+                              label: const Text('全选当前结果'),
+                            ),
+                          if (_selectionMode)
+                            FilledButton.icon(
+                              onPressed: _busy || _selectedIds.isEmpty
+                                  ? null
+                                  : () => _removeSelected(items),
+                              icon: const Icon(Icons.delete_outline_rounded),
+                              label: Text('删除选中（${_selectedIds.length}）'),
+                            ),
+                          OutlinedButton.icon(
+                            onPressed: _busy ? null : () => _removeAll(items),
+                            icon: const Icon(Icons.delete_sweep_outlined),
+                            label: const Text('删除全部'),
+                          ),
+                        ],
+                      ),
+                    ],
                     const SizedBox(height: 10),
                     TextField(
                       onChanged: (value) => setState(() => _query = value),
@@ -654,6 +807,13 @@ class _PluginsPageState extends ConsumerState<PluginsPage> {
                         _PluginCard(
                           plugin: plugin,
                           busy: _busy,
+                          selectable: _selectionMode,
+                          selected: _selectedIds.contains(plugin.id),
+                          onSelect: (value) => setState(() {
+                            value
+                                ? _selectedIds.add(plugin.id)
+                                : _selectedIds.remove(plugin.id);
+                          }),
                           onToggle: (value) => ref
                               .read(_pluginsProvider.notifier)
                               .toggle(plugin, value),
@@ -812,6 +972,9 @@ class _PluginCard extends StatelessWidget {
   const _PluginCard({
     required this.plugin,
     required this.busy,
+    required this.selectable,
+    required this.selected,
+    required this.onSelect,
     required this.onToggle,
     required this.onUpdate,
     required this.onRemove,
@@ -819,6 +982,9 @@ class _PluginCard extends StatelessWidget {
 
   final _PluginInfo plugin;
   final bool busy;
+  final bool selectable;
+  final bool selected;
+  final ValueChanged<bool> onSelect;
   final ValueChanged<bool> onToggle;
   final VoidCallback? onUpdate;
   final VoidCallback onRemove;
@@ -838,6 +1004,11 @@ class _PluginCard extends StatelessWidget {
       ),
       child: Row(
         children: [
+          if (selectable)
+            Checkbox(
+              value: selected,
+              onChanged: busy ? null : (value) => onSelect(value ?? false),
+            ),
           Container(
             width: 46,
             height: 46,

@@ -75,7 +75,7 @@ class PlaylistDetailPage extends ConsumerWidget {
                     const Spacer(),
                     FilledButton.icon(
                       onPressed: () =>
-                          ref.read(libraryProvider.notifier).playList(songs, 0),
+                          ref.read(libraryProvider.notifier).playAll(songs),
                       icon: const Icon(Icons.play_arrow_rounded),
                       label: const Text('播放全部'),
                     ),

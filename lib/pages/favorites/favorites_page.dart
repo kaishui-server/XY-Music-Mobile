@@ -129,7 +129,7 @@ class FavoritesPage extends ConsumerWidget {
                             FilledButton.tonalIcon(
                               onPressed: () => ref
                                   .read(libraryProvider.notifier)
-                                  .playList(songs, 0),
+                                  .playAll(songs),
                               icon: const Icon(Icons.play_arrow, size: 20),
                               label: const Text('播放全部'),
                             ),

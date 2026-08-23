@@ -7,6 +7,8 @@ import 'package:shared_preferences/shared_preferences.dart';
 import '../auth/auth_provider.dart';
 import '../core/db_path.dart';
 import '../library/library_provider.dart';
+import '../recent/recent_provider.dart';
+import '../recent/recent_store.dart';
 import '../rust/api.dart';
 
 const _hotCommentApi = 'https://api.fuchenboke.cn/api/wangyi.php';
@@ -158,12 +160,14 @@ final homeStatisticsProvider = FutureProvider<HomeStatisticsData>((ref) async {
   final library = Map<String, dynamic>.from(jsonDecode(libraryRaw) as Map);
   final behavior = Map<String, dynamic>.from(jsonDecode(behaviorRaw) as Map);
   final listen = Map<String, dynamic>.from(jsonDecode(listenRaw) as Map);
+  final snapshots = await loadRecentSongSnapshots();
   final top = behavior['top_songs'] is List
       ? behavior['top_songs'] as List
       : const [];
   final first = top.whereType<Map>().firstOrNull;
   final mostPath = first?['song_path']?.toString() ?? '';
-  final mostPlayed = songs.where((song) => song.path == mostPath).firstOrNull;
+  final mostPlayed = songs.where((song) => song.path == mostPath).firstOrNull ??
+      songFromRecentSnapshot(snapshots[mostPath]);
   return HomeStatisticsData(
     totalSongs: (library['total_songs'] as num?)?.toInt() ?? songs.length,
     libraryDuration: (library['total_duration'] as num?)?.toInt() ?? 0,

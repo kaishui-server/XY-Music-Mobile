@@ -109,6 +109,24 @@ Future<List<EnabledMusicPlugin>> loadEnabledMusicPlugins(Ref ref) async {
   return plugins;
 }
 
+/// 即使插件已停用，也尽量从仍存在的脚本中读取原显示名；插件文件已删除时
+/// 返回 null，由调用方使用歌曲快照或插件 ID 兜底。
+Future<String?> loadInstalledMusicPluginName(Ref ref, String pluginId) async {
+  final normalizedId = pluginId.trim();
+  if (normalizedId.isEmpty) return null;
+  try {
+    final dataDir = await ref.read(appDataDirProvider.future);
+    final file = File(p.join(dataDir, 'plugins', '$normalizedId.js'));
+    if (!await file.exists()) return null;
+    final metadata = PluginMetadata.parse(await file.readAsString());
+    return metadata.name?.trim().isNotEmpty == true
+        ? metadata.name!.trim()
+        : normalizedId;
+  } catch (_) {
+    return null;
+  }
+}
+
 bool _looksLikeLxPlugin(String source) {
   final lower = source.toLowerCase();
   return lower.contains('lx.event.request') ||

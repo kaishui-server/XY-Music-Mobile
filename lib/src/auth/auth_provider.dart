@@ -4,6 +4,7 @@ import 'dart:math';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter/services.dart';
+import 'package:image/image.dart' as img;
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../core/db_path.dart';
@@ -451,7 +452,7 @@ class AuthNotifier extends StateNotifier<AuthState> {
   }
 
   /// 用户注册（注册成功后自动登录）。
-  Future<void> register({
+  Future<String?> register({
     required String ciyuanxiId,
     required String nickname,
     required String password,
@@ -477,8 +478,11 @@ class AuthNotifier extends StateNotifier<AuthState> {
         throw AuthException('注册响应无效');
       }
       await _saveAuth(token.toString(), data);
+      final notice = data['registration_notice']?.toString().trim() ?? '';
+      return notice.isEmpty ? null : notice;
     } catch (e) {
       state = state.copyWith(loading: false, error: _msg(e, '注册失败'));
+      return null;
     }
   }
 
@@ -491,6 +495,72 @@ class AuthNotifier extends StateNotifier<AuthState> {
       'ciyuanxi_id': ciyuanxiId,
     }, fetchTimeoutMs: 15000);
     await _replaceStoredUser(AuthUser.fromJson(data));
+  }
+
+  /// 上传头像并提交审核。移动端先把图片缩放为 256px JPEG，
+  /// 与电脑版保持相同的审核接口和体积限制。
+  Future<String> uploadAvatar(Uint8List bytes) async {
+    final current = state.user;
+    final ciyuanxiId = current?.ciyuanxiId?.trim() ?? '';
+    if (current == null || ciyuanxiId.isEmpty) {
+      throw AuthException('请先登录');
+    }
+    if (bytes.isEmpty) throw AuthException('请选择有效的图片');
+
+    final decoded = img.decodeImage(bytes);
+    if (decoded == null) throw AuthException('图片读取失败，请更换图片');
+    final source = img.bakeOrientation(decoded);
+    final maxSide = source.width > source.height ? source.width : source.height;
+    final resized = maxSide > 256
+        ? img.copyResize(
+            source,
+            width: source.width >= source.height
+                ? 256
+                : (source.width * 256 / source.height).round(),
+            height: source.height >= source.width
+                ? 256
+                : (source.height * 256 / source.width).round(),
+            interpolation: img.Interpolation.average,
+          )
+        : source;
+
+    var quality = 80;
+    var encoded = Uint8List.fromList(img.encodeJpg(resized, quality: quality));
+    while (encoded.length > 135 * 1024 && quality > 35) {
+      quality -= 10;
+      encoded = Uint8List.fromList(img.encodeJpg(resized, quality: quality));
+    }
+    final avatarData = 'data:image/jpeg;base64,${base64Encode(encoded)}';
+    if (avatarData.length > 195 * 1024) {
+      throw AuthException('图片压缩后仍然过大，请选择更简单的图片');
+    }
+
+    final data = await _requestAction('upload_avatar', {
+      'ciyuanxi_id': ciyuanxiId,
+      'avatar_data': avatarData,
+    }, fetchTimeoutMs: 55000);
+    final status = data['status']?.toString().trim().toLowerCase() ?? '';
+    if (status == 'approved') {
+      await refreshProfile();
+      return '头像已通过审核并生效';
+    }
+    return '头像已上传，等待管理员审核';
+  }
+
+  /// 查询当前头像审核状态：none / pending / rejected。
+  Future<String> fetchAvatarStatus() async {
+    final current = state.user;
+    final ciyuanxiId = current?.ciyuanxiId?.trim() ?? '';
+    if (current == null || ciyuanxiId.isEmpty) return 'none';
+    final data = await _requestAction('get_avatar_status', {
+      'ciyuanxi_id': ciyuanxiId,
+    }, fetchTimeoutMs: 15000);
+    final status = data['status']?.toString().trim().toLowerCase() ?? 'none';
+    return switch (status) {
+      'pending' => 'pending',
+      'rejected' => 'rejected',
+      _ => 'none',
+    };
   }
 
   /// 提交昵称修改。服务端可能立即机审通过，也可能进入人工审核。

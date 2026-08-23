@@ -1,7 +1,7 @@
 use crate::music::utils::{format_distribution_bucket, is_lossless_audio, normalize_path};
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -1548,60 +1548,9 @@ fn aggregate_behavior_stats(conn: &rusqlite::Connection) -> Result<BehaviorStats
 
     let global = query_global_stats(conn)?;
     let song_entries = query_song_stats(conn)?;
-    let index = build_library_match_index(conn)?;
-
-    let mut top_songs = Vec::new();
-    let mut seen_paths = HashSet::new();
-    for entry in song_entries
-        .iter()
-        .filter(|entry| entry.song_stats.play_count > 0)
-    {
-        let Some(candidate) = match_song_identity(&index, &entry.song_identity) else {
-            continue;
-        };
-        if !seen_paths.insert(candidate.path.clone()) {
-            continue;
-        }
-        top_songs.push(TopSong {
-            song_path: candidate.path,
-            play_count: entry.song_stats.play_count,
-            value: entry.song_stats.play_count,
-        });
-        if top_songs.len() >= 5 {
-            break;
-        }
-    }
-
-    let mut duration_entries = song_entries.clone();
-    duration_entries.sort_by(|left, right| {
-        right
-            .song_stats
-            .play_time_ms
-            .cmp(&left.song_stats.play_time_ms)
-            .then_with(|| right.song_stats.play_count.cmp(&left.song_stats.play_count))
-    });
-
-    let mut top_songs_by_duration = Vec::new();
-    let mut seen_duration_paths = HashSet::new();
-    for entry in duration_entries
-        .iter()
-        .filter(|entry| entry.song_stats.play_time_ms > 0)
-    {
-        let Some(candidate) = match_song_identity(&index, &entry.song_identity) else {
-            continue;
-        };
-        if !seen_duration_paths.insert(candidate.path.clone()) {
-            continue;
-        }
-        top_songs_by_duration.push(TopSong {
-            song_path: candidate.path,
-            play_count: entry.song_stats.play_count,
-            value: entry.song_stats.play_time_ms / 1000,
-        });
-        if top_songs_by_duration.len() >= 5 {
-            break;
-        }
-    }
+    // 直接按播放历史中的路径统计，不能再通过 songs 表反查：网络歌曲不在本地曲库，
+    // 但 play_history 仍保留了它的 plugin:// / lx:// 路径。
+    let (top_songs, top_songs_by_duration) = query_top_history_songs(conn, None)?;
 
     let mut artist_map = HashMap::<String, i64>::new();
     let mut album_map = HashMap::<String, i64>::new();
@@ -1682,6 +1631,63 @@ fn aggregate_behavior_stats(conn: &rusqlite::Connection) -> Result<BehaviorStats
         hour_distribution,
         recent_activity,
     })
+}
+
+fn query_top_history_songs(
+    conn: &rusqlite::Connection,
+    time_condition: Option<&str>,
+) -> Result<(Vec<TopSong>, Vec<TopSong>), String> {
+    let condition = time_condition.unwrap_or("");
+    let sql_top_plays = format!(
+        "SELECT ph.song_path, COUNT(*) AS cnt
+         FROM play_history ph
+         WHERE ph.event = 'play' {condition}
+         GROUP BY ph.song_path
+         ORDER BY cnt DESC, ph.song_path COLLATE NOCASE ASC
+         LIMIT 5"
+    );
+    let mut top_songs = Vec::new();
+    let mut stmt = conn.prepare(&sql_top_plays).map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([], |row| {
+            let count: i64 = row.get(1)?;
+            Ok(TopSong {
+                song_path: row.get(0)?,
+                play_count: count,
+                value: count,
+            })
+        })
+        .map_err(|e| e.to_string())?;
+    for row in rows.flatten() {
+        top_songs.push(row);
+    }
+
+    let sql_top_duration = format!(
+        "SELECT ph.song_path, COALESCE(SUM(ph.played_seconds), 0) AS duration
+         FROM play_history ph
+         WHERE ph.event IN ('play', 'play_time') {condition}
+         GROUP BY ph.song_path
+         ORDER BY duration DESC, ph.song_path COLLATE NOCASE ASC
+         LIMIT 5"
+    );
+    let mut top_songs_by_duration = Vec::new();
+    let mut stmt = conn
+        .prepare(&sql_top_duration)
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok(TopSong {
+                song_path: row.get(0)?,
+                play_count: 0,
+                value: row.get(1)?,
+            })
+        })
+        .map_err(|e| e.to_string())?;
+    for row in rows.flatten() {
+        top_songs_by_duration.push(row);
+    }
+
+    Ok((top_songs, top_songs_by_duration))
 }
 
 fn insert_history_event(
@@ -2480,8 +2486,8 @@ pub fn get_behavior_stats(
         None => String::new(),
     };
 
-    // 通过所有历史版本都具备的 song_path 关联曲库，避免旧库缺少 song_id 时整页报错。
-    let base_join = "FROM play_history ph INNER JOIN songs s ON s.path = ph.song_path";
+    // 使用 LEFT JOIN 保留网络歌曲；它们没有本地 songs 记录，但仍在 play_history 中。
+    let base_join = "FROM play_history ph LEFT JOIN songs s ON s.path = ph.song_path";
 
     // 指标 A1: 播放次数
     let sql_plays = format!(
@@ -2503,10 +2509,10 @@ pub fn get_behavior_stats(
 
     // 指标 B1: Top 5 歌曲 (按次数)
     let sql_top_plays = format!(
-        "SELECT s.path, COUNT(*) as cnt 
+        "SELECT ph.song_path, COUNT(*) as cnt
          {} 
          WHERE ph.event = 'play' {}
-         GROUP BY s.path
+         GROUP BY ph.song_path
          ORDER BY cnt DESC 
          LIMIT 5",
         base_join, time_condition
@@ -2531,10 +2537,10 @@ pub fn get_behavior_stats(
 
     // 指标 B2: Top 5 歌曲 (按时长)
     let sql_top_duration = format!(
-        "SELECT s.path, COALESCE(SUM(ph.played_seconds), 0) as duration 
+        "SELECT ph.song_path, COALESCE(SUM(ph.played_seconds), 0) as duration
          {} 
          WHERE ph.event IN ('play', 'play_time') {}
-         GROUP BY s.path
+         GROUP BY ph.song_path
          ORDER BY duration DESC 
          LIMIT 5",
         base_join, time_condition
@@ -2654,8 +2660,7 @@ pub fn get_behavior_stats(
         let sql_activity = format!(
             "SELECT CAST((ph.played_at - {}) / {} AS INTEGER) as day_offset, 
                     COALESCE(SUM(ph.played_seconds), 0) as duration 
-             FROM play_history ph 
-             INNER JOIN songs s ON s.path = ph.song_path
+             FROM play_history ph
              WHERE ph.played_at >= {} AND ph.event IN ('play', 'play_time')
              GROUP BY day_offset",
             start_time, day_seconds, start_time

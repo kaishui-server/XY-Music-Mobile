@@ -4,6 +4,12 @@ import 'package:shared_preferences/shared_preferences.dart';
 /// 主题模式
 enum ThemeModePreference { system, light, dark }
 
+/// 歌词逐字高亮样式。
+///
+/// `wordByWord` 是旧版逐词切换高亮，`progressive` 会在每个词内部从左到右
+/// 逐渐填充高亮，`none` 则使用普通歌词文本。
+enum LyricWordEffectMode { wordByWord, progressive, none }
+
 /// 扫描支持的主流音频格式大类（与 Rust 白名单展开对应）。
 const kSupportedScanFormats = <String>[
   'flac',
@@ -37,7 +43,7 @@ class AppSettings {
     this.onlineDefaultQuality = '320k',
     this.libraryMinDurationSeconds = 0,
     this.showLyricsTranslation = true,
-    this.enableWordEffect = true,
+    this.lyricWordEffectMode = LyricWordEffectMode.progressive,
     this.downloadPath = '',
     this.downloadQuality = '320k',
     this.downloadLyrics = true,
@@ -55,7 +61,10 @@ class AppSettings {
   final String onlineDefaultQuality;
   final int libraryMinDurationSeconds;
   final bool showLyricsTranslation;
-  final bool enableWordEffect;
+  final LyricWordEffectMode lyricWordEffectMode;
+
+  /// 兼容旧调用方：只要不是“不显示逐字”就视为已开启逐字效果。
+  bool get enableWordEffect => lyricWordEffectMode != LyricWordEffectMode.none;
   final String downloadPath;
   final String downloadQuality;
   final bool downloadLyrics;
@@ -73,7 +82,7 @@ class AppSettings {
     String? onlineDefaultQuality,
     int? libraryMinDurationSeconds,
     bool? showLyricsTranslation,
-    bool? enableWordEffect,
+    LyricWordEffectMode? lyricWordEffectMode,
     String? downloadPath,
     String? downloadQuality,
     bool? downloadLyrics,
@@ -93,7 +102,8 @@ class AppSettings {
           libraryMinDurationSeconds ?? this.libraryMinDurationSeconds,
       showLyricsTranslation:
           showLyricsTranslation ?? this.showLyricsTranslation,
-      enableWordEffect: enableWordEffect ?? this.enableWordEffect,
+      lyricWordEffectMode:
+          lyricWordEffectMode ?? this.lyricWordEffectMode,
       downloadPath: downloadPath ?? this.downloadPath,
       downloadQuality: downloadQuality ?? this.downloadQuality,
       downloadLyrics: downloadLyrics ?? this.downloadLyrics,
@@ -118,7 +128,7 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
       onlineDefaultQuality: prefs.getString('onlineDefaultQuality') ?? '320k',
       libraryMinDurationSeconds: prefs.getInt('libraryMinDurationSeconds') ?? 0,
       showLyricsTranslation: prefs.getBool('showLyricsTranslation') ?? true,
-      enableWordEffect: prefs.getBool('enableWordEffect') ?? true,
+      lyricWordEffectMode: _lyricWordEffectModeFromPrefs(prefs),
       downloadPath: prefs.getString('downloadPath') ?? '',
       downloadQuality: prefs.getString('downloadQuality') ?? '320k',
       downloadLyrics: prefs.getBool('downloadLyrics') ?? true,
@@ -139,6 +149,25 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
     }
   }
 
+  LyricWordEffectMode _lyricWordEffectModeFromPrefs(
+    SharedPreferences prefs,
+  ) {
+    final stored = prefs.getInt('lyricWordEffectMode');
+    if (stored != null &&
+        stored >= 0 &&
+        stored < LyricWordEffectMode.values.length) {
+      return LyricWordEffectMode.values[stored];
+    }
+    // 旧版本只有 bool：已有用户继续保留原来的逐词样式；新用户默认渐进填充。
+    final legacy = prefs.getBool('enableWordEffect');
+    if (legacy != null) {
+      return legacy
+          ? LyricWordEffectMode.wordByWord
+          : LyricWordEffectMode.none;
+    }
+    return LyricWordEffectMode.progressive;
+  }
+
   Future<SharedPreferences> _prefs() => SharedPreferences.getInstance();
 
   Future<void> _save(AppSettings next) async {
@@ -155,7 +184,7 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
       prefs.setString('onlineDefaultQuality', next.onlineDefaultQuality),
       prefs.setInt('libraryMinDurationSeconds', next.libraryMinDurationSeconds),
       prefs.setBool('showLyricsTranslation', next.showLyricsTranslation),
-      prefs.setBool('enableWordEffect', next.enableWordEffect),
+      prefs.setInt('lyricWordEffectMode', next.lyricWordEffectMode.index),
       prefs.setString('downloadPath', next.downloadPath),
       prefs.setString('downloadQuality', next.downloadQuality),
       prefs.setBool('downloadLyrics', next.downloadLyrics),
@@ -199,8 +228,15 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
       showLyricsTranslation: v,
     ),
   );
-  Future<void> setEnableWordEffect(bool v) => _save(
-    (state.valueOrNull ?? const AppSettings()).copyWith(enableWordEffect: v),
+  Future<void> setLyricWordEffectMode(LyricWordEffectMode mode) => _save(
+    (state.valueOrNull ?? const AppSettings()).copyWith(
+      lyricWordEffectMode: mode,
+    ),
+  );
+
+  /// 兼容旧调用方，新的设置页面使用三档模式接口。
+  Future<void> setEnableWordEffect(bool v) => setLyricWordEffectMode(
+    v ? LyricWordEffectMode.wordByWord : LyricWordEffectMode.none,
   );
   Future<void> setDownloadPath(String p) => _save(
     (state.valueOrNull ?? const AppSettings()).copyWith(downloadPath: p),

@@ -120,7 +120,7 @@ class _RecentSongs extends ConsumerWidget {
               const Spacer(),
               FilledButton.tonalIcon(
                 onPressed: () =>
-                    ref.read(libraryProvider.notifier).playList(songs, 0),
+                    ref.read(libraryProvider.notifier).playAll(songs),
                 icon: const Icon(Icons.play_arrow, size: 20),
                 label: const Text('播放全部'),
               ),
@@ -169,7 +169,7 @@ class _RecentAlbums extends ConsumerWidget {
         final first = songs.first;
         return InkWell(
           borderRadius: BorderRadius.circular(16),
-          onTap: () => ref.read(libraryProvider.notifier).playList(songs, 0),
+          onTap: () => ref.read(libraryProvider.notifier).playAll(songs),
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [

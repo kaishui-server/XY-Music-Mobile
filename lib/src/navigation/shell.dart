@@ -1,15 +1,20 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 
 import '../playlists/playlists_provider.dart';
+import '../player/player_provider.dart';
 import '../ui/xy_theme.dart';
 import '../widgets/mini_player_bar.dart';
+import '../widgets/top_notice.dart';
 import 'sidebar_controller.dart';
 
 // 暂时从移动端侧栏隐藏，保留路由和组件，之后可直接恢复。
 const _showArtistAndAlbumShortcuts = false;
 const _showPlaylistSection = false;
+int? _activeRelinkProposalId;
 
 /// 电脑端侧栏与迷你播放器在手机上的对应结构。
 class AppShell extends ConsumerWidget {
@@ -24,6 +29,29 @@ class AppShell extends ConsumerWidget {
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
+    ref.listen<PlaybackRelinkProposal?>(playbackRelinkProposalProvider, (
+      previous,
+      next,
+    ) {
+      if (next == null || next.id == _activeRelinkProposalId) return;
+      final dialogContext = appScaffoldKey.currentContext;
+      if (dialogContext != null) {
+        unawaited(_showPlaybackRelinkDialog(dialogContext, ref, next));
+      }
+    });
+    ref.listen<PlaybackNoticeEvent?>(playbackNoticeEventProvider, (
+      previous,
+      next,
+    ) {
+      if (next == null) return;
+      XyNotice.show(
+        context,
+        message: next.message,
+        type: XyNoticeType.warning,
+        duration: const Duration(seconds: 5),
+      );
+      ref.read(playbackNoticeEventProvider.notifier).state = null;
+    });
     final safeBottom = MediaQuery.paddingOf(context).bottom;
     final showMiniPlayer = shouldShowMiniPlayerForPath(currentPath);
 
@@ -53,6 +81,57 @@ class AppShell extends ConsumerWidget {
         ],
       ),
     );
+  }
+}
+
+Future<void> _showPlaybackRelinkDialog(
+  BuildContext context,
+  WidgetRef ref,
+  PlaybackRelinkProposal proposal,
+) async {
+  if (_activeRelinkProposalId != null || !context.mounted) return;
+  _activeRelinkProposalId = proposal.id;
+  final replacement = proposal.replacement;
+  final message = proposal.isLocal
+      ? '该歌曲所属插件“${proposal.originalPluginName}”无法使用，检测到本地同名歌曲“${replacement.title}”，是否关联？'
+      : '该歌曲所属插件“${proposal.originalPluginName}”无法使用，是否自动关联“${proposal.replacementSourceName}”插件的歌曲？';
+  bool? accepted;
+  try {
+    accepted = await showDialog<bool>(
+      context: context,
+      useRootNavigator: true,
+      barrierDismissible: false,
+      builder: (dialogContext) => AlertDialog(
+        icon: Icon(
+          proposal.isLocal
+              ? Icons.library_music_outlined
+              : Icons.extension_outlined,
+        ),
+        title: const Text('发现可替代音源'),
+        content: Text(message),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext, false),
+            child: const Text('暂不关联'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(dialogContext, true),
+            child: const Text('确认关联'),
+          ),
+        ],
+      ),
+    );
+  } finally {
+    if (_activeRelinkProposalId == proposal.id) {
+      _activeRelinkProposalId = null;
+    }
+  }
+  if (!context.mounted) return;
+  final notifier = ref.read(playerProvider.notifier);
+  if (accepted == true) {
+    await notifier.acceptRelinkProposal(proposal);
+  } else {
+    notifier.dismissRelinkProposal(proposal);
   }
 }
 

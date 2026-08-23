@@ -9,13 +9,14 @@ import 'package:flutter/rendering.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:path/path.dart' as p;
-import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../../src/core/db_path.dart';
 import '../../src/core/settings.dart';
 import '../../src/favorites/favorites_provider.dart';
 import '../../src/player/player_provider.dart';
+import '../../src/player/downloaded_song_store.dart';
+import '../../src/playlists/playlists_provider.dart';
 import '../../src/rust/api.dart';
 import '../../src/rust/music/types.dart';
 import '../../src/widgets/cover_image.dart';
@@ -102,6 +103,7 @@ class _LyricLine {
 enum _PlayerMenuAction {
   download,
   quality,
+  playlist,
   linkLyrics,
   lyricsOffset,
   sleepTimer,
@@ -254,11 +256,11 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
     final horizontalDistance = delta.dx.abs();
     final verticalDistance = delta.dy.abs();
     final requiredDistance = math.max(
-      96.0,
-      math.min(140.0, viewportWidth * .28),
+      84.0,
+      math.min(128.0, viewportWidth * .24),
     );
     if (horizontalDistance < requiredDistance ||
-        horizontalDistance < verticalDistance * 1.8) {
+        horizontalDistance < verticalDistance * 1.65) {
       return;
     }
     if (delta.dx < 0 && !_showLyrics) {
@@ -355,6 +357,12 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
                   ),
                   _moreTile(
                     sheetContext,
+                    action: _PlayerMenuAction.playlist,
+                    icon: Icons.playlist_add_rounded,
+                    title: '添加到歌单',
+                  ),
+                  _moreTile(
+                    sheetContext,
                     action: _PlayerMenuAction.linkLyrics,
                     icon: Icons.lyrics_outlined,
                     title: '关联歌词',
@@ -386,6 +394,8 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
         await _downloadCurrent(item);
       case _PlayerMenuAction.quality:
         await _pickPlaybackQuality();
+      case _PlayerMenuAction.playlist:
+        await _addToPlaylist(item);
       case _PlayerMenuAction.linkLyrics:
         await _linkLyrics(item);
       case _PlayerMenuAction.lyricsOffset:
@@ -393,6 +403,26 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
       case _PlayerMenuAction.sleepTimer:
         await _pickSleepTimer();
     }
+  }
+
+  Future<void> _addToPlaylist(QueueItem item) async {
+    final playlistId = await showModalBottomSheet<String>(
+      context: context,
+      useRootNavigator: true,
+      isScrollControlled: true,
+      showDragHandle: true,
+      builder: (_) => _PlaylistPickerSheet(item: item),
+    );
+    if (!mounted || playlistId == null) return;
+    final playlist = ref
+        .read(playlistsProvider)
+        .where((value) => value.id == playlistId)
+        .firstOrNull;
+    XyNotice.show(
+      context,
+      message: playlist == null ? '已添加到歌单' : '已添加到歌单“${playlist.name}”',
+      type: XyNoticeType.success,
+    );
   }
 
   Widget _moreTile(
@@ -570,6 +600,26 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
       );
       return;
     }
+    // 在线歌词也要像本地上传歌词一样写入本地 sidecar。
+    // 这样下次从本地音乐再次播放时，会自动读取上次关联的歌词，
+    // 不需要用户重新搜索并选择插件结果。
+    if (playbackSourceTypeFor(item) == PlaybackSourceType.localFile) {
+      try {
+        await saveSongLyrics(
+          path: item.path,
+          lyrics: selected.lyrics,
+          source: LyricsStorageSource.sidecar,
+        );
+      } catch (error) {
+        if (mounted) {
+          XyNotice.show(
+            context,
+            message: '歌词已应用，但记忆保存失败：${_errorText(error)}',
+            type: XyNoticeType.warning,
+          );
+        }
+      }
+    }
     await ref.read(playerProvider.notifier).setCurrentLyrics(selected.lyrics);
     if (mounted) {
       XyNotice.show(
@@ -693,7 +743,7 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
       return;
     }
     final settings = ref.read(settingsProvider).valueOrNull;
-    final initialDirectory = await _defaultDownloadDirectory(settings);
+    final initialDirectory = await resolveMusicDownloadDirectory(settings);
     if (!mounted) return;
     final playback = ref.read(playerProvider);
     final options = await showDialog<_DownloadOptions>(
@@ -760,6 +810,18 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
           },
         }),
       );
+      await rememberDownloadedSongSnapshot(
+        DownloadedSongSnapshot(
+          path: savedPath,
+          title: item.title,
+          artist: item.artist,
+          album: item.album,
+          durationMs: item.durationMs,
+          downloadedAt: DateTime.now().millisecondsSinceEpoch,
+          coverUrl: item.coverUrl,
+          lyricsRaw: lyrics.isEmpty ? null : lyrics,
+        ),
+      );
       if (mounted) {
         XyNotice.show(
           context,
@@ -776,20 +838,6 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
         );
       }
     }
-  }
-
-  Future<String> _defaultDownloadDirectory(AppSettings? settings) async {
-    final configured = settings?.downloadPath.trim() ?? '';
-    if (configured.isNotEmpty) return configured;
-    Directory? base;
-    try {
-      base = await getDownloadsDirectory();
-    } catch (_) {}
-    try {
-      base ??= await getExternalStorageDirectory();
-    } catch (_) {}
-    base ??= await getApplicationDocumentsDirectory();
-    return p.join(base.path, 'XY Music');
   }
 
   String _qualityLabel(String quality) => switch (quality) {
@@ -955,7 +1003,6 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
                               key: ValueKey('lyrics:${current.path}'),
                               item: current,
                               offsetTenths: _lyricsOffsetTenths,
-                              onTapOutsideLyrics: _toggleLyrics,
                             ),
                         ],
                       ),
@@ -974,6 +1021,158 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
             ),
           ),
         ],
+      ),
+    );
+  }
+}
+
+/// 播放详情页中的歌单选择器。创建歌单后会自动将当前歌曲加入新歌单。
+class _PlaylistPickerSheet extends ConsumerStatefulWidget {
+  const _PlaylistPickerSheet({required this.item});
+
+  final QueueItem item;
+
+  @override
+  ConsumerState<_PlaylistPickerSheet> createState() =>
+      _PlaylistPickerSheetState();
+}
+
+class _PlaylistPickerSheetState
+    extends ConsumerState<_PlaylistPickerSheet> {
+  bool _busy = false;
+
+  Future<void> _addTo(String playlistId) async {
+    if (_busy) return;
+    setState(() => _busy = true);
+    try {
+      await ref
+          .read(playlistsProvider.notifier)
+          .addQueueItem(playlistId, widget.item);
+      if (mounted) Navigator.pop(context, playlistId);
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  Future<void> _createAndAdd() async {
+    if (_busy) return;
+    final controller = TextEditingController();
+    final name = await showDialog<String>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('新建歌单'),
+        content: TextField(
+          controller: controller,
+          autofocus: true,
+          maxLength: 30,
+          decoration: const InputDecoration(hintText: '请输入歌单名称'),
+          onSubmitted: (value) => Navigator.pop(dialogContext, value.trim()),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () =>
+                Navigator.pop(dialogContext, controller.text.trim()),
+            child: const Text('创建并添加'),
+          ),
+        ],
+      ),
+    );
+    controller.dispose();
+    if (!mounted || name == null || name.trim().isEmpty) return;
+    setState(() => _busy = true);
+    try {
+      final playlist = await ref
+          .read(playlistsProvider.notifier)
+          .create(name);
+      if (playlist == null) return;
+      await ref
+          .read(playlistsProvider.notifier)
+          .addQueueItem(playlist.id, widget.item);
+      if (mounted) Navigator.pop(context, playlist.id);
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final playlists = ref.watch(playlistsProvider);
+    final colorScheme = Theme.of(context).colorScheme;
+    return SafeArea(
+      child: SizedBox(
+        height: MediaQuery.sizeOf(context).height * .62,
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Padding(
+              padding: EdgeInsets.fromLTRB(20, 0, 20, 4),
+              child: Text(
+                '添加到歌单',
+                style: TextStyle(fontSize: 20, fontWeight: FontWeight.w800),
+              ),
+            ),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(20, 0, 20, 12),
+              child: Text(
+                widget.item.title,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(color: colorScheme.onSurfaceVariant),
+              ),
+            ),
+            const Divider(height: 1),
+            ListTile(
+              leading: CircleAvatar(
+                backgroundColor: colorScheme.primaryContainer,
+                child: Icon(Icons.add_rounded, color: colorScheme.primary),
+              ),
+              title: const Text('新建歌单'),
+              subtitle: const Text('创建后自动添加当前歌曲'),
+              trailing: const Icon(Icons.chevron_right_rounded),
+              enabled: !_busy,
+              onTap: _createAndAdd,
+            ),
+            const Divider(height: 1),
+            Expanded(
+              child: playlists.isEmpty
+                  ? Center(
+                      child: Text(
+                        '还没有歌单，先新建一个吧',
+                        style: TextStyle(color: colorScheme.onSurfaceVariant),
+                      ),
+                    )
+                  : ListView.builder(
+                      padding: const EdgeInsets.only(bottom: 12),
+                      itemCount: playlists.length,
+                      itemBuilder: (context, index) {
+                        final playlist = playlists[index];
+                        return ListTile(
+                          leading: CircleAvatar(
+                            backgroundColor: colorScheme.surfaceContainerHighest,
+                            child: Icon(
+                              Icons.queue_music_rounded,
+                              color: colorScheme.onSurfaceVariant,
+                            ),
+                          ),
+                          title: Text(
+                            playlist.name,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                          subtitle: Text('${playlist.songPaths.length} 首歌曲'),
+                          trailing: const Icon(Icons.chevron_right_rounded),
+                          enabled: !_busy,
+                          onTap: () => _addTo(playlist.id),
+                        );
+                      },
+                    ),
+            ),
+          ],
+        ),
       ),
     );
   }
@@ -1943,14 +2142,6 @@ class _BigCover extends StatelessWidget {
         return Stack(
           fit: StackFit.expand,
           children: [
-            Semantics(
-              button: onTap != null,
-              label: onTap == null ? null : '显示歌词',
-              child: GestureDetector(
-                behavior: HitTestBehavior.opaque,
-                onTap: onTap,
-              ),
-            ),
             Center(
               child: SizedBox(
                 width: side,
@@ -2180,17 +2371,16 @@ class _LyricsView extends ConsumerStatefulWidget {
     super.key,
     required this.item,
     required this.offsetTenths,
-    required this.onTapOutsideLyrics,
   });
   final QueueItem item;
   final int offsetTenths;
-  final VoidCallback onTapOutsideLyrics;
 
   @override
   ConsumerState<_LyricsView> createState() => _LyricsViewState();
 }
 
-class _LyricsViewState extends ConsumerState<_LyricsView> {
+class _LyricsViewState extends ConsumerState<_LyricsView>
+    with AutomaticKeepAliveClientMixin<_LyricsView> {
   final ScrollController _scrollController = ScrollController();
   final Map<int, GlobalKey> _lineKeys = {};
   bool _scrollScheduled = false;
@@ -2200,6 +2390,9 @@ class _LyricsViewState extends ConsumerState<_LyricsView> {
   bool _userScrolling = false;
   Timer? _resumeAutoScrollTimer;
   List<_LyricLine> _latestLines = const [];
+
+  @override
+  bool get wantKeepAlive => true;
 
   @override
   void didUpdateWidget(_LyricsView oldWidget) {
@@ -2228,10 +2421,14 @@ class _LyricsViewState extends ConsumerState<_LyricsView> {
 
   @override
   Widget build(BuildContext context) {
+    super.build(context);
     final position = applyLyricsOffset(
       ref.watch(playerProvider.select((state) => state.position)),
       widget.offsetTenths,
     );
+    final effectMode =
+        ref.watch(settingsProvider).valueOrNull?.lyricWordEffectMode ??
+        LyricWordEffectMode.progressive;
     final embedded = widget.item.lyricsRaw?.trim() ?? '';
     late final Widget content;
     if (embedded.isNotEmpty) {
@@ -2239,7 +2436,7 @@ class _LyricsViewState extends ConsumerState<_LyricsView> {
       content = lyrics.when(
         loading: () => const Center(child: CircularProgressIndicator()),
         error: (_, _) => _lyricsEmpty(context, '歌词解析失败'),
-        data: (lines) => _buildLines(lines, position),
+        data: (lines) => _buildLines(lines, position, effectMode),
       );
     } else if (widget.item.pluginId != null && !widget.item.lyricsAttempted) {
       content = _lyricsEmpty(context, '正在获取歌词…');
@@ -2250,17 +2447,17 @@ class _LyricsViewState extends ConsumerState<_LyricsView> {
       content = lyrics.when(
         loading: () => const Center(child: CircularProgressIndicator()),
         error: (_, _) => _lyricsEmpty(context, '暂无歌词'),
-        data: (lines) => _buildLines(lines, position),
+        data: (lines) => _buildLines(lines, position, effectMode),
       );
     }
-    return GestureDetector(
-      behavior: HitTestBehavior.opaque,
-      onTap: widget.onTapOutsideLyrics,
-      child: content,
-    );
+    return content;
   }
 
-  Widget _buildLines(List<_LyricLine> lines, double position) {
+  Widget _buildLines(
+    List<_LyricLine> lines,
+    double position,
+    LyricWordEffectMode effectMode,
+  ) {
     if (lines.isEmpty) return _lyricsEmpty(context, '暂无歌词');
     _latestLines = lines;
     var active = lines.lastIndexWhere((line) => line.time <= position);
@@ -2268,7 +2465,6 @@ class _LyricsViewState extends ConsumerState<_LyricsView> {
     _syncScroll(active, lines);
     return LayoutBuilder(
       builder: (context, constraints) {
-        final edgeTapHeight = (constraints.maxHeight * .2).clamp(72.0, 104.0);
         return Stack(
           children: [
             Positioned.fill(
@@ -2335,6 +2531,7 @@ class _LyricsViewState extends ConsumerState<_LyricsView> {
                                   line: line,
                                   position: position,
                                   selected: selected,
+                                  effectMode: effectMode,
                                 ),
                                 if (line.translation.isNotEmpty) ...[
                                   const SizedBox(height: 4),
@@ -2368,26 +2565,6 @@ class _LyricsViewState extends ConsumerState<_LyricsView> {
                     },
                   ),
                 ),
-              ),
-            ),
-            Positioned(
-              top: 0,
-              left: 0,
-              right: 0,
-              height: edgeTapHeight,
-              child: GestureDetector(
-                behavior: HitTestBehavior.opaque,
-                onTap: widget.onTapOutsideLyrics,
-              ),
-            ),
-            Positioned(
-              bottom: 0,
-              left: 0,
-              right: 0,
-              height: edgeTapHeight,
-              child: GestureDetector(
-                behavior: HitTestBehavior.opaque,
-                onTap: widget.onTapOutsideLyrics,
               ),
             ),
           ],
@@ -2517,11 +2694,13 @@ class _TimedLyricText extends StatelessWidget {
     required this.line,
     required this.position,
     required this.selected,
+    required this.effectMode,
   });
 
   final _LyricLine line;
   final double position;
   final bool selected;
+  final LyricWordEffectMode effectMode;
 
   @override
   Widget build(BuildContext context) {
@@ -2543,10 +2722,20 @@ class _TimedLyricText extends StatelessWidget {
           ? const [Shadow(color: Colors.black54, blurRadius: 12)]
           : null,
     );
-    if (!selected || line.words.isEmpty) {
+    if (!selected ||
+        line.words.isEmpty ||
+        effectMode == LyricWordEffectMode.none) {
       return Text(line.text, style: baseStyle);
     }
 
+    if (effectMode == LyricWordEffectMode.progressive) {
+      return _buildProgressiveText(baseStyle);
+    }
+
+    return _buildWordByWordText(baseStyle);
+  }
+
+  Widget _buildWordByWordText(TextStyle baseStyle) {
     final dimColor = Colors.white.withValues(alpha: .28);
     return Text.rich(
       TextSpan(
@@ -2570,10 +2759,67 @@ class _TimedLyricText extends StatelessWidget {
     );
   }
 
+  Widget _buildProgressiveText(TextStyle baseStyle) {
+    return Text.rich(
+      TextSpan(
+        children: [
+          for (final word in line.words)
+            WidgetSpan(
+              alignment: PlaceholderAlignment.baseline,
+              baseline: TextBaseline.alphabetic,
+              child: _ProgressiveLyricWord(
+                text: word.text,
+                style: baseStyle,
+                progress: _wordProgress(word),
+              ),
+            ),
+        ],
+      ),
+      style: baseStyle,
+    );
+  }
+
   double _wordProgress(_LyricWord word) {
     if (position <= word.start) return 0;
     if (position >= word.end || word.end <= word.start) return 1;
     return ((position - word.start) / (word.end - word.start)).clamp(0, 1);
+  }
+}
+
+class _ProgressiveLyricWord extends StatelessWidget {
+  const _ProgressiveLyricWord({
+    required this.text,
+    required this.style,
+    required this.progress,
+  });
+
+  final String text;
+  final TextStyle style;
+  final double progress;
+
+  @override
+  Widget build(BuildContext context) {
+    final value = progress.clamp(0.0, 1.0);
+    // ShaderMask 在进度为 0 时仍会绘制渐变的首个白色采样点，
+    // 每个 WidgetSpan 的左边因此出现一条白边。边界状态直接绘制纯色，
+    // 只有真正播放到当前词时才使用渐变过渡。
+    final dim = Colors.white.withValues(alpha: .28);
+    if (value <= 0) {
+      return Text(text, style: style.copyWith(color: dim));
+    }
+    if (value >= 1) {
+      return Text(text, style: style.copyWith(color: Colors.white));
+    }
+    final edgeStart = (value - .08).clamp(0.0, 1.0);
+    final edgeEnd = (value + .08).clamp(0.0, 1.0);
+    return ShaderMask(
+      blendMode: BlendMode.srcIn,
+      shaderCallback: (bounds) => LinearGradient(
+        colors: [Colors.white, Colors.white, dim, dim],
+        stops: [0, edgeStart, edgeEnd, 1],
+      ).createShader(bounds),
+      child: Text(text, style: style.copyWith(color: Colors.white)),
+    );
   }
 }
 

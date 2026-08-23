@@ -8,6 +8,7 @@ import '../../src/navigation/sidebar_controller.dart';
 import '../../src/player/player_provider.dart';
 import '../../src/ui/xy_surface.dart';
 import '../../src/ui/xy_theme.dart';
+import '../../src/widgets/user_avatar_image.dart';
 
 /// 按电脑端首页顺序组织四个模块，并针对窄屏改为单列纵向布局。
 class HomePage extends ConsumerStatefulWidget {
@@ -332,9 +333,24 @@ class _NowPlayingModule extends ConsumerWidget {
             const SizedBox(height: 14),
             AnimatedSwitcher(
               duration: const Duration(milliseconds: 260),
+              // AnimatedSwitcher 默认使用居中 Stack 布局。上一句歌词如果是
+              // 两行，旧组件的宽度会把新歌词先放到中间，再在布局稳定后跳回左侧。
+              // 让所有歌词占满同一块区域，并始终从左上角开始布局，切换时只做淡入淡出。
+              layoutBuilder: (currentChild, previousChildren) => SizedBox(
+                width: double.infinity,
+                child: Stack(
+                  alignment: Alignment.topLeft,
+                  fit: StackFit.passthrough,
+                  children: <Widget>[
+                    ...previousChildren,
+                    currentChild ?? const SizedBox.shrink(),
+                  ],
+                ),
+              ),
               child: Column(
                 key: ValueKey(activeLyric?.text ?? song?.path ?? 'empty'),
                 crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
                 children: [
                   Text(
                     song == null
@@ -809,7 +825,8 @@ class _LeaderboardModule extends ConsumerStatefulWidget {
 }
 
 class _LeaderboardModuleState extends ConsumerState<_LeaderboardModule> {
-  LeaderboardPeriod _period = LeaderboardPeriod.total;
+  // 首页首次进入默认展示当天的排行榜，用户仍可手动切换周榜和总榜。
+  LeaderboardPeriod _period = LeaderboardPeriod.daily;
 
   @override
   Widget build(BuildContext context) {
@@ -1080,8 +1097,8 @@ class _LeaderboardAvatar extends StatelessWidget {
         dimension: 38,
         child: entry.avatar == null
             ? fallback
-            : Image.network(
-                entry.avatar!,
+            : UserAvatarImage(
+                source: entry.avatar!,
                 fit: BoxFit.cover,
                 errorBuilder: (_, _, _) => fallback,
               ),

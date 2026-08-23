@@ -41,7 +41,7 @@ class _PluginSearchState {
 
 class _SearchPageState extends ConsumerState<SearchPage> {
   static const _historyKey = 'network_search_history_v1';
-  static const _historyLimit = 20;
+  static const _historyLimit = 50;
 
   late final TextEditingController _controller = TextEditingController(
     text: widget.initialQuery,
@@ -275,22 +275,35 @@ class _SearchPageState extends ConsumerState<SearchPage> {
               ),
             ],
           ),
-          const SizedBox(height: 10),
-          Wrap(
-            spacing: 9,
-            runSpacing: 9,
-            children: [
-              for (final keyword in _history)
-                InputChip(
-                  avatar: const Icon(Icons.history_rounded, size: 18),
-                  label: Text(keyword),
-                  onPressed: () => _searchFromHistory(keyword),
-                  onDeleted: () => _removeHistory(keyword),
-                  deleteIcon: const Icon(Icons.close_rounded, size: 17),
-                  deleteButtonTooltipMessage: '删除 $keyword',
-                ),
-            ],
-          ),
+          const SizedBox(height: 4),
+          // 使用竖直列表展示历史，避免关键词被挤成块状标签。
+          for (var index = 0; index < _history.length; index++) ...[
+            ListTile(
+              contentPadding: EdgeInsets.zero,
+              minTileHeight: 46,
+              leading: Icon(
+                Icons.history_rounded,
+                size: 20,
+                color: scheme.onSurfaceVariant,
+              ),
+              title: Text(
+                _history[index],
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+              ),
+              trailing: IconButton(
+                tooltip: '删除 ${_history[index]}',
+                icon: const Icon(Icons.close_rounded, size: 19),
+                onPressed: () => _removeHistory(_history[index]),
+              ),
+              onTap: () => _searchFromHistory(_history[index]),
+            ),
+            if (index != _history.length - 1)
+              Divider(
+                height: 1,
+                color: scheme.outlineVariant.withValues(alpha: .45),
+              ),
+          ],
           const SizedBox(height: 34),
         ],
         Icon(
@@ -370,7 +383,9 @@ class _SearchPageState extends ConsumerState<SearchPage> {
     await playback;
     if (!mounted) return;
     final error = ref.read(playerProvider).errorMessage;
-    if (error != null) {
+    // 失效插件的替代音源搜索由全局播放器统一展示顶部提示，避免这里再用
+    // “播放失败”覆盖更准确的“无法找到代替音源”说明。
+    if (error != null && !error.contains('无法找到代替音源')) {
       XyNotice.show(
         context,
         message: '播放失败：$error',

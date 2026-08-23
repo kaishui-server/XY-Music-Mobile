@@ -4,6 +4,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../library/library_provider.dart';
+import '../player/player_provider.dart';
 
 class PlaylistSongSnapshot {
   const PlaylistSongSnapshot({
@@ -234,6 +235,36 @@ class PlaylistsNotifier extends StateNotifier<List<MobilePlaylist>> {
           item.copyWith(songPaths: {...item.songPaths, ...paths}.toList())
         else
           item,
+    ];
+    await _save();
+  }
+
+  /// 将当前播放队列中的歌曲加入歌单，同时保存网络歌曲所需的完整快照。
+  /// 仅保存 path 会导致网络歌曲重新打开歌单时丢失插件信息，因此这里保留
+  /// 插件、封面和歌词等元数据，确保歌单中的网络歌曲可以继续播放。
+  Future<void> addQueueItem(String id, QueueItem item) async {
+    final snapshot = PlaylistSongSnapshot(
+      path: item.path,
+      title: item.title,
+      artist: item.artist,
+      album: item.album,
+      duration: (item.durationMs / 1000).round(),
+      format: item.pluginId == null ? '本地' : '网络',
+      coverUrl: item.coverUrl,
+      pluginId: item.pluginId,
+      pluginData: item.pluginData,
+      lyricsRaw: item.lyricsRaw,
+    );
+    state = [
+      for (final playlist in state)
+        if (playlist.id == id)
+          playlist.copyWith(
+            songPaths: {...playlist.songPaths, item.path}.toList(),
+            songSnapshots: Map.of(playlist.songSnapshots)
+              ..[item.path] = snapshot,
+          )
+        else
+          playlist,
     ];
     await _save();
   }

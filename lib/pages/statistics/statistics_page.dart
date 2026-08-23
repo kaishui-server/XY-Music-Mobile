@@ -6,6 +6,8 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../src/core/db_path.dart';
 import '../../src/library/library_provider.dart';
+import '../../src/recent/recent_provider.dart';
+import '../../src/recent/recent_store.dart';
 import '../../src/rust/api.dart';
 import '../../src/widgets/cover_image.dart';
 
@@ -49,6 +51,7 @@ final _statisticsProvider = FutureProvider.autoDispose<_StatisticsData>((
   );
   final formats = await fetch(statsGetFormatDistribution(dbPath: dbPath));
   final quality = await fetch(statsGetQualityDistribution(dbPath: dbPath));
+  final snapshots = await loadRecentSongSnapshots();
   final paths = (behavior['top_songs'] as List? ?? const [])
       .map((row) => row is Map ? row['song_path']?.toString() ?? '' : '')
       .where((path) => path.isNotEmpty)
@@ -61,7 +64,10 @@ final _statisticsProvider = FutureProvider.autoDispose<_StatisticsData>((
     behavior: behavior,
     formats: formats,
     quality: quality,
-    topSongs: paths.map((path) => byPath[path]).whereType<Song>().toList(),
+    topSongs: paths
+        .map((path) => byPath[path] ?? songFromRecentSnapshot(snapshots[path]))
+        .whereType<Song>()
+        .toList(),
   );
 });
 

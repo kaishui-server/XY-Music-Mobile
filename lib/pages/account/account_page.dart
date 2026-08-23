@@ -1,9 +1,11 @@
 import 'package:flutter/material.dart';
+import 'package:file_picker/file_picker.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 
 import '../../src/auth/auth_provider.dart';
 import '../../src/widgets/top_notice.dart';
+import '../../src/widgets/user_avatar_image.dart';
 
 /// 账号认证页：未登录时展示登录/注册，已登录时展示个人资料。
 class AccountPage extends ConsumerStatefulWidget {
@@ -24,6 +26,8 @@ class _AccountPageState extends ConsumerState<AccountPage>
   final _codeCtrl = TextEditingController();
   bool _obscure = true;
   int _countdown = 0;
+  bool _avatarUploading = false;
+  String _avatarStatus = 'none';
 
   @override
   void initState() {
@@ -35,6 +39,7 @@ class _AccountPageState extends ConsumerState<AccountPage>
         ref.read(authProvider.notifier).clearError();
       }
     });
+    WidgetsBinding.instance.addPostFrameCallback((_) => _syncProfile());
   }
 
   @override
@@ -123,7 +128,7 @@ class _AccountPageState extends ConsumerState<AccountPage>
         captcha: captcha,
       );
     } else {
-      await notifier.register(
+      final notice = await notifier.register(
         ciyuanxiId: _idCtrl.text,
         nickname: _nicknameCtrl.text,
         password: _passwordCtrl.text,
@@ -131,7 +136,9 @@ class _AccountPageState extends ConsumerState<AccountPage>
         code: _codeCtrl.text,
         captcha: captcha,
       );
+      if (notice != null && mounted) _toast(notice);
     }
+    if (ref.read(authProvider).isLoggedIn) await _loadAvatarStatus();
     // 错误已通过 authProvider.error 反映到内联错误条，无需再弹 SnackBar。
   }
 
@@ -362,10 +369,65 @@ class _AccountPageState extends ConsumerState<AccountPage>
 
   Future<void> _refreshProfile() async {
     try {
-      await ref.read(authProvider.notifier).refreshProfile();
+      await _syncProfile();
       if (mounted) _toast('资料已刷新');
     } catch (error) {
       if (mounted) _toast(error.toString());
+    }
+  }
+
+  /// 进入账号页和手动刷新时都从服务端拉取最新资料。
+  /// 头像人工审核通过后，旧的本地凭证不能继续作为唯一数据源。
+  Future<void> _syncProfile() async {
+    if (!ref.read(authProvider).isLoggedIn) return;
+    try {
+      await ref.read(authProvider.notifier).refreshProfile();
+    } catch (_) {
+      // 网络暂时不可用时保留本地资料，头像状态仍可单独查询。
+    }
+    await _loadAvatarStatus();
+  }
+
+  Future<void> _loadAvatarStatus() async {
+    if (!ref.read(authProvider).isLoggedIn) return;
+    try {
+      final status = await ref.read(authProvider.notifier).fetchAvatarStatus();
+      if (mounted) setState(() => _avatarStatus = status);
+    } catch (_) {
+      // 状态查询失败不影响账号页面和头像显示。
+    }
+  }
+
+  Future<void> _pickAvatar() async {
+    if (_avatarUploading) return;
+    final result = await FilePicker.platform.pickFiles(
+      type: FileType.image,
+      withData: true,
+    );
+    if (result == null || result.files.isEmpty || !mounted) return;
+    final bytes = result.files.single.bytes;
+    if (bytes == null || bytes.isEmpty) {
+      _toast('无法读取图片，请重新选择');
+      return;
+    }
+    if (bytes.length > 5 * 1024 * 1024) {
+      _toast('头像不能超过 5MB');
+      return;
+    }
+    setState(() => _avatarUploading = true);
+    try {
+      final message = await ref.read(authProvider.notifier).uploadAvatar(bytes);
+      if (!mounted) return;
+      setState(
+        () => _avatarStatus = message.contains('等待') ? 'pending' : 'none',
+      );
+      _toast(message);
+    } catch (error) {
+      if (!mounted) return;
+      await _loadAvatarStatus();
+      _toast(error is AuthException ? error.message : '头像上传失败');
+    } finally {
+      if (mounted) setState(() => _avatarUploading = false);
     }
   }
 
@@ -402,6 +464,9 @@ class _AccountPageState extends ConsumerState<AccountPage>
           ? _ProfileView(
               user: auth.user!,
               onRefresh: _refreshProfile,
+              onEditAvatar: _pickAvatar,
+              avatarUploading: _avatarUploading,
+              avatarStatus: _avatarStatus,
               onEditNickname: _editNickname,
               onChangePassword: _changePassword,
               onLogout: () => _confirmLogout(context),
@@ -715,12 +780,18 @@ class _ProfileView extends StatelessWidget {
   const _ProfileView({
     required this.user,
     required this.onRefresh,
+    required this.onEditAvatar,
+    required this.avatarUploading,
+    required this.avatarStatus,
     required this.onEditNickname,
     required this.onChangePassword,
     required this.onLogout,
   });
   final AuthUser user;
   final VoidCallback onRefresh;
+  final VoidCallback onEditAvatar;
+  final bool avatarUploading;
+  final String avatarStatus;
   final VoidCallback onEditNickname;
   final VoidCallback onChangePassword;
   final VoidCallback onLogout;
@@ -731,8 +802,47 @@ class _ProfileView extends StatelessWidget {
     return ListView(
       padding: const EdgeInsets.fromLTRB(16, 32, 16, 24),
       children: [
-        // 头像区：干净地居中放在页面背景上，无大色块
-        Center(child: _Avatar(user: user)),
+        // 头像区：点击头像或右下角按钮即可提交新头像审核。
+        Center(
+          child: Stack(
+            clipBehavior: Clip.none,
+            children: [
+              GestureDetector(
+                onTap: avatarUploading ? null : onEditAvatar,
+                child: _Avatar(user: user),
+              ),
+              Positioned(
+                right: -2,
+                bottom: -2,
+                child: Material(
+                  color: scheme.primary,
+                  shape: const CircleBorder(),
+                  child: InkWell(
+                    onTap: avatarUploading ? null : onEditAvatar,
+                    customBorder: const CircleBorder(),
+                    child: Padding(
+                      padding: const EdgeInsets.all(8),
+                      child: avatarUploading
+                          ? SizedBox(
+                              width: 16,
+                              height: 16,
+                              child: CircularProgressIndicator(
+                                strokeWidth: 2,
+                                color: scheme.onPrimary,
+                              ),
+                            )
+                          : Icon(
+                              Icons.edit_rounded,
+                              size: 16,
+                              color: scheme.onPrimary,
+                            ),
+                    ),
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
         const SizedBox(height: 16),
         Center(
           child: Text(
@@ -785,6 +895,20 @@ class _ProfileView extends StatelessWidget {
               title: const Text('刷新账号资料'),
               trailing: const Icon(Icons.chevron_right_rounded),
               onTap: onRefresh,
+            ),
+            ListTile(
+              leading: Icon(
+                Icons.account_circle_outlined,
+                color: scheme.primary,
+              ),
+              title: const Text('修改头像'),
+              subtitle: Text(switch (avatarStatus) {
+                'pending' => '头像审核中',
+                'rejected' => '上次头像审核未通过，可重新提交',
+                _ => '上传后将进入审核流程',
+              }),
+              trailing: const Icon(Icons.chevron_right_rounded),
+              onTap: avatarUploading ? null : onEditAvatar,
             ),
             ListTile(
               leading: Icon(Icons.edit_outlined, color: scheme.primary),
@@ -850,8 +974,8 @@ class _Avatar extends StatelessWidget {
       ),
       clipBehavior: Clip.antiAlias,
       child: hasAvatar
-          ? Image.network(
-              avatar,
+          ? UserAvatarImage(
+              source: avatar,
               fit: BoxFit.cover,
               errorBuilder: (_, _, _) =>
                   _fallback(fallbackChar, scheme.onPrimary),

@@ -16,6 +16,7 @@ enum SettingsSection {
   library,
   download,
   other,
+  logsDebug,
 }
 
 class SettingsSearchEntry {
@@ -214,6 +215,20 @@ const settingsSearchEntries = <SettingsSearchEntry>[
     route: '/settings/statistics',
     icon: Icons.query_stats_outlined,
     keywords: '播放次数 时长 历史',
+  ),
+  SettingsSearchEntry(
+    title: '日志与调试',
+    path: ['其他', '日志与调试'],
+    route: '/settings/logs-debug',
+    icon: Icons.bug_report_outlined,
+    keywords: '日志 调试 导出 错误 警告',
+  ),
+  SettingsSearchEntry(
+    title: '日志',
+    path: ['其他', '日志与调试', '日志'],
+    route: '/settings/logs',
+    icon: Icons.description_outlined,
+    keywords: '保存条数 错误日志 时间范围 导出',
   ),
   SettingsSearchEntry(
     title: '关于 XY Music',
@@ -451,12 +466,30 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
           value: settings?.showLyricsTranslation ?? true,
           onChanged: (v) => notifier.setShowLyricsTranslation(v),
         ),
-        _switchTile(
+        _tile(
           context,
           icon: Icons.spellcheck,
           title: '逐字动效',
-          value: settings?.enableWordEffect ?? true,
-          onChanged: (v) => notifier.setEnableWordEffect(v),
+          trailing: DropdownButtonHideUnderline(
+            child: DropdownButton<LyricWordEffectMode>(
+              value:
+                  settings?.lyricWordEffectMode ??
+                  LyricWordEffectMode.progressive,
+              isDense: true,
+              alignment: AlignmentDirectional.centerEnd,
+              items: LyricWordEffectMode.values
+                  .map(
+                    (mode) => DropdownMenuItem<LyricWordEffectMode>(
+                      value: mode,
+                      child: Text(_lyricWordEffectLabel(mode)),
+                    ),
+                  )
+                  .toList(),
+              onChanged: (mode) {
+                if (mode != null) notifier.setLyricWordEffectMode(mode);
+              },
+            ),
+          ),
         ),
       ],
       SettingsSection.library => [
@@ -530,6 +563,22 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
           title: '关于 XY Music',
           trailing: const Text('1.0.0'),
           onTap: () => context.push('/settings/about'),
+        ),
+        _categoryTile(
+          context,
+          icon: Icons.bug_report_outlined,
+          title: '日志与调试',
+          subtitle: '日志保存、筛选与导出',
+          route: '/settings/logs-debug',
+        ),
+      ],
+      SettingsSection.logsDebug => [
+        _tile(
+          context,
+          icon: Icons.description_outlined,
+          title: '日志',
+          trailing: const Text('保存与导出'),
+          onTap: () => context.push('/settings/logs'),
         ),
       ],
     };
@@ -661,6 +710,7 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
     SettingsSection.library => '音乐库',
     SettingsSection.download => '下载',
     SettingsSection.other => '其他',
+    SettingsSection.logsDebug => '日志与调试',
   };
 
   Widget _categoryTile(
@@ -739,6 +789,12 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
       ThemeModePreference.dark => '深色',
     });
   }
+
+  String _lyricWordEffectLabel(LyricWordEffectMode mode) => switch (mode) {
+    LyricWordEffectMode.wordByWord => '逐词播放',
+    LyricWordEffectMode.progressive => '渐进填充',
+    LyricWordEffectMode.none => '不显示逐字',
+  };
 
   Widget _volumeSlider(AppSettings? s, SettingsNotifier n) {
     return SizedBox(

@@ -415,28 +415,32 @@ class _RecognizePageState extends ConsumerState<RecognizePage>
             const SizedBox(height: 22),
             _ListeningWaves(active: recording),
             const SizedBox(height: 26),
-            Wrap(
-              alignment: WrapAlignment.center,
-              spacing: 10,
-              runSpacing: 10,
-              children: [
-                FilterChip(
-                  selected: _useSystemAudio,
-                  onSelected: _isBusy
-                      ? null
-                      : (selected) => _setSource(systemAudio: selected),
-                  avatar: const Icon(Icons.volume_up_outlined, size: 19),
-                  label: const Text('识别系统声音'),
-                ),
-                FilterChip(
-                  selected: _useMicrophone,
-                  onSelected: _isBusy
-                      ? null
-                      : (selected) => _setSource(microphone: selected),
-                  avatar: const Icon(Icons.mic_none_rounded, size: 19),
-                  label: const Text('识别麦克风声音'),
-                ),
-              ],
+            ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: 430),
+              child: Column(
+                children: [
+                  SwitchListTile(
+                    contentPadding: const EdgeInsets.symmetric(horizontal: 8),
+                    secondary: const Icon(Icons.volume_up_outlined),
+                    title: const Text('识别系统声音'),
+                    subtitle: const Text('采集手机正在播放的声音'),
+                    value: _useSystemAudio,
+                    onChanged: _isBusy || !_systemAudioSupported
+                        ? null
+                        : (selected) => _setSource(systemAudio: selected),
+                  ),
+                  SwitchListTile(
+                    contentPadding: const EdgeInsets.symmetric(horizontal: 8),
+                    secondary: const Icon(Icons.mic_none_rounded),
+                    title: const Text('识别麦克风声音'),
+                    subtitle: const Text('采集手机周围的声音'),
+                    value: _useMicrophone,
+                    onChanged: _isBusy
+                        ? null
+                        : (selected) => _setSource(microphone: selected),
+                  ),
+                ],
+              ),
             ),
             if (!_systemAudioSupported) ...[
               const SizedBox(height: 8),

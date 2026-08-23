@@ -70,6 +70,8 @@ dependencies:
   # 文件夹选择与存储权限（本地音乐扫描）
   file_picker: ^8.1.0
   permission_handler: ^11.3.0
+  # 头像上传前压缩图片，避免超过服务端审核接口大小限制
+  image: ^4.2.0
 
 dev_dependencies:
   flutter_test:
@@ -88,7 +90,6 @@ dev_dependencies:
 
   # 应用图标生成 + 源图裁切处理
   flutter_launcher_icons: ^0.14.1
-  image: ^4.2.0
 
 # 应用图标生成配置（运行：dart run flutter_launcher_icons）
 flutter_launcher_icons:

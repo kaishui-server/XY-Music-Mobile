@@ -349,17 +349,28 @@ class LibraryNotifier extends StateNotifier<LibraryState> {
     await _playList(songs, index);
   }
 
+  /// 播放当前列表全部歌曲。随机模式下会先将整组歌曲洗牌，
+  /// 因此不会固定从列表第一首开始。
+  Future<void> playAll(List<Song> songs) async {
+    if (songs.isEmpty) return;
+    await _playList(songs, 0, randomizeStart: true);
+  }
+
   /// 播放任意歌曲列表。
   Future<void> playList(List<Song> songs, int index) async {
     if (songs.isEmpty) return;
     await _playList(songs, index);
   }
 
-  Future<void> _playList(List<Song> songs, int index) async {
+  Future<void> _playList(
+    List<Song> songs,
+    int index, {
+    bool randomizeStart = false,
+  }) async {
     final items = songs.map((s) => s.toQueueItem()).toList();
     await _ref
         .read(playerProvider.notifier)
-        .playQueue(items, startIndex: index);
+        .playQueue(items, startIndex: index, randomizeStart: randomizeStart);
   }
 }
 

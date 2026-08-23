@@ -239,6 +239,42 @@ void main() {
     expect(wrongTitle, -1);
   });
 
+  test('失效插件替代音源必须同名、同作者且时长误差不超过两秒', () {
+    expect(
+      isStrictReplacementMatch(
+        title: '晴天',
+        artist: '周杰伦',
+        durationMs: 269000,
+        candidateTitle: '晴 天',
+        candidateArtist: '周杰伦',
+        candidateDurationMs: 270500,
+      ),
+      isTrue,
+    );
+    expect(
+      isStrictReplacementMatch(
+        title: '晴天',
+        artist: '周杰伦',
+        durationMs: 269000,
+        candidateTitle: '晴天',
+        candidateArtist: '其他歌手',
+        candidateDurationMs: 269000,
+      ),
+      isFalse,
+    );
+    expect(
+      isStrictReplacementMatch(
+        title: '晴天',
+        artist: '周杰伦',
+        durationMs: 269000,
+        candidateTitle: '晴天',
+        candidateArtist: '周杰伦',
+        candidateDurationMs: 272000,
+      ),
+      isFalse,
+    );
+  });
+
   test('用户选择的音质会排在插件解析候选首位且不会重复', () {
     expect(pluginQualityCandidates('flac').first, 'flac');
     expect(pluginQualityCandidates('flac').where((q) => q == 'flac'), ['flac']);

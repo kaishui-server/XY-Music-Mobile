@@ -75,7 +75,7 @@ final recentSongsProvider = FutureProvider<List<RecentSongEntry>>((ref) async {
       .map((row) {
         final path = recentHistorySongPath(row);
         final playedAt = recentHistoryPlayedAt(row);
-        final song = byPath[path] ?? _snapshotSong(snapshots[path]);
+        final song = byPath[path] ?? songFromRecentSnapshot(snapshots[path]);
         if (song == null) return null;
         return RecentSongEntry(
           song: song,
@@ -104,7 +104,8 @@ bool _isNetworkRecentPath(String path, RecentSongSnapshot? snapshot) =>
     path.startsWith('http://') ||
     path.startsWith('https://');
 
-Song? _snapshotSong(RecentSongSnapshot? snapshot) {
+/// 将网络歌曲快照还原为曲库歌曲模型，供统计、首页等非历史页面复用。
+Song? songFromRecentSnapshot(RecentSongSnapshot? snapshot) {
   if (snapshot == null) return null;
   final savedCover = snapshot.coverUrl?.trim() ?? '';
   final recoveredCover = snapshot.pluginData == null

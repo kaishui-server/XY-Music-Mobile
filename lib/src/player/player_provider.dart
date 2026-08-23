@@ -7,13 +7,16 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:just_audio/just_audio.dart';
 import 'package:just_audio_background/just_audio_background.dart';
+import 'package:path/path.dart' as p;
 import 'package:permission_handler/permission_handler.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 import '../core/db_path.dart';
 import '../core/settings.dart';
 import '../plugins/plugin_runtime.dart';
 import '../recent/recent_store.dart';
 import '../rust/api.dart';
+import 'downloaded_song_store.dart';
 
 /// 播放中的单曲信息（小而美：仅保留 UI 需要的最小字段）。
 class QueueItem {
@@ -54,9 +57,76 @@ class QueueItem {
   );
 }
 
+class PlaybackRelinkProposal {
+  const PlaybackRelinkProposal({
+    required this.id,
+    required this.queueIndex,
+    required this.originalPath,
+    required this.originalPluginName,
+    required this.replacement,
+    required this.replacementSourceName,
+    required this.isLocal,
+  });
+
+  final int id;
+  final int queueIndex;
+  final String originalPath;
+  final String originalPluginName;
+  final QueueItem replacement;
+  final String replacementSourceName;
+  final bool isLocal;
+}
+
+class PlaybackNoticeEvent {
+  const PlaybackNoticeEvent(this.id, this.message);
+
+  final int id;
+  final String message;
+}
+
+final playbackRelinkProposalProvider = StateProvider<PlaybackRelinkProposal?>(
+  (ref) => null,
+);
+final playbackNoticeEventProvider = StateProvider<PlaybackNoticeEvent?>(
+  (ref) => null,
+);
+
+/// 插件替代音源必须同时满足同名、同作者和近似同长度。不同平台通常会有
+/// 1～2 秒的取整差异，因此把“同时长”限定为最多相差 2 秒。
+bool isStrictReplacementMatch({
+  required String title,
+  required String artist,
+  required int durationMs,
+  required String candidateTitle,
+  required String candidateArtist,
+  required int candidateDurationMs,
+}) {
+  if (durationMs <= 0 || candidateDurationMs <= 0) return false;
+  return _normalizeReplacementText(title) ==
+          _normalizeReplacementText(candidateTitle) &&
+      _normalizeReplacementText(artist) ==
+          _normalizeReplacementText(candidateArtist) &&
+      (durationMs - candidateDurationMs).abs() <= 2000;
+}
+
+String _normalizeReplacementText(String value) =>
+    _normalizeRecognizedText(value.trim());
+
+class _PluginUnavailableException implements Exception {
+  const _PluginUnavailableException(this.pluginId, this.pluginName);
+
+  final String pluginId;
+  final String pluginName;
+
+  @override
+  String toString() => '歌曲所属插件“$pluginName”已停用或删除';
+}
+
 enum PlaybackSourceType { plugin, lx, networkUrl, localFile }
 
 const _recognizedPluginCacheKey = '_recognizedPluginFallback';
+const _playbackSourceAssociationsKey = 'playbackSourceAssociationsV1';
+const _rememberedLyricsKey = 'rememberedLyricsV1';
 
 /// 识曲结果只有歌名、歌手等文本信息，回退到插件搜索时必须先做严格匹配，
 /// 避免仅因标题里有几个相同字符就播放成另一首歌。
@@ -403,11 +473,9 @@ class PlayerNotifier extends StateNotifier<PlaybackState> {
   bool _handlingTrackEnd = false;
   bool _notificationPermissionChecked = false;
   int _playRequestId = 0;
+  int _relinkProposalId = 0;
+  int _noticeId = 0;
   DateTime _lastPosPersist = DateTime.fromMillisecondsSinceEpoch(0);
-
-  // 随机模式历史/未来栈（与桌面端一致）。
-  final List<String> _shuffleHistory = [];
-  final List<String> _shuffleFuture = [];
 
   Future<void> _init() async {
     // 逐字歌词需要比默认 200ms 更细的进度采样，否则短字会被直接跳过。
@@ -570,13 +638,43 @@ class PlayerNotifier extends StateNotifier<PlaybackState> {
     });
   }
 
-  /// 播放一组歌曲（替换队列）。
-  Future<void> playQueue(List<QueueItem> items, {int startIndex = 0}) async {
+  /// 播放一组歌曲（替换队列）。随机模式下使用一次洗牌，保证一轮内
+  /// 每首歌只出现一次，而不是每次切歌都重新抽签。
+  ///
+  /// [randomizeStart] 用于“播放全部”：随机模式下整组歌曲洗牌后从
+  /// 洗牌后的第一首开始。普通点击单曲时保留用户点中的歌曲为第一首，
+  /// 再将剩余歌曲洗牌。
+  Future<void> playQueue(
+    List<QueueItem> items, {
+    int startIndex = 0,
+    bool randomizeStart = false,
+  }) async {
     if (items.isEmpty) return;
-    _shuffleHistory.clear();
-    _shuffleFuture.clear();
-    state = state.copyWith(queue: items);
-    await _playAt(startIndex);
+    var queue = List<QueueItem>.of(items);
+    var effectiveStartIndex = startIndex.clamp(0, queue.length - 1).toInt();
+    if (normalizePlayMode(state.playMode) == 2) {
+      if (randomizeStart) {
+        _shuffleInPlace(queue);
+        effectiveStartIndex = 0;
+      } else {
+        final selected = queue.removeAt(effectiveStartIndex);
+        _shuffleInPlace(queue);
+        queue.insert(0, selected);
+        effectiveStartIndex = 0;
+      }
+    }
+    state = state.copyWith(queue: queue);
+    await _playAt(effectiveStartIndex);
+  }
+
+  void _shuffleInPlace<T>(List<T> values) {
+    for (var i = values.length - 1; i > 0; i--) {
+      final j = _rand.nextInt(i + 1);
+      if (i == j) continue;
+      final item = values[i];
+      values[i] = values[j];
+      values[j] = item;
+    }
   }
 
   /// 将歌曲插到当前曲目之后，不打断正在播放的歌曲。
@@ -598,6 +696,24 @@ class PlayerNotifier extends StateNotifier<PlaybackState> {
   Future<void> _playAt(int index) async {
     if (index < 0 || index >= state.queue.length) return;
     final requestId = ++_playRequestId;
+    var item = state.queue[index];
+    final associated = await _loadAssociatedReplacement(item.path);
+    if (requestId != _playRequestId) return;
+    if (associated != null) {
+      final queue = [...state.queue];
+      queue[index] = associated;
+      item = associated;
+      state = state.copyWith(queue: queue);
+    }
+    // 关联歌词同时适用于插件歌曲、普通网络歌曲和本地歌曲。
+    // 以稳定的歌曲路径（插件 ID + 歌曲 ID）作为键，覆盖搜索结果自带的默认歌词。
+    final rememberedLyrics = await _loadRememberedLyrics(item.path);
+    if (rememberedLyrics != null && rememberedLyrics.trim().isNotEmpty) {
+      item = item.copyWith(lyricsRaw: rememberedLyrics, lyricsAttempted: true);
+      final queue = [...state.queue];
+      queue[index] = item;
+      state = state.copyWith(queue: queue);
+    }
     final previous = state;
     if (previous.current != null && previous.position >= .5) {
       unawaited(_recordPlayback(previous));
@@ -605,7 +721,6 @@ class PlayerNotifier extends StateNotifier<PlaybackState> {
     // stop() 会发出 playing=false；切换音源期间先抑制自动下一首，真正
     // 开始新歌曲前再复位，否则手动点开的歌曲播放结束后永远不会循环。
     _manualPause = true;
-    final item = state.queue[index];
     final playbackQuality =
         _ref.read(settingsProvider).valueOrNull?.onlineDefaultQuality ?? '320k';
     state = state.copyWith(
@@ -637,6 +752,15 @@ class PlayerNotifier extends StateNotifier<PlaybackState> {
       if (requestId != _playRequestId) return;
       debugPrint('歌曲播放失败：$error');
       debugPrintStack(stackTrace: stackTrace);
+      if (error is _PluginUnavailableException) {
+        await _handleUnavailablePlugin(
+          item,
+          index,
+          error,
+          requestId: requestId,
+        );
+        return;
+      }
       state = state.copyWith(
         isPlaying: false,
         isLoading: false,
@@ -666,7 +790,17 @@ class PlayerNotifier extends StateNotifier<PlaybackState> {
         final plugin = plugins
             .where((candidate) => candidate.id == item.pluginId)
             .firstOrNull;
-        if (plugin == null) throw Exception('歌曲所属插件已停用或删除');
+        if (plugin == null) {
+          final pluginId = item.pluginId?.trim() ?? '';
+          final installedName = await loadInstalledMusicPluginName(
+            _ref,
+            pluginId,
+          );
+          throw _PluginUnavailableException(
+            pluginId,
+            installedName ?? _pluginNameFromSnapshot(item) ?? pluginId,
+          );
+        }
         final source = await _ref
             .read(pluginRuntimeProvider)
             .resolveMediaSource(
@@ -679,7 +813,9 @@ class PlayerNotifier extends StateNotifier<PlaybackState> {
           headers: source.headers,
           tag: mediaItem,
         );
-        if (source.lyrics.isNotEmpty) {
+        // 已存在用户记忆的歌词时，不要被插件返回的默认歌词覆盖。
+        if (source.lyrics.isNotEmpty &&
+            state.queue[queueIndex].lyricsRaw?.trim().isEmpty != false) {
           _updateQueueLyrics(queueIndex, source.lyrics);
         }
         return plugin;
@@ -721,7 +857,8 @@ class PlayerNotifier extends StateNotifier<PlaybackState> {
             source.plugin!,
             source.pluginData!,
           );
-          if (source.lyrics.trim().isNotEmpty) {
+          if (source.lyrics.trim().isNotEmpty &&
+              state.queue[queueIndex].lyricsRaw?.trim().isEmpty != false) {
             _updateQueueLyrics(queueIndex, source.lyrics);
           } else if (!(state.current?.lyricsAttempted ?? false)) {
             unawaited(
@@ -742,6 +879,517 @@ class PlayerNotifier extends StateNotifier<PlaybackState> {
         await _setLocalAudioSource(item.path, mediaItem);
         return null;
     }
+  }
+
+  String? _pluginNameFromSnapshot(QueueItem item) {
+    final data = item.pluginData;
+    if (data == null) return null;
+    for (final key in const [
+      'pluginName',
+      'platform',
+      'sourceName',
+      'source',
+    ]) {
+      final value = data[key]?.toString().trim() ?? '';
+      if (value.isNotEmpty && value.length <= 80) return value;
+    }
+    return null;
+  }
+
+  Future<void> _handleUnavailablePlugin(
+    QueueItem item,
+    int queueIndex,
+    _PluginUnavailableException error, {
+    required int requestId,
+  }) async {
+    final localReplacement = await _findLocalReplacement(item);
+    if (requestId != _playRequestId) return;
+    if (localReplacement != null) {
+      _publishRelinkProposal(
+        queueIndex: queueIndex,
+        original: item,
+        originalPluginName: error.pluginName,
+        replacement: localReplacement,
+        replacementSourceName: '本地音乐',
+        isLocal: true,
+      );
+      return;
+    }
+
+    final pluginReplacement = await _findPluginReplacement(item);
+    if (requestId != _playRequestId) return;
+    if (pluginReplacement != null) {
+      _publishRelinkProposal(
+        queueIndex: queueIndex,
+        original: item,
+        originalPluginName: error.pluginName,
+        replacement: pluginReplacement.item,
+        replacementSourceName: pluginReplacement.pluginName,
+        isLocal: false,
+      );
+      return;
+    }
+
+    final message = '该歌曲所属“${error.pluginName}”插件无法使用，无法找到代替音源';
+    state = state.copyWith(
+      isPlaying: false,
+      isLoading: false,
+      errorMessage: message,
+    );
+    _publishNotice(message);
+    unawaited(_persistSession());
+  }
+
+  void _publishRelinkProposal({
+    required int queueIndex,
+    required QueueItem original,
+    required String originalPluginName,
+    required QueueItem replacement,
+    required String replacementSourceName,
+    required bool isLocal,
+  }) {
+    state = state.copyWith(
+      isPlaying: false,
+      isLoading: false,
+      errorMessage: null,
+    );
+    _ref
+        .read(playbackRelinkProposalProvider.notifier)
+        .state = PlaybackRelinkProposal(
+      id: ++_relinkProposalId,
+      queueIndex: queueIndex,
+      originalPath: original.path,
+      originalPluginName: originalPluginName,
+      replacement: replacement,
+      replacementSourceName: replacementSourceName,
+      isLocal: isLocal,
+    );
+  }
+
+  void _publishNotice(String message) {
+    _ref.read(playbackNoticeEventProvider.notifier).state = PlaybackNoticeEvent(
+      ++_noticeId,
+      message,
+    );
+  }
+
+  Future<void> acceptRelinkProposal(PlaybackRelinkProposal proposal) async {
+    final pending = _ref.read(playbackRelinkProposalProvider);
+    if (pending?.id != proposal.id) return;
+    _ref.read(playbackRelinkProposalProvider.notifier).state = null;
+    final index = proposal.queueIndex;
+    if (index < 0 || index >= state.queue.length) return;
+    final currentAtIndex = state.queue[index];
+    if (currentAtIndex.path != proposal.originalPath) return;
+
+    await _saveAssociatedReplacement(
+      proposal.originalPath,
+      proposal.replacement,
+    );
+    final queue = [...state.queue];
+    queue[index] = proposal.replacement;
+    state = state.copyWith(
+      queue: queue,
+      current: index == state.queueIndex ? proposal.replacement : state.current,
+      duration: index == state.queueIndex
+          ? proposal.replacement.durationMs / 1000.0
+          : state.duration,
+      errorMessage: null,
+    );
+    unawaited(_persistSession());
+    await _playAt(index);
+  }
+
+  void dismissRelinkProposal(PlaybackRelinkProposal proposal) {
+    final pending = _ref.read(playbackRelinkProposalProvider);
+    if (pending?.id != proposal.id) return;
+    _ref.read(playbackRelinkProposalProvider.notifier).state = null;
+    state = state.copyWith(
+      isPlaying: false,
+      isLoading: false,
+      errorMessage: '歌曲所属插件“${proposal.originalPluginName}”无法使用',
+    );
+  }
+
+  Future<QueueItem?> _findLocalReplacement(QueueItem original) async {
+    final candidates = <({QueueItem item, bool downloaded})>[];
+    try {
+      final dbPath = await _ref.read(dbPathProvider.future);
+      final raw = await searchLibrarySongs(
+        dbPath: dbPath,
+        query: original.title.trim(),
+        limit: BigInt.from(80),
+      );
+      final decoded = jsonDecode(raw);
+      if (decoded is List) {
+        for (final value in decoded.whereType<Map>()) {
+          final item = _queueItemFromLibraryJson(
+            Map<String, dynamic>.from(value),
+          );
+          if (item == null ||
+              !_sameReplacementTitle(original.title, item.title)) {
+            continue;
+          }
+          if (await _localItemExists(item)) {
+            candidates.add((item: item, downloaded: false));
+          }
+        }
+      }
+    } catch (_) {
+      // 本地库不可用时仍继续检查下载记录和下载目录。
+    }
+
+    try {
+      final snapshots = await loadDownloadedSongSnapshots();
+      for (final snapshot in snapshots) {
+        if (!_sameReplacementTitle(original.title, snapshot.title) ||
+            !await File(normalizeLocalAudioPath(snapshot.path)).exists()) {
+          continue;
+        }
+        candidates.add((
+          item: QueueItem(
+            path: snapshot.path,
+            title: snapshot.title,
+            artist: snapshot.artist,
+            album: snapshot.album,
+            durationMs: snapshot.durationMs,
+            coverUrl: snapshot.coverUrl,
+            lyricsRaw: snapshot.lyricsRaw,
+            lyricsAttempted: snapshot.lyricsRaw?.trim().isNotEmpty == true,
+          ),
+          downloaded: true,
+        ));
+      }
+    } catch (_) {}
+
+    if (candidates.isEmpty) {
+      final legacy = await _findLegacyDownloadedReplacement(original);
+      if (legacy != null) candidates.add((item: legacy, downloaded: true));
+    }
+    if (candidates.isEmpty) return null;
+
+    candidates.sort(
+      (left, right) =>
+          _localReplacementScore(
+            original,
+            right.item,
+            downloaded: right.downloaded,
+          ).compareTo(
+            _localReplacementScore(
+              original,
+              left.item,
+              downloaded: left.downloaded,
+            ),
+          ),
+    );
+    var selected = candidates.first.item;
+    if (selected.lyricsRaw?.trim().isNotEmpty != true) {
+      try {
+        final dbPath = await _ref.read(dbPathProvider.future);
+        final lyrics = await getSongLyrics(dbPath: dbPath, path: selected.path);
+        if (lyrics.trim().isNotEmpty) {
+          selected = selected.copyWith(
+            lyricsRaw: lyrics,
+            lyricsAttempted: true,
+          );
+        }
+      } catch (_) {}
+    }
+    return selected;
+  }
+
+  Future<({QueueItem item, String pluginName})?> _findPluginReplacement(
+    QueueItem original,
+  ) async {
+    if (original.title.trim().isEmpty ||
+        original.artist.trim().isEmpty ||
+        original.durationMs <= 0) {
+      return null;
+    }
+    final plugins = await _ref.read(enabledMusicPluginsProvider.future);
+    if (plugins.isEmpty) return null;
+    final runtime = _ref.read(pluginRuntimeProvider);
+    final batches = await Future.wait(
+      plugins.map((plugin) async {
+        try {
+          final songs = await runtime
+              .search(plugin, original.title.trim())
+              .timeout(const Duration(seconds: 15));
+          return _RecognizedSearchBatch(plugin, songs);
+        } catch (_) {
+          return _RecognizedSearchBatch(plugin, const []);
+        }
+      }),
+    );
+    final matches = <({EnabledMusicPlugin plugin, PluginSearchSong song})>[];
+    for (final batch in batches) {
+      for (final song in batch.songs) {
+        if (isStrictReplacementMatch(
+          title: original.title,
+          artist: original.artist,
+          durationMs: original.durationMs,
+          candidateTitle: song.title,
+          candidateArtist: song.artist,
+          candidateDurationMs: song.durationMs,
+        )) {
+          matches.add((plugin: batch.plugin, song: song));
+        }
+      }
+    }
+    matches.sort((left, right) {
+      final duration = (original.durationMs - left.song.durationMs)
+          .abs()
+          .compareTo((original.durationMs - right.song.durationMs).abs());
+      return duration != 0
+          ? duration
+          : left.plugin.name.compareTo(right.plugin.name);
+    });
+    final quality =
+        _ref.read(settingsProvider).valueOrNull?.onlineDefaultQuality ?? '320k';
+    for (final match in matches.take(10)) {
+      try {
+        final media = await runtime
+            .resolveMediaSource(
+              match.plugin,
+              match.song.rawData,
+              preferredQuality: quality,
+            )
+            .timeout(const Duration(seconds: 20));
+        if (media.url.trim().isEmpty) continue;
+        final cover = match.song.coverUrl.trim().isNotEmpty
+            ? match.song.coverUrl.trim()
+            : extractPluginCoverUrl(match.song.rawData);
+        return (
+          item: QueueItem(
+            path:
+                'plugin://${Uri.encodeComponent(match.plugin.id)}/'
+                '${Uri.encodeComponent(match.song.id)}',
+            title: match.song.title,
+            artist: match.song.artist,
+            album: match.song.album,
+            durationMs: match.song.durationMs,
+            pluginId: match.plugin.id,
+            pluginData: match.song.rawData,
+            coverUrl: cover.isEmpty ? null : cover,
+            lyricsRaw: media.lyrics.trim().isEmpty ? null : media.lyrics,
+            lyricsAttempted: media.lyrics.trim().isNotEmpty,
+          ),
+          pluginName: match.plugin.name,
+        );
+      } catch (_) {
+        // 搜索命中但无法解析播放地址时继续尝试其它插件。
+      }
+    }
+    return null;
+  }
+
+  bool _sameReplacementTitle(String left, String right) =>
+      _normalizeReplacementText(left).isNotEmpty &&
+      _normalizeReplacementText(left) == _normalizeReplacementText(right);
+
+  int _localReplacementScore(
+    QueueItem original,
+    QueueItem candidate, {
+    required bool downloaded,
+  }) {
+    var score = downloaded ? 400 : 300;
+    if (_normalizeReplacementText(original.artist) ==
+        _normalizeReplacementText(candidate.artist)) {
+      score += 100;
+    }
+    if (original.durationMs > 0 && candidate.durationMs > 0) {
+      final difference = (original.durationMs - candidate.durationMs).abs();
+      if (difference <= 2000) {
+        score += 80;
+      } else if (difference <= 5000) {
+        score += 40;
+      }
+    }
+    return score;
+  }
+
+  QueueItem? _queueItemFromLibraryJson(Map<String, dynamic> json) {
+    final path = json['path']?.toString().trim() ?? '';
+    if (path.isEmpty) return null;
+    final cover = json['cover_url']?.toString().trim().isNotEmpty == true
+        ? json['cover_url'].toString().trim()
+        : json['cover_thumb_path']?.toString().trim() ?? '';
+    return QueueItem(
+      path: path,
+      title: json['title']?.toString() ?? _titleFromPath(path),
+      artist: json['artist']?.toString() ?? '',
+      album: json['album']?.toString() ?? '',
+      durationMs: ((json['duration'] as num?)?.toInt() ?? 0) * 1000,
+      coverUrl: cover.isEmpty ? null : cover,
+    );
+  }
+
+  Future<bool> _localItemExists(QueueItem item) async {
+    if (item.path.startsWith('content://')) return true;
+    return File(normalizeLocalAudioPath(item.path)).exists();
+  }
+
+  Future<QueueItem?> _findLegacyDownloadedReplacement(
+    QueueItem original,
+  ) async {
+    try {
+      final settings = _ref.read(settingsProvider).valueOrNull;
+      final directoryPath = await resolveMusicDownloadDirectory(settings);
+      final directory = Directory(directoryPath);
+      if (!await directory.exists()) return null;
+      final normalizedTitle = _normalizeReplacementText(original.title);
+      final paths = <String>[];
+      await for (final entity in directory.list(followLinks: false)) {
+        if (entity is! File || paths.length >= 30) continue;
+        final extension = p.extension(entity.path).toLowerCase();
+        if (!const {
+          '.flac',
+          '.mp3',
+          '.wav',
+          '.aac',
+          '.m4a',
+          '.ogg',
+          '.opus',
+          '.aiff',
+        }.contains(extension)) {
+          continue;
+        }
+        if (_normalizeReplacementText(
+          p.basenameWithoutExtension(entity.path),
+        ).contains(normalizedTitle)) {
+          paths.add(entity.path);
+        }
+      }
+      if (paths.isEmpty) return null;
+      final parsed = jsonDecode(
+        await parseAudioFiles(pathsJson: jsonEncode(paths)),
+      );
+      if (parsed is! List) return null;
+      final candidates = parsed
+          .whereType<Map>()
+          .map(
+            (value) =>
+                _queueItemFromLibraryJson(Map<String, dynamic>.from(value)),
+          )
+          .whereType<QueueItem>()
+          .where((item) => _sameReplacementTitle(original.title, item.title))
+          .toList();
+      if (candidates.isEmpty) return null;
+      candidates.sort(
+        (a, b) => _localReplacementScore(
+          original,
+          b,
+          downloaded: true,
+        ).compareTo(_localReplacementScore(original, a, downloaded: true)),
+      );
+      return candidates.first;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  Future<QueueItem?> _loadAssociatedReplacement(String originalPath) async {
+    try {
+      final preferences = await SharedPreferences.getInstance();
+      final raw = preferences.getString(_playbackSourceAssociationsKey);
+      if (raw == null || raw.isEmpty) return null;
+      final decoded = jsonDecode(raw);
+      if (decoded is! Map || decoded[originalPath] is! Map) return null;
+      return _queueItemFromAssociation(
+        Map<String, dynamic>.from(decoded[originalPath] as Map),
+      );
+    } catch (_) {
+      return null;
+    }
+  }
+
+  Future<void> _saveAssociatedReplacement(
+    String originalPath,
+    QueueItem replacement,
+  ) async {
+    final preferences = await SharedPreferences.getInstance();
+    final associations = <String, dynamic>{};
+    try {
+      final raw = preferences.getString(_playbackSourceAssociationsKey);
+      final decoded = raw == null ? null : jsonDecode(raw);
+      if (decoded is Map) {
+        associations.addAll(Map<String, dynamic>.from(decoded));
+      }
+    } catch (_) {}
+    associations[originalPath] = _queueItemToAssociation(replacement);
+    await preferences.setString(
+      _playbackSourceAssociationsKey,
+      jsonEncode(associations, toEncodable: (value) => value.toString()),
+    );
+  }
+
+  Future<String?> _loadRememberedLyrics(String path) async {
+    final key = path.trim();
+    if (key.isEmpty) return null;
+    try {
+      final preferences = await SharedPreferences.getInstance();
+      final raw = preferences.getString(_rememberedLyricsKey);
+      if (raw == null || raw.isEmpty) return null;
+      final decoded = jsonDecode(raw);
+      if (decoded is! Map) return null;
+      final lyrics = decoded[key]?.toString().trim() ?? '';
+      return lyrics.isEmpty ? null : lyrics;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  Future<void> _saveRememberedLyrics(String path, String lyrics) async {
+    final key = path.trim();
+    final value = lyrics.trim();
+    if (key.isEmpty || value.isEmpty || value.length > 300 * 1024) return;
+    try {
+      final preferences = await SharedPreferences.getInstance();
+      final remembered = <String, dynamic>{};
+      final raw = preferences.getString(_rememberedLyricsKey);
+      final decoded = raw == null ? null : jsonDecode(raw);
+      if (decoded is Map) {
+        remembered.addAll(Map<String, dynamic>.from(decoded));
+      }
+      remembered[key] = value;
+      // 歌词文本可能较大，限制数量避免长期使用后占满偏好设置。
+      while (remembered.length > 100) {
+        remembered.remove(remembered.keys.first);
+      }
+      await preferences.setString(_rememberedLyricsKey, jsonEncode(remembered));
+    } catch (_) {}
+  }
+
+  Map<String, dynamic> _queueItemToAssociation(QueueItem item) => {
+    'path': item.path,
+    'title': item.title,
+    'artist': item.artist,
+    'album': item.album,
+    'durationMs': item.durationMs,
+    'pluginId': item.pluginId,
+    'pluginData': item.pluginData,
+    'coverUrl': item.coverUrl,
+    'lyricsRaw': item.lyricsRaw,
+    'lyricsAttempted': item.lyricsAttempted,
+  };
+
+  QueueItem? _queueItemFromAssociation(Map<String, dynamic> json) {
+    final path = json['path']?.toString() ?? '';
+    if (path.isEmpty) return null;
+    return QueueItem(
+      path: path,
+      title: json['title']?.toString() ?? _titleFromPath(path),
+      artist: json['artist']?.toString() ?? '',
+      album: json['album']?.toString() ?? '',
+      durationMs: (json['durationMs'] as num?)?.toInt() ?? 0,
+      pluginId: json['pluginId']?.toString(),
+      pluginData: json['pluginData'] is Map
+          ? Map<String, dynamic>.from(json['pluginData'] as Map)
+          : null,
+      coverUrl: json['coverUrl']?.toString(),
+      lyricsRaw: json['lyricsRaw']?.toString(),
+      lyricsAttempted: json['lyricsAttempted'] == true,
+    );
   }
 
   Future<void> _setLocalAudioSource(String rawPath, MediaItem mediaItem) async {
@@ -1195,7 +1843,9 @@ class PlayerNotifier extends StateNotifier<PlaybackState> {
     if (lyrics.trim().isEmpty || index < 0 || index >= state.queue.length) {
       return;
     }
+    final item = state.queue[index];
     _updateQueueLyrics(index, lyrics);
+    await _saveRememberedLyrics(item.path, lyrics);
     await _persistSession();
   }
 
@@ -1475,22 +2125,36 @@ class PlayerNotifier extends StateNotifier<PlaybackState> {
     }
     final n = state.queue.length;
     if (n == 0) return;
-    if (normalizePlayMode(state.playMode) == 2) {
-      final i = _randomPrevIndex();
-      if (i >= 0) await _playAt(i);
-      return;
-    }
     final i = state.queueIndex <= 0 ? n - 1 : state.queueIndex - 1;
     await _playAt(i);
   }
 
   Future<void> cyclePlayMode() async {
     final next = (normalizePlayMode(state.playMode) + 1) % 3;
-    state = state.copyWith(playMode: next);
-    _shuffleHistory.clear();
-    _shuffleFuture.clear();
+    if (next == 2 && state.queue.length > 1) {
+      final current = state.current;
+      final queue = List<QueueItem>.of(state.queue);
+      final currentIndex = current == null
+          ? -1
+          : queue.indexWhere((item) => item.path == current.path);
+      if (currentIndex >= 0) {
+        final selected = queue.removeAt(currentIndex);
+        _shuffleInPlace(queue);
+        queue.insert(0, selected);
+      } else {
+        _shuffleInPlace(queue);
+      }
+      state = state.copyWith(
+        playMode: next,
+        queue: queue,
+        queueIndex: current == null ? state.queueIndex : 0,
+      );
+    } else {
+      state = state.copyWith(playMode: next);
+    }
     await _player.setLoopMode(audioLoopModeForPlayMode(next));
     await _ref.read(settingsProvider.notifier).setPlayMode(next);
+    unawaited(_persistSession());
   }
 
   Future<void> _handleTrackEndOnce() async {
@@ -1526,47 +2190,8 @@ class PlayerNotifier extends StateNotifier<PlaybackState> {
   int _pickNextIndex() {
     final n = state.queue.length;
     if (n == 0) return -1;
-    if (normalizePlayMode(state.playMode) == 2) {
-      return _randomNextIndex();
-    }
     if (state.queueIndex < 0) return 0;
     return (state.queueIndex + 1) % n; // 顺序：列表循环环绕
-  }
-
-  /// 随机模式下一首：优先 future 栈，否则随机不重复当前曲并记录历史。
-  int _randomNextIndex() {
-    if (_shuffleFuture.isNotEmpty) {
-      final path = _shuffleFuture.removeLast();
-      final i = state.queue.indexWhere((q) => q.path == path);
-      if (i >= 0) return i;
-    }
-    if (state.current != null) {
-      _shuffleHistory.add(state.current!.path);
-      if (_shuffleHistory.length > 256) _shuffleHistory.removeAt(0);
-    }
-    return _randomDistinctIndex();
-  }
-
-  int _randomPrevIndex() {
-    if (_shuffleHistory.isNotEmpty) {
-      final path = _shuffleHistory.removeLast();
-      if (state.current != null) _shuffleFuture.add(state.current!.path);
-      final i = state.queue.indexWhere((q) => q.path == path);
-      if (i >= 0) return i;
-    }
-    return _randomDistinctIndex();
-  }
-
-  int _randomDistinctIndex() {
-    final n = state.queue.length;
-    if (n <= 1) return 0;
-    final cur = state.current?.path;
-    final candidates = <int>[];
-    for (var i = 0; i < n; i++) {
-      if (state.queue[i].path != cur) candidates.add(i);
-    }
-    if (candidates.isEmpty) return 0;
-    return candidates[_rand.nextInt(candidates.length)];
   }
 
   Future<void> _persistSession() async {
