@@ -159,6 +159,12 @@ class AppFatalErrorScreen extends StatelessWidget {
                       ),
                     ),
                     const SizedBox(height: 22),
+                    OutlinedButton.icon(
+                      onPressed: AppErrorController.instance.clear,
+                      icon: const Icon(Icons.refresh_rounded),
+                      label: const Text('刷新页面'),
+                    ),
+                    const SizedBox(height: 10),
                     FilledButton.icon(
                       onPressed: () => SystemNavigator.pop(),
                       icon: const Icon(Icons.exit_to_app_rounded),

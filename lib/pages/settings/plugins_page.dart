@@ -14,6 +14,7 @@ import '../../src/rust/api.dart';
 import '../../src/ui/xy_surface.dart';
 import '../../src/ui/xy_theme.dart';
 import '../../src/widgets/top_notice.dart';
+import '../../src/navigation/sidebar_controller.dart';
 
 class _PluginInfo {
   const _PluginInfo({
@@ -680,7 +681,10 @@ class _PluginsPageState extends ConsumerState<PluginsPage> {
   Widget build(BuildContext context) {
     final plugins = ref.watch(_pluginsProvider);
     return Scaffold(
-      appBar: AppBar(title: const Text('插件管理')),
+      appBar: AppBar(
+        leading: const AppSidebarMenuButton(),
+        title: const Text('插件管理'),
+      ),
       body: XyPageBackground(
         child: plugins.when(
           loading: () => const Center(child: CircularProgressIndicator()),

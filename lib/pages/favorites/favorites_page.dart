@@ -4,6 +4,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../../src/favorites/favorites_provider.dart';
 import '../../src/library/library_provider.dart';
 import '../../src/player/player_provider.dart';
+import '../../src/navigation/sidebar_controller.dart';
 import '../../src/widgets/song_list_view.dart';
 
 /// 收藏页：展示已收藏的歌曲，点击即播放整个收藏列表。
@@ -68,6 +69,7 @@ class FavoritesPage extends ConsumerWidget {
 
     return Scaffold(
       appBar: AppBar(
+        leading: const AppSidebarMenuButton(),
         title: const Text('我的收藏'),
         actions: [
           IconButton(

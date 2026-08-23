@@ -4,6 +4,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 
 import '../../src/auth/auth_provider.dart';
+import '../../src/navigation/sidebar_controller.dart';
 import '../../src/widgets/top_notice.dart';
 import '../../src/widgets/user_avatar_image.dart';
 
@@ -92,16 +93,6 @@ class _AccountPageState extends ConsumerState<AccountPage>
 
   void _toast(String msg) {
     XyNotice.show(context, message: msg, duration: const Duration(seconds: 2));
-  }
-
-  void _goBack() {
-    // 账号页既可从设置进入，也可从侧边栏直接打开。有历史路由时正常返回，
-    // 侧边栏直接打开时回到首页，避免无历史路由时被错带到设置页。
-    if (context.canPop()) {
-      context.pop();
-    } else {
-      context.go('/home');
-    }
   }
 
   Future<void> _submit() async {
@@ -452,11 +443,7 @@ class _AccountPageState extends ConsumerState<AccountPage>
     final auth = ref.watch(authProvider);
     return Scaffold(
       appBar: AppBar(
-        leading: IconButton(
-          tooltip: '返回',
-          icon: const Icon(Icons.arrow_back_rounded),
-          onPressed: _goBack,
-        ),
+        leading: const AppSidebarMenuButton(),
         title: Text(auth.isLoggedIn ? '我的' : '账号'),
         centerTitle: true,
       ),
@@ -591,7 +578,7 @@ class _AccountPageState extends ConsumerState<AccountPage>
   Widget _loginForm(BuildContext context, AuthState auth) {
     return _formScroll(
       children: [
-        _field(_idCtrl, 'XY Music 账号', hint: '请输入账号', icon: Icons.tag),
+        _field(_idCtrl, '账号', hint: '请输入账号', icon: Icons.tag),
         _field(
           _passwordCtrl,
           '密码',
@@ -615,7 +602,7 @@ class _AccountPageState extends ConsumerState<AccountPage>
   Widget _registerForm(BuildContext context, AuthState auth) {
     return _formScroll(
       children: [
-        _field(_idCtrl, 'XY Music 账号', hint: '6-20 位数字/字母', icon: Icons.tag),
+        _field(_idCtrl, '账号', hint: '6-20 位数字/字母', icon: Icons.tag),
         _field(_nicknameCtrl, '昵称（可选）', hint: '留空使用默认昵称', icon: Icons.badge),
         _field(
           _passwordCtrl,
@@ -880,11 +867,7 @@ class _ProfileView extends StatelessWidget {
               value: user.email.isEmpty ? '未绑定' : user.email,
             ),
             if (user.ciyuanxiId != null && user.ciyuanxiId!.isNotEmpty)
-              _InfoTile(
-                icon: Icons.tag,
-                label: 'XY Music 账号',
-                value: user.ciyuanxiId!,
-              ),
+              _InfoTile(icon: Icons.tag, label: '账号', value: user.ciyuanxiId!),
           ],
         ),
         const SizedBox(height: 16),

@@ -91,6 +91,78 @@ class AuthException implements Exception {
   String toString() => message;
 }
 
+/// 用户提交的反馈记录，与服务端 list_my_feedback 返回结构保持一致。
+class UserFeedbackItem {
+  const UserFeedbackItem({
+    required this.id,
+    required this.title,
+    required this.content,
+    required this.feedbackType,
+    required this.images,
+    required this.status,
+    required this.category,
+    required this.assignee,
+    required this.adminReply,
+    required this.repliedBy,
+    required this.resolveNote,
+    required this.rejectReason,
+    required this.resolveImages,
+    required this.hasErrorLogs,
+    required this.hasAllLogs,
+    required this.createdAt,
+    required this.repliedAt,
+    required this.updatedAt,
+  });
+
+  final int id;
+  final String title;
+  final String content;
+  final String feedbackType;
+  final List<String> images;
+  final String status;
+  final String category;
+  final String assignee;
+  final String adminReply;
+  final String repliedBy;
+  final String resolveNote;
+  final String rejectReason;
+  final List<String> resolveImages;
+  final bool hasErrorLogs;
+  final bool hasAllLogs;
+  final String createdAt;
+  final String repliedAt;
+  final String updatedAt;
+
+  factory UserFeedbackItem.fromJson(Map<String, dynamic> json) {
+    List<String> strings(dynamic value) => value is List
+        ? value
+              .map((item) => item?.toString().trim() ?? '')
+              .where((item) => item.isNotEmpty)
+              .toList()
+        : const <String>[];
+    return UserFeedbackItem(
+      id: (json['id'] as num?)?.toInt() ?? int.tryParse('${json['id']}') ?? 0,
+      title: json['title']?.toString() ?? '',
+      content: json['content']?.toString() ?? '',
+      feedbackType: json['feedbackType']?.toString() ?? 'problem',
+      images: strings(json['images']),
+      status: json['status']?.toString() ?? 'pending',
+      category: json['category']?.toString() ?? 'feedback',
+      assignee: json['assignee']?.toString() ?? '',
+      adminReply: json['adminReply']?.toString() ?? json['admin_reply']?.toString() ?? '',
+      repliedBy: json['repliedBy']?.toString() ?? json['replied_by']?.toString() ?? '',
+      resolveNote: json['resolveNote']?.toString() ?? '',
+      rejectReason: json['rejectReason']?.toString() ?? json['reject_reason']?.toString() ?? '',
+      resolveImages: strings(json['resolveImages']),
+      hasErrorLogs: json['hasErrorLogs'] == true,
+      hasAllLogs: json['hasAllLogs'] == true,
+      createdAt: json['createdAt']?.toString() ?? '',
+      repliedAt: json['repliedAt']?.toString() ?? '',
+      updatedAt: json['updatedAt']?.toString() ?? '',
+    );
+  }
+}
+
 /// 人机验证题目（内置算术题模式，与桌面端 get_captcha 一致）。
 class HumanCaptcha {
   final String captchaId;
@@ -293,7 +365,7 @@ class AuthNotifier extends StateNotifier<AuthState> {
     if (code != 200) {
       throw AuthException(
         (j['msg'] as String?)?.isNotEmpty == true
-            ? j['msg'] as String
+            ? _userFacingMessage(j['msg'] as String)
             : '请求失败（code $code）',
       );
     }
@@ -420,9 +492,9 @@ class AuthNotifier extends StateNotifier<AuthState> {
         'ciyuanxi_id': ciyuanxiId.trim(),
       if (captcha != null) ...captcha.toBodyFields(),
     });
-    return (data['message'] as String?) ??
-        (data['msg'] as String?) ??
-        '验证码已发送到邮箱';
+    return _userFacingMessage(
+      (data['message'] as String?) ?? (data['msg'] as String?) ?? '验证码已发送到邮箱',
+    );
   }
 
   /// XY Music 账号登录。
@@ -479,7 +551,7 @@ class AuthNotifier extends StateNotifier<AuthState> {
       }
       await _saveAuth(token.toString(), data);
       final notice = data['registration_notice']?.toString().trim() ?? '';
-      return notice.isEmpty ? null : notice;
+      return notice.isEmpty ? null : _userFacingMessage(notice);
     } catch (e) {
       state = state.copyWith(loading: false, error: _msg(e, '注册失败'));
       return null;
@@ -657,8 +729,58 @@ class AuthNotifier extends StateNotifier<AuthState> {
     state = const AuthState();
   }
 
+  /// 提交问题反馈或功能建议，支持附加日志和图片 data URL。
+  Future<int> submitFeedback({
+    required String content,
+    String feedbackType = 'problem',
+    String? title,
+    String? errorLogs,
+    String? allLogs,
+    List<String> images = const [],
+  }) async {
+    final current = state.user;
+    final ciyuanxiId = current?.ciyuanxiId?.trim() ?? '';
+    if (current == null || ciyuanxiId.isEmpty) {
+      throw AuthException('请先登录账号后再提交反馈');
+    }
+    final type = feedbackType == 'suggestion' ? 'suggestion' : 'problem';
+    final data = await _requestAction('submit_feedback', {
+      'ciyuanxi_id': ciyuanxiId,
+      'nickname': current.nickname.trim(),
+      'title': (title?.trim().isNotEmpty == true)
+          ? title!.trim()
+          : (type == 'suggestion' ? '功能建议' : '问题反馈'),
+      'content': content.trim(),
+      'feedback_type': type,
+      if (errorLogs?.trim().isNotEmpty == true) 'error_logs': errorLogs,
+      if (allLogs?.trim().isNotEmpty == true) 'all_logs': allLogs,
+      if (images.isNotEmpty) 'images': images,
+    }, fetchTimeoutMs: 55000);
+    return (data['id'] as num?)?.toInt() ?? int.tryParse('${data['id']}') ?? 0;
+  }
+
+  /// 获取当前账号的反馈记录及处理结果。
+  Future<List<UserFeedbackItem>> listMyFeedback() async {
+    final current = state.user;
+    final ciyuanxiId = current?.ciyuanxiId?.trim() ?? '';
+    if (current == null || ciyuanxiId.isEmpty) {
+      throw AuthException('请先登录账号后再查看反馈');
+    }
+    final data = await _requestAction('list_my_feedback', {
+      'ciyuanxi_id': ciyuanxiId,
+    }, fetchTimeoutMs: 20000);
+    final list = data['list'];
+    if (list is! List) return const [];
+    return list
+        .whereType<Map>()
+        .map(
+          (item) => UserFeedbackItem.fromJson(Map<String, dynamic>.from(item)),
+        )
+        .toList();
+  }
+
   String _msg(Object e, String fallback) {
-    if (e is AuthException) return e.message;
+    if (e is AuthException) return _userFacingMessage(e.message);
     final s = e.toString();
     if (s.contains('network') || s.contains('Failed to fetch')) {
       return '网络异常，请检查网络连接';
@@ -666,6 +788,13 @@ class AuthNotifier extends StateNotifier<AuthState> {
     if (s.contains('timeout')) return '请求超时，请稍后重试';
     return fallback;
   }
+
+  /// 兼容服务端尚未更新的旧提示文案，界面统一使用“账号”称呼。
+  String _userFacingMessage(String message) => message
+      .replaceAll('弦予音乐号', '账号')
+      .replaceAll('弦予号', '账号')
+      .replaceAll('弦予音乐 ID', '账号')
+      .replaceAll('弦予音乐ID', '账号');
 }
 
 final authProvider = StateNotifierProvider<AuthNotifier, AuthState>(

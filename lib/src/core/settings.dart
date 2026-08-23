@@ -4,6 +4,9 @@ import 'package:shared_preferences/shared_preferences.dart';
 /// 主题模式
 enum ThemeModePreference { system, light, dark }
 
+/// 播放过程中发生错误时的处理方式。
+enum PlaybackFailureAction { playNext, pause }
+
 /// 歌词逐字高亮样式。
 ///
 /// `wordByWord` 是旧版逐词切换高亮，`progressive` 会在每个词内部从左到右
@@ -35,6 +38,8 @@ class AppSettings {
   const AppSettings({
     this.volume = 1.0,
     this.playMode = 0, // 0 顺序(列表循环) 1 单曲循环 2 随机
+    this.playbackFailureAction = PlaybackFailureAction.playNext,
+    this.playOtherAudioWithoutInterruption = false,
     this.lastTab = 0,
     this.keepScreenOn = true,
     this.themeMode = ThemeModePreference.system,
@@ -53,6 +58,8 @@ class AppSettings {
 
   final double volume;
   final int playMode;
+  final PlaybackFailureAction playbackFailureAction;
+  final bool playOtherAudioWithoutInterruption;
   final int lastTab;
   final bool keepScreenOn;
   final ThemeModePreference themeMode;
@@ -74,6 +81,8 @@ class AppSettings {
   AppSettings copyWith({
     double? volume,
     int? playMode,
+    PlaybackFailureAction? playbackFailureAction,
+    bool? playOtherAudioWithoutInterruption,
     int? lastTab,
     bool? keepScreenOn,
     ThemeModePreference? themeMode,
@@ -92,6 +101,11 @@ class AppSettings {
     return AppSettings(
       volume: volume ?? this.volume,
       playMode: playMode ?? this.playMode,
+      playbackFailureAction:
+          playbackFailureAction ?? this.playbackFailureAction,
+      playOtherAudioWithoutInterruption:
+          playOtherAudioWithoutInterruption ??
+          this.playOtherAudioWithoutInterruption,
       lastTab: lastTab ?? this.lastTab,
       keepScreenOn: keepScreenOn ?? this.keepScreenOn,
       themeMode: themeMode ?? this.themeMode,
@@ -102,8 +116,7 @@ class AppSettings {
           libraryMinDurationSeconds ?? this.libraryMinDurationSeconds,
       showLyricsTranslation:
           showLyricsTranslation ?? this.showLyricsTranslation,
-      lyricWordEffectMode:
-          lyricWordEffectMode ?? this.lyricWordEffectMode,
+      lyricWordEffectMode: lyricWordEffectMode ?? this.lyricWordEffectMode,
       downloadPath: downloadPath ?? this.downloadPath,
       downloadQuality: downloadQuality ?? this.downloadQuality,
       downloadLyrics: downloadLyrics ?? this.downloadLyrics,
@@ -120,6 +133,11 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
     return AppSettings(
       volume: prefs.getDouble('volume') ?? 1.0,
       playMode: normalizePlayMode(prefs.getInt('playMode') ?? 0),
+      playbackFailureAction: _playbackFailureActionFromInt(
+        prefs.getInt('playbackFailureAction') ?? 0,
+      ),
+      playOtherAudioWithoutInterruption:
+          prefs.getBool('playOtherAudioWithoutInterruption') ?? false,
       lastTab: prefs.getInt('lastTab') ?? 0,
       keepScreenOn: prefs.getBool('keepScreenOn') ?? true,
       themeMode: _themeFromInt(prefs.getInt('themeMode') ?? 0),
@@ -149,9 +167,12 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
     }
   }
 
-  LyricWordEffectMode _lyricWordEffectModeFromPrefs(
-    SharedPreferences prefs,
-  ) {
+  PlaybackFailureAction _playbackFailureActionFromInt(int v) =>
+      v == PlaybackFailureAction.pause.index
+      ? PlaybackFailureAction.pause
+      : PlaybackFailureAction.playNext;
+
+  LyricWordEffectMode _lyricWordEffectModeFromPrefs(SharedPreferences prefs) {
     final stored = prefs.getInt('lyricWordEffectMode');
     if (stored != null &&
         stored >= 0 &&
@@ -161,9 +182,7 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
     // 旧版本只有 bool：已有用户继续保留原来的逐词样式；新用户默认渐进填充。
     final legacy = prefs.getBool('enableWordEffect');
     if (legacy != null) {
-      return legacy
-          ? LyricWordEffectMode.wordByWord
-          : LyricWordEffectMode.none;
+      return legacy ? LyricWordEffectMode.wordByWord : LyricWordEffectMode.none;
     }
     return LyricWordEffectMode.progressive;
   }
@@ -176,6 +195,11 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
     await Future.wait([
       prefs.setDouble('volume', next.volume),
       prefs.setInt('playMode', next.playMode),
+      prefs.setInt('playbackFailureAction', next.playbackFailureAction.index),
+      prefs.setBool(
+        'playOtherAudioWithoutInterruption',
+        next.playOtherAudioWithoutInterruption,
+      ),
       prefs.setInt('lastTab', next.lastTab),
       prefs.setBool('keepScreenOn', next.keepScreenOn),
       prefs.setInt('themeMode', next.themeMode.index),
@@ -198,6 +222,16 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
   Future<void> setPlayMode(int m) => _save(
     (state.valueOrNull ?? const AppSettings()).copyWith(
       playMode: normalizePlayMode(m),
+    ),
+  );
+  Future<void> setPlaybackFailureAction(PlaybackFailureAction action) => _save(
+    (state.valueOrNull ?? const AppSettings()).copyWith(
+      playbackFailureAction: action,
+    ),
+  );
+  Future<void> setPlayOtherAudioWithoutInterruption(bool value) => _save(
+    (state.valueOrNull ?? const AppSettings()).copyWith(
+      playOtherAudioWithoutInterruption: value,
     ),
   );
   Future<void> setLastTab(int t) =>

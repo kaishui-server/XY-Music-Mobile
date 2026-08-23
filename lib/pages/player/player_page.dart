@@ -1069,8 +1069,7 @@ class _PlaylistPickerSheet extends ConsumerStatefulWidget {
       _PlaylistPickerSheetState();
 }
 
-class _PlaylistPickerSheetState
-    extends ConsumerState<_PlaylistPickerSheet> {
+class _PlaylistPickerSheetState extends ConsumerState<_PlaylistPickerSheet> {
   bool _busy = false;
 
   Future<void> _addTo(String playlistId) async {
@@ -1117,9 +1116,7 @@ class _PlaylistPickerSheetState
     if (!mounted || name == null || name.trim().isEmpty) return;
     setState(() => _busy = true);
     try {
-      final playlist = await ref
-          .read(playlistsProvider.notifier)
-          .create(name);
+      final playlist = await ref.read(playlistsProvider.notifier).create(name);
       if (playlist == null) return;
       await ref
           .read(playlistsProvider.notifier)
@@ -1182,14 +1179,27 @@ class _PlaylistPickerSheetState
                       itemCount: playlists.length,
                       itemBuilder: (context, index) {
                         final playlist = playlists[index];
+                        final firstPath = playlist.songPaths.isEmpty
+                            ? playlist.id
+                            : playlist.songPaths.first;
                         return ListTile(
-                          leading: CircleAvatar(
-                            backgroundColor: colorScheme.surfaceContainerHighest,
-                            child: Icon(
-                              Icons.queue_music_rounded,
-                              color: colorScheme.onSurfaceVariant,
-                            ),
-                          ),
+                          leading: playlist.songPaths.isEmpty
+                              ? CircleAvatar(
+                                  backgroundColor:
+                                      colorScheme.surfaceContainerHighest,
+                                  child: Icon(
+                                    Icons.queue_music_rounded,
+                                    color: colorScheme.onSurfaceVariant,
+                                  ),
+                                )
+                              : CoverImage(
+                                  songPath: firstPath,
+                                  imageUrl: playlist.effectiveCoverUrl,
+                                  width: 40,
+                                  height: 40,
+                                  radius: 20,
+                                  icon: Icons.queue_music_rounded,
+                                ),
                           title: Text(
                             playlist.name,
                             maxLines: 1,

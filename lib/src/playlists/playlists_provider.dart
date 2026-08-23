@@ -111,6 +111,14 @@ class MobilePlaylist {
   final String? coverUrl;
   final Map<String, PlaylistSongSnapshot> songSnapshots;
 
+  /// 歌单没有单独设置封面时，默认使用第一首歌的封面。
+  String? get effectiveCoverUrl {
+    final explicit = coverUrl?.trim() ?? '';
+    if (explicit.isNotEmpty) return explicit;
+    if (songPaths.isEmpty) return null;
+    return songSnapshots[songPaths.first]?.coverUrl;
+  }
+
   MobilePlaylist copyWith({
     String? name,
     List<String>? songPaths,
@@ -197,12 +205,15 @@ class PlaylistsNotifier extends StateNotifier<List<MobilePlaylist>> {
   }) async {
     final trimmed = name.trim();
     if (trimmed.isEmpty) return null;
+    final firstSongCover = songs.isEmpty ? null : songs.first.coverUrl;
     final item = MobilePlaylist(
       id: DateTime.now().microsecondsSinceEpoch.toString(),
       name: trimmed,
       songPaths: {...paths, ...songs.map((song) => song.path)}.toList(),
       createdAt: DateTime.now(),
-      coverUrl: coverUrl,
+      coverUrl: coverUrl?.trim().isNotEmpty == true
+          ? coverUrl!.trim()
+          : firstSongCover,
       songSnapshots: {
         for (final song in songs)
           song.path: PlaylistSongSnapshot.fromSong(song),
@@ -260,6 +271,11 @@ class PlaylistsNotifier extends StateNotifier<List<MobilePlaylist>> {
         if (playlist.id == id)
           playlist.copyWith(
             songPaths: {...playlist.songPaths, item.path}.toList(),
+            coverUrl:
+                (playlist.coverUrl?.trim().isNotEmpty ?? false) ||
+                    playlist.songPaths.isNotEmpty
+                ? playlist.coverUrl
+                : item.coverUrl,
             songSnapshots: Map.of(playlist.songSnapshots)
               ..[item.path] = snapshot,
           )

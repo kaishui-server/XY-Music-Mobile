@@ -3,6 +3,7 @@ import 'dart:async';
 import 'dart:io';
 import 'dart:math';
 
+import 'package:audio_session/audio_session.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:just_audio/just_audio.dart';
@@ -17,6 +18,7 @@ import '../plugins/plugin_runtime.dart';
 import '../recent/recent_store.dart';
 import '../rust/api.dart';
 import 'downloaded_song_store.dart';
+import 'lx_lyrics_builder.dart';
 
 /// 播放中的单曲信息（小而美：仅保留 UI 需要的最小字段）。
 class QueueItem {
@@ -458,18 +460,28 @@ LoopMode audioLoopModeForPlayMode(int playMode) =>
 
 class PlayerNotifier extends StateNotifier<PlaybackState> {
   PlayerNotifier(this._ref) : super(const PlaybackState()) {
+    _ref.listen<AsyncValue<AppSettings>>(settingsProvider, (previous, next) {
+      final allowOtherAudio =
+          next.valueOrNull?.playOtherAudioWithoutInterruption ?? false;
+      unawaited(_configureAudioSession(allowOtherAudio));
+    });
     _init();
   }
 
   final Ref _ref;
-  final AudioPlayer _player = AudioPlayer();
+  // 音频中断由本类按设置处理：开启“不中断”时忽略其他应用的音频焦点
+  // 中断，避免 just_audio 默认行为直接暂停当前歌曲。
+  final AudioPlayer _player = AudioPlayer(handleInterruptions: false);
   final Random _rand = Random();
   StreamSubscription<Duration?>? _posSub;
   StreamSubscription<Duration?>? _durSub;
   StreamSubscription<dynamic>? _stateSub;
+  StreamSubscription<AudioInterruptionEvent>? _audioInterruptionSub;
+  StreamSubscription<void>? _becomingNoisySub;
   Timer? _sleepTimer;
   Timer? _sleepTimerTicker;
   bool _manualPause = false;
+  bool _wasInterrupted = false;
   bool _handlingTrackEnd = false;
   bool _notificationPermissionChecked = false;
   int _playRequestId = 0;
@@ -478,6 +490,23 @@ class PlayerNotifier extends StateNotifier<PlaybackState> {
   DateTime _lastPosPersist = DateTime.fromMillisecondsSinceEpoch(0);
 
   Future<void> _init() async {
+    final allowOtherAudio =
+        _ref
+            .read(settingsProvider)
+            .valueOrNull
+            ?.playOtherAudioWithoutInterruption ??
+        false;
+    await _configureAudioSession(allowOtherAudio);
+    if (Platform.isAndroid || Platform.isIOS || Platform.isMacOS) {
+      final session = await AudioSession.instance;
+      _audioInterruptionSub = session.interruptionEventStream.listen(
+        _handleAudioInterruption,
+      );
+      _becomingNoisySub = session.becomingNoisyEventStream.listen((_) {
+        _manualPause = true;
+        unawaited(_player.pause());
+      });
+    }
     // 逐字歌词需要比默认 200ms 更细的进度采样，否则短字会被直接跳过。
     _posSub = _player
         .createPositionStream(
@@ -514,6 +543,50 @@ class PlayerNotifier extends StateNotifier<PlaybackState> {
       }
     });
     await _restoreSession();
+  }
+
+  /// 配置系统音频焦点。开启后使用“可降低音量”的焦点类型，并在 iOS
+  /// 使用 mixWithOthers，使其他音乐播放时本应用不会被自动暂停。
+  Future<void> _configureAudioSession(bool allowOtherAudio) async {
+    if (!Platform.isAndroid && !Platform.isIOS && !Platform.isMacOS) return;
+    try {
+      final session = await AudioSession.instance;
+      await session.configure(
+        AudioSessionConfiguration.music().copyWith(
+          androidAudioFocusGainType: allowOtherAudio
+              ? AndroidAudioFocusGainType.gainTransientMayDuck
+              : AndroidAudioFocusGainType.gain,
+          androidWillPauseWhenDucked: allowOtherAudio ? false : null,
+          avAudioSessionCategoryOptions: allowOtherAudio
+              ? AVAudioSessionCategoryOptions.mixWithOthers
+              : AVAudioSessionCategoryOptions.none,
+        ),
+      );
+    } catch (error) {
+      debugPrint('音频焦点配置失败：$error');
+    }
+  }
+
+  void _handleAudioInterruption(AudioInterruptionEvent event) {
+    final allowOtherAudio =
+        _ref
+            .read(settingsProvider)
+            .valueOrNull
+            ?.playOtherAudioWithoutInterruption ??
+        false;
+    if (allowOtherAudio) return;
+    final shouldPause =
+        event.type == AudioInterruptionType.pause ||
+        event.type == AudioInterruptionType.unknown;
+    if (event.begin) {
+      if (shouldPause && _player.playing) {
+        _wasInterrupted = true;
+        unawaited(_player.pause());
+      }
+    } else if (shouldPause && _wasInterrupted) {
+      _wasInterrupted = false;
+      unawaited(_player.play());
+    }
   }
 
   /// 启动时从 SQLite 恢复上次播放会话。
@@ -767,10 +840,10 @@ class PlayerNotifier extends StateNotifier<PlaybackState> {
         );
         return;
       }
-      state = state.copyWith(
-        isPlaying: false,
-        isLoading: false,
-        errorMessage: _friendlyPlaybackError(error),
+      await _handlePlaybackFailure(
+        error,
+        requestId: requestId,
+        queueIndex: index,
       );
     }
     unawaited(_persistSession());
@@ -1729,10 +1802,10 @@ class PlayerNotifier extends StateNotifier<PlaybackState> {
       }
       debugPrint('歌曲播放失败：$error');
       debugPrintStack(stackTrace: stackTrace);
-      state = state.copyWith(
-        isPlaying: false,
-        isLoading: false,
-        errorMessage: _friendlyPlaybackError(error),
+      await _handlePlaybackFailure(
+        error,
+        requestId: requestId,
+        queueIndex: state.queueIndex,
       );
     }
   }
@@ -1806,14 +1879,7 @@ class PlayerNotifier extends StateNotifier<PlaybackState> {
         _markLyricsAttemptedForPath(index, path);
         return;
       }
-      var lyrics = '';
-      for (final key in const ['lxlyric', 'lyric', 'tlyric']) {
-        final value = decoded[key]?.toString().trim() ?? '';
-        if (value.isNotEmpty) {
-          lyrics = value;
-          break;
-        }
-      }
+      final lyrics = buildLxLyricsRaw(Map<String, dynamic>.from(decoded));
       if (lyrics.isEmpty) {
         _markLyricsAttemptedForPath(index, path);
         return;
@@ -1921,6 +1987,37 @@ class PlayerNotifier extends StateNotifier<PlaybackState> {
       message = '音频地址无法播放或已经失效';
     }
     return message.isEmpty ? '歌曲播放失败，请重试' : message;
+  }
+
+  /// 根据“播放失败后”设置决定是停在当前歌曲还是自动尝试下一首。
+  /// 队列只有一首歌时不自动重试，避免同一首失败歌曲无限循环。
+  Future<void> _handlePlaybackFailure(
+    Object error, {
+    required int requestId,
+    required int queueIndex,
+  }) async {
+    if (requestId != _playRequestId ||
+        queueIndex < 0 ||
+        queueIndex >= state.queue.length) {
+      return;
+    }
+    state = state.copyWith(
+      isPlaying: false,
+      isLoading: false,
+      errorMessage: _friendlyPlaybackError(error),
+    );
+    final action =
+        _ref.read(settingsProvider).valueOrNull?.playbackFailureAction ??
+        PlaybackFailureAction.playNext;
+    if (action != PlaybackFailureAction.playNext || state.queue.length <= 1) {
+      return;
+    }
+    // 让错误状态完成一次发布，随后再切换，避免按钮短暂卡在加载状态。
+    await Future<void>.delayed(const Duration(milliseconds: 80));
+    if (requestId != _playRequestId || state.queueIndex != queueIndex) return;
+    final nextIndex = _pickNextIndex();
+    if (nextIndex < 0 || nextIndex == queueIndex) return;
+    await _playAt(nextIndex);
   }
 
   Future<void> _addToRecentHistory(QueueItem item) async {
@@ -2040,6 +2137,15 @@ class PlayerNotifier extends StateNotifier<PlaybackState> {
   ) async {
     final item = state.current;
     if (item == null) throw Exception('当前没有正在播放的歌曲');
+    return resolveDownloadSourceFor(item, quality);
+  }
+
+  /// Resolve a downloadable source without changing the current playback item.
+  /// This is used by playlist batch downloads so downloading does not interrupt playback.
+  Future<PlaybackDownloadSource> resolveDownloadSourceFor(
+    QueueItem item,
+    String quality,
+  ) async {
     final preferredQuality = quality.trim().isEmpty ? '320k' : quality.trim();
     switch (playbackSourceTypeFor(item)) {
       case PlaybackSourceType.plugin:
@@ -2352,6 +2458,8 @@ class PlayerNotifier extends StateNotifier<PlaybackState> {
   void dispose() {
     _sleepTimer?.cancel();
     _sleepTimerTicker?.cancel();
+    _audioInterruptionSub?.cancel();
+    _becomingNoisySub?.cancel();
     _posSub?.cancel();
     _durSub?.cancel();
     _stateSub?.cancel();

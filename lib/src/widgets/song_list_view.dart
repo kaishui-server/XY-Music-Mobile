@@ -13,6 +13,9 @@ class SongsListView extends ConsumerWidget {
   final List<Song> songs;
   final Future<void> Function(List<Song> songs, int index)? onPlay;
   final bool showFavoriteButton;
+  final bool selectionMode;
+  final bool Function(Song song)? isSelected;
+  final ValueChanged<Song>? onToggleSelection;
 
   /// 列表内边距。全屏页可留出底部安全区，嵌在 shell 内的页面可避让底栏。
   final EdgeInsetsGeometry? padding;
@@ -22,6 +25,9 @@ class SongsListView extends ConsumerWidget {
     this.onPlay,
     this.padding,
     this.showFavoriteButton = false,
+    this.selectionMode = false,
+    this.isSelected,
+    this.onToggleSelection,
   });
 
   @override
@@ -42,13 +48,26 @@ class SongsListView extends ConsumerWidget {
             color: Colors.transparent,
             borderRadius: BorderRadius.circular(13),
             child: InkWell(
-              onTap: () => onPlay?.call(songs, i),
-              onLongPress: () => _showSongActions(context, ref, s, i),
+              onTap: () => selectionMode
+                  ? onToggleSelection?.call(s)
+                  : onPlay?.call(songs, i),
+              onLongPress: selectionMode
+                  ? () => onToggleSelection?.call(s)
+                  : () => _showSongActions(context, ref, s, i),
               borderRadius: BorderRadius.circular(13),
               child: Padding(
                 padding: const EdgeInsets.fromLTRB(8, 7, 4, 7),
                 child: Row(
                   children: [
+                    if (selectionMode)
+                      Padding(
+                        padding: const EdgeInsets.only(right: 4),
+                        child: Checkbox(
+                          value: isSelected?.call(s) ?? false,
+                          onChanged: (_) => onToggleSelection?.call(s),
+                          visualDensity: VisualDensity.compact,
+                        ),
+                      ),
                     SongCover(song: s),
                     const SizedBox(width: 11),
                     Expanded(
@@ -103,7 +122,7 @@ class SongsListView extends ConsumerWidget {
                         ).colorScheme.onSurfaceVariant.withValues(alpha: .65),
                       ),
                     ),
-                    if (showFavoriteButton)
+                    if (!selectionMode && showFavoriteButton)
                       IconButton(
                         tooltip: isFavorite ? '取消收藏' : '收藏',
                         icon: Icon(
@@ -113,7 +132,8 @@ class SongsListView extends ConsumerWidget {
                         ),
                         onPressed: () => _toggleFavorite(context, ref, s),
                       ),
-                    IconButton(
+                    if (!selectionMode)
+                      IconButton(
                       tooltip: '更多',
                       icon: const Icon(Icons.more_vert, size: 20),
                       onPressed: () => _showSongActions(context, ref, s, i),

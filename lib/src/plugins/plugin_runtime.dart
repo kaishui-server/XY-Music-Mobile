@@ -14,6 +14,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import '../core/db_path.dart';
 import '../rust/api.dart';
+import '../player/lx_lyrics_builder.dart';
 import 'plugin_metadata.dart';
 
 class EnabledMusicPlugin {
@@ -50,6 +51,28 @@ class PluginSearchSong {
   final String artist;
   final String album;
   final int durationMs;
+  final String coverUrl;
+  final Map<String, dynamic> rawData;
+}
+
+/// 插件分类搜索结果（歌手或专辑）。
+///
+/// MusicFree 插件可以直接返回 artist/album 搜索结果；LX 的分类结果由
+/// 落雪搜索接口提供。点击分类结果后，MusicFree 优先调用详情接口获取作品。
+class PluginCatalogResult {
+  const PluginCatalogResult({
+    required this.pluginId,
+    required this.id,
+    required this.title,
+    required this.subtitle,
+    required this.coverUrl,
+    required this.rawData,
+  });
+
+  final String pluginId;
+  final String id;
+  final String title;
+  final String subtitle;
   final String coverUrl;
   final Map<String, dynamic> rawData;
 }
@@ -346,7 +369,262 @@ class PluginRuntimeService {
         (_isNeteaseMusicPlugin(plugin) || list.any(_looksLikeNeteaseTrack))) {
       list = await _backfillNeteaseTrackMeta(list);
     }
-    return list.map((raw) => _toSearchSong(plugin.id, raw)).toList();
+    return list
+        .map((raw) => _toSearchSong(plugin.id, _resetMediaItem(plugin, raw)))
+        .toList();
+  }
+
+  /// 获取歌手详情中的歌曲，沿用桌面端的 getArtistWorks 逻辑。
+  /// 插件未实现详情接口时才回退到按歌手名搜索。
+  Future<List<PluginSearchSong>> getArtistSongs(
+    EnabledMusicPlugin plugin,
+    PluginCatalogResult artist,
+  ) async {
+    if (plugin.isLx) return _searchLxPlugin(plugin, artist.title);
+    try {
+      final response = _runsPluginsInBackground
+          ? await _runPluginOperation(plugin, 'getArtistWorks', {
+              'rawData': artist.rawData,
+              'page': 1,
+              'type': 'music',
+            })
+          : await _callOnCurrentIsolate(plugin, 'getArtistWorks', [
+              artist.rawData,
+              1,
+              'music',
+            ]);
+      final list = _extractResultList(response);
+      if (list.isNotEmpty) {
+        return list
+            .map(
+              (raw) => _toSearchSong(plugin.id, _resetMediaItem(plugin, raw)),
+            )
+            .toList();
+      }
+    } catch (_) {
+      // 与桌面端一致：详情接口不可用时回退到普通歌曲搜索。
+    }
+    return search(plugin, artist.title);
+  }
+
+  /// 获取专辑详情中的歌曲，沿用桌面端的 getAlbumInfo 逻辑。
+  /// 插件未实现详情接口时才回退到按专辑名搜索并过滤。
+  Future<List<PluginSearchSong>> getAlbumSongs(
+    EnabledMusicPlugin plugin,
+    PluginCatalogResult album,
+  ) async {
+    if (plugin.isLx) return _searchLxPlugin(plugin, album.title);
+    try {
+      final response = _runsPluginsInBackground
+          ? await _runPluginOperation(plugin, 'getAlbumInfo', {
+              'rawData': album.rawData,
+              'page': 1,
+            })
+          : await _callOnCurrentIsolate(plugin, 'getAlbumInfo', [
+              album.rawData,
+              1,
+            ]);
+      final list = _extractResultList(response);
+      if (list.isNotEmpty) {
+        return list
+            .map(
+              (raw) => _toSearchSong(plugin.id, _resetMediaItem(plugin, raw)),
+            )
+            .toList();
+      }
+    } catch (_) {
+      // 与桌面端一致：详情接口不可用时回退到普通歌曲搜索。
+    }
+    final results = await search(plugin, album.title);
+    final target = album.title.trim().toLowerCase();
+    return results.where((song) {
+      final value = song.album.trim().toLowerCase();
+      return value == target ||
+          value.contains(target) ||
+          target.contains(value);
+    }).toList();
+  }
+
+  /// 搜索插件歌手。MF 直接调用插件的 artist 类型；LX 仅保留歌手名匹配的结果。
+  Future<List<PluginCatalogResult>> searchArtists(
+    EnabledMusicPlugin plugin,
+    String keyword,
+  ) async {
+    if (plugin.isLx) {
+      final songs = await _searchLxPlugin(plugin, keyword);
+      return _aggregateLxCatalog(
+        plugin.id,
+        songs,
+        keyword: keyword,
+        artist: true,
+      );
+    }
+    final list = await _searchMusicFreeType(plugin, keyword, 'artist');
+    return list
+        .map(
+          (raw) => _toCatalogResult(
+            plugin.id,
+            _resetMediaItem(plugin, raw),
+            artist: true,
+          ),
+        )
+        .where((item) => item.title.isNotEmpty)
+        .toList();
+  }
+
+  /// 搜索插件专辑。MF 直接调用插件的 album 类型；LX 仅保留专辑名匹配的结果。
+  Future<List<PluginCatalogResult>> searchAlbums(
+    EnabledMusicPlugin plugin,
+    String keyword,
+  ) async {
+    if (plugin.isLx) {
+      final songs = await _searchLxPlugin(plugin, keyword);
+      return _aggregateLxCatalog(
+        plugin.id,
+        songs,
+        keyword: keyword,
+        artist: false,
+      );
+    }
+    final list = await _searchMusicFreeType(plugin, keyword, 'album');
+    return list
+        .map(
+          (raw) => _toCatalogResult(
+            plugin.id,
+            _resetMediaItem(plugin, raw),
+            artist: false,
+          ),
+        )
+        .where((item) => item.title.isNotEmpty)
+        .toList();
+  }
+
+  Future<List<Map<String, dynamic>>> _searchMusicFreeType(
+    EnabledMusicPlugin plugin,
+    String keyword,
+    String type,
+  ) async {
+    dynamic response;
+    if (_runsPluginsInBackground) {
+      response = await _runPluginOperation(plugin, 'search', {
+        'keyword': keyword,
+        'type': type,
+      });
+    } else {
+      response = await _callOnCurrentIsolate(plugin, 'search', [
+        keyword,
+        1,
+        type,
+      ]);
+    }
+    return _extractResultList(response);
+  }
+
+  static PluginCatalogResult _toCatalogResult(
+    String pluginId,
+    Map<String, dynamic> raw, {
+    required bool artist,
+  }) {
+    String valueText(dynamic value) {
+      if (value == null) return '';
+      if (value is String) {
+        return value.replaceAll(RegExp(r'<[^>]*>'), '').trim();
+      }
+      if (value is num || value is bool) return value.toString();
+      if (value is List) {
+        return value.map(valueText).where((item) => item.isNotEmpty).join('/');
+      }
+      if (value is Map) {
+        for (final key in const [
+          'name',
+          'title',
+          'value',
+          'artist',
+          'singer',
+          'author',
+        ]) {
+          final nested = valueText(value[key]);
+          if (nested.isNotEmpty) return nested;
+        }
+      }
+      return '';
+    }
+
+    String text(List<String> keys) {
+      for (final key in keys) {
+        final value = valueText(raw[key]);
+        if (value.isNotEmpty) return value;
+      }
+      return '';
+    }
+
+    final title = artist
+        ? text(const ['name', 'title', 'artist', 'singer', 'artistName'])
+        : text(const ['title', 'name', 'album', 'albumName', 'album_name']);
+    final subtitle = artist
+        ? text(const ['description', 'desc', 'albumCount', 'songCount'])
+        : text(const ['artist', 'singer', 'artistName', 'albumArtist']);
+    final id = text(
+      artist
+          ? const ['id', 'artistId', 'singerId', 'artist_id']
+          : const ['id', 'albumId', 'album_id', 'albumMid', 'album_mid'],
+    );
+    return PluginCatalogResult(
+      pluginId: pluginId,
+      id: id.isEmpty ? title : id,
+      title: title,
+      subtitle: subtitle,
+      coverUrl: _extractCover(raw),
+      rawData: raw,
+    );
+  }
+
+  /// MusicFree 桌面端会在每次搜索/详情接口返回后调用 resetMediaItem，
+  /// 把插件平台写回原始歌曲对象。部分插件的 getMediaSource 依赖这个
+  /// 字段，尤其是 getArtistWorks/getAlbumInfo 返回的歌曲。
+  static Map<String, dynamic> _resetMediaItem(
+    EnabledMusicPlugin plugin,
+    Map<String, dynamic> raw,
+  ) => <String, dynamic>{...raw, 'platform': plugin.name};
+
+  static List<PluginCatalogResult> _aggregateLxCatalog(
+    String pluginId,
+    List<PluginSearchSong> songs, {
+    required String keyword,
+    required bool artist,
+  }) {
+    String normalize(String value) => value
+        .trim()
+        .toLowerCase()
+        .replaceAll(RegExp(r'\s+'), '')
+        .replaceAll(RegExp(r'[·•]'), '');
+
+    final target = normalize(keyword);
+    final seen = <String, PluginCatalogResult>{};
+    for (final song in songs) {
+      final title = (artist ? song.artist : song.album).trim();
+      if (title.isEmpty) continue;
+      final normalizedTitle = normalize(title);
+      if (target.isNotEmpty &&
+          !normalizedTitle.contains(target) &&
+          !target.contains(normalizedTitle)) {
+        continue;
+      }
+      final subtitle = artist ? song.album : song.artist;
+      final key = '${title.toLowerCase()}\u0000${subtitle.toLowerCase()}';
+      seen.putIfAbsent(
+        key,
+        () => PluginCatalogResult(
+          pluginId: pluginId,
+          id: '${song.id}:$key',
+          title: title,
+          subtitle: subtitle,
+          coverUrl: song.coverUrl,
+          rawData: song.rawData,
+        ),
+      );
+    }
+    return seen.values.toList();
   }
 
   Future<List<PluginSearchSong>> _searchLxPlugin(
@@ -398,6 +676,13 @@ class PluginRuntimeService {
     final singer = (raw['singer'] ?? raw['artist'] ?? '').toString();
     final album = (raw['album_name'] ?? raw['albumName'] ?? raw['album'] ?? '')
         .toString();
+    final rawInterval = raw['interval'] ?? raw['duration'];
+    final interval = rawInterval is String
+        ? rawInterval
+        : rawInterval is num
+        ? rawInterval.toString()
+        : null;
+    final durationMs = _parseDuration(raw);
     final lx = <String, dynamic>{
       'songmid': songmid,
       'source': source,
@@ -410,6 +695,9 @@ class PluginRuntimeService {
       'songId': raw['song_id'] ?? raw['songId'],
       'albumMid': raw['album_mid'] ?? raw['albumMid'],
       'copyrightId': raw['copyright_id'] ?? raw['copyrightId'],
+      // LyricSongInfo 需要这两个字段来正确识别 LX 返回的歌词和时长。
+      'interval': interval,
+      '_interval': durationMs > 0 ? durationMs : null,
       '_types': raw['lx_types'] ?? raw['_types'],
     };
     return {
@@ -935,11 +1223,7 @@ class PluginRuntimeService {
     if (response.trim().isEmpty || response.trim() == 'null') return '';
     final decoded = jsonDecode(response);
     if (decoded is! Map) return '';
-    for (final key in const ['lxlyric', 'lyric', 'tlyric']) {
-      final lyrics = decoded[key]?.toString().trim() ?? '';
-      if (lyrics.isNotEmpty) return lyrics;
-    }
-    return '';
+    return buildLxLyricsRaw(Map<String, dynamic>.from(decoded));
   }
 
   Future<String> _getLyricsOnCurrentIsolate(
@@ -1266,6 +1550,17 @@ class PluginRuntimeService {
     }
     if (value is! Map) return const [];
     for (final key in const [
+      'artistList',
+      'artistlist',
+      'artists',
+      'artistResults',
+      'albumList',
+      'albumlist',
+      'albums',
+      'albumResults',
+      'artistResult',
+      'albumResult',
+      'resultList',
       'musicList',
       'musiclist',
       'songList',
@@ -1278,6 +1573,10 @@ class PluginRuntimeService {
       'items',
       'data',
       'resData',
+      'sheetList',
+      'sheetlist',
+      'playlists',
+      'playlist',
     ]) {
       final nested = value[key];
       final result = _extractResultList(nested);
@@ -1290,32 +1589,56 @@ class PluginRuntimeService {
     String pluginId,
     Map<String, dynamic> raw,
   ) {
-    String text(List<String> keys) {
-      for (final key in keys) {
-        final value = raw[key];
-        if (value is String && value.trim().isNotEmpty) {
-          return value.replaceAll(RegExp(r'<[^>]*>'), '').trim();
+    String valueText(dynamic value) {
+      if (value == null) return '';
+      if (value is String) {
+        return value.replaceAll(RegExp(r'<[^>]*>'), '').trim();
+      }
+      if (value is num || value is bool) return value.toString();
+      if (value is List) {
+        return value.map(valueText).where((item) => item.isNotEmpty).join('/');
+      }
+      if (value is Map) {
+        for (final key in const [
+          'name',
+          'title',
+          'value',
+          'artist',
+          'singer',
+          'author',
+        ]) {
+          final nested = valueText(value[key]);
+          if (nested.isNotEmpty) return nested;
         }
       }
       return '';
     }
 
-    var artist = text(const ['artist', 'singer', 'author']);
-    if (artist.isEmpty) {
-      final artists = raw['artists'] ?? raw['ar'];
-      if (artists is List) {
-        artist = artists
-            .map((item) => item is Map ? item['name'] : item)
-            .where((item) => item != null && item.toString().isNotEmpty)
-            .join('/');
+    String text(List<String> keys) {
+      for (final key in keys) {
+        final value = valueText(raw[key]);
+        if (value.isNotEmpty) return value;
       }
+      return '';
     }
-    var album = text(const ['albumName', 'album_name']);
-    final albumValue = raw['album'] ?? raw['al'];
-    if (album.isEmpty && albumValue is String) album = albumValue;
-    if (album.isEmpty && albumValue is Map) {
-      album = albumValue['name']?.toString() ?? '';
-    }
+
+    final artist = text(const [
+      'artist',
+      'singer',
+      'author',
+      'artists',
+      'ar',
+      'singerList',
+      'artistList',
+    ]);
+    final album = text(const [
+      'albumName',
+      'album_name',
+      'albumname',
+      'albumTitle',
+      'album',
+      'al',
+    ]);
     var id = text(const ['id', 'songId', 'musicId', 'mid']);
     if (id.isEmpty) id = _extractTrackId(raw);
     return PluginSearchSong(
@@ -1387,6 +1710,9 @@ class PluginRuntimeService {
       'albumPic',
       'picture',
       'blurPicUrl',
+      'avatar',
+      'avatarUrl',
+      'avatar_url',
     ]) {
       final value = node[key];
       if (value is String) {
@@ -1528,12 +1854,42 @@ Future<String> _executePluginOperationInBackground(
     dynamic data;
     switch (request['operation']) {
       case 'search':
-        data = await service._callOnCurrentIsolate(plugin, 'search', [
-          payload?.toString() ?? '',
-          1,
-          'music',
-        ]);
-        break;
+        {
+          final searchPayload = payload is Map
+              ? Map<String, dynamic>.from(payload)
+              : <String, dynamic>{'keyword': payload?.toString() ?? ''};
+          data = await service._callOnCurrentIsolate(plugin, 'search', [
+            searchPayload['keyword']?.toString() ?? '',
+            1,
+            searchPayload['type']?.toString() ?? 'music',
+          ]);
+          break;
+        }
+      case 'getArtistWorks':
+        {
+          if (payload is! Map || payload['rawData'] is! Map) {
+            throw Exception('歌手信息格式无效');
+          }
+          final payloadMap = Map<String, dynamic>.from(payload);
+          data = await service._callOnCurrentIsolate(plugin, 'getArtistWorks', [
+            Map<String, dynamic>.from(payloadMap['rawData'] as Map),
+            (payloadMap['page'] as num?)?.toInt() ?? 1,
+            payloadMap['type']?.toString() ?? 'music',
+          ]);
+          break;
+        }
+      case 'getAlbumInfo':
+        {
+          if (payload is! Map || payload['rawData'] is! Map) {
+            throw Exception('专辑信息格式无效');
+          }
+          final payloadMap = Map<String, dynamic>.from(payload);
+          data = await service._callOnCurrentIsolate(plugin, 'getAlbumInfo', [
+            Map<String, dynamic>.from(payloadMap['rawData'] as Map),
+            (payloadMap['page'] as num?)?.toInt() ?? 1,
+          ]);
+          break;
+        }
       case 'resolveMediaSource':
         if (payload is! Map) throw Exception('歌曲信息格式无效');
         final wrappedRawData = payload['rawData'];

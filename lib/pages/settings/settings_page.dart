@@ -17,6 +17,7 @@ enum SettingsSection {
   download,
   other,
   logsDebug,
+  feedback,
 }
 
 class SettingsSearchEntry {
@@ -231,6 +232,13 @@ const settingsSearchEntries = <SettingsSearchEntry>[
     keywords: '保存条数 错误日志 时间范围 导出',
   ),
   SettingsSearchEntry(
+    title: '问题反馈',
+    path: ['问题反馈'],
+    route: '/settings/feedback',
+    icon: Icons.feedback_outlined,
+    keywords: '功能建议 提交问题 我的反馈 上传图片 日志',
+  ),
+  SettingsSearchEntry(
     title: '关于 XY Music',
     path: ['其他', '关于 XY Music'],
     route: '/settings/about',
@@ -386,6 +394,13 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
           subtitle: '听歌统计与关于',
           route: '/settings/other',
         ),
+        _categoryTile(
+          context,
+          icon: Icons.feedback_outlined,
+          title: '问题反馈',
+          subtitle: '提交问题、建议并查看处理进度',
+          route: '/settings/feedback',
+        ),
       ],
       SettingsSection.account => [
         _tile(
@@ -433,6 +448,43 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
           title: '在线默认音质',
           trailing: Text(settings?.onlineDefaultQuality ?? '320k'),
           onTap: () => _pickQuality(context, ref, settings, isOnline: true),
+        ),
+        _tile(
+          context,
+          icon: Icons.error_outline,
+          title: '播放失败后',
+          trailing: DropdownButtonHideUnderline(
+            child: DropdownButton<PlaybackFailureAction>(
+              value:
+                  settings?.playbackFailureAction ??
+                  PlaybackFailureAction.playNext,
+              isDense: true,
+              alignment: AlignmentDirectional.centerEnd,
+              items: const [
+                DropdownMenuItem<PlaybackFailureAction>(
+                  value: PlaybackFailureAction.playNext,
+                  child: Text('播放下一首'),
+                ),
+                DropdownMenuItem<PlaybackFailureAction>(
+                  value: PlaybackFailureAction.pause,
+                  child: Text('暂停播放'),
+                ),
+              ],
+              onChanged: (action) {
+                if (action != null) {
+                  notifier.setPlaybackFailureAction(action);
+                }
+              },
+            ),
+          ),
+        ),
+        _switchTile(
+          context,
+          icon: Icons.multitrack_audio_rounded,
+          title: '播放其他音频不中断此应用播放',
+          value: settings?.playOtherAudioWithoutInterruption ?? false,
+          onChanged: (value) =>
+              notifier.setPlayOtherAudioWithoutInterruption(value),
         ),
         _switchTile(
           context,
@@ -571,6 +623,13 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
           subtitle: '日志保存、筛选与导出',
           route: '/settings/logs-debug',
         ),
+        _tile(
+          context,
+          icon: Icons.feedback_outlined,
+          title: '问题反馈',
+          trailing: const Text('提交与查看'),
+          onTap: () => context.push('/settings/feedback'),
+        ),
       ],
       SettingsSection.logsDebug => [
         _tile(
@@ -581,6 +640,7 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
           onTap: () => context.push('/settings/logs'),
         ),
       ],
+      SettingsSection.feedback => const [],
     };
 
     return Scaffold(
@@ -711,6 +771,7 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
     SettingsSection.download => '下载',
     SettingsSection.other => '其他',
     SettingsSection.logsDebug => '日志与调试',
+    SettingsSection.feedback => '问题反馈',
   };
 
   Widget _categoryTile(

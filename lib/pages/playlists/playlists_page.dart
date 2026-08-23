@@ -15,6 +15,7 @@ import '../../src/plugins/plugin_runtime.dart';
 import '../../src/player/player_provider.dart';
 import '../../src/rust/api.dart';
 import '../../src/ui/xy_surface.dart';
+import '../../src/widgets/cover_image.dart';
 import '../../src/widgets/top_notice.dart';
 
 class PlaylistsPage extends ConsumerWidget {
@@ -252,14 +253,14 @@ class PlaylistsPage extends ConsumerWidget {
                           borderRadius: BorderRadius.circular(13),
                         ),
                         clipBehavior: Clip.antiAlias,
-                        child: playlist.coverUrl?.isNotEmpty == true
-                            ? Image.network(
-                                playlist.coverUrl!,
-                                fit: BoxFit.cover,
-                                errorBuilder: (_, _, _) => Icon(
-                                  Icons.queue_music_rounded,
-                                  color: Theme.of(context).colorScheme.primary,
-                                ),
+                        child: playlist.songPaths.isNotEmpty
+                            ? CoverImage(
+                                songPath: playlist.songPaths.first,
+                                imageUrl: playlist.effectiveCoverUrl,
+                                width: 48,
+                                height: 48,
+                                radius: 0,
+                                icon: Icons.queue_music_rounded,
                               )
                             : Icon(
                                 Icons.queue_music_rounded,

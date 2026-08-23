@@ -15,6 +15,7 @@ import '../../pages/settings/remote_library_page.dart';
 import '../../pages/settings/plugins_page.dart';
 import '../../pages/settings/scan_folders_page.dart';
 import '../../pages/settings/logs_page.dart';
+import '../../pages/settings/feedback_page.dart';
 import '../../pages/playlists/playlists_page.dart';
 import '../../pages/playlists/playlist_detail_page.dart';
 import '../../pages/recognize/recognize_page.dart';
@@ -165,6 +166,10 @@ final appRouter = GoRouter(
                 GoRoute(
                   path: 'logs',
                   builder: (context, state) => const LogsPage(),
+                ),
+                GoRoute(
+                  path: 'feedback',
+                  builder: (context, state) => const FeedbackPage(),
                 ),
                 GoRoute(
                   path: 'account',

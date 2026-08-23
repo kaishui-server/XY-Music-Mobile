@@ -3,6 +3,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../src/library/library_provider.dart';
 import '../../src/recent/recent_provider.dart';
+import '../../src/navigation/sidebar_controller.dart';
 import '../../src/widgets/cover_image.dart';
 import '../../src/widgets/song_list_view.dart';
 
@@ -42,6 +43,7 @@ class _RecentPageState extends ConsumerState<RecentPage> {
     final recent = ref.watch(recentSongsProvider);
     return Scaffold(
       appBar: AppBar(
+        leading: const AppSidebarMenuButton(),
         title: const Text('最近播放'),
         actions: [
           IconButton(
