@@ -2,12 +2,16 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../src/auth/auth_provider.dart';
+import '../../src/update/app_update.dart';
 
 final _serverReleaseProvider = FutureProvider.autoDispose<BackendRelease?>((
   ref,
 ) {
   return ref.read(authProvider.notifier).fetchLatestRelease();
 });
+final _clientVersionProvider = FutureProvider.autoDispose<String>(
+  (ref) => ref.read(authProvider.notifier).currentAppVersion(),
+);
 
 class AboutPage extends ConsumerWidget {
   const AboutPage({super.key});
@@ -16,6 +20,7 @@ class AboutPage extends ConsumerWidget {
   Widget build(BuildContext context, WidgetRef ref) {
     final scheme = Theme.of(context).colorScheme;
     final release = ref.watch(_serverReleaseProvider);
+    final clientVersion = ref.watch(_clientVersionProvider).valueOrNull ?? '0.0.0';
     return Scaffold(
       appBar: AppBar(
         title: const Text('关于'),
@@ -60,7 +65,7 @@ class AboutPage extends ConsumerWidget {
                 ),
                 const SizedBox(height: 5),
                 Text(
-                  '移动端 1.0.0 (1)',
+                  '移动端 $clientVersion',
                   style: TextStyle(color: scheme.onSurfaceVariant),
                 ),
                 const SizedBox(height: 9),
@@ -117,14 +122,33 @@ class AboutPage extends ConsumerWidget {
                   '服务器服务',
                   '连接失败，点击右上角重试',
                 ),
-                data: (item) => _row(
-                  context,
-                  Icons.cloud_done_outlined,
-                  '服务器服务',
-                  item == null
-                      ? '已连接 · 暂无服务端版本公告'
-                      : '最新版本 ${item.version}${item.content.isEmpty ? '' : ' · ${item.content}'}',
-                ),
+                data: (item) {
+                  final hasUpdate = item != null &&
+                      compareAppVersions(item.version, clientVersion) > 0 &&
+                      item.downloadUrl.trim().isNotEmpty;
+                  return Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      _row(
+                        context,
+                        Icons.cloud_done_outlined,
+                        '服务器服务',
+                        item == null
+                            ? '已连接 · 暂无服务端版本公告'
+                            : '最新版本 ${item.version}${item.content.isEmpty ? '' : ' · ${item.content}'}',
+                      ),
+                      if (hasUpdate)
+                        Padding(
+                          padding: const EdgeInsets.fromLTRB(66, 0, 14, 12),
+                          child: FilledButton.icon(
+                            onPressed: () => _downloadAndInstall(context, item),
+                            icon: const Icon(Icons.system_update_rounded),
+                            label: Text('发现新版本（当前 $clientVersion）'),
+                          ),
+                        ),
+                    ],
+                  );
+                },
               ),
             ],
           ),
@@ -155,6 +179,13 @@ class AboutPage extends ConsumerWidget {
         ],
       ),
     );
+  }
+
+  Future<void> _downloadAndInstall(
+    BuildContext context,
+    BackendRelease release,
+  ) async {
+    await downloadAndInstallRelease(context, release);
   }
 
   static Widget _row(

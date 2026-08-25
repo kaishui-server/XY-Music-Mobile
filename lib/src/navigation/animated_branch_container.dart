@@ -1,93 +1,92 @@
 import 'package:flutter/material.dart';
 
-/// 一级页面分支容器：带淡入淡出 + 轻微缩放的过渡。
+/// 一级页面分支容器。
 ///
-/// 替代 `StatefulShellRoute.indexedStack` 默认的 `IndexedStack`（瞬间切换、
-/// 无动画）。所有分支始终保留在 widget 树中以维持各 tab 的滚动位置与状态；
-/// 非活跃分支淡出后用 `Offstage` 移出布局与绘制，避免持续开销。
-class AnimatedBranchContainer extends StatelessWidget {
+/// 前一页和下一页同步水平移动，边界始终相接；所有非活动分支仍保留在树中，
+/// 因此滚动位置、Tab 状态和各页面 Navigator 都不会丢失。
+class AnimatedBranchContainer extends StatefulWidget {
   const AnimatedBranchContainer({
     super.key,
     required this.currentIndex,
     required this.children,
-    this.duration = const Duration(milliseconds: 220),
   });
 
   final int currentIndex;
   final List<Widget> children;
-  final Duration duration;
+
+  @override
+  State<AnimatedBranchContainer> createState() =>
+      _AnimatedBranchContainerState();
+}
+
+class _AnimatedBranchContainerState extends State<AnimatedBranchContainer>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _controller;
+  int? _previousIndex;
+  int _direction = 1;
+
+  @override
+  void initState() {
+    super.initState();
+    _controller =
+        AnimationController(
+          vsync: this,
+          duration: const Duration(milliseconds: 280),
+          value: 1,
+        )..addStatusListener((status) {
+          if (status == AnimationStatus.completed && _previousIndex != null) {
+            setState(() => _previousIndex = null);
+          }
+        });
+  }
+
+  @override
+  void didUpdateWidget(AnimatedBranchContainer oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.currentIndex == widget.currentIndex) return;
+    _previousIndex = oldWidget.currentIndex;
+    _direction = widget.currentIndex > oldWidget.currentIndex ? 1 : -1;
+    _controller.forward(from: 0);
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
 
   @override
   Widget build(BuildContext context) {
-    return Stack(
-      children: [
-        for (var i = 0; i < children.length; i++)
-          _BranchLayer(
-            key: ValueKey(i),
-            isActive: i == currentIndex,
-            duration: duration,
-            child: children[i],
-          ),
-      ],
+    final movement = CurvedAnimation(
+      parent: _controller,
+      curve: Curves.easeOutCubic,
+    );
+    return ClipRect(
+      child: Stack(
+        fit: StackFit.expand,
+        children: [
+          for (var index = 0; index < widget.children.length; index++)
+            _branchLayer(index, movement),
+        ],
+      ),
     );
   }
-}
 
-/// 单个分支层：驱动显隐动画，并在淡出结束后移出布局。
-class _BranchLayer extends StatefulWidget {
-  const _BranchLayer({
-    super.key,
-    required this.isActive,
-    required this.duration,
-    required this.child,
-  });
+  Widget _branchLayer(int index, Animation<double> movement) {
+    final active = index == widget.currentIndex;
+    final outgoing = index == _previousIndex;
+    final visible = active || outgoing;
+    final begin = active ? Offset(_direction.toDouble(), 0) : Offset.zero;
+    final end = active ? Offset.zero : Offset(-_direction.toDouble(), 0);
 
-  final bool isActive;
-  final Duration duration;
-  final Widget child;
-
-  @override
-  State<_BranchLayer> createState() => _BranchLayerState();
-}
-
-class _BranchLayerState extends State<_BranchLayer> {
-  /// 是否参与布局与绘制。激活时立即为 true；失活时等淡出动画结束再置 false，
-  /// 保证淡出过程可见。
-  late bool _visible = widget.isActive;
-
-  @override
-  void didUpdateWidget(_BranchLayer old) {
-    super.didUpdateWidget(old);
-    if (widget.isActive && !_visible) {
-      setState(() => _visible = true);
-    }
-  }
-
-  @override
-  Widget build(BuildContext context) {
     return Offstage(
-      offstage: !_visible,
-      child: TweenAnimationBuilder<double>(
-        tween: Tween(end: widget.isActive ? 1.0 : 0.0),
-        duration: widget.duration,
-        curve: Curves.easeOutCubic,
-        onEnd: () {
-          if (mounted && !widget.isActive && _visible) {
-            setState(() => _visible = false);
-          }
-        },
-        builder: (context, t, child) {
-          // 非活跃分支不接收手势，避免隐藏页面误响应点击。
-          return IgnorePointer(
-            ignoring: !widget.isActive,
-            child: Opacity(
-              opacity: t,
-              // 轻微缩放：入场从 0.98 放大到 1.0，观感更顺滑。
-              child: Transform.scale(scale: 0.98 + 0.02 * t, child: child),
-            ),
-          );
-        },
-        child: widget.child,
+      offstage: !visible,
+      child: IgnorePointer(
+        ignoring: !active,
+        child: SlideTransition(
+          position: Tween<Offset>(begin: begin, end: end).animate(movement),
+          child: widget.children[index],
+        ),
       ),
     );
   }

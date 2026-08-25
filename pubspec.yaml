@@ -16,7 +16,7 @@ publish_to: 'none' # Remove this line if you wish to publish to pub.dev
 # https://developer.apple.com/library/archive/documentation/General/Reference/InfoPlistKeyReference/Articles/CoreFoundationKeys.html
 # In Windows, build-name is used as the major, minor, and patch parts
 # of the product and file versions while build-number is used as the build suffix.
-version: 1.0.0+1
+version: 1.1.0+2
 
 environment:
   sdk: ^3.12.2
@@ -50,6 +50,8 @@ dependencies:
 
   # 音频播放
   just_audio: ^0.9.0
+  # Bilibili 插件视频播放（详情页内嵌播放）
+  video_player: ^2.10.0
   # 听歌识曲：采集 8000Hz/16bit/单声道麦克风 PCM 流
   record: ^7.1.1
   # 系统媒体会话、后台播放、通知栏与锁屏播放控件

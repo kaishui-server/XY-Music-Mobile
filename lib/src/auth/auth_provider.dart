@@ -149,10 +149,17 @@ class UserFeedbackItem {
       status: json['status']?.toString() ?? 'pending',
       category: json['category']?.toString() ?? 'feedback',
       assignee: json['assignee']?.toString() ?? '',
-      adminReply: json['adminReply']?.toString() ?? json['admin_reply']?.toString() ?? '',
-      repliedBy: json['repliedBy']?.toString() ?? json['replied_by']?.toString() ?? '',
+      adminReply:
+          json['adminReply']?.toString() ??
+          json['admin_reply']?.toString() ??
+          '',
+      repliedBy:
+          json['repliedBy']?.toString() ?? json['replied_by']?.toString() ?? '',
       resolveNote: json['resolveNote']?.toString() ?? '',
-      rejectReason: json['rejectReason']?.toString() ?? json['reject_reason']?.toString() ?? '',
+      rejectReason:
+          json['rejectReason']?.toString() ??
+          json['reject_reason']?.toString() ??
+          '',
       resolveImages: strings(json['resolveImages']),
       hasErrorLogs: json['hasErrorLogs'] == true,
       hasAllLogs: json['hasAllLogs'] == true,
@@ -219,16 +226,28 @@ class BackendAnnouncement {
 
 class BackendRelease {
   const BackendRelease({
+    this.id = 0,
     required this.version,
     required this.downloadUrl,
     required this.content,
     required this.status,
   });
 
+  final int id;
   final String version;
   final String downloadUrl;
   final String content;
   final String status;
+}
+
+/// 将服务端返回的相对安装包路径转换为可下载的完整地址。
+String resolveBackendDownloadUrl(String value) {
+  final raw = value.trim();
+  if (raw.isEmpty || raw.startsWith('http://') || raw.startsWith('https://')) {
+    return raw;
+  }
+  final base = defaultAuthBaseUrl.replaceFirst(RegExp(r'/api/?$'), '');
+  return '$base/${raw.replaceFirst(RegExp(r'^/+'), '')}';
 }
 
 class _ClientMetadata {
@@ -260,6 +279,10 @@ class AuthNotifier extends StateNotifier<AuthState> {
   final Random _rand = Random();
   Future<_ClientMetadata>? _clientMetadataFuture;
 
+  /// 当前已登录用户的只读快照，供同步等服务层读取，避免直接暴露
+  /// StateNotifier 的受保护 state 成员。
+  AuthUser? get currentUser => state.user;
+
   Future<_ClientMetadata> _clientMetadata() =>
       _clientMetadataFuture ??= _loadClientMetadata();
 
@@ -279,7 +302,7 @@ class AuthNotifier extends StateNotifier<AuthState> {
             ? model
             : '$manufacturer $model'.trim();
         return _ClientMetadata(
-          appVersion: info?['appVersion']?.toString().trim() ?? '1.0.0',
+          appVersion: info?['appVersion']?.toString().trim() ?? '1.1.0',
           osVersion: 'Android ${info?['osVersion'] ?? ''}'.trim(),
           deviceModel: deviceModel.isEmpty ? 'Android 手机' : deviceModel,
         );
@@ -288,7 +311,7 @@ class AuthNotifier extends StateNotifier<AuthState> {
       }
     }
     return _ClientMetadata(
-      appVersion: '1.0.0',
+      appVersion: '1.1.0',
       osVersion: defaultTargetPlatform.name,
       deviceModel: '${defaultTargetPlatform.name} 设备',
     );
@@ -444,12 +467,17 @@ class AuthNotifier extends StateNotifier<AuthState> {
     final version = data['version']?.toString() ?? '';
     if (version.isEmpty) return null;
     return BackendRelease(
+      id: (data['id'] as num?)?.toInt() ?? int.tryParse('${data['id']}') ?? 0,
       version: version,
       downloadUrl: data['download_url']?.toString() ?? '',
       content: data['content']?.toString() ?? '',
       status: data['status']?.toString() ?? '',
     );
   }
+
+  /// 获取当前客户端版本号，供移动端更新提示比较使用。
+  Future<String> currentAppVersion() async =>
+      (await _clientMetadata()).appVersion;
 
   Future<void> _saveAuth(String token, Map<String, dynamic> data) async {
     final dir = await _dataDir();

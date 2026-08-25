@@ -1,13 +1,21 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+import 'package:video_player/video_player.dart';
 
 import '../../src/auth/auth_provider.dart';
 import '../../src/home/home_providers.dart';
 import '../../src/navigation/sidebar_controller.dart';
 import '../../src/player/player_provider.dart';
+import '../../src/player/video_playback_session.dart';
+import '../../src/playlists/playlists_provider.dart';
+import '../../src/sync/account_cloud_sync.dart';
 import '../../src/ui/xy_surface.dart';
 import '../../src/ui/xy_theme.dart';
+import '../../src/update/app_update.dart';
 import '../../src/widgets/user_avatar_image.dart';
 
 /// 按电脑端首页顺序组织四个模块，并针对窄屏改为单列纵向布局。
@@ -27,6 +35,12 @@ class _HomePageState extends ConsumerState<HomePage> {
 
   Future<void> _bootstrapBackend() async {
     final backend = ref.read(authProvider.notifier);
+    final container = ProviderScope.containerOf(context, listen: false);
+    await AccountCloudSync.startAutoUpload(
+      backend,
+      ref.read(playlistsProvider.notifier),
+      container,
+    );
     try {
       await backend.reportAppOpen();
     } catch (_) {
@@ -36,33 +50,115 @@ class _HomePageState extends ConsumerState<HomePage> {
     try {
       announcement = await backend.fetchAnnouncement();
     } catch (_) {
-      return;
+      // 公告检查失败不影响启动更新检查。
     }
-    if (!mounted || announcement == null) return;
-    final confirmed = await showDialog<bool>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        icon: Icon(
-          announcement!.type == 'warning'
-              ? Icons.warning_amber_rounded
-              : Icons.campaign_outlined,
-        ),
-        title: Text(announcement.title),
-        content: SingleChildScrollView(child: Text(announcement.content)),
-        actions: [
-          FilledButton(
-            onPressed: () => Navigator.pop(ctx, true),
-            child: const Text('我知道了'),
+    if (mounted && announcement != null) {
+      final confirmed = await showDialog<bool>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          icon: Icon(
+            announcement!.type == 'warning'
+                ? Icons.warning_amber_rounded
+                : Icons.campaign_outlined,
           ),
-        ],
-      ),
-    );
-    if (confirmed == true) {
-      try {
-        await backend.confirmAnnouncement(announcement);
-      } catch (_) {
-        // 下次启动会再次展示，避免把未成功确认的公告误标为已读。
+          title: Text(announcement.title),
+          content: SingleChildScrollView(child: Text(announcement.content)),
+          actions: [
+            FilledButton(
+              onPressed: () => Navigator.pop(ctx, true),
+              child: const Text('我知道了'),
+            ),
+          ],
+        ),
+      );
+      if (confirmed == true) {
+        try {
+          await backend.confirmAnnouncement(announcement);
+        } catch (_) {
+          // 下次启动会再次展示，避免把未成功确认的公告误标为已读。
+        }
       }
+    }
+    await _checkForAppUpdate();
+  }
+
+  Future<void> _checkForAppUpdate() async {
+    try {
+      final backend = ref.read(authProvider.notifier);
+      final release = await backend.fetchLatestRelease();
+      if (!mounted || release == null || release.downloadUrl.trim().isEmpty) {
+        return;
+      }
+      final currentVersion = await backend.currentAppVersion();
+      if (compareAppVersions(release.version, currentVersion) <= 0) return;
+
+      final prefs = await SharedPreferences.getInstance();
+      if (prefs.getString('xy_music_update_suppressed_version') ==
+          release.version) {
+        return;
+      }
+      if (!mounted) return;
+
+      var suppress = false;
+      final shouldUpdate = await showDialog<bool>(
+        context: context,
+        barrierDismissible: false,
+        builder: (ctx) => StatefulBuilder(
+          builder: (ctx, setState) => AlertDialog(
+            icon: const Icon(Icons.system_update_rounded),
+            title: Text('发现新版本 ${release.version}'),
+            content: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text('当前版本：$currentVersion'),
+                if (release.content.trim().isNotEmpty) ...[
+                  const SizedBox(height: 12),
+                  const Text(
+                    '更新内容',
+                    style: TextStyle(fontWeight: FontWeight.w700),
+                  ),
+                  const SizedBox(height: 6),
+                  ConstrainedBox(
+                    constraints: const BoxConstraints(maxHeight: 180),
+                    child: SingleChildScrollView(child: Text(release.content)),
+                  ),
+                ],
+                const SizedBox(height: 8),
+                CheckboxListTile(
+                  contentPadding: EdgeInsets.zero,
+                  value: suppress,
+                  onChanged: (value) =>
+                      setState(() => suppress = value ?? false),
+                  title: const Text('此次版本更新不再提示'),
+                  controlAffinity: ListTileControlAffinity.leading,
+                ),
+              ],
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(ctx, false),
+                child: const Text('暂不更新'),
+              ),
+              FilledButton(
+                onPressed: () => Navigator.pop(ctx, true),
+                child: const Text('立即更新'),
+              ),
+            ],
+          ),
+        ),
+      );
+      if (suppress) {
+        await prefs.setString(
+          'xy_music_update_suppressed_version',
+          release.version,
+        );
+      }
+      if (shouldUpdate == true && mounted) {
+        await downloadAndInstallRelease(context, release);
+      }
+    } catch (_) {
+      // 启动更新检查失败不影响进入首页。
     }
   }
 
@@ -220,12 +316,47 @@ class _NowPlayingModule extends ConsumerWidget {
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
+    final currentPath = ref.watch(
+      playerProvider.select((state) => state.current?.path),
+    );
+    return ValueListenableBuilder<int>(
+      valueListenable: VideoPlaybackSession.revision,
+      builder: (context, _, child) {
+        final video = VideoPlaybackSession.isFor(currentPath)
+            ? VideoPlaybackSession.controller
+            : null;
+        if (video == null) return _buildContent(context, ref);
+        return ValueListenableBuilder<VideoPlayerValue>(
+          valueListenable: video,
+          builder: (context, value, child) =>
+              _buildContent(context, ref, video: video, videoValue: value),
+        );
+      },
+    );
+  }
+
+  Widget _buildContent(
+    BuildContext context,
+    WidgetRef ref, {
+    VideoPlayerController? video,
+    VideoPlayerValue? videoValue,
+  }) {
     final player = ref.watch(playerProvider);
     final song = player.current;
     final theme = Theme.of(context);
-    final progress = player.duration <= 0
+    final position = videoValue == null
+        ? player.position
+        : videoValue.position.inMilliseconds / 1000.0;
+    final duration = videoValue == null
+        ? player.duration
+        : videoValue.duration.inMilliseconds / 1000.0;
+    final isPlaying = videoValue?.isPlaying ?? player.isPlaying;
+    final isLoading =
+        video == null && player.isLoading ||
+        video == null && VideoPlaybackSession.loading;
+    final progress = duration <= 0
         ? 0.0
-        : (player.position / player.duration).clamp(0.0, 1.0);
+        : (position / duration).clamp(0.0, 1.0);
     final source = song == null
         ? '等待播放'
         : song.pluginId != null
@@ -242,7 +373,7 @@ class _NowPlayingModule extends ConsumerWidget {
             )),
           );
     final activeLyric = lyric?.whenOrNull(
-      data: (lines) => _activeLyric(lines, player.position),
+      data: (lines) => _activeLyric(lines, position),
     );
 
     return GestureDetector(
@@ -291,16 +422,26 @@ class _NowPlayingModule extends ConsumerWidget {
             const SizedBox(height: 24),
             _HomeProgressBar(
               value: progress,
-              enabled: song != null && player.duration > 0,
-              onSeek: (value) => ref
-                  .read(playerProvider.notifier)
-                  .seek(value * player.duration),
+              enabled: song != null && duration > 0,
+              onSeek: (value) {
+                if (video != null) {
+                  unawaited(
+                    video.seekTo(
+                      Duration(milliseconds: (value * duration * 1000).round()),
+                    ),
+                  );
+                } else {
+                  unawaited(
+                    ref.read(playerProvider.notifier).seek(value * duration),
+                  );
+                }
+              },
             ),
             const SizedBox(height: 7),
             Row(
               children: [
                 Text(
-                  '${_formatClock(player.position)} / ${_formatClock(player.duration)}',
+                  '${_formatClock(position)} / ${_formatClock(duration)}',
                   style: TextStyle(
                     fontSize: 11,
                     fontFeatures: const [FontFeature.tabularFigures()],
@@ -311,20 +452,35 @@ class _NowPlayingModule extends ConsumerWidget {
                 _RoundControl(
                   primary: true,
                   enabled: song != null,
-                  label: player.isPlaying ? '暂停' : '播放',
-                  icon: player.isLoading
+                  label: isPlaying ? '暂停' : '播放',
+                  icon: isLoading
                       ? Icons.hourglass_top_rounded
-                      : player.isPlaying
+                      : isPlaying
                       ? Icons.pause_rounded
                       : Icons.play_arrow_rounded,
-                  onTap: () => ref.read(playerProvider.notifier).toggle(),
+                  onTap: isLoading
+                      ? () {}
+                      : video != null
+                      ? () {
+                          if (video.value.isPlaying) {
+                            unawaited(video.pause());
+                          } else {
+                            unawaited(video.play());
+                          }
+                        }
+                      : () => ref.read(playerProvider.notifier).toggle(),
                 ),
                 const SizedBox(width: 9),
                 _RoundControl(
                   enabled: song != null,
                   label: '下一首',
                   icon: Icons.skip_next_rounded,
-                  onTap: () => ref.read(playerProvider.notifier).next(),
+                  onTap: () {
+                    if (video != null) {
+                      unawaited(VideoPlaybackSession.stopForTrackAction());
+                    }
+                    unawaited(ref.read(playerProvider.notifier).next());
+                  },
                 ),
               ],
             ),

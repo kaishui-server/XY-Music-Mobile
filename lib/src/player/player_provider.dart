@@ -6,6 +6,7 @@ import 'dart:math';
 import 'package:audio_session/audio_session.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:flutter/widgets.dart';
 import 'package:just_audio/just_audio.dart';
 import 'package:just_audio_background/just_audio_background.dart';
 import 'package:path/path.dart' as p;
@@ -18,7 +19,9 @@ import '../plugins/plugin_runtime.dart';
 import '../recent/recent_store.dart';
 import '../rust/api.dart';
 import 'downloaded_song_store.dart';
+import 'desktop_lyrics.dart';
 import 'lx_lyrics_builder.dart';
+import 'video_playback_session.dart';
 
 /// 播放中的单曲信息（小而美：仅保留 UI 需要的最小字段）。
 class QueueItem {
@@ -460,10 +463,12 @@ LoopMode audioLoopModeForPlayMode(int playMode) =>
 
 class PlayerNotifier extends StateNotifier<PlaybackState> {
   PlayerNotifier(this._ref) : super(const PlaybackState()) {
+    VideoPlaybackSession.progressRevision.addListener(_syncVideoPlaybackState);
     _ref.listen<AsyncValue<AppSettings>>(settingsProvider, (previous, next) {
       final allowOtherAudio =
           next.valueOrNull?.playOtherAudioWithoutInterruption ?? false;
       unawaited(_configureAudioSession(allowOtherAudio));
+      unawaited(_syncDesktopLyrics());
     });
     _init();
   }
@@ -485,9 +490,15 @@ class PlayerNotifier extends StateNotifier<PlaybackState> {
   bool _handlingTrackEnd = false;
   bool _notificationPermissionChecked = false;
   int _playRequestId = 0;
+  String? _lastFailureKey;
   int _relinkProposalId = 0;
   int _noticeId = 0;
   DateTime _lastPosPersist = DateTime.fromMillisecondsSinceEpoch(0);
+  String? _lastVideoPath;
+  bool _videoMediaBridgeActive = false;
+  bool _syncingVideoMediaBridge = false;
+  bool? _expectedAudioPlayingFromVideo;
+  DateTime _lastVideoMediaSeek = DateTime.fromMillisecondsSinceEpoch(0);
 
   Future<void> _init() async {
     final allowOtherAudio =
@@ -515,10 +526,22 @@ class PlayerNotifier extends StateNotifier<PlaybackState> {
           maxPeriod: const Duration(milliseconds: 80),
         )
         .listen((p) {
+          // B 站视频播放时，just_audio 只是供系统媒体会话使用的静音时钟。
+          // 它与视频解码时钟存在微小偏差，不能再反向更新歌词位置，否则在
+          // 句子边界会在上一句和下一句之间反复横跳。
+          if (_videoMediaBridgeActive &&
+              VideoPlaybackSession.isFor(state.current?.path)) {
+            return;
+          }
           state = state.copyWith(position: p.inMilliseconds / 1000.0);
           _persistPositionDebounced();
+          unawaited(_syncDesktopLyrics());
         });
     _durSub = _player.durationStream.listen((d) {
+      if (_videoMediaBridgeActive &&
+          VideoPlaybackSession.isFor(state.current?.path)) {
+        return;
+      }
       state = state.copyWith(
         duration: (d ?? Duration.zero).inMilliseconds / 1000.0,
       );
@@ -538,11 +561,222 @@ class PlayerNotifier extends StateNotifier<PlaybackState> {
       }
       // just_audio 播放到末尾时可能仍保持 playing=true，必须明确监听
       // ProcessingState.completed，不能只等待 playing 变为 false。
-      if (completed && !_manualPause) {
+      if (_videoMediaBridgeActive) {
+        if (completed) {
+          unawaited(_recoverVideoMediaBridge());
+        } else if (_expectedAudioPlayingFromVideo == playing) {
+          // 这是视频状态同步产生的音频事件，不要再反向操作视频。
+          _expectedAudioPlayingFromVideo = null;
+        } else {
+          // 通知栏、锁屏或灵动岛直接控制的是 just_audio。视频播放期间
+          // 将该操作反向转发给视频控制器，系统按钮才能真正生效。
+          unawaited(_applySystemMediaControlToVideo(playing));
+        }
+      }
+      if (completed && !_manualPause && !_videoMediaBridgeActive) {
         unawaited(_handleTrackEndOnce());
       }
+      unawaited(_syncDesktopLyrics());
     });
     await _restoreSession();
+  }
+
+  Future<void> _syncDesktopLyrics() async {
+    final settings = _ref.read(settingsProvider).valueOrNull;
+    final item = state.current;
+    final isAppForeground =
+        WidgetsBinding.instance.lifecycleState == AppLifecycleState.resumed;
+    if (settings == null ||
+        !settings.desktopLyricsEnabled ||
+        item == null ||
+        (settings.desktopLyricsHideInApp && isAppForeground)) {
+      await DesktopLyricsBridge.sync(
+        enabled: false,
+        title: '',
+        artist: '',
+        lyrics: '',
+        position: 0,
+        noBackground: true,
+        lyricColor: 0xFFFFFFFF,
+        translationColor: 0xFFE1E1E6,
+        lyricFontSize: 24,
+        translationFontSize: 13,
+        backgroundColor: 0xFF18181C,
+        backgroundOpacity: .85,
+        wordEffectMode: LyricWordEffectMode.none.index,
+        locked: false,
+      );
+      return;
+    }
+    await DesktopLyricsBridge.sync(
+      enabled: true,
+      title: item.title,
+      artist: item.artist,
+      lyrics: item.lyricsRaw ?? '',
+      position: state.position,
+      noBackground: settings.desktopLyricsNoBackground,
+      lyricColor: settings.desktopLyricsLyricColor,
+      translationColor: settings.desktopLyricsTranslationColor,
+      lyricFontSize: settings.desktopLyricsLyricFontSize,
+      translationFontSize: settings.desktopLyricsTranslationFontSize,
+      backgroundColor: settings.desktopLyricsBackgroundColor,
+      backgroundOpacity: settings.desktopLyricsBackgroundOpacity,
+      wordEffectMode: settings.lyricWordEffectMode.index,
+      locked: settings.desktopLyricsLocked,
+    );
+  }
+
+  /// B站视频播放时 just_audio 处于暂停状态，普通进度流不会再更新。
+  /// 将视频控制器的状态镜像到播放状态，桌面歌词即可继续按视频进度刷新。
+  void _syncVideoPlaybackState() {
+    final controller = VideoPlaybackSession.controller;
+    final path = VideoPlaybackSession.songPath;
+    if (controller == null || path == null || path.isEmpty) {
+      if (_videoMediaBridgeActive) {
+        unawaited(disableVideoMediaBridge());
+      }
+      if (_lastVideoPath != null && state.current?.path == _lastVideoPath) {
+        _lastVideoPath = null;
+        state = state.copyWith(isPlaying: false, isLoading: false);
+        unawaited(_syncDesktopLyrics());
+      }
+      return;
+    }
+    if (state.current?.path != path) return;
+    _lastVideoPath = path;
+    final value = controller.value;
+    if (value.isCompleted && normalizePlayMode(state.playMode) == 1) {
+      // 视频不是 just_audio 的音频源，不能依赖 AudioPlayer 的 LoopMode.one。
+      // 单曲循环时直接重播共享的视频控制器，避免结束后退回音频播放。
+      unawaited(VideoPlaybackSession.restartSingleLoop());
+    }
+    final duration = value.duration.inMilliseconds > 0
+        ? value.duration.inMilliseconds / 1000.0
+        : state.duration;
+    state = state.copyWith(
+      position: value.position.inMilliseconds / 1000.0,
+      duration: duration,
+      isPlaying: value.isPlaying,
+      isLoading: false,
+    );
+    _persistPositionDebounced();
+    if (_videoMediaBridgeActive) {
+      unawaited(_mirrorVideoStateToSystemMedia());
+    }
+    unawaited(_syncDesktopLyrics());
+  }
+
+  /// 用已经加载的音频源作为 Android 系统媒体会话的“静音时钟”。
+  ///
+  /// video_player 自己没有接入 audio_service，直接暂停音频后系统媒体卡片
+  /// 会停在旧进度，系统播放按钮也只能控制音频。视频播放期间让音频静音并
+  /// 与视频保持同一进度，即可复用稳定的系统媒体会话，同时避免双重声音。
+  Future<void> enableVideoMediaBridge() async {
+    final controller = VideoPlaybackSession.controller;
+    final path = VideoPlaybackSession.songPath;
+    if (controller == null || path == null || state.current?.path != path) {
+      return;
+    }
+    _videoMediaBridgeActive = true;
+    _lastVideoMediaSeek = DateTime.fromMillisecondsSinceEpoch(0);
+    await _player.setVolume(0);
+    await _player.seek(controller.value.position);
+    if (controller.value.isPlaying) {
+      _manualPause = false;
+      _expectedAudioPlayingFromVideo = true;
+      unawaited(_startPlayback(_playRequestId, path));
+    } else {
+      _manualPause = true;
+      _expectedAudioPlayingFromVideo = false;
+      await _player.pause();
+    }
+  }
+
+  /// 结束视频媒体桥接并恢复用户音量。关闭视频、切歌和视频初始化失败均可
+  /// 重复调用，因此这里保持幂等。
+  Future<void> disableVideoMediaBridge() async {
+    final wasActive = _videoMediaBridgeActive;
+    _videoMediaBridgeActive = false;
+    _syncingVideoMediaBridge = false;
+    _expectedAudioPlayingFromVideo = null;
+    if (wasActive && _player.playing) {
+      _manualPause = true;
+      await _player.pause();
+    }
+    await _player.setVolume(_ref.read(volumeProvider));
+  }
+
+  Future<void> _mirrorVideoStateToSystemMedia() async {
+    if (!_videoMediaBridgeActive || _syncingVideoMediaBridge) return;
+    final controller = VideoPlaybackSession.controller;
+    final path = VideoPlaybackSession.songPath;
+    if (controller == null || path == null || state.current?.path != path) {
+      return;
+    }
+    _syncingVideoMediaBridge = true;
+    try {
+      final value = controller.value;
+      final shouldPlay = value.isPlaying && !value.isCompleted;
+      if (shouldPlay != _player.playing) {
+        _expectedAudioPlayingFromVideo = shouldPlay;
+        _manualPause = !shouldPlay;
+        if (shouldPlay) {
+          unawaited(_startPlayback(_playRequestId, path));
+        } else {
+          await _player.pause();
+        }
+      }
+
+      // 视频和音频来自同一条 B 站内容，但两套解码时钟仍可能产生小幅漂移。
+      // 每秒最多校准一次；小于 600ms 不 seek，避免造成系统进度条抖动。
+      final now = DateTime.now();
+      if (now.difference(_lastVideoMediaSeek) >= const Duration(seconds: 1)) {
+        _lastVideoMediaSeek = now;
+        final drift = (_player.position - value.position).inMilliseconds.abs();
+        if (drift > 600) await _player.seek(value.position);
+      }
+    } finally {
+      _syncingVideoMediaBridge = false;
+    }
+  }
+
+  Future<void> _applySystemMediaControlToVideo(bool shouldPlay) async {
+    if (!_videoMediaBridgeActive) return;
+    final controller = VideoPlaybackSession.controller;
+    if (controller == null ||
+        VideoPlaybackSession.songPath != state.current?.path ||
+        controller.value.isPlaying == shouldPlay) {
+      return;
+    }
+    try {
+      if (shouldPlay) {
+        await controller.play();
+      } else {
+        await controller.pause();
+      }
+      VideoPlaybackSession.progressChanged();
+    } catch (error) {
+      debugPrint('系统媒体按钮控制 B 站视频失败：$error');
+    }
+  }
+
+  Future<void> _recoverVideoMediaBridge() async {
+    if (!_videoMediaBridgeActive) return;
+    final controller = VideoPlaybackSession.controller;
+    final path = VideoPlaybackSession.songPath;
+    if (controller == null || path == null || state.current?.path != path) {
+      return;
+    }
+    if (controller.value.isCompleted) return;
+    try {
+      await _player.seek(controller.value.position);
+      if (controller.value.isPlaying) {
+        _expectedAudioPlayingFromVideo = true;
+        unawaited(_startPlayback(_playRequestId, path));
+      }
+    } catch (error) {
+      debugPrint('B 站视频系统媒体进度恢复失败：$error');
+    }
   }
 
   /// 配置系统音频焦点。开启后使用“可降低音量”的焦点类型，并在 iOS
@@ -814,7 +1048,7 @@ class PlayerNotifier extends StateNotifier<PlaybackState> {
       // 阻断音频播放，因此放到独立异步任务中执行。
       unawaited(_addToRecentHistory(item));
       _manualPause = false;
-      _startPlayback(requestId, item.path);
+      unawaited(_startPlayback(requestId, item.path));
       if (requestId != _playRequestId) return;
       // play() 已成功发起。不要 await：它只会在暂停、停止或播放结束后完成。
       state = state.copyWith(isLoading: false, errorMessage: null);
@@ -854,7 +1088,7 @@ class PlayerNotifier extends StateNotifier<PlaybackState> {
     required int queueIndex,
     String? preferredQualityOverride,
   }) async {
-    final mediaItem = _systemMediaItem(item);
+    final mediaItem = await _systemMediaItem(item);
     final preferredQuality = preferredQualityOverride?.trim().isNotEmpty == true
         ? preferredQualityOverride!.trim()
         : (_ref.read(settingsProvider).valueOrNull?.onlineDefaultQuality ??
@@ -1741,33 +1975,109 @@ class PlayerNotifier extends StateNotifier<PlaybackState> {
     }
   }
 
-  MediaItem _systemMediaItem(QueueItem item) => MediaItem(
-    id: item.path,
-    title: item.title.trim().isEmpty ? _titleFromPath(item.path) : item.title,
-    artist: item.artist.trim().isEmpty ? '未知歌手' : item.artist,
-    album: item.album.trim().isEmpty ? null : item.album,
-    duration: item.durationMs > 0
-        ? Duration(milliseconds: item.durationMs)
-        : null,
-    artUri: _systemArtworkUri(item.coverUrl),
-    displayTitle: item.title,
-    displaySubtitle: item.artist,
-    playable: true,
-  );
-
-  Uri? _systemArtworkUri(String? value) {
-    final text = value?.trim() ?? '';
-    if (text.isEmpty) return null;
-    final uri = Uri.tryParse(text);
-    if (uri == null ||
-        !const {'http', 'https', 'file', 'content'}.contains(uri.scheme)) {
-      return null;
-    }
-    return uri;
+  Future<MediaItem> _systemMediaItem(QueueItem item) async {
+    final artwork = await _systemArtwork(item);
+    return MediaItem(
+      id: item.path,
+      title: item.title.trim().isEmpty ? _titleFromPath(item.path) : item.title,
+      artist: item.artist.trim().isEmpty ? '未知歌手' : item.artist,
+      album: item.album.trim().isEmpty ? null : item.album,
+      duration: item.durationMs > 0
+          ? Duration(milliseconds: item.durationMs)
+          : null,
+      artUri: artwork.uri,
+      artHeaders: artwork.headers,
+      displayTitle: item.title,
+      displaySubtitle: item.artist,
+      playable: true,
+    );
   }
 
-  void _startPlayback(int requestId, String itemPath) {
-    unawaited(_ensureMediaNotificationPermission());
+  Future<({Uri? uri, Map<String, String>? headers})> _systemArtwork(
+    QueueItem item,
+  ) async {
+    var text = item.coverUrl?.trim() ?? '';
+    if (text.startsWith('//')) text = 'https:$text';
+    var uri = Uri.tryParse(text);
+    if (uri != null && uri.scheme == 'http' && _coverHostSupportsHttps(uri)) {
+      uri = uri.replace(scheme: 'https');
+    }
+    if (uri != null && const {'http', 'https'}.contains(uri.scheme)) {
+      return (uri: uri, headers: _systemArtworkHeaders(uri));
+    }
+    if (uri != null && const {'file', 'content'}.contains(uri.scheme)) {
+      return (uri: uri, headers: null);
+    }
+    // 部分本地歌曲把封面缩略图保存为普通绝对路径，没有 file:// 前缀。
+    if (text.isNotEmpty && File(text).existsSync()) {
+      return (uri: Uri.file(text), headers: null);
+    }
+    if (playbackSourceTypeFor(item) != PlaybackSourceType.localFile) {
+      return (uri: null, headers: null);
+    }
+    // 本地歌曲通常只有音频路径，Flutter 页面会临时提取内嵌封面；系统
+    // 媒体服务无法读取 Flutter 图片对象，因此生成缩略图并传 file URI。
+    try {
+      final dbPath = await _ref.read(dbPathProvider.future);
+      final cacheRoot = await _ref.read(appDataDirProvider.future);
+      final thumbnail = await getSongCoverThumbnail(
+        dbPath: dbPath,
+        cacheRoot: cacheRoot,
+        path: normalizeLocalAudioPath(item.path),
+      );
+      if (thumbnail.trim().isNotEmpty && File(thumbnail).existsSync()) {
+        return (uri: Uri.file(thumbnail), headers: null);
+      }
+    } catch (error) {
+      debugPrint('系统媒体封面提取失败：$error');
+    }
+    return (uri: null, headers: null);
+  }
+
+  bool _coverHostSupportsHttps(Uri uri) {
+    final host = uri.host.toLowerCase();
+    return host == 'music.126.net' ||
+        host.endsWith('.music.126.net') ||
+        host.endsWith('.qq.com') ||
+        host.endsWith('.kugou.com') ||
+        host.endsWith('.bilivideo.com') ||
+        host.endsWith('.hdslb.com');
+  }
+
+  Map<String, String>? _systemArtworkHeaders(Uri uri) {
+    final host = uri.host.toLowerCase();
+    const userAgent =
+        'Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 '
+        '(KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36';
+    if (host == 'music.126.net' || host.endsWith('.music.126.net')) {
+      return const {
+        'User-Agent': userAgent,
+        'Referer': 'https://music.163.com/',
+      };
+    }
+    if (host.endsWith('.hdslb.com') || host.endsWith('.bilivideo.com')) {
+      return const {
+        'User-Agent': userAgent,
+        'Referer': 'https://www.bilibili.com/',
+      };
+    }
+    if (host.endsWith('.qq.com')) {
+      return const {'User-Agent': userAgent, 'Referer': 'https://y.qq.com/'};
+    }
+    if (host.endsWith('.kugou.com')) {
+      return const {
+        'User-Agent': userAgent,
+        'Referer': 'https://www.kugou.com/',
+      };
+    }
+    return const {'User-Agent': userAgent};
+  }
+
+  Future<void> _startPlayback(int requestId, String itemPath) async {
+    // Android 13+ 要求先获得通知权限，媒体服务才能把 MediaStyle 通知写入
+    // 状态栏、锁屏和系统媒体中心。之前这里与 play() 并发执行，权限弹窗
+    // 尚未完成时音频服务已经启动，部分系统会直接丢弃首个媒体通知。
+    await _ensureMediaNotificationPermission();
     final playback = _player.play();
     unawaited(_watchPlayback(playback, requestId, itemPath));
   }
@@ -1823,6 +2133,8 @@ class PlayerNotifier extends StateNotifier<PlaybackState> {
       queue: queue,
       current: index == state.queueIndex ? queue[index] : state.current,
     );
+    // 视频播放期间 just_audio 没有进度流，歌词补全后要主动刷新桌面歌词。
+    unawaited(_syncDesktopLyrics());
   }
 
   Future<void> _loadPluginLyrics(
@@ -2001,6 +2313,10 @@ class PlayerNotifier extends StateNotifier<PlaybackState> {
         queueIndex >= state.queue.length) {
       return;
     }
+    // errorStream 与 play() Future 可能同时报告同一个错误，避免重复切歌。
+    final failureKey = '$requestId:$queueIndex';
+    if (_lastFailureKey == failureKey) return;
+    _lastFailureKey = failureKey;
     state = state.copyWith(
       isPlaying: false,
       isLoading: false,
@@ -2328,6 +2644,18 @@ class PlayerNotifier extends StateNotifier<PlaybackState> {
 
   Future<void> toggle() async {
     if (state.current == null) return;
+    final video = VideoPlaybackSession.isFor(state.current?.path)
+        ? VideoPlaybackSession.controller
+        : null;
+    if (video != null) {
+      if (video.value.isPlaying) {
+        await video.pause();
+      } else {
+        await video.play();
+      }
+      VideoPlaybackSession.progressChanged();
+      return;
+    }
     if (state.errorMessage != null && state.queueIndex >= 0) {
       await _playAt(state.queueIndex);
       return;
@@ -2349,11 +2677,32 @@ class PlayerNotifier extends StateNotifier<PlaybackState> {
     }
   }
 
+  /// 播放详情页临时播放视频时暂停音频，但保留当前音源和进度，
+  /// 关闭视频后可以无缝恢复原歌曲。
+  Future<bool> pauseForVideo() async {
+    final wasPlaying = _player.playing || state.isPlaying;
+    _manualPause = true;
+    if (_player.playing) await _player.pause();
+    return wasPlaying;
+  }
+
+  Future<void> resumeAfterVideo() async {
+    final current = state.current;
+    if (current == null || state.errorMessage != null) return;
+    await _player.setVolume(_ref.read(volumeProvider));
+    _manualPause = false;
+    unawaited(_startPlayback(_playRequestId, current.path));
+  }
+
   Future<void> seek(double secs) async {
     await _player.seek(Duration(milliseconds: (secs * 1000).round()));
   }
 
   Future<void> next() async {
+    if (VideoPlaybackSession.controller != null) {
+      await VideoPlaybackSession.stopForTrackAction();
+      await disableVideoMediaBridge();
+    }
     final i = _pickNextIndex();
     if (i >= 0) await _playAt(i);
   }
@@ -2361,8 +2710,30 @@ class PlayerNotifier extends StateNotifier<PlaybackState> {
   Future<void> playIndex(int index) => _playAt(index);
 
   Future<void> previous() async {
-    if (state.position > 3) {
-      await seek(0);
+    final video = VideoPlaybackSession.isFor(state.current?.path)
+        ? VideoPlaybackSession.controller
+        : null;
+    if (video != null) {
+      final videoPosition = video.value.position.inMilliseconds / 1000.0;
+      if (max(state.position, videoPosition) > 3) {
+        await video.seekTo(Duration.zero);
+        await _player.seek(Duration.zero);
+        state = state.copyWith(position: 0);
+        VideoPlaybackSession.progressChanged();
+        return;
+      }
+      await VideoPlaybackSession.stopForTrackAction();
+      await disableVideoMediaBridge();
+    }
+    // 常见播放器行为：当前歌曲已经播放超过几秒时，第一次点“上一首”
+    // 先回到本曲开头；只有再次点击才切换到队列上一首。不要只依赖
+    // positionStream 的状态值，它在切歌、后台播放或快速点击时可能滞后。
+    final playerPosition = _player.position.inMilliseconds / 1000.0;
+    final position = max(state.position, playerPosition);
+    if (position > 3) {
+      await _player.seek(Duration.zero);
+      // 立即同步状态，避免用户快速再次点击时仍被旧进度判定为重播。
+      state = state.copyWith(position: 0);
       return;
     }
     final n = state.queue.length;
@@ -2456,6 +2827,9 @@ class PlayerNotifier extends StateNotifier<PlaybackState> {
 
   @override
   void dispose() {
+    VideoPlaybackSession.progressRevision.removeListener(
+      _syncVideoPlaybackState,
+    );
     _sleepTimer?.cancel();
     _sleepTimerTicker?.cancel();
     _audioInterruptionSub?.cancel();

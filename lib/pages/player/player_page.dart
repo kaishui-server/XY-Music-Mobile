@@ -10,13 +10,16 @@ import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:path/path.dart' as p;
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:video_player/video_player.dart';
 
 import '../../src/core/db_path.dart';
 import '../../src/core/settings.dart';
 import '../../src/favorites/favorites_provider.dart';
 import '../../src/player/player_provider.dart';
 import '../../src/player/downloaded_song_store.dart';
+import '../../src/player/video_playback_session.dart';
 import '../../src/playlists/playlists_provider.dart';
+import '../../src/plugins/plugin_runtime.dart';
 import '../../src/rust/api.dart';
 import '../../src/rust/music/types.dart';
 import '../../src/widgets/cover_image.dart';
@@ -107,6 +110,7 @@ enum _PlayerMenuAction {
   linkLyrics,
   lyricsOffset,
   sleepTimer,
+  playVideo,
 }
 
 enum _LyricsSourceAction { plugin, local }
@@ -157,6 +161,30 @@ String lyricsOffsetLabel(int offsetTenths) {
   return normalized > 0 ? '提前 $seconds 秒' : '延后 $seconds 秒';
 }
 
+bool _isBilibiliQueueItem(QueueItem item) {
+  final raw = item.pluginData;
+  final values = <String>[
+    item.path,
+    item.pluginId ?? '',
+    if (raw != null) ...[
+      raw['platform']?.toString() ?? '',
+      raw['source']?.toString() ?? '',
+      raw['pluginId']?.toString() ?? '',
+      raw['bvid']?.toString() ?? '',
+      raw['aid']?.toString() ?? '',
+      if (raw['rawData'] is Map) ...[
+        (raw['rawData'] as Map)['platform']?.toString() ?? '',
+        (raw['rawData'] as Map)['bvid']?.toString() ?? '',
+        (raw['rawData'] as Map)['aid']?.toString() ?? '',
+      ],
+    ],
+  ];
+  return RegExp(
+    r'bilibili|哔哩哔哩|哔哩|b站',
+    caseSensitive: false,
+  ).hasMatch(values.join(' '));
+}
+
 /// 正在播放页：现代毛玻璃风格。
 /// 封面大圆角浮于流光背景之上，下方毛玻璃控制卡承载进度与按钮。
 class PlayerPage extends ConsumerStatefulWidget {
@@ -167,7 +195,13 @@ class PlayerPage extends ConsumerStatefulWidget {
 }
 
 class _PlayerPageState extends ConsumerState<PlayerPage> {
+  static const _screenAwakeChannel = MethodChannel(
+    'com.xymusic.mobile/screen_awake',
+  );
+
   late final PageController _detailPageController = PageController();
+  ProviderSubscription<bool>? _playingSubscription;
+  bool _screenAwake = false;
   bool _showLyrics = false;
   int? _detailPointerId;
   Offset? _detailPointerStart;
@@ -177,6 +211,91 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
   int _lyricsOffsetLoadRequest = 0;
   String? _lyricsCheckSongPath;
   String? _noLyricsNoticePath;
+  VideoPlayerController? _videoController;
+  String? _videoSongPath;
+  bool _videoLoading = false;
+  bool _videoClosing = false;
+  bool _resumeAudioAfterVideo = false;
+  String? _videoError;
+  VoidCallback? _videoControllerListener;
+
+  @override
+  void initState() {
+    super.initState();
+    _playingSubscription = ref.listenManual<bool>(
+      playerProvider.select((state) => state.isPlaying),
+      (_, playing) => unawaited(_setScreenAwake(playing)),
+      fireImmediately: true,
+    );
+    _videoController = VideoPlaybackSession.controller;
+    _videoSongPath = VideoPlaybackSession.songPath;
+    _videoLoading = VideoPlaybackSession.loading;
+    _resumeAudioAfterVideo = VideoPlaybackSession.resumeAudioAfterVideo;
+    _videoError = VideoPlaybackSession.error;
+    VideoPlaybackSession.revision.addListener(_syncVideoSession);
+    final controller = _videoController;
+    if (controller != null) _bindVideoController(controller);
+  }
+
+  Future<void> _setScreenAwake(bool enabled) async {
+    if (!Platform.isAndroid || _screenAwake == enabled) return;
+    _screenAwake = enabled;
+    try {
+      await _screenAwakeChannel.invokeMethod<bool>('setKeepScreenOn', {
+        'enabled': enabled,
+      });
+    } catch (error) {
+      // 防熄屏属于体验增强；平台通道不可用时不能影响播放详情页。
+      debugPrint('播放详情页防熄屏设置失败：$error');
+    }
+  }
+
+  void _syncVideoSession() {
+    // 共享会话在释放原生纹理前会先置空控制器；及时解除 listener，避免
+    // 释放过程中再次读取 controller.value 导致 native peer 错误。
+    if (VideoPlaybackSession.controller == null && _videoController != null) {
+      final old = _videoController!;
+      _unbindVideoController(old);
+      _videoController = null;
+      if (mounted && !_videoClosing) setState(() {});
+    }
+  }
+
+  void _bindVideoController(VideoPlayerController controller) {
+    _unbindVideoController(_videoController);
+    void listener() {
+      if (VideoPlaybackSession.controller == controller) {
+        VideoPlaybackSession.progressChanged();
+      }
+      if (!mounted || _videoController != controller) return;
+      if (controller.value.hasError) {
+        final error = controller.value.errorDescription;
+        VideoPlaybackSession.error = error;
+        if (_videoError != error) setState(() => _videoError = error);
+      } else if (controller.value.isCompleted &&
+          !_videoClosing &&
+          !VideoPlaybackSession.restarting) {
+        if (normalizePlayMode(ref.read(playerProvider).playMode) == 1) {
+          // 播放器状态监听通常会先触发共享会话重播；这里保留兜底，
+          // 防止详情页单独收到完成事件时切回音频。
+          unawaited(VideoPlaybackSession.restartSingleLoop());
+        } else {
+          unawaited(_closeBilibiliVideo());
+        }
+      }
+    }
+
+    _videoControllerListener = listener;
+    controller.addListener(listener);
+  }
+
+  void _unbindVideoController(VideoPlayerController? controller) {
+    final listener = _videoControllerListener;
+    if (controller != null && listener != null) {
+      controller.removeListener(listener);
+    }
+    _videoControllerListener = null;
+  }
 
   void _toggleLyrics() {
     _showDetailPage(!_showLyrics);
@@ -278,112 +397,339 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
     _detailPointerLast = null;
   }
 
+  Future<void> _startBilibiliVideo(QueueItem item) async {
+    if (_videoLoading || _videoSongPath == item.path) return;
+    if (!_isBilibiliQueueItem(item)) {
+      XyNotice.show(
+        context,
+        message: '当前歌曲不是哔哩哔哩插件歌曲',
+        type: XyNoticeType.warning,
+      );
+      return;
+    }
+    final pluginData = item.pluginData;
+    if (pluginData == null || pluginData.isEmpty) {
+      XyNotice.show(
+        context,
+        message: '当前歌曲缺少 B 站视频信息',
+        type: XyNoticeType.error,
+      );
+      return;
+    }
+    List<EnabledMusicPlugin> plugins;
+    try {
+      plugins = await ref.read(enabledMusicPluginsProvider.future);
+    } catch (error) {
+      if (mounted) {
+        XyNotice.show(
+          context,
+          message: '读取哔哩哔哩插件失败：${_errorText(error)}',
+          type: XyNoticeType.error,
+        );
+      }
+      return;
+    }
+    final plugin = plugins
+        .where((value) => value.id == item.pluginId)
+        .firstOrNull;
+    if (!mounted) return;
+    if (plugin == null) {
+      XyNotice.show(context, message: '哔哩哔哩插件已停用或删除', type: XyNoticeType.error);
+      return;
+    }
+
+    final notifier = ref.read(playerProvider.notifier);
+    final resumeAudio = await notifier.pauseForVideo();
+    if (!mounted || ref.read(playerProvider).current?.path != item.path) {
+      if (resumeAudio) await notifier.resumeAfterVideo();
+      return;
+    }
+    setState(() {
+      _videoSongPath = item.path;
+      _videoLoading = true;
+      _videoClosing = false;
+      _resumeAudioAfterVideo = resumeAudio;
+      _videoError = null;
+    });
+    VideoPlaybackSession.songPath = item.path;
+    VideoPlaybackSession.controller = null;
+    VideoPlaybackSession.loading = true;
+    VideoPlaybackSession.resumeAudioAfterVideo = resumeAudio;
+    VideoPlaybackSession.error = null;
+    VideoPlaybackSession.changed();
+    try {
+      final source = await ref
+          .read(pluginRuntimeProvider)
+          .resolveVideoSource(
+            plugin,
+            pluginData,
+            videoQuality: '720P',
+            path: item.path,
+          )
+          .timeout(const Duration(seconds: 25));
+      if (!mounted || _videoSongPath != item.path) return;
+      VideoPlayerController? controller;
+      Object? lastVideoError;
+      for (final url in <String>[source.url, ...source.backupUrls]) {
+        VideoPlayerController? candidate;
+        try {
+          candidate = VideoPlayerController.networkUrl(
+            Uri.parse(url),
+            httpHeaders: source.headers,
+            videoPlayerOptions: VideoPlayerOptions(
+              // video_player 默认会在锁屏/切后台时暂停自身；视频歌曲需要
+              // 和普通歌曲一样保持后台播放。
+              allowBackgroundPlayback: true,
+              mixWithOthers: true,
+            ),
+          );
+          await candidate.initialize();
+          controller = candidate;
+          break;
+        } catch (error) {
+          lastVideoError = error;
+          // 初始化失败的候选地址也要释放，避免连续尝试备用地址时泄漏
+          // ExoPlayer/纹理资源。
+          try {
+            await candidate?.dispose();
+          } catch (_) {}
+        }
+      }
+      if (controller == null) {
+        throw lastVideoError ?? Exception('视频地址无法播放');
+      }
+      final activeController = controller;
+      if (!mounted || _videoSongPath != item.path) {
+        await activeController.dispose();
+        return;
+      }
+      final position = ref.read(playerProvider).position;
+      if (position.isFinite && position > 0) {
+        await activeController.seekTo(
+          Duration(milliseconds: (position * 1000).round()),
+        );
+      }
+      _bindVideoController(activeController);
+      _videoController = activeController;
+      VideoPlaybackSession.controller = activeController;
+      VideoPlaybackSession.loading = false;
+      VideoPlaybackSession.changed();
+      VideoPlaybackSession.progressChanged();
+      setState(() => _videoLoading = false);
+      await activeController.play();
+      // video_player 不会自动接入 Android MediaSession。启动静音音频桥接，
+      // 让通知栏/锁屏/灵动岛进度与播放暂停按钮同步控制当前视频。
+      await notifier.enableVideoMediaBridge();
+    } catch (error) {
+      if (!mounted || _videoSongPath != item.path) return;
+      final errorText = _errorText(error);
+      setState(() {
+        _videoSongPath = null;
+        _videoLoading = false;
+        _videoError = errorText;
+      });
+      VideoPlaybackSession.songPath = null;
+      VideoPlaybackSession.controller = null;
+      VideoPlaybackSession.loading = false;
+      VideoPlaybackSession.error = errorText;
+      VideoPlaybackSession.changed();
+      _videoController = null;
+      if (_resumeAudioAfterVideo) {
+        _resumeAudioAfterVideo = false;
+        await notifier.resumeAfterVideo();
+      }
+      if (mounted) {
+        XyNotice.show(
+          context,
+          message: '视频播放失败：${_errorText(error)}',
+          type: XyNoticeType.error,
+        );
+      }
+    }
+  }
+
+  Future<void> _closeBilibiliVideo() async {
+    if (_videoClosing) return;
+    _videoClosing = true;
+    // 在后续释放原生视频纹理期间页面可能被移除；先缓存应用级播放器
+    // notifier，避免 await 返回后再次访问已销毁页面的 WidgetRef。
+    final notifier = ref.read(playerProvider.notifier);
+    final controller = _videoController;
+    final sessionOwnsController =
+        controller != null && VideoPlaybackSession.controller == controller;
+    final shouldResume = _resumeAudioAfterVideo;
+    final songPath = _videoSongPath;
+    // 视频播放期间音频播放器一直停在进入视频前的位置；关闭视频前先
+    // 读取视频当前时间，随后把音频播放器定位到同一位置，避免回跳。
+    final videoPosition = controller?.value.position;
+    await notifier.disableVideoMediaBridge();
+    _videoController = null;
+    _videoSongPath = null;
+    _videoLoading = false;
+    _videoError = null;
+    _resumeAudioAfterVideo = false;
+    VideoPlaybackSession.songPath = null;
+    VideoPlaybackSession.controller = null;
+    VideoPlaybackSession.loading = false;
+    VideoPlaybackSession.resumeAudioAfterVideo = false;
+    VideoPlaybackSession.error = null;
+    VideoPlaybackSession.changed();
+    VideoPlaybackSession.progressChanged();
+    if (mounted) setState(() {});
+    // 首页/迷你播放栏切歌时可能已经负责释放控制器，避免二次 dispose。
+    _unbindVideoController(controller);
+    if (sessionOwnsController) await controller.dispose();
+    if (!mounted) {
+      _videoClosing = false;
+      return;
+    }
+    final current = ref.read(playerProvider).current;
+    if (songPath != null &&
+        videoPosition != null &&
+        videoPosition.inMilliseconds >= 0 &&
+        current?.path == songPath) {
+      await notifier.seek(videoPosition.inMilliseconds / 1000.0);
+    }
+    if (shouldResume && current?.path == songPath) {
+      await notifier.resumeAfterVideo();
+    }
+    _videoClosing = false;
+  }
+
   Future<void> _showMoreMenu(QueueItem item) async {
     final settings = ref.read(settingsProvider).valueOrNull;
+    final viewport = MediaQuery.sizeOf(context);
+    final isLandscape = viewport.width > viewport.height;
     final action = await showModalBottomSheet<_PlayerMenuAction>(
       context: context,
       useRootNavigator: true,
       showDragHandle: true,
       isScrollControlled: true,
+      useSafeArea: true,
+      constraints: isLandscape
+          ? BoxConstraints(
+              maxWidth: math.min(560, viewport.width - 32),
+              maxHeight: viewport.height * .9,
+            )
+          : null,
       builder: (sheetContext) => Consumer(
         builder: (context, ref, child) {
           final sleepTimerEndsAt = ref.watch(
             playerProvider.select((state) => state.sleepTimerEndsAt),
           );
-          return SafeArea(
-            child: Padding(
-              padding: const EdgeInsets.only(bottom: 8),
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Padding(
-                    padding: const EdgeInsets.fromLTRB(20, 0, 20, 12),
-                    child: Row(
-                      children: [
-                        CoverImage(
-                          songPath: item.path,
-                          imageUrl: item.coverUrl,
-                          width: 54,
-                          height: 54,
-                          radius: 12,
-                          icon: Icons.music_note_rounded,
-                        ),
-                        const SizedBox(width: 12),
-                        Expanded(
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              Text(
-                                item.title,
-                                maxLines: 1,
-                                overflow: TextOverflow.ellipsis,
-                                style: const TextStyle(
-                                  fontSize: 16,
-                                  fontWeight: FontWeight.w700,
-                                ),
+          return ConstrainedBox(
+            constraints: BoxConstraints(
+              maxHeight: isLandscape
+                  ? viewport.height * .86
+                  : viewport.height * .8,
+            ),
+            child: SingleChildScrollView(
+              child: SafeArea(
+                child: Padding(
+                  padding: const EdgeInsets.only(bottom: 8),
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Padding(
+                        padding: const EdgeInsets.fromLTRB(20, 0, 20, 12),
+                        child: Row(
+                          children: [
+                            CoverImage(
+                              songPath: item.path,
+                              imageUrl: item.coverUrl,
+                              width: 54,
+                              height: 54,
+                              radius: 12,
+                              icon: Icons.music_note_rounded,
+                            ),
+                            const SizedBox(width: 12),
+                            Expanded(
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Text(
+                                    item.title,
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: const TextStyle(
+                                      fontSize: 16,
+                                      fontWeight: FontWeight.w700,
+                                    ),
+                                  ),
+                                  const SizedBox(height: 3),
+                                  Text(
+                                    item.artist.trim().isEmpty
+                                        ? '未知歌手'
+                                        : item.artist,
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: TextStyle(
+                                      color: Theme.of(
+                                        sheetContext,
+                                      ).colorScheme.onSurfaceVariant,
+                                    ),
+                                  ),
+                                ],
                               ),
-                              const SizedBox(height: 3),
-                              Text(
-                                item.artist.trim().isEmpty
-                                    ? '未知歌手'
-                                    : item.artist,
-                                maxLines: 1,
-                                overflow: TextOverflow.ellipsis,
-                                style: TextStyle(
-                                  color: Theme.of(
-                                    sheetContext,
-                                  ).colorScheme.onSurfaceVariant,
-                                ),
-                              ),
-                            ],
-                          ),
+                            ),
+                          ],
                         ),
-                      ],
-                    ),
+                      ),
+                      const Divider(height: 1),
+                      _moreTile(
+                        sheetContext,
+                        action: _PlayerMenuAction.download,
+                        icon: Icons.download_rounded,
+                        title: '下载',
+                      ),
+                      _moreTile(
+                        sheetContext,
+                        action: _PlayerMenuAction.quality,
+                        icon: Icons.high_quality_rounded,
+                        title: '选择音质',
+                        value: _qualityLabel(
+                          settings?.onlineDefaultQuality ?? '320k',
+                        ),
+                      ),
+                      _moreTile(
+                        sheetContext,
+                        action: _PlayerMenuAction.playlist,
+                        icon: Icons.playlist_add_rounded,
+                        title: '添加到歌单',
+                      ),
+                      _moreTile(
+                        sheetContext,
+                        action: _PlayerMenuAction.linkLyrics,
+                        icon: Icons.lyrics_outlined,
+                        title: '关联歌词',
+                      ),
+                      _moreTile(
+                        sheetContext,
+                        action: _PlayerMenuAction.lyricsOffset,
+                        icon: Icons.sync_alt_rounded,
+                        title: '歌词偏移',
+                        value: lyricsOffsetLabel(_lyricsOffsetTenths),
+                      ),
+                      _moreTile(
+                        sheetContext,
+                        action: _PlayerMenuAction.sleepTimer,
+                        icon: Icons.timer_outlined,
+                        title: '定时关闭',
+                        value: _sleepTimerLabel(sleepTimerEndsAt),
+                      ),
+                      if (_isBilibiliQueueItem(item))
+                        _moreTile(
+                          sheetContext,
+                          action: _PlayerMenuAction.playVideo,
+                          icon: _videoSongPath == item.path
+                              ? Icons.stop_circle_outlined
+                              : Icons.ondemand_video_outlined,
+                          title: _videoSongPath == item.path ? '关闭视频' : '播放视频',
+                          value: _videoLoading ? '解析中' : null,
+                        ),
+                    ],
                   ),
-                  const Divider(height: 1),
-                  _moreTile(
-                    sheetContext,
-                    action: _PlayerMenuAction.download,
-                    icon: Icons.download_rounded,
-                    title: '下载',
-                  ),
-                  _moreTile(
-                    sheetContext,
-                    action: _PlayerMenuAction.quality,
-                    icon: Icons.high_quality_rounded,
-                    title: '选择音质',
-                    value: _qualityLabel(
-                      settings?.onlineDefaultQuality ?? '320k',
-                    ),
-                  ),
-                  _moreTile(
-                    sheetContext,
-                    action: _PlayerMenuAction.playlist,
-                    icon: Icons.playlist_add_rounded,
-                    title: '添加到歌单',
-                  ),
-                  _moreTile(
-                    sheetContext,
-                    action: _PlayerMenuAction.linkLyrics,
-                    icon: Icons.lyrics_outlined,
-                    title: '关联歌词',
-                  ),
-                  _moreTile(
-                    sheetContext,
-                    action: _PlayerMenuAction.lyricsOffset,
-                    icon: Icons.sync_alt_rounded,
-                    title: '歌词偏移',
-                    value: lyricsOffsetLabel(_lyricsOffsetTenths),
-                  ),
-                  _moreTile(
-                    sheetContext,
-                    action: _PlayerMenuAction.sleepTimer,
-                    icon: Icons.timer_outlined,
-                    title: '定时关闭',
-                    value: _sleepTimerLabel(sleepTimerEndsAt),
-                  ),
-                ],
+                ),
               ),
             ),
           );
@@ -404,6 +750,12 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
         await _pickLyricsOffset(item);
       case _PlayerMenuAction.sleepTimer:
         await _pickSleepTimer();
+      case _PlayerMenuAction.playVideo:
+        if (_videoSongPath == item.path) {
+          await _closeBilibiliVideo();
+        } else {
+          await _startBilibiliVideo(item);
+        }
     }
   }
 
@@ -912,6 +1264,15 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
 
   @override
   void dispose() {
+    // 视频控制器由会话对象持有，退出详情页只销毁页面 UI，不暂停或释放视频。
+    // 这样从详情页返回后，视频仍可继续播放；重新进入详情页时会重新绑定。
+    VideoPlaybackSession.revision.removeListener(_syncVideoSession);
+    _playingSubscription?.close();
+    _playingSubscription = null;
+    if (_screenAwake) {
+      unawaited(_setScreenAwake(false));
+    }
+    _unbindVideoController(_videoController);
     _detailPageController.dispose();
     super.dispose();
   }
@@ -922,9 +1283,139 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
     // 全屏背景、封面和模糊层一起高频重建。
     final current = ref.watch(playerProvider.select((state) => state.current));
     _loadLyricsOffsetFor(current);
+    if (_videoSongPath != null &&
+        _videoSongPath != current?.path &&
+        !_videoClosing) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted && !_videoClosing) unawaited(_closeBilibiliVideo());
+      });
+    }
     final notifier = ref.read(playerProvider.notifier);
     _checkLyricsOnEntry(current);
     final scheme = Theme.of(context).colorScheme;
+    final viewport = MediaQuery.sizeOf(context);
+    final isLandscape = viewport.width > viewport.height;
+
+    final detailHeader = Padding(
+      padding: EdgeInsets.symmetric(
+        horizontal: 4,
+        vertical: isLandscape ? 0 : 0,
+      ),
+      child: Row(
+        children: [
+          IconButton(
+            icon: const Icon(
+              Icons.keyboard_arrow_down,
+              size: 28,
+              color: Colors.white,
+            ),
+            onPressed: () => Navigator.of(context).pop(),
+          ),
+          Expanded(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(
+                  current?.title ?? '正在播放',
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(
+                    color: Colors.white,
+                    fontSize: 16,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+                if ((current?.artist ?? '').isNotEmpty)
+                  Text(
+                    current!.artist,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                      color: Colors.white.withValues(alpha: .58),
+                      fontSize: 11,
+                    ),
+                  ),
+                const SizedBox(height: 4),
+                if (_videoSongPath != current?.path)
+                  _DetailPageIndicator(showLyrics: _showLyrics),
+              ],
+            ),
+          ),
+          IconButton(
+            tooltip: '更多',
+            icon: const Icon(Icons.more_horiz_rounded, color: Colors.white),
+            onPressed: current == null ? null : () => _showMoreMenu(current),
+          ),
+        ],
+      ),
+    );
+
+    final detailPager = LayoutBuilder(
+      builder: (context, constraints) => Listener(
+        behavior: HitTestBehavior.translucent,
+        onPointerDown: current == null ? null : _startDetailSwipe,
+        onPointerMove: current == null ? null : _updateDetailSwipe,
+        onPointerUp: current == null
+            ? null
+            : (event) => _finishDetailSwipe(event, constraints.maxWidth),
+        onPointerCancel: current == null
+            ? null
+            : (event) => _finishDetailSwipe(event, constraints.maxWidth),
+        child: PageView(
+          controller: _detailPageController,
+          physics: const NeverScrollableScrollPhysics(),
+          onPageChanged: (page) {
+            final showLyrics = page == 1;
+            if (_showLyrics != showLyrics) {
+              setState(() => _showLyrics = showLyrics);
+            }
+          },
+          children: [
+            _BigCover(
+              key: ValueKey('cover:${current?.path ?? ''}'),
+              item: current,
+              offsetTenths: _lyricsOffsetTenths,
+              onTap: current == null ? null : _toggleLyrics,
+            ),
+            if (current == null)
+              const Center(
+                child: Text('暂无歌词', style: TextStyle(color: Colors.white54)),
+              )
+            else
+              _LyricsView(
+                key: ValueKey('lyrics:${current.path}'),
+                item: current,
+                offsetTenths: _lyricsOffsetTenths,
+              ),
+          ],
+        ),
+      ),
+    );
+
+    final videoActive =
+        _videoSongPath != null && _videoSongPath == current?.path;
+    final detailControls = Padding(
+      padding: EdgeInsets.fromLTRB(
+        isLandscape ? 8 : 16,
+        0,
+        isLandscape ? 8 : 16,
+        isLandscape ? 8 : 20,
+      ),
+      child: _GlassControlCard(
+        notifier: notifier,
+        current: current,
+        videoActive: videoActive,
+        videoController: videoActive ? _videoController : null,
+      ),
+    );
+    final detailContent = videoActive
+        ? _BilibiliVideoView(
+            controller: _videoController,
+            loading: _videoLoading,
+            error: _videoError,
+          )
+        : detailPager;
 
     return Scaffold(
       backgroundColor: scheme.surface,
@@ -934,123 +1425,31 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
           // 电脑版详情页同款：封面铺满、重度模糊并叠加暗色氛围层。
           _PlayerDetailBackground(current: current),
           SafeArea(
-            child: Column(
-              children: [
-                // 顶栏
-                Padding(
-                  padding: const EdgeInsets.symmetric(horizontal: 4),
-                  child: Row(
+            child: isLandscape
+                ? Column(
                     children: [
-                      IconButton(
-                        icon: const Icon(
-                          Icons.keyboard_arrow_down,
-                          size: 28,
-                          color: Colors.white,
-                        ),
-                        onPressed: () => Navigator.of(context).pop(),
-                      ),
+                      detailHeader,
                       Expanded(
-                        child: Column(
+                        child: Row(
+                          crossAxisAlignment: CrossAxisAlignment.stretch,
                           children: [
-                            Text(
-                              current?.title ?? '正在播放',
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis,
-                              textAlign: TextAlign.center,
-                              style: const TextStyle(
-                                color: Colors.white,
-                                fontSize: 16,
-                                fontWeight: FontWeight.w700,
-                              ),
+                            Expanded(child: detailContent),
+                            SizedBox(
+                              width: math.min(360, viewport.width * .38),
+                              child: Center(child: detailControls),
                             ),
-                            if ((current?.artist ?? '').isNotEmpty)
-                              Text(
-                                current!.artist,
-                                maxLines: 1,
-                                overflow: TextOverflow.ellipsis,
-                                style: TextStyle(
-                                  color: Colors.white.withValues(alpha: .58),
-                                  fontSize: 11,
-                                ),
-                              ),
-                            const SizedBox(height: 4),
-                            _DetailPageIndicator(showLyrics: _showLyrics),
                           ],
                         ),
                       ),
-                      IconButton(
-                        tooltip: '更多',
-                        icon: const Icon(
-                          Icons.more_horiz_rounded,
-                          color: Colors.white,
-                        ),
-                        onPressed: current == null
-                            ? null
-                            : () => _showMoreMenu(current),
-                      ),
+                    ],
+                  )
+                : Column(
+                    children: [
+                      detailHeader,
+                      Expanded(child: detailContent),
+                      detailControls,
                     ],
                   ),
-                ),
-                Expanded(
-                  child: LayoutBuilder(
-                    builder: (context, constraints) => Listener(
-                      behavior: HitTestBehavior.translucent,
-                      onPointerDown: current == null ? null : _startDetailSwipe,
-                      onPointerMove: current == null
-                          ? null
-                          : _updateDetailSwipe,
-                      onPointerUp: current == null
-                          ? null
-                          : (event) =>
-                                _finishDetailSwipe(event, constraints.maxWidth),
-                      onPointerCancel: current == null
-                          ? null
-                          : (event) =>
-                                _finishDetailSwipe(event, constraints.maxWidth),
-                      child: PageView(
-                        controller: _detailPageController,
-                        physics: const NeverScrollableScrollPhysics(),
-                        onPageChanged: (page) {
-                          final showLyrics = page == 1;
-                          if (_showLyrics != showLyrics) {
-                            setState(() => _showLyrics = showLyrics);
-                          }
-                        },
-                        children: [
-                          _BigCover(
-                            key: ValueKey('cover:${current?.path ?? ''}'),
-                            item: current,
-                            offsetTenths: _lyricsOffsetTenths,
-                            onTap: current == null ? null : _toggleLyrics,
-                          ),
-                          if (current == null)
-                            const Center(
-                              child: Text(
-                                '暂无歌词',
-                                style: TextStyle(color: Colors.white54),
-                              ),
-                            )
-                          else
-                            _LyricsView(
-                              key: ValueKey('lyrics:${current.path}'),
-                              item: current,
-                              offsetTenths: _lyricsOffsetTenths,
-                            ),
-                        ],
-                      ),
-                    ),
-                  ),
-                ),
-                // 毛玻璃控制卡
-                Padding(
-                  padding: const EdgeInsets.fromLTRB(16, 0, 16, 20),
-                  child: _GlassControlCard(
-                    notifier: notifier,
-                    current: current,
-                  ),
-                ),
-              ],
-            ),
           ),
         ],
       ),
@@ -2152,6 +2551,60 @@ class _PlayerDetailBackground extends StatelessWidget {
   }
 }
 
+class _BilibiliVideoView extends StatelessWidget {
+  const _BilibiliVideoView({
+    required this.controller,
+    required this.loading,
+    required this.error,
+  });
+
+  final VideoPlayerController? controller;
+  final bool loading;
+  final String? error;
+
+  @override
+  Widget build(BuildContext context) {
+    final player = controller;
+    final initialized = player?.value.isInitialized == true;
+    return ColoredBox(
+      color: Colors.black,
+      child: Center(
+        child: Stack(
+          alignment: Alignment.center,
+          children: [
+            if (initialized)
+              GestureDetector(
+                onTap: () {
+                  if (player.value.isPlaying) {
+                    player.pause();
+                  } else {
+                    player.play();
+                  }
+                },
+                child: AspectRatio(
+                  aspectRatio: player!.value.aspectRatio > 0
+                      ? player.value.aspectRatio
+                      : 16 / 9,
+                  child: VideoPlayer(player),
+                ),
+              ),
+            if (loading) const CircularProgressIndicator(color: Colors.white),
+            if (error?.trim().isNotEmpty == true)
+              Padding(
+                padding: const EdgeInsets.all(24),
+                child: Text(
+                  '视频播放失败\n$error',
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(color: Colors.white70, height: 1.5),
+                ),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
 class _BigCover extends StatelessWidget {
   const _BigCover({
     super.key,
@@ -2507,6 +2960,8 @@ class _LyricsViewState extends ConsumerState<_LyricsView>
     var active = lines.lastIndexWhere((line) => line.time <= position);
     if (active < 0) active = 0;
     _syncScroll(active, lines);
+    final size = MediaQuery.sizeOf(context);
+    final compactVertical = size.width > size.height;
     return LayoutBuilder(
       builder: (context, constraints) {
         return Stack(
@@ -2529,7 +2984,12 @@ class _LyricsViewState extends ConsumerState<_LyricsView>
                   onNotification: _handleScrollNotification,
                   child: ListView.builder(
                     controller: _scrollController,
-                    padding: const EdgeInsets.fromLTRB(26, 124, 26, 124),
+                    padding: EdgeInsets.fromLTRB(
+                      26,
+                      compactVertical ? 28 : 124,
+                      26,
+                      compactVertical ? 28 : 124,
+                    ),
                     itemCount: lines.length,
                     itemBuilder: (context, index) {
                       final line = lines[index];
@@ -2869,9 +3329,16 @@ class _ProgressiveLyricWord extends StatelessWidget {
 
 /// 毛玻璃控制卡：标题 + 进度 + 播放控制。
 class _GlassControlCard extends ConsumerWidget {
-  const _GlassControlCard({required this.notifier, required this.current});
+  const _GlassControlCard({
+    required this.notifier,
+    required this.current,
+    this.videoActive = false,
+    this.videoController,
+  });
   final PlayerNotifier notifier;
   final QueueItem? current;
+  final bool videoActive;
+  final VideoPlayerController? videoController;
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
@@ -2907,9 +3374,17 @@ class _GlassControlCard extends ConsumerWidget {
                     ),
                   ],
                   const SizedBox(height: 14),
-                  _ProgressBar(notifier: notifier),
+                  _ProgressBar(
+                    notifier: notifier,
+                    enabled: !videoActive || videoController != null,
+                    videoController: videoController,
+                  ),
                   const SizedBox(height: 6),
-                  _Controls(notifier: notifier),
+                  _Controls(
+                    notifier: notifier,
+                    disabled: videoActive,
+                    videoController: videoController,
+                  ),
                 ],
               ),
       ),
@@ -3010,8 +3485,14 @@ class _TitleRow extends ConsumerWidget {
 }
 
 class _ProgressBar extends ConsumerWidget {
-  const _ProgressBar({required this.notifier});
+  const _ProgressBar({
+    required this.notifier,
+    this.enabled = true,
+    this.videoController,
+  });
   final PlayerNotifier notifier;
+  final bool enabled;
+  final VideoPlayerController? videoController;
 
   String _fmt(double s) {
     if (!s.isFinite || s < 0) s = 0;
@@ -3022,18 +3503,47 @@ class _ProgressBar extends ConsumerWidget {
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
-    final scheme = Theme.of(context).colorScheme;
+    final controller = videoController;
+    if (controller != null) {
+      return ValueListenableBuilder<VideoPlayerValue>(
+        valueListenable: controller,
+        builder: (context, value, child) => _buildProgress(
+          context,
+          value.position.inMilliseconds / 1000.0,
+          value.duration.inMilliseconds / 1000.0,
+          onChanged: enabled
+              ? (position) => unawaited(
+                  controller.seekTo(
+                    Duration(milliseconds: (position * 1000).round()),
+                  ),
+                )
+              : null,
+        ),
+      );
+    }
+
     final progress = ref.watch(
       playerProvider.select(
         (state) => (position: state.position, duration: state.duration),
       ),
     );
-    final dur = progress.duration.isFinite && progress.duration > 0
-        ? progress.duration
-        : 1.0;
-    final position = progress.position.isFinite
-        ? progress.position.clamp(0.0, dur)
-        : 0.0;
+    return _buildProgress(
+      context,
+      progress.position,
+      progress.duration,
+      onChanged: enabled ? notifier.seek : null,
+    );
+  }
+
+  Widget _buildProgress(
+    BuildContext context,
+    double rawPosition,
+    double rawDuration, {
+    required ValueChanged<double>? onChanged,
+  }) {
+    final scheme = Theme.of(context).colorScheme;
+    final dur = rawDuration.isFinite && rawDuration > 0 ? rawDuration : 1.0;
+    final position = rawPosition.isFinite ? rawPosition.clamp(0.0, dur) : 0.0;
     return Column(
       children: [
         SliderTheme(
@@ -3046,11 +3556,7 @@ class _ProgressBar extends ConsumerWidget {
             thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 5),
             overlayShape: const RoundSliderOverlayShape(overlayRadius: 14),
           ),
-          child: Slider(
-            value: position,
-            max: dur,
-            onChanged: (v) => notifier.seek(v),
-          ),
+          child: Slider(value: position, max: dur, onChanged: onChanged),
         ),
         Padding(
           padding: const EdgeInsets.symmetric(horizontal: 10),
@@ -3080,8 +3586,14 @@ class _ProgressBar extends ConsumerWidget {
 }
 
 class _Controls extends ConsumerWidget {
-  const _Controls({required this.notifier});
+  const _Controls({
+    required this.notifier,
+    this.disabled = false,
+    this.videoController,
+  });
   final PlayerNotifier notifier;
+  final bool disabled;
+  final VideoPlayerController? videoController;
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
@@ -3096,19 +3608,46 @@ class _Controls extends ConsumerWidget {
         ),
       ),
     );
+    final video = videoController;
+    if (video != null) {
+      return ValueListenableBuilder<VideoPlayerValue>(
+        valueListenable: video,
+        builder: (context, value, child) =>
+            _buildControls(context, ref, scheme, (
+              isPlaying: value.isPlaying,
+              isLoading: false,
+              playMode: player.playMode,
+              hasQueue: player.hasQueue,
+            ), videoController: video),
+      );
+    }
+    return _buildControls(context, ref, scheme, player);
+  }
+
+  Widget _buildControls(
+    BuildContext context,
+    WidgetRef ref,
+    ColorScheme scheme,
+    ({bool isPlaying, bool isLoading, int playMode, bool hasQueue}) player, {
+    VideoPlayerController? videoController,
+  }) {
     final icons = [Icons.repeat, Icons.repeat_one, Icons.shuffle];
+    final video = videoController;
+    // 视频播放时，视频控制器接管播放/进度，但切歌、循环模式和队列仍应可用。
+    // 之前把 video != null 整体视为 disabled，导致详情页只有播放按钮能点。
+    final controlsDisabled = disabled && video == null;
     return Row(
       mainAxisAlignment: MainAxisAlignment.spaceBetween,
       children: [
         IconButton(
           iconSize: 21,
           icon: Icon(icons[player.playMode], color: Colors.white70),
-          onPressed: notifier.cyclePlayMode,
+          onPressed: controlsDisabled ? null : notifier.cyclePlayMode,
         ),
         IconButton(
           iconSize: 32,
           icon: const Icon(Icons.skip_previous, color: Colors.white),
-          onPressed: notifier.previous,
+          onPressed: controlsDisabled ? null : notifier.previous,
         ),
         // 主题色实心播放键
         Container(
@@ -3140,18 +3679,32 @@ class _Controls extends ConsumerWidget {
                     color: Colors.white,
                   ),
             iconSize: 34,
-            onPressed: player.isLoading ? null : notifier.toggle,
+            onPressed: player.isLoading
+                ? null
+                : video != null
+                ? () {
+                    if (video.value.isPlaying) {
+                      unawaited(video.pause());
+                    } else {
+                      unawaited(video.play());
+                    }
+                  }
+                : disabled
+                ? null
+                : notifier.toggle,
           ),
         ),
         IconButton(
           iconSize: 32,
           icon: const Icon(Icons.skip_next, color: Colors.white),
-          onPressed: notifier.next,
+          onPressed: controlsDisabled ? null : notifier.next,
         ),
         IconButton(
           iconSize: 21,
           icon: const Icon(Icons.queue_music, color: Colors.white70),
-          onPressed: !player.hasQueue ? null : () => _showQueue(context, ref),
+          onPressed: controlsDisabled || !player.hasQueue
+              ? null
+              : () => _showQueue(context, ref),
         ),
       ],
     );

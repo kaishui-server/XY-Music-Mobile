@@ -10,6 +10,7 @@ import 'package:image/image.dart' as img;
 
 import '../../src/auth/auth_provider.dart';
 import '../../src/logging/app_log_store.dart';
+import '../../src/navigation/animated_page_route.dart';
 import '../../src/ui/xy_surface.dart';
 import '../../src/widgets/top_notice.dart';
 
@@ -255,7 +256,7 @@ class _FeedbackPageState extends ConsumerState<FeedbackPage> {
                   leading: const Icon(Icons.info_outline),
                   title: const Text('请先登录账号后再提交反馈'),
                   trailing: const Icon(Icons.chevron_right_rounded),
-                  onTap: () => context.push('/account'),
+                  onTap: () => context.push('/account?from=settings'),
                 ),
               ),
             Card(
@@ -524,136 +525,136 @@ class _MyFeedbackSheetState extends ConsumerState<_MyFeedbackSheet> {
                         child: InkWell(
                           onTap: () => _openDetail(item),
                           child: Padding(
-                          padding: const EdgeInsets.all(14),
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              Row(
-                                children: [
-                                  Text(
-                                    item.feedbackType == 'suggestion'
-                                        ? '功能建议'
-                                        : '问题反馈',
-                                    style: TextStyle(
-                                      color: Theme.of(
-                                        context,
-                                      ).colorScheme.primary,
-                                      fontWeight: FontWeight.w700,
+                            padding: const EdgeInsets.all(14),
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Row(
+                                  children: [
+                                    Text(
+                                      item.feedbackType == 'suggestion'
+                                          ? '功能建议'
+                                          : '问题反馈',
+                                      style: TextStyle(
+                                        color: Theme.of(
+                                          context,
+                                        ).colorScheme.primary,
+                                        fontWeight: FontWeight.w700,
+                                      ),
                                     ),
-                                  ),
-                                  const Spacer(),
-                                  Text(
-                                    _status(item.status),
-                                    style: TextStyle(
+                                    const Spacer(),
+                                    Text(
+                                      _status(item.status),
+                                      style: TextStyle(
+                                        color: Theme.of(
+                                          context,
+                                        ).colorScheme.onSurfaceVariant,
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                                const SizedBox(height: 8),
+                                Text(
+                                  item.content,
+                                  style: const TextStyle(height: 1.5),
+                                ),
+                                if (item.adminReply.isNotEmpty) ...[
+                                  const SizedBox(height: 10),
+                                  Container(
+                                    width: double.infinity,
+                                    padding: const EdgeInsets.all(10),
+                                    decoration: BoxDecoration(
                                       color: Theme.of(
                                         context,
-                                      ).colorScheme.onSurfaceVariant,
+                                      ).colorScheme.primaryContainer,
+                                      borderRadius: BorderRadius.circular(10),
+                                    ),
+                                    child: Text(
+                                      '管理员回复：${item.adminReply}',
+                                      style: TextStyle(
+                                        color: Theme.of(
+                                          context,
+                                        ).colorScheme.onPrimaryContainer,
+                                      ),
                                     ),
                                   ),
                                 ],
-                              ),
-                              const SizedBox(height: 8),
-                              Text(
-                                item.content,
-                                style: const TextStyle(height: 1.5),
-                              ),
-                              if (item.adminReply.isNotEmpty) ...[
-                                const SizedBox(height: 10),
-                                Container(
-                                  width: double.infinity,
-                                  padding: const EdgeInsets.all(10),
-                                  decoration: BoxDecoration(
-                                    color: Theme.of(context)
-                                        .colorScheme
-                                        .primaryContainer,
-                                    borderRadius: BorderRadius.circular(10),
-                                  ),
-                                  child: Text(
-                                    '管理员回复：${item.adminReply}',
-                                    style: TextStyle(
-                                      color: Theme.of(context)
-                                          .colorScheme
-                                          .onPrimaryContainer,
+                                if (item.resolveNote.isNotEmpty) ...[
+                                  const SizedBox(height: 10),
+                                  Container(
+                                    width: double.infinity,
+                                    padding: const EdgeInsets.all(10),
+                                    decoration: BoxDecoration(
+                                      color: Theme.of(
+                                        context,
+                                      ).colorScheme.surfaceContainerHighest,
+                                      borderRadius: BorderRadius.circular(10),
+                                    ),
+                                    child: Text(
+                                      '处理说明（${item.assignee.isEmpty ? '管理员' : item.assignee}）：${item.resolveNote}',
                                     ),
                                   ),
-                                ),
-                              ],
-                              if (item.resolveNote.isNotEmpty) ...[
-                                const SizedBox(height: 10),
-                                Container(
-                                  width: double.infinity,
-                                  padding: const EdgeInsets.all(10),
-                                  decoration: BoxDecoration(
-                                    color: Theme.of(
-                                      context,
-                                    ).colorScheme.surfaceContainerHighest,
-                                    borderRadius: BorderRadius.circular(10),
-                                  ),
-                                  child: Text(
-                                    '处理说明（${item.assignee.isEmpty ? '管理员' : item.assignee}）：${item.resolveNote}',
-                                  ),
-                                ),
-                              ],
-                              if (item.status == 'rejected' && item.rejectReason.isNotEmpty) ...[
-                                const SizedBox(height: 10),
-                                Container(
-                                  width: double.infinity,
-                                  padding: const EdgeInsets.all(10),
-                                  decoration: BoxDecoration(
-                                    color: Theme.of(context)
-                                        .colorScheme
-                                        .errorContainer,
-                                    borderRadius: BorderRadius.circular(10),
-                                  ),
-                                  child: Text(
-                                    '拒绝原因：${item.rejectReason}',
-                                    style: TextStyle(
-                                      color: Theme.of(context)
-                                          .colorScheme
-                                          .onErrorContainer,
+                                ],
+                                if (item.status == 'rejected' &&
+                                    item.rejectReason.isNotEmpty) ...[
+                                  const SizedBox(height: 10),
+                                  Container(
+                                    width: double.infinity,
+                                    padding: const EdgeInsets.all(10),
+                                    decoration: BoxDecoration(
+                                      color: Theme.of(
+                                        context,
+                                      ).colorScheme.errorContainer,
+                                      borderRadius: BorderRadius.circular(10),
+                                    ),
+                                    child: Text(
+                                      '拒绝原因：${item.rejectReason}',
+                                      style: TextStyle(
+                                        color: Theme.of(
+                                          context,
+                                        ).colorScheme.onErrorContainer,
+                                      ),
                                     ),
                                   ),
-                                ),
-                              ],
-                              if (images.isNotEmpty) ...[
-                                const SizedBox(height: 10),
-                                SizedBox(
-                                  height: 64,
-                                  child: ListView.separated(
-                                    scrollDirection: Axis.horizontal,
-                                    itemCount: images.length,
-                                    separatorBuilder: (_, _) =>
-                                        const SizedBox(width: 8),
-                                    itemBuilder: (_, imageIndex) =>
-                                        GestureDetector(
-                                          onTap: () => _showImages(images),
-                                          child: ClipRRect(
-                                            borderRadius: BorderRadius.circular(
-                                              8,
-                                            ),
-                                            child: Image.network(
-                                              images[imageIndex],
-                                              width: 64,
-                                              height: 64,
-                                              fit: BoxFit.cover,
+                                ],
+                                if (images.isNotEmpty) ...[
+                                  const SizedBox(height: 10),
+                                  SizedBox(
+                                    height: 64,
+                                    child: ListView.separated(
+                                      scrollDirection: Axis.horizontal,
+                                      itemCount: images.length,
+                                      separatorBuilder: (_, _) =>
+                                          const SizedBox(width: 8),
+                                      itemBuilder: (_, imageIndex) =>
+                                          GestureDetector(
+                                            onTap: () => _showImages(images),
+                                            child: ClipRRect(
+                                              borderRadius:
+                                                  BorderRadius.circular(8),
+                                              child: Image.network(
+                                                images[imageIndex],
+                                                width: 64,
+                                                height: 64,
+                                                fit: BoxFit.cover,
+                                              ),
                                             ),
                                           ),
-                                        ),
+                                    ),
+                                  ),
+                                ],
+                                const SizedBox(height: 8),
+                                Text(
+                                  item.createdAt,
+                                  style: TextStyle(
+                                    fontSize: 11,
+                                    color: Theme.of(
+                                      context,
+                                    ).colorScheme.onSurfaceVariant,
                                   ),
                                 ),
                               ],
-                              const SizedBox(height: 8),
-                              Text(
-                                item.createdAt,
-                                style: TextStyle(
-                                  fontSize: 11,
-                                  color: Theme.of(
-                                    context,
-                                  ).colorScheme.onSurfaceVariant,
-                                ),
-                              ),
-                            ],
-                          ),
+                            ),
                           ),
                         ),
                       );
@@ -670,7 +671,7 @@ class _MyFeedbackSheetState extends ConsumerState<_MyFeedbackSheet> {
 
   Future<void> _openDetail(UserFeedbackItem item) async {
     await Navigator.of(context).push(
-      MaterialPageRoute<void>(
+      XyAnimatedPageRoute<void>(
         builder: (_) => _FeedbackDetailPage(item: item),
       ),
     );
@@ -753,7 +754,10 @@ class _FeedbackDetailPage extends StatelessWidget {
             children: [
               Text(
                 item.feedbackType == 'suggestion' ? '功能建议' : '问题反馈',
-                style: TextStyle(color: scheme.primary, fontWeight: FontWeight.w700),
+                style: TextStyle(
+                  color: scheme.primary,
+                  fontWeight: FontWeight.w700,
+                ),
               ),
               const Spacer(),
               Chip(label: Text(_status(item.status))),
@@ -766,7 +770,10 @@ class _FeedbackDetailPage extends StatelessWidget {
           _section(
             context,
             '反馈内容',
-            Text(item.content.isEmpty ? '无内容' : item.content, style: const TextStyle(height: 1.6)),
+            Text(
+              item.content.isEmpty ? '无内容' : item.content,
+              style: const TextStyle(height: 1.6),
+            ),
           ),
           _section(
             context,
@@ -775,7 +782,8 @@ class _FeedbackDetailPage extends StatelessWidget {
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 Text('提交时间：${_time(item.createdAt)}'),
-                if (item.updatedAt.isNotEmpty && item.updatedAt != item.createdAt)
+                if (item.updatedAt.isNotEmpty &&
+                    item.updatedAt != item.createdAt)
                   Text('更新时间：${_time(item.updatedAt)}'),
                 if (item.repliedAt.isNotEmpty)
                   Text('回复时间：${_time(item.repliedAt)}'),
@@ -796,7 +804,12 @@ class _FeedbackDetailPage extends StatelessWidget {
                     onTap: () => _showImages(context, images),
                     child: ClipRRect(
                       borderRadius: BorderRadius.circular(9),
-                      child: Image.network(images[index], width: 76, height: 76, fit: BoxFit.cover),
+                      child: Image.network(
+                        images[index],
+                        width: 76,
+                        height: 76,
+                        fit: BoxFit.cover,
+                      ),
                     ),
                   ),
                 ),
@@ -806,10 +819,9 @@ class _FeedbackDetailPage extends StatelessWidget {
             _section(
               context,
               '日志附件',
-              Text('${[
-                if (item.hasErrorLogs) '错误日志',
-                if (item.hasAllLogs) '完整日志',
-              ].join('、')}已随反馈上传'),
+              Text(
+                '${[if (item.hasErrorLogs) '错误日志', if (item.hasAllLogs) '完整日志'].join('、')}已随反馈上传',
+              ),
             ),
           if (item.adminReply.isNotEmpty)
             _section(
@@ -822,18 +834,28 @@ class _FeedbackDetailPage extends StatelessWidget {
                   const SizedBox(height: 8),
                   Text(
                     '回复时间：${_time(item.repliedAt)}',
-                    style: TextStyle(fontSize: 12, color: scheme.onSurfaceVariant),
+                    style: TextStyle(
+                      fontSize: 12,
+                      color: scheme.onSurfaceVariant,
+                    ),
                   ),
                 ],
               ),
             ),
           if (item.resolveNote.isNotEmpty)
-            _section(context, '处理说明', Text(item.resolveNote, style: const TextStyle(height: 1.6))),
+            _section(
+              context,
+              '处理说明',
+              Text(item.resolveNote, style: const TextStyle(height: 1.6)),
+            ),
           if (item.rejectReason.isNotEmpty)
             _section(
               context,
               '拒绝原因',
-              Text(item.rejectReason, style: TextStyle(height: 1.6, color: scheme.error)),
+              Text(
+                item.rejectReason,
+                style: TextStyle(height: 1.6, color: scheme.error),
+              ),
             ),
         ],
       ),

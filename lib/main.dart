@@ -44,6 +44,11 @@ Future<void> main() async {
           androidNotificationIcon: 'drawable/ic_stat_xy_music',
           androidNotificationOngoing: true,
           androidStopForegroundOnPause: false,
+          // MediaSession 会经 Binder 传递封面位图。512x512 的 ARGB 位图
+          // 已接近 1MB 事务上限，部分 ROM 会连同整张媒体卡片一起丢弃。
+          // 256x256 足够通知栏/锁屏展示，同时保留充足的事务余量。
+          artDownscaleWidth: 256,
+          artDownscaleHeight: 256,
         );
         final audioSession = await AudioSession.instance;
         await audioSession.configure(const AudioSessionConfiguration.music());
@@ -53,6 +58,15 @@ Future<void> main() async {
         debugPrintStack(stackTrace: stackTrace);
       }
     }
-    runApp(AppErrorBoundary(child: const ProviderScope(child: XyMusicApp())));
+    // 自定义背景必须在第一帧之前加载。否则设置 Provider 完成异步读取前，
+    // 页面会短暂使用默认底色，表现为每次恢复或切页时闪一下。
+    final startupBackground = await loadXyStartupBackground();
+    runApp(
+      AppErrorBoundary(
+        child: ProviderScope(
+          child: XyMusicApp(startupBackground: startupBackground),
+        ),
+      ),
+    );
   });
 }

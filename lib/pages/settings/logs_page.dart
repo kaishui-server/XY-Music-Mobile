@@ -66,6 +66,35 @@ class _LogsPageState extends State<LogsPage> {
     await _store.setWarningOnly(value);
   }
 
+  Future<void> _clearLogs() async {
+    if (_store.entries.isEmpty) {
+      XyNotice.show(context, message: '当前没有可清空的日志');
+      return;
+    }
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('清空日志？'),
+        content: const Text('将删除本机保存的全部日志，删除后无法恢复。'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext, false),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(dialogContext, true),
+            child: const Text('清空'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true) return;
+    await _store.clear();
+    if (!mounted) return;
+    setState(() {});
+    XyNotice.show(context, message: '日志已清空');
+  }
+
   Future<void> _export({required bool errorsOnly}) async {
     if (_exporting) return;
     final entries = _query(errorsOnly: errorsOnly);
@@ -163,6 +192,20 @@ class _LogsPageState extends State<LogsPage> {
                         onChanged: _setWarningOnly,
                       ),
                     ],
+                  ),
+                ),
+                const SizedBox(height: 20),
+                _sectionTitle(context, '日志管理'),
+                Card(
+                  child: ListTile(
+                    leading: Icon(
+                      Icons.delete_sweep_outlined,
+                      color: Theme.of(context).colorScheme.error,
+                    ),
+                    title: const Text('一键清空日志'),
+                    subtitle: const Text('删除本机保存的全部日志，操作不可恢复'),
+                    trailing: const Icon(Icons.chevron_right_rounded),
+                    onTap: _clearLogs,
                   ),
                 ),
                 const SizedBox(height: 20),

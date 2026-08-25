@@ -15,6 +15,10 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK"/>
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION"/>
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+    <!-- 桌面歌词悬浮窗 -->
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW"/>
+    <!-- 从后台下载并打开 APK 安装程序 -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES"/>
     <application
         android:label="XY Music"
         android:name="${applicationName}"
@@ -42,6 +46,15 @@
                 <category android:name="android.intent.category.LAUNCHER"/>
             </intent-filter>
         </activity>
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
         <!-- Don't delete the meta-data below.
              This is used by the Flutter tool to generate GeneratedPluginRegistrant.java -->
         <meta-data
@@ -59,6 +72,9 @@
         <service
             android:name=".SystemAudioCaptureService"
             android:foregroundServiceType="mediaProjection"
+            android:exported="false"/>
+        <service
+            android:name=".DesktopLyricsService"
             android:exported="false"/>
         <receiver
             android:name="com.ryanheise.audioservice.MediaButtonReceiver"

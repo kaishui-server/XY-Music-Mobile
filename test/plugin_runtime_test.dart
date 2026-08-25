@@ -10,6 +10,44 @@ import 'package:xy_music/src/plugins/plugin_runtime.dart';
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
 
+  test('Bilibili 歌手搜索将用户结果映射为歌手并支持 data.result', () async {
+    final source = r'''
+      module.exports = {
+        platform: '哔哩哔哩',
+        search: async (query, page, type) => ({
+          data: {
+            result: type === 'artist' ? [{
+              mid: 12345,
+              uname: query,
+              upic: 'https://example.com/avatar.jpg',
+              usign: 'B站用户简介',
+              videos: 8,
+            }] : [],
+          },
+        }),
+      };
+    ''';
+    final service = PluginRuntimeService(
+      httpClient: MockClient((_) async => http.Response('', 200)),
+      pluginSources: {'bilibili': source},
+    );
+    addTearDown(() {
+      service.dispose();
+      service.httpClient?.close();
+    });
+
+    final result = await service.searchArtists(
+      const EnabledMusicPlugin(id: 'bilibili', name: '哔哩哔哩', path: ''),
+      '测试用户',
+    );
+
+    expect(result, hasLength(1));
+    expect(result.single.id, '12345');
+    expect(result.single.title, '测试用户');
+    expect(result.single.subtitle, 'B站用户简介');
+    expect(result.single.coverUrl, 'https://example.com/avatar.jpg');
+  });
+
   test('MusicFree 插件可以异步搜索并返回标准歌曲', () async {
     final directory = await Directory.systemTemp.createTemp(
       'xianyu-plugin-runtime-',

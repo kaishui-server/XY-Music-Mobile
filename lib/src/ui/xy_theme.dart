@@ -23,6 +23,19 @@ abstract final class XyRadii {
   static const extraLarge = 24.0;
 }
 
+class _XyNoPageTransitionsBuilder extends PageTransitionsBuilder {
+  const _XyNoPageTransitionsBuilder();
+
+  @override
+  Widget buildTransitions<T>(
+    PageRoute<T> route,
+    BuildContext context,
+    Animation<double> animation,
+    Animation<double> secondaryAnimation,
+    Widget child,
+  ) => child;
+}
+
 SystemUiOverlayStyle xySystemUiOverlayStyle(Brightness brightness) {
   final dark = brightness == Brightness.dark;
   return SystemUiOverlayStyle(
@@ -76,7 +89,21 @@ ThemeData buildXyTheme({
   final base = ThemeData(
     brightness: brightness,
     colorScheme: scheme,
-    scaffoldBackgroundColor: background,
+    // 由应用级 XyAppBackground 绘制纯色或用户自定义背景，页面 Scaffold
+    // 保持透明后才能让背景图贯穿所有移动端页面。
+    scaffoldBackgroundColor: Colors.transparent,
+    // 页面背景由 Navigator 外侧的常驻背景层负责。禁用整页路由动画，避免
+    // 退场页面的默认 Material 底色在 200~300ms 内覆盖自定义背景。
+    pageTransitionsTheme: const PageTransitionsTheme(
+      builders: {
+        TargetPlatform.android: _XyNoPageTransitionsBuilder(),
+        TargetPlatform.iOS: _XyNoPageTransitionsBuilder(),
+        TargetPlatform.macOS: _XyNoPageTransitionsBuilder(),
+        TargetPlatform.windows: _XyNoPageTransitionsBuilder(),
+        TargetPlatform.linux: _XyNoPageTransitionsBuilder(),
+        TargetPlatform.fuchsia: _XyNoPageTransitionsBuilder(),
+      },
+    ),
     useMaterial3: true,
   );
 

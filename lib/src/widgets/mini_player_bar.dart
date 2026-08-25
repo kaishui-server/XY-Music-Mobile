@@ -1,8 +1,12 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
+import 'package:video_player/video_player.dart';
 
 import '../player/player_provider.dart';
+import '../player/video_playback_session.dart';
 import '../ui/xy_theme.dart';
 import 'cover_image.dart';
 
@@ -30,8 +34,56 @@ class MiniPlayerBar extends ConsumerWidget {
     final current = player.current;
     if (current == null) return const SizedBox.shrink();
 
+    // 视频播放时音频播放器会暂停，视频控制器自己提供进度和播放状态。
+    // revision 负责在视频控制器创建/销毁时让首页底栏重新绑定。
+    return ValueListenableBuilder<int>(
+      valueListenable: VideoPlaybackSession.revision,
+      builder: (context, _, child) {
+        final video = VideoPlaybackSession.isFor(current.path)
+            ? VideoPlaybackSession.controller
+            : null;
+        if (video == null) {
+          return _buildBar(context, ref, player, current);
+        }
+        return ValueListenableBuilder<VideoPlayerValue>(
+          valueListenable: video,
+          builder: (context, value, child) => _buildBar(
+            context,
+            ref,
+            player,
+            current,
+            video: video,
+            videoValue: value,
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _buildBar(
+    BuildContext context,
+    WidgetRef ref,
+    ({QueueItem? current, bool isPlaying, bool isLoading, String? errorMessage})
+    player,
+    QueueItem current, {
+    VideoPlayerController? video,
+    VideoPlayerValue? videoValue,
+  }) {
     final theme = Theme.of(context);
     final dark = theme.brightness == Brightness.dark;
+    final videoLoading =
+        VideoPlaybackSession.isFor(current.path) &&
+        VideoPlaybackSession.loading &&
+        video == null;
+    final isPlaying = videoValue?.isPlaying ?? player.isPlaying;
+    final isLoading = videoLoading || (video == null && player.isLoading);
+    final position = videoValue == null
+        ? ref.read(playerProvider).position
+        : videoValue.position.inMilliseconds / 1000.0;
+    final duration = videoValue == null
+        ? ref.read(playerProvider).duration
+        : videoValue.duration.inMilliseconds / 1000.0;
+
     return GestureDetector(
       onTap: () => context.push('/player'),
       onVerticalDragEnd: (details) {
@@ -39,8 +91,6 @@ class MiniPlayerBar extends ConsumerWidget {
       },
       child: ClipRRect(
         borderRadius: BorderRadius.circular(XyRadii.large),
-        // 不使用实时 BackdropFilter；播放器进度高频更新时，旧设备的 GPU
-        // 可能持续重采样整块底栏并发生原生崩溃。
         child: Container(
           height: 64,
           decoration: BoxDecoration(
@@ -110,29 +160,47 @@ class MiniPlayerBar extends ConsumerWidget {
                   ),
                   _PlayerButton(
                     primary: true,
-                    icon: player.isLoading
+                    icon: isLoading
                         ? Icons.hourglass_top_rounded
-                        : player.isPlaying
+                        : isPlaying
                         ? Icons.pause_rounded
                         : Icons.play_arrow_rounded,
-                    label: player.isLoading
+                    label: isLoading
                         ? '加载中'
-                        : player.isPlaying
+                        : isPlaying
                         ? '暂停'
                         : '播放',
-                    onTap: () => ref.read(playerProvider.notifier).toggle(),
+                    onTap: isLoading
+                        ? () {}
+                        : video != null
+                        ? () {
+                            if (video.value.isPlaying) {
+                              unawaited(video.pause());
+                            } else {
+                              unawaited(video.play());
+                            }
+                          }
+                        : () => ref.read(playerProvider.notifier).toggle(),
                   ),
                   _PlayerButton(
                     icon: Icons.skip_next_rounded,
                     label: '下一首',
-                    onTap: () => ref.read(playerProvider.notifier).next(),
+                    onTap: () {
+                      if (video != null) {
+                        unawaited(VideoPlaybackSession.stopForTrackAction());
+                      }
+                      unawaited(ref.read(playerProvider.notifier).next());
+                    },
                   ),
                   const SizedBox(width: 3),
                 ],
               ),
-              const Align(
+              Align(
                 alignment: Alignment.bottomLeft,
-                child: _MiniPlayerProgress(),
+                child: _MiniPlayerProgress(
+                  position: position,
+                  duration: duration,
+                ),
               ),
             ],
           ),
@@ -142,17 +210,15 @@ class MiniPlayerBar extends ConsumerWidget {
   }
 }
 
-class _MiniPlayerProgress extends ConsumerWidget {
-  const _MiniPlayerProgress();
+class _MiniPlayerProgress extends StatelessWidget {
+  const _MiniPlayerProgress({required this.position, required this.duration});
+
+  final double position;
+  final double duration;
 
   @override
-  Widget build(BuildContext context, WidgetRef ref) {
-    final timing = ref.watch(
-      playerProvider.select(
-        (state) => (position: state.position, duration: state.duration),
-      ),
-    );
-    final progress = safeMiniPlayerProgress(timing.position, timing.duration);
+  Widget build(BuildContext context) {
+    final progress = safeMiniPlayerProgress(position, duration);
     return FractionallySizedBox(
       widthFactor: progress,
       child: Container(

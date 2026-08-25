@@ -170,6 +170,19 @@ class AppLogStore {
     await preferences.setBool(_warningOnlyKey, value);
   }
 
+  /// 清空本地日志并同步删除持久化快照。
+  Future<void> clear() async {
+    _persistTimer?.cancel();
+    _persistTimer = null;
+    _entries.clear();
+    try {
+      final preferences = await SharedPreferences.getInstance();
+      await preferences.remove(_entriesKey);
+    } catch (_) {
+      // 本地存储失败不应阻止页面立即显示为空；下次写入时会重新创建。
+    }
+  }
+
   List<AppLogEntry> query({Duration? since, bool errorsOnly = false}) {
     final threshold = since == null ? null : DateTime.now().subtract(since);
     return _entries

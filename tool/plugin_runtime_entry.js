@@ -5,6 +5,7 @@ import dayjs from 'dayjs';
 import he from 'he';
 import qs from 'qs';
 import bigInteger from 'big-integer';
+import * as pakoModule from 'pako';
 import { Buffer } from 'buffer';
 
 const nativeBodyMarker = '__XY_HTTP_BODY_BASE64__';
@@ -148,6 +149,9 @@ const packages = {
   he,
   qs,
   'big-integer': bigInteger,
+  // 酷狗等插件使用 pako 解压接口返回的压缩数据，保持与桌面端
+  // require('pako') 的对象形态一致（包含 inflate/ungzip 等方法）。
+  pako: unwrap(pakoModule, 'inflate'),
   buffer: { Buffer },
 };
 

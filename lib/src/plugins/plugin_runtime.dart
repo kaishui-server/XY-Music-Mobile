@@ -100,6 +100,22 @@ class PluginMediaSource {
   final String lyrics;
 }
 
+/// Bilibili 视频流地址。DASH 视频通常需要 Referer 才能在 Android 播放器中
+/// 正常打开，因此地址和请求头一起返回给详情页。
+class PluginVideoSource {
+  const PluginVideoSource({
+    required this.url,
+    this.backupUrls = const [],
+    this.headers = const {},
+    this.mimeType = 'video/mp4',
+  });
+
+  final String url;
+  final List<String> backupUrls;
+  final Map<String, String> headers;
+  final String mimeType;
+}
+
 String pluginSongPath(EnabledMusicPlugin plugin, PluginSearchSong song) {
   final explicit = song.rawData['_sourcePath']?.toString().trim() ?? '';
   if (explicit.isNotEmpty) return explicit;
@@ -208,6 +224,8 @@ class PluginRuntimeService {
   final Map<String, String> pluginSources;
   JavascriptRuntime? _runtime;
   Future<void>? _initializing;
+  int _activeRuntimeOperations = 0;
+  bool _disposeRequested = false;
   Future<String>? _runtimeBootstrapTask;
   final Set<String> _loaded = {};
   final Map<String, Future<void>> _loadTasks = {};
@@ -280,23 +298,37 @@ class PluginRuntimeService {
     String method,
     List<dynamic> args,
   ) async {
-    await _ensurePlugin(plugin);
-    final expression =
-        '__xyCallMusicFreePlugin('
-        '${jsonEncode(plugin.id)},${jsonEncode(method)},${jsonEncode(jsonEncode(args))})';
-    final promise = _runtime!.evaluate(expression);
-    if (promise.isError) throw Exception(_friendlyError(promise.stringResult));
-    final result = await _runtime!.handlePromise(
-      promise,
-      timeout: const Duration(seconds: 30),
-    );
-    if (result.isError) throw Exception(_friendlyError(result.stringResult));
-    final decoded = _decodeResult(result.stringResult);
-    if (decoded is! Map) throw Exception('插件返回格式无效');
-    if (decoded['ok'] != true) {
-      throw Exception(_friendlyError(decoded['error']?.toString() ?? '插件调用失败'));
+    _activeRuntimeOperations++;
+    try {
+      await _ensurePlugin(plugin);
+      final expression =
+          '__xyCallMusicFreePlugin('
+          '${jsonEncode(plugin.id)},${jsonEncode(method)},${jsonEncode(jsonEncode(args))})';
+      final promise = _runtime!.evaluate(expression);
+      if (promise.isError) {
+        throw Exception(_friendlyError(promise.stringResult));
+      }
+      final result = await _runtime!.handlePromise(
+        promise,
+        timeout: const Duration(seconds: 30),
+      );
+      if (result.isError) {
+        throw Exception(_friendlyError(result.stringResult));
+      }
+      final decoded = _decodeResult(result.stringResult);
+      if (decoded is! Map) throw Exception('插件返回格式无效');
+      if (decoded['ok'] != true) {
+        throw Exception(
+          _friendlyError(decoded['error']?.toString() ?? '插件调用失败'),
+        );
+      }
+      return decoded['data'];
+    } finally {
+      _activeRuntimeOperations--;
+      if (_activeRuntimeOperations == 0 && _disposeRequested) {
+        _disposeNow();
+      }
     }
-    return decoded['data'];
   }
 
   Future<dynamic> _runPluginOperation(
@@ -459,7 +491,27 @@ class PluginRuntimeService {
         artist: true,
       );
     }
-    final list = await _searchMusicFreeType(plugin, keyword, 'artist');
+    // Bilibili 的“歌手”实际上是 UP 主。不同版本的 B 站插件有的沿用
+    // MusicFree 的 artist 类型，有的则使用 user 类型；先走桌面端的
+    // artist 流程，返回空时再兼容 user，避免把 B 站用户误当成歌曲歌手。
+    List<Map<String, dynamic>> list;
+    Object? artistError;
+    try {
+      list = await _searchMusicFreeType(plugin, keyword, 'artist');
+    } catch (error) {
+      artistError = error;
+      list = const [];
+    }
+    if (list.isEmpty && _isBilibiliPlugin(plugin)) {
+      try {
+        list = await _searchMusicFreeType(plugin, keyword, 'user');
+      } catch (error) {
+        if (artistError != null) rethrow;
+      }
+    }
+    if (list.isEmpty && artistError != null) {
+      throw artistError;
+    }
     return list
         .map(
           (raw) => _toCatalogResult(
@@ -542,6 +594,9 @@ class PluginRuntimeService {
           'artist',
           'singer',
           'author',
+          'uname',
+          'nickname',
+          'username',
         ]) {
           final nested = valueText(value[key]);
           if (nested.isNotEmpty) return nested;
@@ -559,14 +614,49 @@ class PluginRuntimeService {
     }
 
     final title = artist
-        ? text(const ['name', 'title', 'artist', 'singer', 'artistName'])
+        ? text(const [
+            'name',
+            'title',
+            'artist',
+            'singer',
+            'artistName',
+            // Bilibili 用户搜索结果字段。
+            'uname',
+            'nickname',
+            'username',
+            'userName',
+            'author_name',
+            'authorName',
+            'ownerName',
+            'author',
+          ])
         : text(const ['title', 'name', 'album', 'albumName', 'album_name']);
     final subtitle = artist
-        ? text(const ['description', 'desc', 'albumCount', 'songCount'])
+        ? text(const [
+            'description',
+            'desc',
+            'usign',
+            'sign',
+            'albumCount',
+            'songCount',
+            'videoCount',
+            'videos',
+            'fans',
+          ])
         : text(const ['artist', 'singer', 'artistName', 'albumArtist']);
     final id = text(
       artist
-          ? const ['id', 'artistId', 'singerId', 'artist_id']
+          ? const [
+              'id',
+              'artistId',
+              'singerId',
+              'artist_id',
+              // Bilibili 用户主键及常见别名。
+              'mid',
+              'uid',
+              'userId',
+              'user_id',
+            ]
           : const ['id', 'albumId', 'album_id', 'albumMid', 'album_mid'],
     );
     return PluginCatalogResult(
@@ -749,8 +839,9 @@ class PluginRuntimeService {
   ) async {
     Object? lastError;
 
-    // 与桌面端一致：优先搜索歌单，这样可以保留真实歌单名称与封面。
-    for (final type in const ['sheet', 'playlist']) {
+    // 与电脑版一致：输入的是歌单名称、ID 或链接，先让 MusicFree 插件搜索，
+    // 这样能保留真实歌单名称、封面和插件自己的媒体字段。
+    for (final type in const ['sheet', 'playlist', 'album']) {
       try {
         final searched = await _callOnCurrentIsolate(plugin, 'search', [
           input,
@@ -760,33 +851,11 @@ class PluginRuntimeService {
         final sheets = _extractResultList(searched);
         if (sheets.isEmpty) continue;
         final sheet = _bestMatchingPlaylist(sheets, input);
-        final songs = <Map<String, dynamic>>[];
-        final seen = <String>{};
-        for (var page = 1; page <= 50; page++) {
-          dynamic detail;
-          try {
-            detail = await _callOnCurrentIsolate(plugin, 'getMusicSheetInfo', [
-              sheet,
-              page,
-            ]);
-          } catch (_) {
-            if (songs.isNotEmpty) break;
-            rethrow;
-          }
-          final pageSongs = _extractResultList(detail);
-          if (pageSongs.isEmpty) break;
-          var added = 0;
-          for (final song in pageSongs) {
-            final key = _songIdentity(song);
-            if (seen.add(key)) {
-              songs.add(song);
-              added++;
-            }
-          }
-          if (detail is Map && detail['isEnd'] == true) break;
-          // 防止未返回 isEnd 的插件每页重复返回同一批歌曲。
-          if (added == 0) break;
-        }
+        final songs = await _loadMusicFreePlaylistSongs(
+          plugin,
+          sheet,
+          kind: type == 'album' ? 'album' : 'sheet',
+        );
         if (songs.isNotEmpty) {
           return {
             'name': _playlistName(sheet, plugin.name),
@@ -799,12 +868,14 @@ class PluginRuntimeService {
       }
     }
 
-    // 纯 ID 导入的兼容路径，酷狗、B 站等插件通常只实现此接口。
+    // 收藏夹/纯 ID 导入兼容路径，B 站、酷狗等插件常只实现此接口。
     try {
       final imported = await _callOnCurrentIsolate(plugin, 'importMusicSheet', [
         input,
       ]);
-      final songs = _extractResultList(imported);
+      final songs = _extractResultList(
+        imported,
+      ).map((song) => _resetMediaItem(plugin, song)).toList();
       if (songs.isNotEmpty) {
         return {
           'name': '${plugin.name}歌单',
@@ -815,9 +886,117 @@ class PluginRuntimeService {
     } catch (error) {
       lastError = error;
     }
+
+    // 电脑版的最后一层回退：部分插件不能搜索歌单，但提供排行榜列表。
+    try {
+      final response = await _callOnCurrentIsolate(plugin, 'getTopLists', []);
+      final topLists = _extractTopListItems(response);
+      if (topLists.isNotEmpty) {
+        final sheet = _bestMatchingPlaylist(topLists, input);
+        final songs = await _loadMusicFreePlaylistSongs(
+          plugin,
+          sheet,
+          kind: 'top',
+        );
+        if (songs.isNotEmpty) {
+          return {
+            'name': _playlistName(sheet, plugin.name),
+            'coverUrl': _extractCover(sheet),
+            'songs': songs,
+          };
+        }
+      }
+    } catch (error) {
+      lastError = error;
+    }
     throw Exception(
       lastError == null ? '该插件不支持歌单导入' : _friendlyError(lastError.toString()),
     );
+  }
+
+  Future<List<Map<String, dynamic>>> _loadMusicFreePlaylistSongs(
+    EnabledMusicPlugin plugin,
+    Map<String, dynamic> sheet, {
+    required String kind,
+  }) async {
+    final method = switch (kind) {
+      'album' => 'getAlbumInfo',
+      'top' => 'getTopListDetail',
+      _ => 'getMusicSheetInfo',
+    };
+    final songs = <Map<String, dynamic>>[];
+    final seen = <String>{};
+    for (var page = 1; page <= 50; page++) {
+      dynamic detail;
+      try {
+        detail = await _callOnCurrentIsolate(plugin, method, [sheet, page]);
+      } catch (_) {
+        if (songs.isNotEmpty) break;
+        // 普通歌单详情不可用时，按电脑版逻辑用歌单标题搜索歌曲兜底。
+        if (kind == 'sheet' && page == 1) {
+          final title = _playlistName(sheet, '').trim();
+          if (title.isNotEmpty) {
+            final searched = await _callOnCurrentIsolate(plugin, 'search', [
+              title,
+              1,
+              'music',
+            ]);
+            return _extractResultList(
+              searched,
+            ).map((song) => _resetMediaItem(plugin, song)).toList();
+          }
+        }
+        rethrow;
+      }
+      final pageSongs = _extractResultList(detail);
+      if (pageSongs.isEmpty) {
+        if (songs.isEmpty && kind == 'sheet' && page == 1) {
+          final title = _playlistName(sheet, '').trim();
+          if (title.isNotEmpty) {
+            final searched = await _callOnCurrentIsolate(plugin, 'search', [
+              title,
+              1,
+              'music',
+            ]);
+            return _extractResultList(
+              searched,
+            ).map((song) => _resetMediaItem(plugin, song)).toList();
+          }
+        }
+        break;
+      }
+      var added = 0;
+      for (final raw in pageSongs) {
+        final song = _resetMediaItem(plugin, raw);
+        final key = _songIdentity(song);
+        if (seen.add(key)) {
+          songs.add(song);
+          added++;
+        }
+      }
+      if (detail is Map && detail['isEnd'] == true) break;
+      // MusicFree 通常每页 30 首；不足一页即视为结束。
+      if (pageSongs.length < 30 || added == 0) break;
+    }
+    return songs;
+  }
+
+  static List<Map<String, dynamic>> _extractTopListItems(dynamic value) {
+    final categories = value is List
+        ? value.whereType<Map>().map(Map<String, dynamic>.from)
+        : _extractResultList(value);
+    final result = <Map<String, dynamic>>[];
+    for (final category in categories) {
+      final nested = category['data'];
+      if (nested is List) {
+        for (final item in nested.whereType<Map>()) {
+          result.add(Map<String, dynamic>.from(item));
+        }
+      } else if (category['id'] != null || category['title'] != null) {
+        result.add(category);
+      }
+    }
+    return result;
   }
 
   static Map<String, dynamic> _bestMatchingPlaylist(
@@ -844,7 +1023,7 @@ class PluginRuntimeService {
           .trim();
       if (value?.isNotEmpty == true) return value!;
     }
-    return '$pluginName歌单';
+    return pluginName.trim().isEmpty ? '' : '$pluginName歌单';
   }
 
   static String _songIdentity(Map<String, dynamic> song) {
@@ -879,6 +1058,13 @@ class PluginRuntimeService {
         name.contains('netease') ||
         id == 'wy' ||
         id.contains('netease');
+  }
+
+  static bool _isBilibiliPlugin(EnabledMusicPlugin plugin) {
+    final value = '${plugin.id} ${plugin.name}'.toLowerCase();
+    return value.contains('bilibili') ||
+        value.contains('哔哩') ||
+        value.contains('b站');
   }
 
   static bool _looksLikeNeteaseTrack(Map<String, dynamic> raw) {
@@ -1148,6 +1334,74 @@ class PluginRuntimeService {
     );
   }
 
+  /// 获取 Bilibili 视频流。优先调用电脑版 MusicFree 插件提供的
+  /// `getMvSource` 扩展；旧版 B 站插件没有该方法时，按电脑版的备用流程
+  /// 通过 BV/AV 号查询 CID，再请求 playurl 接口。
+  Future<PluginVideoSource> resolveVideoSource(
+    EnabledMusicPlugin plugin,
+    Map<String, dynamic> rawData, {
+    String? videoQuality,
+    String? path,
+  }) async {
+    if (plugin.isLx) throw Exception('LX 插件不支持视频播放');
+    Object? pluginError;
+    try {
+      final response = _runsPluginsInBackground
+          ? await _runPluginOperation(plugin, 'resolveVideoSource', {
+              'rawData': rawData,
+              'videoQuality': videoQuality ?? '720P',
+            })
+          : await _callOnCurrentIsolate(plugin, 'getMvSource', [
+              _videoPluginItem(plugin, rawData),
+              videoQuality ?? '720P',
+            ]);
+      final source = _toVideoSource(response);
+      if (source != null) return source;
+    } catch (error) {
+      pluginError = error;
+    }
+
+    final fallback = await _resolveBilibiliVideoSource(
+      rawData,
+      path: path,
+      videoQuality: videoQuality,
+    );
+    if (fallback != null) return fallback;
+    final suffix = pluginError == null
+        ? ''
+        : '：${_friendlyError(pluginError.toString())}';
+    throw Exception('未能解析当前 Bilibili 视频$suffix');
+  }
+
+  Future<PluginVideoSource?> _resolveVideoSourceOnCurrentIsolate(
+    EnabledMusicPlugin plugin,
+    Map<String, dynamic> rawData, {
+    String? videoQuality,
+  }) async {
+    final response = await _callOnCurrentIsolate(plugin, 'getMvSource', [
+      _videoPluginItem(plugin, rawData),
+      videoQuality ?? '720P',
+    ]);
+    return _toVideoSource(response);
+  }
+
+  static Map<String, dynamic> _videoPluginItem(
+    EnabledMusicPlugin plugin,
+    Map<String, dynamic> rawData,
+  ) {
+    return <String, dynamic>{
+      ...rawData,
+      'id': rawData['id'] ?? rawData['bvid'] ?? rawData['aid'] ?? '',
+      'title': rawData['title'] ?? rawData['name'] ?? '',
+      'artist': rawData['artist'] ?? rawData['author'] ?? '',
+      'album': rawData['album'] ?? '',
+      'duration': rawData['duration'] ?? rawData['durationMs'] ?? 0,
+      'platform': plugin.name,
+      'pluginId': plugin.id,
+      'rawData': rawData,
+    };
+  }
+
   Future<PluginMediaSource> _resolveLxMediaSource(
     Map<String, dynamic> rawData, {
     String? preferredQuality,
@@ -1386,6 +1640,245 @@ class PluginRuntimeService {
     );
   }
 
+  static PluginVideoSource? _toVideoSource(dynamic value) {
+    if (value is String && _isHttpUrl(value.trim())) {
+      return PluginVideoSource(
+        url: value.trim(),
+        headers: const {
+          'Referer': 'https://www.bilibili.com/',
+          'Origin': 'https://www.bilibili.com',
+        },
+      );
+    }
+    if (value is! Map) return null;
+    final url =
+        (value['url'] ?? value['baseUrl'] ?? value['base_url'])
+            ?.toString()
+            .trim() ??
+        '';
+    if (!_isHttpUrl(url)) return null;
+    final headers = <String, String>{};
+    final rawHeaders = value['headers'];
+    if (rawHeaders is Map) {
+      for (final entry in rawHeaders.entries) {
+        headers[entry.key.toString()] = entry.value.toString();
+      }
+    }
+    headers.putIfAbsent('Referer', () => 'https://www.bilibili.com/');
+    headers.putIfAbsent('Origin', () => 'https://www.bilibili.com');
+    final backups = <String>[];
+    for (final key in const [
+      'backupUrls',
+      'backup_urls',
+      'backupUrl',
+      'backup_url',
+    ]) {
+      final raw = value[key];
+      if (raw is Iterable) {
+        backups.addAll(
+          raw
+              .map((item) => item.toString().trim())
+              .where((item) => _isHttpUrl(item)),
+        );
+      } else if (raw is String && _isHttpUrl(raw.trim())) {
+        backups.add(raw.trim());
+      }
+    }
+    return PluginVideoSource(
+      url: url,
+      backupUrls: backups,
+      headers: headers,
+      mimeType: value['mimeType']?.toString().trim().isNotEmpty == true
+          ? value['mimeType'].toString().trim()
+          : 'video/mp4',
+    );
+  }
+
+  Future<PluginVideoSource?> _resolveBilibiliVideoSource(
+    Map<String, dynamic> rawData, {
+    String? path,
+    String? videoQuality,
+  }) async {
+    final identity = _extractBilibiliIdentity(rawData, path: path);
+    if (identity.bvid.isEmpty && identity.aid.isEmpty) return null;
+    final identityQuery = identity.bvid.isNotEmpty
+        ? {'bvid': identity.bvid}
+        : {'aid': identity.aid};
+    final headers = const {
+      'User-Agent':
+          'Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 '
+          '(KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36',
+      'Referer': 'https://www.bilibili.com/',
+      'Origin': 'https://www.bilibili.com',
+    };
+
+    var cid = identity.cid;
+    if (cid.isEmpty) {
+      final view = await _rawGet(
+        Uri.https('api.bilibili.com', '/x/web-interface/view', identityQuery),
+        headers: headers,
+      );
+      final data = _parseBilibiliResponse(view, 'Bilibili 视频信息解析');
+      cid =
+          (data['cid'] ??
+                  (data['pages'] is List && data['pages'].isNotEmpty
+                      ? data['pages'][0]['cid']
+                      : null))
+              ?.toString()
+              .trim() ??
+          '';
+    }
+    if (cid.isEmpty) throw Exception('Bilibili 视频信息中缺少 CID');
+
+    final qn = _bilibiliQualityId(videoQuality);
+    final query = <String, String>{
+      ...identityQuery,
+      'cid': cid,
+      'qn': '$qn',
+      'fnval': '16',
+      'fourk': '1',
+    };
+    final play = await _rawGet(
+      Uri.https('api.bilibili.com', '/x/player/playurl', query),
+      headers: headers,
+    );
+    final data = _parseBilibiliResponse(play, 'Bilibili 视频流解析');
+    final dash = data['dash'];
+    final videos = dash is Map && dash['video'] is List
+        ? (dash['video'] as List).whereType<Map>().toList()
+        : const <Map>[];
+    bool hasVideoUrl(Map? candidate) =>
+        candidate?['baseUrl'] != null || candidate?['base_url'] != null;
+    bool isAvc(Map? candidate) =>
+        candidate?['codecs']?.toString().toLowerCase().startsWith('avc1') ==
+        true;
+    Map? selected;
+    final target = qn;
+    final sorted = [...videos]
+      ..sort((left, right) {
+        final codecOrder = (isAvc(right) ? 1 : 0).compareTo(
+          isAvc(left) ? 1 : 0,
+        );
+        if (codecOrder != 0) return codecOrder;
+        final leftId = (left['id'] as num?)?.toInt() ?? 0;
+        final rightId = (right['id'] as num?)?.toInt() ?? 0;
+        return rightId.compareTo(leftId);
+      });
+    selected = videos.cast<Map?>().firstWhere(
+      (candidate) =>
+          (candidate?['id'] as num?)?.toInt() == target &&
+          hasVideoUrl(candidate),
+      orElse: () => null,
+    );
+    selected ??= sorted.cast<Map?>().firstWhere(
+      (candidate) =>
+          ((candidate?['id'] as num?)?.toInt() ?? 0) <= target &&
+          hasVideoUrl(candidate),
+      orElse: () => null,
+    );
+    selected ??= sorted.isEmpty ? null : sorted.first;
+    final direct =
+        (selected?['baseUrl'] ??
+                selected?['base_url'] ??
+                (data['durl'] is List && (data['durl'] as List).isNotEmpty
+                    ? (data['durl'] as List).first['url']
+                    : null))
+            ?.toString()
+            .trim() ??
+        '';
+    if (!_isHttpUrl(direct)) return null;
+    final backups = <String>[];
+    final backup = selected?['backupUrl'] ?? selected?['backup_url'];
+    if (backup is Iterable) {
+      backups.addAll(
+        backup
+            .map((item) => item.toString().trim())
+            .where((item) => _isHttpUrl(item)),
+      );
+    }
+    return PluginVideoSource(
+      url: direct,
+      backupUrls: backups,
+      headers: headers,
+      mimeType: selected?['mimeType']?.toString().trim().isNotEmpty == true
+          ? selected!['mimeType'].toString().trim()
+          : 'video/mp4',
+    );
+  }
+
+  static Map<String, dynamic> _parseBilibiliResponse(
+    http.Response response,
+    String label,
+  ) {
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw Exception('$label失败：HTTP ${response.statusCode}');
+    }
+    final decoded = jsonDecode(
+      utf8.decode(response.bodyBytes, allowMalformed: true),
+    );
+    if (decoded is! Map || decoded['data'] is! Map) {
+      throw Exception('$label返回了无效数据');
+    }
+    if (decoded['code'] is num && decoded['code'] != 0) {
+      throw Exception(
+        '$label失败${decoded['message'] == null ? '' : '：${decoded['message']}'}',
+      );
+    }
+    return Map<String, dynamic>.from(decoded['data'] as Map);
+  }
+
+  static int _bilibiliQualityId(String? quality) {
+    final text = quality?.trim().toUpperCase() ?? '';
+    final match = RegExp(r'\d+').firstMatch(text);
+    final parsed = int.tryParse(match?.group(0) ?? '');
+    if (parsed == null) return 64;
+    const allowed = {6, 16, 32, 64, 74, 80, 112, 116, 120, 125, 126, 127};
+    return allowed.contains(parsed) ? parsed : 64;
+  }
+
+  static ({String bvid, String aid, String cid}) _extractBilibiliIdentity(
+    Map<String, dynamic> raw, {
+    String? path,
+  }) {
+    final values = <String>[];
+    for (final node in _nestedTrackNodes(raw)) {
+      for (final key in const ['bvid', 'bv', 'aid', 'id', 'videoId']) {
+        final value = node[key]?.toString().trim() ?? '';
+        if (value.isNotEmpty) values.add(value);
+      }
+    }
+    if (path != null && path.trim().isNotEmpty) {
+      values.add(Uri.decodeComponent(path.split('/').last));
+    }
+    final text = values.join(' ');
+    final bvid =
+        RegExp(
+          r'BV[0-9A-Za-z]{10,}',
+          caseSensitive: false,
+        ).firstMatch(text)?.group(0) ??
+        '';
+    final aid =
+        RegExp(
+          r'(?:^|\W)av?(\d+)(?:\W|$)',
+          caseSensitive: false,
+        ).firstMatch(text)?.group(1) ??
+        (bvid.isEmpty
+            ? values.firstWhere(
+                (value) => RegExp(r'^\d+$').hasMatch(value),
+                orElse: () => '',
+              )
+            : '');
+    var cid = '';
+    for (final node in _nestedTrackNodes(raw)) {
+      final value = node['cid']?.toString().trim() ?? '';
+      if (value.isNotEmpty) {
+        cid = value;
+        break;
+      }
+    }
+    return (bvid: bvid, aid: aid, cid: cid);
+  }
+
   static String _extractLyrics(dynamic value) {
     if (value is String) {
       final text = value.trim();
@@ -1560,6 +2053,14 @@ class PluginRuntimeService {
       'albumResults',
       'artistResult',
       'albumResult',
+      // Bilibili 用户搜索接口返回 data.result；部分插件直接暴露
+      // userList/users，不能只依赖 MusicFree 的 musicList 字段。
+      'result',
+      'userList',
+      'userlist',
+      'users',
+      'userResults',
+      'userResult',
       'resultList',
       'musicList',
       'musiclist',
@@ -1713,6 +2214,13 @@ class PluginRuntimeService {
       'avatar',
       'avatarUrl',
       'avatar_url',
+      // Bilibili 用户搜索结果常用 upic/face。
+      'upic',
+      'face',
+      'userFace',
+      'user_face',
+      'headUrl',
+      'head_url',
     ]) {
       final value = node[key];
       if (value is String) {
@@ -1811,9 +2319,16 @@ class PluginRuntimeService {
   }
 
   void dispose() {
+    _disposeRequested = true;
+    if (_activeRuntimeOperations > 0) return;
+    _disposeNow();
+  }
+
+  void _disposeNow() {
     _runtime?.dispose();
     _runtime = null;
     _initializing = null;
+    _disposeRequested = false;
     _loaded.clear();
     _pluginSourceTasks.clear();
     _neteaseTrackMetaCache.clear();
@@ -1908,6 +2423,25 @@ Future<String> _executePluginOperationInBackground(
           'url': source.url,
           'headers': source.headers,
           'lyrics': source.lyrics,
+        };
+        break;
+      case 'resolveVideoSource':
+        if (payload is! Map || payload['rawData'] is! Map) {
+          throw Exception('视频歌曲信息格式无效');
+        }
+        final payloadMap = Map<String, dynamic>.from(payload);
+        final rawData = Map<String, dynamic>.from(payloadMap['rawData'] as Map);
+        final source = await service._resolveVideoSourceOnCurrentIsolate(
+          plugin,
+          rawData,
+          videoQuality: payloadMap['videoQuality']?.toString(),
+        );
+        if (source == null) throw Exception('插件没有返回视频地址');
+        data = {
+          'url': source.url,
+          'backupUrls': source.backupUrls,
+          'headers': source.headers,
+          'mimeType': source.mimeType,
         };
         break;
       case 'getLyrics':

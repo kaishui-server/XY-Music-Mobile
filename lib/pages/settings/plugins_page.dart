@@ -386,7 +386,9 @@ final _pluginsProvider =
     );
 
 class PluginsPage extends ConsumerStatefulWidget {
-  const PluginsPage({super.key});
+  const PluginsPage({super.key, this.showSidebarButton = false});
+
+  final bool showSidebarButton;
 
   @override
   ConsumerState<PluginsPage> createState() => _PluginsPageState();
@@ -682,7 +684,9 @@ class _PluginsPageState extends ConsumerState<PluginsPage> {
     final plugins = ref.watch(_pluginsProvider);
     return Scaffold(
       appBar: AppBar(
-        leading: const AppSidebarMenuButton(),
+        leading: widget.showSidebarButton
+            ? const AppSidebarMenuButton()
+            : const BackButton(),
         title: const Text('插件管理'),
       ),
       body: XyPageBackground(

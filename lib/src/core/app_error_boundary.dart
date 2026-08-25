@@ -34,6 +34,14 @@ class AppErrorController {
     final previousFlutterError = FlutterError.onError;
     FlutterError.onError = (details) {
       previousFlutterError?.call(details);
+      if (_isRecoverableNetworkError(details.exception) ||
+          _isRecoverableLifecycleError(details.exception) ||
+          _isNonFatalFlutterError(details)) {
+        // Flutter 会把布局溢出、图片加载失败、异步请求超时等问题都
+        // 交给 onError，但这些问题通常只影响当前组件，不能替换整个应用。
+        debugPrint('忽略可恢复的局部错误：${details.exception}');
+        return;
+      }
       report(
         details.exception,
         stackTrace: details.stack,
@@ -44,6 +52,11 @@ class AppErrorController {
     final previousPlatformError = PlatformDispatcher.instance.onError;
     PlatformDispatcher.instance.onError = (error, stack) {
       previousPlatformError?.call(error, stack);
+      if (_isRecoverableNetworkError(error) ||
+          _isRecoverableLifecycleError(error)) {
+        debugPrint('忽略可恢复的音频网络错误：$error');
+        return true;
+      }
       report(error, stackTrace: stack, source: '异步运行时错误');
       // 已经展示错误页，告诉 Flutter 不要再让未处理异常结束应用。
       return true;
@@ -65,6 +78,63 @@ class AppErrorController {
   }
 
   void clear() => current.value = null;
+
+  /// 临时音源失效或网络超时只影响当前歌曲，不能替换整个应用界面。
+  ///
+  /// 这里不能按域名白名单判断。插件来源很多，QQ 音乐、酷狗、B 站等
+  /// 返回的音源地址都可能变化；只要是底层网络连接失败，就应该交给
+  /// 播放器/搜索页处理，而不是把整个应用替换成错误页。
+  static bool _isRecoverableNetworkError(Object error) {
+    final text = error.toString().toLowerCase();
+    return text.contains('socketexception') ||
+        text.contains('socketconnection') ||
+        text.contains('clientexception') ||
+        text.contains('httpexception') ||
+        text.contains('handshakeexception') ||
+        text.contains('failed host lookup') ||
+        text.contains('connection timed out') ||
+        text.contains('connection closed') ||
+        text.contains('connection reset') ||
+        text.contains('connection refused') ||
+        text.contains('network is unreachable') ||
+        text.contains('broken pipe') ||
+        text.contains('timed out') ||
+        text.contains('errno = 110') ||
+        text.contains('errno = 111') ||
+        text.contains('playerexception') ||
+        text.contains('source error') ||
+        text.contains('missingpluginexception');
+  }
+
+  /// 页面或原生资源销毁时，仍在完成的异步回调可能晚到一帧。它们不应
+  /// 替换整个应用页面；对应的播放器/插件服务会在回调结束后自行收尾。
+  static bool _isRecoverableLifecycleError(Object error) {
+    final text = error.toString().toLowerCase();
+    return text.contains('cannot use "ref" after the widget was disposed') ||
+        text.contains("cannot use 'ref' after the widget was disposed") ||
+        text.contains('cannot use ref after the widget was disposed') ||
+        text.contains('a dart object attempted to access a native peer') ||
+        text.contains('native peer has been collected') ||
+        text.contains('native resources have already been disposed') ||
+        text.contains('native peer is null');
+  }
+
+  /// 这些是 Flutter 的诊断性错误，框架可以继续绘制后续页面。
+  /// 记录日志即可，不能因此触发全屏保护页。
+  static bool _isNonFatalFlutterError(FlutterErrorDetails details) {
+    final text = details.exception.toString().toLowerCase();
+    return text.contains('renderflex overflowed') ||
+        text.contains('renderbox was not laid out') ||
+        text.contains('setstate() called after dispose') ||
+        text.contains('setstate() or markneedsbuild() called during build') ||
+        text.contains('_dependents.isempty') ||
+        text.contains('tried to build dirty widget in the wrong build scope') ||
+        text.contains('mouse tracker') ||
+        text.contains('semantics node') ||
+        text.contains('unable to load asset') ||
+        text.contains('image provider') ||
+        text.contains('failed to load network image');
+  }
 }
 
 /// 放在应用最外层，接收异步异常并替换为可操作的错误页。
@@ -195,6 +265,11 @@ class AppFatalErrorScreen extends StatelessWidget {
 
 Future<void> runAppGuarded(Future<void> Function() body) async {
   await runZonedGuarded<Future<void>>(body, (error, stackTrace) {
+    if (AppErrorController._isRecoverableNetworkError(error) ||
+        AppErrorController._isRecoverableLifecycleError(error)) {
+      debugPrint('忽略可恢复的音频网络错误：$error');
+      return;
+    }
     AppErrorController.instance.report(
       error,
       stackTrace: stackTrace,

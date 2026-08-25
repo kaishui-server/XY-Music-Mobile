@@ -7,6 +7,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import '../../src/auth/auth_provider.dart';
 import '../../src/library/library_provider.dart';
+import '../../src/navigation/animated_page_route.dart';
 import '../../src/player/player_provider.dart';
 import '../../src/plugins/plugin_runtime.dart';
 import '../../src/widgets/mini_player_bar.dart';
@@ -275,7 +276,7 @@ class _SearchPageState extends ConsumerState<SearchPage>
     // 避免点击后等待网络请求完成才发生页面跳转。
     final runtime = ref.read(pluginRuntimeProvider);
     await Navigator.of(context).push<void>(
-      MaterialPageRoute(
+      XyAnimatedPageRoute(
         builder: (_) => OnlineCatalogDetailPage(
           title: keyword,
           subtitle: item.subtitle,

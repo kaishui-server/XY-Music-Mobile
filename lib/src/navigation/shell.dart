@@ -6,7 +6,9 @@ import 'package:go_router/go_router.dart';
 
 import '../playlists/playlists_provider.dart';
 import '../player/player_provider.dart';
+import '../core/settings.dart';
 import '../ui/xy_theme.dart';
+import '../ui/xy_surface.dart';
 import '../widgets/mini_player_bar.dart';
 import '../widgets/top_notice.dart';
 import 'sidebar_controller.dart';
@@ -187,6 +189,7 @@ class XyMobileSidebar extends ConsumerWidget {
   Widget build(BuildContext context, WidgetRef ref) {
     final theme = Theme.of(context);
     final dark = theme.brightness == Brightness.dark;
+    final settings = ref.watch(settingsProvider).valueOrNull;
     final playlists = ref.watch(playlistsProvider);
     final width = MediaQuery.sizeOf(context).width * 0.5;
 
@@ -214,12 +217,12 @@ class XyMobileSidebar extends ConsumerWidget {
       const _SidebarDestination(
         '插件管理',
         Icons.extension_outlined,
-        '/settings/plugins',
+        '/settings/plugins?from=sidebar',
       ),
       const _SidebarDestination(
         '账号',
         Icons.account_circle_outlined,
-        '/account',
+        '/account?from=sidebar',
       ),
     ];
 
@@ -227,182 +230,189 @@ class XyMobileSidebar extends ConsumerWidget {
       width: width,
       elevation: 0,
       shape: const RoundedRectangleBorder(),
-      backgroundColor: theme.colorScheme.surface,
-      child: SafeArea(
-        right: false,
-        child: Column(
-          children: [
-            SizedBox(
-              height: 62,
-              child: Padding(
-                padding: const EdgeInsets.fromLTRB(10, 8, 4, 8),
-                child: Row(
-                  children: [
-                    Container(
-                      width: 32,
-                      height: 32,
-                      padding: const EdgeInsets.all(3),
-                      decoration: BoxDecoration(
-                        color: Colors.white,
-                        borderRadius: BorderRadius.circular(9),
-                      ),
-                      child: ClipRRect(
-                        borderRadius: BorderRadius.circular(6),
-                        child: Image.asset(
-                          'assets/icon/app_icon.png',
-                          fit: BoxFit.contain,
+      backgroundColor: Colors.transparent,
+      child: XyAppBackground(
+        imagePath: settings?.customBackgroundPath ?? '',
+        blur: settings?.customBackgroundBlur ?? 18,
+        child: SafeArea(
+          right: false,
+          child: Column(
+            children: [
+              SizedBox(
+                height: 62,
+                child: Padding(
+                  padding: const EdgeInsets.fromLTRB(10, 8, 4, 8),
+                  child: Row(
+                    children: [
+                      Container(
+                        width: 32,
+                        height: 32,
+                        padding: const EdgeInsets.all(3),
+                        decoration: BoxDecoration(
+                          color: Colors.white,
+                          borderRadius: BorderRadius.circular(9),
+                        ),
+                        child: ClipRRect(
+                          borderRadius: BorderRadius.circular(6),
+                          child: Image.asset(
+                            'assets/icon/app_icon.png',
+                            fit: BoxFit.contain,
+                          ),
                         ),
                       ),
-                    ),
-                    const SizedBox(width: 7),
-                    const Expanded(
-                      child: Text(
-                        'XY Music',
-                        style: TextStyle(
-                          fontSize: 16,
-                          fontWeight: FontWeight.w900,
+                      const SizedBox(width: 7),
+                      const Expanded(
+                        child: Text(
+                          'XY Music',
+                          style: TextStyle(
+                            fontSize: 16,
+                            fontWeight: FontWeight.w900,
+                          ),
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
                         ),
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
                       ),
-                    ),
-                    IconButton(
-                      tooltip: '关闭侧栏',
-                      onPressed: () => Navigator.pop(context),
-                      padding: EdgeInsets.zero,
-                      constraints: BoxConstraints.tightFor(
-                        width: 36,
-                        height: 36,
+                      IconButton(
+                        tooltip: '关闭侧栏',
+                        onPressed: () => Navigator.pop(context),
+                        padding: EdgeInsets.zero,
+                        constraints: BoxConstraints.tightFor(
+                          width: 36,
+                          height: 36,
+                        ),
+                        icon: const Icon(Icons.close_rounded, size: 20),
                       ),
-                      icon: const Icon(Icons.close_rounded, size: 20),
-                    ),
-                  ],
+                    ],
+                  ),
                 ),
               ),
-            ),
-            Divider(
-              height: 1,
-              color: dark ? XyColors.darkBorder : XyColors.lightBorder,
-            ),
-            Expanded(
-              child: ListView(
-                padding: const EdgeInsets.fromLTRB(10, 10, 10, 20),
-                children: [
-                  for (final item in primaryItems)
-                    _SidebarTile(
-                      destination: item,
-                      selected: _selected(item.path),
-                      onTap: () => onNavigate(item.path),
-                    ),
-                  if (_showPlaylistSection) ...[
-                    const SizedBox(height: 17),
-                    Padding(
-                      padding: const EdgeInsets.fromLTRB(4, 0, 0, 6),
-                      child: Row(
-                        children: [
-                          const Icon(Icons.expand_more_rounded, size: 16),
-                          const SizedBox(width: 4),
-                          Expanded(
+              Divider(
+                height: 1,
+                color: dark ? XyColors.darkBorder : XyColors.lightBorder,
+              ),
+              Expanded(
+                child: ListView(
+                  padding: const EdgeInsets.fromLTRB(10, 10, 10, 20),
+                  children: [
+                    for (final item in primaryItems)
+                      _SidebarTile(
+                        destination: item,
+                        selected: _selected(item.path),
+                        onTap: () => onNavigate(item.path),
+                      ),
+                    if (_showPlaylistSection) ...[
+                      const SizedBox(height: 17),
+                      Padding(
+                        padding: const EdgeInsets.fromLTRB(4, 0, 0, 6),
+                        child: Row(
+                          children: [
+                            const Icon(Icons.expand_more_rounded, size: 16),
+                            const SizedBox(width: 4),
+                            Expanded(
+                              child: Text(
+                                '歌单 (${playlists.length})',
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: const TextStyle(
+                                  fontSize: 12,
+                                  fontWeight: FontWeight.w800,
+                                ),
+                              ),
+                            ),
+                            IconButton(
+                              tooltip: '新建歌单',
+                              onPressed: () => _createPlaylist(context, ref),
+                              padding: EdgeInsets.zero,
+                              constraints: const BoxConstraints.tightFor(
+                                width: 32,
+                                height: 32,
+                              ),
+                              icon: const Icon(Icons.add_rounded, size: 19),
+                            ),
+                            IconButton(
+                              tooltip: '导入歌单',
+                              onPressed: () => onNavigate('/home/playlists'),
+                              padding: EdgeInsets.zero,
+                              constraints: const BoxConstraints.tightFor(
+                                width: 32,
+                                height: 32,
+                              ),
+                              icon: const Icon(
+                                Icons.download_rounded,
+                                size: 18,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                      if (playlists.isEmpty)
+                        InkWell(
+                          onTap: () => onNavigate('/home/playlists'),
+                          borderRadius: BorderRadius.circular(XyRadii.medium),
+                          child: Padding(
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 13,
+                              vertical: 14,
+                            ),
                             child: Text(
-                              '歌单 (${playlists.length})',
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis,
-                              style: const TextStyle(
+                              '新建或导入第一个歌单',
+                              style: TextStyle(
                                 fontSize: 12,
-                                fontWeight: FontWeight.w800,
+                                color: theme.colorScheme.onSurfaceVariant,
                               ),
                             ),
                           ),
-                          IconButton(
-                            tooltip: '新建歌单',
-                            onPressed: () => _createPlaylist(context, ref),
-                            padding: EdgeInsets.zero,
-                            constraints: const BoxConstraints.tightFor(
-                              width: 32,
-                              height: 32,
-                            ),
-                            icon: const Icon(Icons.add_rounded, size: 19),
+                        )
+                      else
+                        for (final playlist in playlists)
+                          _PlaylistSidebarTile(
+                            playlist: playlist,
+                            selected:
+                                currentPath == '/home/playlists/${playlist.id}',
+                            onTap: () =>
+                                onNavigate('/home/playlists/${playlist.id}'),
                           ),
-                          IconButton(
-                            tooltip: '导入歌单',
-                            onPressed: () => onNavigate('/home/playlists'),
-                            padding: EdgeInsets.zero,
-                            constraints: const BoxConstraints.tightFor(
-                              width: 32,
-                              height: 32,
-                            ),
-                            icon: const Icon(Icons.download_rounded, size: 18),
-                          ),
-                        ],
+                    ],
+                    const SizedBox(height: 12),
+                    _SidebarTile(
+                      destination: const _SidebarDestination(
+                        '听歌识曲',
+                        Icons.mic_none_rounded,
+                        '/home/recognize',
                       ),
+                      selected: currentPath == '/home/recognize',
+                      onTap: () => onNavigate('/home/recognize'),
                     ),
-                    if (playlists.isEmpty)
-                      InkWell(
-                        onTap: () => onNavigate('/home/playlists'),
-                        borderRadius: BorderRadius.circular(XyRadii.medium),
-                        child: Padding(
-                          padding: const EdgeInsets.symmetric(
-                            horizontal: 13,
-                            vertical: 14,
-                          ),
-                          child: Text(
-                            '新建或导入第一个歌单',
-                            style: TextStyle(
-                              fontSize: 12,
-                              color: theme.colorScheme.onSurfaceVariant,
-                            ),
-                          ),
-                        ),
-                      )
-                    else
-                      for (final playlist in playlists)
-                        _PlaylistSidebarTile(
-                          playlist: playlist,
-                          selected:
-                              currentPath == '/home/playlists/${playlist.id}',
-                          onTap: () =>
-                              onNavigate('/home/playlists/${playlist.id}'),
-                        ),
+                    _SidebarTile(
+                      destination: const _SidebarDestination(
+                        '管理全部歌单',
+                        Icons.queue_music_rounded,
+                        '/home/playlists',
+                      ),
+                      selected: currentPath == '/home/playlists',
+                      onTap: () => onNavigate('/home/playlists'),
+                    ),
                   ],
-                  const SizedBox(height: 12),
-                  _SidebarTile(
-                    destination: const _SidebarDestination(
-                      '听歌识曲',
-                      Icons.mic_none_rounded,
-                      '/home/recognize',
-                    ),
-                    selected: currentPath == '/home/recognize',
-                    onTap: () => onNavigate('/home/recognize'),
-                  ),
-                  _SidebarTile(
-                    destination: const _SidebarDestination(
-                      '管理全部歌单',
-                      Icons.queue_music_rounded,
-                      '/home/playlists',
-                    ),
-                    selected: currentPath == '/home/playlists',
-                    onTap: () => onNavigate('/home/playlists'),
-                  ),
-                ],
-              ),
-            ),
-            Divider(
-              height: 1,
-              color: dark ? XyColors.darkBorder : XyColors.lightBorder,
-            ),
-            Padding(
-              padding: const EdgeInsets.fromLTRB(12, 7, 12, 9),
-              child: _SidebarTile(
-                destination: const _SidebarDestination(
-                  '设置',
-                  Icons.settings_outlined,
-                  '/settings',
                 ),
-                selected: currentPath == '/settings',
-                onTap: () => onNavigate('/settings'),
               ),
-            ),
-          ],
+              Divider(
+                height: 1,
+                color: dark ? XyColors.darkBorder : XyColors.lightBorder,
+              ),
+              Padding(
+                padding: const EdgeInsets.fromLTRB(12, 7, 12, 9),
+                child: _SidebarTile(
+                  destination: const _SidebarDestination(
+                    '设置',
+                    Icons.settings_outlined,
+                    '/settings',
+                  ),
+                  selected: currentPath == '/settings',
+                  onTap: () => onNavigate('/settings'),
+                ),
+              ),
+            ],
+          ),
         ),
       ),
     );

@@ -7,6 +7,7 @@ import 'package:permission_handler/permission_handler.dart';
 
 import '../../src/library/library_provider.dart';
 import '../../src/library/scan_settings_provider.dart';
+import '../../src/navigation/animated_page_route.dart';
 import '../../src/navigation/sidebar_controller.dart';
 import '../../src/widgets/song_list_view.dart';
 import '../../src/widgets/top_notice.dart';
@@ -115,7 +116,7 @@ class _LibraryPageState extends ConsumerState<LibraryPage>
     if (!mounted || selected == null || selected.songCount <= 0) return;
     await Navigator.push<void>(
       context,
-      MaterialPageRoute(
+      XyAnimatedPageRoute(
         builder: (_) => SongListPage(
           title: selected.name,
           loader: () =>
@@ -295,7 +296,7 @@ class _ArtistsTab extends ConsumerWidget {
           ),
           onTap: () => Navigator.push(
             context,
-            MaterialPageRoute(
+            XyAnimatedPageRoute(
               builder: (_) => SongListPage(
                 title: a.name,
                 loader: () =>
@@ -343,7 +344,7 @@ class _AlbumsTab extends ConsumerWidget {
           ),
           onTap: () => Navigator.push(
             context,
-            MaterialPageRoute(
+            XyAnimatedPageRoute(
               builder: (_) => SongListPage(
                 title: a.name,
                 loader: () =>
@@ -432,7 +433,7 @@ class _FoldersTabState extends ConsumerState<_FoldersTab> {
             if (n.songCount > 0) {
               Navigator.push(
                 context,
-                MaterialPageRoute(
+                XyAnimatedPageRoute(
                   builder: (_) => SongListPage(
                     title: n.name,
                     loader: () => ref

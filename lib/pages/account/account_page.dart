@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -5,12 +7,16 @@ import 'package:go_router/go_router.dart';
 
 import '../../src/auth/auth_provider.dart';
 import '../../src/navigation/sidebar_controller.dart';
+import '../../src/playlists/playlists_provider.dart';
+import '../../src/sync/account_cloud_sync.dart';
 import '../../src/widgets/top_notice.dart';
 import '../../src/widgets/user_avatar_image.dart';
 
 /// 账号认证页：未登录时展示登录/注册，已登录时展示个人资料。
 class AccountPage extends ConsumerStatefulWidget {
-  const AccountPage({super.key});
+  const AccountPage({super.key, this.showSidebarButton = true});
+
+  final bool showSidebarButton;
 
   @override
   ConsumerState<AccountPage> createState() => _AccountPageState();
@@ -29,6 +35,7 @@ class _AccountPageState extends ConsumerState<AccountPage>
   int _countdown = 0;
   bool _avatarUploading = false;
   String _avatarStatus = 'none';
+  bool _cloudSyncing = false;
 
   @override
   void initState() {
@@ -129,7 +136,10 @@ class _AccountPageState extends ConsumerState<AccountPage>
       );
       if (notice != null && mounted) _toast(notice);
     }
-    if (ref.read(authProvider).isLoggedIn) await _loadAvatarStatus();
+    if (ref.read(authProvider).isLoggedIn) {
+      await _loadAvatarStatus();
+      if (isLogin) await _handleCloudSyncAfterLogin();
+    }
     // 错误已通过 authProvider.error 反映到内联错误条，无需再弹 SnackBar。
   }
 
@@ -371,21 +381,87 @@ class _AccountPageState extends ConsumerState<AccountPage>
   /// 头像人工审核通过后，旧的本地凭证不能继续作为唯一数据源。
   Future<void> _syncProfile() async {
     if (!ref.read(authProvider).isLoggedIn) return;
+    final container = ProviderScope.containerOf(context, listen: false);
+    final auth = ref.read(authProvider.notifier);
+    final playlists = ref.read(playlistsProvider.notifier);
     try {
-      await ref.read(authProvider.notifier).refreshProfile();
+      await auth.refreshProfile();
     } catch (_) {
       // 网络暂时不可用时保留本地资料，头像状态仍可单独查询。
     }
     await _loadAvatarStatus();
+    if (!mounted) return;
+    await AccountCloudSync.startAutoUpload(auth, playlists, container);
   }
 
   Future<void> _loadAvatarStatus() async {
-    if (!ref.read(authProvider).isLoggedIn) return;
+    if (!mounted || !ref.read(authProvider).isLoggedIn) return;
     try {
       final status = await ref.read(authProvider.notifier).fetchAvatarStatus();
       if (mounted) setState(() => _avatarStatus = status);
     } catch (_) {
       // 状态查询失败不影响账号页面和头像显示。
+    }
+  }
+
+  Future<void> _handleCloudSyncAfterLogin() async {
+    final accountId = ref.read(authProvider).user?.ciyuanxiId?.trim() ?? '';
+    if (accountId.isEmpty || !mounted) return;
+    final container = ProviderScope.containerOf(context, listen: false);
+    if (await AccountCloudSync.isEnabled(accountId)) {
+      await _runCloudSync();
+      await AccountCloudSync.startAutoUpload(
+        ref.read(authProvider.notifier),
+        ref.read(playlistsProvider.notifier),
+        container,
+      );
+      return;
+    }
+    if (await AccountCloudSync.hasPrompted(accountId) || !mounted) return;
+    final enabled = await showDialog<bool>(
+      context: context,
+      barrierDismissible: false,
+      builder: (_) => const _CloudSyncPromptDialog(),
+    );
+    if (enabled == null) return;
+    await AccountCloudSync.markPrompted(accountId);
+    await AccountCloudSync.setEnabled(accountId, enabled);
+    if (enabled && mounted) {
+      await _runCloudSync();
+      await AccountCloudSync.startAutoUpload(
+        ref.read(authProvider.notifier),
+        ref.read(playlistsProvider.notifier),
+        container,
+      );
+    }
+  }
+
+  Future<void> _runCloudSync() async {
+    if (_cloudSyncing || !mounted) return;
+    final container = ProviderScope.containerOf(context, listen: false);
+    setState(() => _cloudSyncing = true);
+    try {
+      final auth = ref.read(authProvider.notifier);
+      final playlists = ref.read(playlistsProvider.notifier);
+      final result = await AccountCloudSync.syncAll(auth, playlists, container);
+      if (mounted) {
+        final suffix = result.pluginErrors.isEmpty
+            ? ''
+            : '；插件失败 ${result.pluginErrors.length} 个，请稍后重试';
+        _toast(
+          result.noChange
+              ? '云同步完成：歌单和插件没有变化，未重复上传$suffix'
+              : '云同步完成：插件下载 ${result.downloadedPlugins} 个、上传 ${result.uploadedPlugins} 个；歌单上传 ${result.uploadedPlaylists} 个、下载 ${result.downloadedPlaylists} 个$suffix',
+        );
+      }
+    } catch (error) {
+      if (mounted) {
+        _toast(
+          error is AuthException ? '云同步失败：${error.message}' : '云同步失败：$error',
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _cloudSyncing = false);
     }
   }
 
@@ -443,7 +519,9 @@ class _AccountPageState extends ConsumerState<AccountPage>
     final auth = ref.watch(authProvider);
     return Scaffold(
       appBar: AppBar(
-        leading: const AppSidebarMenuButton(),
+        leading: widget.showSidebarButton
+            ? const AppSidebarMenuButton()
+            : const BackButton(),
         title: Text(auth.isLoggedIn ? '我的' : '账号'),
         centerTitle: true,
       ),
@@ -456,6 +534,8 @@ class _AccountPageState extends ConsumerState<AccountPage>
               avatarStatus: _avatarStatus,
               onEditNickname: _editNickname,
               onChangePassword: _changePassword,
+              onCloudSync: () => context.push('/account/cloud-sync'),
+              cloudSyncing: _cloudSyncing,
               onLogout: () => _confirmLogout(context),
             )
           : _buildAuthForm(context, auth),
@@ -482,10 +562,15 @@ class _AccountPageState extends ConsumerState<AccountPage>
       ),
     );
     if (ok == true) {
+      AccountCloudSync.stopAutoUpload();
       await ref.read(authProvider.notifier).logout();
       // 从侧边栏直达账号页时，退出登录只应清空账号状态，不应让外层 StatefulShell 把路由切回设置。
       // 显式保持在账号页，让用户可直接切换到登录/注册。
-      if (mounted) router.go('/account');
+      if (mounted) {
+        router.go(
+          widget.showSidebarButton ? '/account' : '/account?from=settings',
+        );
+      }
     }
   }
 
@@ -532,7 +617,7 @@ class _AccountPageState extends ConsumerState<AccountPage>
               ),
               const SizedBox(height: 2),
               Text(
-                '登录后同步你的音乐与设置',
+                '登录后可在多端共享歌单等信息',
                 style: TextStyle(fontSize: 13, color: scheme.onSurfaceVariant),
               ),
             ],
@@ -772,6 +857,8 @@ class _ProfileView extends StatelessWidget {
     required this.avatarStatus,
     required this.onEditNickname,
     required this.onChangePassword,
+    required this.onCloudSync,
+    required this.cloudSyncing,
     required this.onLogout,
   });
   final AuthUser user;
@@ -781,6 +868,8 @@ class _ProfileView extends StatelessWidget {
   final String avatarStatus;
   final VoidCallback onEditNickname;
   final VoidCallback onChangePassword;
+  final VoidCallback onCloudSync;
+  final bool cloudSyncing;
   final VoidCallback onLogout;
 
   @override
@@ -905,6 +994,19 @@ class _ProfileView extends StatelessWidget {
               title: const Text('修改密码'),
               trailing: const Icon(Icons.chevron_right_rounded),
               onTap: onChangePassword,
+            ),
+            ListTile(
+              leading: Icon(Icons.cloud_sync_outlined, color: scheme.primary),
+              title: const Text('账号云同步'),
+              subtitle: Text(cloudSyncing ? '正在上传和同步歌单…' : '设置自动上传频率或手动同步'),
+              trailing: cloudSyncing
+                  ? const SizedBox(
+                      width: 20,
+                      height: 20,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    )
+                  : const Icon(Icons.chevron_right_rounded),
+              onTap: cloudSyncing ? null : onCloudSync,
             ),
           ],
         ),
@@ -1033,6 +1135,82 @@ class _InfoTile extends StatelessWidget {
       leading: Icon(icon, color: scheme.primary),
       title: Text(label),
       trailing: Text(value, style: TextStyle(color: scheme.onSurfaceVariant)),
+    );
+  }
+}
+
+/// 登录成功后的账号云同步选择弹窗。
+class _CloudSyncPromptDialog extends StatefulWidget {
+  const _CloudSyncPromptDialog();
+
+  @override
+  State<_CloudSyncPromptDialog> createState() => _CloudSyncPromptDialogState();
+}
+
+class _CloudSyncPromptDialogState extends State<_CloudSyncPromptDialog> {
+  Timer? _timer;
+  int _remaining = 3;
+
+  @override
+  void initState() {
+    super.initState();
+    _timer = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (!mounted) return;
+      if (_remaining <= 1) {
+        _timer?.cancel();
+        setState(() => _remaining = 0);
+      } else {
+        setState(() => _remaining--);
+      }
+    });
+  }
+
+  @override
+  void dispose() {
+    _timer?.cancel();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final enabled = _remaining == 0;
+    final scheme = Theme.of(context).colorScheme;
+    return AlertDialog(
+      title: const Text('是否启用账号云同步？'),
+      content: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            '开启后您可在多端共享歌单等信息',
+            style: TextStyle(color: scheme.onSurfaceVariant),
+          ),
+          const SizedBox(height: 8),
+          Text(
+            '如您关闭，后续您可在账号页手动进行上传',
+            style: TextStyle(color: scheme.onSurfaceVariant),
+          ),
+          if (!enabled) ...[
+            const SizedBox(height: 16),
+            Center(
+              child: Text(
+                '请等待 $_remaining 秒后选择',
+                style: TextStyle(fontSize: 13, color: scheme.primary),
+              ),
+            ),
+          ],
+        ],
+      ),
+      actions: [
+        TextButton(
+          onPressed: enabled ? () => Navigator.pop(context, false) : null,
+          child: const Text('暂不上传'),
+        ),
+        FilledButton(
+          onPressed: enabled ? () => Navigator.pop(context, true) : null,
+          child: const Text('开启'),
+        ),
+      ],
     );
   }
 }

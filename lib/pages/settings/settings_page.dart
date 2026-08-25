@@ -1,10 +1,17 @@
+import 'dart:io';
+
+import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
+import 'package:path/path.dart' as p;
 
 import '../../src/core/settings.dart';
+import '../../src/core/db_path.dart';
 import '../../src/auth/auth_provider.dart';
 import '../../src/navigation/sidebar_controller.dart';
+import '../../src/player/desktop_lyrics.dart';
+import '../../src/ui/xy_surface.dart';
 
 enum SettingsSection {
   root,
@@ -13,6 +20,7 @@ enum SettingsSection {
   playback,
   playbackDetail,
   lyrics,
+  desktopLyrics,
   library,
   download,
   other,
@@ -42,7 +50,7 @@ const settingsSearchEntries = <SettingsSearchEntry>[
   SettingsSearchEntry(
     title: '账号',
     path: ['账号'],
-    route: '/account',
+    route: '/account?from=settings',
     icon: Icons.manage_accounts_outlined,
     keywords: '登录 注册 账号安全 退出',
   ),
@@ -51,7 +59,7 @@ const settingsSearchEntries = <SettingsSearchEntry>[
     path: ['外观'],
     route: '/settings/appearance',
     icon: Icons.palette_outlined,
-    keywords: '主题 模式 颜色 深色 浅色',
+    keywords: '主题 模式 颜色 深色 浅色 背景 图片 模糊',
   ),
   SettingsSearchEntry(
     title: '播放',
@@ -61,8 +69,8 @@ const settingsSearchEntries = <SettingsSearchEntry>[
     keywords: '音量 音质 屏幕常亮',
   ),
   SettingsSearchEntry(
-    title: '播放详情页',
-    path: ['播放详情页'],
+    title: '歌词',
+    path: ['歌词'],
     route: '/settings/playback-detail',
     icon: Icons.queue_music_outlined,
     keywords: '歌词 播放详情 封面 歌词显示',
@@ -98,13 +106,13 @@ const settingsSearchEntries = <SettingsSearchEntry>[
   SettingsSearchEntry(
     title: '账号与安全',
     path: ['账号', '账号与安全'],
-    route: '/account',
+    route: '/account?from=settings',
     icon: Icons.account_circle_outlined,
     keywords: '登录 注册 验证码 退出',
   ),
   SettingsSearchEntry(
-    title: '歌词',
-    path: ['播放详情页', '歌词'],
+    title: '播放详情页歌词',
+    path: ['歌词', '播放详情页歌词'],
     route: '/settings/lyrics',
     icon: Icons.lyrics_outlined,
     keywords: '翻译 逐字 动效',
@@ -151,16 +159,23 @@ const settingsSearchEntries = <SettingsSearchEntry>[
   ),
   SettingsSearchEntry(
     title: '显示翻译',
-    path: ['播放详情页', '歌词', '显示翻译'],
+    path: ['歌词', '播放详情页歌词', '显示翻译'],
     route: '/settings/lyrics',
     icon: Icons.translate_outlined,
   ),
   SettingsSearchEntry(
     title: '逐字动效',
-    path: ['播放详情页', '歌词', '逐字动效'],
+    path: ['歌词', '播放详情页歌词', '逐字动效'],
     route: '/settings/lyrics',
     icon: Icons.spellcheck_outlined,
     keywords: '逐字歌词 动画',
+  ),
+  SettingsSearchEntry(
+    title: '桌面歌词',
+    path: ['歌词', '桌面歌词'],
+    route: '/settings/desktop-lyrics',
+    icon: Icons.subtitles_outlined,
+    keywords: '悬浮歌词 桌面歌词 浮窗',
   ),
   SettingsSearchEntry(
     title: '扫描文件夹',
@@ -343,7 +358,7 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
           icon: Icons.manage_accounts_outlined,
           title: '账号',
           subtitle: auth.isLoggedIn ? auth.user!.nickname : '登录、注册与账号安全',
-          route: '/account',
+          route: '/account?from=settings',
         ),
         _categoryTile(
           context,
@@ -369,7 +384,7 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
         _categoryTile(
           context,
           icon: Icons.queue_music_outlined,
-          title: '播放详情页',
+          title: '歌词',
           subtitle: '播放详情页中的歌词显示设置',
           route: '/settings/playback-detail',
         ),
@@ -414,7 +429,7 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
               color: Theme.of(context).colorScheme.onSurfaceVariant,
             ),
           ),
-          onTap: () => context.push('/account'),
+          onTap: () => context.push('/account?from=settings'),
         ),
       ],
       SettingsSection.appearance => [
@@ -433,6 +448,17 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
             color: Color(settings?.accentColor ?? 0xFFEC4141),
           ),
           onTap: () => _pickAccentColor(context, ref, settings),
+        ),
+        _tile(
+          context,
+          icon: Icons.wallpaper_outlined,
+          title: '自定义背景',
+          trailing: Text(
+            settings?.customBackgroundPath.trim().isNotEmpty == true
+                ? '已启用'
+                : '未设置',
+          ),
+          onTap: () => _editCustomBackground(context, ref, settings),
         ),
       ],
       SettingsSection.playback => [
@@ -505,9 +531,16 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
         _tile(
           context,
           icon: Icons.lyrics_outlined,
-          title: '歌词',
+          title: '播放详情页歌词',
           trailing: const Text(''),
           onTap: () => context.push('/settings/lyrics'),
+        ),
+        _tile(
+          context,
+          icon: Icons.subtitles_outlined,
+          title: '桌面歌词',
+          trailing: const Text(''),
+          onTap: () => context.push('/settings/desktop-lyrics'),
         ),
       ],
       SettingsSection.lyrics => [
@@ -543,6 +576,125 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
             ),
           ),
         ),
+      ],
+      SettingsSection.desktopLyrics => [
+        _switchTile(
+          context,
+          icon: Icons.subtitles_outlined,
+          title: '开启桌面歌词',
+          value: settings?.desktopLyricsEnabled ?? false,
+          onChanged: (value) => _setDesktopLyrics(context, ref, value),
+        ),
+        _switchTile(
+          context,
+          icon: Icons.visibility_off_outlined,
+          title: '软件内不显示桌面歌词',
+          value: settings?.desktopLyricsHideInApp ?? true,
+          onChanged: (value) => notifier.setDesktopLyricsHideInApp(value),
+        ),
+        _switchTile(
+          context,
+          icon: Icons.layers_clear_outlined,
+          title: '不显示背景色',
+          value: settings?.desktopLyricsNoBackground ?? true,
+          onChanged: (value) => notifier.setDesktopLyricsNoBackground(value),
+        ),
+        _switchTile(
+          context,
+          icon: Icons.lock_outline,
+          title: '锁定桌面歌词',
+          value: settings?.desktopLyricsLocked ?? false,
+          onChanged: (value) => notifier.setDesktopLyricsLocked(value),
+        ),
+        _tile(
+          context,
+          icon: Icons.format_color_text_outlined,
+          title: '歌词颜色',
+          trailing: _desktopColorDot(
+            context,
+            settings?.desktopLyricsLyricColor ?? 0xFFFFFFFF,
+          ),
+          onTap: () => _pickDesktopLyricsColor(
+            context,
+            ref,
+            title: '歌词颜色',
+            current: settings?.desktopLyricsLyricColor ?? 0xFFFFFFFF,
+            save: notifier.setDesktopLyricsLyricColor,
+          ),
+        ),
+        _tile(
+          context,
+          icon: Icons.translate_outlined,
+          title: '翻译颜色',
+          trailing: _desktopColorDot(
+            context,
+            settings?.desktopLyricsTranslationColor ?? 0xFFE1E1E6,
+          ),
+          onTap: () => _pickDesktopLyricsColor(
+            context,
+            ref,
+            title: '翻译颜色',
+            current: settings?.desktopLyricsTranslationColor ?? 0xFFE1E1E6,
+            save: notifier.setDesktopLyricsTranslationColor,
+          ),
+        ),
+        _tile(
+          context,
+          icon: Icons.format_size_rounded,
+          title: '歌词字号',
+          trailing: _desktopLyricsFontSizeControl(
+            value: settings?.desktopLyricsLyricFontSize ?? 24,
+            min: 16,
+            max: 40,
+            onChanged: notifier.setDesktopLyricsLyricFontSize,
+          ),
+        ),
+        _tile(
+          context,
+          icon: Icons.text_fields_rounded,
+          title: '翻译字号',
+          trailing: _desktopLyricsFontSizeControl(
+            value: settings?.desktopLyricsTranslationFontSize ?? 13,
+            min: 10,
+            max: 28,
+            onChanged: notifier.setDesktopLyricsTranslationFontSize,
+          ),
+        ),
+        _tile(
+          context,
+          icon: Icons.format_color_fill_outlined,
+          title: '背景颜色',
+          trailing: _desktopColorDot(
+            context,
+            settings?.desktopLyricsBackgroundColor ?? 0xFF18181C,
+          ),
+          onTap: () => _pickDesktopLyricsColor(
+            context,
+            ref,
+            title: '背景颜色',
+            current: settings?.desktopLyricsBackgroundColor ?? 0xFF18181C,
+            save: notifier.setDesktopLyricsBackgroundColor,
+          ),
+        ),
+        _tile(
+          context,
+          icon: Icons.opacity_outlined,
+          title: '背景透明度',
+          trailing: SizedBox(
+            width: 145,
+            child: Slider(
+              value: settings?.desktopLyricsBackgroundOpacity ?? .85,
+              min: .1,
+              max: 1,
+              divisions: 18,
+              label:
+                  '${(((settings?.desktopLyricsBackgroundOpacity ?? .85) * 100).round())}%',
+              onChanged: (value) =>
+                  notifier.setDesktopLyricsBackgroundOpacity(value),
+            ),
+          ),
+        ),
+        _desktopLyricsPreview(context, settings),
       ],
       SettingsSection.library => [
         _tile(
@@ -613,7 +765,7 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
           context,
           icon: Icons.info_outline,
           title: '关于 XY Music',
-          trailing: const Text('1.0.0'),
+          trailing: const Text('1.1.0'),
           onTap: () => context.push('/settings/about'),
         ),
         _categoryTile(
@@ -765,8 +917,9 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
     SettingsSection.account => '账号',
     SettingsSection.appearance => '外观',
     SettingsSection.playback => '播放',
-    SettingsSection.playbackDetail => '播放详情页',
-    SettingsSection.lyrics => '歌词',
+    SettingsSection.playbackDetail => '歌词',
+    SettingsSection.lyrics => '播放详情页歌词',
+    SettingsSection.desktopLyrics => '桌面歌词',
     SettingsSection.library => '音乐库',
     SettingsSection.download => '下载',
     SettingsSection.other => '其他',
@@ -856,6 +1009,241 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
     LyricWordEffectMode.progressive => '渐进填充',
     LyricWordEffectMode.none => '不显示逐字',
   };
+
+  Future<void> _setDesktopLyrics(
+    BuildContext context,
+    WidgetRef ref,
+    bool enabled,
+  ) async {
+    final notifier = ref.read(settingsProvider.notifier);
+    if (enabled) {
+      final started = await DesktopLyricsBridge.setEnabled(true);
+      if (!started) {
+        if (context.mounted) {
+          ScaffoldMessenger.of(
+            context,
+          ).showSnackBar(const SnackBar(content: Text('请授予悬浮窗权限后再开启桌面歌词')));
+        }
+        return;
+      }
+    } else {
+      await DesktopLyricsBridge.setEnabled(false);
+    }
+    await notifier.setDesktopLyricsEnabled(enabled);
+  }
+
+  Widget _desktopColorDot(BuildContext context, int value) {
+    return Container(
+      width: 28,
+      height: 28,
+      decoration: BoxDecoration(
+        color: Color(value),
+        shape: BoxShape.circle,
+        border: Border.all(color: Theme.of(context).colorScheme.outline),
+      ),
+    );
+  }
+
+  Widget _desktopLyricsPreview(BuildContext context, AppSettings? settings) {
+    final noBackground = settings?.desktopLyricsNoBackground ?? true;
+    final lyricColor = Color(settings?.desktopLyricsLyricColor ?? 0xFFFFFFFF);
+    final translationColor = Color(
+      settings?.desktopLyricsTranslationColor ?? 0xFFE1E1E6,
+    );
+    final background = Color(
+      settings?.desktopLyricsBackgroundColor ?? 0xFF18181C,
+    ).withValues(alpha: settings?.desktopLyricsBackgroundOpacity ?? .85);
+    final lyricFontSize = settings?.desktopLyricsLyricFontSize ?? 24;
+    final translationFontSize =
+        settings?.desktopLyricsTranslationFontSize ?? 13;
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 12, 16, 16),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            '效果预览',
+            style: TextStyle(
+              fontWeight: FontWeight.w600,
+              color: Theme.of(context).colorScheme.onSurface,
+            ),
+          ),
+          const SizedBox(height: 10),
+          Container(
+            width: double.infinity,
+            padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 18),
+            decoration: BoxDecoration(
+              color: noBackground ? Colors.transparent : background,
+              borderRadius: BorderRadius.circular(22),
+              border: Border.all(
+                color: Theme.of(context).colorScheme.outlineVariant,
+              ),
+            ),
+            child: Column(
+              children: [
+                Text(
+                  '当前播放歌词',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(
+                    color: lyricColor,
+                    fontSize: lyricFontSize,
+                    height: 1.3,
+                    fontWeight: FontWeight.w800,
+                    shadows: const [
+                      Shadow(color: Colors.black54, blurRadius: 12),
+                    ],
+                  ),
+                ),
+                const SizedBox(height: 4),
+                Text(
+                  'Translation',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(
+                    color: translationColor,
+                    fontSize: translationFontSize,
+                    height: 1.25,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _desktopLyricsFontSizeControl({
+    required double value,
+    required double min,
+    required double max,
+    required ValueChanged<double> onChanged,
+  }) {
+    final normalized = value.clamp(min, max).toDouble();
+    return SizedBox(
+      width: 168,
+      child: Row(
+        children: [
+          SizedBox(
+            width: 30,
+            child: Text(
+              normalized.round().toString(),
+              textAlign: TextAlign.center,
+            ),
+          ),
+          Expanded(
+            child: Slider(
+              value: normalized,
+              min: min,
+              max: max,
+              divisions: (max - min).round(),
+              label: normalized.round().toString(),
+              onChanged: onChanged,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _pickDesktopLyricsColor(
+    BuildContext context,
+    WidgetRef ref, {
+    required String title,
+    required int current,
+    required Future<void> Function(int) save,
+  }) async {
+    const colors = [
+      0xFFFFFFFF,
+      0xFFE1E1E6,
+      0xFFFFCDD2,
+      0xFFFFE0B2,
+      0xFFFFF9C4,
+      0xFFC8E6C9,
+      0xFFB3E5FC,
+      0xFFD1C4E9,
+      0xFF263238,
+      0xFF37474F,
+      0xFF4A148C,
+      0xFF880E4F,
+      0xFF7F0000,
+      0xFF0D47A1,
+      0xFF01579B,
+      0xFF1B5E20,
+      0xFF33691E,
+      0xFF4E342E,
+      0xFF000000,
+      0xFF18181C,
+    ];
+    final choice = await showModalBottomSheet<int>(
+      context: context,
+      builder: (sheetContext) => Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Text(title, style: const TextStyle(fontWeight: FontWeight.w600)),
+            const SizedBox(height: 16),
+            Wrap(
+              spacing: 12,
+              runSpacing: 12,
+              children: [
+                for (final color in colors)
+                  InkWell(
+                    onTap: () => Navigator.pop(sheetContext, color),
+                    borderRadius: BorderRadius.circular(20),
+                    child: Container(
+                      width: 40,
+                      height: 40,
+                      decoration: BoxDecoration(
+                        color: Color(color),
+                        shape: BoxShape.circle,
+                        border: Border.all(
+                          color: color == current
+                              ? Theme.of(sheetContext).colorScheme.primary
+                              : Theme.of(sheetContext).colorScheme.outline,
+                          width: color == current ? 3 : 1,
+                        ),
+                      ),
+                      child: color == current
+                          ? const Icon(
+                              Icons.check,
+                              color: Colors.white,
+                              size: 20,
+                            )
+                          : null,
+                    ),
+                  ),
+                InkWell(
+                  onTap: () => Navigator.pop(sheetContext, -1),
+                  borderRadius: BorderRadius.circular(20),
+                  child: Container(
+                    width: 40,
+                    height: 40,
+                    decoration: BoxDecoration(
+                      shape: BoxShape.circle,
+                      border: Border.all(
+                        color: Theme.of(sheetContext).colorScheme.outline,
+                      ),
+                    ),
+                    child: const Icon(Icons.colorize_outlined, size: 20),
+                  ),
+                ),
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
+    if (choice == -1 && context.mounted) {
+      final custom = await showDialog<int>(
+        context: context,
+        builder: (_) => _CustomDesktopColorDialog(initial: current),
+      );
+      if (custom != null) await save(custom);
+    } else if (choice != null) {
+      await save(choice);
+    }
+  }
 
   Widget _volumeSlider(AppSettings? s, SettingsNotifier n) {
     return SizedBox(
@@ -961,6 +1349,188 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
     if (choice != null) {
       await ref.read(settingsProvider.notifier).setAccentColor(choice);
     }
+  }
+
+  Future<void> _editCustomBackground(
+    BuildContext context,
+    WidgetRef ref,
+    AppSettings? settings,
+  ) async {
+    var imagePath = settings?.customBackgroundPath ?? '';
+    var blur = settings?.customBackgroundBlur ?? 18.0;
+    final result = await showModalBottomSheet<_CustomBackgroundResult>(
+      context: context,
+      isScrollControlled: true,
+      showDragHandle: true,
+      builder: (sheetContext) => StatefulBuilder(
+        builder: (context, setSheetState) {
+          Future<void> pickImage() async {
+            final picked = await FilePicker.platform.pickFiles(
+              type: FileType.image,
+              withData: true,
+            );
+            if (picked == null || picked.files.isEmpty) return;
+            final file = picked.files.single;
+            final bytes = file.bytes;
+            final sourcePath = file.path;
+            if ((bytes == null || bytes.isEmpty) && sourcePath == null) {
+              if (context.mounted) {
+                ScaffoldMessenger.of(
+                  context,
+                ).showSnackBar(const SnackBar(content: Text('无法读取图片，请重新选择')));
+              }
+              return;
+            }
+            if ((bytes?.length ?? 0) > 20 * 1024 * 1024) {
+              if (context.mounted) {
+                ScaffoldMessenger.of(
+                  context,
+                ).showSnackBar(const SnackBar(content: Text('图片不能超过 20 MB')));
+              }
+              return;
+            }
+            try {
+              final dataDir = await ref.read(appDataDirProvider.future);
+              final directory = Directory(p.join(dataDir, 'appearance'));
+              await directory.create(recursive: true);
+              final extension = p
+                  .extension(sourcePath ?? file.name)
+                  .toLowerCase();
+              final safeExtension =
+                  const [
+                    '.jpg',
+                    '.jpeg',
+                    '.png',
+                    '.webp',
+                    '.gif',
+                  ].contains(extension)
+                  ? extension
+                  : '.jpg';
+              // 文件名必须每次都变化。若覆盖同一个路径，Flutter 的 ImageProvider
+              // 和根节点 ui.Image 都会认为图片没变，用户换图后仍会显示旧缓存。
+              final target = File(
+                p.join(
+                  directory.path,
+                  'custom_background_${DateTime.now().microsecondsSinceEpoch}$safeExtension',
+                ),
+              );
+              if (bytes != null && bytes.isNotEmpty) {
+                await target.writeAsBytes(bytes, flush: true);
+              } else {
+                await File(sourcePath!).copy(target.path);
+              }
+              if (context.mounted) {
+                await precacheImage(FileImage(target), context);
+              }
+              if (context.mounted) {
+                setSheetState(() => imagePath = target.path);
+              }
+            } catch (error) {
+              if (context.mounted) {
+                ScaffoldMessenger.of(
+                  context,
+                ).showSnackBar(SnackBar(content: Text('保存背景图片失败：$error')));
+              }
+            }
+          }
+
+          return SafeArea(
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(16, 0, 16, 20),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text(
+                    '自定义背景',
+                    style: TextStyle(fontSize: 19, fontWeight: FontWeight.w700),
+                  ),
+                  const SizedBox(height: 6),
+                  Text(
+                    '图片仅保存在本机，不会上传到服务器。',
+                    style: TextStyle(
+                      color: Theme.of(context).colorScheme.onSurfaceVariant,
+                      fontSize: 12,
+                    ),
+                  ),
+                  const SizedBox(height: 14),
+                  ClipRRect(
+                    borderRadius: BorderRadius.circular(16),
+                    child: SizedBox(
+                      height: 170,
+                      width: double.infinity,
+                      child: XyAppBackground(
+                        imagePath: imagePath,
+                        blur: blur,
+                        child: Center(
+                          child: Text(
+                            imagePath.isEmpty ? '尚未选择背景图片' : 'XY Music 背景预览',
+                            style: const TextStyle(
+                              color: Colors.white,
+                              fontSize: 18,
+                              fontWeight: FontWeight.w700,
+                              shadows: [
+                                Shadow(blurRadius: 8, color: Colors.black87),
+                              ],
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 14),
+                  Row(
+                    children: [
+                      const Icon(Icons.blur_on_outlined, size: 20),
+                      const SizedBox(width: 8),
+                      const Text('模糊度'),
+                      const Spacer(),
+                      Text('${blur.toStringAsFixed(0)} px'),
+                    ],
+                  ),
+                  Slider(
+                    value: blur.clamp(0.0, 40.0),
+                    min: 0,
+                    max: 40,
+                    divisions: 40,
+                    label: '${blur.toStringAsFixed(0)} px',
+                    onChanged: (value) => setSheetState(() => blur = value),
+                  ),
+                  const SizedBox(height: 4),
+                  Row(
+                    children: [
+                      OutlinedButton.icon(
+                        onPressed: pickImage,
+                        icon: const Icon(Icons.upload_file_outlined),
+                        label: const Text('选择图片'),
+                      ),
+                      const Spacer(),
+                      if (imagePath.isNotEmpty)
+                        TextButton(
+                          onPressed: () => setSheetState(() => imagePath = ''),
+                          child: const Text('恢复默认'),
+                        ),
+                      const SizedBox(width: 6),
+                      FilledButton(
+                        onPressed: () => Navigator.pop(
+                          sheetContext,
+                          _CustomBackgroundResult(imagePath, blur),
+                        ),
+                        child: const Text('应用'),
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+          );
+        },
+      ),
+    );
+    if (result == null || !context.mounted) return;
+    final notifier = ref.read(settingsProvider.notifier);
+    await notifier.setCustomBackgroundPath(result.path);
+    await notifier.setCustomBackgroundBlur(result.blur);
   }
 
   Future<void> _pickQuality(
@@ -1153,6 +1723,34 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
               ),
             ),
             const SizedBox(height: 12),
+            OutlinedButton.icon(
+              onPressed: () async {
+                try {
+                  final selected = await FilePicker.platform.getDirectoryPath();
+                  if (!ctx.mounted || selected == null) return;
+                  if (selected.startsWith('content://')) {
+                    ScaffoldMessenger.of(ctx).showSnackBar(
+                      const SnackBar(
+                        content: Text('该目录无法直接写入，请选择可访问的文件夹或手动输入路径'),
+                      ),
+                    );
+                    return;
+                  }
+                  controller.text = selected;
+                  controller.selection = TextSelection.collapsed(
+                    offset: selected.length,
+                  );
+                } catch (error) {
+                  if (!ctx.mounted) return;
+                  ScaffoldMessenger.of(
+                    ctx,
+                  ).showSnackBar(SnackBar(content: Text('选择文件夹失败：$error')));
+                }
+              },
+              icon: const Icon(Icons.folder_open_rounded),
+              label: const Text('选择文件夹'),
+            ),
+            const SizedBox(height: 12),
             Row(
               mainAxisAlignment: MainAxisAlignment.end,
               children: [
@@ -1204,6 +1802,100 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
   }
 }
 
+class _CustomDesktopColorDialog extends StatefulWidget {
+  const _CustomDesktopColorDialog({required this.initial});
+
+  final int initial;
+
+  @override
+  State<_CustomDesktopColorDialog> createState() =>
+      _CustomDesktopColorDialogState();
+}
+
+class _CustomDesktopColorDialogState extends State<_CustomDesktopColorDialog> {
+  late double _red;
+  late double _green;
+  late double _blue;
+
+  @override
+  void initState() {
+    super.initState();
+    final color = Color(widget.initial);
+    _red = (color.r * 255).roundToDouble();
+    _green = (color.g * 255).roundToDouble();
+    _blue = (color.b * 255).roundToDouble();
+  }
+
+  Color get _color =>
+      Color.fromARGB(255, _red.round(), _green.round(), _blue.round());
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: const Text('自定义颜色'),
+      content: SingleChildScrollView(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Container(
+              width: double.infinity,
+              height: 52,
+              decoration: BoxDecoration(
+                color: _color,
+                borderRadius: BorderRadius.circular(12),
+              ),
+            ),
+            const SizedBox(height: 12),
+            _channelSlider('红', _red, Colors.red, (value) {
+              setState(() => _red = value);
+            }),
+            _channelSlider('绿', _green, Colors.green, (value) {
+              setState(() => _green = value);
+            }),
+            _channelSlider('蓝', _blue, Colors.blue, (value) {
+              setState(() => _blue = value);
+            }),
+          ],
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(context),
+          child: const Text('取消'),
+        ),
+        FilledButton(
+          onPressed: () => Navigator.pop(context, _color.toARGB32()),
+          child: const Text('应用'),
+        ),
+      ],
+    );
+  }
+
+  Widget _channelSlider(
+    String label,
+    double value,
+    Color activeColor,
+    ValueChanged<double> onChanged,
+  ) {
+    return Row(
+      children: [
+        SizedBox(width: 26, child: Text(label)),
+        Expanded(
+          child: Slider(
+            value: value,
+            min: 0,
+            max: 255,
+            divisions: 255,
+            activeColor: activeColor,
+            onChanged: onChanged,
+          ),
+        ),
+        SizedBox(width: 30, child: Text(value.round().toString())),
+      ],
+    );
+  }
+}
+
 class _ColorDot extends StatelessWidget {
   const _ColorDot({required this.color});
   final Color color;
@@ -1221,4 +1913,11 @@ class _Choice {
   final String label;
   final dynamic value;
   const _Choice(this.label, this.value);
+}
+
+class _CustomBackgroundResult {
+  const _CustomBackgroundResult(this.path, this.blur);
+
+  final String path;
+  final double blur;
 }

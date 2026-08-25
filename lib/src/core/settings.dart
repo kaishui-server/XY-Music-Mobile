@@ -44,11 +44,23 @@ class AppSettings {
     this.keepScreenOn = true,
     this.themeMode = ThemeModePreference.system,
     this.accentColor = 0xFFEC4141,
+    this.customBackgroundPath = '',
+    this.customBackgroundBlur = 18.0,
     this.showQualityBadges = true,
     this.onlineDefaultQuality = '320k',
     this.libraryMinDurationSeconds = 0,
     this.showLyricsTranslation = true,
     this.lyricWordEffectMode = LyricWordEffectMode.progressive,
+    this.desktopLyricsEnabled = false,
+    this.desktopLyricsHideInApp = true,
+    this.desktopLyricsLocked = false,
+    this.desktopLyricsNoBackground = true,
+    this.desktopLyricsLyricColor = 0xFFFFFFFF,
+    this.desktopLyricsTranslationColor = 0xFFE1E1E6,
+    this.desktopLyricsLyricFontSize = 24.0,
+    this.desktopLyricsTranslationFontSize = 13.0,
+    this.desktopLyricsBackgroundColor = 0xFF18181C,
+    this.desktopLyricsBackgroundOpacity = .85,
     this.downloadPath = '',
     this.downloadQuality = '320k',
     this.downloadLyrics = true,
@@ -64,11 +76,23 @@ class AppSettings {
   final bool keepScreenOn;
   final ThemeModePreference themeMode;
   final int accentColor;
+  final String customBackgroundPath;
+  final double customBackgroundBlur;
   final bool showQualityBadges;
   final String onlineDefaultQuality;
   final int libraryMinDurationSeconds;
   final bool showLyricsTranslation;
   final LyricWordEffectMode lyricWordEffectMode;
+  final bool desktopLyricsEnabled;
+  final bool desktopLyricsHideInApp;
+  final bool desktopLyricsLocked;
+  final bool desktopLyricsNoBackground;
+  final int desktopLyricsLyricColor;
+  final int desktopLyricsTranslationColor;
+  final double desktopLyricsLyricFontSize;
+  final double desktopLyricsTranslationFontSize;
+  final int desktopLyricsBackgroundColor;
+  final double desktopLyricsBackgroundOpacity;
 
   /// 兼容旧调用方：只要不是“不显示逐字”就视为已开启逐字效果。
   bool get enableWordEffect => lyricWordEffectMode != LyricWordEffectMode.none;
@@ -87,11 +111,23 @@ class AppSettings {
     bool? keepScreenOn,
     ThemeModePreference? themeMode,
     int? accentColor,
+    String? customBackgroundPath,
+    double? customBackgroundBlur,
     bool? showQualityBadges,
     String? onlineDefaultQuality,
     int? libraryMinDurationSeconds,
     bool? showLyricsTranslation,
     LyricWordEffectMode? lyricWordEffectMode,
+    bool? desktopLyricsEnabled,
+    bool? desktopLyricsHideInApp,
+    bool? desktopLyricsLocked,
+    bool? desktopLyricsNoBackground,
+    int? desktopLyricsLyricColor,
+    int? desktopLyricsTranslationColor,
+    double? desktopLyricsLyricFontSize,
+    double? desktopLyricsTranslationFontSize,
+    int? desktopLyricsBackgroundColor,
+    double? desktopLyricsBackgroundOpacity,
     String? downloadPath,
     String? downloadQuality,
     bool? downloadLyrics,
@@ -110,6 +146,8 @@ class AppSettings {
       keepScreenOn: keepScreenOn ?? this.keepScreenOn,
       themeMode: themeMode ?? this.themeMode,
       accentColor: accentColor ?? this.accentColor,
+      customBackgroundPath: customBackgroundPath ?? this.customBackgroundPath,
+      customBackgroundBlur: customBackgroundBlur ?? this.customBackgroundBlur,
       showQualityBadges: showQualityBadges ?? this.showQualityBadges,
       onlineDefaultQuality: onlineDefaultQuality ?? this.onlineDefaultQuality,
       libraryMinDurationSeconds:
@@ -117,6 +155,25 @@ class AppSettings {
       showLyricsTranslation:
           showLyricsTranslation ?? this.showLyricsTranslation,
       lyricWordEffectMode: lyricWordEffectMode ?? this.lyricWordEffectMode,
+      desktopLyricsEnabled: desktopLyricsEnabled ?? this.desktopLyricsEnabled,
+      desktopLyricsHideInApp:
+          desktopLyricsHideInApp ?? this.desktopLyricsHideInApp,
+      desktopLyricsLocked: desktopLyricsLocked ?? this.desktopLyricsLocked,
+      desktopLyricsNoBackground:
+          desktopLyricsNoBackground ?? this.desktopLyricsNoBackground,
+      desktopLyricsLyricColor:
+          desktopLyricsLyricColor ?? this.desktopLyricsLyricColor,
+      desktopLyricsTranslationColor:
+          desktopLyricsTranslationColor ?? this.desktopLyricsTranslationColor,
+      desktopLyricsLyricFontSize:
+          desktopLyricsLyricFontSize ?? this.desktopLyricsLyricFontSize,
+      desktopLyricsTranslationFontSize:
+          desktopLyricsTranslationFontSize ??
+          this.desktopLyricsTranslationFontSize,
+      desktopLyricsBackgroundColor:
+          desktopLyricsBackgroundColor ?? this.desktopLyricsBackgroundColor,
+      desktopLyricsBackgroundOpacity:
+          desktopLyricsBackgroundOpacity ?? this.desktopLyricsBackgroundOpacity,
       downloadPath: downloadPath ?? this.downloadPath,
       downloadQuality: downloadQuality ?? this.downloadQuality,
       downloadLyrics: downloadLyrics ?? this.downloadLyrics,
@@ -142,11 +199,34 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
       keepScreenOn: prefs.getBool('keepScreenOn') ?? true,
       themeMode: _themeFromInt(prefs.getInt('themeMode') ?? 0),
       accentColor: prefs.getInt('accentColor') ?? 0xFFEC4141,
+      customBackgroundPath: prefs.getString('customBackgroundPath') ?? '',
+      customBackgroundBlur: prefs.getDouble('customBackgroundBlur') ?? 18.0,
       showQualityBadges: prefs.getBool('showQualityBadges') ?? true,
       onlineDefaultQuality: prefs.getString('onlineDefaultQuality') ?? '320k',
       libraryMinDurationSeconds: prefs.getInt('libraryMinDurationSeconds') ?? 0,
       showLyricsTranslation: prefs.getBool('showLyricsTranslation') ?? true,
       lyricWordEffectMode: _lyricWordEffectModeFromPrefs(prefs),
+      desktopLyricsEnabled: prefs.getBool('desktopLyricsEnabled') ?? false,
+      desktopLyricsHideInApp: prefs.getBool('desktopLyricsHideInApp') ?? true,
+      desktopLyricsLocked: prefs.getBool('desktopLyricsLocked') ?? false,
+      desktopLyricsNoBackground:
+          prefs.getBool('desktopLyricsNoBackground') ?? true,
+      desktopLyricsLyricColor:
+          prefs.getInt('desktopLyricsLyricColor') ?? 0xFFFFFFFF,
+      desktopLyricsTranslationColor:
+          prefs.getInt('desktopLyricsTranslationColor') ?? 0xFFE1E1E6,
+      desktopLyricsLyricFontSize:
+          (prefs.getDouble('desktopLyricsLyricFontSize') ?? 24.0)
+              .clamp(16.0, 40.0)
+              .toDouble(),
+      desktopLyricsTranslationFontSize:
+          (prefs.getDouble('desktopLyricsTranslationFontSize') ?? 13.0)
+              .clamp(10.0, 28.0)
+              .toDouble(),
+      desktopLyricsBackgroundColor:
+          prefs.getInt('desktopLyricsBackgroundColor') ?? 0xFF18181C,
+      desktopLyricsBackgroundOpacity:
+          prefs.getDouble('desktopLyricsBackgroundOpacity') ?? .85,
       downloadPath: prefs.getString('downloadPath') ?? '',
       downloadQuality: prefs.getString('downloadQuality') ?? '320k',
       downloadLyrics: prefs.getBool('downloadLyrics') ?? true,
@@ -204,11 +284,41 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
       prefs.setBool('keepScreenOn', next.keepScreenOn),
       prefs.setInt('themeMode', next.themeMode.index),
       prefs.setInt('accentColor', next.accentColor),
+      prefs.setString('customBackgroundPath', next.customBackgroundPath),
+      prefs.setDouble('customBackgroundBlur', next.customBackgroundBlur),
       prefs.setBool('showQualityBadges', next.showQualityBadges),
       prefs.setString('onlineDefaultQuality', next.onlineDefaultQuality),
       prefs.setInt('libraryMinDurationSeconds', next.libraryMinDurationSeconds),
       prefs.setBool('showLyricsTranslation', next.showLyricsTranslation),
       prefs.setInt('lyricWordEffectMode', next.lyricWordEffectMode.index),
+      prefs.setBool('desktopLyricsEnabled', next.desktopLyricsEnabled),
+      prefs.setBool('desktopLyricsHideInApp', next.desktopLyricsHideInApp),
+      prefs.setBool('desktopLyricsLocked', next.desktopLyricsLocked),
+      prefs.setBool(
+        'desktopLyricsNoBackground',
+        next.desktopLyricsNoBackground,
+      ),
+      prefs.setInt('desktopLyricsLyricColor', next.desktopLyricsLyricColor),
+      prefs.setInt(
+        'desktopLyricsTranslationColor',
+        next.desktopLyricsTranslationColor,
+      ),
+      prefs.setDouble(
+        'desktopLyricsLyricFontSize',
+        next.desktopLyricsLyricFontSize,
+      ),
+      prefs.setDouble(
+        'desktopLyricsTranslationFontSize',
+        next.desktopLyricsTranslationFontSize,
+      ),
+      prefs.setInt(
+        'desktopLyricsBackgroundColor',
+        next.desktopLyricsBackgroundColor,
+      ),
+      prefs.setDouble(
+        'desktopLyricsBackgroundOpacity',
+        next.desktopLyricsBackgroundOpacity,
+      ),
       prefs.setString('downloadPath', next.downloadPath),
       prefs.setString('downloadQuality', next.downloadQuality),
       prefs.setBool('downloadLyrics', next.downloadLyrics),
@@ -244,6 +354,16 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
   Future<void> setAccentColor(int c) => _save(
     (state.valueOrNull ?? const AppSettings()).copyWith(accentColor: c),
   );
+  Future<void> setCustomBackgroundPath(String path) => _save(
+    (state.valueOrNull ?? const AppSettings()).copyWith(
+      customBackgroundPath: path,
+    ),
+  );
+  Future<void> setCustomBackgroundBlur(double value) => _save(
+    (state.valueOrNull ?? const AppSettings()).copyWith(
+      customBackgroundBlur: value.clamp(0, 40).toDouble(),
+    ),
+  );
   Future<void> setShowQualityBadges(bool v) => _save(
     (state.valueOrNull ?? const AppSettings()).copyWith(showQualityBadges: v),
   );
@@ -265,6 +385,56 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
   Future<void> setLyricWordEffectMode(LyricWordEffectMode mode) => _save(
     (state.valueOrNull ?? const AppSettings()).copyWith(
       lyricWordEffectMode: mode,
+    ),
+  );
+  Future<void> setDesktopLyricsEnabled(bool value) => _save(
+    (state.valueOrNull ?? const AppSettings()).copyWith(
+      desktopLyricsEnabled: value,
+    ),
+  );
+  Future<void> setDesktopLyricsHideInApp(bool value) => _save(
+    (state.valueOrNull ?? const AppSettings()).copyWith(
+      desktopLyricsHideInApp: value,
+    ),
+  );
+  Future<void> setDesktopLyricsLocked(bool value) => _save(
+    (state.valueOrNull ?? const AppSettings()).copyWith(
+      desktopLyricsLocked: value,
+    ),
+  );
+  Future<void> setDesktopLyricsNoBackground(bool value) => _save(
+    (state.valueOrNull ?? const AppSettings()).copyWith(
+      desktopLyricsNoBackground: value,
+    ),
+  );
+  Future<void> setDesktopLyricsLyricColor(int value) => _save(
+    (state.valueOrNull ?? const AppSettings()).copyWith(
+      desktopLyricsLyricColor: value,
+    ),
+  );
+  Future<void> setDesktopLyricsTranslationColor(int value) => _save(
+    (state.valueOrNull ?? const AppSettings()).copyWith(
+      desktopLyricsTranslationColor: value,
+    ),
+  );
+  Future<void> setDesktopLyricsLyricFontSize(double value) => _save(
+    (state.valueOrNull ?? const AppSettings()).copyWith(
+      desktopLyricsLyricFontSize: value.clamp(16.0, 40.0).toDouble(),
+    ),
+  );
+  Future<void> setDesktopLyricsTranslationFontSize(double value) => _save(
+    (state.valueOrNull ?? const AppSettings()).copyWith(
+      desktopLyricsTranslationFontSize: value.clamp(10.0, 28.0).toDouble(),
+    ),
+  );
+  Future<void> setDesktopLyricsBackgroundColor(int value) => _save(
+    (state.valueOrNull ?? const AppSettings()).copyWith(
+      desktopLyricsBackgroundColor: value,
+    ),
+  );
+  Future<void> setDesktopLyricsBackgroundOpacity(double value) => _save(
+    (state.valueOrNull ?? const AppSettings()).copyWith(
+      desktopLyricsBackgroundOpacity: value.clamp(0.1, 1.0).toDouble(),
     ),
   );
 

@@ -169,10 +169,16 @@ class MobilePlaylist {
 
 class PlaylistsNotifier extends StateNotifier<List<MobilePlaylist>> {
   PlaylistsNotifier() : super(const []) {
-    _load();
+    _loaded = _load();
   }
 
   static const _storageKey = 'mobilePlaylistsV1';
+  late final Future<void> _loaded;
+
+  Future<void> get ready => _loaded;
+
+  /// 当前歌单的只读快照，供云同步服务读取。
+  List<MobilePlaylist> get items => List.unmodifiable(state);
 
   Future<void> _load() async {
     final prefs = await SharedPreferences.getInstance();
@@ -195,6 +201,18 @@ class PlaylistsNotifier extends StateNotifier<List<MobilePlaylist>> {
       _storageKey,
       jsonEncode(state.map((item) => item.toJson()).toList()),
     );
+  }
+
+  /// 查找与导入歌单同名的本地歌单。名称比较忽略首尾空白，但保留用户
+  /// 输入的大小写和正文，避免导入时意外覆盖其他歌单。
+  Future<MobilePlaylist?> findByName(String name) async {
+    await _loaded;
+    final normalized = name.trim();
+    if (normalized.isEmpty) return null;
+    for (final item in state) {
+      if (item.name.trim() == normalized) return item;
+    }
+    return null;
   }
 
   Future<MobilePlaylist?> create(
@@ -234,8 +252,61 @@ class PlaylistsNotifier extends StateNotifier<List<MobilePlaylist>> {
     await _save();
   }
 
+  /// 合并一份从账号云同步下载的歌单，保留本机已有歌曲并补齐云端快照。
+  Future<void> mergeCloudPlaylist({
+    required String id,
+    required String name,
+    required DateTime createdAt,
+    required Iterable<PlaylistSongSnapshot> songs,
+    String? coverUrl,
+  }) async {
+    await _loaded;
+    final incoming = songs.toList();
+    final index = state.indexWhere((item) => item.id == id);
+    if (index < 0) {
+      state = [
+        ...state,
+        MobilePlaylist(
+          id: id,
+          name: name.trim().isEmpty ? '未命名歌单' : name.trim(),
+          songPaths: incoming.map((song) => song.path).toSet().toList(),
+          createdAt: createdAt,
+          coverUrl: coverUrl?.trim().isEmpty == true ? null : coverUrl?.trim(),
+          songSnapshots: {for (final song in incoming) song.path: song},
+        ),
+      ];
+    } else {
+      final current = state[index];
+      final paths = <String>[...current.songPaths];
+      final snapshots = Map<String, PlaylistSongSnapshot>.of(
+        current.songSnapshots,
+      );
+      for (final song in incoming) {
+        if (!paths.contains(song.path)) paths.add(song.path);
+        snapshots[song.path] = song;
+      }
+      final next = current.copyWith(
+        name: name.trim().isEmpty ? current.name : name.trim(),
+        songPaths: paths,
+        coverUrl: current.coverUrl ?? coverUrl,
+        songSnapshots: snapshots,
+      );
+      final nextState = [...state];
+      nextState[index] = next;
+      state = nextState;
+    }
+    await _save();
+  }
+
   Future<void> delete(String id) async {
     state = state.where((item) => item.id != id).toList();
+    await _save();
+  }
+
+  Future<void> deleteMany(Iterable<String> ids) async {
+    final selected = ids.toSet();
+    if (selected.isEmpty) return;
+    state = state.where((item) => !selected.contains(item.id)).toList();
     await _save();
   }
 
@@ -247,6 +318,47 @@ class PlaylistsNotifier extends StateNotifier<List<MobilePlaylist>> {
         else
           item,
     ];
+    await _save();
+  }
+
+  /// 将导入歌单的歌曲合并到已有歌单，同时保存网络歌曲的完整快照。
+  /// 相同路径只保留一份，已有歌曲的顺序保持不变，新歌曲追加到末尾。
+  Future<void> mergeImportedSongs(
+    String id,
+    Iterable<Song> songs, {
+    String? coverUrl,
+  }) async {
+    await _loaded;
+    final incoming = songs.toList(growable: false);
+    if (incoming.isEmpty) return;
+    final index = state.indexWhere((item) => item.id == id);
+    if (index < 0) return;
+    final current = state[index];
+    final paths = <String>[...current.songPaths];
+    final snapshots = Map<String, PlaylistSongSnapshot>.of(
+      current.songSnapshots,
+    );
+    for (final song in incoming) {
+      if (song.path.trim().isEmpty) continue;
+      if (!paths.contains(song.path)) paths.add(song.path);
+      snapshots[song.path] = PlaylistSongSnapshot.fromSong(song);
+    }
+    final fallbackCover = incoming
+        .map((song) => song.coverUrl?.trim() ?? '')
+        .firstWhere((value) => value.isNotEmpty, orElse: () => '');
+    final next = [...state];
+    next[index] = current.copyWith(
+      songPaths: paths,
+      songSnapshots: snapshots,
+      coverUrl:
+          current.coverUrl ??
+          (coverUrl?.trim().isNotEmpty == true
+              ? coverUrl!.trim()
+              : fallbackCover.isEmpty
+              ? null
+              : fallbackCover),
+    );
+    state = next;
     await _save();
   }
 
