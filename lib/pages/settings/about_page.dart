@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../src/auth/auth_provider.dart';
@@ -129,13 +130,25 @@ class AboutPage extends ConsumerWidget {
                   return Column(
                     crossAxisAlignment: CrossAxisAlignment.stretch,
                     children: [
-                      _row(
-                        context,
-                        Icons.cloud_done_outlined,
-                        '服务器服务',
-                        item == null
-                            ? '已连接 · 暂无服务端版本公告'
-                            : '最新版本 ${item.version}${item.content.isEmpty ? '' : ' · ${item.content}'}',
+                      InkWell(
+                        borderRadius: BorderRadius.circular(11),
+                        onTap: item == null
+                            ? null
+                            : () => _showReleaseNotes(context, item),
+                        child: _row(
+                          context,
+                          Icons.cloud_done_outlined,
+                          '服务器服务',
+                          item == null
+                              ? '已连接 · 暂无服务端版本公告'
+                              : '最新版本 ${item.version}${item.content.isEmpty ? '' : ' · ${item.content}'}',
+                          trailing: item == null || item.content.isEmpty
+                              ? null
+                              : const Icon(
+                                  Icons.chevron_right_rounded,
+                                  color: Color(0xFFEC4141),
+                                ),
+                        ),
                       ),
                       if (hasUpdate)
                         Padding(
@@ -167,6 +180,26 @@ class AboutPage extends ConsumerWidget {
               ),
             ],
           ),
+          const SizedBox(height: 14),
+          _AboutCard(
+            children: [
+              InkWell(
+                borderRadius: BorderRadius.circular(11),
+                onTap: () => _copyQqGroup(context),
+                child: _row(
+                  context,
+                  Icons.groups_outlined,
+                  'QQ 交流群',
+                  '656117919 · 点击复制群号',
+                  trailing: const Icon(
+                    Icons.copy_rounded,
+                    size: 18,
+                    color: Color(0xFFEC4141),
+                  ),
+                ),
+              ),
+            ],
+          ),
           const SizedBox(height: 24),
           Text(
             '© 2026 XY Music',
@@ -188,12 +221,55 @@ class AboutPage extends ConsumerWidget {
     await downloadAndInstallRelease(context, release);
   }
 
+  /// 查看服务端版本更新公告的完整内容。
+  Future<void> _showReleaseNotes(
+    BuildContext context,
+    BackendRelease release,
+  ) async {
+    await showDialog<void>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: Text('${release.version} 更新公告'),
+        content: SingleChildScrollView(
+          child: Text(
+            release.content.trim().isEmpty ? '暂无公告内容' : release.content,
+            style: const TextStyle(fontSize: 14, height: 1.5),
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext),
+            child: const Text('关闭'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// 复制 QQ 群号，方便用户加群交流。
+  Future<void> _copyQqGroup(BuildContext context) async {
+    const groupNumber = '656117919';
+    await Clipboard.setData(const ClipboardData(text: groupNumber));
+    if (context.mounted) {
+      ScaffoldMessenger.of(context)
+        ..hideCurrentSnackBar()
+        ..showSnackBar(
+          SnackBar(
+            content: const Text('群号已复制：$groupNumber'),
+            behavior: SnackBarBehavior.floating,
+            duration: const Duration(seconds: 2),
+          ),
+        );
+    }
+  }
+
   static Widget _row(
     BuildContext context,
     IconData icon,
     String title,
-    String subtitle,
-  ) => Padding(
+    String subtitle, {
+    Widget? trailing,
+  }) => Padding(
     padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 13),
     child: Row(
       children: [
@@ -225,6 +301,7 @@ class AboutPage extends ConsumerWidget {
             ],
           ),
         ),
+        ?trailing,
       ],
     ),
   );

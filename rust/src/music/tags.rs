@@ -1328,7 +1328,7 @@ mod tests {
     #[test]
     fn reads_wav_with_leading_id3v2_header_via_fallback() {
         let temp_name = format!(
-            "xianyu_id3_prefixed_{}.wav",
+            "xymusic_id3_prefixed_{}.wav",
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
@@ -1352,7 +1352,7 @@ mod tests {
     #[test]
     fn mp3_text_prefers_id3v2_over_id3v1_tail() {
         let temp_name = format!(
-            "xianyu_id3v2_priority_{}.mp3",
+            "xymusic_id3v2_priority_{}.mp3",
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
@@ -1377,7 +1377,7 @@ mod tests {
     #[test]
     fn reads_mp3_text_when_id3_timestamp_contains_non_ascii_characters() {
         let temp_name = format!(
-            "xianyu_bad_timestamp_{}.mp3",
+            "xymusic_bad_timestamp_{}.mp3",
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
@@ -1401,7 +1401,7 @@ mod tests {
     #[test]
     fn scan_reader_skips_cover_art_for_wav_fallback() {
         let temp_name = format!(
-            "xianyu_id3_prefixed_cover_{}.wav",
+            "xymusic_id3_prefixed_cover_{}.wav",
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()

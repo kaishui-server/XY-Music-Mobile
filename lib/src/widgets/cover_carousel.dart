@@ -60,18 +60,33 @@ class _CoverCarouselState extends ConsumerState<CoverCarousel>
 
   @override
   Widget build(BuildContext context) {
-    final player = ref.watch(playerProvider);
+    // 轮播只关心队列和播放状态。不要订阅 position/error 等高频字段，
+    // 否则播放器每次进度采样都会重建整块大封面。
+    final player = ref.watch(
+      playerProvider.select(
+        (state) => (
+          queue: state.queue,
+          queueIndex: state.queueIndex,
+          isPlaying: state.isPlaying,
+        ),
+      ),
+    );
     final queue = player.queue;
 
     // 频谱条只在有队列且播放时运转，省电。
-    ref.listen(playerProvider, (prev, next) {
-      final shouldRun = next.queue.isNotEmpty && next.isPlaying;
-      if (shouldRun && !_eq.isAnimating) {
-        _eq.repeat();
-      } else if (!shouldRun && _eq.isAnimating) {
-        _eq.stop();
-      }
-    });
+    ref.listen(
+      playerProvider.select(
+        (state) => (state.queue.isNotEmpty, state.isPlaying),
+      ),
+      (prev, next) {
+        final shouldRun = next.$1 && next.$2;
+        if (shouldRun && !_eq.isAnimating) {
+          _eq.repeat();
+        } else if (!shouldRun && _eq.isAnimating) {
+          _eq.stop();
+        }
+      },
+    );
 
     if (queue.isEmpty) {
       return const _EmptyCarousel();
@@ -161,6 +176,7 @@ class _CarouselCard extends StatelessWidget {
           children: [
             CoverImage(
               songPath: item.path,
+              highQuality: true,
               width: double.infinity,
               height: double.infinity,
               radius: 0,

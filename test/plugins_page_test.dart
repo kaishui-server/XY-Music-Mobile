@@ -17,7 +17,7 @@ void main() {
       ProviderScope(
         overrides: [
           appDataDirProvider.overrideWith(
-            (ref) async => r'Z:\xianyu-plugin-page-test-missing',
+            (ref) async => r'Z:\xymusic-plugin-page-test-missing',
           ),
         ],
         child: const MaterialApp(home: PluginsPage()),

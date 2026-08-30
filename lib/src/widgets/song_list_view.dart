@@ -9,13 +9,15 @@ import 'top_notice.dart';
 
 /// 通用歌曲列表：手机端以 56dp 以上触控行展示，点击播放、长按或右侧
 /// 更多按钮打开桌面端右键菜单对应的底部操作面板。
-class SongsListView extends ConsumerWidget {
+class SongsListView extends ConsumerStatefulWidget {
   final List<Song> songs;
   final Future<void> Function(List<Song> songs, int index)? onPlay;
   final bool showFavoriteButton;
   final bool selectionMode;
   final bool Function(Song song)? isSelected;
   final ValueChanged<Song>? onToggleSelection;
+  final ScrollController? controller;
+  final Widget? footer;
 
   /// 列表内边距。全屏页可留出底部安全区，嵌在 shell 内的页面可避让底栏。
   final EdgeInsetsGeometry? padding;
@@ -28,123 +30,183 @@ class SongsListView extends ConsumerWidget {
     this.selectionMode = false,
     this.isSelected,
     this.onToggleSelection,
+    this.controller,
+    this.footer,
   });
 
   @override
-  Widget build(BuildContext context, WidgetRef ref) {
-    if (songs.isEmpty) {
+  ConsumerState<SongsListView> createState() => _SongsListViewState();
+}
+
+class _SongsListViewState extends ConsumerState<SongsListView> {
+  ScrollController? _internalController;
+
+  ScrollController get _controller =>
+      widget.controller ?? (_internalController ??= ScrollController());
+
+  @override
+  void initState() {
+    super.initState();
+  }
+
+  @override
+  void didUpdateWidget(covariant SongsListView oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.controller != widget.controller) {
+      _internalController?.dispose();
+      _internalController = null;
+    }
+  }
+
+  @override
+  void dispose() {
+    _internalController?.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (widget.songs.isEmpty) {
       return const Center(child: Text('暂无歌曲'));
     }
     final favorites = ref.watch(favoritesProvider);
-    return ListView.builder(
-      padding: padding,
-      itemCount: songs.length,
-      itemBuilder: (context, i) {
-        final s = songs[i];
-        final isFavorite = favorites.contains(s.path);
-        return Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 2, vertical: 3),
-          child: Material(
-            color: Colors.transparent,
-            borderRadius: BorderRadius.circular(13),
-            child: InkWell(
-              onTap: () => selectionMode
-                  ? onToggleSelection?.call(s)
-                  : onPlay?.call(songs, i),
-              onLongPress: selectionMode
-                  ? () => onToggleSelection?.call(s)
-                  : () => _showSongActions(context, ref, s, i),
-              borderRadius: BorderRadius.circular(13),
+    final hasCurrentSong = ref.watch(
+      playerProvider.select((state) => state.current != null),
+    );
+    return Stack(
+      children: [
+        ListView.builder(
+          controller: _controller,
+          padding: widget.padding,
+          itemCount: widget.songs.length + (widget.footer == null ? 0 : 1),
+          itemBuilder: (context, i) {
+            if (i == widget.songs.length) return widget.footer!;
+            final s = widget.songs[i];
+            final isFavorite = favorites.contains(s.path);
+            // RepaintBoundary 把每行圈成独立重绘范围：多选勾选或收藏状态
+            // 变化时只重绘对应行，避免整个列表跟着重绘造成卡顿。
+            return RepaintBoundary(
               child: Padding(
-                padding: const EdgeInsets.fromLTRB(8, 7, 4, 7),
-                child: Row(
-                  children: [
-                    if (selectionMode)
-                      Padding(
-                        padding: const EdgeInsets.only(right: 4),
-                        child: Checkbox(
-                          value: isSelected?.call(s) ?? false,
-                          onChanged: (_) => onToggleSelection?.call(s),
-                          visualDensity: VisualDensity.compact,
-                        ),
-                      ),
-                    SongCover(song: s),
-                    const SizedBox(width: 11),
-                    Expanded(
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 2,
+                  vertical: 3,
+                ),
+                child: Material(
+                  color: Colors.transparent,
+                  borderRadius: BorderRadius.circular(13),
+                  child: InkWell(
+                    onTap: () => widget.selectionMode
+                        ? widget.onToggleSelection?.call(s)
+                        : widget.onPlay?.call(widget.songs, i),
+                    onLongPress: widget.selectionMode
+                        ? () => widget.onToggleSelection?.call(s)
+                        : () => _showSongActions(context, ref, s, i),
+                    borderRadius: BorderRadius.circular(13),
+                    child: Padding(
+                      padding: const EdgeInsets.fromLTRB(8, 7, 4, 7),
+                      child: Row(
                         children: [
-                          Row(
-                            children: [
-                              Expanded(
-                                child: Text(
-                                  s.title,
+                          if (widget.selectionMode)
+                            Padding(
+                              padding: const EdgeInsets.only(right: 4),
+                              child: Checkbox(
+                                value: widget.isSelected?.call(s) ?? false,
+                                onChanged: (_) =>
+                                    widget.onToggleSelection?.call(s),
+                                visualDensity: VisualDensity.compact,
+                              ),
+                            ),
+                          SongCover(song: s),
+                          const SizedBox(width: 11),
+                          Expanded(
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Row(
+                                  children: [
+                                    Expanded(
+                                      child: Text(
+                                        s.title,
+                                        maxLines: 1,
+                                        overflow: TextOverflow.ellipsis,
+                                        style: const TextStyle(
+                                          fontSize: 15,
+                                          fontWeight: FontWeight.w600,
+                                        ),
+                                      ),
+                                    ),
+                                    if (!widget.showFavoriteButton &&
+                                        isFavorite) ...[
+                                      const SizedBox(width: 5),
+                                      const Icon(
+                                        Icons.favorite,
+                                        size: 14,
+                                        color: Color(0xFFEC4141),
+                                      ),
+                                    ],
+                                  ],
+                                ),
+                                const SizedBox(height: 3),
+                                Text(
+                                  _subtitle(s),
                                   maxLines: 1,
                                   overflow: TextOverflow.ellipsis,
-                                  style: const TextStyle(
-                                    fontSize: 15,
-                                    fontWeight: FontWeight.w600,
+                                  style: TextStyle(
+                                    fontSize: 12,
+                                    color: Theme.of(
+                                      context,
+                                    ).colorScheme.onSurfaceVariant,
                                   ),
                                 ),
-                              ),
-                              if (!showFavoriteButton && isFavorite) ...[
-                                const SizedBox(width: 5),
-                                const Icon(
-                                  Icons.favorite,
-                                  size: 14,
-                                  color: Color(0xFFEC4141),
-                                ),
                               ],
-                            ],
-                          ),
-                          const SizedBox(height: 3),
-                          Text(
-                            _subtitle(s),
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                            style: TextStyle(
-                              fontSize: 12,
-                              color: Theme.of(
-                                context,
-                              ).colorScheme.onSurfaceVariant,
                             ),
                           ),
+                          const SizedBox(width: 8),
+                          Text(
+                            _fmt(s.duration),
+                            style: TextStyle(
+                              fontSize: 11,
+                              color: Theme.of(context)
+                                  .colorScheme
+                                  .onSurfaceVariant
+                                  .withValues(alpha: .65),
+                            ),
+                          ),
+                          if (!widget.selectionMode &&
+                              widget.showFavoriteButton)
+                            IconButton(
+                              tooltip: isFavorite ? '取消收藏' : '收藏',
+                              icon: Icon(
+                                isFavorite
+                                    ? Icons.favorite
+                                    : Icons.favorite_border,
+                                size: 21,
+                                color: const Color(0xFFEC4141),
+                              ),
+                              onPressed: () =>
+                                  _toggleFavorite(context, ref, s),
+                            ),
+                          if (!widget.selectionMode)
+                            IconButton(
+                              tooltip: '更多',
+                              icon: const Icon(Icons.more_vert, size: 20),
+                              onPressed: () =>
+                                  _showSongActions(context, ref, s, i),
+                            ),
                         ],
                       ),
                     ),
-                    const SizedBox(width: 8),
-                    Text(
-                      _fmt(s.duration),
-                      style: TextStyle(
-                        fontSize: 11,
-                        color: Theme.of(
-                          context,
-                        ).colorScheme.onSurfaceVariant.withValues(alpha: .65),
-                      ),
-                    ),
-                    if (!selectionMode && showFavoriteButton)
-                      IconButton(
-                        tooltip: isFavorite ? '取消收藏' : '收藏',
-                        icon: Icon(
-                          isFavorite ? Icons.favorite : Icons.favorite_border,
-                          size: 21,
-                          color: const Color(0xFFEC4141),
-                        ),
-                        onPressed: () => _toggleFavorite(context, ref, s),
-                      ),
-                    if (!selectionMode)
-                      IconButton(
-                      tooltip: '更多',
-                      icon: const Icon(Icons.more_vert, size: 20),
-                      onPressed: () => _showSongActions(context, ref, s, i),
-                    ),
-                  ],
+                  ),
                 ),
               ),
-            ),
-          ),
-        );
-      },
+            );
+          },
+        ),
+        ScrollToTopButton(
+          controller: _controller,
+          hasMiniPlayer: hasCurrentSong,
+        ),
+      ],
     );
   }
 
@@ -242,7 +304,7 @@ class SongsListView extends ConsumerWidget {
     if (!context.mounted || action == null) return;
     switch (action) {
       case _SongAction.play:
-        await onPlay?.call(songs, index);
+        await widget.onPlay?.call(widget.songs, index);
         return;
       case _SongAction.playNext:
         await ref.read(playerProvider.notifier).playNext(song.toQueueItem());
@@ -359,7 +421,84 @@ class SongCover extends StatelessWidget {
       width: size,
       height: size,
       radius: 10,
+      // 按 3 倍逻辑像素解码即可覆盖主流高清屏；不限制会把 480px 级别的
+      // 网络封面整张解码进纹理，长列表滚动时明显增加内存与解码开销。
+      cacheWidth: (size * 3).round(),
       icon: Icons.music_note,
+    );
+  }
+}
+
+/// 长列表统一使用的回到顶部按钮。该组件只能放在 Stack 中，未滚动到
+/// 较低位置时不占用空间，避免遮挡列表内容。
+class ScrollToTopButton extends StatefulWidget {
+  const ScrollToTopButton({
+    super.key,
+    required this.controller,
+    this.hasMiniPlayer = false,
+  });
+
+  final ScrollController controller;
+  final bool hasMiniPlayer;
+
+  @override
+  State<ScrollToTopButton> createState() => _ScrollToTopButtonState();
+}
+
+class _ScrollToTopButtonState extends State<ScrollToTopButton> {
+  var _visible = false;
+
+  @override
+  void initState() {
+    super.initState();
+    widget.controller.addListener(_handleScroll);
+  }
+
+  @override
+  void didUpdateWidget(covariant ScrollToTopButton oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.controller != widget.controller) {
+      oldWidget.controller.removeListener(_handleScroll);
+      widget.controller.addListener(_handleScroll);
+      _visible = false;
+    }
+  }
+
+  void _handleScroll() {
+    final visible =
+        widget.controller.hasClients && widget.controller.offset > 180;
+    if (visible != _visible && mounted) setState(() => _visible = visible);
+  }
+
+  @override
+  void dispose() {
+    widget.controller.removeListener(_handleScroll);
+    super.dispose();
+  }
+
+  void _scrollToTop() {
+    if (!widget.controller.hasClients) return;
+    widget.controller.animateTo(
+      0,
+      duration: const Duration(milliseconds: 360),
+      curve: Curves.easeOutCubic,
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (!_visible) return const SizedBox.shrink();
+    return Positioned(
+      right: 20,
+      bottom:
+          MediaQuery.paddingOf(context).bottom +
+          (widget.hasMiniPlayer ? 104 : 24),
+      child: FloatingActionButton.small(
+        heroTag: null,
+        tooltip: '回到顶部',
+        onPressed: _scrollToTop,
+        child: const Icon(Icons.keyboard_arrow_up_rounded),
+      ),
     );
   }
 }

@@ -15,6 +15,8 @@ class DownloadedSongSnapshot {
     required this.album,
     required this.durationMs,
     required this.downloadedAt,
+    this.sourcePath,
+    this.quality,
     this.coverUrl,
     this.lyricsRaw,
   });
@@ -25,6 +27,8 @@ class DownloadedSongSnapshot {
   final String album;
   final int durationMs;
   final int downloadedAt;
+  final String? sourcePath;
+  final String? quality;
   final String? coverUrl;
   final String? lyricsRaw;
 
@@ -36,6 +40,8 @@ class DownloadedSongSnapshot {
         album: json['album']?.toString() ?? '',
         durationMs: (json['durationMs'] as num?)?.toInt() ?? 0,
         downloadedAt: (json['downloadedAt'] as num?)?.toInt() ?? 0,
+        sourcePath: json['sourcePath']?.toString(),
+        quality: json['quality']?.toString(),
         coverUrl: json['coverUrl']?.toString(),
         lyricsRaw: json['lyricsRaw']?.toString(),
       );
@@ -47,6 +53,8 @@ class DownloadedSongSnapshot {
     'album': album,
     'durationMs': durationMs,
     'downloadedAt': downloadedAt,
+    'sourcePath': sourcePath,
+    'quality': quality,
     'coverUrl': coverUrl,
     'lyricsRaw': lyricsRaw,
   };
@@ -61,10 +69,12 @@ Future<List<DownloadedSongSnapshot>> loadDownloadedSongSnapshots() async {
   } catch (_) {}
   final preferences = await SharedPreferences.getInstance();
   final raw = preferences.getString(_downloadedSongsKey);
-  if (raw == null || raw.trim().isEmpty) return const [];
+  // 返回可修改的空列表：调用方会对结果 sort，const [] 会抛
+  // "Cannot modify an unmodifiable list"。
+  if (raw == null || raw.trim().isEmpty) return <DownloadedSongSnapshot>[];
   try {
     final decoded = jsonDecode(raw);
-    if (decoded is! Map) return const [];
+    if (decoded is! Map) return <DownloadedSongSnapshot>[];
     return decoded.values
         .whereType<Map>()
         .map(
@@ -74,7 +84,7 @@ Future<List<DownloadedSongSnapshot>> loadDownloadedSongSnapshots() async {
         .where((snapshot) => snapshot.path.isNotEmpty)
         .toList();
   } catch (_) {
-    return const [];
+    return <DownloadedSongSnapshot>[];
   }
 }
 
@@ -106,4 +116,13 @@ Future<String> resolveMusicDownloadDirectory(AppSettings? settings) async {
   } catch (_) {}
   base ??= await getApplicationDocumentsDirectory();
   return p.join(base.path, 'XY Music');
+}
+
+/// Writable staging directory used before copying a download to an Android
+/// SAF tree URI selected by the user.
+Future<String> resolveDownloadStagingDirectory() async {
+  final base = await getApplicationSupportDirectory();
+  final directory = Directory(p.join(base.path, 'download_staging'));
+  await directory.create(recursive: true);
+  return directory.path;
 }

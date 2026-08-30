@@ -8,6 +8,7 @@ import 'package:path/path.dart' as p;
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../../src/core/db_path.dart';
+import '../../src/core/settings.dart';
 import '../../src/plugins/plugin_metadata.dart';
 import '../../src/plugins/plugin_runtime.dart';
 import '../../src/rust/api.dart';
@@ -24,7 +25,9 @@ class _PluginInfo {
     required this.path,
     required this.enabled,
     this.author,
+    this.remark,
     this.sourceUrl,
+    this.userVariables = const [],
   });
 
   final String id;
@@ -33,7 +36,11 @@ class _PluginInfo {
   final String path;
   final bool enabled;
   final String? author;
+  final String? remark;
   final String? sourceUrl;
+  final List<PluginUserVariable> userVariables;
+
+  bool get isOnline => sourceUrl?.trim().isNotEmpty == true;
 }
 
 class _InstallSummary {
@@ -101,7 +108,7 @@ class _PluginsNotifier extends AsyncNotifier<List<_PluginInfo>> {
             .where((file) => p.extension(file.path).toLowerCase() == '.js')
             .toList()
           ..sort((a, b) => a.path.compareTo(b.path));
-    return files.map((file) {
+    final items = files.map((file) {
       final script = file.readAsStringSync();
       final metadata = PluginMetadata.parse(script);
       final id = p.basenameWithoutExtension(file.path);
@@ -110,11 +117,25 @@ class _PluginsNotifier extends AsyncNotifier<List<_PluginInfo>> {
         name: metadata.name ?? id,
         version: metadata.version ?? '未知版本',
         author: metadata.author,
+        remark: metadata.remark,
         path: file.path,
         enabled: enabled.contains(id),
         sourceUrl: sourceUrls[id],
+        userVariables: metadata.userVariables,
       );
     }).toList();
+    // 拖拽保存的顺序优先；未记录过的插件（新安装）按文件名顺序追加在后。
+    final orderedIds = prefs.getStringList(pluginOrderKey) ?? const [];
+    if (orderedIds.isNotEmpty) {
+      final byId = {for (final item in items) item.id: item};
+      final ordered = <_PluginInfo>[
+        for (final id in orderedIds)
+          if (byId.containsKey(id)) byId.remove(id)!,
+      ];
+      ordered.addAll(items.where((item) => byId.containsKey(item.id)));
+      return ordered;
+    }
+    return items;
   }
 
   static Map<String, String> _readSourceUrls(SharedPreferences prefs) {
@@ -235,7 +256,12 @@ class _PluginsNotifier extends AsyncNotifier<List<_PluginInfo>> {
     }
 
     final dataDir = await ref.read(appDataDirProvider.future);
-    await savePluginScript(dataDir: dataDir, id: id, script: script);
+    // 本地导入不依赖 Rust bridge。插件管理页可能在应用启动初始化 bridge
+    // 完成前就被打开，直接调用 RustLib.instance 会触发
+    // LateInitializationError；插件目录本身由 Dart 写入即可。
+    final pluginsDir = Directory(p.join(dataDir, 'plugins'));
+    await pluginsDir.create(recursive: true);
+    await File(p.join(pluginsDir.path, '$id.js')).writeAsString(script);
     final prefs = await SharedPreferences.getInstance();
     final enabled = (prefs.getStringList(_enabledKey) ?? const []).toSet()
       ..add(id);
@@ -307,9 +333,12 @@ class _PluginsNotifier extends AsyncNotifier<List<_PluginInfo>> {
     final result = await FilePicker.platform.pickFiles(
       type: FileType.custom,
       allowedExtensions: const ['js'],
+      // Android 的 Storage Access Framework 对外部文件有时不会返回可直接
+      // 读取的 path，只返回文件内容；同时请求 bytes 兼容这类文件选择结果。
+      withData: true,
     );
-    final path = result?.files.single.path;
-    if (path == null) {
+    final file = result?.files.single;
+    if (file == null) {
       return const _InstallSummary(
         installed: 0,
         skipped: 0,
@@ -320,8 +349,17 @@ class _PluginsNotifier extends AsyncNotifier<List<_PluginInfo>> {
     }
     final summary = _MutableInstallSummary();
     try {
-      final script = await readPluginFile(path: path);
-      await _persistScript(script, path, summary);
+      final path = file.path;
+      final script = file.bytes != null
+          ? utf8.decode(file.bytes!, allowMalformed: true)
+          : path != null
+          ? await File(path).readAsString()
+          : '';
+      if (script.isEmpty) {
+        throw Exception('无法读取所选插件文件，请重新选择');
+      }
+      // path 为空时使用文件名作为来源，保证插件 ID 仍能稳定生成。
+      await _persistScript(script, path ?? file.name, summary);
     } catch (error) {
       summary.failed++;
       summary.errors.add(error.toString());
@@ -337,6 +375,51 @@ class _PluginsNotifier extends AsyncNotifier<List<_PluginInfo>> {
     value ? enabled.add(plugin.id) : enabled.remove(plugin.id);
     await prefs.setStringList(_enabledKey, enabled.toList());
     state = AsyncData(await _load());
+    ref.invalidate(enabledMusicPluginsProvider);
+  }
+
+  /// 拖拽排序：同步更新列表并持久化顺序，该顺序即搜索页插件 Tab 优先级。
+  /// 注意：onReorderItem 回调的 newIndex 已为移除 oldIndex 项后的目标位置，
+  /// 无需手动减一。
+  Future<void> reorder(int oldIndex, int newIndex) async {
+    final items = [...?state.valueOrNull];
+    if (oldIndex < 0 || oldIndex >= items.length) return;
+    if (newIndex < 0) newIndex = 0;
+    if (newIndex > items.length) newIndex = items.length;
+    if (newIndex == oldIndex) return;
+    final item = items.removeAt(oldIndex);
+    items.insert(newIndex, item);
+    state = AsyncData(items);
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setStringList(
+      pluginOrderKey,
+      items.map((plugin) => plugin.id).toList(),
+    );
+    ref.invalidate(enabledMusicPluginsProvider);
+  }
+
+  /// 保存插件用户变量并让运行时按新值重新加载插件。
+  Future<void> saveUserVariables(
+    _PluginInfo plugin,
+    Map<String, String> values,
+  ) async {
+    final prefs = await SharedPreferences.getInstance();
+    final stored = readPluginUserVariables(prefs);
+    // 只保留插件当前声明的变量键，卸载或插件更新后消失的键会被清理。
+    final declared = plugin.userVariables.map((v) => v.key).toSet();
+    final filtered = {
+      for (final entry in values.entries)
+        if (declared.contains(entry.key) && entry.value.isNotEmpty)
+          entry.key: entry.value,
+    };
+    if (filtered.isEmpty) {
+      stored.remove(plugin.id);
+    } else {
+      stored[plugin.id] = filtered;
+    }
+    await prefs.setString(pluginUserVariablesKey, jsonEncode(stored));
+    // 已加载的插件实例持有旧的 env.userVariables，必须让运行时重建。
+    ref.invalidate(pluginRuntimeProvider);
     ref.invalidate(enabledMusicPluginsProvider);
   }
 
@@ -371,6 +454,11 @@ class _PluginsNotifier extends AsyncNotifier<List<_PluginInfo>> {
       sources.remove(id);
     }
     await prefs.setString(_sourceUrlsKey, jsonEncode(sources));
+    final variables = readPluginUserVariables(prefs);
+    if (variables.isNotEmpty) {
+      variables.removeWhere((id, _) => ids.contains(id));
+      await prefs.setString(pluginUserVariablesKey, jsonEncode(variables));
+    }
     state = AsyncData(await _load());
     ref.invalidate(enabledMusicPluginsProvider);
   }
@@ -396,7 +484,6 @@ class PluginsPage extends ConsumerStatefulWidget {
 
 class _PluginsPageState extends ConsumerState<PluginsPage> {
   final TextEditingController _installUrlController = TextEditingController();
-  String _query = '';
   bool _busy = false;
   bool _selectionMode = false;
   final Set<String> _selectedIds = <String>{};
@@ -426,6 +513,16 @@ class _PluginsPageState extends ConsumerState<PluginsPage> {
     setState(() => _busy = true);
     try {
       _showResult(await ref.read(_pluginsProvider.notifier).importPlugin());
+    } catch (error) {
+      // 文件选择器、系统存储权限或插件解析失败都不能静默吞掉，
+      // 否则用户点击“本地导入”后看起来像按钮没有反应。
+      if (mounted) {
+        XyNotice.show(
+          context,
+          message: '本地导入失败：$error',
+          type: XyNoticeType.error,
+        );
+      }
     } finally {
       if (mounted) setState(() => _busy = false);
     }
@@ -583,6 +680,149 @@ class _PluginsPageState extends ConsumerState<PluginsPage> {
     }
   }
 
+  Future<void> _showPluginInfo(_PluginInfo plugin) async {
+    final theme = Theme.of(context);
+    final muted = theme.colorScheme.onSurfaceVariant;
+    await showDialog<void>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('插件信息'),
+        content: SingleChildScrollView(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              _PluginInfoRow(label: '名称', value: plugin.name),
+              _PluginInfoRow(label: '作者', value: _displayValue(plugin.author)),
+              _PluginInfoRow(label: '版本', value: plugin.version),
+              _PluginInfoRow(label: '备注', value: _displayValue(plugin.remark)),
+              if (plugin.isOnline) ...[
+                const SizedBox(height: 4),
+                Text('导入链接', style: TextStyle(fontSize: 12, color: muted)),
+                const SizedBox(height: 4),
+                SelectableText(
+                  plugin.sourceUrl!.trim(),
+                  style: TextStyle(
+                    fontSize: 13,
+                    color: theme.colorScheme.primary,
+                  ),
+                ),
+              ],
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext),
+            child: const Text('关闭'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  static String _displayValue(String? value) {
+    final text = value?.trim() ?? '';
+    return text.isEmpty ? '暂无' : text;
+  }
+
+  Future<void> _showUserVariables(_PluginInfo plugin) async {
+    final variables = plugin.userVariables;
+    if (variables.isEmpty) return;
+    final prefs = await SharedPreferences.getInstance();
+    if (!mounted) return;
+    final saved = readPluginUserVariables(prefs)[plugin.id] ?? const {};
+    final controllers = {
+      for (final variable in variables)
+        variable.key: TextEditingController(text: saved[variable.key] ?? ''),
+    };
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('用户变量'),
+        content: SingleChildScrollView(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text(
+                '${plugin.name} 声明了以下变量，填写后插件可通过 env.getUserVariables() 读取。',
+                style: TextStyle(
+                  fontSize: 12,
+                  color: Theme.of(dialogContext).colorScheme.onSurfaceVariant,
+                ),
+              ),
+              const SizedBox(height: 14),
+              for (final variable in variables) ...[
+                Text(
+                  variable.displayName,
+                  style: const TextStyle(fontWeight: FontWeight.w600),
+                ),
+                if (variable.hint?.isNotEmpty == true) ...[
+                  const SizedBox(height: 2),
+                  Text(
+                    variable.hint!,
+                    style: TextStyle(
+                      fontSize: 11,
+                      color: Theme.of(dialogContext).colorScheme.onSurfaceVariant,
+                    ),
+                  ),
+                ],
+                const SizedBox(height: 6),
+                TextField(
+                  controller: controllers[variable.key],
+                  decoration: InputDecoration(
+                    isDense: true,
+                    border: const OutlineInputBorder(),
+                    hintText: variable.hint ?? '请输入 ${variable.displayName}',
+                    suffixIcon: ValueListenableBuilder<TextEditingValue>(
+                      valueListenable: controllers[variable.key]!,
+                      builder: (context, value, _) => value.text.isEmpty
+                          ? const SizedBox.shrink()
+                          : IconButton(
+                              icon: const Icon(Icons.close_rounded, size: 18),
+                              onPressed: () =>
+                                  controllers[variable.key]!.clear(),
+                            ),
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 14),
+              ],
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext, false),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(dialogContext, true),
+            child: const Text('保存'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true) return;
+    await ref
+        .read(_pluginsProvider.notifier)
+        .saveUserVariables(
+          plugin,
+          {
+            for (final variable in variables)
+              variable.key: controllers[variable.key]!.text.trim(),
+          },
+        );
+    if (mounted) {
+      XyNotice.show(
+        context,
+        message: '已保存 ${plugin.name} 的用户变量',
+        type: XyNoticeType.success,
+      );
+    }
+  }
+
   Future<void> _remove(_PluginInfo plugin) async {
     final confirmed = await showDialog<bool>(
       context: context,
@@ -682,12 +922,24 @@ class _PluginsPageState extends ConsumerState<PluginsPage> {
   @override
   Widget build(BuildContext context) {
     final plugins = ref.watch(_pluginsProvider);
+    final sidebarOnRight = ref.watch(
+      settingsProvider.select(
+        (value) => value.valueOrNull?.sidebarPosition == SidebarPosition.right,
+      ),
+    );
     return Scaffold(
       appBar: AppBar(
-        leading: widget.showSidebarButton
+        automaticallyImplyLeading: !widget.showSidebarButton || !sidebarOnRight,
+        leading: widget.showSidebarButton && !sidebarOnRight
             ? const AppSidebarMenuButton()
+            : widget.showSidebarButton
+            ? null
             : const BackButton(),
         title: const Text('插件管理'),
+        actions: [
+          if (widget.showSidebarButton && sidebarOnRight)
+            const AppSidebarMenuButton(),
+        ],
       ),
       body: XyPageBackground(
         child: plugins.when(
@@ -697,144 +949,183 @@ class _PluginsPageState extends ConsumerState<PluginsPage> {
             _selectedIds.removeWhere(
               (id) => !items.any((plugin) => plugin.id == id),
             );
-            final query = _query.trim().toLowerCase();
-            final filtered = query.isEmpty
-                ? items
-                : items.where((item) {
-                    return item.name.toLowerCase().contains(query) ||
-                        item.id.toLowerCase().contains(query) ||
-                        (item.author?.toLowerCase().contains(query) ?? false);
-                  }).toList();
             return Stack(
               children: [
-                ListView(
-                  padding: const EdgeInsets.fromLTRB(16, 8, 16, 24),
-                  children: [
-                    const _SecurityNotice(),
-                    const SizedBox(height: 14),
-                    _InstallPanel(
-                      busy: _busy,
-                      onOnline: _installFromUrl,
-                      onLocal: _importLocal,
-                    ),
-                    const SizedBox(height: 22),
-                    Row(
-                      children: [
-                        const Expanded(
-                          child: Text(
-                            '已安装插件',
-                            style: TextStyle(
-                              fontSize: 18,
-                              fontWeight: FontWeight.w800,
+                CustomScrollView(
+                  slivers: [
+                    SliverPadding(
+                      padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
+                      sliver: SliverToBoxAdapter(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            const _SecurityNotice(),
+                            const SizedBox(height: 14),
+                            _InstallPanel(
+                              busy: _busy,
+                              onOnline: _installFromUrl,
+                              onLocal: _importLocal,
                             ),
-                          ),
+                            const SizedBox(height: 22),
+                            Row(
+                              children: [
+                                const Expanded(
+                                  child: Text(
+                                    '已安装插件',
+                                    style: TextStyle(
+                                      fontSize: 18,
+                                      fontWeight: FontWeight.w800,
+                                    ),
+                                  ),
+                                ),
+                                Text(
+                                  '${items.length} 个',
+                                  style: TextStyle(
+                                    color: Theme.of(
+                                      context,
+                                    ).colorScheme.onSurfaceVariant,
+                                  ),
+                                ),
+                              ],
+                            ),
+                            if (items.isNotEmpty) ...[
+                              const SizedBox(height: 8),
+                              Wrap(
+                                spacing: 8,
+                                runSpacing: 8,
+                                children: [
+                                  OutlinedButton.icon(
+                                    onPressed: _busy
+                                        ? null
+                                        : () => setState(() {
+                                            _selectionMode = !_selectionMode;
+                                            if (!_selectionMode) {
+                                              _selectedIds.clear();
+                                            }
+                                          }),
+                                    icon: Icon(
+                                      _selectionMode
+                                          ? Icons.close_rounded
+                                          : Icons.checklist_rounded,
+                                    ),
+                                    label: Text(
+                                      _selectionMode ? '退出选择' : '批量管理',
+                                    ),
+                                  ),
+                                  if (_selectionMode)
+                                    OutlinedButton.icon(
+                                      onPressed: _busy
+                                          ? null
+                                          : () => setState(() {
+                                              final visibleIds = items
+                                                  .map((plugin) => plugin.id)
+                                                  .toSet();
+                                              if (visibleIds.every(
+                                                _selectedIds.contains,
+                                              )) {
+                                                _selectedIds.removeAll(
+                                                  visibleIds,
+                                                );
+                                              } else {
+                                                _selectedIds.addAll(visibleIds);
+                                              }
+                                            }),
+                                      icon: const Icon(Icons.select_all_rounded),
+                                      label: const Text('全选'),
+                                    ),
+                                  if (_selectionMode)
+                                    FilledButton.icon(
+                                      onPressed: _busy || _selectedIds.isEmpty
+                                          ? null
+                                          : () => _removeSelected(items),
+                                      icon: const Icon(
+                                        Icons.delete_outline_rounded,
+                                      ),
+                                      label: Text(
+                                        '删除选中（${_selectedIds.length}）',
+                                      ),
+                                    ),
+                                  OutlinedButton.icon(
+                                    onPressed: _busy
+                                        ? null
+                                        : () => _removeAll(items),
+                                    icon: const Icon(
+                                      Icons.delete_sweep_outlined,
+                                    ),
+                                    label: const Text('删除全部'),
+                                  ),
+                                ],
+                              ),
+                              const SizedBox(height: 8),
+                              Text(
+                                '拖动插件左侧的手柄排序，从上到下即搜索页插件 Tab 的优先级。',
+                                style: TextStyle(
+                                  fontSize: 11,
+                                  color: Theme.of(
+                                    context,
+                                  ).colorScheme.onSurfaceVariant,
+                                ),
+                              ),
+                            ],
+                            const SizedBox(height: 12),
+                          ],
                         ),
-                        Text(
-                          '${items.length} 个',
-                          style: TextStyle(
-                            color: Theme.of(
-                              context,
-                            ).colorScheme.onSurfaceVariant,
-                          ),
-                        ),
-                      ],
-                    ),
-                    if (items.isNotEmpty) ...[
-                      const SizedBox(height: 8),
-                      Wrap(
-                        spacing: 8,
-                        runSpacing: 8,
-                        children: [
-                          OutlinedButton.icon(
-                            onPressed: _busy
-                                ? null
-                                : () => setState(() {
-                                    _selectionMode = !_selectionMode;
-                                    if (!_selectionMode) _selectedIds.clear();
-                                  }),
-                            icon: Icon(
-                              _selectionMode
-                                  ? Icons.close_rounded
-                                  : Icons.checklist_rounded,
-                            ),
-                            label: Text(_selectionMode ? '退出选择' : '批量管理'),
-                          ),
-                          if (_selectionMode)
-                            OutlinedButton.icon(
-                              onPressed: _busy
-                                  ? null
-                                  : () => setState(() {
-                                      final visibleIds = filtered
-                                          .map((plugin) => plugin.id)
-                                          .toSet();
-                                      if (visibleIds.every(
-                                        _selectedIds.contains,
-                                      )) {
-                                        _selectedIds.removeAll(visibleIds);
-                                      } else {
-                                        _selectedIds.addAll(visibleIds);
-                                      }
-                                    }),
-                              icon: const Icon(Icons.select_all_rounded),
-                              label: const Text('全选当前结果'),
-                            ),
-                          if (_selectionMode)
-                            FilledButton.icon(
-                              onPressed: _busy || _selectedIds.isEmpty
-                                  ? null
-                                  : () => _removeSelected(items),
-                              icon: const Icon(Icons.delete_outline_rounded),
-                              label: Text('删除选中（${_selectedIds.length}）'),
-                            ),
-                          OutlinedButton.icon(
-                            onPressed: _busy ? null : () => _removeAll(items),
-                            icon: const Icon(Icons.delete_sweep_outlined),
-                            label: const Text('删除全部'),
-                          ),
-                        ],
-                      ),
-                    ],
-                    const SizedBox(height: 10),
-                    TextField(
-                      onChanged: (value) => setState(() => _query = value),
-                      decoration: const InputDecoration(
-                        hintText: '搜索插件名称、作者或 ID',
-                        prefixIcon: Icon(Icons.search_rounded),
                       ),
                     ),
-                    const SizedBox(height: 12),
                     if (items.isEmpty)
-                      _EmptyPlugins(
-                        onOnline: _installFromUrl,
-                        onLocal: _importLocal,
-                      )
-                    else if (filtered.isEmpty)
-                      const Padding(
-                        padding: EdgeInsets.symmetric(vertical: 50),
-                        child: Center(child: Text('没有匹配的插件')),
+                      SliverPadding(
+                        padding: const EdgeInsets.fromLTRB(16, 0, 16, 24),
+                        sliver: SliverToBoxAdapter(
+                          child: _EmptyPlugins(
+                            onOnline: _installFromUrl,
+                            onLocal: _importLocal,
+                          ),
+                        ),
                       )
                     else
-                      for (final plugin in filtered) ...[
-                        _PluginCard(
-                          plugin: plugin,
-                          busy: _busy,
-                          selectable: _selectionMode,
-                          selected: _selectedIds.contains(plugin.id),
-                          onSelect: (value) => setState(() {
-                            value
-                                ? _selectedIds.add(plugin.id)
-                                : _selectedIds.remove(plugin.id);
-                          }),
-                          onToggle: (value) => ref
+                      SliverPadding(
+                        padding: const EdgeInsets.fromLTRB(16, 0, 16, 24),
+                        sliver: SliverReorderableList(
+                          onReorderItem: (oldIndex, newIndex) => ref
                               .read(_pluginsProvider.notifier)
-                              .toggle(plugin, value),
-                          onUpdate: plugin.sourceUrl == null
-                              ? null
-                              : () => _update(plugin),
-                          onRemove: () => _remove(plugin),
+                              .reorder(oldIndex, newIndex),
+                          itemCount: items.length,
+                          itemBuilder: (context, index) {
+                            final plugin = items[index];
+                            return Padding(
+                              key: ValueKey(plugin.id),
+                              padding: EdgeInsets.only(
+                                bottom: index == items.length - 1 ? 0 : 10,
+                              ),
+                              // 批量选择模式下不显示拖拽手柄，避免与勾选冲突。
+                              child: _PluginCard(
+                                plugin: plugin,
+                                dragIndex: _selectionMode ? -1 : index,
+                                busy: _busy,
+                                selectable: _selectionMode,
+                                selected: _selectedIds.contains(plugin.id),
+                                onSelect: (value) => setState(() {
+                                  value
+                                      ? _selectedIds.add(plugin.id)
+                                      : _selectedIds.remove(plugin.id);
+                                }),
+                                onToggle: (value) => ref
+                                    .read(_pluginsProvider.notifier)
+                                    .toggle(plugin, value),
+                                onInfo: () => _showPluginInfo(plugin),
+                                onUserVariables:
+                                    plugin.userVariables.isEmpty
+                                    ? null
+                                    : () => _showUserVariables(plugin),
+                                onUpdate: !plugin.isOnline
+                                    ? null
+                                    : () => _update(plugin),
+                                onRemove: () => _remove(plugin),
+                              ),
+                            );
+                          },
                         ),
-                        const SizedBox(height: 10),
-                      ],
+                      ),
                   ],
                 ),
                 if (_busy)
@@ -982,21 +1273,28 @@ class _EmptyPlugins extends StatelessWidget {
 class _PluginCard extends StatelessWidget {
   const _PluginCard({
     required this.plugin,
+    required this.dragIndex,
     required this.busy,
     required this.selectable,
     required this.selected,
     required this.onSelect,
     required this.onToggle,
+    required this.onInfo,
+    required this.onUserVariables,
     required this.onUpdate,
     required this.onRemove,
   });
 
   final _PluginInfo plugin;
+  /// 拖拽手柄对应的列表下标；小于 0（批量选择模式）时不显示手柄。
+  final int dragIndex;
   final bool busy;
   final bool selectable;
   final bool selected;
   final ValueChanged<bool> onSelect;
   final ValueChanged<bool> onToggle;
+  final VoidCallback onInfo;
+  final VoidCallback? onUserVariables;
   final VoidCallback? onUpdate;
   final VoidCallback onRemove;
 
@@ -1005,7 +1303,7 @@ class _PluginCard extends StatelessWidget {
     final theme = Theme.of(context);
     final dark = theme.brightness == Brightness.dark;
     return Container(
-      padding: const EdgeInsets.fromLTRB(13, 12, 7, 12),
+      padding: const EdgeInsets.fromLTRB(7, 12, 7, 12),
       decoration: BoxDecoration(
         color: theme.colorScheme.surface.withValues(alpha: 0.92),
         borderRadius: BorderRadius.circular(XyRadii.large),
@@ -1019,20 +1317,22 @@ class _PluginCard extends StatelessWidget {
             Checkbox(
               value: selected,
               onChanged: busy ? null : (value) => onSelect(value ?? false),
+            )
+          else if (dragIndex >= 0)
+            // 只有拖拽手柄区域可以发起排序拖拽，卡片其它位置不响应。
+            ReorderableDragStartListener(
+              index: dragIndex,
+              child: SizedBox(
+                width: 36,
+                height: 46,
+                child: Icon(
+                  Icons.drag_indicator_rounded,
+                  size: 22,
+                  color: theme.colorScheme.onSurfaceVariant,
+                ),
+              ),
             ),
-          Container(
-            width: 46,
-            height: 46,
-            decoration: BoxDecoration(
-              color: theme.colorScheme.primary.withValues(alpha: 0.14),
-              borderRadius: BorderRadius.circular(13),
-            ),
-            child: Icon(
-              Icons.extension_rounded,
-              color: theme.colorScheme.primary,
-            ),
-          ),
-          const SizedBox(width: 11),
+          const SizedBox(width: 4),
           Expanded(
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
@@ -1048,7 +1348,7 @@ class _PluginCard extends StatelessWidget {
                   [
                     'v${plugin.version}',
                     if (plugin.author?.isNotEmpty == true) plugin.author!,
-                    plugin.sourceUrl == null ? '本地' : '在线',
+                    plugin.isOnline ? '在线' : '本地',
                   ].join(' · '),
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
@@ -1064,15 +1364,48 @@ class _PluginCard extends StatelessWidget {
           PopupMenuButton<String>(
             enabled: !busy,
             onSelected: (value) {
+              if (value == 'info') onInfo();
+              if (value == 'variables') onUserVariables?.call();
               if (value == 'update') onUpdate?.call();
               if (value == 'remove') onRemove();
             },
             itemBuilder: (context) => [
+              const PopupMenuItem(value: 'info', child: Text('插件信息')),
+              if (onUserVariables != null)
+                const PopupMenuItem(value: 'variables', child: Text('用户变量')),
               if (onUpdate != null)
                 const PopupMenuItem(value: 'update', child: Text('检查并安装更新')),
               const PopupMenuItem(value: 'remove', child: Text('卸载插件')),
             ],
           ),
+        ],
+      ),
+    );
+  }
+}
+
+class _PluginInfoRow extends StatelessWidget {
+  const _PluginInfoRow({required this.label, required this.value});
+
+  final String label;
+  final String value;
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 12),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            label,
+            style: TextStyle(
+              fontSize: 12,
+              color: Theme.of(context).colorScheme.onSurfaceVariant,
+            ),
+          ),
+          const SizedBox(height: 3),
+          Text(value),
         ],
       ),
     );

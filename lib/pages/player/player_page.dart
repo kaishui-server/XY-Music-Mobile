@@ -2,21 +2,26 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:math' as math;
+import 'dart:ui' as ui;
 
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:http/http.dart' as http;
 import 'package:path/path.dart' as p;
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:video_player/video_player.dart';
 
 import '../../src/core/db_path.dart';
 import '../../src/core/settings.dart';
+import '../../src/auth/auth_provider.dart';
 import '../../src/favorites/favorites_provider.dart';
 import '../../src/player/player_provider.dart';
+import '../../src/player/desktop_lyrics.dart';
 import '../../src/player/downloaded_song_store.dart';
+import '../../src/player/android_storage.dart';
 import '../../src/player/video_playback_session.dart';
 import '../../src/playlists/playlists_provider.dart';
 import '../../src/plugins/plugin_runtime.dart';
@@ -24,6 +29,8 @@ import '../../src/rust/api.dart';
 import '../../src/rust/music/types.dart';
 import '../../src/widgets/cover_image.dart';
 import '../../src/widgets/top_notice.dart';
+
+const _pluginLyricsSearchMemoryKey = 'pluginLyricsSearchQueriesV1';
 
 final _lyricsProvider = FutureProvider.autoDispose
     .family<List<_LyricLine>, String>((ref, path) async {
@@ -56,6 +63,56 @@ List<_LyricLine> _decodeLyricLines(Map<String, dynamic> payload) {
       })
       .where((line) => line.text.trim().isNotEmpty)
       .toList();
+}
+
+/// 有些插件会把 QRC/KRC 等歌词的密文直接放进播放结果。播放页解析器
+/// 可以识别其中一部分格式，但如果原样写入下载的 `.lrc` 文件，用户看到的
+/// 就会是长串数字和大写字母。仅对明显不像歌词正文的编码串做转换，普通
+/// 英文歌词不会被误判。
+bool _looksLikeEncodedLyrics(String raw) {
+  final text = raw.trim();
+  if (text.length < 80 || text.contains('[') || text.contains('<')) {
+    return false;
+  }
+  final compact = text.replaceAll(RegExp(r'\s+'), '');
+  if (compact.length < 80 ||
+      !RegExp(r'^[A-Za-z0-9+/=_-]+$').hasMatch(compact)) {
+    return false;
+  }
+  final upperOrDigit = RegExp(r'[A-Z0-9]').allMatches(compact).length;
+  return upperOrDigit / compact.length >= .82;
+}
+
+String _formatLrcTime(double seconds) {
+  final milliseconds = (seconds.isFinite && seconds > 0 ? seconds * 1000 : 0)
+      .round();
+  final minutes = milliseconds ~/ 60000;
+  final remainder = milliseconds % 60000;
+  final wholeSeconds = remainder ~/ 1000;
+  final millis = remainder % 1000;
+  return '[${minutes.toString().padLeft(2, '0')}:${wholeSeconds.toString().padLeft(2, '0')}.${millis.toString().padLeft(3, '0')}]';
+}
+
+/// 将解析器输出的展示行还原为可保存的标准 LRC。这样下载文件中不会保留
+/// QRC 等密文，同时翻译行仍会按同一时间戳写入。
+String _displayLinesToLrc(dynamic payload) {
+  if (payload is! Map) return '';
+  final lines = payload['displayLines'];
+  if (lines is! List) return '';
+  final output = <String>[];
+  for (final value in lines.whereType<Map>()) {
+    final text = value['text']?.toString().trim() ?? '';
+    if (text.isEmpty) continue;
+    final time = (value['time'] as num?)?.toDouble();
+    if (time == null || !time.isFinite || time < 0) continue;
+    final stamp = _formatLrcTime(time);
+    output.add('$stamp$text');
+    final translation = value['translation']?.toString().trim() ?? '';
+    if (translation.isNotEmpty && translation != text) {
+      output.add('$stamp$translation');
+    }
+  }
+  return output.join('\n');
 }
 
 List<_LyricWord> _decodeLyricWords(dynamic value) {
@@ -104,16 +161,21 @@ class _LyricLine {
 }
 
 enum _PlayerMenuAction {
+  share,
   download,
   quality,
   playlist,
   linkLyrics,
   lyricsOffset,
+  lyricFontSize,
   sleepTimer,
+  playbackSpeed,
+  toggleDesktopLyrics,
   playVideo,
+  playMv,
 }
 
-enum _LyricsSourceAction { plugin, local }
+enum _LyricsSourceAction { plugin, local, cancel }
 
 enum _SleepTimerOption {
   off,
@@ -126,10 +188,15 @@ enum _SleepTimerOption {
 }
 
 class _DownloadOptions {
-  const _DownloadOptions({required this.directory, required this.quality});
+  const _DownloadOptions({
+    required this.directory,
+    required this.quality,
+    this.dontAskAgain = false,
+  });
 
   final String directory;
   final String quality;
+  final bool dontAskAgain;
 }
 
 String _formatSleepDuration(Duration duration) {
@@ -145,6 +212,9 @@ String _formatSleepDuration(Duration duration) {
 }
 
 const _lyricsOffsetsPreferenceKey = 'playerLyricsOffsetsTenthsV1';
+// 播放详情页可能被反复打开（B 站视频尤其常见）；同一首歌的无歌词提示
+// 只在当前应用运行期间首次进入时显示一次，避免每次返回页面都打扰用户。
+final _noLyricsNoticeShownPaths = <String>{};
 
 int clampLyricsOffsetTenths(int value) => value.clamp(-100, 100);
 
@@ -186,7 +256,7 @@ bool _isBilibiliQueueItem(QueueItem item) {
 }
 
 /// 正在播放页：现代毛玻璃风格。
-/// 封面大圆角浮于流光背景之上，下方毛玻璃控制卡承载进度与按钮。
+/// 封面大圆角浮于详情页背景之上，下方播放栏直接叠加在背景上。
 class PlayerPage extends ConsumerStatefulWidget {
   const PlayerPage({super.key});
 
@@ -198,6 +268,7 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
   static const _screenAwakeChannel = MethodChannel(
     'com.xymusic.mobile/screen_awake',
   );
+  static const _galleryChannel = MethodChannel('com.xymusic.mobile/gallery');
 
   late final PageController _detailPageController = PageController();
   ProviderSubscription<bool>? _playingSubscription;
@@ -215,6 +286,7 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
   String? _videoSongPath;
   bool _videoLoading = false;
   bool _videoClosing = false;
+  bool _videoIsMv = false;
   bool _resumeAudioAfterVideo = false;
   String? _videoError;
   VoidCallback? _videoControllerListener;
@@ -230,6 +302,7 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
     _videoController = VideoPlaybackSession.controller;
     _videoSongPath = VideoPlaybackSession.songPath;
     _videoLoading = VideoPlaybackSession.loading;
+    _videoIsMv = VideoPlaybackSession.isMv;
     _resumeAudioAfterVideo = VideoPlaybackSession.resumeAudioAfterVideo;
     _videoError = VideoPlaybackSession.error;
     VideoPlaybackSession.revision.addListener(_syncVideoSession);
@@ -376,12 +449,16 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
     final delta = end - start;
     final horizontalDistance = delta.dx.abs();
     final verticalDistance = delta.dy.abs();
+    // Keep the gesture easy to trigger on narrow phones.  The previous
+    // 84px/24% threshold made short, deliberate swipes get ignored.  A
+    // smaller distance still requires a clear horizontal direction so the
+    // vertical lyric scrolling gesture does not switch the page by accident.
     final requiredDistance = math.max(
-      84.0,
-      math.min(128.0, viewportWidth * .24),
+      56.0,
+      math.min(96.0, viewportWidth * .18),
     );
     if (horizontalDistance < requiredDistance ||
-        horizontalDistance < verticalDistance * 1.65) {
+        horizontalDistance < verticalDistance * 1.3) {
       return;
     }
     if (delta.dx < 0 && !_showLyrics) {
@@ -397,9 +474,12 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
     _detailPointerLast = null;
   }
 
-  Future<void> _startBilibiliVideo(QueueItem item) async {
+  /// 启动视频画面。B 站插件歌曲走 [resolveVideoSource]；其他插件歌曲
+  /// 在 [isMv] 为 true 时参考 BakaMusic 调用插件 `getMvSource` 解析 MV，
+  /// 其余流程（视频层、进度同步、媒体通知桥接）与 B 站视频完全一致。
+  Future<void> _startBilibiliVideo(QueueItem item, {bool isMv = false}) async {
     if (_videoLoading || _videoSongPath == item.path) return;
-    if (!_isBilibiliQueueItem(item)) {
+    if (!isMv && !_isBilibiliQueueItem(item)) {
       XyNotice.show(
         context,
         message: '当前歌曲不是哔哩哔哩插件歌曲',
@@ -411,7 +491,7 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
     if (pluginData == null || pluginData.isEmpty) {
       XyNotice.show(
         context,
-        message: '当前歌曲缺少 B 站视频信息',
+        message: isMv ? '当前歌曲缺少 MV 信息' : '当前歌曲缺少 B 站视频信息',
         type: XyNoticeType.error,
       );
       return;
@@ -423,7 +503,9 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
       if (mounted) {
         XyNotice.show(
           context,
-          message: '读取哔哩哔哩插件失败：${_errorText(error)}',
+          message: isMv
+              ? '读取歌曲插件失败：${_errorText(error)}'
+              : '读取哔哩哔哩插件失败：${_errorText(error)}',
           type: XyNoticeType.error,
         );
       }
@@ -434,7 +516,11 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
         .firstOrNull;
     if (!mounted) return;
     if (plugin == null) {
-      XyNotice.show(context, message: '哔哩哔哩插件已停用或删除', type: XyNoticeType.error);
+      XyNotice.show(
+        context,
+        message: isMv ? '歌曲所属插件已停用或删除' : '哔哩哔哩插件已停用或删除',
+        type: XyNoticeType.error,
+      );
       return;
     }
 
@@ -448,25 +534,32 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
       _videoSongPath = item.path;
       _videoLoading = true;
       _videoClosing = false;
+      _videoIsMv = isMv;
       _resumeAudioAfterVideo = resumeAudio;
       _videoError = null;
     });
     VideoPlaybackSession.songPath = item.path;
     VideoPlaybackSession.controller = null;
     VideoPlaybackSession.loading = true;
+    VideoPlaybackSession.isMv = isMv;
     VideoPlaybackSession.resumeAudioAfterVideo = resumeAudio;
     VideoPlaybackSession.error = null;
     VideoPlaybackSession.changed();
     try {
-      final source = await ref
-          .read(pluginRuntimeProvider)
-          .resolveVideoSource(
-            plugin,
-            pluginData,
-            videoQuality: '720P',
-            path: item.path,
-          )
-          .timeout(const Duration(seconds: 25));
+      final source = isMv
+          ? await ref
+                .read(pluginRuntimeProvider)
+                .resolveMvSource(plugin, pluginData)
+                .timeout(const Duration(seconds: 25))
+          : await ref
+                .read(pluginRuntimeProvider)
+                .resolveVideoSource(
+                  plugin,
+                  pluginData,
+                  videoQuality: '720P',
+                  path: item.path,
+                )
+                .timeout(const Duration(seconds: 25));
       if (!mounted || _videoSongPath != item.path) return;
       VideoPlayerController? controller;
       Object? lastVideoError;
@@ -504,6 +597,8 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
         return;
       }
       final position = ref.read(playerProvider).position;
+      final playbackSpeed = ref.read(playerProvider).playbackSpeed;
+      await activeController.setPlaybackSpeed(playbackSpeed);
       if (position.isFinite && position > 0) {
         await activeController.seekTo(
           Duration(milliseconds: (position * 1000).round()),
@@ -526,11 +621,13 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
       setState(() {
         _videoSongPath = null;
         _videoLoading = false;
+        _videoIsMv = false;
         _videoError = errorText;
       });
       VideoPlaybackSession.songPath = null;
       VideoPlaybackSession.controller = null;
       VideoPlaybackSession.loading = false;
+      VideoPlaybackSession.isMv = false;
       VideoPlaybackSession.error = errorText;
       VideoPlaybackSession.changed();
       _videoController = null;
@@ -541,7 +638,9 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
       if (mounted) {
         XyNotice.show(
           context,
-          message: '视频播放失败：${_errorText(error)}',
+          message: isMv
+              ? 'MV 播放失败：${_errorText(error)}'
+              : '视频播放失败：${_errorText(error)}',
           type: XyNoticeType.error,
         );
       }
@@ -567,10 +666,12 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
     _videoSongPath = null;
     _videoLoading = false;
     _videoError = null;
+    _videoIsMv = false;
     _resumeAudioAfterVideo = false;
     VideoPlaybackSession.songPath = null;
     VideoPlaybackSession.controller = null;
     VideoPlaybackSession.loading = false;
+    VideoPlaybackSession.isMv = false;
     VideoPlaybackSession.resumeAudioAfterVideo = false;
     VideoPlaybackSession.error = null;
     VideoPlaybackSession.changed();
@@ -596,22 +697,51 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
     _videoClosing = false;
   }
 
+  /// 参考 BakaMusic 的 canPlayMusicVideo：非 B 站插件歌曲需要插件
+  /// 声明 `getMvSource` 扩展，且歌曲携带 mv/mvId/videoId 等 MV 标识，
+  /// 才在更多菜单中提供“播放MV”。
+  Future<bool> _checkMvAvailable(QueueItem item) async {
+    final pluginData = item.pluginData;
+    if (item.pluginId == null || pluginData == null) return false;
+    if (!PluginRuntimeService.hasMvIdentifier(pluginData)) return false;
+    try {
+      final plugins = await ref.read(enabledMusicPluginsProvider.future);
+      final plugin = plugins
+          .where((value) => value.id == item.pluginId)
+          .firstOrNull;
+      if (plugin == null || plugin.isLx) return false;
+      return await ref
+          .read(pluginRuntimeProvider)
+          .pluginSupportsMvSource(plugin);
+    } catch (_) {
+      return false;
+    }
+  }
+
   Future<void> _showMoreMenu(QueueItem item) async {
     final settings = ref.read(settingsProvider).valueOrNull;
+    final playbackSpeed = ref.read(playerProvider).playbackSpeed;
+    final isLocalSong =
+        playbackSourceTypeFor(item) == PlaybackSourceType.localFile;
     final viewport = MediaQuery.sizeOf(context);
     final isLandscape = viewport.width > viewport.height;
+    final mvAvailable = !_isBilibiliQueueItem(item) &&
+        await _checkMvAvailable(item);
+    if (!mounted) return;
     final action = await showModalBottomSheet<_PlayerMenuAction>(
       context: context,
       useRootNavigator: true,
       showDragHandle: true,
       isScrollControlled: true,
       useSafeArea: true,
+      // 仅限制更多菜单的高度，宽度保持系统默认布局；项目较多时由下方
+      // SingleChildScrollView 负责纵向滑动浏览。
       constraints: isLandscape
           ? BoxConstraints(
               maxWidth: math.min(560, viewport.width - 32),
-              maxHeight: viewport.height * .9,
+              maxHeight: viewport.height * .64,
             )
-          : null,
+          : BoxConstraints(maxHeight: viewport.height * .64),
       builder: (sheetContext) => Consumer(
         builder: (context, ref, child) {
           final sleepTimerEndsAt = ref.watch(
@@ -672,25 +802,35 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
                                 ],
                               ),
                             ),
+                            IconButton(
+                              tooltip: '分享',
+                              onPressed: () => Navigator.pop(
+                                sheetContext,
+                                _PlayerMenuAction.share,
+                              ),
+                              icon: const Icon(Icons.share_outlined),
+                            ),
                           ],
                         ),
                       ),
                       const Divider(height: 1),
-                      _moreTile(
-                        sheetContext,
-                        action: _PlayerMenuAction.download,
-                        icon: Icons.download_rounded,
-                        title: '下载',
-                      ),
-                      _moreTile(
-                        sheetContext,
-                        action: _PlayerMenuAction.quality,
-                        icon: Icons.high_quality_rounded,
-                        title: '选择音质',
-                        value: _qualityLabel(
-                          settings?.onlineDefaultQuality ?? '320k',
+                      if (!isLocalSong) ...[
+                        _moreTile(
+                          sheetContext,
+                          action: _PlayerMenuAction.download,
+                          icon: Icons.download_rounded,
+                          title: '下载',
                         ),
-                      ),
+                        _moreTile(
+                          sheetContext,
+                          action: _PlayerMenuAction.quality,
+                          icon: Icons.high_quality_rounded,
+                          title: '选择音质',
+                          value: _qualityLabel(
+                            settings?.onlineDefaultQuality ?? '320k',
+                          ),
+                        ),
+                      ],
                       _moreTile(
                         sheetContext,
                         action: _PlayerMenuAction.playlist,
@@ -712,19 +852,50 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
                       ),
                       _moreTile(
                         sheetContext,
+                        action: _PlayerMenuAction.lyricFontSize,
+                        icon: Icons.format_size_rounded,
+                        title: '歌词字号',
+                        value: (settings?.lyricFontSize ?? 18)
+                            .toStringAsFixed(0),
+                      ),
+                      _moreTile(
+                        sheetContext,
                         action: _PlayerMenuAction.sleepTimer,
                         icon: Icons.timer_outlined,
                         title: '定时关闭',
                         value: _sleepTimerLabel(sleepTimerEndsAt),
                       ),
-                      if (_isBilibiliQueueItem(item))
+                      _moreTile(
+                        sheetContext,
+                        action: _PlayerMenuAction.playbackSpeed,
+                        icon: Icons.speed_rounded,
+                        title: '倍速',
+                        value: '${_formatPlaybackSpeed(playbackSpeed)}x',
+                      ),
+                      _moreTile(
+                        sheetContext,
+                        action: _PlayerMenuAction.toggleDesktopLyrics,
+                        icon: settings?.desktopLyricsEnabled == true
+                            ? Icons.desktop_access_disabled_outlined
+                            : Icons.desktop_windows_outlined,
+                        title: settings?.desktopLyricsEnabled == true
+                            ? '关闭桌面歌词'
+                            : '开启桌面歌词',
+                      ),
+                      if (_isBilibiliQueueItem(item) || mvAvailable)
                         _moreTile(
                           sheetContext,
-                          action: _PlayerMenuAction.playVideo,
+                          action: _isBilibiliQueueItem(item)
+                              ? _PlayerMenuAction.playVideo
+                              : _PlayerMenuAction.playMv,
                           icon: _videoSongPath == item.path
                               ? Icons.stop_circle_outlined
                               : Icons.ondemand_video_outlined,
-                          title: _videoSongPath == item.path ? '关闭视频' : '播放视频',
+                          title: _videoSongPath == item.path
+                              ? (_videoIsMv ? '关闭MV' : '关闭视频')
+                              : (_isBilibiliQueueItem(item)
+                                    ? '播放视频'
+                                    : '播放MV'),
                           value: _videoLoading ? '解析中' : null,
                         ),
                     ],
@@ -738,6 +909,8 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
     );
     if (!mounted || action == null) return;
     switch (action) {
+      case _PlayerMenuAction.share:
+        await _showShareSheet(item);
       case _PlayerMenuAction.download:
         await _downloadCurrent(item);
       case _PlayerMenuAction.quality:
@@ -748,34 +921,428 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
         await _linkLyrics(item);
       case _PlayerMenuAction.lyricsOffset:
         await _pickLyricsOffset(item);
+      case _PlayerMenuAction.lyricFontSize:
+        await _pickLyricFontSize();
       case _PlayerMenuAction.sleepTimer:
         await _pickSleepTimer();
+      case _PlayerMenuAction.playbackSpeed:
+        await _pickPlaybackSpeed();
+      case _PlayerMenuAction.toggleDesktopLyrics:
+        await _toggleDesktopLyrics();
       case _PlayerMenuAction.playVideo:
         if (_videoSongPath == item.path) {
           await _closeBilibiliVideo();
         } else {
           await _startBilibiliVideo(item);
         }
+      case _PlayerMenuAction.playMv:
+        if (_videoSongPath == item.path) {
+          await _closeBilibiliVideo();
+        } else {
+          await _startBilibiliVideo(item, isMv: true);
+        }
     }
   }
 
+  Future<void> _showShareSheet(QueueItem item) async {
+    await showModalBottomSheet<void>(
+      context: context,
+      useRootNavigator: true,
+      showDragHandle: true,
+      useSafeArea: true,
+      builder: (sheetContext) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const ListTile(
+              leading: Icon(Icons.share_outlined),
+              title: Text('分享歌曲'),
+            ),
+            ListTile(
+              leading: const Icon(Icons.image_outlined),
+              title: const Text('保存为分享图片'),
+              onTap: () {
+                Navigator.pop(sheetContext);
+                unawaited(_createShareImagePreview(item));
+              },
+            ),
+            ListTile(
+              leading: const Icon(Icons.chat_outlined),
+              title: const Text('分享链接到QQ'),
+              onTap: () => Navigator.pop(sheetContext),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Future<void> _createShareImagePreview(QueueItem item) async {
+    try {
+      final bytes = await _buildShareImage(item);
+      if (!mounted) return;
+      await showDialog<void>(
+        context: context,
+        builder: (dialogContext) => AlertDialog(
+          title: const Text('分享图片预览'),
+          content: ConstrainedBox(
+            constraints: const BoxConstraints(maxHeight: 560, maxWidth: 420),
+            child: InteractiveViewer(
+              minScale: .8,
+              maxScale: 3,
+              child: Image.memory(bytes, fit: BoxFit.contain),
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(dialogContext),
+              child: const Text('取消'),
+            ),
+            FilledButton(
+              onPressed: () async {
+                final saved = await _saveShareImage(bytes);
+                if (saved && dialogContext.mounted) {
+                  Navigator.pop(dialogContext);
+                }
+              },
+              child: const Text('保存到本地'),
+            ),
+          ],
+        ),
+      );
+    } catch (error) {
+      if (mounted) {
+        XyNotice.show(
+          context,
+          message: '生成分享图片失败：${_errorText(error)}',
+          type: XyNoticeType.error,
+        );
+      }
+    }
+  }
+
+  Future<bool> _saveShareImage(Uint8List bytes) async {
+    try {
+      final fileName =
+          'xy_music_share_${DateTime.now().millisecondsSinceEpoch}.png';
+      bool saved;
+      if (Platform.isAndroid) {
+        saved =
+            await _galleryChannel.invokeMethod<bool>('saveImage', {
+              'bytes': bytes,
+              'fileName': fileName,
+            }) ??
+            false;
+      } else {
+        // 其他桌面平台保留文件保存能力；Android 直接写入系统相册，
+        // 不再弹出目录选择器。
+        final path = await FilePicker.platform.saveFile(
+          dialogTitle: '保存分享图片',
+          fileName: fileName,
+          type: FileType.custom,
+          allowedExtensions: const ['png'],
+          bytes: bytes,
+        );
+        saved = path != null && path.isNotEmpty;
+      }
+      if (!mounted || !saved) return false;
+      XyNotice.show(context, message: '分享图片已保存', type: XyNoticeType.success);
+      return true;
+    } catch (error) {
+      if (mounted) {
+        XyNotice.show(
+          context,
+          message: '保存分享图片失败：${_errorText(error)}',
+          type: XyNoticeType.error,
+        );
+      }
+      return false;
+    }
+  }
+
+  Future<Uint8List> _buildShareImage(QueueItem item) async {
+    const width = 450.0;
+    const height = 600.0;
+    final accentColor = Theme.of(context).colorScheme.primary;
+    final settings = ref.read(settingsProvider).valueOrNull;
+    final backgroundBytes = await _shareBackgroundBytes(item, settings);
+    final recorder = ui.PictureRecorder();
+    final canvas = Canvas(recorder);
+    final bounds = const Rect.fromLTWH(0, 0, width, height);
+    if (backgroundBytes != null && backgroundBytes.isNotEmpty) {
+      final codec = await ui.instantiateImageCodec(
+        backgroundBytes,
+        targetWidth: width.toInt(),
+      );
+      final frame = await codec.getNextFrame();
+      final image = frame.image;
+      final source = Rect.fromLTWH(
+        0,
+        0,
+        image.width.toDouble(),
+        image.height.toDouble(),
+      );
+      final scale = math.max(width / image.width, height / image.height);
+      final destination = Rect.fromCenter(
+        center: bounds.center,
+        width: image.width * scale,
+        height: image.height * scale,
+      );
+      final paint = Paint()
+        ..filterQuality = FilterQuality.high
+        ..imageFilter = ui.ImageFilter.blur(sigmaX: 2, sigmaY: 2);
+      canvas.drawImageRect(image, source, destination, paint);
+      image.dispose();
+    } else {
+      final gradient = LinearGradient(
+        colors: [
+          accentColor.withValues(alpha: .9),
+          const Color(0xFF171323),
+          const Color(0xFF0A0A0F),
+        ],
+        begin: Alignment.topLeft,
+        end: Alignment.bottomRight,
+      );
+      canvas.drawRect(bounds, Paint()..shader = gradient.createShader(bounds));
+    }
+    canvas.drawRect(
+      bounds,
+      Paint()..color = Colors.black.withValues(alpha: .34),
+    );
+    final user = ref.read(authProvider).user;
+    final userName = user?.nickname.trim() ?? '';
+    final greeting = userName.isEmpty
+        ? 'XY Music 给你分享了一首歌'
+        : '$userName 给你分享了一首歌';
+    _paintText(
+      canvas,
+      greeting,
+      const Offset(30, 30),
+      maxWidth: width - 60,
+      fontSize: 18,
+      color: Colors.white.withValues(alpha: .94),
+      fontWeight: userName.isEmpty ? FontWeight.w600 : FontWeight.w800,
+      maxLines: 3,
+    );
+    _paintText(
+      canvas,
+      item.title.trim().isEmpty ? '未知歌曲' : item.title.trim(),
+      const Offset(30, 475),
+      maxWidth: width - 60,
+      fontSize: 38,
+      color: Colors.white,
+      fontWeight: FontWeight.w800,
+      maxLines: 2,
+    );
+    _paintText(
+      canvas,
+      item.artist.trim().isEmpty ? '未知歌手' : item.artist.trim(),
+      const Offset(32, 545),
+      maxWidth: width - 64,
+      fontSize: 18,
+      color: Colors.white.withValues(alpha: .78),
+      fontWeight: FontWeight.w500,
+      maxLines: 1,
+    );
+    final picture = recorder.endRecording();
+    final image = await picture.toImage(width.toInt(), height.toInt());
+    final data = await image.toByteData(format: ui.ImageByteFormat.png);
+    image.dispose();
+    picture.dispose();
+    if (data == null) throw Exception('图片编码失败');
+    return data.buffer.asUint8List();
+  }
+
+  void _paintText(
+    Canvas canvas,
+    String text,
+    Offset offset, {
+    required double maxWidth,
+    required double fontSize,
+    required Color color,
+    required FontWeight fontWeight,
+    int maxLines = 1,
+    TextAlign textAlign = TextAlign.left,
+  }) {
+    final painter = TextPainter(
+      text: TextSpan(
+        text: text,
+        style: TextStyle(
+          color: color,
+          fontSize: fontSize,
+          fontWeight: fontWeight,
+          shadows: const [Shadow(color: Colors.black54, blurRadius: 8)],
+        ),
+      ),
+      textDirection: TextDirection.ltr,
+      textAlign: textAlign,
+      maxLines: maxLines,
+      ellipsis: '…',
+    )..layout(maxWidth: maxWidth);
+    painter.paint(canvas, offset);
+  }
+
+  Future<Uint8List?> _shareBackgroundBytes(
+    QueueItem item,
+    AppSettings? settings,
+  ) async {
+    final coverUrl = item.coverUrl?.trim() ?? '';
+    if (coverUrl.startsWith('http://') || coverUrl.startsWith('https://')) {
+      try {
+        final response = await http
+            .get(Uri.parse(coverUrl))
+            .timeout(const Duration(seconds: 8));
+        if (response.statusCode >= 200 && response.statusCode < 300) {
+          return response.bodyBytes;
+        }
+      } catch (_) {}
+    }
+    if (playbackSourceTypeFor(item) == PlaybackSourceType.localFile) {
+      try {
+        final dbPath = await ref.read(dbPathProvider.future);
+        final cacheRoot = await ref.read(appDataDirProvider.future);
+        final path = await getSongCover(
+          dbPath: dbPath,
+          cacheRoot: cacheRoot,
+          path: item.path,
+        );
+        if (path.trim().isNotEmpty && await File(path).exists()) {
+          return await File(path).readAsBytes();
+        }
+      } catch (_) {}
+    }
+    final wallpaper = settings?.customBackgroundPath.trim() ?? '';
+    if (wallpaper.isNotEmpty && await File(wallpaper).exists()) {
+      return await File(wallpaper).readAsBytes();
+    }
+    return null;
+  }
+
+  Future<void> _toggleDesktopLyrics() async {
+    final currentlyEnabled =
+        ref.read(settingsProvider).valueOrNull?.desktopLyricsEnabled ?? false;
+    final nextEnabled = !currentlyEnabled;
+
+    if (nextEnabled) {
+      if (!Platform.isAndroid) {
+        if (mounted) {
+          XyNotice.show(
+            context,
+            message: '当前平台不支持桌面歌词',
+            type: XyNoticeType.warning,
+          );
+        }
+        return;
+      }
+      final started = await DesktopLyricsBridge.setEnabled(true);
+      if (!started) {
+        if (mounted) {
+          XyNotice.show(
+            context,
+            message: '请授予悬浮窗权限后再开启桌面歌词',
+            type: XyNoticeType.warning,
+          );
+        }
+        return;
+      }
+    } else {
+      await DesktopLyricsBridge.setEnabled(false);
+    }
+
+    await ref
+        .read(settingsProvider.notifier)
+        .setDesktopLyricsEnabled(nextEnabled);
+    if (!mounted) return;
+    XyNotice.show(
+      context,
+      message: nextEnabled ? '桌面歌词样式请在设置中修改' : '桌面歌词已关闭',
+      type: XyNoticeType.success,
+    );
+  }
+
+  Future<void> _pickPlaybackSpeed() async {
+    final current = ref.read(playerProvider).playbackSpeed;
+    const speeds = [0.5, 0.8, 1.0, 1.5, 2.0];
+    final selected = await showModalBottomSheet<double>(
+      context: context,
+      useRootNavigator: true,
+      showDragHandle: true,
+      builder: (sheetContext) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const ListTile(
+              leading: Icon(Icons.speed_rounded),
+              title: Text('播放倍速'),
+            ),
+            for (final speed in speeds)
+              ListTile(
+                title: Text('${_formatPlaybackSpeed(speed)}x'),
+                trailing: (speed - current).abs() < 0.001
+                    ? Icon(
+                        Icons.check,
+                        color: Theme.of(sheetContext).colorScheme.primary,
+                      )
+                    : null,
+                onTap: () => Navigator.pop(sheetContext, speed),
+              ),
+          ],
+        ),
+      ),
+    );
+    if (selected == null) return;
+    await ref.read(playerProvider.notifier).setPlaybackSpeed(selected);
+  }
+
+  String _formatPlaybackSpeed(double speed) => speed == speed.roundToDouble()
+      ? speed.toStringAsFixed(0)
+      : speed.toStringAsFixed(1);
+
+  /// 歌词字号调整弹窗：滑杆实时调整，下方用示例歌词预览效果，
+  /// 确认后写入设置。设置页“播放详情页歌词-歌词字号”共用同一份数据。
+  Future<void> _pickLyricFontSize() async {
+    await showModalBottomSheet<void>(
+      context: context,
+      useRootNavigator: true,
+      showDragHandle: true,
+      isScrollControlled: true,
+      builder: (sheetContext) => _LyricFontSizeSheet(
+        initial: ref.read(settingsProvider).valueOrNull?.lyricFontSize ?? 18.0,
+        onChanged: (value) => ref
+            .read(settingsProvider.notifier)
+            .setLyricFontSize(value),
+      ),
+    );
+  }
+
   Future<void> _addToPlaylist(QueueItem item) async {
-    final playlistId = await showModalBottomSheet<String>(
+    final result = await showModalBottomSheet<_PlaylistPickResult>(
       context: context,
       useRootNavigator: true,
       isScrollControlled: true,
       showDragHandle: true,
       builder: (_) => _PlaylistPickerSheet(item: item),
     );
-    if (!mounted || playlistId == null) return;
+    if (!mounted || result == null) return;
     final playlist = ref
         .read(playlistsProvider)
-        .where((value) => value.id == playlistId)
+        .where((value) => value.id == result.playlistId)
         .firstOrNull;
+    final name = playlist?.name;
     XyNotice.show(
       context,
-      message: playlist == null ? '已添加到歌单' : '已添加到歌单“${playlist.name}”',
-      type: XyNoticeType.success,
+      message: switch (result.kind) {
+        // 歌曲已在该歌单中，未重复添加。
+        _PlaylistPickKind.alreadyExists => name == null
+            ? '该歌曲已在歌单中'
+            : '该歌曲已在歌单“$name”中',
+        _PlaylistPickKind.added => name == null
+            ? '已添加到歌单'
+            : '已添加到歌单“$name”',
+      },
+      type: result.kind == _PlaylistPickKind.alreadyExists
+          ? XyNoticeType.warning
+          : XyNoticeType.success,
     );
   }
 
@@ -814,8 +1381,13 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
   }
 
   Future<void> _pickPlaybackQuality() async {
+    final item = ref.read(playerProvider).current;
+    if (item == null) return;
     final current =
         ref.read(settingsProvider).valueOrNull?.onlineDefaultQuality ?? '320k';
+    XyNotice.show(context, message: '正在读取插件支持的音质…');
+    final qualities = await _discoverQualityOptions(item, preferred: current);
+    if (!mounted) return;
     final quality = await showModalBottomSheet<String>(
       context: context,
       useRootNavigator: true,
@@ -825,7 +1397,7 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
           child: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
-              for (final value in const ['128k', '192k', '320k', 'flac'])
+              for (final value in qualities)
                 ListTile(
                   title: Text(_qualityLabel(value)),
                   trailing: value == current
@@ -853,45 +1425,122 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
     );
   }
 
+  /// 按显示名称去重音质选项。插件可能同时返回 flac/lossless/sq 等映射到
+  /// 同一档位名称的别名 token（master 系列同理），不去重时选择器会出现
+  /// 两个“无损 FLAC”或两个“超清母带”。同组别名保留当前选中的 token，
+  /// 保证勾选状态能正确回显；没有选中值时保留第一个。
+  List<String> _dedupeQualityByLabel(
+    List<String> qualities,
+    String preferred,
+  ) {
+    final trimmed = preferred.trim();
+    final ordered = [
+      if (trimmed.isNotEmpty && qualities.contains(trimmed)) trimmed,
+      ...qualities.where((value) => value != trimmed),
+    ];
+    final seenLabels = <String>{};
+    final result = <String>[];
+    for (final value in ordered) {
+      if (seenLabels.add(_qualityLabel(value))) result.add(value);
+    }
+    return result;
+  }
+
+  Future<List<String>> _discoverQualityOptions(
+    QueueItem item, {
+    String? preferred,
+  }) async {
+    final current = preferred?.trim() ?? '';
+    final fallback = <String>{if (current.isNotEmpty) current};
+    final raw = item.pluginData;
+    final pluginId = item.pluginId?.trim() ?? '';
+    if (raw == null || raw.isEmpty || pluginId.isEmpty) {
+      return fallback.isEmpty ? const ['320k'] : fallback.toList();
+    }
+    try {
+      final plugins = await ref.read(enabledMusicPluginsProvider.future);
+      final plugin = plugins.where((value) => value.id == pluginId).firstOrNull;
+      if (plugin == null) {
+        return fallback.isEmpty ? const ['320k'] : fallback.toList();
+      }
+      final discovered = await ref
+          .read(pluginRuntimeProvider)
+          .discoverQualities(plugin, raw, preferredQuality: current)
+          // 逐音质探测可能因插件网络问题长时间无响应，超时后回退到
+          // 当前音质，保证下载/切音质弹窗一定能弹出。
+          .timeout(const Duration(seconds: 12), onTimeout: () => const <String>[]);
+      final result = <String>{...discovered, ...fallback};
+      final list = result.isEmpty ? const ['320k'] : result.toList();
+      return _dedupeQualityByLabel(list, current);
+    } catch (_) {
+      return fallback.isEmpty ? const ['320k'] : fallback.toList();
+    }
+  }
+
   Future<void> _linkLyrics(QueueItem item) async {
+    final associated = await ref
+        .read(playerProvider.notifier)
+        .rememberedLyricsAssociation(item.path);
+    if (!mounted) return;
     final source = await showModalBottomSheet<_LyricsSourceAction>(
       context: context,
       useRootNavigator: true,
       showDragHandle: true,
       builder: (context) => SafeArea(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            const Padding(
-              padding: EdgeInsets.fromLTRB(20, 0, 20, 10),
-              child: Align(
-                alignment: Alignment.centerLeft,
-                child: Text(
-                  '关联歌词',
-                  style: TextStyle(fontSize: 18, fontWeight: FontWeight.w700),
+        child: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Padding(
+                padding: EdgeInsets.fromLTRB(20, 0, 20, 10),
+                child: Align(
+                  alignment: Alignment.centerLeft,
+                  child: Text(
+                    '关联歌词',
+                    style: TextStyle(fontSize: 18, fontWeight: FontWeight.w700),
+                  ),
                 ),
               ),
-            ),
-            ListTile(
-              leading: const Icon(Icons.extension_outlined),
-              title: const Text('从插件获取'),
-              subtitle: const Text('搜索所有已启用插件提供的歌词'),
-              trailing: const Icon(Icons.chevron_right),
-              onTap: () => Navigator.pop(context, _LyricsSourceAction.plugin),
-            ),
-            ListTile(
-              leading: const Icon(Icons.upload_file_outlined),
-              title: const Text('从本地上传'),
-              subtitle: const Text('选择 LRC、YRC、QRC 等歌词文件'),
-              trailing: const Icon(Icons.chevron_right),
-              onTap: () => Navigator.pop(context, _LyricsSourceAction.local),
-            ),
-          ],
+              if (associated != null)
+                _AssociatedLyricsCard(
+                  association: associated,
+                  onCancel: () =>
+                      Navigator.pop(context, _LyricsSourceAction.cancel),
+                ),
+              ListTile(
+                leading: const Icon(Icons.extension_outlined),
+                title: const Text('从插件获取'),
+                subtitle: const Text('搜索所有已启用插件提供的歌词'),
+                trailing: const Icon(Icons.chevron_right),
+                onTap: () => Navigator.pop(context, _LyricsSourceAction.plugin),
+              ),
+              ListTile(
+                leading: const Icon(Icons.upload_file_outlined),
+                title: const Text('从本地上传'),
+                subtitle: const Text('选择 LRC、YRC、QRC 等歌词文件'),
+                trailing: const Icon(Icons.chevron_right),
+                onTap: () => Navigator.pop(context, _LyricsSourceAction.local),
+              ),
+            ],
+          ),
         ),
       ),
     );
     if (!mounted || source == null) return;
-    if (source == _LyricsSourceAction.plugin) {
+    if (ref.read(playerProvider).current?.path != item.path) {
+      XyNotice.show(
+        context,
+        message: '歌曲已切换，请重新关联歌词',
+        type: XyNoticeType.warning,
+      );
+      return;
+    }
+    if (source == _LyricsSourceAction.cancel) {
+      await ref.read(playerProvider.notifier).clearCurrentLyricsAssociation();
+      if (mounted) {
+        XyNotice.show(context, message: '已取消关联歌词', type: XyNoticeType.success);
+      }
+    } else if (source == _LyricsSourceAction.plugin) {
       await _linkLyricsFromPlugin(item);
     } else {
       await _linkLyricsFromLocal(item);
@@ -974,7 +1623,18 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
         }
       }
     }
-    await ref.read(playerProvider.notifier).setCurrentLyrics(selected.lyrics);
+    await ref
+        .read(playerProvider.notifier)
+        .setCurrentLyrics(
+          selected.lyrics,
+          association: RememberedLyricsAssociation(
+            source: 'plugin',
+            pluginName: selected.pluginName,
+            title: selected.songTitle,
+            artist: selected.songArtist,
+            durationMs: selected.durationMs,
+          ),
+        );
     if (mounted) {
       XyNotice.show(
         context,
@@ -1005,7 +1665,17 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
       if (ref.read(playerProvider).current?.path != item.path) {
         throw Exception('歌曲已切换，请重新关联歌词');
       }
-      await ref.read(playerProvider.notifier).setCurrentLyrics(lyrics);
+      await ref
+          .read(playerProvider.notifier)
+          .setCurrentLyrics(
+            lyrics,
+            association: RememberedLyricsAssociation(
+              source: 'local',
+              title: item.title,
+              artist: item.artist,
+              durationMs: item.durationMs,
+            ),
+          );
       if (mounted) {
         XyNotice.show(context, message: '歌词关联成功', type: XyNoticeType.success);
       }
@@ -1091,23 +1761,125 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
     );
   }
 
+  Future<String> _lyricsForDownload(QueueItem item) async {
+    var raw = item.lyricsRaw?.trim() ?? '';
+    if (raw.isEmpty || !_looksLikeEncodedLyrics(raw)) return raw;
+
+    // 先用 Rust 歌词解析器解码 QRC/KRC 等格式，再把展示行写成标准 LRC。
+    try {
+      final parsed = jsonDecode(await parseLyrics(rawLyrics: raw));
+      final decoded = _displayLinesToLrc(parsed);
+      if (decoded.isNotEmpty) return decoded;
+    } catch (_) {
+      // 密文格式不完整时继续尝试向插件重新取一次歌词。
+    }
+
+    // 部分插件的搜索结果携带的是损坏的 lyric 字段，但 getLyrics 接口
+    // 会返回正常正文；重新请求一次可避免把密文写入文件。
+    final pluginId = item.pluginId?.trim() ?? '';
+    final pluginData = item.pluginData;
+    if (pluginId.isNotEmpty && pluginData != null) {
+      try {
+        final plugins = await ref.read(enabledMusicPluginsProvider.future);
+        final plugin = plugins
+            .where((candidate) => candidate.id == pluginId)
+            .firstOrNull;
+        if (plugin != null) {
+          final retry =
+              (await ref
+                      .read(pluginRuntimeProvider)
+                      .getLyrics(plugin, pluginData))
+                  .trim();
+          if (retry.isNotEmpty && !_looksLikeEncodedLyrics(retry)) {
+            raw = retry;
+          }
+        }
+      } catch (_) {
+        // 歌词属于下载附加项，重新获取失败不应影响音频下载。
+      }
+    }
+    // 无法可靠解码时宁可不保存歌词，也不要生成用户无法阅读的乱码文件。
+    return _looksLikeEncodedLyrics(raw) ? '' : raw;
+  }
+
   Future<void> _downloadCurrent(QueueItem item) async {
     if (playbackSourceTypeFor(item) == PlaybackSourceType.localFile) {
       XyNotice.show(context, message: '当前歌曲已经是本地文件');
       return;
     }
+    // 整个下载流程都可能抛出异常（设置写入、地址解析、文件下载等），
+    // 必须整体兜底，否则用户点击下载后没有任何反馈。
+    try {
+      await _downloadCurrentInner(item);
+    } catch (error) {
+      if (mounted) {
+        XyNotice.show(
+          context,
+          message: '下载失败：${_errorText(error)}',
+          type: XyNoticeType.error,
+        );
+      }
+    }
+  }
+
+  Future<void> _downloadCurrentInner(QueueItem item) async {
     final settings = ref.read(settingsProvider).valueOrNull;
     final initialDirectory = await resolveMusicDownloadDirectory(settings);
     if (!mounted) return;
+    // 先检查是否已下载过；已下载时由用户确认是否重新下载。
+    final existing = await _existingDownloadFor(item);
+    if (!mounted) return;
+    final reDownloading = existing != null;
+    if (existing != null) {
+      final reDownload = await showDialog<bool>(
+        context: context,
+        useRootNavigator: true,
+        builder: (context) => AlertDialog(
+          title: const Text('歌曲已下载过'),
+          content: Text(
+            '《${existing.title}》已下载过'
+            '${existing.quality == null || existing.quality!.isEmpty ? '' : '（${_qualityLabel(existing.quality!)}）'}，'
+            '是否重新下载？',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context, false),
+              child: const Text('取消'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(context, true),
+              child: const Text('重新下载'),
+            ),
+          ],
+        ),
+      );
+      if (!mounted || reDownload != true) return;
+    }
     final playback = ref.read(playerProvider);
-    final options = await showDialog<_DownloadOptions>(
-      context: context,
-      useRootNavigator: true,
-      builder: (context) => _DownloadOptionsDialog(
-        initialDirectory: initialDirectory,
-        initialQuality: playback.currentQuality,
-      ),
-    );
+    final shouldAsk = settings?.askDownloadDetails ?? true;
+    _DownloadOptions? options;
+    if (shouldAsk) {
+      XyNotice.show(context, message: '正在读取插件支持的下载音质…');
+      final qualities = await _discoverQualityOptions(
+        item,
+        preferred: playback.currentQuality,
+      );
+      if (!mounted) return;
+      options = await showDialog<_DownloadOptions>(
+        context: context,
+        useRootNavigator: true,
+        builder: (context) => _DownloadOptionsDialog(
+          initialDirectory: initialDirectory,
+          initialQuality: settings?.downloadQuality ?? playback.currentQuality,
+          qualities: qualities,
+        ),
+      );
+    } else {
+      options = _DownloadOptions(
+        directory: initialDirectory,
+        quality: settings?.downloadQuality ?? playback.currentQuality,
+      );
+    }
     if (!mounted || options == null) return;
     if (ref.read(playerProvider).current?.path != item.path) {
       XyNotice.show(
@@ -1119,17 +1891,34 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
     }
     final quality = options.quality;
     final directory = options.directory.trim();
-    XyNotice.show(context, message: '已开始下载 ${item.title}');
+    final settingsNotifier = ref.read(settingsProvider.notifier);
+    await settingsNotifier.setDownloadPath(directory);
+    await settingsNotifier.setDownloadQuality(quality);
+    if (options.dontAskAgain) {
+      await settingsNotifier.setAskDownloadDetails(false);
+    }
+    if (!mounted) return;
+    final usesSafDirectory = AndroidStorage.isTreeUri(directory);
+    XyNotice.show(
+      context,
+      message: '下载已开始 ${item.title}',
+      type: XyNoticeType.success,
+    );
     try {
-      await Directory(directory).create(recursive: true);
+      final workDirectory = usesSafDirectory
+          ? await resolveDownloadStagingDirectory()
+          : directory;
+      await Directory(workDirectory).create(recursive: true);
       final source = await ref
           .read(playerProvider.notifier)
-          .resolveCurrentDownloadSource(quality);
+          .resolveCurrentDownloadSource(quality)
+          // 插件解析可能因网络卡死永久挂起，超时后转成可提示的错误。
+          .timeout(const Duration(seconds: 60));
       if (ref.read(playerProvider).current?.path != item.path) {
         throw Exception('歌曲已切换，请重新选择下载');
       }
       final destination = await resolveDownloadFullPath(
-        directory: directory,
+        directory: workDirectory,
         title: item.title,
         artist: item.artist,
         album: item.album,
@@ -1137,14 +1926,15 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
         quality: quality,
         keepSourceFilename: false,
         fileNameStyle: 'artist-title',
-        overwriteExisting: false,
+        // 用户已确认重新下载时直接覆盖旧文件，避免生成 "(1)" 副本。
+        overwriteExisting: reDownloading,
       );
       final savedPath = await downloadOnlineSong(
         url: source.url,
         destPath: destination,
         headersJson: jsonEncode(source.headers),
       );
-      final lyrics = item.lyricsRaw?.trim() ?? '';
+      final lyrics = await _lyricsForDownload(item);
       final coverUrl = item.coverUrl?.trim() ?? '';
       await finalizeDownloadExtras(
         requestJson: jsonEncode({
@@ -1164,14 +1954,38 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
           },
         }),
       );
+      var finalPath = savedPath;
+      if (usesSafDirectory) {
+        finalPath = await AndroidStorage.copyFileToDirectory(
+          directoryUri: directory,
+          sourcePath: savedPath,
+          fileName: p.basename(savedPath),
+          mimeType: 'audio/*',
+        );
+        final lrcPath = p.setExtension(savedPath, '.lrc');
+        if (await File(lrcPath).exists()) {
+          await AndroidStorage.copyFileToDirectory(
+            directoryUri: directory,
+            sourcePath: lrcPath,
+            fileName: p.basename(lrcPath),
+            mimeType: 'text/plain',
+          );
+        }
+        try {
+          await File(savedPath).delete();
+          if (await File(lrcPath).exists()) await File(lrcPath).delete();
+        } catch (_) {}
+      }
       await rememberDownloadedSongSnapshot(
         DownloadedSongSnapshot(
-          path: savedPath,
+          path: finalPath,
           title: item.title,
           artist: item.artist,
           album: item.album,
           durationMs: item.durationMs,
           downloadedAt: DateTime.now().millisecondsSinceEpoch,
+          sourcePath: item.path,
+          quality: quality,
           coverUrl: item.coverUrl,
           lyricsRaw: lyrics.isEmpty ? null : lyrics,
         ),
@@ -1194,13 +2008,43 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
     }
   }
 
-  String _qualityLabel(String quality) => switch (quality) {
-    '128k' => '标准 128k',
-    '192k' => '较高 192k',
-    '320k' => '高品质 320k',
-    'flac' => '无损 FLAC',
-    _ => quality,
-  };
+  Future<DownloadedSongSnapshot?> _existingDownloadFor(QueueItem item) async {
+    final snapshots = await loadDownloadedSongSnapshots();
+    final title = item.title.trim().toLowerCase();
+    final artist = item.artist.trim().toLowerCase();
+    snapshots.sort((a, b) => b.downloadedAt.compareTo(a.downloadedAt));
+    for (final snapshot in snapshots) {
+      final sourceMatches = snapshot.sourcePath?.trim().isNotEmpty == true
+          ? snapshot.sourcePath == item.path
+          : snapshot.title.trim().toLowerCase() == title &&
+                snapshot.artist.trim().toLowerCase() == artist;
+      if (!sourceMatches) continue;
+      final path = snapshot.path.trim();
+      if (path.toLowerCase().startsWith('content://') ||
+          await File(path).exists()) {
+        return snapshot;
+      }
+    }
+    return null;
+  }
+
+  String _qualityLabel(String quality) {
+    final lower = quality.trim().toLowerCase();
+    if (lower == '128k' || lower == 'standard') return '标准 128k';
+    if (lower == '192k') return '较高 192k';
+    if (lower == '320k' || lower == 'high') return '高品质 320k';
+    if (lower == 'flac' || lower == 'lossless' || lower == 'sq') {
+      return '无损 FLAC';
+    }
+    if (lower.contains('master')) return '超清母带';
+    if (lower == 'hires' || lower == 'hi-res' || lower.contains('24bit')) {
+      return 'Hi-Res 高清';
+    }
+    if (lower == 'ape') return 'APE 无损';
+    if (lower == 'wav') return 'WAV 无损';
+    if (lower == 'dolby' || lower == 'atmos') return '杜比全景声';
+    return quality;
+  }
 
   String _sleepTimerLabel(DateTime? endsAt) {
     if (endsAt == null) return '未开启';
@@ -1243,6 +2087,7 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
     }
     if (current.lyricsAttempted &&
         current.lyricsRaw?.trim().isNotEmpty != true &&
+        !_noLyricsNoticeShownPaths.contains(path) &&
         _noLyricsNoticePath != path) {
       _noLyricsNoticePath = path;
       WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -1253,10 +2098,13 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
             latest?.lyricsAttempted != true) {
           return;
         }
+        _noLyricsNoticeShownPaths.add(path);
         XyNotice.show(
           context,
           message: '未检测到歌词，可点击右上角关联歌词',
-          type: XyNoticeType.warning,
+          type: XyNoticeType.success,
+          compact: true,
+          blur: true,
         );
       });
     }
@@ -1405,6 +2253,17 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
       child: _GlassControlCard(
         notifier: notifier,
         current: current,
+        showMetadata: !_showLyrics,
+        onDownload: current == null
+            ? null
+            : () => unawaited(_downloadCurrent(current)),
+        onAddToPlaylist: current == null
+            ? null
+            : () => unawaited(_addToPlaylist(current)),
+        onLyricsOffset: current == null
+            ? null
+            : () => unawaited(_pickLyricsOffset(current)),
+        onDesktopLyrics: () => unawaited(_toggleDesktopLyrics()),
         videoActive: videoActive,
         videoController: videoActive ? _videoController : null,
       ),
@@ -1458,6 +2317,15 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
 }
 
 /// 播放详情页中的歌单选择器。创建歌单后会自动将当前歌曲加入新歌单。
+enum _PlaylistPickKind { added, alreadyExists }
+
+class _PlaylistPickResult {
+  const _PlaylistPickResult(this.playlistId, this.kind);
+
+  final String playlistId;
+  final _PlaylistPickKind kind;
+}
+
 class _PlaylistPickerSheet extends ConsumerStatefulWidget {
   const _PlaylistPickerSheet({required this.item});
 
@@ -1475,10 +2343,18 @@ class _PlaylistPickerSheetState extends ConsumerState<_PlaylistPickerSheet> {
     if (_busy) return;
     setState(() => _busy = true);
     try {
-      await ref
+      final added = await ref
           .read(playlistsProvider.notifier)
           .addQueueItem(playlistId, widget.item);
-      if (mounted) Navigator.pop(context, playlistId);
+      if (mounted) {
+        Navigator.pop(
+          context,
+          _PlaylistPickResult(
+            playlistId,
+            added ? _PlaylistPickKind.added : _PlaylistPickKind.alreadyExists,
+          ),
+        );
+      }
     } finally {
       if (mounted) setState(() => _busy = false);
     }
@@ -1520,7 +2396,13 @@ class _PlaylistPickerSheetState extends ConsumerState<_PlaylistPickerSheet> {
       await ref
           .read(playlistsProvider.notifier)
           .addQueueItem(playlist.id, widget.item);
-      if (mounted) Navigator.pop(context, playlist.id);
+      if (mounted) {
+        // 新建歌单中不可能存在重复歌曲，结果恒为“已添加”。
+        Navigator.pop(
+          context,
+          _PlaylistPickResult(playlist.id, _PlaylistPickKind.added),
+        );
+      }
     } finally {
       if (mounted) setState(() => _busy = false);
     }
@@ -1623,27 +2505,37 @@ class _DownloadOptionsDialog extends StatefulWidget {
   const _DownloadOptionsDialog({
     required this.initialDirectory,
     required this.initialQuality,
+    required this.qualities,
   });
 
   final String initialDirectory;
   final String initialQuality;
+  final List<String> qualities;
 
   @override
   State<_DownloadOptionsDialog> createState() => _DownloadOptionsDialogState();
 }
 
 class _DownloadOptionsDialogState extends State<_DownloadOptionsDialog> {
-  static const _qualities = ['128k', '192k', '320k', 'flac'];
   late final TextEditingController _directoryController;
+  late String _directoryValue;
+  late final List<String> _qualities;
   late String _quality;
+  bool _dontAskAgain = false;
   bool _choosingDirectory = false;
   String? _error;
 
   @override
   void initState() {
     super.initState();
-    _directoryController = TextEditingController(text: widget.initialDirectory);
-    _quality = _normalizeQuality(widget.initialQuality);
+    _directoryValue = widget.initialDirectory;
+    _directoryController = TextEditingController(
+      text: AndroidStorage.displayPath(widget.initialDirectory),
+    );
+    _qualities = widget.qualities.isEmpty
+        ? const ['320k']
+        : widget.qualities.toSet().toList();
+    _quality = _normalizeQuality(widget.initialQuality, _qualities);
   }
 
   @override
@@ -1659,15 +2551,15 @@ class _DownloadOptionsDialogState extends State<_DownloadOptionsDialog> {
       _error = null;
     });
     try {
-      final selected = await FilePicker.platform.getDirectoryPath();
+      final selected = Platform.isAndroid
+          ? await AndroidStorage.pickDirectory()
+          : await FilePicker.platform.getDirectoryPath();
       if (!mounted || selected == null) return;
-      if (selected.startsWith('content://')) {
-        setState(() => _error = '该目录无法直接写入，请选择可访问的文件夹或手动输入路径');
-        return;
-      }
-      _directoryController.text = selected;
+      _directoryValue = selected;
+      final displayPath = AndroidStorage.displayPath(selected);
+      _directoryController.text = displayPath;
       _directoryController.selection = TextSelection.collapsed(
-        offset: selected.length,
+        offset: displayPath.length,
       );
       setState(() {});
     } catch (error) {
@@ -1678,18 +2570,18 @@ class _DownloadOptionsDialogState extends State<_DownloadOptionsDialog> {
   }
 
   void _submit() {
-    final directory = _directoryController.text.trim();
+    final directory = _directoryValue.trim();
     if (directory.isEmpty) {
       setState(() => _error = '请输入或选择下载文件夹');
       return;
     }
-    if (directory.startsWith('content://')) {
-      setState(() => _error = '暂不支持将 content URI 作为下载目录');
-      return;
-    }
     Navigator.pop(
       context,
-      _DownloadOptions(directory: directory, quality: _quality),
+      _DownloadOptions(
+        directory: directory,
+        quality: _quality,
+        dontAskAgain: _dontAskAgain,
+      ),
     );
   }
 
@@ -1698,64 +2590,106 @@ class _DownloadOptionsDialogState extends State<_DownloadOptionsDialog> {
     final scheme = Theme.of(context).colorScheme;
     return AlertDialog(
       title: const Text('下载歌曲'),
-      content: SingleChildScrollView(
-        child: SizedBox(
-          width: 360,
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text('下载位置', style: Theme.of(context).textTheme.titleSmall),
-              const SizedBox(height: 8),
-              TextField(
-                controller: _directoryController,
-                minLines: 1,
-                maxLines: 2,
-                onChanged: (_) {
-                  if (_error != null) setState(() => _error = null);
-                },
-                decoration: const InputDecoration(
-                  hintText: '/storage/emulated/0/Music',
-                  prefixIcon: Icon(Icons.folder_outlined),
-                ),
-              ),
-              const SizedBox(height: 8),
-              SizedBox(
-                width: double.infinity,
-                child: OutlinedButton.icon(
-                  onPressed: _choosingDirectory ? null : _chooseDirectory,
-                  icon: _choosingDirectory
-                      ? const SizedBox.square(
-                          dimension: 16,
-                          child: CircularProgressIndicator(strokeWidth: 2),
-                        )
-                      : const Icon(Icons.create_new_folder_outlined),
-                  label: Text(_choosingDirectory ? '正在选择…' : '直接选择文件夹'),
-                ),
-              ),
-              const SizedBox(height: 20),
-              Text('下载音质', style: Theme.of(context).textTheme.titleSmall),
-              const SizedBox(height: 8),
-              Wrap(
-                spacing: 8,
-                runSpacing: 6,
-                children: [
-                  for (final quality in _qualities)
-                    ChoiceChip(
-                      label: Text(_qualityLabel(quality)),
-                      selected: _quality == quality,
-                      onSelected: (_) => setState(() => _quality = quality),
-                    ),
-                ],
-              ),
-              if (_error != null) ...[
-                const SizedBox(height: 12),
+      content: SizedBox(
+        width: 360,
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(maxHeight: 420),
+          child: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
                 Text(
-                  _error!,
-                  style: TextStyle(fontSize: 12, color: scheme.error),
+                  '下载位置',
+                  style: Theme.of(
+                    context,
+                  ).textTheme.labelLarge?.copyWith(fontWeight: FontWeight.w600),
                 ),
+                const SizedBox(height: 6),
+                Row(
+                  children: [
+                    Expanded(
+                      child: TextField(
+                        controller: _directoryController,
+                        maxLines: 1,
+                        style: const TextStyle(fontSize: 13),
+                        onChanged: (value) {
+                          _directoryValue = value;
+                          if (_error != null) setState(() => _error = null);
+                        },
+                        decoration: const InputDecoration(
+                          isDense: true,
+                          hintText: '/storage/emulated/0/Music',
+                          prefixIcon: Icon(Icons.folder_outlined, size: 19),
+                          prefixIconConstraints: BoxConstraints(minWidth: 38),
+                          contentPadding: EdgeInsets.symmetric(
+                            horizontal: 10,
+                            vertical: 11,
+                          ),
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    SizedBox(
+                      height: 40,
+                      child: OutlinedButton.icon(
+                        style: OutlinedButton.styleFrom(
+                          visualDensity: VisualDensity.compact,
+                          padding: const EdgeInsets.symmetric(horizontal: 11),
+                        ),
+                        onPressed: _choosingDirectory ? null : _chooseDirectory,
+                        icon: _choosingDirectory
+                            ? const SizedBox.square(
+                                dimension: 14,
+                                child: CircularProgressIndicator(
+                                  strokeWidth: 2,
+                                ),
+                              )
+                            : const Icon(Icons.folder_open_rounded, size: 18),
+                        label: Text(
+                          _choosingDirectory ? '选择中' : '选择',
+                          style: const TextStyle(fontSize: 13),
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 16),
+                Text(
+                  '下载音质',
+                  style: Theme.of(
+                    context,
+                  ).textTheme.labelLarge?.copyWith(fontWeight: FontWeight.w600),
+                ),
+                const SizedBox(height: 6),
+                _QualitySelector(
+                  qualities: _qualities,
+                  selected: _quality,
+                  onSelected: (quality) => setState(() => _quality = quality),
+                ),
+                const SizedBox(height: 8),
+                CheckboxListTile(
+                  value: _dontAskAgain,
+                  onChanged: (value) =>
+                      setState(() => _dontAskAgain = value == true),
+                  contentPadding: EdgeInsets.zero,
+                  visualDensity: VisualDensity.compact,
+                  materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                  controlAffinity: ListTileControlAffinity.leading,
+                  title: const Text(
+                    '不再弹出此窗口',
+                    style: TextStyle(fontSize: 13),
+                  ),
+                ),
+                if (_error != null) ...[
+                  const SizedBox(height: 12),
+                  Text(
+                    _error!,
+                    style: TextStyle(fontSize: 12, color: scheme.error),
+                  ),
+                ],
               ],
-            ],
+            ),
           ),
         ),
       ),
@@ -1769,20 +2703,214 @@ class _DownloadOptionsDialogState extends State<_DownloadOptionsDialog> {
     );
   }
 
-  static String _normalizeQuality(String quality) => switch (quality.trim()) {
-    '128k' || 'standard' => '128k',
-    '192k' => '192k',
-    'flac' || 'lossless' => 'flac',
-    _ => '320k',
-  };
+  static String _normalizeQuality(String quality, List<String> available) {
+    final value = quality.trim();
+    if (available.contains(value)) return value;
+    final alias = switch (value.toLowerCase()) {
+      'standard' => '128k',
+      'lossless' || 'sq' => 'flac',
+      'high' => '320k',
+      _ => value,
+    };
+    if (available.contains(alias)) return alias;
+    return available.first;
+  }
 
-  static String _qualityLabel(String quality) => switch (quality) {
-    '128k' => '标准 128k',
-    '192k' => '较高 192k',
-    '320k' => '高品质 320k',
-    'flac' => '无损 FLAC',
-    _ => quality,
-  };
+  static String _qualityLabel(String quality) {
+    final lower = quality.trim().toLowerCase();
+    if (lower == '128k' || lower == 'standard') return '标准 128k';
+    if (lower == '192k') return '较高 192k';
+    if (lower == '320k' || lower == 'high') return '高品质 320k';
+    if (lower == 'flac' || lower == 'lossless' || lower == 'sq') {
+      return '无损 FLAC';
+    }
+    if (lower.contains('master')) return '超清母带';
+    if (lower == 'hires' || lower == 'hi-res' || lower.contains('24bit')) {
+      return 'Hi-Res 高清';
+    }
+    if (lower == 'ape') return 'APE 无损';
+    if (lower == 'wav') return 'WAV 无损';
+    if (lower == 'dolby' || lower == 'atmos') return '杜比全景声';
+    return quality;
+  }
+}
+
+class _QualitySelector extends StatefulWidget {
+  const _QualitySelector({
+    required this.qualities,
+    required this.selected,
+    required this.onSelected,
+  });
+
+  final List<String> qualities;
+  final String selected;
+  final ValueChanged<String> onSelected;
+
+  @override
+  State<_QualitySelector> createState() => _QualitySelectorState();
+}
+
+class _QualitySelectorState extends State<_QualitySelector> {
+  static const double _spacing = 6;
+  static const double _runSpacing = 5;
+  static const int _maxRows = 2;
+
+  final GlobalKey _offstageWrapKey = GlobalKey();
+  final GlobalKey _expandButtonKey = GlobalKey();
+  final List<GlobalKey> _chipKeys = <GlobalKey>[];
+
+  bool _expanded = false;
+  bool _overflow = false;
+  int _visibleCount = 0;
+
+  @override
+  void initState() {
+    super.initState();
+    _visibleCount = widget.qualities.length;
+  }
+
+  List<GlobalKey> get _keys {
+    while (_chipKeys.length < widget.qualities.length) {
+      _chipKeys.add(GlobalKey());
+    }
+    return _chipKeys;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    WidgetsBinding.instance.addPostFrameCallback((_) => _measure());
+    final chips = <Widget>[
+      for (final quality in widget.qualities) _buildChip(quality),
+    ];
+    final Widget visible;
+    if (!_overflow || _expanded) {
+      visible = Wrap(
+        spacing: _spacing,
+        runSpacing: _runSpacing,
+        children: [
+          ...chips,
+          if (_overflow) _buildToggleChip(expanded: true),
+        ],
+      );
+    } else {
+      visible = Wrap(
+        spacing: _spacing,
+        runSpacing: _runSpacing,
+        children: [
+          ...chips.sublist(0, _visibleCount),
+          _buildToggleChip(expanded: false),
+        ],
+      );
+    }
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        visible,
+        Offstage(
+          child: Wrap(
+            key: _offstageWrapKey,
+            spacing: _spacing,
+            runSpacing: _runSpacing,
+            children: [
+              for (var i = 0; i < widget.qualities.length; i++)
+                _buildChip(widget.qualities[i], key: _keys[i]),
+              _buildToggleChip(expanded: false, key: _expandButtonKey),
+            ],
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildChip(String quality, {Key? key}) {
+    return ChoiceChip(
+      key: key,
+      label: Text(
+        _DownloadOptionsDialogState._qualityLabel(quality),
+        style: const TextStyle(fontSize: 12),
+      ),
+      visualDensity: VisualDensity.compact,
+      materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+      padding: const EdgeInsets.symmetric(horizontal: 3),
+      selected: widget.selected == quality,
+      onSelected: (_) => widget.onSelected(quality),
+    );
+  }
+
+  Widget _buildToggleChip({required bool expanded, Key? key}) {
+    return ActionChip(
+      key: key,
+      avatar: Icon(
+        expanded ? Icons.expand_less_rounded : Icons.expand_more_rounded,
+        size: 16,
+      ),
+      label: Text(
+        expanded ? '收起' : '展开更多',
+        style: const TextStyle(fontSize: 12),
+      ),
+      visualDensity: VisualDensity.compact,
+      materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+      padding: const EdgeInsets.symmetric(horizontal: 3),
+      onPressed: () => setState(() => _expanded = !expanded),
+    );
+  }
+
+  void _measure() {
+    if (!mounted) return;
+    final wrapObject = _offstageWrapKey.currentContext?.findRenderObject();
+    final buttonContext = _expandButtonKey.currentContext;
+    if (wrapObject is! RenderBox || buttonContext == null) return;
+    final buttonSize = buttonContext.size;
+    if (buttonSize == null) return;
+    final available = wrapObject.constraints.maxWidth;
+    if (!available.isFinite) return;
+
+    final widths = <double>[];
+    for (final key in _keys) {
+      final size = key.currentContext?.size;
+      if (size == null) return;
+      widths.add(size.width);
+    }
+    final buttonWidth = buttonSize.width;
+
+    final overflow = _rowsFor([...widths, buttonWidth], available) > _maxRows;
+    var visibleCount = widget.qualities.length;
+    if (overflow) {
+      visibleCount = 1;
+      for (var i = 0; i < widths.length; i++) {
+        final candidate = [...widths.sublist(0, i + 1), buttonWidth];
+        if (_rowsFor(candidate, available) <= _maxRows) {
+          visibleCount = i + 1;
+        } else {
+          break;
+        }
+      }
+    }
+    if (overflow != _overflow ||
+        (!_expanded && visibleCount != _visibleCount)) {
+      setState(() {
+        _overflow = overflow;
+        _visibleCount = visibleCount;
+      });
+    }
+  }
+
+  int _rowsFor(List<double> widths, double available) {
+    var rows = 1;
+    var used = 0.0;
+    for (final width in widths) {
+      if (used == 0) {
+        used = width;
+      } else if (used + _spacing + width <= available + 1) {
+        used += _spacing + width;
+      } else {
+        rows++;
+        used = width;
+      }
+    }
+    return rows;
+  }
 }
 
 class _LyricsOffsetDialog extends StatefulWidget {
@@ -2042,6 +3170,85 @@ class _CustomSleepTimerDialogState extends State<_CustomSleepTimerDialog> {
   }
 }
 
+class _AssociatedLyricsCard extends StatelessWidget {
+  const _AssociatedLyricsCard({
+    required this.association,
+    required this.onCancel,
+  });
+
+  final RememberedLyricsAssociation association;
+  final VoidCallback onCancel;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final source = association.source == 'plugin'
+        ? (association.pluginName?.trim().isNotEmpty == true
+              ? '插件：${association.pluginName}'
+              : '插件歌词')
+        : '本地歌词';
+    final title = association.title.trim().isEmpty
+        ? '当前歌曲歌词'
+        : association.title;
+    final artist = association.artist.trim().isEmpty
+        ? '未知作者'
+        : association.artist;
+    return Container(
+      width: double.infinity,
+      margin: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+      padding: const EdgeInsets.fromLTRB(14, 12, 8, 12),
+      decoration: BoxDecoration(
+        color: theme.colorScheme.primaryContainer.withValues(alpha: .35),
+        borderRadius: BorderRadius.circular(14),
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.center,
+        children: [
+          Icon(Icons.link_rounded, color: theme.colorScheme.primary),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text(
+                  '已关联歌词',
+                  style: TextStyle(fontWeight: FontWeight.w700),
+                ),
+                const SizedBox(height: 3),
+                Text(
+                  '$source · $title',
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    fontSize: 12,
+                    color: theme.colorScheme.onSurfaceVariant,
+                  ),
+                ),
+                Text(
+                  '$artist · ${_formatAssociatedLyricsDuration(association.durationMs)}',
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    fontSize: 11,
+                    color: theme.colorScheme.onSurfaceVariant,
+                  ),
+                ),
+              ],
+            ),
+          ),
+          TextButton(onPressed: onCancel, child: const Text('取消关联')),
+        ],
+      ),
+    );
+  }
+}
+
+String _formatAssociatedLyricsDuration(int durationMs) {
+  if (durationMs <= 0) return '--:--';
+  final seconds = durationMs ~/ 1000;
+  return '${seconds ~/ 60}:${(seconds % 60).toString().padLeft(2, '0')}';
+}
+
 class _PluginLyricsSearchSheet extends ConsumerStatefulWidget {
   const _PluginLyricsSearchSheet({required this.item});
 
@@ -2055,9 +3262,11 @@ class _PluginLyricsSearchSheet extends ConsumerStatefulWidget {
 class _PluginLyricsSearchSheetState
     extends ConsumerState<_PluginLyricsSearchSheet> {
   late final TextEditingController _controller;
+  late final String _defaultQuery;
   List<PluginLyricsOption> _options = const [];
   bool _searching = false;
   bool _searched = false;
+  bool _queryEdited = false;
   int _completedPlugins = 0;
   int _totalPlugins = 0;
   String? _applyingId;
@@ -2067,13 +3276,13 @@ class _PluginLyricsSearchSheetState
   @override
   void initState() {
     super.initState();
-    final query = createDefaultPluginLyricsSearchQuery(
+    _defaultQuery = createDefaultPluginLyricsSearchQuery(
       widget.item.title,
       widget.item.artist,
     );
-    _controller = TextEditingController(text: query)
-      ..selection = TextSelection.collapsed(offset: query.length);
-    WidgetsBinding.instance.addPostFrameCallback((_) => _search());
+    _controller = TextEditingController(text: _defaultQuery)
+      ..selection = TextSelection.collapsed(offset: _defaultQuery.length);
+    WidgetsBinding.instance.addPostFrameCallback((_) => _initializeSearch());
   }
 
   @override
@@ -2083,9 +3292,63 @@ class _PluginLyricsSearchSheetState
     super.dispose();
   }
 
+  String get _searchMemoryId {
+    final path = widget.item.path.trim();
+    if (path.isNotEmpty) return path;
+    return '${widget.item.title}\u0000${widget.item.artist}';
+  }
+
+  Future<String?> _loadRememberedQuery() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final raw = prefs.getString(_pluginLyricsSearchMemoryKey);
+      if (raw == null || raw.trim().isEmpty) return null;
+      final decoded = jsonDecode(raw);
+      if (decoded is! Map) return null;
+      final value = decoded[_searchMemoryId]?.toString().trim() ?? '';
+      return value.isEmpty ? null : value;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  Future<void> _rememberQueryIfEdited(String query) async {
+    if (!_queryEdited || query.isEmpty || query == _defaultQuery) return;
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final decoded = jsonDecode(
+        prefs.getString(_pluginLyricsSearchMemoryKey) ?? '{}',
+      );
+      final values = decoded is Map
+          ? Map<String, dynamic>.from(decoded)
+          : <String, dynamic>{};
+      values[_searchMemoryId] = query;
+      // 避免极少数设备积累大量歌曲查询记录，保留最近 200 首即可。
+      while (values.length > 200) {
+        values.remove(values.keys.first);
+      }
+      await prefs.setString(_pluginLyricsSearchMemoryKey, jsonEncode(values));
+    } catch (_) {
+      // 搜索本身不应因偏好记忆写入失败而中断。
+    }
+  }
+
+  Future<void> _initializeSearch() async {
+    final remembered = await _loadRememberedQuery();
+    if (!mounted) return;
+    if (remembered != null && remembered != _controller.text) {
+      _controller.value = TextEditingValue(
+        text: remembered,
+        selection: TextSelection.collapsed(offset: remembered.length),
+      );
+    }
+    await _search();
+  }
+
   Future<void> _search() async {
     final query = _controller.text.trim();
     if (query.isEmpty || _searching) return;
+    await _rememberQueryIfEdited(query);
     final requestId = ++_requestId;
     setState(() {
       _searching = true;
@@ -2203,7 +3466,10 @@ class _PluginLyricsSearchSheetState
                         controller: _controller,
                         enabled: !_searching && _applyingId == null,
                         textInputAction: TextInputAction.search,
-                        onChanged: (_) => setState(() {}),
+                        onChanged: (_) {
+                          _queryEdited = true;
+                          setState(() {});
+                        },
                         onSubmitted: (_) => _search(),
                         decoration: const InputDecoration(
                           hintText: '输入歌名、歌手或其他搜索内容',
@@ -2496,40 +3762,44 @@ class _DetailPageIndicator extends StatelessWidget {
   }
 }
 
-class _PlayerDetailBackground extends StatelessWidget {
+class _PlayerDetailBackground extends ConsumerWidget {
   const _PlayerDetailBackground({required this.current});
 
   final QueueItem? current;
 
   @override
-  Widget build(BuildContext context) {
+  Widget build(BuildContext context, WidgetRef ref) {
     final size = MediaQuery.sizeOf(context);
+    final settings = ref.watch(settingsProvider).valueOrNull;
+    final mode =
+        settings?.playerDetailBackgroundMode ??
+        PlayerDetailBackgroundMode.coverBlur;
+    final wallpaperPath = settings?.customBackgroundPath.trim() ?? '';
+    final detailImagePath = settings?.playerDetailCustomImagePath.trim() ?? '';
+    final wallpaperBlur = settings?.customBackgroundBlur ?? 18.0;
+
+    final backdrop = switch (mode) {
+      PlayerDetailBackgroundMode.coverBlur => _coverBackdrop(current, size),
+      PlayerDetailBackgroundMode.wallpaperBlur =>
+        wallpaperPath.isEmpty
+            ? _flowingLightBackdrop()
+            : _wallpaperBackdrop(wallpaperPath, wallpaperBlur, blurred: true),
+      PlayerDetailBackgroundMode.flowingLight => _flowingLightBackdrop(),
+      PlayerDetailBackgroundMode.customImage =>
+        detailImagePath.isEmpty
+            ? _flowingLightBackdrop()
+            : _wallpaperBackdrop(
+                detailImagePath,
+                wallpaperBlur,
+                blurred: false,
+              ),
+    };
+
     return RepaintBoundary(
       child: Stack(
         fit: StackFit.expand,
         children: [
-          const ColoredBox(color: Color(0xFF0B0D12)),
-          if (current != null)
-            Positioned.fill(
-              // 低分辨率封面放大后作为氛围背景，不使用动态模糊滤镜。
-              // 部分旧 Android GPU 在切换滤镜下的纹理时会发生原生崩溃。
-              child: Transform.scale(
-                scale: 1.24,
-                child: Opacity(
-                  opacity: .46,
-                  child: CoverImage(
-                    key: ValueKey('background:${current!.path}'),
-                    songPath: current!.path,
-                    imageUrl: current!.coverUrl,
-                    width: size.width,
-                    height: size.height,
-                    radius: 0,
-                    cacheWidth: 256,
-                    icon: Icons.music_note_rounded,
-                  ),
-                ),
-              ),
-            ),
+          Positioned.fill(child: backdrop),
           ColoredBox(color: const Color(0xFF080A0F).withValues(alpha: .58)),
           const DecoratedBox(
             decoration: BoxDecoration(
@@ -2549,6 +3819,123 @@ class _PlayerDetailBackground extends StatelessWidget {
       ),
     );
   }
+
+  Widget _coverBackdrop(QueueItem? item, Size size) {
+    if (item == null) return const ColoredBox(color: Color(0xFF0B0D12));
+    // 封面模式保持原有氛围背景样式，不额外施加模糊滤镜。
+    return Transform.scale(
+      scale: 1.24,
+      child: Opacity(
+        opacity: .46,
+        child: CoverImage(
+          key: ValueKey('background:${item.path}'),
+          songPath: item.path,
+          imageUrl: item.coverUrl,
+          width: size.width,
+          height: size.height,
+          radius: 0,
+          cacheWidth: 256,
+          icon: Icons.music_note_rounded,
+        ),
+      ),
+    );
+  }
+
+  Widget _wallpaperBackdrop(String path, double blur, {required bool blurred}) {
+    Widget image = Image.file(
+      File(path),
+      fit: BoxFit.cover,
+      cacheWidth: 1440,
+      gaplessPlayback: true,
+      filterQuality: FilterQuality.low,
+      errorBuilder: (_, _, _) => const SizedBox.expand(),
+    );
+    if (blurred) {
+      image = ImageFiltered(
+        imageFilter: ui.ImageFilter.blur(
+          sigmaX: blur.clamp(0, 40),
+          sigmaY: blur.clamp(0, 40),
+        ),
+        child: image,
+      );
+    }
+    return image;
+  }
+
+  Widget _flowingLightBackdrop() => const _FlowingLightBackground();
+}
+
+class _FlowingLightBackground extends StatefulWidget {
+  const _FlowingLightBackground();
+
+  @override
+  State<_FlowingLightBackground> createState() =>
+      _FlowingLightBackgroundState();
+}
+
+class _FlowingLightBackgroundState extends State<_FlowingLightBackground>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _controller = AnimationController(
+    vsync: this,
+    duration: const Duration(seconds: 9),
+  )..repeat();
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) => AnimatedBuilder(
+    animation: _controller,
+    builder: (_, _) => CustomPaint(
+      painter: _FlowingLightPainter(_controller.value),
+      child: const SizedBox.expand(),
+    ),
+  );
+}
+
+class _FlowingLightPainter extends CustomPainter {
+  const _FlowingLightPainter(this.progress);
+
+  final double progress;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    canvas.drawColor(const Color(0xFF0B0D12), BlendMode.srcOver);
+    final phase = progress * math.pi * 2;
+    final points = [
+      (
+        Offset(size.width * (.18 + .18 * math.sin(phase)), size.height * .12),
+        const Color(0x88EC4141),
+      ),
+      (
+        Offset(size.width * (.82 + .16 * math.cos(phase)), size.height * .62),
+        const Color(0x664C6FFF),
+      ),
+      (
+        Offset(
+          size.width * (.45 + .2 * math.sin(phase + 1)),
+          size.height * .95,
+        ),
+        const Color(0x5548C6EF),
+      ),
+    ];
+    for (final (center, color) in points) {
+      final radius = math.max(size.width, size.height) * .78;
+      final paint = Paint()
+        ..shader = ui.Gradient.radial(center, radius, [
+          color,
+          color.withValues(alpha: 0),
+        ]);
+      canvas.drawRect(Offset.zero & size, paint);
+    }
+  }
+
+  @override
+  bool shouldRepaint(_FlowingLightPainter oldDelegate) =>
+      oldDelegate.progress != progress;
 }
 
 class _BilibiliVideoView extends StatelessWidget {
@@ -2567,7 +3954,8 @@ class _BilibiliVideoView extends StatelessWidget {
     final player = controller;
     final initialized = player?.value.isInitialized == true;
     return ColoredBox(
-      color: Colors.black,
+      // 保留视频原始比例，黑边区域透明显示详情页背景，避免裁剪视频内容。
+      color: Colors.transparent,
       child: Center(
         child: Stack(
           alignment: Alignment.center,
@@ -2739,6 +4127,7 @@ class _BigCover extends StatelessWidget {
       height: size,
       radius: radius,
       cacheWidth: cacheWidth,
+      highQuality: true,
       icon: Icons.music_note_rounded,
     );
   }
@@ -2904,6 +4293,10 @@ class _LyricsViewState extends ConsumerState<_LyricsView>
           _scrollController.jumpTo(0);
         }
       });
+    } else if (oldWidget.offsetTenths != widget.offsetTenths) {
+      // 偏移变化（含恢复同步）会移动活动行；重置滚动目标，强制
+      // 下一帧重新同步滚动，确保歌词能滚回正确行而不是停留在原处。
+      _lastScrollTarget = -1;
     }
   }
 
@@ -2924,6 +4317,16 @@ class _LyricsViewState extends ConsumerState<_LyricsView>
     final effectMode =
         ref.watch(settingsProvider).valueOrNull?.lyricWordEffectMode ??
         LyricWordEffectMode.progressive;
+    final lyricAlignment =
+        ref.watch(settingsProvider).valueOrNull?.lyricDisplayAlignment ??
+        LyricDisplayAlignment.left;
+    final baseFontSize =
+        ref.watch(settingsProvider).valueOrNull?.lyricFontSize ?? 18.0;
+    final textAlign = switch (lyricAlignment) {
+      LyricDisplayAlignment.left => TextAlign.left,
+      LyricDisplayAlignment.center => TextAlign.center,
+      LyricDisplayAlignment.right => TextAlign.right,
+    };
     final embedded = widget.item.lyricsRaw?.trim() ?? '';
     late final Widget content;
     if (embedded.isNotEmpty) {
@@ -2931,7 +4334,8 @@ class _LyricsViewState extends ConsumerState<_LyricsView>
       content = lyrics.when(
         loading: () => const Center(child: CircularProgressIndicator()),
         error: (_, _) => _lyricsEmpty(context, '歌词解析失败'),
-        data: (lines) => _buildLines(lines, position, effectMode),
+        data: (lines) =>
+            _buildLines(lines, position, effectMode, textAlign, baseFontSize),
       );
     } else if (widget.item.pluginId != null && !widget.item.lyricsAttempted) {
       content = _lyricsEmpty(context, '正在获取歌词…');
@@ -2942,7 +4346,8 @@ class _LyricsViewState extends ConsumerState<_LyricsView>
       content = lyrics.when(
         loading: () => const Center(child: CircularProgressIndicator()),
         error: (_, _) => _lyricsEmpty(context, '暂无歌词'),
-        data: (lines) => _buildLines(lines, position, effectMode),
+        data: (lines) =>
+            _buildLines(lines, position, effectMode, textAlign, baseFontSize),
       );
     }
     return content;
@@ -2952,6 +4357,8 @@ class _LyricsViewState extends ConsumerState<_LyricsView>
     List<_LyricLine> lines,
     double position,
     LyricWordEffectMode effectMode,
+    TextAlign textAlign,
+    double baseFontSize,
   ) {
     if (lines.isEmpty) {
       return _lyricsEmpty(context, '暂无歌词');
@@ -2962,6 +4369,7 @@ class _LyricsViewState extends ConsumerState<_LyricsView>
     _syncScroll(active, lines);
     final size = MediaQuery.sizeOf(context);
     final compactVertical = size.width > size.height;
+    final indicatorOnRight = textAlign == TextAlign.right;
     return LayoutBuilder(
       builder: (context, constraints) {
         return Stack(
@@ -3009,18 +4417,32 @@ class _LyricsViewState extends ConsumerState<_LyricsView>
                           duration: const Duration(milliseconds: 220),
                           curve: Curves.easeOutCubic,
                           padding: EdgeInsets.fromLTRB(
-                            selected ? 14 : 8,
+                            selected && !indicatorOnRight ? 14 : 8,
                             10,
-                            8,
+                            selected && indicatorOnRight ? 14 : 8,
                             10,
                           ),
                           decoration: BoxDecoration(
                             border: selected
-                                ? const Border(
-                                    left: BorderSide(
-                                      color: Color(0xFFEC4141),
-                                      width: 3,
-                                    ),
+                                ? Border(
+                                    // 当前歌词指示线跟随主题色；歌词靠右时
+                                    // 指示线同步移动到右侧。
+                                    left: indicatorOnRight
+                                        ? BorderSide.none
+                                        : BorderSide(
+                                            color: Theme.of(
+                                              context,
+                                            ).colorScheme.primary,
+                                            width: 3,
+                                          ),
+                                    right: indicatorOnRight
+                                        ? BorderSide(
+                                            color: Theme.of(
+                                              context,
+                                            ).colorScheme.primary,
+                                            width: 3,
+                                          )
+                                        : BorderSide.none,
                                   )
                                 : null,
                           ),
@@ -3029,20 +4451,26 @@ class _LyricsViewState extends ConsumerState<_LyricsView>
                             curve: Curves.easeOutCubic,
                             opacity: selected ? 1 : .34,
                             child: Column(
-                              crossAxisAlignment: CrossAxisAlignment.start,
+                              crossAxisAlignment: CrossAxisAlignment.stretch,
                               children: [
                                 _TimedLyricText(
                                   line: line,
                                   position: position,
                                   selected: selected,
                                   effectMode: effectMode,
+                                  textAlign: textAlign,
+                                  baseFontSize: baseFontSize,
                                 ),
                                 if (line.translation.isNotEmpty) ...[
                                   const SizedBox(height: 4),
                                   Text(
                                     line.translation,
+                                    textAlign: textAlign,
                                     style: TextStyle(
-                                      fontSize: 13,
+                                      fontSize: (baseFontSize - 5).clamp(
+                                        10.0,
+                                        26.0,
+                                      ),
                                       color: Colors.white.withValues(
                                         alpha: .68,
                                       ),
@@ -3053,8 +4481,12 @@ class _LyricsViewState extends ConsumerState<_LyricsView>
                                   const SizedBox(height: 3),
                                   Text(
                                     line.romaji,
+                                    textAlign: textAlign,
                                     style: TextStyle(
-                                      fontSize: 12,
+                                      fontSize: (baseFontSize - 6).clamp(
+                                        9.0,
+                                        24.0,
+                                      ),
                                       color: Colors.white.withValues(
                                         alpha: .48,
                                       ),
@@ -3085,7 +4517,14 @@ class _LyricsViewState extends ConsumerState<_LyricsView>
     _scrollScheduled = true;
     WidgetsBinding.instance.addPostFrameCallback((_) {
       _scrollScheduled = false;
-      if (!mounted || !_scrollController.hasClients) return;
+      if (!mounted) return;
+      if (!_scrollController.hasClients) {
+        // 歌词页未挂载（如用户停留在封面页调偏移）时无法执行滚动；
+        // 不能让 _lastScrollTarget 停留在"已同步"状态，否则重新挂载后
+        // 永远不会再滚回正确行。
+        _lastScrollTarget = -1;
+        return;
+      }
 
       final currentOffset = _revealOffset(active);
       if (currentOffset == null) {
@@ -3193,23 +4632,144 @@ class _LyricsViewState extends ConsumerState<_LyricsView>
   );
 }
 
+/// 歌词字号调整弹窗：滑杆 + 实时预览。拖动即写入设置（实时生效），
+/// 播放详情页歌词会立即使用新字号重新渲染。
+class _LyricFontSizeSheet extends StatefulWidget {
+  const _LyricFontSizeSheet({
+    required this.initial,
+    required this.onChanged,
+  });
+
+  final double initial;
+  final ValueChanged<double> onChanged;
+
+  @override
+  State<_LyricFontSizeSheet> createState() => _LyricFontSizeSheetState();
+}
+
+class _LyricFontSizeSheetState extends State<_LyricFontSizeSheet> {
+  late double _value;
+
+  @override
+  void initState() {
+    super.initState();
+    _value = widget.initial;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return Padding(
+      padding: EdgeInsets.only(
+        left: 20,
+        right: 20,
+        bottom: 20 + MediaQuery.viewInsetsOf(context).bottom,
+      ),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Row(
+            children: [
+              Icon(Icons.format_size_rounded, color: scheme.primary),
+              const SizedBox(width: 12),
+              const Text('歌词字号', style: TextStyle(fontSize: 16)),
+              const Spacer(),
+              Text(
+                _value.toStringAsFixed(0),
+                style: TextStyle(
+                  fontSize: 15,
+                  fontWeight: FontWeight.w700,
+                  color: scheme.primary,
+                ),
+              ),
+            ],
+          ),
+          Slider(
+            value: _value,
+            min: 12,
+            max: 32,
+            divisions: 20,
+            label: _value.toStringAsFixed(0),
+            onChanged: (value) {
+              setState(() => _value = value);
+              widget.onChanged(value);
+            },
+          ),
+          const SizedBox(height: 6),
+          Container(
+            padding: const EdgeInsets.symmetric(vertical: 18, horizontal: 16),
+            decoration: BoxDecoration(
+              color: scheme.surfaceContainerHighest.withValues(alpha: .5),
+              borderRadius: BorderRadius.circular(14),
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Text(
+                  '正在播放的歌词行',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(
+                    fontSize: math.min(32, _value + 6),
+                    height: 1.3,
+                    fontWeight: FontWeight.w800,
+                    color: scheme.onSurface,
+                  ),
+                ),
+                const SizedBox(height: 6),
+                Text(
+                  '其他歌词行',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(
+                    fontSize: _value,
+                    height: 1.3,
+                    fontWeight: FontWeight.w600,
+                    color: scheme.onSurface.withValues(alpha: .45),
+                  ),
+                ),
+                const SizedBox(height: 5),
+                Text(
+                  '翻译歌词行',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(
+                    fontSize: (_value - 5).clamp(10.0, 26.0),
+                    color: scheme.onSurface.withValues(alpha: .4),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
 class _TimedLyricText extends StatelessWidget {
   const _TimedLyricText({
     required this.line,
     required this.position,
     required this.selected,
     required this.effectMode,
+    required this.textAlign,
+    required this.baseFontSize,
   });
 
   final _LyricLine line;
   final double position;
   final bool selected;
   final LyricWordEffectMode effectMode;
+  final TextAlign textAlign;
+
+  /// 设置中的歌词基础字号；选中行在此基础上放大（上限 +6）。
+  final double baseFontSize;
 
   @override
   Widget build(BuildContext context) {
     return TweenAnimationBuilder<double>(
-      tween: Tween(end: selected ? 24 : 18),
+      tween: Tween(
+        end: selected ? math.min(32, baseFontSize + 6) : baseFontSize,
+      ),
       duration: const Duration(milliseconds: 260),
       curve: Curves.easeOutCubic,
       builder: (context, fontSize, _) => _buildText(fontSize),
@@ -3229,7 +4789,7 @@ class _TimedLyricText extends StatelessWidget {
     if (!selected ||
         line.words.isEmpty ||
         effectMode == LyricWordEffectMode.none) {
-      return Text(line.text, style: baseStyle);
+      return Text(line.text, textAlign: textAlign, style: baseStyle);
     }
 
     if (effectMode == LyricWordEffectMode.progressive) {
@@ -3259,6 +4819,7 @@ class _TimedLyricText extends StatelessWidget {
             ),
         ],
       ),
+      textAlign: textAlign,
       style: baseStyle,
     );
   }
@@ -3279,6 +4840,7 @@ class _TimedLyricText extends StatelessWidget {
             ),
         ],
       ),
+      textAlign: textAlign,
       style: baseStyle,
     );
   }
@@ -3332,62 +4894,71 @@ class _GlassControlCard extends ConsumerWidget {
   const _GlassControlCard({
     required this.notifier,
     required this.current,
+    this.showMetadata = true,
+    this.onDownload,
+    this.onAddToPlaylist,
+    this.onLyricsOffset,
+    this.onDesktopLyrics,
     this.videoActive = false,
     this.videoController,
   });
   final PlayerNotifier notifier;
   final QueueItem? current;
+  final bool showMetadata;
+  final VoidCallback? onDownload;
+  final VoidCallback? onAddToPlaylist;
+  final VoidCallback? onLyricsOffset;
+  final VoidCallback? onDesktopLyrics;
   final bool videoActive;
   final VideoPlayerController? videoController;
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
-    final glassColor = Colors.black.withValues(alpha: .24);
     final errorMessage = ref.watch(
       playerProvider.select((state) => state.errorMessage),
     );
 
-    return ClipRRect(
-      borderRadius: BorderRadius.circular(26),
-      // 背景已经静态模糊，这里用半透明表面即可，避免第二层实时整块采样。
-      child: Container(
-        padding: const EdgeInsets.fromLTRB(20, 18, 20, 16),
-        decoration: BoxDecoration(
-          color: glassColor,
-          borderRadius: BorderRadius.circular(26),
-          border: Border.all(color: Colors.white.withValues(alpha: .12)),
-        ),
-        child: current == null
-            ? const Padding(
-                padding: EdgeInsets.all(24),
-                child: Center(child: Text('暂无播放')),
-              )
-            : Column(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  _TitleRow(current: current!),
-                  if (errorMessage != null) ...[
-                    const SizedBox(height: 10),
-                    _PlaybackError(
-                      message: errorMessage,
-                      onRetry: notifier.toggle,
-                    ),
-                  ],
-                  const SizedBox(height: 14),
-                  _ProgressBar(
-                    notifier: notifier,
-                    enabled: !videoActive || videoController != null,
-                    videoController: videoController,
-                  ),
-                  const SizedBox(height: 6),
-                  _Controls(
-                    notifier: notifier,
-                    disabled: videoActive,
-                    videoController: videoController,
+    // 播放栏直接叠加在详情页背景上，不再使用整块半透明卡片，
+    // 让封面背景能够连续延伸到屏幕底部。
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(20, 18, 20, 16),
+      child: current == null
+          ? const Padding(
+              padding: EdgeInsets.all(24),
+              child: Center(child: Text('暂无播放')),
+            )
+          : Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                _TitleRow(
+                  current: current!,
+                  showMetadata: showMetadata,
+                  onDownload: onDownload,
+                  onAddToPlaylist: onAddToPlaylist,
+                  onLyricsOffset: onLyricsOffset,
+                  onDesktopLyrics: onDesktopLyrics,
+                ),
+                if (errorMessage != null) ...[
+                  const SizedBox(height: 10),
+                  _PlaybackError(
+                    message: errorMessage,
+                    onRetry: notifier.toggle,
                   ),
                 ],
-              ),
-      ),
+                const SizedBox(height: 14),
+                _ProgressBar(
+                  notifier: notifier,
+                  enabled: !videoActive || videoController != null,
+                  videoController: videoController,
+                ),
+                const SizedBox(height: 6),
+                _Controls(
+                  notifier: notifier,
+                  disabled: videoActive,
+                  videoController: videoController,
+                ),
+              ],
+            ),
     );
   }
 }
@@ -3431,55 +5002,141 @@ class _PlaybackError extends StatelessWidget {
 }
 
 class _TitleRow extends ConsumerWidget {
-  const _TitleRow({required this.current});
+  const _TitleRow({
+    required this.current,
+    this.showMetadata = true,
+    this.onDownload,
+    this.onAddToPlaylist,
+    this.onLyricsOffset,
+    this.onDesktopLyrics,
+  });
   final QueueItem current;
+  final bool showMetadata;
+  final VoidCallback? onDownload;
+  final VoidCallback? onAddToPlaylist;
+  final VoidCallback? onLyricsOffset;
+  final VoidCallback? onDesktopLyrics;
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
-    final scheme = Theme.of(context).colorScheme;
     final isFav = ref.watch(favoritesProvider).contains(current.path);
+    final desktopLyricsEnabled = ref.watch(
+      settingsProvider.select(
+        (value) => value.valueOrNull?.desktopLyricsEnabled == true,
+      ),
+    );
+    final isLocal =
+        playbackSourceTypeFor(current) == PlaybackSourceType.localFile;
     return Row(
+      mainAxisAlignment: showMetadata
+          ? MainAxisAlignment.start
+          : MainAxisAlignment.spaceBetween,
       children: [
-        Expanded(
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text(
-                current.title,
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-                style: const TextStyle(
-                  color: Colors.white,
-                  fontSize: 18,
-                  fontWeight: FontWeight.w700,
+        if (showMetadata)
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  current.title,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(
+                    color: Colors.white,
+                    fontSize: 18,
+                    fontWeight: FontWeight.w700,
+                  ),
                 ),
-              ),
-              const SizedBox(height: 3),
-              Text(
-                current.artist,
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-                style: TextStyle(
-                  fontSize: 13,
-                  color: Colors.white.withValues(alpha: .56),
+                const SizedBox(height: 3),
+                Text(
+                  current.artist,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    fontSize: 13,
+                    color: Colors.white.withValues(alpha: .56),
+                  ),
                 ),
-              ),
-            ],
+              ],
+            ),
           ),
-        ),
-        IconButton(
-          icon: Icon(
-            isFav ? Icons.favorite : Icons.favorite_border,
-            color: isFav ? scheme.primary : Colors.white70,
+        if (!showMetadata)
+          _quickAction(
+            context,
+            icon: Icons.download_rounded,
+            tooltip: '下载',
+            onPressed: isLocal ? null : onDownload,
           ),
-          onPressed: () => ref
-              .read(favoritesProvider.notifier)
-              .toggle(
-                current.path,
-                song: FavoriteSongSnapshot.fromQueueItem(current),
-              ),
-        ),
+        if (!showMetadata)
+          _quickAction(
+            context,
+            icon: Icons.playlist_add_rounded,
+            tooltip: '添加到歌单',
+            onPressed: onAddToPlaylist,
+          ),
+        if (!showMetadata)
+          _quickAction(
+            context,
+            icon: Icons.sync_alt_rounded,
+            tooltip: '歌词偏移',
+            onPressed: onLyricsOffset,
+          ),
+        if (!showMetadata)
+          _quickAction(
+            context,
+            icon: desktopLyricsEnabled
+                ? Icons.desktop_access_disabled_outlined
+                : Icons.desktop_windows_outlined,
+            tooltip: desktopLyricsEnabled ? '关闭桌面歌词' : '开启桌面歌词',
+            onPressed: onDesktopLyrics,
+          ),
+        if (!showMetadata)
+          _quickAction(
+            context,
+            icon: isFav ? Icons.favorite : Icons.favorite_border,
+            tooltip: isFav ? '取消收藏' : '收藏',
+            color: isFav ? const Color(0xFFEC4141) : Colors.white70,
+            onPressed: () => ref
+                .read(favoritesProvider.notifier)
+                .toggle(
+                  current.path,
+                  song: FavoriteSongSnapshot.fromQueueItem(current),
+                ),
+          ),
+        if (showMetadata)
+          IconButton(
+            icon: Icon(
+              isFav ? Icons.favorite : Icons.favorite_border,
+              // 收藏状态使用固定红色，不随用户自定义主题色变化。
+              color: isFav ? const Color(0xFFEC4141) : Colors.white70,
+            ),
+            onPressed: () => ref
+                .read(favoritesProvider.notifier)
+                .toggle(
+                  current.path,
+                  song: FavoriteSongSnapshot.fromQueueItem(current),
+                ),
+          ),
       ],
+    );
+  }
+
+  Widget _quickAction(
+    BuildContext context, {
+    required IconData icon,
+    required String tooltip,
+    required VoidCallback? onPressed,
+    Color? color,
+  }) {
+    return IconButton(
+      tooltip: tooltip,
+      icon: Icon(icon, color: color ?? Colors.white70),
+      onPressed: onPressed,
+      // 与封面界面的收藏按钮保持同一尺寸和内边距，切换页面时图标
+      // 中心位置不会发生跳动；所有快捷按钮也因此保持同一水平基线。
+      visualDensity: VisualDensity.standard,
+      padding: const EdgeInsets.all(8),
+      constraints: const BoxConstraints(minWidth: 48, minHeight: 48),
     );
   }
 }

@@ -3,6 +3,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../src/effects/effects_provider.dart';
 import '../../src/navigation/sidebar_controller.dart';
+import '../../src/core/settings.dart';
 
 class EffectsPage extends ConsumerStatefulWidget {
   const EffectsPage({super.key});
@@ -17,10 +18,17 @@ class _EffectsPageState extends ConsumerState<EffectsPage> {
   @override
   Widget build(BuildContext context) {
     final effects = ref.watch(effectsProvider);
+    final sidebarOnRight = ref.watch(
+      settingsProvider.select(
+        (value) => value.valueOrNull?.sidebarPosition == SidebarPosition.right,
+      ),
+    );
     return Scaffold(
       appBar: AppBar(
-        leading: const AppSidebarMenuButton(),
+        automaticallyImplyLeading: !sidebarOnRight,
+        leading: sidebarOnRight ? null : const AppSidebarMenuButton(),
         title: const Text('音效'),
+        actions: [if (sidebarOnRight) const AppSidebarMenuButton()],
       ),
       body: effects.when(
         loading: () => const Center(child: CircularProgressIndicator()),

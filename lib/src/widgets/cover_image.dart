@@ -19,6 +19,7 @@ class CoverImage extends ConsumerStatefulWidget {
     this.height = 48,
     this.radius = 12,
     this.cacheWidth,
+    this.highQuality = false,
     this.gradient = const [Color(0xFFEC4141), Color(0xFFFF8A5C)],
     this.icon = Icons.music_note,
   });
@@ -32,6 +33,10 @@ class CoverImage extends ConsumerStatefulWidget {
   /// 图片解码宽度（物理像素）。只供明确需要低分辨率纹理的页面使用；
   /// 普通封面不强制 ResizeImage，避免影响所有列表和播放底栏。
   final int? cacheWidth;
+
+  /// 本地歌曲的大尺寸封面使用高清缓存，避免将列表缩略图放大后模糊。
+  /// 网络封面仍由网络图片本身负责分辨率，不受此开关影响。
+  final bool highQuality;
   final List<Color> gradient;
   final IconData icon;
 
@@ -60,7 +65,8 @@ class _CoverImageState extends ConsumerState<CoverImage> {
   void didUpdateWidget(CoverImage oldWidget) {
     super.didUpdateWidget(oldWidget);
     if (oldWidget.songPath != widget.songPath ||
-        oldWidget.imageUrl != widget.imageUrl) {
+        oldWidget.imageUrl != widget.imageUrl ||
+        oldWidget.highQuality != widget.highQuality) {
       _path = null;
       _proxyBytes = null;
       _proxyLoading = false;
@@ -72,7 +78,7 @@ class _CoverImageState extends ConsumerState<CoverImage> {
   Future<void> _load() async {
     final imageUrl = normalizeCoverImageUrl(widget.imageUrl);
     if (imageUrl.isNotEmpty) return;
-    final cached = _cache[widget.songPath];
+    final cached = _cache[_cacheKey];
     if (cached != null) {
       if (mounted) setState(() => _path = cached.isEmpty ? null : cached);
       return;
@@ -80,18 +86,27 @@ class _CoverImageState extends ConsumerState<CoverImage> {
     try {
       final dbPath = await ref.read(dbPathProvider.future);
       final cacheRoot = await ref.read(appDataDirProvider.future);
-      final p = await getSongCoverThumbnail(
-        dbPath: dbPath,
-        cacheRoot: cacheRoot,
-        path: widget.songPath,
-      );
-      _cache[widget.songPath] = p;
+      final p = await (widget.highQuality
+          ? getSongCover(
+              dbPath: dbPath,
+              cacheRoot: cacheRoot,
+              path: widget.songPath,
+            )
+          : getSongCoverThumbnail(
+              dbPath: dbPath,
+              cacheRoot: cacheRoot,
+              path: widget.songPath,
+            ));
+      _cache[_cacheKey] = p;
       if (mounted) setState(() => _path = p.isEmpty ? null : p);
     } catch (_) {
-      _cache[widget.songPath] = '';
+      _cache[_cacheKey] = '';
       if (mounted) setState(() => _path = null);
     }
   }
+
+  String get _cacheKey =>
+      '${widget.highQuality ? 'full' : 'thumb'}:${widget.songPath}';
 
   Future<void> _loadProxiedImage(String imageUrl) async {
     if (_proxyLoading || _proxyFailed) return;
@@ -186,7 +201,7 @@ class _CoverImageState extends ConsumerState<CoverImage> {
                 fit: BoxFit.cover,
                 errorBuilder: (_, _, _) => _networkError(imageUrl),
               )
-            : (path != null && File(path).existsSync())
+            : (path != null)
             ? Image.file(
                 File(path),
                 cacheWidth: decodeWidth,

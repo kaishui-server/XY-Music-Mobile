@@ -6,6 +6,8 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 
 import '../../src/auth/auth_provider.dart';
+import '../../src/core/settings.dart';
+import '../../src/favorites/favorites_provider.dart';
 import '../../src/navigation/sidebar_controller.dart';
 import '../../src/playlists/playlists_provider.dart';
 import '../../src/sync/account_cloud_sync.dart';
@@ -112,22 +114,24 @@ class _AccountPageState extends ConsumerState<AccountPage>
       return;
     }
 
-    // 登录/注册前先过人机验证。
-    final captcha = await _requestHumanCaptcha(
-      title: isLogin ? '登录前验证' : '注册前验证',
-      description: isLogin ? '完成验证后将继续登录当前账号。' : '完成验证后将继续创建账号。',
-    );
-    if (captcha == null || !mounted) return;
+    // 注册仍需人机验证；登录完全不请求、不弹出也不提交人机验证字段。
+    HumanCaptchaPayload? captcha;
+    if (!isLogin) {
+      captcha = await _requestHumanCaptcha(
+        title: '注册前验证',
+        description: '完成验证后将继续创建账号。',
+      );
+      if (captcha == null || !mounted) return;
+    }
 
     if (isLogin) {
       await notifier.login(
-        ciyuanxiId: _idCtrl.text,
+        xymusicId: _idCtrl.text,
         password: _passwordCtrl.text,
-        captcha: captcha,
       );
     } else {
       final notice = await notifier.register(
-        ciyuanxiId: _idCtrl.text,
+        xymusicId: _idCtrl.text,
         nickname: _nicknameCtrl.text,
         password: _passwordCtrl.text,
         email: _emailCtrl.text,
@@ -391,7 +395,12 @@ class _AccountPageState extends ConsumerState<AccountPage>
     }
     await _loadAvatarStatus();
     if (!mounted) return;
-    await AccountCloudSync.startAutoUpload(auth, playlists, container);
+    await AccountCloudSync.startAutoUpload(
+      auth,
+      playlists,
+      container,
+      favorites: ref.read(favoritesProvider.notifier),
+    );
   }
 
   Future<void> _loadAvatarStatus() async {
@@ -405,7 +414,7 @@ class _AccountPageState extends ConsumerState<AccountPage>
   }
 
   Future<void> _handleCloudSyncAfterLogin() async {
-    final accountId = ref.read(authProvider).user?.ciyuanxiId?.trim() ?? '';
+    final accountId = ref.read(authProvider).user?.xymusicId?.trim() ?? '';
     if (accountId.isEmpty || !mounted) return;
     final container = ProviderScope.containerOf(context, listen: false);
     if (await AccountCloudSync.isEnabled(accountId)) {
@@ -414,6 +423,7 @@ class _AccountPageState extends ConsumerState<AccountPage>
         ref.read(authProvider.notifier),
         ref.read(playlistsProvider.notifier),
         container,
+        favorites: ref.read(favoritesProvider.notifier),
       );
       return;
     }
@@ -432,6 +442,7 @@ class _AccountPageState extends ConsumerState<AccountPage>
         ref.read(authProvider.notifier),
         ref.read(playlistsProvider.notifier),
         container,
+        favorites: ref.read(favoritesProvider.notifier),
       );
     }
   }
@@ -443,7 +454,12 @@ class _AccountPageState extends ConsumerState<AccountPage>
     try {
       final auth = ref.read(authProvider.notifier);
       final playlists = ref.read(playlistsProvider.notifier);
-      final result = await AccountCloudSync.syncAll(auth, playlists, container);
+      final result = await AccountCloudSync.syncAll(
+        auth,
+        playlists,
+        container,
+        favorites: ref.read(favoritesProvider.notifier),
+      );
       if (mounted) {
         final suffix = result.pluginErrors.isEmpty
             ? ''
@@ -517,13 +533,25 @@ class _AccountPageState extends ConsumerState<AccountPage>
   @override
   Widget build(BuildContext context) {
     final auth = ref.watch(authProvider);
+    final sidebarOnRight = ref.watch(
+      settingsProvider.select(
+        (value) => value.valueOrNull?.sidebarPosition == SidebarPosition.right,
+      ),
+    );
     return Scaffold(
       appBar: AppBar(
-        leading: widget.showSidebarButton
+        automaticallyImplyLeading: !widget.showSidebarButton || !sidebarOnRight,
+        leading: widget.showSidebarButton && !sidebarOnRight
             ? const AppSidebarMenuButton()
+            : widget.showSidebarButton
+            ? null
             : const BackButton(),
         title: Text(auth.isLoggedIn ? '我的' : '账号'),
         centerTitle: true,
+        actions: [
+          if (widget.showSidebarButton && sidebarOnRight)
+            const AppSidebarMenuButton(),
+        ],
       ),
       body: auth.isLoggedIn
           ? _ProfileView(
@@ -955,8 +983,8 @@ class _ProfileView extends StatelessWidget {
               label: '邮箱',
               value: user.email.isEmpty ? '未绑定' : user.email,
             ),
-            if (user.ciyuanxiId != null && user.ciyuanxiId!.isNotEmpty)
-              _InfoTile(icon: Icons.tag, label: '账号', value: user.ciyuanxiId!),
+            if (user.xymusicId != null && user.xymusicId!.isNotEmpty)
+              _InfoTile(icon: Icons.tag, label: '账号', value: user.xymusicId!),
           ],
         ),
         const SizedBox(height: 16),
@@ -1237,6 +1265,7 @@ class _HumanCaptchaDialogState extends State<_HumanCaptchaDialog> {
   bool _loading = false;
   bool _verifying = false;
   String? _error;
+  int _refreshToken = 0;
 
   @override
   void initState() {
@@ -1251,6 +1280,8 @@ class _HumanCaptchaDialogState extends State<_HumanCaptchaDialog> {
   }
 
   Future<void> _refresh() async {
+    if (!mounted) return;
+    final refreshToken = ++_refreshToken;
     setState(() {
       _loading = true;
       _error = null;
@@ -1258,13 +1289,13 @@ class _HumanCaptchaDialogState extends State<_HumanCaptchaDialog> {
     });
     try {
       final c = await widget.notifier.fetchCaptcha();
-      if (!mounted) return;
+      if (!mounted || refreshToken != _refreshToken) return;
       setState(() {
         _captcha = c;
         _loading = false;
       });
     } catch (e) {
-      if (!mounted) return;
+      if (!mounted || refreshToken != _refreshToken) return;
       setState(() {
         _captcha = null;
         _loading = false;

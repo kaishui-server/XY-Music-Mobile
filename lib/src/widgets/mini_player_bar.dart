@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -28,6 +29,10 @@ class MiniPlayerBar extends ConsumerWidget {
           isPlaying: state.isPlaying,
           isLoading: state.isLoading,
           errorMessage: state.errorMessage,
+          // 进度也必须订阅：单曲循环由播放器原生回绕，current 等字段不变，
+          // 不订阅 position 的话底栏不会重建，循环重播后进度条停在末尾。
+          position: state.position,
+          duration: state.duration,
         ),
       ),
     );
@@ -63,8 +68,14 @@ class MiniPlayerBar extends ConsumerWidget {
   Widget _buildBar(
     BuildContext context,
     WidgetRef ref,
-    ({QueueItem? current, bool isPlaying, bool isLoading, String? errorMessage})
-    player,
+    ({
+      QueueItem? current,
+      bool isPlaying,
+      bool isLoading,
+      String? errorMessage,
+      double position,
+      double duration,
+    }) player,
     QueueItem current, {
     VideoPlayerController? video,
     VideoPlayerValue? videoValue,
@@ -78,10 +89,10 @@ class MiniPlayerBar extends ConsumerWidget {
     final isPlaying = videoValue?.isPlaying ?? player.isPlaying;
     final isLoading = videoLoading || (video == null && player.isLoading);
     final position = videoValue == null
-        ? ref.read(playerProvider).position
+        ? player.position
         : videoValue.position.inMilliseconds / 1000.0;
     final duration = videoValue == null
-        ? ref.read(playerProvider).duration
+        ? player.duration
         : videoValue.duration.inMilliseconds / 1000.0;
 
     return GestureDetector(
@@ -91,118 +102,122 @@ class MiniPlayerBar extends ConsumerWidget {
       },
       child: ClipRRect(
         borderRadius: BorderRadius.circular(XyRadii.large),
-        child: Container(
-          height: 64,
-          decoration: BoxDecoration(
-            color: theme.colorScheme.surface.withValues(
-              alpha: dark ? 0.98 : 0.99,
-            ),
-            borderRadius: BorderRadius.circular(XyRadii.large),
-            border: Border.all(
-              color: dark ? XyColors.darkBorder : XyColors.lightBorder,
-            ),
-            boxShadow: [
-              BoxShadow(
-                color: Colors.black.withValues(alpha: dark ? 0.3 : 0.09),
-                blurRadius: 24,
-                offset: const Offset(0, 8),
+        child: BackdropFilter.grouped(
+          // 小型底栏也会在页面滚动时参与合成，降低半径避免低端手机掉帧。
+          filter: ui.ImageFilter.blur(sigmaX: 12, sigmaY: 12),
+          child: Container(
+            height: 64,
+            decoration: BoxDecoration(
+              color: theme.colorScheme.surface.withValues(
+                alpha: dark ? .34 : .48,
               ),
-            ],
-          ),
-          child: Stack(
-            children: [
-              Row(
-                children: [
-                  Padding(
-                    padding: const EdgeInsets.all(6),
-                    child: CoverImage(
-                      key: ValueKey('mini:${current.path}'),
-                      songPath: current.path,
-                      imageUrl: current.coverUrl,
-                      width: 50,
-                      height: 50,
-                      radius: 12,
-                      icon: Icons.music_note_rounded,
-                    ),
-                  ),
-                  const SizedBox(width: 6),
-                  Expanded(
-                    child: Column(
-                      mainAxisAlignment: MainAxisAlignment.center,
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text(
-                          current.title,
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: const TextStyle(
-                            fontSize: 14,
-                            fontWeight: FontWeight.w700,
-                          ),
-                        ),
-                        const SizedBox(height: 3),
-                        Text(
-                          player.errorMessage ??
-                              (current.artist.isEmpty
-                                  ? '未知歌手'
-                                  : current.artist),
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: TextStyle(
-                            fontSize: 11,
-                            color: player.errorMessage == null
-                                ? theme.colorScheme.onSurfaceVariant
-                                : theme.colorScheme.error,
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
-                  _PlayerButton(
-                    primary: true,
-                    icon: isLoading
-                        ? Icons.hourglass_top_rounded
-                        : isPlaying
-                        ? Icons.pause_rounded
-                        : Icons.play_arrow_rounded,
-                    label: isLoading
-                        ? '加载中'
-                        : isPlaying
-                        ? '暂停'
-                        : '播放',
-                    onTap: isLoading
-                        ? () {}
-                        : video != null
-                        ? () {
-                            if (video.value.isPlaying) {
-                              unawaited(video.pause());
-                            } else {
-                              unawaited(video.play());
-                            }
-                          }
-                        : () => ref.read(playerProvider.notifier).toggle(),
-                  ),
-                  _PlayerButton(
-                    icon: Icons.skip_next_rounded,
-                    label: '下一首',
-                    onTap: () {
-                      if (video != null) {
-                        unawaited(VideoPlaybackSession.stopForTrackAction());
-                      }
-                      unawaited(ref.read(playerProvider.notifier).next());
-                    },
-                  ),
-                  const SizedBox(width: 3),
-                ],
+              borderRadius: BorderRadius.circular(XyRadii.large),
+              border: Border.all(
+                color: dark ? XyColors.darkBorder : XyColors.lightBorder,
               ),
-              Align(
-                alignment: Alignment.bottomLeft,
-                child: _MiniPlayerProgress(
-                  position: position,
-                  duration: duration,
+              boxShadow: [
+                BoxShadow(
+                  color: Colors.black.withValues(alpha: dark ? 0.3 : 0.09),
+                  blurRadius: 24,
+                  offset: const Offset(0, 8),
                 ),
-              ),
-            ],
+              ],
+            ),
+            child: Stack(
+              children: [
+                Row(
+                  children: [
+                    Padding(
+                      padding: const EdgeInsets.all(6),
+                      child: CoverImage(
+                        key: ValueKey('mini:${current.path}'),
+                        songPath: current.path,
+                        imageUrl: current.coverUrl,
+                        width: 50,
+                        height: 50,
+                        radius: 12,
+                        icon: Icons.music_note_rounded,
+                      ),
+                    ),
+                    const SizedBox(width: 6),
+                    Expanded(
+                      child: Column(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            current.title,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: const TextStyle(
+                              fontSize: 14,
+                              fontWeight: FontWeight.w700,
+                            ),
+                          ),
+                          const SizedBox(height: 3),
+                          Text(
+                            player.errorMessage ??
+                                (current.artist.isEmpty
+                                    ? '未知歌手'
+                                    : current.artist),
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: TextStyle(
+                              fontSize: 11,
+                              color: player.errorMessage == null
+                                  ? theme.colorScheme.onSurfaceVariant
+                                  : theme.colorScheme.error,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                    _PlayerButton(
+                      primary: true,
+                      icon: isLoading
+                          ? Icons.hourglass_top_rounded
+                          : isPlaying
+                          ? Icons.pause_rounded
+                          : Icons.play_arrow_rounded,
+                      label: isLoading
+                          ? '加载中'
+                          : isPlaying
+                          ? '暂停'
+                          : '播放',
+                      onTap: isLoading
+                          ? () {}
+                          : video != null
+                          ? () {
+                              if (video.value.isPlaying) {
+                                unawaited(video.pause());
+                              } else {
+                                unawaited(video.play());
+                              }
+                            }
+                          : () => ref.read(playerProvider.notifier).toggle(),
+                    ),
+                    _PlayerButton(
+                      icon: Icons.skip_next_rounded,
+                      label: '下一首',
+                      onTap: () {
+                        if (video != null) {
+                          unawaited(VideoPlaybackSession.stopForTrackAction());
+                        }
+                        unawaited(ref.read(playerProvider.notifier).next());
+                      },
+                    ),
+                    const SizedBox(width: 3),
+                  ],
+                ),
+                Align(
+                  alignment: Alignment.bottomLeft,
+                  child: _MiniPlayerProgress(
+                    position: position,
+                    duration: duration,
+                  ),
+                ),
+              ],
+            ),
           ),
         ),
       ),

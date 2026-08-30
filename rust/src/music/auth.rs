@@ -17,8 +17,12 @@ use std::time::Duration;
 /// 默认 API 签名密钥。自建后端可在客户端账号设置页覆盖。
 const DEFAULT_API_SECRET: &str = "53dab6e42c380c4502f73b40fc2e9af9c2ee523ecb92b6884ad17156c9c762af";
 
-/// 官方后端地址
-const OFFICIAL_AUTH_BASE_URL: &str = "http://156.233.228.213:8081/api";
+/// 官方后端地址（域名 HTTPS 入口）。
+///
+/// Flutter 侧会在启动时将该地址写入持久化配置，但 Rust 仍需要使用同一
+/// 地址作为首次启动、配置文件损坏或启动竞态时的回退值；否则会回退到旧
+/// IP 的明文入口，导致计算题验证请求无法返回题目。
+const OFFICIAL_AUTH_BASE_URL: &str = "https://cosn.xymusic.cc:8081/api";
 
 /// 默认后端地址：与桌面端当前使用的官方服务保持一致。
 const DEFAULT_AUTH_BASE_URL: &str = OFFICIAL_AUTH_BASE_URL;

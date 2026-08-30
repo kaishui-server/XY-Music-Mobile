@@ -55,7 +55,7 @@ class RecentSongSnapshot {
 }
 
 const _recentSongMetadataKey = 'recentSongMetadataV1';
-const _maxRecentSongSnapshots = 500;
+const _maxRecentSongSnapshots = 300;
 
 // 播放/切歌可能连续触发异步写入；串行化可避免较晚完成的旧快照覆盖新数据。
 Future<void> _recentSnapshotWriteQueue = Future<void>.value();

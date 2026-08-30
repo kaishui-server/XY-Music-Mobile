@@ -11,7 +11,7 @@ import '../core/db_path.dart';
 import '../rust/api.dart';
 
 /// 默认后端地址与签名密钥（与桌面端一致）。
-const defaultAuthBaseUrl = 'http://156.233.228.213:8081/api';
+const defaultAuthBaseUrl = 'https://cosn.xymusic.cc:8081/api';
 const defaultAuthApiSecret =
     '53dab6e42c380c4502f73b40fc2e9af9c2ee523ecb92b6884ad17156c9c762af';
 
@@ -22,7 +22,7 @@ class AuthUser {
   final String nickname;
   final String email;
   final String? avatar;
-  final String? ciyuanxiId;
+  final String? xymusicId;
   final String role;
   const AuthUser({
     required this.id,
@@ -30,7 +30,7 @@ class AuthUser {
     required this.nickname,
     required this.email,
     this.avatar,
-    this.ciyuanxiId,
+    this.xymusicId,
     this.role = '',
   });
 
@@ -40,14 +40,15 @@ class AuthUser {
     final nickname = ((j['nickname'] as String?)?.isNotEmpty ?? false)
         ? (j['nickname'] as String)
         : username;
-    final ciyuanxi = j['ciyuanxi_id'];
+    // 读取一次旧版本地凭据字段，保存或刷新资料后会统一写回 xymusic_id。
+    final xymusic = j['xymusic_id'] ?? j['ciyuanxi_id'];
     return AuthUser(
       id: idRaw.toString(),
       username: username,
       nickname: nickname,
       email: (j['email'] as String?) ?? '',
       avatar: (j['avatar_url'] ?? j['avatar']) as String?,
-      ciyuanxiId: ciyuanxi?.toString(),
+      xymusicId: xymusic?.toString(),
       role: (j['role'] as String?) ?? '',
     );
   }
@@ -58,7 +59,7 @@ class AuthUser {
     'nickname': nickname,
     'email': email,
     'avatar': avatar,
-    'ciyuanxi_id': ciyuanxiId,
+    'xymusic_id': xymusicId,
     'role': role,
   };
 }
@@ -181,11 +182,18 @@ class HumanCaptcha {
     this.expireSeconds,
   });
 
-  factory HumanCaptcha.fromJson(Map<String, dynamic> j) => HumanCaptcha(
-    captchaId: (j['captcha_id'] ?? '').toString(),
-    question: (j['question'] ?? '').toString(),
-    expireSeconds: (j['expire_seconds'] as num?)?.toInt(),
-  );
+  factory HumanCaptcha.fromJson(Map<String, dynamic> j) {
+    // 兼容不同版本服务端的字段命名，避免收到题目后因字段名不一致而
+    // 显示空白题目。
+    final id = j['captcha_id'] ?? j['captchaId'] ?? j['id'];
+    final question = j['question'] ?? j['captcha_question'] ?? j['captchaQuestion'];
+    final expire = j['expire_seconds'] ?? j['expireSeconds'];
+    return HumanCaptcha(
+      captchaId: id?.toString().trim() ?? '',
+      question: question?.toString().trim() ?? '',
+      expireSeconds: expire is num ? expire.toInt() : int.tryParse('$expire'),
+    );
+  }
 }
 
 /// 人机验证结果载荷（算术题：id + 答案）。
@@ -302,7 +310,7 @@ class AuthNotifier extends StateNotifier<AuthState> {
             ? model
             : '$manufacturer $model'.trim();
         return _ClientMetadata(
-          appVersion: info?['appVersion']?.toString().trim() ?? '1.1.0',
+          appVersion: info?['appVersion']?.toString().trim() ?? '1.3.1',
           osVersion: 'Android ${info?['osVersion'] ?? ''}'.trim(),
           deviceModel: deviceModel.isEmpty ? 'Android 手机' : deviceModel,
         );
@@ -311,7 +319,7 @@ class AuthNotifier extends StateNotifier<AuthState> {
       }
     }
     return _ClientMetadata(
-      appVersion: '1.1.0',
+      appVersion: '1.3.1',
       osVersion: defaultTargetPlatform.name,
       deviceModel: '${defaultTargetPlatform.name} 设备',
     );
@@ -410,7 +418,7 @@ class AuthNotifier extends StateNotifier<AuthState> {
     final metadata = await _clientMetadata();
     await _requestAction('open', {
       'device_id': await _deviceId(),
-      'ciyuanxi_id': state.user?.ciyuanxiId ?? '',
+      'xymusic_id': state.user?.xymusicId ?? '',
       ...metadata.toRequestFields(),
     }, fetchTimeoutMs: 8000);
   }
@@ -431,7 +439,7 @@ class AuthNotifier extends StateNotifier<AuthState> {
 
   Future<BackendAnnouncement?> fetchAnnouncement() async {
     final data = await _requestAction('get_announcement', {
-      'ciyuanxi_id': state.user?.ciyuanxiId ?? '',
+      'xymusic_id': state.user?.xymusicId ?? '',
       'device_id': await _deviceId(),
     }, fetchTimeoutMs: 15000);
     final id = data['id']?.toString() ?? '';
@@ -453,7 +461,7 @@ class AuthNotifier extends StateNotifier<AuthState> {
     await _requestAction('confirm_announcement', {
       'announcement_id': announcement.id,
       'announcement_updated_at': announcement.updatedAt,
-      'ciyuanxi_id': state.user?.ciyuanxiId ?? '',
+      'xymusic_id': state.user?.xymusicId ?? '',
       'device_id': await _deviceId(),
     }, fetchTimeoutMs: 15000);
   }
@@ -492,18 +500,32 @@ class AuthNotifier extends StateNotifier<AuthState> {
 
   /// 获取一次性人机验证题（算术题，purpose=auth）。
   Future<HumanCaptcha> fetchCaptcha() async {
-    final data = await _requestAction('get_captcha', {'purpose': 'auth'});
-    return HumanCaptcha.fromJson(data);
+    // 验证弹窗不能无限停留在“加载中”。网络或服务端数据库异常时，
+    // 给请求设置一个有限超时，让界面进入可重试状态。
+    final data = await _requestAction(
+      'get_captcha',
+      {'purpose': 'auth'},
+      fetchTimeoutMs: 12000,
+    ).timeout(const Duration(seconds: 15));
+    final captcha = HumanCaptcha.fromJson(data);
+    if (captcha.captchaId.isEmpty || captcha.question.isEmpty) {
+      throw AuthException('验证题返回内容无效，请点击换一题重试');
+    }
+    return captcha;
   }
 
   /// 预校验人机验证答案。答案正确返回，错误抛 AuthException。
   /// 此接口只确认答案，不消费验证码；后续登录/注册/发码请求会再次校验并消费。
   Future<void> verifyCaptcha(HumanCaptchaPayload payload) async {
-    await _requestAction('verify_captcha', {
-      'purpose': 'auth',
-      'captcha_id': payload.captchaId,
-      'captcha_answer': payload.captchaAnswer,
-    });
+    await _requestAction(
+      'verify_captcha',
+      {
+        'purpose': 'auth',
+        'captcha_id': payload.captchaId,
+        'captcha_answer': payload.captchaAnswer,
+      },
+      fetchTimeoutMs: 12000,
+    ).timeout(const Duration(seconds: 15));
   }
 
   /// 发送邮箱验证码（注册/找回密码等场景），需先通过人机验证。
@@ -511,13 +533,13 @@ class AuthNotifier extends StateNotifier<AuthState> {
     String email,
     String type, {
     HumanCaptchaPayload? captcha,
-    String? ciyuanxiId,
+    String? xymusicId,
   }) async {
     final data = await _requestAction('send_verify_code', {
       'email': email,
       'type': type,
-      if (ciyuanxiId != null && ciyuanxiId.trim().isNotEmpty)
-        'ciyuanxi_id': ciyuanxiId.trim(),
+      if (xymusicId != null && xymusicId.trim().isNotEmpty)
+        'xymusic_id': xymusicId.trim(),
       if (captcha != null) ...captcha.toBodyFields(),
     });
     return _userFacingMessage(
@@ -527,19 +549,17 @@ class AuthNotifier extends StateNotifier<AuthState> {
 
   /// XY Music 账号登录。
   Future<void> login({
-    required String ciyuanxiId,
+    required String xymusicId,
     required String password,
-    HumanCaptchaPayload? captcha,
   }) async {
     state = state.copyWith(loading: true, clearError: true);
     try {
       final metadata = await _clientMetadata();
       final data = await _requestAction('user_login', {
-        'ciyuanxi_id': ciyuanxiId.trim(),
+        'xymusic_id': xymusicId.trim(),
         'password': password,
         'device_id': await _deviceId(),
         ...metadata.toRequestFields(),
-        if (captcha != null) ...captcha.toBodyFields(),
       });
       final token = data['token'];
       if (token == null || token.toString().isEmpty) {
@@ -553,7 +573,7 @@ class AuthNotifier extends StateNotifier<AuthState> {
 
   /// 用户注册（注册成功后自动登录）。
   Future<String?> register({
-    required String ciyuanxiId,
+    required String xymusicId,
     required String nickname,
     required String password,
     required String email,
@@ -564,7 +584,7 @@ class AuthNotifier extends StateNotifier<AuthState> {
     try {
       final metadata = await _clientMetadata();
       final data = await _requestAction('register', {
-        'ciyuanxi_id': ciyuanxiId.trim(),
+        'xymusic_id': xymusicId.trim(),
         'nickname': nickname.trim(),
         'password': password,
         'email': email.trim(),
@@ -589,10 +609,10 @@ class AuthNotifier extends StateNotifier<AuthState> {
   /// 从目标服务器刷新当前用户资料，避免审核通过后的昵称/头像长期停留在旧缓存。
   Future<void> refreshProfile() async {
     final current = state.user;
-    final ciyuanxiId = current?.ciyuanxiId?.trim() ?? '';
-    if (current == null || ciyuanxiId.isEmpty) return;
+    final xymusicId = current?.xymusicId?.trim() ?? '';
+    if (current == null || xymusicId.isEmpty) return;
     final data = await _requestAction('get_user_info', {
-      'ciyuanxi_id': ciyuanxiId,
+      'xymusic_id': xymusicId,
     }, fetchTimeoutMs: 15000);
     await _replaceStoredUser(AuthUser.fromJson(data));
   }
@@ -601,8 +621,8 @@ class AuthNotifier extends StateNotifier<AuthState> {
   /// 与电脑版保持相同的审核接口和体积限制。
   Future<String> uploadAvatar(Uint8List bytes) async {
     final current = state.user;
-    final ciyuanxiId = current?.ciyuanxiId?.trim() ?? '';
-    if (current == null || ciyuanxiId.isEmpty) {
+    final xymusicId = current?.xymusicId?.trim() ?? '';
+    if (current == null || xymusicId.isEmpty) {
       throw AuthException('请先登录');
     }
     if (bytes.isEmpty) throw AuthException('请选择有效的图片');
@@ -636,7 +656,7 @@ class AuthNotifier extends StateNotifier<AuthState> {
     }
 
     final data = await _requestAction('upload_avatar', {
-      'ciyuanxi_id': ciyuanxiId,
+      'xymusic_id': xymusicId,
       'avatar_data': avatarData,
     }, fetchTimeoutMs: 55000);
     final status = data['status']?.toString().trim().toLowerCase() ?? '';
@@ -650,10 +670,10 @@ class AuthNotifier extends StateNotifier<AuthState> {
   /// 查询当前头像审核状态：none / pending / rejected。
   Future<String> fetchAvatarStatus() async {
     final current = state.user;
-    final ciyuanxiId = current?.ciyuanxiId?.trim() ?? '';
-    if (current == null || ciyuanxiId.isEmpty) return 'none';
+    final xymusicId = current?.xymusicId?.trim() ?? '';
+    if (current == null || xymusicId.isEmpty) return 'none';
     final data = await _requestAction('get_avatar_status', {
-      'ciyuanxi_id': ciyuanxiId,
+      'xymusic_id': xymusicId,
     }, fetchTimeoutMs: 15000);
     final status = data['status']?.toString().trim().toLowerCase() ?? 'none';
     return switch (status) {
@@ -666,13 +686,13 @@ class AuthNotifier extends StateNotifier<AuthState> {
   /// 提交昵称修改。服务端可能立即机审通过，也可能进入人工审核。
   Future<String> updateNickname(String nickname) async {
     final current = state.user;
-    final ciyuanxiId = current?.ciyuanxiId?.trim() ?? '';
-    if (current == null || ciyuanxiId.isEmpty) throw AuthException('请先登录');
+    final xymusicId = current?.xymusicId?.trim() ?? '';
+    if (current == null || xymusicId.isEmpty) throw AuthException('请先登录');
     if (nickname.trim().isEmpty) throw AuthException('昵称不能为空');
     final token = await _storedToken();
     final data = await _requestAction('update_profile', {
       'token': token,
-      'ciyuanxi_id': ciyuanxiId,
+      'xymusic_id': xymusicId,
       'username': nickname.trim(),
       'nickname': nickname.trim(),
       'avatar': '',
@@ -690,11 +710,11 @@ class AuthNotifier extends StateNotifier<AuthState> {
     required String oldPassword,
     required String newPassword,
   }) async {
-    final ciyuanxiId = state.user?.ciyuanxiId?.trim() ?? '';
-    if (ciyuanxiId.isEmpty) throw AuthException('请先登录');
+    final xymusicId = state.user?.xymusicId?.trim() ?? '';
+    if (xymusicId.isEmpty) throw AuthException('请先登录');
     if (newPassword.length < 6) throw AuthException('新密码长度不能少于 6 位');
     await _requestAction('change_password', {
-      'ciyuanxi_id': ciyuanxiId,
+      'xymusic_id': xymusicId,
       'old_password': oldPassword,
       'new_password': newPassword,
     });
@@ -767,13 +787,13 @@ class AuthNotifier extends StateNotifier<AuthState> {
     List<String> images = const [],
   }) async {
     final current = state.user;
-    final ciyuanxiId = current?.ciyuanxiId?.trim() ?? '';
-    if (current == null || ciyuanxiId.isEmpty) {
+    final xymusicId = current?.xymusicId?.trim() ?? '';
+    if (current == null || xymusicId.isEmpty) {
       throw AuthException('请先登录账号后再提交反馈');
     }
     final type = feedbackType == 'suggestion' ? 'suggestion' : 'problem';
     final data = await _requestAction('submit_feedback', {
-      'ciyuanxi_id': ciyuanxiId,
+      'xymusic_id': xymusicId,
       'nickname': current.nickname.trim(),
       'title': (title?.trim().isNotEmpty == true)
           ? title!.trim()
@@ -790,12 +810,12 @@ class AuthNotifier extends StateNotifier<AuthState> {
   /// 获取当前账号的反馈记录及处理结果。
   Future<List<UserFeedbackItem>> listMyFeedback() async {
     final current = state.user;
-    final ciyuanxiId = current?.ciyuanxiId?.trim() ?? '';
-    if (current == null || ciyuanxiId.isEmpty) {
+    final xymusicId = current?.xymusicId?.trim() ?? '';
+    if (current == null || xymusicId.isEmpty) {
       throw AuthException('请先登录账号后再查看反馈');
     }
     final data = await _requestAction('list_my_feedback', {
-      'ciyuanxi_id': ciyuanxiId,
+      'xymusic_id': xymusicId,
     }, fetchTimeoutMs: 20000);
     final list = data['list'];
     if (list is! List) return const [];
@@ -817,12 +837,8 @@ class AuthNotifier extends StateNotifier<AuthState> {
     return fallback;
   }
 
-  /// 兼容服务端尚未更新的旧提示文案，界面统一使用“账号”称呼。
-  String _userFacingMessage(String message) => message
-      .replaceAll('弦予音乐号', '账号')
-      .replaceAll('弦予号', '账号')
-      .replaceAll('弦予音乐 ID', '账号')
-      .replaceAll('弦予音乐ID', '账号');
+  /// 服务端返回的提示文案直接使用 XY Music 的统一称呼。
+  String _userFacingMessage(String message) => message;
 }
 
 final authProvider = StateNotifierProvider<AuthNotifier, AuthState>(

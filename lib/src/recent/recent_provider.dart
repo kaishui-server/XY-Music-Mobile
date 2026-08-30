@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -45,13 +46,19 @@ int recentHistoryPlayedAt(Map<String, dynamic> row) {
       0;
 }
 
+/// 最近播放最多保留的歌曲数，与 Rust 侧写入裁剪保持一致。
+const maxRecentSongCount = 300;
+
 /// 最近播放记录。等待播放历史真正写入后再刷新，避免当前歌曲已经切换、
 /// SQLite 记录尚未落库时提前读取，导致页面一直保留旧结果。
 final recentSongsProvider = FutureProvider<List<RecentSongEntry>>((ref) async {
   ref.watch(recentHistoryRevisionProvider);
   final dbPath = await ref.watch(dbPathProvider.future);
   final results = await Future.wait([
-    statsGetRecentHistory(dbPath: dbPath, limit: BigInt.from(500)),
+    statsGetRecentHistory(
+      dbPath: dbPath,
+      limit: BigInt.from(maxRecentSongCount),
+    ),
     loadRecentSongSnapshots(),
   ]);
   final raw = results[0] as String;
@@ -87,6 +94,17 @@ final recentSongsProvider = FutureProvider<List<RecentSongEntry>>((ref) async {
       .whereType<RecentSongEntry>()
       .toList();
 });
+
+/// 在主页首帧完成后预热最近播放数据。最近播放需要读取 SQLite 和网络歌曲
+/// 快照，首次进入页面时才发起请求会把等待时间集中到页面转场阶段；预热后
+/// Riverpod 会复用同一个 Future，页面打开时直接显示缓存结果。
+void preloadRecentSongs(WidgetRef ref) {
+  unawaited(
+    ref
+        .read(recentSongsProvider.future)
+        .catchError((_) => const <RecentSongEntry>[]),
+  );
+}
 
 Future<void> clearRecentSongs(WidgetRef ref) async {
   final dbPath = await ref.read(dbPathProvider.future);

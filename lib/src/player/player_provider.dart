@@ -3,6 +3,7 @@ import 'dart:async';
 import 'dart:io';
 import 'dart:math';
 
+import 'package:audio_service/audio_service.dart' as audio_service;
 import 'package:audio_session/audio_session.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -11,6 +12,7 @@ import 'package:just_audio/just_audio.dart';
 import 'package:just_audio_background/just_audio_background.dart';
 import 'package:path/path.dart' as p;
 import 'package:permission_handler/permission_handler.dart';
+import 'package:rxdart/rxdart.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../core/db_path.dart';
@@ -18,6 +20,7 @@ import '../core/settings.dart';
 import '../plugins/plugin_runtime.dart';
 import '../recent/recent_store.dart';
 import '../rust/api.dart';
+import '../rust/music/types.dart';
 import 'downloaded_song_store.dart';
 import 'desktop_lyrics.dart';
 import 'lx_lyrics_builder.dart';
@@ -48,7 +51,11 @@ class QueueItem {
     this.lyricsAttempted = false,
   });
 
-  QueueItem copyWith({String? lyricsRaw, bool? lyricsAttempted}) => QueueItem(
+  QueueItem copyWith({
+    String? lyricsRaw,
+    bool? lyricsAttempted,
+    bool clearLyricsRaw = false,
+  }) => QueueItem(
     path: path,
     title: title,
     artist: artist,
@@ -57,7 +64,7 @@ class QueueItem {
     pluginId: pluginId,
     pluginData: pluginData,
     coverUrl: coverUrl,
-    lyricsRaw: lyricsRaw ?? this.lyricsRaw,
+    lyricsRaw: clearLyricsRaw ? null : lyricsRaw ?? this.lyricsRaw,
     lyricsAttempted: lyricsAttempted ?? this.lyricsAttempted,
   );
 }
@@ -132,6 +139,8 @@ enum PlaybackSourceType { plugin, lx, networkUrl, localFile }
 const _recognizedPluginCacheKey = '_recognizedPluginFallback';
 const _playbackSourceAssociationsKey = 'playbackSourceAssociationsV1';
 const _rememberedLyricsKey = 'rememberedLyricsV1';
+const _rememberedLyricsAssociationKey = 'rememberedLyricsAssociationV1';
+const _rememberedLyricsOriginalKey = 'rememberedLyricsOriginalV1';
 
 /// 识曲结果只有歌名、歌手等文本信息，回退到插件搜索时必须先做严格匹配，
 /// 避免仅因标题里有几个相同字符就播放成另一首歌。
@@ -287,6 +296,40 @@ class PluginLyricsOption {
   );
 }
 
+/// 当前歌曲手动关联歌词的来源信息，用于在“更多 > 关联歌词”中展示并支持取消关联。
+class RememberedLyricsAssociation {
+  const RememberedLyricsAssociation({
+    required this.source,
+    this.pluginName,
+    this.title = '',
+    this.artist = '',
+    this.durationMs = 0,
+  });
+
+  final String source;
+  final String? pluginName;
+  final String title;
+  final String artist;
+  final int durationMs;
+
+  factory RememberedLyricsAssociation.fromJson(Map<String, dynamic> json) =>
+      RememberedLyricsAssociation(
+        source: json['source']?.toString() ?? 'local',
+        pluginName: json['pluginName']?.toString(),
+        title: json['title']?.toString() ?? '',
+        artist: json['artist']?.toString() ?? '',
+        durationMs: (json['durationMs'] as num?)?.toInt() ?? 0,
+      );
+
+  Map<String, dynamic> toJson() => {
+    'source': source,
+    'pluginName': pluginName,
+    'title': title,
+    'artist': artist,
+    'durationMs': durationMs,
+  };
+}
+
 class PluginLyricsSearchProgress {
   const PluginLyricsSearchProgress({
     required this.options,
@@ -409,6 +452,7 @@ class PlaybackState {
   final String? errorMessage;
   final DateTime? sleepTimerEndsAt;
   final String currentQuality;
+  final double playbackSpeed;
   const PlaybackState({
     this.current,
     this.queue = const [],
@@ -421,6 +465,7 @@ class PlaybackState {
     this.errorMessage,
     this.sleepTimerEndsAt,
     this.currentQuality = '320k',
+    this.playbackSpeed = 1.0,
   });
 
   PlaybackState copyWith({
@@ -435,6 +480,7 @@ class PlaybackState {
     Object? errorMessage = _playbackErrorNotSet,
     Object? sleepTimerEndsAt = _sleepTimerNotSet,
     String? currentQuality,
+    double? playbackSpeed,
   }) {
     return PlaybackState(
       current: current ?? this.current,
@@ -452,6 +498,7 @@ class PlaybackState {
           ? this.sleepTimerEndsAt
           : sleepTimerEndsAt as DateTime?,
       currentQuality: currentQuality ?? this.currentQuality,
+      playbackSpeed: playbackSpeed ?? this.playbackSpeed,
     );
   }
 }
@@ -461,16 +508,162 @@ class PlaybackState {
 LoopMode audioLoopModeForPlayMode(int playMode) =>
     normalizePlayMode(playMode) == 1 ? LoopMode.one : LoopMode.off;
 
-class PlayerNotifier extends StateNotifier<PlaybackState> {
+/// 媒体会话桥接。
+///
+/// 本应用采用“每首歌单独 setUrl”的播放模型，just_audio_background 内部
+/// 队列永远只有一项，其 hasNext/hasPrevious 恒为 false，因此系统媒体通知
+/// （状态栏/锁屏/灵动岛样式的媒体卡片）只显示播放/暂停按钮，MediaSession
+/// 也没有声明 skipToNext/skipToPrevious 能力——蓝牙耳机的上一首/下一首
+/// 按键因此失效。
+///
+/// 该桥接包装 just_audio_background 的内部 handler：
+/// - 在 playbackState 中补上上一首/下一首控件与对应的 MediaAction，
+///   让媒体卡片显示完整的三键布局，并让系统知道支持切歌；
+/// - 把 skipToNext/skipToPrevious 转发回 [PlayerNotifier]，由应用自己的
+///   播放队列决定切歌行为。
+class _MediaSessionBridge extends audio_service.CompositeAudioHandler {
+  _MediaSessionBridge(super.inner) : _innerRef = inner;
+
+  /// 被包装的 handler（CompositeAudioHandler 不公开 inner 访问器）。
+  final audio_service.AudioHandler _innerRef;
+
+  /// 由播放器注入的切歌回调；为空时回退到被包装 handler 的默认行为。
+  Future<void> Function()? onSkipToNext;
+  Future<void> Function()? onSkipToPrevious;
+
+  final BehaviorSubject<audio_service.PlaybackState> _patchedPlaybackState =
+      BehaviorSubject<audio_service.PlaybackState>();
+  bool _attached = false;
+
+  /// 订阅被包装 handler 的播放状态并开始发布补丁后的状态。
+  /// 必须在替换 SwitchAudioHandler.inner 之前调用一次。
+  void attach() {
+    if (_attached) return;
+    _attached = true;
+    _innerRef.playbackState.listen(_publish);
+  }
+
+  void _publish(audio_service.PlaybackState state) {
+    final controls = [...state.controls];
+    // 单 URL 播放导致原状态里永远没有切歌控件，这里补齐成
+    // [上一首, 播放/暂停, 上一首/下一首按钮之外的原有按钮, 下一首] 的
+    // 标准三键布局（stop 保留在完整控件里但不进紧凑视图）。
+    final hasPreviousControl = controls.any(
+      (control) => control.action == audio_service.MediaAction.skipToPrevious,
+    );
+    final hasNextControl = controls.any(
+      (control) => control.action == audio_service.MediaAction.skipToNext,
+    );
+    if (!hasPreviousControl) {
+      controls.insert(0, audio_service.MediaControl.skipToPrevious);
+    }
+    if (!hasNextControl) {
+      controls.add(audio_service.MediaControl.skipToNext);
+    }
+    final compactActionIndices = <int>[
+      for (var i = 0; i < controls.length; i++)
+        if (controls[i].action != audio_service.MediaAction.stop) i,
+    ];
+    _patchedPlaybackState.add(
+      state.copyWith(
+        controls: controls,
+        systemActions: {
+          ...state.systemActions,
+          audio_service.MediaAction.skipToPrevious,
+          audio_service.MediaAction.skipToNext,
+        },
+        androidCompactActionIndices: compactActionIndices,
+      ),
+    );
+  }
+
+  @override
+  ValueStream<audio_service.PlaybackState> get playbackState =>
+      _patchedPlaybackState;
+
+  @override
+  // ignore: must_call_super
+  Future<void> skipToNext() async {
+    final callback = onSkipToNext;
+    if (callback != null) {
+      await callback();
+      return;
+    }
+    await super.skipToNext();
+  }
+
+  @override
+  // ignore: must_call_super
+  Future<void> skipToPrevious() async {
+    final callback = onSkipToPrevious;
+    if (callback != null) {
+      await callback();
+      return;
+    }
+    await super.skipToPrevious();
+  }
+}
+
+class PlayerNotifier extends StateNotifier<PlaybackState>
+    with WidgetsBindingObserver {
   PlayerNotifier(this._ref) : super(const PlaybackState()) {
+    WidgetsBinding.instance.addObserver(this);
+    _statsFlushTimer = Timer.periodic(const Duration(seconds: 15), (_) {
+      if (state.current != null && state.isPlaying) {
+        _flushCurrentPlaybackStats();
+      }
+    });
     VideoPlaybackSession.progressRevision.addListener(_syncVideoPlaybackState);
     _ref.listen<AsyncValue<AppSettings>>(settingsProvider, (previous, next) {
       final allowOtherAudio =
           next.valueOrNull?.playOtherAudioWithoutInterruption ?? false;
       unawaited(_configureAudioSession(allowOtherAudio));
-      unawaited(_syncDesktopLyrics());
+      // 开关桌面歌词时会直接启动原生浮窗（此时显示“暂无歌词”），
+      // 之前发送过隐藏消息的标记已失效，必须重置后重新判定显隐，
+      // 否则“软件内不显示桌面歌词”时浮窗会一直停留在“暂无歌词”。
+      _desktopLyricsHiddenSent = false;
+      _requestDesktopLyricsSync(immediate: true);
     });
     _init();
+    // just_audio_background 的内部 handler 要等首个 AudioPlayer 完成平台
+    // 初始化才会挂到 SwitchAudioHandler 上，延迟安装 + 播放时兜底重试。
+    Future<void>.delayed(const Duration(seconds: 1)).then((_) {
+      _installMediaSessionBridge();
+    });
+  }
+
+  bool _mediaSessionBridgeReady = false;
+
+  /// 安装媒体会话桥接（见 [_MediaSessionBridge]），让通知栏/锁屏/灵动岛
+  /// 显示上一首/下一首按钮，并把蓝牙耳机的切歌按键转发到本播放器。
+  /// 幂等：初始化未完成时静默返回，下次播放时重试。
+  void _installMediaSessionBridge() {
+    if (_mediaSessionBridgeReady || kIsWeb) return;
+    if (defaultTargetPlatform != TargetPlatform.android) {
+      _mediaSessionBridgeReady = true;
+      return;
+    }
+    try {
+      // 本地补丁包暴露的内部 SwitchAudioHandler（upstream 0.0.1-beta.17
+      // 将其藏在私有变量中，宿主无法干预媒体会话）。
+      final handler = xySwitchAudioHandler;
+      final current = handler.inner;
+      if (current is _MediaSessionBridge) {
+        _mediaSessionBridgeReady = true;
+        return;
+      }
+      // 只有 just_audio_background 的内部 handler 就位后才安装，避免把
+      // 桥接套在初始空 handler 上，随后又被平台初始化覆盖。
+      if (current.runtimeType.toString() != '_PlayerAudioHandler') return;
+      final bridge = _MediaSessionBridge(current)
+        ..onSkipToNext = next
+        ..onSkipToPrevious = previous;
+      bridge.attach();
+      handler.inner = bridge;
+      _mediaSessionBridgeReady = true;
+    } catch (_) {
+      // 媒体服务初始化失败时保持未安装，播放时重试。
+    }
   }
 
   final Ref _ref;
@@ -485,11 +678,20 @@ class PlayerNotifier extends StateNotifier<PlaybackState> {
   StreamSubscription<void>? _becomingNoisySub;
   Timer? _sleepTimer;
   Timer? _sleepTimerTicker;
+  Timer? _statsFlushTimer;
+  Timer? _desktopLyricsSyncTimer;
   bool _manualPause = false;
   bool _wasInterrupted = false;
   bool _handlingTrackEnd = false;
   bool _notificationPermissionChecked = false;
   int _playRequestId = 0;
+  // 标识当前 just_audio 音频源属于哪一次切歌请求。切歌时网络音源解析和
+  // 系统媒体权限请求都可能异步完成，过期请求不能再调用 play()，否则会
+  // 出现界面已经显示新歌但实际仍播放旧歌（或下一首）的错位。
+  int? _preparedSourceRequestId;
+  // just_audio 的 setUrl/setFilePath 必须按顺序执行，避免两个并发切歌请求
+  // 在原生层交错完成，最后把旧音源覆盖到新歌曲上。
+  Future<void> _sourceOperation = Future<void>.value();
   String? _lastFailureKey;
   int _relinkProposalId = 0;
   int _noticeId = 0;
@@ -497,8 +699,17 @@ class PlayerNotifier extends StateNotifier<PlaybackState> {
   String? _lastVideoPath;
   bool _videoMediaBridgeActive = false;
   bool _syncingVideoMediaBridge = false;
+  bool _desktopLyricsSyncInFlight = false;
+  bool _desktopLyricsSyncPending = false;
+  bool _desktopLyricsHiddenSent = false;
+  DateTime _lastDesktopLyricsSync = DateTime.fromMillisecondsSinceEpoch(0);
   bool? _expectedAudioPlayingFromVideo;
   DateTime _lastVideoMediaSeek = DateTime.fromMillisecondsSinceEpoch(0);
+  // 听歌统计按会话增量刷写，避免定时刷写把累计 position 重复计算。
+  String? _statsSessionPath;
+  int _statsRecordedPositionMs = 0;
+  bool _statsPlayEventRecorded = false;
+  Future<void> _statsWriteChain = Future<void>.value();
 
   Future<void> _init() async {
     final allowOtherAudio =
@@ -515,15 +726,18 @@ class PlayerNotifier extends StateNotifier<PlaybackState> {
       );
       _becomingNoisySub = session.becomingNoisyEventStream.listen((_) {
         _manualPause = true;
+        _flushCurrentPlaybackStats();
         unawaited(_player.pause());
       });
     }
-    // 逐字歌词需要比默认 200ms 更细的进度采样，否则短字会被直接跳过。
+    // 逐字歌词需要比默认 200ms 更细的进度采样，但 40ms 会让全局播放状态
+    // 在手机上以 25fps 重建，首页、底栏和歌词页会同时承受不必要的开销。
+    // 80~120ms 足够逐词/渐进效果使用，也能明显降低主 isolate 的负担。
     _posSub = _player
         .createPositionStream(
           steps: 3600,
-          minPeriod: const Duration(milliseconds: 40),
-          maxPeriod: const Duration(milliseconds: 80),
+          minPeriod: const Duration(milliseconds: 80),
+          maxPeriod: const Duration(milliseconds: 120),
         )
         .listen((p) {
           // B 站视频播放时，just_audio 只是供系统媒体会话使用的静音时钟。
@@ -535,7 +749,7 @@ class PlayerNotifier extends StateNotifier<PlaybackState> {
           }
           state = state.copyWith(position: p.inMilliseconds / 1000.0);
           _persistPositionDebounced();
-          unawaited(_syncDesktopLyrics());
+          _requestDesktopLyricsSync();
         });
     _durSub = _player.durationStream.listen((d) {
       if (_videoMediaBridgeActive &&
@@ -576,9 +790,18 @@ class PlayerNotifier extends StateNotifier<PlaybackState> {
       if (completed && !_manualPause && !_videoMediaBridgeActive) {
         unawaited(_handleTrackEndOnce());
       }
-      unawaited(_syncDesktopLyrics());
+      _requestDesktopLyricsSync(immediate: true);
     });
     await _restoreSession();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    // 后台播放仍会继续计时，但在进入后台/非激活状态时先保存一次，
+    // 避免系统回收进程后丢失最后一段播放时长。
+    if (state != AppLifecycleState.resumed) {
+      _flushCurrentPlaybackStats();
+    }
   }
 
   Future<void> _syncDesktopLyrics() async {
@@ -621,7 +844,9 @@ class PlayerNotifier extends StateNotifier<PlaybackState> {
       translationFontSize: settings.desktopLyricsTranslationFontSize,
       backgroundColor: settings.desktopLyricsBackgroundColor,
       backgroundOpacity: settings.desktopLyricsBackgroundOpacity,
-      wordEffectMode: settings.lyricWordEffectMode.index,
+      wordEffectMode: settings.desktopLyricsShowWordEffect
+          ? settings.lyricWordEffectMode.index
+          : LyricWordEffectMode.none.index,
       locked: settings.desktopLyricsLocked,
     );
   }
@@ -638,7 +863,7 @@ class PlayerNotifier extends StateNotifier<PlaybackState> {
       if (_lastVideoPath != null && state.current?.path == _lastVideoPath) {
         _lastVideoPath = null;
         state = state.copyWith(isPlaying: false, isLoading: false);
-        unawaited(_syncDesktopLyrics());
+        _requestDesktopLyricsSync(immediate: true);
       }
       return;
     }
@@ -663,7 +888,67 @@ class PlayerNotifier extends StateNotifier<PlaybackState> {
     if (_videoMediaBridgeActive) {
       unawaited(_mirrorVideoStateToSystemMedia());
     }
-    unawaited(_syncDesktopLyrics());
+    _requestDesktopLyricsSync();
+  }
+
+  /// 桌面歌词是附加能力，不能随着每次播放进度更新都跨 MethodChannel。
+  /// 关闭桌面歌词时只发送一次隐藏消息；开启时最多每 100ms 同步一次，
+  /// 并且不会让旧的异步同步任务和新的任务同时堆积。
+  void _requestDesktopLyricsSync({bool immediate = false}) {
+    final settings = _ref.read(settingsProvider).valueOrNull;
+    final shouldShow =
+        settings?.desktopLyricsEnabled == true &&
+        !(settings?.desktopLyricsHideInApp == true &&
+            WidgetsBinding.instance.lifecycleState ==
+                AppLifecycleState.resumed);
+    if (!shouldShow) {
+      _desktopLyricsSyncPending = false;
+      _desktopLyricsSyncTimer?.cancel();
+      _desktopLyricsSyncTimer = null;
+      if (!_desktopLyricsHiddenSent) {
+        _desktopLyricsHiddenSent = true;
+        if (!_desktopLyricsSyncInFlight) {
+          _desktopLyricsSyncInFlight = true;
+          unawaited(
+            _syncDesktopLyrics().whenComplete(
+              () => _desktopLyricsSyncInFlight = false,
+            ),
+          );
+        }
+      }
+      return;
+    }
+
+    _desktopLyricsHiddenSent = false;
+    _desktopLyricsSyncPending = true;
+    if (immediate) {
+      _desktopLyricsSyncTimer?.cancel();
+      _desktopLyricsSyncTimer = null;
+      if (!_desktopLyricsSyncInFlight) _startDesktopLyricsSync();
+      return;
+    }
+    if (_desktopLyricsSyncInFlight || _desktopLyricsSyncTimer != null) return;
+    final elapsed = DateTime.now().difference(_lastDesktopLyricsSync);
+    final delay = elapsed >= const Duration(milliseconds: 100)
+        ? Duration.zero
+        : const Duration(milliseconds: 100) - elapsed;
+    _desktopLyricsSyncTimer = Timer(delay, () {
+      _desktopLyricsSyncTimer = null;
+      if (!_desktopLyricsSyncInFlight) _startDesktopLyricsSync();
+    });
+  }
+
+  void _startDesktopLyricsSync() {
+    if (_desktopLyricsSyncInFlight || !_desktopLyricsSyncPending) return;
+    _desktopLyricsSyncPending = false;
+    _desktopLyricsSyncInFlight = true;
+    _lastDesktopLyricsSync = DateTime.now();
+    unawaited(
+      _syncDesktopLyrics().whenComplete(() {
+        _desktopLyricsSyncInFlight = false;
+        if (_desktopLyricsSyncPending) _requestDesktopLyricsSync();
+      }),
+    );
   }
 
   /// 用已经加载的音频源作为 Android 系统媒体会话的“静音时钟”。
@@ -815,6 +1100,7 @@ class PlayerNotifier extends StateNotifier<PlaybackState> {
     if (event.begin) {
       if (shouldPause && _player.playing) {
         _wasInterrupted = true;
+        _flushCurrentPlaybackStats();
         unawaited(_player.pause());
       }
     } else if (shouldPause && _wasInterrupted) {
@@ -886,6 +1172,7 @@ class PlayerNotifier extends StateNotifier<PlaybackState> {
         errorMessage: null,
         currentQuality: restoredQuality,
       );
+      _beginStatsSession(items[idx], initialPositionMs: (pos * 1000).round());
       await _ref.read(settingsProvider.notifier).setPlayMode(mode);
       try {
         await _player.setLoopMode(audioLoopModeForPlayMode(mode));
@@ -894,6 +1181,7 @@ class PlayerNotifier extends StateNotifier<PlaybackState> {
           queueIndex: idx,
           preferredQualityOverride: restoredQuality,
         );
+        _preparedSourceRequestId = _playRequestId;
         await _player.setVolume(_ref.read(volumeProvider));
         await seek(pos);
         // 进程重新启动时只恢复队列、歌曲和进度，不自动恢复“正在播放”。
@@ -1002,7 +1290,16 @@ class PlayerNotifier extends StateNotifier<PlaybackState> {
 
   Future<void> _playAt(int index) async {
     if (index < 0 || index >= state.queue.length) return;
+    _installMediaSessionBridge();
+    // 重新点播歌曲（包括正在以视频形式播放的 B 站歌曲）时，先结束
+    // 临时视频会话并退出媒体桥接。否则视频画面自带的伴音会与新启动
+    // 的音频流同时播放，出现两路重复的声音。
+    if (VideoPlaybackSession.controller != null) {
+      await VideoPlaybackSession.stopForTrackAction();
+      await disableVideoMediaBridge();
+    }
     final requestId = ++_playRequestId;
+    _preparedSourceRequestId = null;
     var item = state.queue[index];
     final associated = await _loadAssociatedReplacement(item.path);
     if (requestId != _playRequestId) return;
@@ -1022,9 +1319,8 @@ class PlayerNotifier extends StateNotifier<PlaybackState> {
       state = state.copyWith(queue: queue);
     }
     final previous = state;
-    if (previous.current != null && previous.position >= .5) {
-      unawaited(_recordPlayback(previous));
-    }
+    _flushPlaybackStats(previous);
+    _beginStatsSession(item);
     // stop() 会发出 playing=false；切换音源期间先抑制自动下一首，真正
     // 开始新歌曲前再复位，否则手动点开的歌曲播放结束后永远不会循环。
     _manualPause = true;
@@ -1042,8 +1338,15 @@ class PlayerNotifier extends StateNotifier<PlaybackState> {
     );
     try {
       await _player.stop();
-      final plugin = await _prepareAudioSource(item, queueIndex: index);
+      final plugin = await _prepareAudioSource(
+        item,
+        queueIndex: index,
+        requestId: requestId,
+      );
+      if (requestId != _playRequestId) return;
+      _preparedSourceRequestId = requestId;
       await _player.setVolume(_ref.read(volumeProvider));
+      await _player.setSpeed(state.playbackSpeed);
       // 最近播放是“开始播放”即记录，与桌面端行为一致。统计写入失败不应
       // 阻断音频播放，因此放到独立异步任务中执行。
       unawaited(_addToRecentHistory(item));
@@ -1087,6 +1390,7 @@ class PlayerNotifier extends StateNotifier<PlaybackState> {
     QueueItem item, {
     required int queueIndex,
     String? preferredQualityOverride,
+    int? requestId,
   }) async {
     final mediaItem = await _systemMediaItem(item);
     final preferredQuality = preferredQualityOverride?.trim().isNotEmpty == true
@@ -1114,18 +1418,56 @@ class PlayerNotifier extends StateNotifier<PlaybackState> {
             installedName ?? _pluginNameFromSnapshot(item) ?? pluginId,
           );
         }
-        final source = await _ref
+        final runtime = _ref.read(pluginRuntimeProvider);
+        late PluginMediaSource source;
+        try {
+          source = await runtime.resolveMediaSource(
+            plugin,
+            pluginData,
+            preferredQuality: preferredQuality,
+          );
+        } catch (error) {
+          // 默认音质是跨歌曲保存的，当前歌曲可能并不支持上首歌使用的
+          // super/母带档位。若插件明确返回“不支持音质”，自动降到 320k
+          // 重试，并更新默认值，避免后续歌曲继续重复失败。
+          final lower = error.toString().toLowerCase();
+          final unsupportedQuality =
+              lower.contains('不支持') && lower.contains('音质');
+          if (!unsupportedQuality || preferredQuality.toLowerCase() == '320k') {
+            rethrow;
+          }
+          source = await runtime.resolveMediaSource(
+            plugin,
+            pluginData,
+            preferredQuality: '320k',
+          );
+          await _ref
+              .read(settingsProvider.notifier)
+              .setOnlineDefaultQuality('320k');
+        }
+        await _setPlayerUrl(
+          source.url,
+          // just_audio treats even an empty map as an instruction to route
+          // the request through its local Dart proxy.  LX plugins (including
+          // 长青) normally return no headers; that proxy performs the TLS
+          // request with Dart's HttpClient and some Android networks abort
+          // the connection, resulting in a generic `(0) Source error`.
+          // Leave headers null when none are required so ExoPlayer opens the
+          // URL natively.  Keep the proxy for plugins that really need
+          // custom headers (for example Bilibili DASH streams).
+          headers: source.headers.isEmpty ? null : source.headers,
+          tag: mediaItem,
+          requestId: requestId,
+        );
+        // 歌曲开始准备播放后立即后台探测当前插件支持的音质，结果由运行时
+        // 缓存；播放和下载菜单重复打开时直接读取缓存，不再现场等待网络。
+        _ref
             .read(pluginRuntimeProvider)
-            .resolveMediaSource(
+            .preloadQualities(
               plugin,
               pluginData,
               preferredQuality: preferredQuality,
             );
-        await _player.setUrl(
-          source.url,
-          headers: source.headers,
-          tag: mediaItem,
-        );
         // 已存在用户记忆的歌词时，不要被插件返回的默认歌词覆盖。
         if (source.lyrics.isNotEmpty &&
             state.queue[queueIndex].lyricsRaw?.trim().isEmpty != false) {
@@ -1138,6 +1480,47 @@ class PlayerNotifier extends StateNotifier<PlaybackState> {
           throw Exception('识曲结果缺少播放元数据');
         }
         final plugins = await _ref.read(enabledMusicPluginsProvider.future);
+        // 洛雪插件自有歌曲只走洛雪命名空间（见 _resolveOwnedLxSource）。
+        final owned = await _resolveOwnedLxSource(
+          item,
+          Map<String, dynamic>.from(rawLx),
+          plugins,
+          preferredQuality: preferredQuality,
+        );
+        if (owned != null) {
+          await _setPlayerUrl(
+            owned.url,
+            headers: owned.headers.isEmpty ? null : owned.headers,
+            tag: mediaItem,
+            requestId: requestId,
+          );
+          if (!(state.current?.lyricsAttempted ?? false)) {
+            unawaited(
+              _loadLxLyrics(
+                queueIndex,
+                item.path,
+                Map<String, dynamic>.from(rawLx),
+              ),
+            );
+          }
+          if (owned.lyrics.trim().isNotEmpty &&
+              state.queue[queueIndex].lyricsRaw?.trim().isEmpty != false) {
+            _updateQueueLyrics(queueIndex, owned.lyrics);
+          }
+          final lxPlugin = owned.plugin;
+          if (lxPlugin != null) {
+            _ref
+                .read(pluginRuntimeProvider)
+                .preloadQualities(
+                  lxPlugin,
+                  item.pluginData ?? const <String, dynamic>{},
+                  preferredQuality: preferredQuality,
+                );
+          }
+          return null;
+        }
+        // 识曲等没有对应洛雪插件的歌曲保持原有回退链：缓存、全插件
+        // 标题搜索与洛雪公共解析并行竞速。
         final cached = await _resolveCachedRecognizedPlugin(
           item,
           plugins,
@@ -1153,16 +1536,18 @@ class PlayerNotifier extends StateNotifier<PlaybackState> {
               ),
               _resolveRecognizedWithLx(
                 Map<String, dynamic>.from(rawLx),
+                plugins: plugins,
                 preferredQuality: preferredQuality,
               ),
-            ]);
+            ]).timeout(const Duration(seconds: 30), onTimeout: () => null);
         if (source == null) {
           throw Exception('无法获取识曲结果的播放地址，请确认至少启用了一个可用音乐插件');
         }
-        await _player.setUrl(
+        await _setPlayerUrl(
           source.url,
-          headers: source.headers,
+          headers: source.headers.isEmpty ? null : source.headers,
           tag: mediaItem,
+          requestId: requestId,
         );
         if (!(state.current?.lyricsAttempted ?? false)) {
           unawaited(
@@ -1195,12 +1580,36 @@ class PlayerNotifier extends StateNotifier<PlaybackState> {
         }
         return null;
       case PlaybackSourceType.networkUrl:
-        await _player.setUrl(item.path, tag: mediaItem);
+        await _setPlayerUrl(item.path, tag: mediaItem, requestId: requestId);
         return null;
       case PlaybackSourceType.localFile:
-        await _setLocalAudioSource(item.path, mediaItem);
+        await _setLocalAudioSource(item.path, mediaItem, requestId: requestId);
         return null;
     }
+  }
+
+  /// 将原生音频源设置操作串行化，并在真正提交前检查请求是否仍然有效。
+  /// 这样快速点击上一首/下一首时，旧请求即使晚于新请求完成解析，也不会
+  /// 把旧音源重新写回播放器。
+  Future<T> _enqueueSourceOperation<T>(Future<T> Function() operation) {
+    final result = _sourceOperation.then((_) => operation());
+    _sourceOperation = result.then<void>(
+      (_) {},
+      onError: (error, stackTrace) {},
+    );
+    return result;
+  }
+
+  Future<void> _setPlayerUrl(
+    String url, {
+    Map<String, String>? headers,
+    Object? tag,
+    int? requestId,
+  }) async {
+    await _enqueueSourceOperation(() async {
+      if (requestId != null && requestId != _playRequestId) return;
+      await _player.setUrl(url, headers: headers, tag: tag);
+    });
   }
 
   String? _pluginNameFromSnapshot(QueueItem item) {
@@ -1682,6 +2091,128 @@ class PlayerNotifier extends StateNotifier<PlaybackState> {
     } catch (_) {}
   }
 
+  Future<void> _saveRememberedLyricsAssociation(
+    String path,
+    RememberedLyricsAssociation association,
+    String originalLyrics,
+  ) async {
+    final key = path.trim();
+    if (key.isEmpty) return;
+    try {
+      final preferences = await SharedPreferences.getInstance();
+      final associations = <String, dynamic>{};
+      final originals = <String, dynamic>{};
+      final rawAssociations = preferences.getString(
+        _rememberedLyricsAssociationKey,
+      );
+      final rawOriginals = preferences.getString(_rememberedLyricsOriginalKey);
+      final decodedAssociations = rawAssociations == null
+          ? null
+          : jsonDecode(rawAssociations);
+      final decodedOriginals = rawOriginals == null
+          ? null
+          : jsonDecode(rawOriginals);
+      if (decodedAssociations is Map) {
+        associations.addAll(Map<String, dynamic>.from(decodedAssociations));
+      }
+      if (decodedOriginals is Map) {
+        originals.addAll(Map<String, dynamic>.from(decodedOriginals));
+      }
+      associations[key] = association.toJson();
+      // 重新选择歌词时保留第一次关联前的默认歌词，取消关联才能真正恢复默认内容。
+      originals.putIfAbsent(key, () => originalLyrics);
+      while (associations.length > 100) {
+        final oldest = associations.keys.first;
+        associations.remove(oldest);
+        originals.remove(oldest);
+      }
+      await Future.wait([
+        preferences.setString(
+          _rememberedLyricsAssociationKey,
+          jsonEncode(associations),
+        ),
+        preferences.setString(
+          _rememberedLyricsOriginalKey,
+          jsonEncode(originals),
+        ),
+      ]);
+    } catch (_) {}
+  }
+
+  Future<RememberedLyricsAssociation?> rememberedLyricsAssociation(
+    String path,
+  ) async {
+    final key = path.trim();
+    if (key.isEmpty) return null;
+    try {
+      final preferences = await SharedPreferences.getInstance();
+      final raw = preferences.getString(_rememberedLyricsAssociationKey);
+      final decoded = raw == null || raw.isEmpty ? null : jsonDecode(raw);
+      final value = decoded is Map ? decoded[key] : null;
+      if (value is! Map) return null;
+      return RememberedLyricsAssociation.fromJson(
+        Map<String, dynamic>.from(value),
+      );
+    } catch (_) {
+      return null;
+    }
+  }
+
+  Future<String?> _removeRememberedLyricsAssociation(String path) async {
+    final key = path.trim();
+    if (key.isEmpty) return null;
+    try {
+      final preferences = await SharedPreferences.getInstance();
+      final rawOriginals = preferences.getString(_rememberedLyricsOriginalKey);
+      final decodedOriginals = rawOriginals == null || rawOriginals.isEmpty
+          ? null
+          : jsonDecode(rawOriginals);
+      final originals = decodedOriginals is Map
+          ? Map<String, dynamic>.from(decodedOriginals)
+          : <String, dynamic>{};
+      final original = originals.remove(key)?.toString();
+      final rawAssociations = preferences.getString(
+        _rememberedLyricsAssociationKey,
+      );
+      final decodedAssociations =
+          rawAssociations == null || rawAssociations.isEmpty
+          ? null
+          : jsonDecode(rawAssociations);
+      final associations = decodedAssociations is Map
+          ? Map<String, dynamic>.from(decodedAssociations)
+          : <String, dynamic>{};
+      associations.remove(key);
+      final rawLyrics = preferences.getString(_rememberedLyricsKey);
+      final decodedLyrics = rawLyrics == null || rawLyrics.isEmpty
+          ? null
+          : jsonDecode(rawLyrics);
+      final lyrics = decodedLyrics is Map
+          ? Map<String, dynamic>.from(decodedLyrics)
+          : <String, dynamic>{};
+      lyrics.remove(key);
+      await Future.wait([
+        associations.isEmpty
+            ? preferences.remove(_rememberedLyricsAssociationKey)
+            : preferences.setString(
+                _rememberedLyricsAssociationKey,
+                jsonEncode(associations),
+              ),
+        originals.isEmpty
+            ? preferences.remove(_rememberedLyricsOriginalKey)
+            : preferences.setString(
+                _rememberedLyricsOriginalKey,
+                jsonEncode(originals),
+              ),
+        lyrics.isEmpty
+            ? preferences.remove(_rememberedLyricsKey)
+            : preferences.setString(_rememberedLyricsKey, jsonEncode(lyrics)),
+      ]);
+      return original;
+    } catch (_) {
+      return null;
+    }
+  }
+
   Map<String, dynamic> _queueItemToAssociation(QueueItem item) => {
     'path': item.path,
     'title': item.title,
@@ -1714,13 +2245,20 @@ class PlayerNotifier extends StateNotifier<PlaybackState> {
     );
   }
 
-  Future<void> _setLocalAudioSource(String rawPath, MediaItem mediaItem) async {
+  Future<void> _setLocalAudioSource(
+    String rawPath,
+    MediaItem mediaItem, {
+    int? requestId,
+  }) async {
     final trimmed = rawPath.trim();
     if (trimmed.startsWith('content://')) {
       try {
-        await _player.setAudioSource(
-          AudioSource.uri(Uri.parse(trimmed), tag: mediaItem),
-        );
+        await _enqueueSourceOperation(() async {
+          if (requestId != null && requestId != _playRequestId) return;
+          await _player.setAudioSource(
+            AudioSource.uri(Uri.parse(trimmed), tag: mediaItem),
+          );
+        });
         return;
       } catch (_) {
         throw const _LocalPlaybackException('本地歌曲无法播放，请重新选择文件或重新授予文件访问权限');
@@ -1737,7 +2275,10 @@ class PlayerNotifier extends StateNotifier<PlaybackState> {
       throw const _LocalPlaybackException('本地歌曲文件不存在或没有访问权限，请重新扫描歌曲');
     }
     try {
-      await _player.setFilePath(path, tag: mediaItem);
+      await _enqueueSourceOperation(() async {
+        if (requestId != null && requestId != _playRequestId) return;
+        await _player.setFilePath(path, tag: mediaItem);
+      });
     } catch (_) {
       throw const _LocalPlaybackException('本地歌曲无法播放，请确认文件未损坏且格式受支持');
     }
@@ -1752,6 +2293,64 @@ class PlayerNotifier extends StateNotifier<PlaybackState> {
     if ((await Permission.audio.request()).isGranted) return;
     if ((await Permission.storage.request()).isGranted) return;
     await Permission.manageExternalStorage.request();
+  }
+
+  /// 洛雪插件自有歌曲的解析（对齐 BakaMusic 的命名空间隔离：洛雪音源
+  /// 与 MusicFree 插件是两个独立命名空间，互不接管对方的歌曲）。
+  ///
+  /// 歌曲携带的 pluginId 对应一个已启用的洛雪插件时，由该插件自己解析
+  /// 播放地址；失败也只在洛雪命名空间内回退（其它洛雪插件与公共解析
+  /// 器），不再按标题搜索 MusicFree 插件，避免洛雪歌单的歌曲被聆澜等
+  /// 聚合插件的 QQ 音源接管。
+  ///
+  /// 返回 null 表示该歌曲不属于任何已启用的洛雪插件（识曲等场景），
+  /// 调用方应继续走通用回退链。
+  Future<_RecognizedAudioSource?> _resolveOwnedLxSource(
+    QueueItem item,
+    Map<String, dynamic> rawLx,
+    List<EnabledMusicPlugin> plugins, {
+    String? preferredQuality,
+  }) async {
+    final lxPluginId = item.pluginId?.trim() ?? '';
+    if (lxPluginId.isEmpty) return null;
+    final lxPlugin = plugins
+        .where((candidate) => candidate.id == lxPluginId && candidate.isLx)
+        .firstOrNull;
+    if (lxPlugin == null) return null;
+    Object? lxError;
+    try {
+      final media = await _ref
+          .read(pluginRuntimeProvider)
+          .resolveMediaSource(
+            lxPlugin,
+            item.pluginData ?? const <String, dynamic>{},
+            preferredQuality: preferredQuality,
+          )
+          .timeout(const Duration(seconds: 30));
+      if (media.url.trim().isNotEmpty) {
+        return _RecognizedAudioSource(
+          url: media.url,
+          headers: media.headers,
+          lyrics: media.lyrics,
+          plugin: lxPlugin,
+        );
+      }
+    } catch (error) {
+      lxError = error;
+    }
+    final fallback = await _resolveRecognizedWithLx(
+      Map<String, dynamic>.from(rawLx),
+      plugins: plugins
+          .where((candidate) => candidate.id != lxPlugin.id)
+          .toList(),
+      preferredQuality: preferredQuality,
+    ).timeout(const Duration(seconds: 30), onTimeout: () => null);
+    if (fallback != null && fallback.url.trim().isNotEmpty) return fallback;
+    final reason = lxError == null
+        ? '洛雪音源解析失败，请检查洛雪插件是否可用'
+        : '洛雪音源解析失败：'
+              '${lxError.toString().replaceFirst('Exception: ', '')}';
+    throw Exception(reason);
   }
 
   Future<_RecognizedAudioSource?> _resolveCachedRecognizedPlugin(
@@ -1856,8 +2455,39 @@ class PlayerNotifier extends StateNotifier<PlaybackState> {
 
   Future<_RecognizedAudioSource?> _resolveRecognizedWithLx(
     Map<String, dynamic> songInfo, {
+    List<EnabledMusicPlugin> plugins = const [],
     String? preferredQuality,
   }) async {
+    // LX 歌曲可能来自导入/听歌识曲，路径中没有原始插件 ID。优先让已
+    // 安装的 LX 插件自己解析播放地址（例如自定义 API 音源），再回退
+    // 到公共 Rust 地址解析器。
+    final source = songInfo['source']?.toString().trim() ?? '';
+    final runtime = _ref.read(pluginRuntimeProvider);
+    for (final plugin in plugins.where((item) => item.isLx)) {
+      if (source.isNotEmpty &&
+          plugin.lxSources.isNotEmpty &&
+          !plugin.lxSources.contains(source)) {
+        continue;
+      }
+      try {
+        final media = await runtime
+            .resolveMediaSource(plugin, {
+              'lx': songInfo,
+            }, preferredQuality: preferredQuality)
+            .timeout(const Duration(seconds: 20));
+        if (media.url.trim().isNotEmpty) {
+          return _RecognizedAudioSource(
+            url: media.url,
+            headers: media.headers,
+            lyrics: media.lyrics,
+            plugin: plugin,
+            pluginData: {'lx': songInfo},
+          );
+        }
+      } catch (_) {
+        // 当前 LX 插件不支持该来源时继续尝试其它插件/公共接口。
+      }
+    }
     final types = songInfo['_types'] is Map
         ? Map<String, dynamic>.from(songInfo['_types'] as Map)
         : const <String, dynamic>{};
@@ -2078,6 +2708,13 @@ class PlayerNotifier extends StateNotifier<PlaybackState> {
     // 状态栏、锁屏和系统媒体中心。之前这里与 play() 并发执行，权限弹窗
     // 尚未完成时音频服务已经启动，部分系统会直接丢弃首个媒体通知。
     await _ensureMediaNotificationPermission();
+    // 权限请求期间用户可能已经切换了歌曲；同时确认播放器音源仍是本次
+    // 请求准备的音源，避免过期的 play() 把实际音频推进到错误的歌曲。
+    if (requestId != _playRequestId ||
+        state.current?.path != itemPath ||
+        _preparedSourceRequestId != requestId) {
+      return;
+    }
     final playback = _player.play();
     unawaited(_watchPlayback(playback, requestId, itemPath));
   }
@@ -2134,7 +2771,7 @@ class PlayerNotifier extends StateNotifier<PlaybackState> {
       current: index == state.queueIndex ? queue[index] : state.current,
     );
     // 视频播放期间 just_audio 没有进度流，歌词补全后要主动刷新桌面歌词。
-    unawaited(_syncDesktopLyrics());
+    _requestDesktopLyricsSync(immediate: true);
   }
 
   Future<void> _loadPluginLyrics(
@@ -2301,6 +2938,12 @@ class PlayerNotifier extends StateNotifier<PlaybackState> {
     return message.isEmpty ? '歌曲播放失败，请重试' : message;
   }
 
+  bool _isUnsupportedQualityError(Object error) {
+    final message = error.toString().toLowerCase();
+    return message.contains('不支持') &&
+        (message.contains('音质') || message.contains('quality'));
+  }
+
   /// 根据“播放失败后”设置决定是停在当前歌曲还是自动尝试下一首。
   /// 队列只有一首歌时不自动重试，避免同一首失败歌曲无限循环。
   Future<void> _handlePlaybackFailure(
@@ -2316,6 +2959,24 @@ class PlayerNotifier extends StateNotifier<PlaybackState> {
     // errorStream 与 play() Future 可能同时报告同一个错误，避免重复切歌。
     final failureKey = '$requestId:$queueIndex';
     if (_lastFailureKey == failureKey) return;
+
+    // 有些插件会先返回一个看似有效的 URL，真正开始播放时才返回
+    // “不支持 super 音质”。这类错误无法在解析阶段发现，先把跨歌曲
+    // 保存的偏好降到 320k 并重试当前歌曲，避免误跳到下一首。
+    final currentQuality = state.currentQuality.trim();
+    if (_isUnsupportedQualityError(error) &&
+        currentQuality.isNotEmpty &&
+        currentQuality.toLowerCase() != '320k') {
+      _lastFailureKey = failureKey;
+      await _ref
+          .read(settingsProvider.notifier)
+          .setOnlineDefaultQuality('320k');
+      if (requestId != _playRequestId || state.queueIndex != queueIndex) {
+        return;
+      }
+      await _playAt(queueIndex);
+      return;
+    }
     _lastFailureKey = failureKey;
     state = state.copyWith(
       isPlaying: false,
@@ -2364,30 +3025,117 @@ class PlayerNotifier extends StateNotifier<PlaybackState> {
     }
   }
 
-  Future<void> _recordPlayback(PlaybackState snapshot) async {
-    final item = snapshot.current;
-    if (item == null) return;
-    try {
-      final dbPath = await _ref.read(dbPathProvider.future);
-      await statsRecordPlay(
-        dbPath: dbPath,
-        payloadJson: jsonEncode({
-          'songPath': item.path,
-          'listenedMs': (snapshot.position * 1000).round(),
-          'durationMs': item.durationMs > 0
-              ? item.durationMs
-              : (snapshot.duration * 1000).round(),
-          'title': item.title,
-          'artist': item.artist,
-          'album': item.album,
-        }),
-      );
-    } catch (_) {
-      // 统计失败不影响播放。
-    }
+  void _beginStatsSession(QueueItem item, {int initialPositionMs = 0}) {
+    _statsSessionPath = item.path;
+    // Dart 的 int 和 SQLite 的 INTEGER 都是 64 位（在 Android/iOS 上不会
+    // 因播放超过 2^31 毫秒而溢出）。旧代码把恢复位置硬限制在 2^31 ms，
+    // 恰好约 35.8 分钟，长时间播放/恢复时会造成排行榜时长停止累计。
+    _statsRecordedPositionMs = initialPositionMs < 0 ? 0 : initialPositionMs;
+    _statsPlayEventRecorded = false;
   }
 
-  Future<void> setCurrentLyrics(String lyrics) async {
+  int _statsPositionMs(PlaybackState snapshot) {
+    var positionMs = (snapshot.position * 1000).round();
+    // 只有播放器音源已明确属于当前切歌请求时才读取原生进度。切歌/换音质
+    // 的异步过程中，just_audio 可能暂时仍返回上一首的 position，直接取
+    // max 会把旧歌曲的大段进度误记到新歌曲，进而放大排行榜时长。
+    if (snapshot.current?.path == state.current?.path &&
+        _preparedSourceRequestId == _playRequestId) {
+      final playerPositionMs = _player.position.inMilliseconds;
+      final statePositionMs = (snapshot.position * 1000).round();
+      // positionStream 最多只会滞后约一个采样周期；差距过大通常意味着
+      // 原生播放器仍在切源或刚刚切换，宁可等待下一次刷写也不采用它。
+      if (playerPositionMs >= statePositionMs &&
+          playerPositionMs - statePositionMs <= 2000) {
+        positionMs = max(positionMs, playerPositionMs);
+      }
+    }
+    final video = VideoPlaybackSession.controller;
+    if (video != null && VideoPlaybackSession.isFor(snapshot.current?.path)) {
+      positionMs = max(positionMs, video.value.position.inMilliseconds);
+    }
+    final item = snapshot.current;
+    final durationMs = item != null && item.durationMs > 0
+        ? item.durationMs
+        : (snapshot.duration * 1000).round();
+    if (durationMs > 0) positionMs = min(positionMs, durationMs);
+    return max(0, positionMs);
+  }
+
+  void _enqueueStatsChunk(
+    QueueItem item,
+    PlaybackState snapshot,
+    int listenedMs,
+    bool countAsPlay,
+  ) {
+    if (listenedMs <= 0) return;
+    final payload = jsonEncode({
+      'songPath': item.path,
+      'listenedMs': listenedMs,
+      'durationMs': item.durationMs > 0
+          ? item.durationMs
+          : (snapshot.duration * 1000).round(),
+      'title': item.title,
+      'artist': item.artist,
+      'album': item.album,
+      'countAsPlay': countAsPlay,
+    });
+    _statsWriteChain = _statsWriteChain.then((_) async {
+      try {
+        final dbPath = await _ref.read(dbPathProvider.future);
+        await statsRecordPlay(dbPath: dbPath, payloadJson: payload);
+      } catch (_) {
+        // 统计失败不影响播放；下一次刷写继续尝试记录新增时长。
+      }
+    });
+  }
+
+  /// 将当前会话相对上次刷写的新增时长写入统计。
+  void _flushPlaybackStats(PlaybackState snapshot) {
+    final item = snapshot.current;
+    if (item == null) return;
+    // 已暂停且没有正在播放的原生音频时，不会产生新的听歌时长。过滤这类
+    // 调用可避免暂停期间残留的 position 被重复结算。
+    if (!snapshot.isPlaying && !_player.playing) return;
+    if (_statsSessionPath != item.path) {
+      _beginStatsSession(item);
+    }
+    final positionMs = _statsPositionMs(snapshot);
+    if (positionMs < 500) return;
+
+    // just_audio 的单曲循环可能在原生层直接把 position 从末尾跳回 0，
+    // 不一定经过 ProcessingState.completed。先补齐上一轮的尾部，再开启
+    // 新一轮会话，避免循环播放时后续时长全部被当成负增量丢弃。
+    if (positionMs + 1000 < _statsRecordedPositionMs) {
+      final durationMs = item.durationMs > 0
+          ? item.durationMs
+          : (snapshot.duration * 1000).round();
+      final tailMs = max(0, durationMs - _statsRecordedPositionMs);
+      if (tailMs > 0) {
+        _enqueueStatsChunk(item, snapshot, tailMs, !_statsPlayEventRecorded);
+      }
+      _statsRecordedPositionMs = positionMs;
+      _statsPlayEventRecorded = false;
+      return;
+    }
+
+    final deltaMs = positionMs - _statsRecordedPositionMs;
+    if (deltaMs <= 0) return;
+
+    _statsRecordedPositionMs = positionMs;
+    final countAsPlay = !_statsPlayEventRecorded;
+    _statsPlayEventRecorded = true;
+    _enqueueStatsChunk(item, snapshot, deltaMs, countAsPlay);
+  }
+
+  void _flushCurrentPlaybackStats() {
+    _flushPlaybackStats(state);
+  }
+
+  Future<void> setCurrentLyrics(
+    String lyrics, {
+    RememberedLyricsAssociation? association,
+  }) async {
     final index = state.queueIndex;
     if (lyrics.trim().isEmpty || index < 0 || index >= state.queue.length) {
       return;
@@ -2395,7 +3143,53 @@ class PlayerNotifier extends StateNotifier<PlaybackState> {
     final item = state.queue[index];
     _updateQueueLyrics(index, lyrics);
     await _saveRememberedLyrics(item.path, lyrics);
+    if (association != null) {
+      await _saveRememberedLyricsAssociation(
+        item.path,
+        association,
+        item.lyricsRaw ?? '',
+      );
+    }
     await _persistSession();
+  }
+
+  /// 取消当前歌曲的手动关联歌词，恢复关联前保存的默认歌词，并重新探测歌词。
+  Future<void> clearCurrentLyricsAssociation() async {
+    final item = state.current;
+    if (item == null) return;
+    final original = await _removeRememberedLyricsAssociation(item.path);
+    final index = state.queueIndex;
+    if (index < 0 || index >= state.queue.length) return;
+    final restoredLyrics = original?.trim() ?? '';
+    final queue = [...state.queue];
+    queue[index] = item.copyWith(
+      lyricsRaw: restoredLyrics.isEmpty ? null : restoredLyrics,
+      clearLyricsRaw: restoredLyrics.isEmpty,
+      lyricsAttempted: restoredLyrics.isNotEmpty,
+    );
+    state = state.copyWith(queue: queue, current: queue[index]);
+    if (playbackSourceTypeFor(item) == PlaybackSourceType.localFile &&
+        !item.path.startsWith('content://')) {
+      try {
+        final sidecarPath = p.setExtension(item.path, '.lrc');
+        if (restoredLyrics.isEmpty) {
+          final sidecar = File(sidecarPath);
+          if (await sidecar.exists()) await sidecar.delete();
+        } else {
+          await saveSongLyrics(
+            path: item.path,
+            lyrics: restoredLyrics,
+            source: LyricsStorageSource.sidecar,
+          );
+        }
+      } catch (_) {
+        // 恢复歌词文件失败时仍保留内存中的默认歌词，不能影响播放。
+      }
+    }
+    await _persistSession();
+    if (restoredLyrics.isEmpty) {
+      await ensureCurrentLyricsChecked();
+    }
   }
 
   Future<void> setCurrentQuality(String quality) async {
@@ -2412,7 +3206,16 @@ class PlayerNotifier extends StateNotifier<PlaybackState> {
       return;
     }
 
+    // 视频播放期间切换音质时，先结束临时视频会话并退出媒体桥接。
+    // 否则视频画面自带的伴音会与新解析的音频流（且已恢复音量）同时
+    // 播放，出现两路声音。
+    if (VideoPlaybackSession.controller != null) {
+      await VideoPlaybackSession.stopForTrackAction();
+      await disableVideoMediaBridge();
+    }
+
     final requestId = ++_playRequestId;
+    _preparedSourceRequestId = null;
     final position = state.position;
     final wasPlaying = state.isPlaying;
     _manualPause = true;
@@ -2423,7 +3226,10 @@ class PlayerNotifier extends StateNotifier<PlaybackState> {
         item,
         queueIndex: index,
         preferredQualityOverride: normalized,
+        requestId: requestId,
       );
+      if (requestId != _playRequestId) return;
+      _preparedSourceRequestId = requestId;
       await _player.setVolume(_ref.read(volumeProvider));
       await seek(position);
       _manualPause = !wasPlaying;
@@ -2484,6 +3290,19 @@ class PlayerNotifier extends StateNotifier<PlaybackState> {
         final rawLx = item.pluginData?['lx'];
         if (rawLx is! Map) throw Exception('识曲结果缺少播放元数据');
         final plugins = await _ref.read(enabledMusicPluginsProvider.future);
+        // 洛雪插件自有歌曲只走洛雪命名空间，下载不并入 MusicFree 插件。
+        final owned = await _resolveOwnedLxSource(
+          item,
+          Map<String, dynamic>.from(rawLx),
+          plugins,
+          preferredQuality: preferredQuality,
+        );
+        if (owned != null) {
+          return PlaybackDownloadSource(
+            url: owned.url,
+            headers: owned.headers,
+          );
+        }
         final cached = await _resolveCachedRecognizedPlugin(
           item,
           plugins,
@@ -2499,9 +3318,10 @@ class PlayerNotifier extends StateNotifier<PlaybackState> {
               ),
               _resolveRecognizedWithLx(
                 Map<String, dynamic>.from(rawLx),
+                plugins: plugins,
                 preferredQuality: preferredQuality,
               ),
-            ]);
+            ]).timeout(const Duration(seconds: 30), onTimeout: () => null);
         if (source == null) throw Exception('无法获取歌曲下载地址');
         return PlaybackDownloadSource(url: source.url, headers: source.headers);
       case PlaybackSourceType.networkUrl:
@@ -2638,6 +3458,7 @@ class PlayerNotifier extends StateNotifier<PlaybackState> {
       _sleepTimerTicker = null;
       state = state.copyWith(sleepTimerEndsAt: null);
       _manualPause = true;
+      _flushCurrentPlaybackStats();
       unawaited(_player.pause());
     });
   }
@@ -2663,6 +3484,7 @@ class PlayerNotifier extends StateNotifier<PlaybackState> {
     try {
       if (state.isPlaying) {
         _manualPause = true;
+        _flushCurrentPlaybackStats();
         await _player.pause();
       } else {
         _manualPause = false;
@@ -2682,6 +3504,7 @@ class PlayerNotifier extends StateNotifier<PlaybackState> {
   Future<bool> pauseForVideo() async {
     final wasPlaying = _player.playing || state.isPlaying;
     _manualPause = true;
+    _flushCurrentPlaybackStats();
     if (_player.playing) await _player.pause();
     return wasPlaying;
   }
@@ -2694,12 +3517,37 @@ class PlayerNotifier extends StateNotifier<PlaybackState> {
     unawaited(_startPlayback(_playRequestId, current.path));
   }
 
+  /// 设置当前播放速度。音频和 B 站视频共用同一速度状态，切换视频或
+  /// 关闭视频后仍保持用户刚刚选择的倍速。
+  Future<void> setPlaybackSpeed(double speed) async {
+    const supported = <double>[0.5, 0.8, 1.0, 1.5, 2.0];
+    final normalized = supported.reduce(
+      (a, b) => (a - speed).abs() <= (b - speed).abs() ? a : b,
+    );
+    state = state.copyWith(playbackSpeed: normalized);
+    try {
+      await _player.setSpeed(normalized);
+      final video = VideoPlaybackSession.isFor(state.current?.path)
+          ? VideoPlaybackSession.controller
+          : null;
+      if (video != null) await video.setPlaybackSpeed(normalized);
+    } catch (error) {
+      debugPrint('设置播放倍速失败：$error');
+    }
+  }
+
   Future<void> seek(double secs) async {
-    await _player.seek(Duration(milliseconds: (secs * 1000).round()));
+    final targetMs = max(0, (secs * 1000).round());
+    _flushCurrentPlaybackStats();
+    await _player.seek(Duration(milliseconds: targetMs));
+    if (_statsSessionPath == state.current?.path) {
+      _statsRecordedPositionMs = targetMs;
+    }
   }
 
   Future<void> next() async {
     if (VideoPlaybackSession.controller != null) {
+      _flushCurrentPlaybackStats();
       await VideoPlaybackSession.stopForTrackAction();
       await disableVideoMediaBridge();
     }
@@ -2716,8 +3564,12 @@ class PlayerNotifier extends StateNotifier<PlaybackState> {
     if (video != null) {
       final videoPosition = video.value.position.inMilliseconds / 1000.0;
       if (max(state.position, videoPosition) > 3) {
+        _flushCurrentPlaybackStats();
         await video.seekTo(Duration.zero);
         await _player.seek(Duration.zero);
+        if (_statsSessionPath == state.current?.path) {
+          _statsRecordedPositionMs = 0;
+        }
         state = state.copyWith(position: 0);
         VideoPlaybackSession.progressChanged();
         return;
@@ -2731,7 +3583,7 @@ class PlayerNotifier extends StateNotifier<PlaybackState> {
     final playerPosition = _player.position.inMilliseconds / 1000.0;
     final position = max(state.position, playerPosition);
     if (position > 3) {
-      await _player.seek(Duration.zero);
+      await seek(0);
       // 立即同步状态，避免用户快速再次点击时仍被旧进度判定为重播。
       state = state.copyWith(position: 0);
       return;
@@ -2784,6 +3636,7 @@ class PlayerNotifier extends StateNotifier<PlaybackState> {
     if (normalizePlayMode(state.playMode) == 1) {
       // 单曲循环：重播当前曲。
       await seek(0);
+      _statsPlayEventRecorded = false;
       final current = state.current;
       if (current != null) {
         _manualPause = false;
@@ -2827,11 +3680,15 @@ class PlayerNotifier extends StateNotifier<PlaybackState> {
 
   @override
   void dispose() {
+    _flushCurrentPlaybackStats();
+    WidgetsBinding.instance.removeObserver(this);
     VideoPlaybackSession.progressRevision.removeListener(
       _syncVideoPlaybackState,
     );
     _sleepTimer?.cancel();
     _sleepTimerTicker?.cancel();
+    _statsFlushTimer?.cancel();
+    _desktopLyricsSyncTimer?.cancel();
     _audioInterruptionSub?.cancel();
     _becomingNoisySub?.cancel();
     _posSub?.cancel();

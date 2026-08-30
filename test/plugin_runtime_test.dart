@@ -50,7 +50,7 @@ void main() {
 
   test('MusicFree 插件可以异步搜索并返回标准歌曲', () async {
     final directory = await Directory.systemTemp.createTemp(
-      'xianyu-plugin-runtime-',
+      'xymusic-plugin-runtime-',
     );
     final pluginFile = File(
       '${directory.path}${Platform.pathSeparator}test.js',
@@ -110,7 +110,7 @@ void main() {
 
   test('插件同步计算不会阻塞 Flutter 主 isolate', () async {
     final directory = await Directory.systemTemp.createTemp(
-      'xianyu-plugin-isolate-',
+      'xymusic-plugin-isolate-',
     );
     final pluginFile = File(
       '${directory.path}${Platform.pathSeparator}busy-search.js',
@@ -156,7 +156,7 @@ void main() {
 
   test('插件 HTTP 桥不会破坏包含引号和换行的 JSON', () async {
     final directory = await Directory.systemTemp.createTemp(
-      'xianyu-plugin-http-runtime-',
+      'xymusic-plugin-http-runtime-',
     );
     final pluginFile = File(
       '${directory.path}${Platform.pathSeparator}escaped-json.js',
@@ -203,7 +203,7 @@ void main() {
 
   test('QQ音乐插件搜索为空时使用 Web 接口返回可播放所需字段', () async {
     final directory = await Directory.systemTemp.createTemp(
-      'xianyu-qq-fallback-',
+      'xymusic-qq-fallback-',
     );
     final pluginFile = File('${directory.path}${Platform.pathSeparator}qq.js');
     await pluginFile.writeAsString(r'''

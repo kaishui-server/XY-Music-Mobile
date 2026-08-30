@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../src/auth/auth_provider.dart';
+import '../../src/favorites/favorites_provider.dart';
 import '../../src/playlists/playlists_provider.dart';
 import '../../src/sync/account_cloud_sync.dart';
 import '../../src/widgets/top_notice.dart';
@@ -23,8 +24,7 @@ class _CloudSyncPageState extends ConsumerState<CloudSyncPage> {
   int _cooldown = 0;
   Timer? _cooldownTimer;
 
-  String get _accountId =>
-      ref.read(authProvider).user?.ciyuanxiId?.trim() ?? '';
+  String get _accountId => ref.read(authProvider).user?.xymusicId?.trim() ?? '';
 
   @override
   void initState() {
@@ -57,6 +57,7 @@ class _CloudSyncPageState extends ConsumerState<CloudSyncPage> {
       ref.read(authProvider.notifier),
       ref.read(playlistsProvider.notifier),
       container,
+      favorites: ref.read(favoritesProvider.notifier),
     );
     _startCooldownTicker();
   }
@@ -88,6 +89,7 @@ class _CloudSyncPageState extends ConsumerState<CloudSyncPage> {
       ref.read(authProvider.notifier),
       ref.read(playlistsProvider.notifier),
       container,
+      favorites: ref.read(favoritesProvider.notifier),
     );
     if (mounted) _notice('已更新同步频率：${value.label}');
   }
@@ -107,6 +109,7 @@ class _CloudSyncPageState extends ConsumerState<CloudSyncPage> {
         ref.read(authProvider.notifier),
         ref.read(playlistsProvider.notifier),
         container,
+        favorites: ref.read(favoritesProvider.notifier),
       );
       if (mounted) {
         final suffix = result.pluginErrors.isEmpty

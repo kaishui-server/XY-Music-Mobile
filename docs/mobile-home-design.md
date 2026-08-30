@@ -7,7 +7,7 @@
 
 | 来源 | 取用部分 |
 |------|---------|
-| 桌面版（XianYu-Music-Desktop） | 网易云红 `#EC4141`、暗色 `#262626`、Inter 字体、毛玻璃材质、频谱/旋转/淡入动效、"播放中"红色徽章 |
+| 桌面版（XY-Music-Desktop） | 网易云红 `#EC4141`、暗色 `#262626`、Inter 字体、毛玻璃材质、频谱/旋转/淡入动效、"播放中"红色徽章 |
 | RawS（XY-Music-Mobile） | 主页自上而下编排：顶部栏 → 搜索 → 封面轮播 → 音乐库网格 → 听过最多 → 工具网格；液态玻璃浮动底栏；旋转封面+环形进度迷你播放器 |
 | XY Music Flutter 端 | 沿用 `go_router` + Riverpod 架构，把当前"音乐库即主页"升级为独立"主界面"首页 |
 
@@ -102,10 +102,10 @@
 
 | 桌面版参考 | 作用 |
 |-----------|------|
-| `XianYu-Music-Desktop/src/components/layout/PlayerFooter.vue` | 底栏播放控制 + 跑马灯 |
-| `XianYu-Music-Desktop/src/components/song-list/SongTable.vue` | 频谱条 + 红色徽章 |
-| `XianYu-Music-Desktop/src/components/layout/GlobalBackground.vue` | 流光背景 |
-| `XianYu-Music-Desktop/src/style.css` | 主题色 / 字体 / 暗色变量 |
+| `XY-Music-Desktop/src/components/layout/PlayerFooter.vue` | 底栏播放控制 + 跑马灯 |
+| `XY-Music-Desktop/src/components/song-list/SongTable.vue` | 频谱条 + 红色徽章 |
+| `XY-Music-Desktop/src/components/layout/GlobalBackground.vue` | 流光背景 |
+| `XY-Music-Desktop/src/style.css` | 主题色 / 字体 / 暗色变量 |
 
 | RawS 参考 | 作用 |
 |----------|------|

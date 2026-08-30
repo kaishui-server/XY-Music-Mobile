@@ -1976,157 +1976,157 @@ use flutter_rust_bridge::for_generated::byteorder::{NativeEndian, WriteBytesExt,
 flutter_rust_bridge::frb_generated_boilerplate_io!();
 
                 #[unsafe(no_mangle)]
-                pub extern "C" fn frbgen_xianyu_music_mobile_rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerCueParseError(ptr: *const std::ffi::c_void)  {
+                pub extern "C" fn frbgen_xymusic_mobile_rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerCueParseError(ptr: *const std::ffi::c_void)  {
                     MoiArc::<flutter_rust_bridge::for_generated::RustAutoOpaqueInner<CueParseError>>::increment_strong_count(ptr as _);
                 }
             
 
                 #[unsafe(no_mangle)]
-                pub extern "C" fn frbgen_xianyu_music_mobile_rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerCueParseError(ptr: *const std::ffi::c_void)  {
+                pub extern "C" fn frbgen_xymusic_mobile_rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerCueParseError(ptr: *const std::ffi::c_void)  {
                     MoiArc::<flutter_rust_bridge::for_generated::RustAutoOpaqueInner<CueParseError>>::decrement_strong_count(ptr as _);
                 }
             
 
                 #[unsafe(no_mangle)]
-                pub extern "C" fn frbgen_xianyu_music_mobile_rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerCueSheet(ptr: *const std::ffi::c_void)  {
+                pub extern "C" fn frbgen_xymusic_mobile_rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerCueSheet(ptr: *const std::ffi::c_void)  {
                     MoiArc::<flutter_rust_bridge::for_generated::RustAutoOpaqueInner<CueSheet>>::increment_strong_count(ptr as _);
                 }
             
 
                 #[unsafe(no_mangle)]
-                pub extern "C" fn frbgen_xianyu_music_mobile_rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerCueSheet(ptr: *const std::ffi::c_void)  {
+                pub extern "C" fn frbgen_xymusic_mobile_rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerCueSheet(ptr: *const std::ffi::c_void)  {
                     MoiArc::<flutter_rust_bridge::for_generated::RustAutoOpaqueInner<CueSheet>>::decrement_strong_count(ptr as _);
                 }
             
 
                 #[unsafe(no_mangle)]
-                pub extern "C" fn frbgen_xianyu_music_mobile_rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEmbeddedLyricsMatch(ptr: *const std::ffi::c_void)  {
+                pub extern "C" fn frbgen_xymusic_mobile_rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEmbeddedLyricsMatch(ptr: *const std::ffi::c_void)  {
                     MoiArc::<flutter_rust_bridge::for_generated::RustAutoOpaqueInner<EmbeddedLyricsMatch>>::increment_strong_count(ptr as _);
                 }
             
 
                 #[unsafe(no_mangle)]
-                pub extern "C" fn frbgen_xianyu_music_mobile_rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEmbeddedLyricsMatch(ptr: *const std::ffi::c_void)  {
+                pub extern "C" fn frbgen_xymusic_mobile_rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEmbeddedLyricsMatch(ptr: *const std::ffi::c_void)  {
                     MoiArc::<flutter_rust_bridge::for_generated::RustAutoOpaqueInner<EmbeddedLyricsMatch>>::decrement_strong_count(ptr as _);
                 }
             
 
                 #[unsafe(no_mangle)]
-                pub extern "C" fn frbgen_xianyu_music_mobile_rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerFullCoverImageConcurrencyLimit(ptr: *const std::ffi::c_void)  {
+                pub extern "C" fn frbgen_xymusic_mobile_rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerFullCoverImageConcurrencyLimit(ptr: *const std::ffi::c_void)  {
                     MoiArc::<flutter_rust_bridge::for_generated::RustAutoOpaqueInner<FullCoverImageConcurrencyLimit>>::increment_strong_count(ptr as _);
                 }
             
 
                 #[unsafe(no_mangle)]
-                pub extern "C" fn frbgen_xianyu_music_mobile_rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerFullCoverImageConcurrencyLimit(ptr: *const std::ffi::c_void)  {
+                pub extern "C" fn frbgen_xymusic_mobile_rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerFullCoverImageConcurrencyLimit(ptr: *const std::ffi::c_void)  {
                     MoiArc::<flutter_rust_bridge::for_generated::RustAutoOpaqueInner<FullCoverImageConcurrencyLimit>>::decrement_strong_count(ptr as _);
                 }
             
 
                 #[unsafe(no_mangle)]
-                pub extern "C" fn frbgen_xianyu_music_mobile_rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerItemKey(ptr: *const std::ffi::c_void)  {
+                pub extern "C" fn frbgen_xymusic_mobile_rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerItemKey(ptr: *const std::ffi::c_void)  {
                     MoiArc::<flutter_rust_bridge::for_generated::RustAutoOpaqueInner<ItemKey>>::increment_strong_count(ptr as _);
                 }
             
 
                 #[unsafe(no_mangle)]
-                pub extern "C" fn frbgen_xianyu_music_mobile_rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerItemKey(ptr: *const std::ffi::c_void)  {
+                pub extern "C" fn frbgen_xymusic_mobile_rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerItemKey(ptr: *const std::ffi::c_void)  {
                     MoiArc::<flutter_rust_bridge::for_generated::RustAutoOpaqueInner<ItemKey>>::decrement_strong_count(ptr as _);
                 }
             
 
                 #[unsafe(no_mangle)]
-                pub extern "C" fn frbgen_xianyu_music_mobile_rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerPath(ptr: *const std::ffi::c_void)  {
+                pub extern "C" fn frbgen_xymusic_mobile_rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerPath(ptr: *const std::ffi::c_void)  {
                     MoiArc::<flutter_rust_bridge::for_generated::RustAutoOpaqueInner<Path>>::increment_strong_count(ptr as _);
                 }
             
 
                 #[unsafe(no_mangle)]
-                pub extern "C" fn frbgen_xianyu_music_mobile_rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerPath(ptr: *const std::ffi::c_void)  {
+                pub extern "C" fn frbgen_xymusic_mobile_rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerPath(ptr: *const std::ffi::c_void)  {
                     MoiArc::<flutter_rust_bridge::for_generated::RustAutoOpaqueInner<Path>>::decrement_strong_count(ptr as _);
                 }
             
 
                 #[unsafe(no_mangle)]
-                pub extern "C" fn frbgen_xianyu_music_mobile_rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerPathBuf(ptr: *const std::ffi::c_void)  {
+                pub extern "C" fn frbgen_xymusic_mobile_rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerPathBuf(ptr: *const std::ffi::c_void)  {
                     MoiArc::<flutter_rust_bridge::for_generated::RustAutoOpaqueInner<PathBuf>>::increment_strong_count(ptr as _);
                 }
             
 
                 #[unsafe(no_mangle)]
-                pub extern "C" fn frbgen_xianyu_music_mobile_rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerPathBuf(ptr: *const std::ffi::c_void)  {
+                pub extern "C" fn frbgen_xymusic_mobile_rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerPathBuf(ptr: *const std::ffi::c_void)  {
                     MoiArc::<flutter_rust_bridge::for_generated::RustAutoOpaqueInner<PathBuf>>::decrement_strong_count(ptr as _);
                 }
             
 
                 #[unsafe(no_mangle)]
-                pub extern "C" fn frbgen_xianyu_music_mobile_rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerSemaphore(ptr: *const std::ffi::c_void)  {
+                pub extern "C" fn frbgen_xymusic_mobile_rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerSemaphore(ptr: *const std::ffi::c_void)  {
                     MoiArc::<flutter_rust_bridge::for_generated::RustAutoOpaqueInner<Semaphore>>::increment_strong_count(ptr as _);
                 }
             
 
                 #[unsafe(no_mangle)]
-                pub extern "C" fn frbgen_xianyu_music_mobile_rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerSemaphore(ptr: *const std::ffi::c_void)  {
+                pub extern "C" fn frbgen_xymusic_mobile_rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerSemaphore(ptr: *const std::ffi::c_void)  {
                     MoiArc::<flutter_rust_bridge::for_generated::RustAutoOpaqueInner<Semaphore>>::decrement_strong_count(ptr as _);
                 }
             
 
                 #[unsafe(no_mangle)]
-                pub extern "C" fn frbgen_xianyu_music_mobile_rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerTagType(ptr: *const std::ffi::c_void)  {
+                pub extern "C" fn frbgen_xymusic_mobile_rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerTagType(ptr: *const std::ffi::c_void)  {
                     MoiArc::<flutter_rust_bridge::for_generated::RustAutoOpaqueInner<TagType>>::increment_strong_count(ptr as _);
                 }
             
 
                 #[unsafe(no_mangle)]
-                pub extern "C" fn frbgen_xianyu_music_mobile_rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerTagType(ptr: *const std::ffi::c_void)  {
+                pub extern "C" fn frbgen_xymusic_mobile_rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerTagType(ptr: *const std::ffi::c_void)  {
                     MoiArc::<flutter_rust_bridge::for_generated::RustAutoOpaqueInner<TagType>>::decrement_strong_count(ptr as _);
                 }
             
 
                 #[unsafe(no_mangle)]
-                pub extern "C" fn frbgen_xianyu_music_mobile_rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerTaggedFile(ptr: *const std::ffi::c_void)  {
+                pub extern "C" fn frbgen_xymusic_mobile_rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerTaggedFile(ptr: *const std::ffi::c_void)  {
                     MoiArc::<flutter_rust_bridge::for_generated::RustAutoOpaqueInner<TaggedFile>>::increment_strong_count(ptr as _);
                 }
             
 
                 #[unsafe(no_mangle)]
-                pub extern "C" fn frbgen_xianyu_music_mobile_rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerTaggedFile(ptr: *const std::ffi::c_void)  {
+                pub extern "C" fn frbgen_xymusic_mobile_rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerTaggedFile(ptr: *const std::ffi::c_void)  {
                     MoiArc::<flutter_rust_bridge::for_generated::RustAutoOpaqueInner<TaggedFile>>::decrement_strong_count(ptr as _);
                 }
             
 
                 #[unsafe(no_mangle)]
-                pub extern "C" fn frbgen_xianyu_music_mobile_rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerThumbnailImageConcurrencyLimit(ptr: *const std::ffi::c_void)  {
+                pub extern "C" fn frbgen_xymusic_mobile_rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerThumbnailImageConcurrencyLimit(ptr: *const std::ffi::c_void)  {
                     MoiArc::<flutter_rust_bridge::for_generated::RustAutoOpaqueInner<ThumbnailImageConcurrencyLimit>>::increment_strong_count(ptr as _);
                 }
             
 
                 #[unsafe(no_mangle)]
-                pub extern "C" fn frbgen_xianyu_music_mobile_rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerThumbnailImageConcurrencyLimit(ptr: *const std::ffi::c_void)  {
+                pub extern "C" fn frbgen_xymusic_mobile_rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerThumbnailImageConcurrencyLimit(ptr: *const std::ffi::c_void)  {
                     MoiArc::<flutter_rust_bridge::for_generated::RustAutoOpaqueInner<ThumbnailImageConcurrencyLimit>>::decrement_strong_count(ptr as _);
                 }
             
 
                 #[unsafe(no_mangle)]
-                pub extern "C" fn frbgen_xianyu_music_mobile_rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerstr(ptr: *const std::ffi::c_void)  {
+                pub extern "C" fn frbgen_xymusic_mobile_rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerstr(ptr: *const std::ffi::c_void)  {
                     MoiArc::<flutter_rust_bridge::for_generated::RustAutoOpaqueInner<str>>::increment_strong_count(ptr as _);
                 }
             
 
                 #[unsafe(no_mangle)]
-                pub extern "C" fn frbgen_xianyu_music_mobile_rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerstr(ptr: *const std::ffi::c_void)  {
+                pub extern "C" fn frbgen_xymusic_mobile_rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerstr(ptr: *const std::ffi::c_void)  {
                     MoiArc::<flutter_rust_bridge::for_generated::RustAutoOpaqueInner<str>>::decrement_strong_count(ptr as _);
                 }
             
 
                 #[unsafe(no_mangle)]
-                pub extern "C" fn frbgen_xianyu_music_mobile_rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInneru8(ptr: *const std::ffi::c_void)  {
+                pub extern "C" fn frbgen_xymusic_mobile_rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInneru8(ptr: *const std::ffi::c_void)  {
                     MoiArc::<flutter_rust_bridge::for_generated::RustAutoOpaqueInner<[u8]>>::increment_strong_count(ptr as _);
                 }
             
 
                 #[unsafe(no_mangle)]
-                pub extern "C" fn frbgen_xianyu_music_mobile_rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInneru8(ptr: *const std::ffi::c_void)  {
+                pub extern "C" fn frbgen_xymusic_mobile_rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInneru8(ptr: *const std::ffi::c_void)  {
                     MoiArc::<flutter_rust_bridge::for_generated::RustAutoOpaqueInner<[u8]>>::decrement_strong_count(ptr as _);
                 }
             

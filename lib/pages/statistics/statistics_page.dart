@@ -241,6 +241,7 @@ class _StatisticsContent extends StatelessWidget {
                       children: [
                         CoverImage(
                           songPath: data.topSongs[i].path,
+                          imageUrl: data.topSongs[i].coverUrl,
                           width: 44,
                           height: 44,
                           radius: 10,

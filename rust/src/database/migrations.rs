@@ -282,6 +282,21 @@ fn migrate_play_history(conn: &Connection) -> Result<(), String> {
         .ok();
     }
 
+    if !columns.iter().any(|column| column == "played_ms") {
+        conn.execute(
+            "ALTER TABLE play_history ADD COLUMN played_ms INTEGER NOT NULL DEFAULT 0",
+            [],
+        )
+        .ok();
+        // 旧版本只保存整数秒，迁移时保留原有数据的全部精度。
+        conn.execute(
+            "UPDATE play_history SET played_ms = played_seconds * 1000
+             WHERE played_ms = 0 AND played_seconds IS NOT NULL",
+            [],
+        )
+        .ok();
+    }
+
     if !columns.iter().any(|column| column == "song_id") {
         conn.execute("ALTER TABLE play_history ADD COLUMN song_id INTEGER", [])
             .ok();

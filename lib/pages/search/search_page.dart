@@ -6,8 +6,10 @@ import 'package:go_router/go_router.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../../src/auth/auth_provider.dart';
+import '../../src/core/settings.dart';
 import '../../src/library/library_provider.dart';
 import '../../src/navigation/animated_page_route.dart';
+import '../../src/navigation/sidebar_controller.dart';
 import '../../src/player/player_provider.dart';
 import '../../src/plugins/plugin_runtime.dart';
 import '../../src/widgets/mini_player_bar.dart';
@@ -19,9 +21,18 @@ bool isCurrentSearchSong(QueueItem? current, Song song) =>
     current?.path == song.path;
 
 class SearchPage extends ConsumerStatefulWidget {
-  const SearchPage({super.key, this.initialQuery = ''});
+  const SearchPage({
+    super.key,
+    this.initialQuery = '',
+    this.showSidebarButton = false,
+    this.embeddedInShell = false,
+    this.exploreMode = false,
+  });
 
   final String initialQuery;
+  final bool showSidebarButton;
+  final bool embeddedInShell;
+  final bool exploreMode;
 
   @override
   ConsumerState<SearchPage> createState() => _SearchPageState();
@@ -43,7 +54,7 @@ class _PluginSearchState {
   final String? error;
 }
 
-enum _SearchCategory { songs, artists, albums }
+enum _SearchCategory { songs, artists, albums, playlists }
 
 class _SearchPageState extends ConsumerState<SearchPage>
     with SingleTickerProviderStateMixin {
@@ -59,8 +70,13 @@ class _SearchPageState extends ConsumerState<SearchPage>
   _SearchCategory _selectedCategory = _SearchCategory.songs;
   List<String> _history = const [];
   late final Future<void> _historyReady;
-  Timer? _debounce;
+  final ScrollController _historyController = ScrollController();
+  final FocusNode _searchFocusNode = FocusNode();
+  int _inputRevision = 0;
+  int _searchedRevision = -1;
   int _queryToken = 0;
+  DateTime _lastInputAt = DateTime.fromMillisecondsSinceEpoch(0);
+  Timer? _submitConfirmTimer;
 
   @override
   void initState() {
@@ -69,6 +85,7 @@ class _SearchPageState extends ConsumerState<SearchPage>
       length: _SearchCategory.values.length,
       vsync: this,
     );
+    _searchFocusNode.addListener(_onSearchFocusChanged);
     _historyReady = _loadHistory();
     if (widget.initialQuery.trim().isNotEmpty) {
       WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -131,7 +148,6 @@ class _SearchPageState extends ConsumerState<SearchPage>
   }
 
   void _searchFromHistory(String keyword) {
-    _debounce?.cancel();
     _controller.value = TextEditingValue(
       text: keyword,
       selection: TextSelection.collapsed(offset: keyword.length),
@@ -143,15 +159,24 @@ class _SearchPageState extends ConsumerState<SearchPage>
 
   @override
   void dispose() {
-    _debounce?.cancel();
+    _submitConfirmTimer?.cancel();
+    _searchFocusNode
+      ..removeListener(_onSearchFocusChanged)
+      ..dispose();
     _categoryController.dispose();
     _controller.dispose();
+    _historyController.dispose();
     super.dispose();
   }
 
   void _onChanged(String value) {
+    _lastInputAt = DateTime.now();
+    // 部分输入法的“搜索”动作先于字符提交到达：确认期内文本又发生了
+    // 变化，说明该动作是随本次字符误发的，取消挂起的提交。
+    _submitConfirmTimer?.cancel();
+    _submitConfirmTimer = null;
+    _inputRevision++;
     setState(() {});
-    _debounce?.cancel();
     final keyword = value.trim();
     if (keyword.isEmpty) {
       _queryToken++;
@@ -162,10 +187,39 @@ class _SearchPageState extends ConsumerState<SearchPage>
       });
       return;
     }
-    _debounce = Timer(
-      const Duration(milliseconds: 350),
-      () => _search(keyword),
-    );
+  }
+
+  /// 键盘“搜索”动作的提交处理（带误报甄别）。
+  ///
+  /// 部分中文输入法（搜狗等）在候选字上屏时会随字符误发一次“搜索”
+  /// 动作，且动作与字符提交的先后顺序不定：
+  /// 1. 动作在字符提交**之后**到达——距最近一次输入不足 100ms，直接忽略；
+  /// 2. 动作在字符提交**之前**到达——先挂起 200ms 确认定时器，若期间
+  ///    文本发生变化（字符随后到达）则取消，视为误报。
+  /// 只有确认期内文本始终未变的动作才视为用户真实按下搜索键，此时才
+  /// 收起键盘并执行搜索。
+  void _onSubmitted(String value) {
+    if (DateTime.now().difference(_lastInputAt) <
+        const Duration(milliseconds: 100)) {
+      return;
+    }
+    _submitConfirmTimer?.cancel();
+    _submitConfirmTimer = Timer(const Duration(milliseconds: 200), () {
+      _submitConfirmTimer = null;
+      if (!mounted) return;
+      final keyword = _controller.text.trim();
+      if (keyword.isEmpty) return;
+      _searchFocusNode.unfocus();
+      unawaited(_search(keyword));
+    });
+  }
+
+  void _onSearchFocusChanged() {
+    if (_searchFocusNode.hasFocus) return;
+    final keyword = _controller.text.trim();
+    if (keyword.isNotEmpty && _searchedRevision != _inputRevision) {
+      unawaited(_search(keyword));
+    }
   }
 
   String _stateKey(String pluginId, _SearchCategory category) =>
@@ -179,6 +233,7 @@ class _SearchPageState extends ConsumerState<SearchPage>
   Future<void> _search(String input) async {
     final keyword = input.trim();
     if (keyword.isEmpty) return;
+    _searchedRevision = _inputRevision;
     _recordHistory(keyword);
     final token = ++_queryToken;
     final plugins = await ref.read(enabledMusicPluginsProvider.future);
@@ -190,6 +245,8 @@ class _SearchPageState extends ConsumerState<SearchPage>
         _states[_stateKey(plugin.id, _SearchCategory.artists)] =
             const _PluginSearchState();
         _states[_stateKey(plugin.id, _SearchCategory.albums)] =
+            const _PluginSearchState();
+        _states[_stateKey(plugin.id, _SearchCategory.playlists)] =
             const _PluginSearchState();
       }
     });
@@ -281,11 +338,24 @@ class _SearchPageState extends ConsumerState<SearchPage>
           title: keyword,
           subtitle: item.subtitle,
           coverUrl: item.coverUrl,
-          categoryLabel: _categoryLabel(category),
+          categoryLabel: _categoryLabelForPlugin(category, plugin),
           loadSongs: () async {
-            final results = category == _SearchCategory.artists
-                ? await runtime.getArtistSongs(plugin, item)
-                : await runtime.getAlbumSongs(plugin, item);
+            final results = switch (category) {
+              _SearchCategory.artists => await runtime.getArtistSongs(
+                plugin,
+                item,
+              ),
+              _SearchCategory.albums => await runtime.getAlbumSongs(
+                plugin,
+                item,
+              ),
+              _SearchCategory.playlists => await _loadPlaylistSongs(
+                runtime,
+                plugin,
+                item,
+              ),
+              _SearchCategory.songs => const <PluginSearchSong>[],
+            };
             return results
                 .where((song) => song.title.trim().isNotEmpty)
                 .map((song) => _songFromPlugin(plugin, song))
@@ -294,6 +364,33 @@ class _SearchPageState extends ConsumerState<SearchPage>
         ),
       ),
     );
+  }
+
+  Future<List<PluginSearchSong>> _loadPlaylistSongs(
+    PluginRuntimeService runtime,
+    EnabledMusicPlugin plugin,
+    PluginCatalogResult item,
+  ) async {
+    final raw = item.rawData;
+    final input = <String>[
+      for (final key in const [
+        'id',
+        'playlistId',
+        'playlist_id',
+        'sheetId',
+        'sheet_id',
+        'albumId',
+        'album_id',
+        'url',
+        'link',
+      ])
+        if (raw[key]?.toString().trim().isNotEmpty == true)
+          raw[key].toString().trim(),
+      if (item.id.trim().isNotEmpty) item.id.trim(),
+      item.title.trim(),
+    ].firstWhere((value) => value.isNotEmpty);
+    final imported = await runtime.importPlaylist(plugin, input);
+    return imported.songs;
   }
 
   Future<void> _searchPluginCategory(
@@ -308,9 +405,16 @@ class _SearchPageState extends ConsumerState<SearchPage>
     });
     try {
       final runtime = ref.read(pluginRuntimeProvider);
-      final catalog = category == _SearchCategory.artists
-          ? await runtime.searchArtists(plugin, keyword)
-          : await runtime.searchAlbums(plugin, keyword);
+      final catalog = switch (category) {
+        _SearchCategory.artists => await runtime.searchArtists(plugin, keyword),
+        _SearchCategory.albums => await runtime.searchAlbums(plugin, keyword),
+        _SearchCategory.playlists => await runtime.searchPlaylists(
+          plugin,
+          keyword,
+          includeAlbums: false,
+        ),
+        _SearchCategory.songs => const <PluginCatalogResult>[],
+      };
       if (!mounted || token != _queryToken) return;
       setState(() {
         _states[key] = _PluginSearchState(catalog: catalog, searched: true);
@@ -368,7 +472,6 @@ class _SearchPageState extends ConsumerState<SearchPage>
 
   void _clear() {
     _controller.clear();
-    _debounce?.cancel();
     _queryToken++;
     setState(() {
       _states.clear();
@@ -379,74 +482,96 @@ class _SearchPageState extends ConsumerState<SearchPage>
 
   Widget _historyBody({required bool showMiniPlayer}) {
     final scheme = Theme.of(context).colorScheme;
-    return ListView(
-      padding: EdgeInsets.fromLTRB(
-        20,
-        22,
-        20,
-        MediaQuery.of(context).padding.bottom + (showMiniPlayer ? 104 : 24),
-      ),
+    return Stack(
       children: [
-        if (_history.isNotEmpty) ...[
-          Row(
-            children: [
-              Expanded(
+        ListView(
+          controller: _historyController,
+          padding: EdgeInsets.fromLTRB(
+            20,
+            22,
+            20,
+            MediaQuery.of(context).padding.bottom + (showMiniPlayer ? 104 : 24),
+          ),
+          children: [
+            if (_history.isNotEmpty) ...[
+              Row(
+                children: [
+                  Expanded(
+                    child: Text(
+                      '搜索历史',
+                      style: Theme.of(context).textTheme.titleMedium?.copyWith(
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                  ),
+                  TextButton.icon(
+                    onPressed: _clearHistory,
+                    icon: const Icon(Icons.delete_sweep_outlined, size: 18),
+                    label: const Text('清空'),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 4),
+              // 使用竖直列表展示历史，避免关键词被挤成块状标签。
+              for (var index = 0; index < _history.length; index++) ...[
+                ListTile(
+                  contentPadding: EdgeInsets.zero,
+                  minTileHeight: 46,
+                  leading: Icon(
+                    Icons.history_rounded,
+                    size: 20,
+                    color: scheme.onSurfaceVariant,
+                  ),
+                  title: Text(
+                    _history[index],
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                  trailing: IconButton(
+                    tooltip: '删除 ${_history[index]}',
+                    icon: const Icon(Icons.close_rounded, size: 19),
+                    onPressed: () => _removeHistory(_history[index]),
+                  ),
+                  onTap: () => _searchFromHistory(_history[index]),
+                ),
+              ],
+              const SizedBox(height: 34),
+            ],
+            Icon(
+              Icons.manage_search_rounded,
+              size: 48,
+              color: scheme.onSurfaceVariant.withValues(alpha: 0.7),
+            ),
+            const SizedBox(height: 12),
+            Text(
+              _history.isEmpty ? '搜索网络音乐' : '继续搜索',
+              textAlign: TextAlign.center,
+              style: Theme.of(context).textTheme.titleMedium,
+            ),
+            const SizedBox(height: 7),
+            Text(
+              '输入歌曲、歌手、专辑或歌单名称，结果将按插件分类展示',
+              textAlign: TextAlign.center,
+              style: TextStyle(color: scheme.onSurfaceVariant),
+            ),
+            if (widget.exploreMode) ...[
+              const SizedBox(height: 34),
+              Align(
+                alignment: Alignment.centerLeft,
                 child: Text(
-                  '搜索历史',
+                  '推荐',
                   style: Theme.of(context).textTheme.titleMedium?.copyWith(
                     fontWeight: FontWeight.w700,
                   ),
                 ),
               ),
-              TextButton.icon(
-                onPressed: _clearHistory,
-                icon: const Icon(Icons.delete_sweep_outlined, size: 18),
-                label: const Text('清空'),
-              ),
+              const SizedBox(height: 72),
             ],
-          ),
-          const SizedBox(height: 4),
-          // 使用竖直列表展示历史，避免关键词被挤成块状标签。
-          for (var index = 0; index < _history.length; index++) ...[
-            ListTile(
-              contentPadding: EdgeInsets.zero,
-              minTileHeight: 46,
-              leading: Icon(
-                Icons.history_rounded,
-                size: 20,
-                color: scheme.onSurfaceVariant,
-              ),
-              title: Text(
-                _history[index],
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-              ),
-              trailing: IconButton(
-                tooltip: '删除 ${_history[index]}',
-                icon: const Icon(Icons.close_rounded, size: 19),
-                onPressed: () => _removeHistory(_history[index]),
-              ),
-              onTap: () => _searchFromHistory(_history[index]),
-            ),
           ],
-          const SizedBox(height: 34),
-        ],
-        Icon(
-          Icons.manage_search_rounded,
-          size: 48,
-          color: scheme.onSurfaceVariant.withValues(alpha: 0.7),
         ),
-        const SizedBox(height: 12),
-        Text(
-          _history.isEmpty ? '搜索网络音乐' : '继续搜索',
-          textAlign: TextAlign.center,
-          style: Theme.of(context).textTheme.titleMedium,
-        ),
-        const SizedBox(height: 7),
-        Text(
-          '输入歌曲、歌手或专辑名称，结果将按插件分类展示',
-          textAlign: TextAlign.center,
-          style: TextStyle(color: scheme.onSurfaceVariant),
+        ScrollToTopButton(
+          controller: _historyController,
+          hasMiniPlayer: showMiniPlayer,
         ),
       ],
     );
@@ -464,7 +589,7 @@ class _SearchPageState extends ConsumerState<SearchPage>
         child: Text(
           category == _SearchCategory.songs
               ? '输入关键词，从 ${plugin.name} 搜索网络音乐'
-              : '点击上方“${_categoryLabel(category)}”开始搜索 ${plugin.name} 分类结果',
+              : '点击上方“${_categoryLabelForPlugin(category, plugin)}”开始搜索 ${plugin.name} 分类结果',
           textAlign: TextAlign.center,
           style: TextStyle(color: scheme.onSurfaceVariant),
         ),
@@ -494,6 +619,7 @@ class _SearchPageState extends ConsumerState<SearchPage>
       return _CatalogListView(
         items: state.catalog,
         category: category,
+        categoryLabel: _categoryLabelForPlugin(category, plugin),
         showMiniPlayer: showMiniPlayer,
         onTap: (item) => _openCatalogResult(plugin, category, item),
       );
@@ -510,14 +636,19 @@ class _SearchPageState extends ConsumerState<SearchPage>
     );
   }
 
-  String _categoryLabel(_SearchCategory category) {
+  String _categoryLabelForPlugin(
+    _SearchCategory category,
+    EnabledMusicPlugin? plugin,
+  ) {
     switch (category) {
       case _SearchCategory.songs:
         return '歌曲';
       case _SearchCategory.artists:
-        return '歌手';
+        return plugin != null && isBilibiliPluginSource(plugin) ? 'UP主' : '歌手';
       case _SearchCategory.albums:
         return '专辑';
+      case _SearchCategory.playlists:
+        return '歌单';
     }
   }
 
@@ -553,22 +684,36 @@ class _SearchPageState extends ConsumerState<SearchPage>
     final pluginsValue = ref.watch(enabledMusicPluginsProvider);
     final plugins = pluginsValue.valueOrNull ?? const <EnabledMusicPlugin>[];
     final showingHistory = _controller.text.trim().isEmpty;
-    final showMiniPlayer = ref.watch(
-      playerProvider.select((state) => state.current != null),
-    );
+    final showMiniPlayer =
+        ref.watch(playerProvider.select((state) => state.current != null)) &&
+        !widget.embeddedInShell;
     final safeBottom = MediaQuery.paddingOf(context).bottom;
+    final sidebarOnRight = ref.watch(
+      settingsProvider.select(
+        (value) => value.valueOrNull?.sidebarPosition == SidebarPosition.right,
+      ),
+    );
     return DefaultTabController(
       length: plugins.isEmpty ? 1 : plugins.length,
       child: Scaffold(
         appBar: AppBar(
+          automaticallyImplyLeading:
+              !widget.showSidebarButton && !widget.embeddedInShell,
+          leading: widget.showSidebarButton && !sidebarOnRight
+              ? const AppSidebarMenuButton()
+              : null,
           title: TextField(
             controller: _controller,
+            focusNode: _searchFocusNode,
             autofocus: widget.initialQuery.isEmpty,
             textInputAction: TextInputAction.search,
             onChanged: _onChanged,
-            onSubmitted: _search,
+            // 空实现：覆盖框架默认的“收到键盘动作即失焦收起键盘”行为，
+            // 由 _onSubmitted 自行决定何时收起键盘。
+            onEditingComplete: () {},
+            onSubmitted: _onSubmitted,
             decoration: InputDecoration(
-              hintText: '搜索网络歌曲、歌手、专辑',
+              hintText: '搜索网络歌曲、歌手、专辑、歌单',
               border: InputBorder.none,
               suffixIcon: _controller.text.isEmpty
                   ? null
@@ -579,7 +724,15 @@ class _SearchPageState extends ConsumerState<SearchPage>
                     ),
             ),
           ),
-          bottom: plugins.isEmpty || showingHistory
+          actions: [
+            if (widget.showSidebarButton && sidebarOnRight)
+              const AppSidebarMenuButton(),
+          ],
+          // TabBar 始终挂载（只要插件列表非空），不随输入文本有无变化。
+          // 否则输入第一个字符时 AppBar 底部从无到有挂载（高度突增 92px），
+          // 输入法组词期间发生布局重排会导致键盘被强制收起，输入被打断。
+          // body 仍按是否有文本在历史页/结果页之间切换。
+          bottom: plugins.isEmpty
               ? null
               : PreferredSize(
                   preferredSize: const Size.fromHeight(92),
@@ -590,7 +743,7 @@ class _SearchPageState extends ConsumerState<SearchPage>
                         isScrollable: true,
                         tabAlignment: TabAlignment.start,
                         onTap: (index) {
-                          _selectedPluginIndex = index;
+                          setState(() => _selectedPluginIndex = index);
                           _ensureCategorySearch(plugins, pluginIndex: index);
                         },
                         tabs: [
@@ -618,10 +771,21 @@ class _SearchPageState extends ConsumerState<SearchPage>
                             );
                           }
                         },
-                        tabs: const [
-                          Tab(text: '歌曲'),
-                          Tab(text: '歌手'),
-                          Tab(text: '专辑'),
+                        tabs: [
+                          const Tab(text: '歌曲'),
+                          Tab(
+                            text:
+                                plugins.isNotEmpty &&
+                                    _selectedPluginIndex >= 0 &&
+                                    _selectedPluginIndex < plugins.length &&
+                                    isBilibiliPluginSource(
+                                      plugins[_selectedPluginIndex],
+                                    )
+                                ? 'UP主'
+                                : '歌手',
+                          ),
+                          const Tab(text: '专辑'),
+                          const Tab(text: '歌单'),
                         ],
                       ),
                     ],
@@ -678,79 +842,109 @@ class _SearchPageState extends ConsumerState<SearchPage>
   }
 }
 
-class _CatalogListView extends StatelessWidget {
+class _CatalogListView extends StatefulWidget {
   const _CatalogListView({
     required this.items,
     required this.category,
+    required this.categoryLabel,
     required this.showMiniPlayer,
     required this.onTap,
   });
 
   final List<PluginCatalogResult> items;
   final _SearchCategory category;
+  final String categoryLabel;
   final bool showMiniPlayer;
   final ValueChanged<PluginCatalogResult> onTap;
+
+  @override
+  State<_CatalogListView> createState() => _CatalogListViewState();
+}
+
+class _CatalogListViewState extends State<_CatalogListView> {
+  final ScrollController _controller = ScrollController();
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
 
   @override
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
     final bottom =
-        MediaQuery.of(context).padding.bottom + (showMiniPlayer ? 104 : 16);
-    return ListView.separated(
-      padding: EdgeInsets.fromLTRB(16, 8, 16, bottom),
-      itemCount: items.length,
-      separatorBuilder: (_, _) => const SizedBox(height: 4),
-      itemBuilder: (context, index) {
-        final item = items[index];
-        final isArtist = category == _SearchCategory.artists;
-        final cover = item.coverUrl.trim();
-        final placeholder = Icon(
-          isArtist ? Icons.person_outline_rounded : Icons.album_outlined,
-          color: scheme.onSurfaceVariant,
-          size: 26,
-        );
-        return ListTile(
-          contentPadding: const EdgeInsets.symmetric(
-            horizontal: 10,
-            vertical: 4,
-          ),
-          leading: ClipRRect(
-            borderRadius: BorderRadius.circular(isArtist ? 28 : 8),
-            child: SizedBox(
-              width: 52,
-              height: 52,
-              child: cover.isEmpty
-                  ? ColoredBox(
-                      color: scheme.surfaceContainerHighest,
-                      child: Center(child: placeholder),
-                    )
-                  : Image.network(
-                      cover,
-                      fit: BoxFit.cover,
-                      errorBuilder: (_, _, _) => ColoredBox(
-                        color: scheme.surfaceContainerHighest,
-                        child: Center(child: placeholder),
-                      ),
-                    ),
-            ),
-          ),
-          title: Text(
-            item.title,
-            maxLines: 1,
-            overflow: TextOverflow.ellipsis,
-            style: const TextStyle(fontWeight: FontWeight.w600),
-          ),
-          subtitle: item.subtitle.trim().isEmpty
-              ? Text(isArtist ? '歌手' : '专辑')
-              : Text(
-                  item.subtitle,
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
+        MediaQuery.of(context).padding.bottom +
+        (widget.showMiniPlayer ? 104 : 16);
+    final isArtist = widget.category == _SearchCategory.artists;
+    final isPlaylist = widget.category == _SearchCategory.playlists;
+    return Stack(
+      children: [
+        ListView.separated(
+          controller: _controller,
+          padding: EdgeInsets.fromLTRB(16, 8, 16, bottom),
+          itemCount: widget.items.length,
+          separatorBuilder: (_, _) => const SizedBox(height: 4),
+          itemBuilder: (context, index) {
+            final item = widget.items[index];
+            final cover = item.coverUrl.trim();
+            final placeholder = Icon(
+              isArtist
+                  ? Icons.person_outline_rounded
+                  : isPlaylist
+                  ? Icons.queue_music_rounded
+                  : Icons.album_outlined,
+              color: scheme.onSurfaceVariant,
+              size: 26,
+            );
+            return ListTile(
+              contentPadding: const EdgeInsets.symmetric(
+                horizontal: 10,
+                vertical: 4,
+              ),
+              leading: ClipRRect(
+                borderRadius: BorderRadius.circular(isArtist ? 28 : 8),
+                child: SizedBox(
+                  width: 52,
+                  height: 52,
+                  child: cover.isEmpty
+                      ? ColoredBox(
+                          color: scheme.surfaceContainerHighest,
+                          child: Center(child: placeholder),
+                        )
+                      : Image.network(
+                          cover,
+                          fit: BoxFit.cover,
+                          errorBuilder: (_, _, _) => ColoredBox(
+                            color: scheme.surfaceContainerHighest,
+                            child: Center(child: placeholder),
+                          ),
+                        ),
                 ),
-          trailing: const Icon(Icons.chevron_right_rounded),
-          onTap: () => onTap(item),
-        );
-      },
+              ),
+              title: Text(
+                item.title,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(fontWeight: FontWeight.w600),
+              ),
+              subtitle: item.subtitle.trim().isEmpty
+                  ? Text(widget.categoryLabel)
+                  : Text(
+                      item.subtitle,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+              trailing: const Icon(Icons.chevron_right_rounded),
+              onTap: () => widget.onTap(item),
+            );
+          },
+        ),
+        ScrollToTopButton(
+          controller: _controller,
+          hasMiniPlayer: widget.showMiniPlayer,
+        ),
+      ],
     );
   }
 }

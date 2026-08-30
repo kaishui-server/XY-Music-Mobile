@@ -13,7 +13,10 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::SystemTime;
 
 const COVER_CACHE_MAX_SIZE_BYTES: u64 = 4 * 1024 * 1024 * 1024; // 4 GB
-const THUMBNAIL_EDGE_PX: u32 = 150;
+// 列表封面会在高 DPI 设备上按物理像素放大显示。150px 在手机和平板上
+// 容易出现明显的插值模糊，因此将缩略图缓存提升到 300px；缓存文件名
+// 同时包含该值，升级后会自动生成新的缓存，不会复用旧的低分辨率文件。
+const THUMBNAIL_EDGE_PX: u32 = 300;
 const FULL_COVER_EDGE_PX: u32 = 800;
 const FULL_COVER_CACHE_VERSION: &str = "v3";
 const FULL_COVER_FALLBACK_EXT: &str = "png";
@@ -328,7 +331,7 @@ pub fn get_or_create_thumbnail(path: &Path, cache_dir: &Path) -> Option<String> 
                 let resized = img.resize(
                     THUMBNAIL_EDGE_PX,
                     THUMBNAIL_EDGE_PX,
-                    image::imageops::FilterType::Triangle,
+                    image::imageops::FilterType::Lanczos3,
                 );
                 let persisted = persist_image_atomically(&resized, ImageFormat::Jpeg, &cache_path)?;
                 let _ = persist_alias_target(&alias_path, &cache_path);

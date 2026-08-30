@@ -13,6 +13,9 @@ class VideoPlaybackSession {
   static bool restarting = false;
   static String? error;
 
+  /// 当前视频是否来自插件的 MV 解析（非 B 站视频），用于菜单文案区分。
+  static bool isMv = false;
+
   /// 控制器从 null 切换为实例、或视频开始/结束时递增，供外部页面重新绑定。
   static final ValueNotifier<int> revision = ValueNotifier<int>(0);
 
@@ -50,6 +53,7 @@ class VideoPlaybackSession {
     resumeAudioAfterVideo = false;
     restarting = false;
     error = null;
+    isMv = false;
     changed();
     progressChanged();
     await active?.dispose();

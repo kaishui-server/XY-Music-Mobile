@@ -56,6 +56,9 @@ class AppShell extends ConsumerWidget {
     });
     final safeBottom = MediaQuery.paddingOf(context).bottom;
     final showMiniPlayer = shouldShowMiniPlayerForPath(currentPath);
+    final sidebarOnRight =
+        ref.watch(settingsProvider).valueOrNull?.sidebarPosition ==
+        SidebarPosition.right;
 
     void navigate(String path) {
       Navigator.of(appScaffoldKey.currentContext!).pop();
@@ -69,7 +72,12 @@ class AppShell extends ConsumerWidget {
       extendBody: true,
       drawerScrimColor: Colors.black.withValues(alpha: 0.58),
       drawerEdgeDragWidth: MediaQuery.sizeOf(context).width * 0.16,
-      drawer: XyMobileSidebar(currentPath: currentPath, onNavigate: navigate),
+      drawer: sidebarOnRight
+          ? null
+          : XyMobileSidebar(currentPath: currentPath, onNavigate: navigate),
+      endDrawer: sidebarOnRight
+          ? XyMobileSidebar(currentPath: currentPath, onNavigate: navigate)
+          : null,
       body: Stack(
         children: [
           navigationShell,
@@ -181,8 +189,12 @@ class XyMobileSidebar extends ConsumerWidget {
   }
 
   bool _selected(String path) {
-    if (path == '/home') return currentPath == '/home';
-    return currentPath == path || currentPath.startsWith('$path/');
+    // 抽屉目的地可能带有 from=sidebar 查询参数，而 shell 传入的
+    // currentPath 是不含查询参数的 uri.path；先统一比较纯路径，确保
+    // “账号”和“插件管理”从侧边栏进入后也能正确高亮。
+    final normalized = path.split('?').first;
+    if (normalized == '/home') return currentPath == '/home';
+    return currentPath == normalized || currentPath.startsWith('$normalized/');
   }
 
   @override
@@ -193,38 +205,75 @@ class XyMobileSidebar extends ConsumerWidget {
     final playlists = ref.watch(playlistsProvider);
     final width = MediaQuery.sizeOf(context).width * 0.5;
 
-    final primaryItems = <_SidebarDestination>[
-      const _SidebarDestination('首页', Icons.home_outlined, '/home'),
-      const _SidebarDestination(
+    final destinations = <String, _SidebarDestination>{
+      kSidebarHome: const _SidebarDestination(
+        '首页',
+        Icons.home_outlined,
+        '/home',
+      ),
+      kSidebarExplore: const _SidebarDestination(
+        '探索',
+        Icons.explore_outlined,
+        '/home/explore',
+      ),
+      kSidebarLocalMusic: const _SidebarDestination(
         '本地音乐',
         Icons.music_note_outlined,
         '/local-music',
       ),
-      if (_showArtistAndAlbumShortcuts) ...[
-        const _SidebarDestination(
-          '歌手',
-          Icons.person_outline_rounded,
-          '/artists',
-        ),
-        const _SidebarDestination('专辑', Icons.album_outlined, '/albums'),
-      ],
-      const _SidebarDestination(
+      kSidebarFavorites: const _SidebarDestination(
         '我的收藏',
         Icons.favorite_border_rounded,
         '/home/favorites',
       ),
-      const _SidebarDestination('最近播放', Icons.history_rounded, '/home/recent'),
-      const _SidebarDestination(
+      kSidebarRecent: const _SidebarDestination(
+        '最近播放',
+        Icons.history_rounded,
+        '/home/recent',
+      ),
+      kSidebarPlugins: const _SidebarDestination(
         '插件管理',
         Icons.extension_outlined,
         '/settings/plugins?from=sidebar',
       ),
-      const _SidebarDestination(
+      kSidebarAccount: const _SidebarDestination(
         '账号',
         Icons.account_circle_outlined,
         '/account?from=sidebar',
       ),
-    ];
+      kSidebarRecognize: const _SidebarDestination(
+        '听歌识曲',
+        Icons.mic_none_rounded,
+        '/home/recognize',
+      ),
+      kSidebarPlaylists: const _SidebarDestination(
+        '管理全部歌单',
+        Icons.queue_music_rounded,
+        '/home/playlists',
+      ),
+      kSidebarSettings: const _SidebarDestination(
+        '设置',
+        Icons.settings_outlined,
+        '/settings',
+      ),
+    };
+    final hiddenItems =
+        settings?.sidebarHiddenItems.toSet() ?? const <String>{};
+    final showSettings = !hiddenItems.contains(kSidebarSettings);
+    final primaryItems =
+        normalizeSidebarItemOrder(
+              settings?.sidebarItemOrder ?? kDefaultSidebarItemOrder,
+            )
+            .where((id) => id != kSidebarSettings && !hiddenItems.contains(id))
+            .map((id) => destinations[id])
+            .whereType<_SidebarDestination>()
+            .toList();
+    if (_showArtistAndAlbumShortcuts) {
+      primaryItems.addAll(const [
+        _SidebarDestination('歌手', Icons.person_outline_rounded, '/artists'),
+        _SidebarDestination('专辑', Icons.album_outlined, '/albums'),
+      ]);
+    }
 
     return Drawer(
       width: width,
@@ -373,44 +422,23 @@ class XyMobileSidebar extends ConsumerWidget {
                                 onNavigate('/home/playlists/${playlist.id}'),
                           ),
                     ],
-                    const SizedBox(height: 12),
-                    _SidebarTile(
-                      destination: const _SidebarDestination(
-                        '听歌识曲',
-                        Icons.mic_none_rounded,
-                        '/home/recognize',
-                      ),
-                      selected: currentPath == '/home/recognize',
-                      onTap: () => onNavigate('/home/recognize'),
-                    ),
-                    _SidebarTile(
-                      destination: const _SidebarDestination(
-                        '管理全部歌单',
-                        Icons.queue_music_rounded,
-                        '/home/playlists',
-                      ),
-                      selected: currentPath == '/home/playlists',
-                      onTap: () => onNavigate('/home/playlists'),
-                    ),
                   ],
                 ),
               ),
-              Divider(
-                height: 1,
-                color: dark ? XyColors.darkBorder : XyColors.lightBorder,
-              ),
-              Padding(
-                padding: const EdgeInsets.fromLTRB(12, 7, 12, 9),
-                child: _SidebarTile(
-                  destination: const _SidebarDestination(
-                    '设置',
-                    Icons.settings_outlined,
-                    '/settings',
-                  ),
-                  selected: currentPath == '/settings',
-                  onTap: () => onNavigate('/settings'),
+              if (showSettings) ...[
+                Divider(
+                  height: 1,
+                  color: dark ? XyColors.darkBorder : XyColors.lightBorder,
                 ),
-              ),
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(12, 7, 12, 9),
+                  child: _SidebarTile(
+                    destination: destinations[kSidebarSettings]!,
+                    selected: currentPath == '/settings',
+                    onTap: () => onNavigate('/settings'),
+                  ),
+                ),
+              ],
             ],
           ),
         ),

@@ -151,8 +151,10 @@ class DesktopLyricsBridge {
                 .toList();
             return _DesktopLyricLine(
               time: (line['time'] as num?)?.toDouble() ?? 0,
-              text: line['text']?.toString() ?? '',
-              translation: line['translation']?.toString() ?? '',
+              text: _cleanDesktopLyricText(line['text']?.toString() ?? ''),
+              translation: _cleanDesktopLyricText(
+                line['translation']?.toString() ?? '',
+              ),
               words: words,
             );
           })
@@ -169,7 +171,9 @@ class DesktopLyricsBridge {
     for (final line in source.split(RegExp(r'\r?\n'))) {
       final tags = tagPattern.allMatches(line).toList();
       if (tags.isEmpty) continue;
-      final text = line.replaceAll(tagPattern, '').trim();
+      final text = _cleanDesktopLyricText(
+        line.replaceAll(tagPattern, '').trim(),
+      );
       if (text.isEmpty) continue;
       for (final tag in tags) {
         final minute = int.tryParse(tag.group(1) ?? '') ?? 0;
@@ -191,7 +195,10 @@ class DesktopLyricsBridge {
     if (lines.isEmpty) {
       final first = source
           .split(RegExp(r'\r?\n'))
-          .map((line) => line.replaceAll(tagPattern, '').trim())
+          .map(
+            (line) =>
+                _cleanDesktopLyricText(line.replaceAll(tagPattern, '').trim()),
+          )
           .firstWhere((line) => line.isNotEmpty, orElse: () => '暂无歌词');
       return DesktopLyric(text: first);
     }
@@ -203,6 +210,20 @@ class DesktopLyricsBridge {
     }
     return DesktopLyric(text: current.text);
   }
+}
+
+/// 个别插件的逐字歌词会把内部 token（十六进制数字/大写字母串）误放
+/// 到展示文本中。桌面歌词不应把这种 token 直接画出来，发现时返回空值，
+/// 让解析器回退到原始 LRC 文本。
+String _cleanDesktopLyricText(String value) {
+  final text = value.replaceAll(RegExp(r'[\u0000-\u001F]'), '').trim();
+  if (text.length >= 8 &&
+      RegExp(r'^[A-Z0-9]+$').hasMatch(text) &&
+      RegExp(r'[A-Z]').hasMatch(text) &&
+      RegExp(r'\d').hasMatch(text)) {
+    return '';
+  }
+  return text;
 }
 
 class DesktopLyric {

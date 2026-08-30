@@ -166,7 +166,8 @@ final homeStatisticsProvider = FutureProvider<HomeStatisticsData>((ref) async {
       : const [];
   final first = top.whereType<Map>().firstOrNull;
   final mostPath = first?['song_path']?.toString() ?? '';
-  final mostPlayed = songs.where((song) => song.path == mostPath).firstOrNull ??
+  final mostPlayed =
+      songs.where((song) => song.path == mostPath).firstOrNull ??
       songFromRecentSnapshot(snapshots[mostPath]);
   return HomeStatisticsData(
     totalSongs: (library['total_songs'] as num?)?.toInt() ?? songs.length,
@@ -258,68 +259,109 @@ LeaderboardData decodeLeaderboardData(Map<String, dynamic> data) {
   );
 }
 
-final homeLeaderboardProvider = FutureProvider.autoDispose
-    .family<LeaderboardData, LeaderboardPeriod>((ref, period) async {
-      final auth = ref.watch(authProvider);
-      final stats = await ref.watch(homeStatisticsProvider.future);
-      final notifier = ref.read(authProvider.notifier);
-      final ciyuanxiId = auth.user?.ciyuanxiId?.trim() ?? '';
+// 页面切换或网络短暂抖动时保留上一次成功结果，避免排行榜因为一次超时
+// 直接进入错误态；下一次请求成功后会覆盖对应榜单的数据。
+final Map<LeaderboardPeriod, LeaderboardData> _leaderboardCache = {};
 
-      if (ciyuanxiId.isNotEmpty) {
-        try {
-          final report = await notifier.requestBackendAction(
-            'report_listen_stats',
-            buildListenStatsReportPayload(
-              ciyuanxiId: ciyuanxiId,
-              totalDuration: stats.listenDuration,
-              dailyDuration: stats.dailyListenDuration,
-              weeklyDuration: stats.weeklyListenDuration,
-            ),
-            fetchTimeoutMs: 8000,
-          );
-          final resetAt = report['reset_at']?.toString().trim() ?? '';
-          if (resetAt.isNotEmpty) {
-            const resetKey = 'listen_stats_last_reset_at';
-            final prefs = await SharedPreferences.getInstance();
-            final lastResetAt = prefs.getString(resetKey) ?? '';
-            if (lastResetAt.isEmpty || resetAt.compareTo(lastResetAt) > 0) {
-              await statsResetLocalStatistics(
-                dbPath: await ref.read(dbPathProvider.future),
-              );
-              await prefs.setString(resetKey, resetAt);
-              ref.invalidate(homeStatisticsProvider);
-              await notifier.requestBackendAction(
-                'report_listen_stats',
-                buildListenStatsReportPayload(
-                  ciyuanxiId: ciyuanxiId,
-                  totalDuration: 0,
-                  dailyDuration: 0,
-                  weeklyDuration: 0,
-                ),
-                fetchTimeoutMs: 8000,
-              );
+/// 启动首页时预加载全部榜单。调用方无需等待，结果会写入内存缓存，
+/// 后续切换榜单时直接复用；单个榜单失败不会影响其他榜单。
+void preloadHomeLeaderboards(WidgetRef ref) {
+  for (final period in LeaderboardPeriod.values) {
+    final future = ref.read(homeLeaderboardProvider(period).future);
+    unawaited(
+      future.catchError(
+        (_) => const LeaderboardData(leaderboard: [], totalUsers: 0),
+      ),
+    );
+  }
+}
+
+// 榜单由首页启动时后台预加载，并在内存中保留到下一次定时刷新；如果使用
+// autoDispose，预加载结束后 provider 会立即销毁，切换到周榜/总榜仍会重新
+// 请求，造成用户感知到的卡顿。
+final homeLeaderboardProvider =
+    FutureProvider.family<LeaderboardData, LeaderboardPeriod>((
+      ref,
+      period,
+    ) async {
+      final auth = ref.watch(authProvider);
+      final notifier = ref.read(authProvider.notifier);
+      final xymusicId = auth.user?.xymusicId?.trim() ?? '';
+
+      // 预加载会同时启动日/周/总榜三个 provider。统计上报只需要执行一次，
+      // 否则三份 provider 会并发读取本地统计库并重复请求服务端，启动时会
+      // 与首页首帧争抢 SQLite/网络资源，造成明显卡顿。
+      if (xymusicId.isNotEmpty && period == LeaderboardPeriod.daily) {
+        // 听歌统计上报完全作为旁路任务执行，不能阻塞榜单请求；网络较慢
+        // 或本地统计库繁忙时，用户仍可立即切换并查看日/周/总榜。
+        unawaited(() async {
+          try {
+            final stats = await ref
+                .read(homeStatisticsProvider.future)
+                .timeout(const Duration(seconds: 3));
+            final report = await notifier.requestBackendAction(
+              'report_listen_stats',
+              buildListenStatsReportPayload(
+                xymusicId: xymusicId,
+                totalDuration: stats.listenDuration,
+                dailyDuration: stats.dailyListenDuration,
+                weeklyDuration: stats.weeklyListenDuration,
+              ),
+              fetchTimeoutMs: 3000,
+            );
+            final resetAt = report['reset_at']?.toString().trim() ?? '';
+            if (resetAt.isNotEmpty) {
+              const resetKey = 'listen_stats_last_reset_at';
+              final prefs = await SharedPreferences.getInstance();
+              final lastResetAt = prefs.getString(resetKey) ?? '';
+              if (lastResetAt.isEmpty || resetAt.compareTo(lastResetAt) > 0) {
+                await statsResetLocalStatistics(
+                  dbPath: await ref.read(dbPathProvider.future),
+                );
+                await prefs.setString(resetKey, resetAt);
+                ref.invalidate(homeStatisticsProvider);
+                await notifier.requestBackendAction(
+                  'report_listen_stats',
+                  buildListenStatsReportPayload(
+                    xymusicId: xymusicId,
+                    totalDuration: 0,
+                    dailyDuration: 0,
+                    weeklyDuration: 0,
+                  ),
+                  fetchTimeoutMs: 3000,
+                );
+              }
             }
+          } catch (_) {
+            // 上报失败不影响公共排行榜读取。
           }
-        } catch (_) {
-          // 上报失败不影响公共排行榜读取。
-        }
+        }());
       }
 
-      final data = await notifier.requestBackendAction('get_leaderboard', {
-        if (ciyuanxiId.isNotEmpty) 'ciyuanxi_id': ciyuanxiId,
-        'limit': 15,
-        'period': period.apiName,
-      }, fetchTimeoutMs: 12000);
-      return decodeLeaderboardData(data);
+      try {
+        final data = await notifier.requestBackendAction('get_leaderboard', {
+          if (xymusicId.isNotEmpty) 'xymusic_id': xymusicId,
+          'limit': 15,
+          'period': period.apiName,
+        }, fetchTimeoutMs: 8000);
+        final decoded = decodeLeaderboardData(data);
+        _leaderboardCache[period] = decoded;
+        return decoded;
+      } catch (_) {
+        // 网络暂时不可用时展示缓存；没有缓存则展示空榜单，而不是让整个首页
+        // 进入“排行榜加载失败”错误态。用户仍可点击刷新再次请求。
+        return _leaderboardCache[period] ??
+            const LeaderboardData(leaderboard: [], totalUsers: 0);
+      }
     });
 
 Map<String, dynamic> buildListenStatsReportPayload({
-  required String ciyuanxiId,
+  required String xymusicId,
   required int totalDuration,
   required int dailyDuration,
   required int weeklyDuration,
 }) => {
-  'ciyuanxi_id': ciyuanxiId,
+  'xymusic_id': xymusicId,
   'duration': totalDuration.clamp(0, 0x7FFFFFFFFFFFFFFF),
   'daily_duration': dailyDuration.clamp(0, 0x7FFFFFFFFFFFFFFF),
   // 服务端周榜由每日记录汇总；保留该字段便于服务端日志和后续兼容。

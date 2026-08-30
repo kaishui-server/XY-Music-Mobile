@@ -15,14 +15,14 @@
 
 ## 关键坑：中文路径
 
-项目路径 `d:\Program Files\MC\开发端\开发组\XY Music\XianYu-Music-Mobile` 含空格：
+项目路径 `d:\Program Files\MC\开发端\开发组\XY Music\XY-Music-Mobile` 含空格：
 
 - **Debug 构建（JIT）** → 中文路径可用 ✓
 - **Release 构建（AOT）** → 会失败 ✗（`gen_snapshot` 无法读取含中文路径，见 flutter/flutter#149194），必须用 `scripts/build-release.ps1`
 
 ## 步骤 1：打开项目并装插件
 
-- IDEA（或 Android Studio）→ `Open` → 选根目录 `XianYu-Music-Mobile`（识别为 Flutter 项目）
+- IDEA（或 Android Studio）→ `Open` → 选根目录 `XY-Music-Mobile`（识别为 Flutter 项目）
 - `Settings → Plugins`：安装 **Flutter** 和 **Dart** 插件，重启
 
 ## 步骤 2：配置 SDK
@@ -59,7 +59,7 @@ flutter pub get
 
 IDEA 终端里也能直接调这个脚本。脚本逻辑：
 
-1. robocopy 源码到 `D:\build\XianYuMusicSrc`（ASCII 路径）
+1. robocopy 源码到 `D:\build\XYMusicSrc`（ASCII 路径）
 2. 在该目录执行 `flutter build apk --release --split-per-abi`
 3. 将 arm64 单架构 APK 复制到 `releases/`
 

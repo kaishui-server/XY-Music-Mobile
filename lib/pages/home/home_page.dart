@@ -7,16 +7,26 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:video_player/video_player.dart';
 
 import '../../src/auth/auth_provider.dart';
+import '../../src/favorites/favorites_provider.dart';
 import '../../src/home/home_providers.dart';
+import '../../src/explore/recommendation_provider.dart';
 import '../../src/navigation/sidebar_controller.dart';
 import '../../src/player/player_provider.dart';
 import '../../src/player/video_playback_session.dart';
+import '../../src/recent/recent_provider.dart';
 import '../../src/playlists/playlists_provider.dart';
 import '../../src/sync/account_cloud_sync.dart';
+import '../../src/core/settings.dart';
 import '../../src/ui/xy_surface.dart';
 import '../../src/ui/xy_theme.dart';
 import '../../src/update/app_update.dart';
 import '../../src/widgets/user_avatar_image.dart';
+
+Color _homeGlassPanelColor(BuildContext context) {
+  final theme = Theme.of(context);
+  final dark = theme.brightness == Brightness.dark;
+  return theme.colorScheme.surface.withValues(alpha: dark ? .34 : .48);
+}
 
 /// 按电脑端首页顺序组织四个模块，并针对窄屏改为单列纵向布局。
 class HomePage extends ConsumerStatefulWidget {
@@ -27,10 +37,47 @@ class HomePage extends ConsumerStatefulWidget {
 }
 
 class _HomePageState extends ConsumerState<HomePage> {
+  Timer? _leaderboardRefreshTimer;
+  Timer? _listPageWarmupTimer;
+
   @override
   void initState() {
     super.initState();
-    WidgetsBinding.instance.addPostFrameCallback((_) => _bootstrapBackend());
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      // 首页首帧后立即后台预加载日/周/总榜，避免用户切换到排行榜时才开始请求。
+      preloadHomeLeaderboards(ref);
+      // 探索页的推荐和热门榜单也在首页首帧后预热，进入探索页时直接复用
+      // Riverpod 缓存，避免重新等待插件初始化和网络请求。
+      preloadExploreData(ref);
+      // 收藏和最近播放稍后再读取，避免和首页首帧的排行榜/推荐预热争用
+      // CPU；用户进入列表页前通常已经完成，页面转场不会再承担查询开销。
+      _listPageWarmupTimer = Timer(const Duration(milliseconds: 650), () {
+        if (!mounted) return;
+        preloadFavoriteSongs(ref);
+        preloadRecentSongs(ref);
+      });
+      _leaderboardRefreshTimer = Timer.periodic(
+        const Duration(minutes: 5),
+        (_) => _refreshLeaderboards(),
+      );
+      _bootstrapBackend();
+    });
+  }
+
+  @override
+  void dispose() {
+    _leaderboardRefreshTimer?.cancel();
+    _listPageWarmupTimer?.cancel();
+    super.dispose();
+  }
+
+  void _refreshLeaderboards() {
+    if (!mounted) return;
+    for (final period in LeaderboardPeriod.values) {
+      ref.invalidate(homeLeaderboardProvider(period));
+    }
+    preloadHomeLeaderboards(ref);
   }
 
   Future<void> _bootstrapBackend() async {
@@ -40,6 +87,7 @@ class _HomePageState extends ConsumerState<HomePage> {
       backend,
       ref.read(playlistsProvider.notifier),
       container,
+      favorites: ref.read(favoritesProvider.notifier),
     );
     try {
       await backend.reportAppOpen();
@@ -186,14 +234,16 @@ class _HomePageState extends ConsumerState<HomePage> {
                     await Future.wait([
                       ref.read(hotCommentProvider.future),
                       ref.read(homeStatisticsProvider.future),
+                      ...LeaderboardPeriod.values.map(
+                        (period) =>
+                            ref.read(homeLeaderboardProvider(period).future),
+                      ),
                     ]);
                   },
                   child: ListView(
                     physics: const AlwaysScrollableScrollPhysics(),
                     padding: const EdgeInsets.fromLTRB(16, 14, 16, 100),
                     children: const [
-                      _HomeSearchBar(),
-                      SizedBox(height: 22),
                       _NowPlayingModule(),
                       Padding(
                         padding: EdgeInsets.symmetric(vertical: 18),
@@ -223,90 +273,44 @@ class _HomeHeader extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Row(
-      children: [
-        const AppSidebarMenuButton(),
-        const SizedBox(width: 4),
-        const Expanded(
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text(
-                'XY Music',
-                style: TextStyle(fontSize: 18, fontWeight: FontWeight.w800),
+    return Consumer(
+      builder: (context, ref, child) {
+        final right =
+            ref.watch(
+              settingsProvider.select(
+                (value) =>
+                    value.valueOrNull?.sidebarPosition == SidebarPosition.right,
               ),
-              SizedBox(height: 1),
-              Text(
-                'XY MUSIC',
-                style: TextStyle(
-                  fontSize: 9,
-                  fontWeight: FontWeight.w700,
-                  letterSpacing: 2.2,
-                  color: Color(0xFF999999),
-                ),
-              ),
-            ],
-          ),
-        ),
-      ],
-    );
-  }
-}
-
-class _HomeSearchBar extends StatelessWidget {
-  const _HomeSearchBar();
-
-  @override
-  Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-    final dark = theme.brightness == Brightness.dark;
-    return Semantics(
-      button: true,
-      label: '搜索网络音乐',
-      child: Material(
-        color: theme.colorScheme.surfaceContainerHigh.withValues(alpha: 0.82),
-        shape: RoundedRectangleBorder(
-          borderRadius: BorderRadius.circular(XyRadii.large),
-          side: BorderSide(
-            color: dark ? XyColors.darkBorder : XyColors.lightBorder,
-          ),
-        ),
-        clipBehavior: Clip.antiAlias,
-        child: InkWell(
-          onTap: () => context.push('/search'),
-          child: SizedBox(
-            height: 48,
-            child: Row(
-              children: [
-                const SizedBox(width: 16),
-                Icon(
-                  Icons.search_rounded,
-                  size: 21,
-                  color: theme.colorScheme.onSurfaceVariant,
-                ),
-                const SizedBox(width: 11),
-                Expanded(
-                  child: Text(
-                    '搜索网络歌曲、歌手、专辑',
-                    style: TextStyle(
-                      fontSize: 14,
-                      color: theme.colorScheme.onSurfaceVariant,
-                    ),
-                  ),
-                ),
-                Icon(
-                  Icons.arrow_forward_ios_rounded,
-                  size: 13,
-                  color: theme.colorScheme.onSurfaceVariant.withValues(
-                    alpha: 0.65,
-                  ),
-                ),
-                const SizedBox(width: 17),
-              ],
+            ) ==
+            true;
+        final logo = const Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              'XY Music',
+              style: TextStyle(fontSize: 18, fontWeight: FontWeight.w800),
             ),
-          ),
-        ),
-      ),
+            SizedBox(height: 1),
+            Text(
+              'XY MUSIC',
+              style: TextStyle(
+                fontSize: 9,
+                fontWeight: FontWeight.w700,
+                letterSpacing: 2.2,
+                color: Color(0xFF999999),
+              ),
+            ),
+          ],
+        );
+        return Row(
+          mainAxisAlignment: right
+              ? MainAxisAlignment.end
+              : MainAxisAlignment.start,
+          children: right
+              ? [logo, const SizedBox(width: 4), const AppSidebarMenuButton()]
+              : [const AppSidebarMenuButton(), const SizedBox(width: 4), logo],
+        );
+      },
     );
   }
 }
@@ -341,7 +345,18 @@ class _NowPlayingModule extends ConsumerWidget {
     VideoPlayerController? video,
     VideoPlayerValue? videoValue,
   }) {
-    final player = ref.watch(playerProvider);
+    // 只订阅当前歌曲和进度字段，避免队列元数据/错误状态变化时重建首页大模块。
+    final player = ref.watch(
+      playerProvider.select(
+        (state) => (
+          current: state.current,
+          isPlaying: state.isPlaying,
+          position: state.position,
+          duration: state.duration,
+          isLoading: state.isLoading,
+        ),
+      ),
+    );
     final song = player.current;
     final theme = Theme.of(context);
     final position = videoValue == null
@@ -773,8 +788,16 @@ class _ListeningStatisticsModule extends ConsumerWidget {
         ),
         const SizedBox(height: 10),
         statistics.when(
-          loading: () => const XyPanel(child: _ModuleLoading(height: 190)),
+          loading: () => XyPanel(
+            color: _homeGlassPanelColor(context),
+            // 低端手机上大半径 BackdropFilter 会在滚动时反复重采样整块背景。
+            // 10px 仍保留玻璃质感，但显著降低合成开销。
+            blurSigma: 10,
+            child: const _ModuleLoading(height: 190),
+          ),
           error: (_, _) => XyPanel(
+            color: _homeGlassPanelColor(context),
+            blurSigma: 10,
             child: _InlineError(
               message: '听歌统计加载失败',
               onRetry: () => ref.invalidate(homeStatisticsProvider),
@@ -796,6 +819,8 @@ class _StatisticsPanel extends StatelessWidget {
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     return XyPanel(
+      color: _homeGlassPanelColor(context),
+      blurSigma: 10,
       padding: const EdgeInsets.fromLTRB(18, 18, 18, 16),
       radius: XyRadii.extraLarge,
       child: Column(
@@ -994,19 +1019,21 @@ class _LeaderboardModuleState extends ConsumerState<_LeaderboardModule> {
           title: '听歌排行榜',
           subtitle: '${_period.label} · 云端排行',
           action: '刷新',
-          onAction: ranking.isLoading
-              ? null
-              : () => ref.invalidate(homeLeaderboardProvider(_period)),
+          onAction: () => ref.invalidate(homeLeaderboardProvider(_period)),
         ),
         const SizedBox(height: 10),
         XyPanel(
+          color: _homeGlassPanelColor(context),
+          blurSigma: 10,
           padding: const EdgeInsets.fromLTRB(10, 10, 10, 12),
           radius: XyRadii.extraLarge,
           child: Column(
             children: [
               _PeriodTabs(
                 selected: _period,
-                enabled: !ranking.isLoading,
+                // 请求进行中也允许切换榜单；每个周期使用独立的 provider，
+                // 不应被当前周期的加载状态锁死。
+                enabled: true,
                 onChanged: (period) => setState(() => _period = period),
               ),
               const SizedBox(height: 10),
@@ -1052,7 +1079,7 @@ class _PeriodTabs extends StatelessWidget {
     return Container(
       padding: const EdgeInsets.all(4),
       decoration: BoxDecoration(
-        color: theme.colorScheme.surfaceContainerHigh,
+        color: theme.colorScheme.surfaceContainerHigh.withValues(alpha: .42),
         borderRadius: BorderRadius.circular(13),
       ),
       child: Row(

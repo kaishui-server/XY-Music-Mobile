@@ -1,5 +1,5 @@
 [package]
-name = "xianyu_core"
+name = "xymusic_core"
 version = "0.1.0"
 description = "XY Music 移动端复用核心（从桌面端抽取的纯逻辑，不依赖 Tauri）"
 authors = ["lyc"]
@@ -7,7 +7,7 @@ license = "AGPL-3.0-only"
 edition = "2021"
 
 [lib]
-name = "xianyu_core"
+name = "xymusic_core"
 crate-type = ["rlib", "staticlib", "cdylib"]
 
 [dependencies]
@@ -38,7 +38,7 @@ rayon = "1.10"
 walkdir = "2"
 symphonia = { version = "0.5.5", default-features = false, features = ["aac", "adpcm", "aiff", "alac", "flac", "isomp4", "mp3", "ogg", "pcm", "vorbis", "wav"] }
 uuid = { version = "1", features = ["v4"] }
-image = { version = "0.25", features = ["jpeg", "png", "webp"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 
 [target.'cfg(target_os = "android")'.dependencies]
 libc = "0.2"
@@ -49,3 +49,10 @@ opt-level = 1
 
 [profile.dev.package."*"]
 opt-level = 3
+
+[profile.release]
+# 保持音频/DSP 热路径的优化级别，同时通过跨 crate 优化和符号裁剪缩小 Android 动态库。
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

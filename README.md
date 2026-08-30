@@ -1,6 +1,6 @@
 # XY-Music · 移动端
 
-XY-Music 的移动端，基于 **Flutter + Rust** 跨平台架构。Rust 核心（`xianyu_core`）从桌面端抽取为纯逻辑库（不依赖 Tauri），通过 [flutter_rust_bridge](https://github.com/fzyzcjy/flutter_rust_bridge) 暴露给 Flutter 调用，实现音频解码、DSP 处理、音乐库管理、USB 独占播放等能力跨平台复用。
+XY-Music 的移动端，基于 **Flutter + Rust** 跨平台架构。Rust 核心（`xymusic_core`）从桌面端抽取为纯逻辑库（不依赖 Tauri），通过 [flutter_rust_bridge](https://github.com/fzyzcjy/flutter_rust_bridge) 暴露给 Flutter 调用，实现音频解码、DSP 处理、音乐库管理、USB 独占播放等能力跨平台复用。
 
 > 仓库：`github.com/kaishui-server/XY-Music-Mobile`  
 > 版本：`1.0.0+1` · Rust 核心 `0.1.0` · 许可证 `AGPL-3.0-only`
@@ -56,7 +56,7 @@ XY-Music-Mobile/
 │       ├── player/               # 播放状态
 │       ├── rust/                 # flutter_rust_bridge 生成的 Dart 绑定（frb_generated.*）
 │       └── widgets/              # 迷你播放条、歌曲列表等通用组件
-├── rust/                         # Rust 核心（crate: xianyu_core）
+├── rust/                         # Rust 核心（crate: xymusic_core）
 │   └── src/
 │       ├── api/                  # 暴露给 Flutter 的 API（FRB 入口）
 │       ├── database/             # SQLite：迁移 / schema / 状态 / 重置
@@ -81,7 +81,7 @@ XY-Music-Mobile/
 ├──────────────────────────────────────┤
 │  flutter_rust_bridge（自动生成绑定） │
 ├──────────────────────────────────────┤
-│  Rust 核心 xianyu_core               │  纯逻辑，无 Tauri 依赖
+│  Rust 核心 xymusic_core               │  纯逻辑，无 Tauri 依赖
 │  ┌────────┬──────────┬─────────────┐ │
 │  │ 解码   │ DSP 音效 │ USB 独占播放│ │
 │  │ 扫描   │ 歌词/QMC │ WebDAV/DB   │ │

@@ -2,6 +2,7 @@ import 'package:flutter/widgets.dart';
 import 'package:go_router/go_router.dart';
 
 import '../../pages/home/home_page.dart';
+import '../../pages/explore/explore_page.dart';
 import '../../pages/library/library_page.dart';
 import '../../pages/effects/effects_page.dart';
 import '../../pages/search/search_page.dart';
@@ -84,6 +85,8 @@ final appRouter = GoRouter(
                         state,
                         PlaylistDetailPage(
                           playlistId: state.pathParameters['id']!,
+                          autoFocusSearch:
+                              state.uri.queryParameters['search'] == '1',
                         ),
                       ),
                     ),
@@ -93,6 +96,20 @@ final appRouter = GoRouter(
                   path: 'recognize',
                   pageBuilder: (context, state) =>
                       _instantPage(state, const RecognizePage()),
+                ),
+                GoRoute(
+                  path: 'explore',
+                  pageBuilder: (context, state) =>
+                      _instantPage(state, const ExplorePage()),
+                  routes: [
+                    GoRoute(
+                      path: 'recommendations',
+                      pageBuilder: (context, state) => _instantPage(
+                        state,
+                        const ExploreRecommendationsPage(),
+                      ),
+                    ),
+                  ],
                 ),
               ],
             ),
@@ -156,6 +173,13 @@ final appRouter = GoRouter(
                   pageBuilder: (context, state) => _instantPage(
                     state,
                     const SettingsPage(section: SettingsSection.appearance),
+                  ),
+                ),
+                GoRoute(
+                  path: 'layout',
+                  pageBuilder: (context, state) => _instantPage(
+                    state,
+                    const SettingsPage(section: SettingsSection.layout),
                   ),
                 ),
                 GoRoute(

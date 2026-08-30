@@ -57,10 +57,10 @@ if exist "%~dp0logs" (
 )
 echo.
 
-:: [6/6] Clean external ASCII build dir (build-release.ps1 cache D:\build\XianYuMusicSrc)
-if exist "D:\build\XianYuMusicSrc" (
-    echo [6/6] Cleaning external build dir [D:\build\XianYuMusicSrc]...
-    rmdir /s /q "D:\build\XianYuMusicSrc"
+:: [6/6] Clean external ASCII build dir (build-release.ps1 cache D:\build\XYMusicSrc)
+if exist "D:\build\XYMusicSrc" (
+    echo [6/6] Cleaning external build dir [D:\build\XYMusicSrc]...
+    rmdir /s /q "D:\build\XYMusicSrc"
 ) else (
     echo [6/6] No external build dir, skip
 )

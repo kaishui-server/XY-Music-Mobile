@@ -272,6 +272,14 @@ class NetworkPlaylistImportService {
       final title = _cleanText(item['name']?.toString() ?? '');
       final artist = _cleanText(item['artist']?.toString() ?? '');
       final album = _cleanText(item['album']?.toString() ?? '');
+      // 歌曲封面：pic 可能是完整 URL 也可能是短路径，统一走酷我归一化；
+      // web_albumpic_short 一定是短路径（/120/xxx.jpg）。
+      final songCover = _kuwoCoverUrl(
+        item['pic']?.toString() ??
+            item['web_albumpic_short']?.toString() ??
+            item['albumpic_short']?.toString() ??
+            '',
+      );
       songs.add(
         _lxSong(
           source: 'kw',
@@ -280,7 +288,7 @@ class NetworkPlaylistImportService {
           artist: artist,
           album: album,
           durationMs: _number(item['duration']) * 1000,
-          coverUrl: _httpsUrl(item['pic']?.toString() ?? ''),
+          coverUrl: songCover,
           raw: {
             'songmid': songId,
             'source': 'kw',
@@ -288,6 +296,8 @@ class NetworkPlaylistImportService {
             'singer': artist,
             'albumName': album,
             'albumId': item['albumid'],
+            'web_albumpic_short': item['web_albumpic_short'] ??
+                item['albumpic_short'],
           },
         ),
       );
@@ -295,18 +305,74 @@ class NetworkPlaylistImportService {
     if (songs.isEmpty) throw Exception('酷我歌单为空，或歌单不是公开歌单');
     return NetworkPlaylistImportResult(
       name: _cleanText(body['title']?.toString() ?? '酷我歌单'),
-      coverUrl: _httpsUrl(body['pic']?.toString() ?? ''),
+      coverUrl: _kuwoCoverUrl(body['pic']?.toString() ?? ''),
       songs: songs,
     );
   }
 
   Future<NetworkPlaylistImportResult> _importKugou(String input) async {
-    final id = _extractId(input, const [
+    // 酷狗码：App/PC 分享出的数字码（如“酷狗码：8291145”，24 小时有效），
+    // 通过 t.kugou.com 分享码服务解析。
+    final kugouCode = RegExp(
+      r'酷狗码[：:\s]*(\d{4,10})',
+    ).firstMatch(input)?.group(1);
+    if (kugouCode != null) {
+      final id = await _resolveKugouShareCode(kugouCode);
+      if (id == null) {
+        throw Exception('酷狗码无效或已过期（酷狗码 24 小时内有效）');
+      }
+      return _fetchKugouSpecial(id);
+    }
+
+    // t.kugou.com / t1.kugou.com 短链
+    final shortUrl = RegExp(
+      r'https?://t\d?\.kugou\.com/[0-9a-zA-Z_-]+',
+      caseSensitive: false,
+    ).firstMatch(input)?.group(0);
+    if (shortUrl != null) {
+      final id = await _resolveKugouShareCode(shortUrl);
+      if (id == null) {
+        throw Exception('无法从酷狗短链解析歌单 ID');
+      }
+      return _fetchKugouSpecial(id);
+    }
+
+    var id = _extractId(input, const [
       r'/special/(?:single/)?(\d+)',
       r'/(\d+)\.html',
-      r'^(\d+)$',
     ]);
+    // App 分享的移动端链接形如 m.kugou.com/songlist/gcid_xxx，
+    // 页面内嵌的 window.$output JSON 携带数字 specialid，取到后走通用导入。
+    if (id == null) {
+      final gcid = RegExp(
+        r'gcid_([0-9a-zA-Z]+)',
+        caseSensitive: false,
+      ).firstMatch(input)?.group(1);
+      if (gcid != null) {
+        id = await _resolveKugouGcidSpecialId(gcid);
+        if (id == null) {
+          throw Exception('无法从酷狗分享链接解析歌单 ID');
+        }
+      }
+    }
+    final pureNumber = RegExp(r'^\d{4,10}$').hasMatch(input);
+    if (id == null && pureNumber) id = input;
     if (id == null) throw Exception('无法识别酷狗歌单 ID');
+    try {
+      return await _fetchKugouSpecial(id);
+    } catch (e) {
+      // 纯数字输入也可能是酷狗码而非歌单 ID，按歌单 ID 获取失败时按码重试
+      if (pureNumber) {
+        final codeId = await _resolveKugouShareCode(input);
+        if (codeId != null && codeId != id) {
+          return _fetchKugouSpecial(codeId);
+        }
+      }
+      rethrow;
+    }
+  }
+
+  Future<NetworkPlaylistImportResult> _fetchKugouSpecial(String id) async {
     final response = await _client
         .get(
           Uri.parse(
@@ -324,6 +390,21 @@ class NetworkPlaylistImportService {
       dotAll: true,
     ).firstMatch(text);
     if (match == null) throw Exception('酷狗歌单为空，或歌单不是公开歌单');
+    // 页面内嵌 var global = {...} 携带歌单名称与封面
+    final name = _cleanText(
+      RegExp(
+        r'name:\s*"([^"]*)"[^"\n]*//\s*精选集名字',
+      ).firstMatch(text)?.group(1) ??
+          '',
+    );
+    var coverUrl = RegExp(
+      r'pic:\s*"(http[^"]*)"[^"\n]*//\s*歌单图片',
+    ).firstMatch(text)?.group(1) ??
+        '';
+    // 240 为缩略图，替换为 480 高清尺寸
+    if (coverUrl.contains('/240/')) {
+      coverUrl = coverUrl.replaceFirst('/240/', '/480/');
+    }
     final decoded = jsonDecode(match.group(1)!);
     final songs = <Song>[];
     if (decoded is List) {
@@ -336,6 +417,14 @@ class NetworkPlaylistImportService {
         final title = _cleanText(item['songname']?.toString() ?? '');
         final artist = _cleanText(item['singername']?.toString() ?? '');
         final album = _cleanText(item['album_name']?.toString() ?? '');
+        // 封面位于 trans_param.union_cover，{size} 占位符替换为 480
+        final transParam = item['trans_param'];
+        final rawCover = transParam is Map
+            ? transParam['union_cover']?.toString() ?? ''
+            : '';
+        final songCover = rawCover.contains('{size}')
+            ? rawCover.replaceFirst('{size}', '480')
+            : rawCover;
         songs.add(
           _lxSong(
             source: 'kg',
@@ -344,7 +433,7 @@ class NetworkPlaylistImportService {
             artist: artist,
             album: album,
             durationMs: _number(item['duration']),
-            coverUrl: '',
+            coverUrl: songCover,
             raw: {
               'songmid': songId,
               'source': 'kg',
@@ -360,10 +449,142 @@ class NetworkPlaylistImportService {
     }
     if (songs.isEmpty) throw Exception('酷狗歌单为空，或歌单不是公开歌单');
     return NetworkPlaylistImportResult(
-      name: '酷狗歌单 $id',
-      coverUrl: '',
+      name: name.isNotEmpty ? name : '酷狗歌单 $id',
+      coverUrl: coverUrl,
       songs: songs,
     );
+  }
+
+  /// 解析酷狗码 / t.kugou.com 短链对应的数字歌单 ID（specialid）。
+  ///
+  /// 酷狗码通过 POST http://t.kugou.com/command/ 解析（参考 MusicFree 酷狗插件），
+  /// 返回 data.info.id 即歌单 specialid；短链则通过 GET 后的重定向/返回内容解析。
+  Future<String?> _resolveKugouShareCode(String code) async {
+    try {
+      if (!code.startsWith('http')) {
+        // 纯数字/字母数字酷狗码：走 command 接口
+        final response = await _client
+            .post(
+              Uri.parse('http://t.kugou.com/command/'),
+              headers: const {
+                'User-Agent': _userAgent,
+                'Content-Type': 'application/json',
+              },
+              body: jsonEncode({
+                'appid': 1001,
+                'clientver': 9020,
+                'mid': '21511157a05844bd085308bc76ef3343',
+                'clienttime': 640612895,
+                'key': '36164c4015e704673c588ee202b9ecb8',
+                'data': code,
+              }),
+            )
+            .timeout(const Duration(seconds: 15));
+        if (response.statusCode < 200 || response.statusCode >= 300) {
+          return null;
+        }
+        final decoded = jsonDecode(response.body);
+        if (decoded is! Map || decoded['status'] != 1) return null;
+        final data = decoded['data'];
+        final info = data is Map ? data['info'] : null;
+        final id = info is Map ? info['id']?.toString() : null;
+        if (id != null && RegExp(r'^[1-9]\d*$').hasMatch(id)) return id;
+        // 兜底：在返回内容中递归查找歌单引用
+        final ref = _findKugouPlaylistRef(decoded);
+        if (ref != null) return await _kugouIdFromRef(ref);
+        return null;
+      }
+      // t.kugou.com / t1.kugou.com 短链：GET 解析
+      final response = await _client
+          .get(
+            Uri.parse(code),
+            headers: const {'User-Agent': _userAgent},
+          )
+          .timeout(const Duration(seconds: 15));
+      if (response.statusCode < 200 || response.statusCode >= 300) return null;
+      final text = response.body.trim();
+      dynamic decoded;
+      if (text.startsWith('{') || text.startsWith('[')) {
+        decoded = jsonDecode(text);
+      }
+      final ref =
+          _findKugouPlaylistRef(decoded) ??
+          // 若发生了重定向，最终地址本身可能就是歌单链接
+          _findKugouPlaylistRef(response.request?.url.toString());
+      if (ref == null) return null;
+      return await _kugouIdFromRef(ref);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// 在分享码解析结果中递归查找歌单引用（specialid 或歌单链接）。
+  static String? _findKugouPlaylistRef(dynamic node) {
+    if (node is Map) {
+      for (final entry in node.entries) {
+        final key = entry.key.toString().toLowerCase();
+        final value = entry.value;
+        if (value == null) continue;
+        if (key == 'specialid' &&
+            RegExp(r'^[1-9]\d*$').hasMatch(value.toString())) {
+          return value.toString();
+        }
+        if ((key == 'url' || key == 'link' || key == 'share_url') &&
+            value.toString().contains('kugou.com')) {
+          return value.toString();
+        }
+        final nested = _findKugouPlaylistRef(value);
+        if (nested != null) return nested;
+      }
+    } else if (node is List) {
+      for (final value in node) {
+        final nested = _findKugouPlaylistRef(value);
+        if (nested != null) return nested;
+      }
+    } else if (node is String && node.contains('kugou.com')) {
+      return node;
+    }
+    return null;
+  }
+
+  /// 从歌单引用（ID / 链接 / gcid）解析出数字 specialid。
+  Future<String?> _kugouIdFromRef(String ref) async {
+    final gcid = RegExp(
+      r'gcid_([0-9a-zA-Z]+)',
+      caseSensitive: false,
+    ).firstMatch(ref)?.group(1);
+    if (gcid != null) return _resolveKugouGcidSpecialId(gcid);
+    return _extractId(ref, const [
+      r'/special/(?:single/)?(\d+)',
+      r'/(\d+)\.html',
+      r'^(\d+)$',
+    ]);
+  }
+
+  Future<String?> _resolveKugouGcidSpecialId(String gcid) async {
+    try {
+      final response = await _client
+          .get(
+            Uri.parse('https://m.kugou.com/songlist/gcid_$gcid/'),
+            headers: const {'User-Agent': _userAgent},
+          )
+          .timeout(const Duration(seconds: 25));
+      if (response.statusCode < 200 || response.statusCode >= 300) return null;
+      final html = utf8.decode(response.bodyBytes, allowMalformed: true);
+      final match = RegExp(
+        r'window\.\$output\s*=\s*(\{.*?\})\s*[;<]',
+        dotAll: true,
+      ).firstMatch(html);
+      if (match == null) return null;
+      final decoded = jsonDecode(match.group(1)!);
+      final info = decoded is Map ? decoded['info'] : null;
+      final listinfo = info is Map ? info['listinfo'] : null;
+      final specialId = listinfo is Map ? listinfo['specialid'] : null;
+      final value = specialId?.toString().trim() ?? '';
+      return RegExp(r'^\d+$').hasMatch(value) ? value : null;
+    } catch (_) {
+      return null;
+    }
   }
 
   Future<Map<String, dynamic>> _getJson(
@@ -460,6 +681,27 @@ class NetworkPlaylistImportService {
     if (url.startsWith('//')) return 'https:$url';
     if (url.startsWith('http://')) return 'https://${url.substring(7)}';
     return url.startsWith('https://') ? url : '';
+  }
+
+  /// 归一化酷我封面地址。
+  ///
+  /// 酷我接口（pl.svc 歌单详情 / 歌曲条目）返回的封面多为**短路径**
+  /// （如 `/120/albumcover/xxx.jpg` 或 `120/xxx.jpg`），不是完整 URL，
+  /// 需拼上 `https://img3.kuwo.cn/star/albumcover/` 前缀并把开头的
+  /// 尺寸段替换为高清尺寸（与 rust 侧 build_kuwo_cover_url 规则一致）。
+  /// 完整 http(s) URL 则直接升级为 https 返回。
+  static String _kuwoCoverUrl(String value, {int size = 480}) {
+    final url = value.trim();
+    if (url.isEmpty) return '';
+    if (url.startsWith('//') ||
+        url.startsWith('http://') ||
+        url.startsWith('https://')) {
+      return _httpsUrl(url);
+    }
+    // 短路径：去掉开头的 /，把尺寸段（如 120/）替换为目标尺寸
+    var short = url.startsWith('/') ? url.substring(1) : url;
+    short = short.replaceFirst(RegExp(r'^\d+/'), '$size/');
+    return 'https://img3.kuwo.cn/star/albumcover/$short';
   }
 
   void dispose() {

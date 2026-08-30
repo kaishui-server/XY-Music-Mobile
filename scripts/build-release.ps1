@@ -1,4 +1,4 @@
-﻿#requires -version 5.1
+#requires -version 5.1
 param(
     [switch]$SkipBuild,
     [string]$SourceRoot = ""
@@ -11,7 +11,7 @@ param(
   移动端 release 构建必须在纯 ASCII 路径下进行（Flutter 的 Dart AOT 快照生成器
   gen_snapshot 无法读取含中文/非 ASCII 字符的路径，见 flutter/flutter#149194）。
   因此本脚本：
-    1. 用 robocopy 将源码增量同步到 ASCII 构建目录（D:\build\XianYuMusicSrc）
+    1. 用 robocopy 将源码增量同步到 ASCII 构建目录（D:\build\XYMusicSrc）
     2. 在该目录执行 `flutter build apk --release --split-per-abi`
        （按 ABI 拆包，交付 arm64 单架构包，避免通用包把所有 ABI 引擎都打进 42MB）
     3. 将 arm64 分架构的 APK 复制到项目根目录 releases/，命名格式：XY Music_<version>_arm64.apk
@@ -27,12 +27,12 @@ $ErrorActionPreference = "Stop"
 
 # ---------- 路径与常量 ----------
 if ([string]::IsNullOrWhiteSpace($SourceRoot)) {
-    $SourceRoot = Split-Path -Parent $PSScriptRoot   # XianYu-Music-Mobile
+    $SourceRoot = Split-Path -Parent $PSScriptRoot   # XY-Music-Mobile
 }
 # 项目源码根目录（可能含中文）实际路径
 $realSource = (Resolve-Path $SourceRoot).Path
 # ASCII 构建目录（junction 会被 Flutter 解析回真实路径，故用真实复制目录）
-$buildRoot   = "D:\build\XianYuMusicSrc"
+$buildRoot   = "D:\build\XYMusicSrc"
 $releasesDir = Join-Path $realSource "releases"
 # 排除的缓存/平台目录（不必同步到 ASCII 构建目录）
 $excludeDirs = @(
@@ -63,11 +63,18 @@ if (-not $SkipBuild) {
     robocopy $realSource $buildRoot /E @excludeArgs /NFL /NDL /NJH /NP /R:1 /W:1 | Out-Null
     if ($LASTEXITCODE -ge 8) { throw "[build-release] robocopy 同步失败 (exit=$LASTEXITCODE)" }
 
+    # 增量复制不会移除源码中已经删除的原生库；单独镜像 jniLibs，避免旧 .so
+    # 长期残留在 ASCII 构建目录并被重新打入 APK。
+    $sourceJniLibs = Join-Path $realSource "android\app\src\main\jniLibs"
+    $buildJniLibs = Join-Path $buildRoot "android\app\src\main\jniLibs"
+    robocopy $sourceJniLibs $buildJniLibs /MIR /NFL /NDL /NJH /NP /R:1 /W:1 | Out-Null
+    if ($LASTEXITCODE -ge 8) { throw "[build-release] jniLibs 同步失败 (exit=$LASTEXITCODE)" }
+
     # ---------- 2. 构建 release ----------
     Write-Host "[build-release] 执行 flutter build apk --release --split-per-abi ..." -ForegroundColor Cyan
     Push-Location $buildRoot
     try {
-        & "C:\flutter\sdk_tmp\flutter\bin\flutter.bat" build apk --release --split-per-abi
+        & "D:\flutter\bin\flutter.bat" build apk --release --split-per-abi
         if ($LASTEXITCODE -ne 0) { throw "[build-release] flutter build 失败 (exit=$LASTEXITCODE)" }
     } finally {
         Pop-Location

@@ -1,6 +1,6 @@
 //! 音效处理模块（sound_effect）。
 //!
-//! 从桌面端 `XianYu-Music-Desktop` 抽取的可复用音效 DSP 核心。
+//! 从桌面端 `XY-Music-Desktop` 抽取的可复用音效 DSP 核心。
 //! 不含 rodio / Tauri 依赖，可被 Flutter（flutter_rust_bridge）宿主跨平台复用。
 //!
 //! 处理链顺序（每帧 L/R 同时处理）：

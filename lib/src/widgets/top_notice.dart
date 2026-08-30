@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart';
 
@@ -18,6 +19,8 @@ class XyNotice {
     Duration duration = const Duration(milliseconds: 2600),
     String? actionLabel,
     VoidCallback? onAction,
+    bool compact = false,
+    bool blur = false,
   }) {
     final overlay = Overlay.maybeOf(context, rootOverlay: true);
     if (overlay == null || message.trim().isEmpty) return;
@@ -37,6 +40,8 @@ class XyNotice {
         duration: duration,
         actionLabel: actionLabel,
         onAction: onAction,
+        compact: compact,
+        blur: blur,
         onDismissed: () {
           if (entry.mounted) entry.remove();
           if (identical(_current, handle)) _current = null;
@@ -76,6 +81,8 @@ class _TopNoticeOverlay extends StatefulWidget {
     required this.onDismissed,
     this.actionLabel,
     this.onAction,
+    this.compact = false,
+    this.blur = false,
   });
 
   final String message;
@@ -84,6 +91,8 @@ class _TopNoticeOverlay extends StatefulWidget {
   final VoidCallback onDismissed;
   final String? actionLabel;
   final VoidCallback? onAction;
+  final bool compact;
+  final bool blur;
 
   @override
   State<_TopNoticeOverlay> createState() => _TopNoticeOverlayState();
@@ -154,64 +163,84 @@ class _TopNoticeOverlayState extends State<_TopNoticeOverlay>
               position: _offset,
               child: ConstrainedBox(
                 constraints: const BoxConstraints(maxWidth: 560),
-                child: Material(
-                  key: const ValueKey('xy-top-notice'),
-                  color: colors.background,
-                  elevation: 10,
-                  shadowColor: Colors.black.withValues(alpha: 0.24),
+                // BackdropFilter 必须被局部裁剪，否则其滤镜区域会扩展到
+                // Overlay 的整块画布，导致提示条之外的页面也被模糊。
+                child: ClipRRect(
                   borderRadius: BorderRadius.circular(16),
-                  clipBehavior: Clip.antiAlias,
-                  child: DecoratedBox(
-                    decoration: BoxDecoration(
-                      border: Border.all(
-                        color: colors.accent.withValues(alpha: 0.28),
-                      ),
+                  child: BackdropFilter(
+                    filter: widget.blur
+                        ? ui.ImageFilter.blur(sigmaX: 12, sigmaY: 12)
+                        : ui.ImageFilter.blur(sigmaX: 0, sigmaY: 0),
+                    child: Material(
+                      key: const ValueKey('xy-top-notice'),
+                      color: widget.blur
+                          ? colors.background.withValues(alpha: .64)
+                          : colors.background,
+                      elevation: 10,
+                      shadowColor: Colors.black.withValues(alpha: 0.24),
                       borderRadius: BorderRadius.circular(16),
-                    ),
-                    child: Padding(
-                      padding: const EdgeInsets.fromLTRB(14, 10, 6, 10),
-                      child: Row(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          Icon(colors.icon, size: 20, color: colors.accent),
-                          const SizedBox(width: 10),
-                          Flexible(
-                            child: Text(
-                              widget.message,
-                              maxLines: 4,
-                              overflow: TextOverflow.ellipsis,
-                              style: TextStyle(
-                                color: colors.foreground,
-                                fontSize: 13,
-                                fontWeight: FontWeight.w600,
-                                height: 1.35,
-                              ),
-                            ),
+                      clipBehavior: Clip.antiAlias,
+                      child: DecoratedBox(
+                        decoration: BoxDecoration(
+                          border: Border.all(
+                            color: colors.accent.withValues(alpha: 0.28),
                           ),
-                          if (widget.actionLabel != null &&
-                              widget.onAction != null) ...[
-                            const SizedBox(width: 8),
-                            TextButton(
-                              onPressed: () {
-                                widget.onAction!();
-                                unawaited(dismiss());
-                              },
-                              style: TextButton.styleFrom(
-                                foregroundColor: colors.accent,
+                          borderRadius: BorderRadius.circular(16),
+                        ),
+                        child: Padding(
+                          padding: widget.compact
+                              ? const EdgeInsets.fromLTRB(12, 5, 4, 5)
+                              : const EdgeInsets.fromLTRB(14, 10, 6, 10),
+                          child: Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Icon(
+                                colors.icon,
+                                size: widget.compact ? 18 : 20,
+                                color: colors.accent,
+                              ),
+                              SizedBox(width: widget.compact ? 8 : 10),
+                              Flexible(
+                                child: Text(
+                                  widget.message,
+                                  maxLines: widget.compact ? 2 : 4,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: TextStyle(
+                                    color: colors.foreground,
+                                    fontSize: widget.compact ? 12 : 13,
+                                    fontWeight: FontWeight.w600,
+                                    height: 1.35,
+                                  ),
+                                ),
+                              ),
+                              if (widget.actionLabel != null &&
+                                  widget.onAction != null) ...[
+                                const SizedBox(width: 8),
+                                TextButton(
+                                  onPressed: () {
+                                    widget.onAction!();
+                                    unawaited(dismiss());
+                                  },
+                                  style: TextButton.styleFrom(
+                                    foregroundColor: colors.accent,
+                                    visualDensity: VisualDensity.compact,
+                                  ),
+                                  child: Text(widget.actionLabel!),
+                                ),
+                              ],
+                              IconButton(
+                                tooltip: '关闭提示',
+                                onPressed: dismiss,
                                 visualDensity: VisualDensity.compact,
+                                iconSize: widget.compact ? 16 : 18,
+                                color: colors.foreground.withValues(
+                                  alpha: 0.68,
+                                ),
+                                icon: const Icon(Icons.close_rounded),
                               ),
-                              child: Text(widget.actionLabel!),
-                            ),
-                          ],
-                          IconButton(
-                            tooltip: '关闭提示',
-                            onPressed: dismiss,
-                            visualDensity: VisualDensity.compact,
-                            iconSize: 18,
-                            color: colors.foreground.withValues(alpha: 0.68),
-                            icon: const Icon(Icons.close_rounded),
+                            ],
                           ),
-                        ],
+                        ),
                       ),
                     ),
                   ),

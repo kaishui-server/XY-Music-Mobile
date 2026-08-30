@@ -329,7 +329,7 @@ mod tests {
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        let dir = std::env::temp_dir().join(format!("xianyu_remote_cache_test_{unique}"));
+        let dir = std::env::temp_dir().join(format!("xymusic_remote_cache_test_{unique}"));
         fs::create_dir_all(&dir).expect("create cache dir");
         fs::write(dir.join("a.flac"), b"aaa").expect("write a");
         fs::write(dir.join("b.mp3"), b"bb").expect("write b");
@@ -348,7 +348,7 @@ mod tests {
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        let dir = std::env::temp_dir().join(format!("xianyu_remote_clear_test_{unique}"));
+        let dir = std::env::temp_dir().join(format!("xymusic_remote_clear_test_{unique}"));
         fs::create_dir_all(&dir).expect("create cache dir");
         fs::write(dir.join("a.flac"), b"aaa").expect("write a");
 

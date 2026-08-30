@@ -6,6 +6,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../auth/auth_provider.dart';
+import '../favorites/favorites_provider.dart';
 import '../playlists/playlists_provider.dart';
 import 'account_plugin_sync.dart';
 
@@ -82,21 +83,25 @@ class AccountCloudSync {
   static Future<void> startAutoUpload(
     AuthNotifier auth,
     PlaylistsNotifier playlists,
-    ProviderContainer container,
-  ) async {
+    ProviderContainer container, {
+    FavoritesNotifier? favorites,
+  }) async {
     stopAutoUpload();
-    final accountId = auth.currentUser?.ciyuanxiId?.trim() ?? '';
+    final accountId = auth.currentUser?.xymusicId?.trim() ?? '';
     if (accountId.isEmpty || !await isEnabled(accountId)) return;
     final selected = await frequency(accountId);
     final interval = selected.interval;
     if (interval == null) return;
     _autoTimer = Timer.periodic(interval, (_) async {
-      if (_autoUploading || auth.currentUser?.ciyuanxiId?.trim() != accountId) {
+      if (_autoUploading || auth.currentUser?.xymusicId?.trim() != accountId) {
         return;
       }
       _autoUploading = true;
       try {
-        await uploadIfChanged(auth, playlists);
+        // 自动同步按周期发送完整歌单快照，而不是依赖本地哈希跳过。
+        // 这样即使上次上传只保存了歌单元数据、服务器端歌曲数据不完整，
+        // 下一次自动同步也会把当前歌单中的全部歌曲补齐到云端。
+        await upload(auth, playlists, favorites: favorites);
         await AccountPluginSync.uploadIfChanged(auth, container);
       } catch (_) {
         // 自动同步失败不打断播放或页面操作，下次周期继续重试。
@@ -114,13 +119,23 @@ class AccountCloudSync {
 
   static Future<CloudSyncResult> upload(
     AuthNotifier auth,
-    PlaylistsNotifier playlists,
-  ) async {
+    PlaylistsNotifier playlists, {
+    FavoritesNotifier? favorites,
+  }) async {
     final accountId = _accountId(auth);
     await playlists.ready;
+    await favorites?.ready;
     final payload = playlists.items.map(_playlistPayload).toList();
-    final result = await _uploadPayload(auth, accountId, payload);
-    await _saveUploadHash(accountId, payload);
+    final favoritePayload = favorites == null
+        ? const <Map<String, dynamic>>[]
+        : _favoritePayload(favorites);
+    final result = await _uploadPayload(
+      auth,
+      accountId,
+      payload,
+      favorites: favoritePayload,
+    );
+    await _saveUploadHash(accountId, payload, favoritePayload);
     return result;
   }
 
@@ -128,17 +143,27 @@ class AccountCloudSync {
   /// 返回 null 表示与上次上传完全一致。
   static Future<CloudSyncResult?> uploadIfChanged(
     AuthNotifier auth,
-    PlaylistsNotifier playlists,
-  ) async {
+    PlaylistsNotifier playlists, {
+    FavoritesNotifier? favorites,
+  }) async {
     final accountId = _accountId(auth);
     await playlists.ready;
+    await favorites?.ready;
     final payload = playlists.items.map(_playlistPayload).toList();
-    final hash = _payloadHash(payload);
+    final favoritePayload = favorites == null
+        ? const <Map<String, dynamic>>[]
+        : _favoritePayload(favorites);
+    final hash = _payloadHash(payload, favoritePayload);
     final prefs = await SharedPreferences.getInstance();
     if (prefs.getString(_key(_lastUploadHashPrefix, accountId)) == hash) {
       return const CloudSyncResult(noChange: true);
     }
-    final result = await _uploadPayload(auth, accountId, payload);
+    final result = await _uploadPayload(
+      auth,
+      accountId,
+      payload,
+      favorites: favoritePayload,
+    );
     await prefs.setString(_key(_lastUploadHashPrefix, accountId), hash);
     return result;
   }
@@ -146,8 +171,9 @@ class AccountCloudSync {
   static Future<CloudSyncResult> _uploadPayload(
     AuthNotifier auth,
     String accountId,
-    List<Map<String, dynamic>> payload,
-  ) async {
+    List<Map<String, dynamic>> payload, {
+    required List<Map<String, dynamic>> favorites,
+  }) async {
     await auth.requestBackendAction('file_sync_upload_start', {
       'user_id': accountId,
     }, fetchTimeoutMs: 30000);
@@ -177,6 +203,7 @@ class AccountCloudSync {
     }
     final data = await auth.requestBackendAction('file_sync_upload_finish', {
       'user_id': accountId,
+      'favorites': favorites,
     }, fetchTimeoutMs: 60000);
     return CloudSyncResult(
       uploadedPlaylists:
@@ -190,77 +217,136 @@ class AccountCloudSync {
     );
   }
 
-  static String _payloadHash(List<Map<String, dynamic>> payload) =>
-      sha256.convert(utf8.encode(jsonEncode(payload))).toString();
+  static String _payloadHash(
+    List<Map<String, dynamic>> payload,
+    List<Map<String, dynamic>> favorites,
+  ) => sha256
+      .convert(
+        utf8.encode(jsonEncode({'playlists': payload, 'favorites': favorites})),
+      )
+      .toString();
 
   static Future<void> _saveUploadHash(
     String accountId,
     List<Map<String, dynamic>> payload,
+    List<Map<String, dynamic>> favorites,
   ) async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString(
       _key(_lastUploadHashPrefix, accountId),
-      _payloadHash(payload),
+      _payloadHash(payload, favorites),
     );
   }
 
   static Future<CloudSyncResult> download(
     AuthNotifier auth,
-    PlaylistsNotifier playlists,
-  ) async {
+    PlaylistsNotifier playlists, {
+    FavoritesNotifier? favorites,
+  }) async {
     final accountId = _accountId(auth);
     await playlists.ready;
     final data = await auth.requestBackendAction('file_sync_download', {
       'user_id': accountId,
     }, fetchTimeoutMs: 60000);
     final raw = data['playlists'];
-    if (raw is! List) return const CloudSyncResult();
     var downloadedSongs = 0;
     var downloadedPlaylists = 0;
-    for (final value in raw.whereType<Map>()) {
-      final id = value['id']?.toString().trim() ?? '';
-      if (id.isEmpty) continue;
-      final songs = <PlaylistSongSnapshot>[];
-      final rawSongs = value['songs'];
-      if (rawSongs is List) {
-        for (final song in rawSongs.whereType<Map>()) {
-          final normalized = _normalizeSong(Map<String, dynamic>.from(song));
-          final snapshot = PlaylistSongSnapshot.fromJson(normalized);
-          if (snapshot.path.isNotEmpty) songs.add(snapshot);
+    final legacyFavorites = <FavoriteSongSnapshot>[];
+    if (raw is List) {
+      for (final value in raw.whereType<Map>()) {
+        final id = value['id']?.toString().trim() ?? '';
+        if (id.isEmpty) continue;
+        final songs = <PlaylistSongSnapshot>[];
+        final rawSongs = value['songs'];
+        final playlistName = value['name']?.toString().trim() ?? '';
+        final isLegacyFavorites =
+            favorites != null &&
+            (value['isFavorite'] == true ||
+                playlistName == '我喜欢的音乐' ||
+                playlistName == '我喜欢');
+        if (rawSongs is List) {
+          for (final song in rawSongs.whereType<Map>()) {
+            final normalized = _normalizeSong(Map<String, dynamic>.from(song));
+            if (isLegacyFavorites) {
+              final snapshot = FavoriteSongSnapshot.fromJson(normalized);
+              if (snapshot.path.isNotEmpty) legacyFavorites.add(snapshot);
+            } else {
+              final snapshot = PlaylistSongSnapshot.fromJson(normalized);
+              if (snapshot.path.isNotEmpty) songs.add(snapshot);
+            }
+          }
+        }
+        if (isLegacyFavorites) continue;
+        await playlists.mergeCloudPlaylist(
+          id: id,
+          name: value['name']?.toString() ?? '未命名歌单',
+          createdAt:
+              DateTime.tryParse(value['createdAt']?.toString() ?? '') ??
+              DateTime.now(),
+          coverUrl:
+              value['cloudCoverUrl']?.toString() ??
+              value['coverUrl']?.toString(),
+          songs: songs,
+        );
+        downloadedPlaylists++;
+        downloadedSongs += songs.length;
+      }
+    }
+    var downloadedFavorites = 0;
+    if (favorites != null) {
+      final rawFavorites = data['favorites'];
+      final favoriteSongs = <FavoriteSongSnapshot>[];
+      if (rawFavorites is List) {
+        for (final value in rawFavorites) {
+          if (value is Map) {
+            final normalized = _normalizeSong(Map<String, dynamic>.from(value));
+            final snapshot = FavoriteSongSnapshot.fromJson(normalized);
+            if (snapshot.path.isNotEmpty) favoriteSongs.add(snapshot);
+          } else if (value is String && value.trim().isNotEmpty) {
+            favoriteSongs.add(
+              FavoriteSongSnapshot(
+                path: value.trim(),
+                title: value.trim().split(RegExp(r'[\\/]')).last,
+                artist: '',
+                album: '',
+                duration: 0,
+                format: '本地',
+              ),
+            );
+          }
         }
       }
-      await playlists.mergeCloudPlaylist(
-        id: id,
-        name: value['name']?.toString() ?? '未命名歌单',
-        createdAt:
-            DateTime.tryParse(value['createdAt']?.toString() ?? '') ??
-            DateTime.now(),
-        coverUrl:
-            value['cloudCoverUrl']?.toString() ?? value['coverUrl']?.toString(),
-        songs: songs,
-      );
-      downloadedPlaylists++;
-      downloadedSongs += songs.length;
+      downloadedFavorites = await favorites.mergeCloudFavorites([
+        ...legacyFavorites,
+        ...favoriteSongs,
+      ]);
     }
     return CloudSyncResult(
       downloadedPlaylists: downloadedPlaylists,
       downloadedSongs: downloadedSongs,
+      downloadedFavorites: downloadedFavorites,
     );
   }
 
   static Future<CloudSyncResult> sync(
     AuthNotifier auth,
-    PlaylistsNotifier playlists,
-  ) async {
+    PlaylistsNotifier playlists, {
+    FavoritesNotifier? favorites,
+  }) async {
     // 先下载并合并云端数据，再上传合并后的完整快照，避免新设备本地为空
     // 时先上传空歌单而覆盖账号已有数据。
-    final downloaded = await download(auth, playlists);
-    final uploaded = await uploadIfChanged(auth, playlists);
+    final downloaded = await download(auth, playlists, favorites: favorites);
+    final uploaded = await uploadIfChanged(
+      auth,
+      playlists,
+      favorites: favorites,
+    );
     if (uploaded == null) {
       return CloudSyncResult(
         noChange: true,
         downloadedPlaylists: downloaded.downloadedPlaylists,
         downloadedSongs: downloaded.downloadedSongs,
+        downloadedFavorites: downloaded.downloadedFavorites,
       );
     }
     return CloudSyncResult(
@@ -268,6 +354,7 @@ class AccountCloudSync {
       uploadedSongs: uploaded.uploadedSongs,
       downloadedPlaylists: downloaded.downloadedPlaylists,
       downloadedSongs: downloaded.downloadedSongs,
+      downloadedFavorites: downloaded.downloadedFavorites,
     );
   }
 
@@ -276,16 +363,18 @@ class AccountCloudSync {
   static Future<CloudSyncResult> syncAll(
     AuthNotifier auth,
     PlaylistsNotifier playlists,
-    ProviderContainer container,
-  ) async {
+    ProviderContainer container, {
+    FavoritesNotifier? favorites,
+  }) async {
     final plugins = await AccountPluginSync.sync(auth, container);
-    final playlistsResult = await sync(auth, playlists);
+    final playlistsResult = await sync(auth, playlists, favorites: favorites);
     return CloudSyncResult(
       noChange: playlistsResult.noChange && plugins.noChange,
       uploadedPlaylists: playlistsResult.uploadedPlaylists,
       uploadedSongs: playlistsResult.uploadedSongs,
       downloadedPlaylists: playlistsResult.downloadedPlaylists,
       downloadedSongs: playlistsResult.downloadedSongs,
+      downloadedFavorites: playlistsResult.downloadedFavorites,
       uploadedPlugins: plugins.uploadedPlugins,
       downloadedPlugins: plugins.downloadedPlugins,
       pluginErrors: plugins.errors,
@@ -293,7 +382,7 @@ class AccountCloudSync {
   }
 
   static String _accountId(AuthNotifier auth) {
-    final id = auth.currentUser?.ciyuanxiId?.trim() ?? '';
+    final id = auth.currentUser?.xymusicId?.trim() ?? '';
     if (id.isEmpty) throw AuthException('请先登录账号');
     return id;
   }
@@ -311,6 +400,42 @@ class AccountCloudSync {
       'cloudCoverUrl': playlist.effectiveCoverUrl,
       'isFavorite': false,
       'songs': songs,
+    };
+  }
+
+  static List<Map<String, dynamic>> _favoritePayload(
+    FavoritesNotifier favorites,
+  ) => [
+    for (final path in favorites.paths)
+      _favoriteSongPayload(path, favorites.snapshotFor(path)),
+  ];
+
+  static Map<String, dynamic> _favoriteSongPayload(
+    String path,
+    FavoriteSongSnapshot? snapshot,
+  ) {
+    if (snapshot != null) {
+      return {
+        ...snapshot.toJson(),
+        'name': snapshot.title,
+        'source_type': snapshot.pluginId?.isNotEmpty == true
+            ? 'plugin'
+            : 'local',
+        'syncType': snapshot.pluginId?.isNotEmpty == true ? 'online' : 'local',
+      };
+    }
+    final fileName = path.split(RegExp(r'[\\/]')).last;
+    final title = fileName.replaceFirst(RegExp(r'\.[^.]+$'), '');
+    return {
+      'path': path,
+      'name': title,
+      'title': title,
+      'artist': '',
+      'album': '',
+      'duration': 0,
+      'format': '本地',
+      'source_type': 'local',
+      'syncType': 'local',
     };
   }
 
@@ -374,6 +499,7 @@ class CloudSyncResult {
     this.uploadedSongs = 0,
     this.downloadedPlaylists = 0,
     this.downloadedSongs = 0,
+    this.downloadedFavorites = 0,
     this.uploadedPlugins = 0,
     this.downloadedPlugins = 0,
     this.pluginErrors = const [],
@@ -384,6 +510,7 @@ class CloudSyncResult {
   final int uploadedSongs;
   final int downloadedPlaylists;
   final int downloadedSongs;
+  final int downloadedFavorites;
   final int uploadedPlugins;
   final int downloadedPlugins;
   final List<String> pluginErrors;

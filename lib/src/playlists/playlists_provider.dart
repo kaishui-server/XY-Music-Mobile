@@ -365,7 +365,13 @@ class PlaylistsNotifier extends StateNotifier<List<MobilePlaylist>> {
   /// 将当前播放队列中的歌曲加入歌单，同时保存网络歌曲所需的完整快照。
   /// 仅保存 path 会导致网络歌曲重新打开歌单时丢失插件信息，因此这里保留
   /// 插件、封面和歌词等元数据，确保歌单中的网络歌曲可以继续播放。
-  Future<void> addQueueItem(String id, QueueItem item) async {
+  ///
+  /// 返回 true 表示新添加；false 表示歌曲已在该歌单中（未重复添加）。
+  Future<bool> addQueueItem(String id, QueueItem item) async {
+    final existing = state.where((playlist) => playlist.id == id).firstOrNull;
+    if (existing != null && existing.songPaths.contains(item.path)) {
+      return false;
+    }
     final snapshot = PlaylistSongSnapshot(
       path: item.path,
       title: item.title,
@@ -395,6 +401,7 @@ class PlaylistsNotifier extends StateNotifier<List<MobilePlaylist>> {
           playlist,
     ];
     await _save();
+    return true;
   }
 
   Future<void> removeSong(String id, String path) async {

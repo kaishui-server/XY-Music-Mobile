@@ -35,6 +35,28 @@ class XyPageBackground extends StatelessWidget {
   }
 }
 
+/// Shares the app-level decoded wallpaper with descendants such as the drawer.
+/// Keeping a single decoded frame avoids a white placeholder flash each time a
+/// new XyAppBackground instance (for example, the sidebar) is opened.
+class XyBackgroundScope extends InheritedWidget {
+  const XyBackgroundScope({
+    super.key,
+    required this.path,
+    required this.image,
+    required super.child,
+  });
+
+  final String path;
+  final ui.Image? image;
+
+  static XyBackgroundScope? maybeOf(BuildContext context) =>
+      context.dependOnInheritedWidgetOfExactType<XyBackgroundScope>();
+
+  @override
+  bool updateShouldNotify(XyBackgroundScope oldWidget) =>
+      path != oldWidget.path || !identical(image, oldWidget.image);
+}
+
 /// 应用级背景。用户选择的图片只保存在本机应用目录，不会上传到服务器。
 class XyAppBackground extends StatefulWidget {
   const XyAppBackground({
@@ -77,21 +99,25 @@ class _XyAppBackgroundState extends State<XyAppBackground> {
     final brightness = Theme.of(context).brightness;
     final path = widget.imagePath.trim();
     final blur = widget.blur.clamp(0, 40).toDouble();
+    final inherited = XyBackgroundScope.maybeOf(context);
+    final decodedImage =
+        widget.decodedImage ??
+        (inherited?.path.trim() == path ? inherited?.image : null);
     if (_backgroundLayer != null &&
         _layerPath == path &&
         _layerBlur == blur &&
-        identical(_layerImage, widget.decodedImage) &&
+        identical(_layerImage, decodedImage) &&
         _layerBrightness == brightness) {
       return;
     }
     _layerPath = path;
     _layerBlur = blur;
-    _layerImage = widget.decodedImage;
+    _layerImage = decodedImage;
     _layerBrightness = brightness;
     _backgroundLayer = _buildBackgroundLayer(
       path: path,
       blur: blur,
-      decodedImage: widget.decodedImage,
+      decodedImage: decodedImage,
       brightness: brightness,
     );
   }
@@ -116,6 +142,7 @@ class _XyAppBackgroundState extends State<XyAppBackground> {
       return Image.file(
         File(path),
         fit: BoxFit.cover,
+        cacheWidth: 1440,
         gaplessPlayback: true,
         filterQuality: FilterQuality.low,
         errorBuilder: (context, error, stackTrace) => const SizedBox.shrink(),
@@ -157,7 +184,14 @@ class _XyAppBackgroundState extends State<XyAppBackground> {
     _ensureBackgroundLayer();
     return Stack(
       fit: StackFit.expand,
-      children: [_backgroundLayer!, widget.child],
+      children: [
+        _backgroundLayer!,
+        XyBackgroundScope(
+          path: widget.imagePath.trim(),
+          image: _layerImage,
+          child: widget.child,
+        ),
+      ],
     );
   }
 }
@@ -169,6 +203,7 @@ class XyPanel extends StatelessWidget {
     this.padding = const EdgeInsets.all(16),
     this.radius = XyRadii.large,
     this.color,
+    this.blurSigma = 0,
   });
 
   final Widget child;
@@ -176,11 +211,14 @@ class XyPanel extends StatelessWidget {
   final double radius;
   final Color? color;
 
+  /// 对面板后方内容进行模糊。配合半透明 [color] 使用可实现玻璃效果。
+  final double blurSigma;
+
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final dark = theme.brightness == Brightness.dark;
-    return DecoratedBox(
+    final panel = DecoratedBox(
       decoration: BoxDecoration(
         color:
             color ??
@@ -198,6 +236,14 @@ class XyPanel extends StatelessWidget {
         ],
       ),
       child: Padding(padding: padding, child: child),
+    );
+    if (blurSigma <= 0) return panel;
+    return ClipRRect(
+      borderRadius: BorderRadius.circular(radius),
+      child: BackdropFilter.grouped(
+        filter: ui.ImageFilter.blur(sigmaX: blurSigma, sigmaY: blurSigma),
+        child: panel,
+      ),
     );
   }
 }

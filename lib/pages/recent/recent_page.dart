@@ -3,6 +3,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../src/library/library_provider.dart';
 import '../../src/recent/recent_provider.dart';
+import '../../src/core/settings.dart';
 import '../../src/navigation/sidebar_controller.dart';
 import '../../src/widgets/cover_image.dart';
 import '../../src/widgets/song_list_view.dart';
@@ -16,6 +17,15 @@ class RecentPage extends ConsumerStatefulWidget {
 
 class _RecentPageState extends ConsumerState<RecentPage> {
   int _segment = 0;
+  bool _searching = false;
+  final TextEditingController _searchController = TextEditingController();
+  String _query = '';
+
+  @override
+  void dispose() {
+    _searchController.dispose();
+    super.dispose();
+  }
 
   Future<void> _clear() async {
     final confirmed = await showDialog<bool>(
@@ -41,11 +51,56 @@ class _RecentPageState extends ConsumerState<RecentPage> {
   @override
   Widget build(BuildContext context) {
     final recent = ref.watch(recentSongsProvider);
+    final sidebarOnRight = ref.watch(
+      settingsProvider.select(
+        (value) => value.valueOrNull?.sidebarPosition == SidebarPosition.right,
+      ),
+    );
+    final keyword = _query.toLowerCase();
+    final entries = recent.valueOrNull ?? const <RecentSongEntry>[];
+    final filteredEntries = keyword.isEmpty
+        ? entries
+        : entries
+              .where(
+                (entry) =>
+                    entry.song.title.toLowerCase().contains(keyword) ||
+                    entry.song.artist.toLowerCase().contains(keyword) ||
+                    entry.song.album.toLowerCase().contains(keyword),
+              )
+              .toList();
     return Scaffold(
       appBar: AppBar(
-        leading: const AppSidebarMenuButton(),
-        title: const Text('最近播放'),
+        automaticallyImplyLeading: !sidebarOnRight,
+        leading: sidebarOnRight ? null : const AppSidebarMenuButton(),
+        title: _searching
+            ? TextField(
+                controller: _searchController,
+                autofocus: true,
+                textInputAction: TextInputAction.search,
+                decoration: const InputDecoration(
+                  hintText: '搜索最近播放',
+                  border: InputBorder.none,
+                ),
+                onChanged: (value) => setState(() => _query = value.trim()),
+              )
+            : const Text('最近播放'),
         actions: [
+          if (sidebarOnRight) const AppSidebarMenuButton(),
+          IconButton(
+            tooltip: _searching ? '取消' : '搜索',
+            onPressed: () {
+              setState(() {
+                _searching = !_searching;
+                if (!_searching) {
+                  _query = '';
+                  _searchController.clear();
+                }
+              });
+            },
+            icon: Icon(
+              _searching ? Icons.close_rounded : Icons.search_rounded,
+            ),
+          ),
           IconButton(
             tooltip: '清空记录',
             onPressed: recent.valueOrNull?.isNotEmpty == true ? _clear : null,
@@ -55,30 +110,31 @@ class _RecentPageState extends ConsumerState<RecentPage> {
       ),
       body: Column(
         children: [
-          Padding(
-            padding: const EdgeInsets.fromLTRB(16, 4, 16, 12),
-            child: SizedBox(
-              width: double.infinity,
-              child: SegmentedButton<int>(
-                segments: const [
-                  ButtonSegment(
-                    value: 0,
-                    icon: Icon(Icons.music_note, size: 18),
-                    label: Text('歌曲'),
-                  ),
-                  ButtonSegment(
-                    value: 1,
-                    icon: Icon(Icons.album_outlined, size: 18),
-                    label: Text('专辑'),
-                  ),
-                ],
-                selected: {_segment},
-                onSelectionChanged: (value) =>
-                    setState(() => _segment = value.first),
-                showSelectedIcon: false,
+          if (!_searching)
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 4, 16, 12),
+              child: SizedBox(
+                width: double.infinity,
+                child: SegmentedButton<int>(
+                  segments: const [
+                    ButtonSegment(
+                      value: 0,
+                      icon: Icon(Icons.music_note, size: 18),
+                      label: Text('歌曲'),
+                    ),
+                    ButtonSegment(
+                      value: 1,
+                      icon: Icon(Icons.album_outlined, size: 18),
+                      label: Text('专辑'),
+                    ),
+                  ],
+                  selected: {_segment},
+                  onSelectionChanged: (value) =>
+                      setState(() => _segment = value.first),
+                  showSelectedIcon: false,
+                ),
               ),
             ),
-          ),
           Expanded(
             child: recent.when(
               loading: () => const Center(child: CircularProgressIndicator()),
@@ -86,11 +142,13 @@ class _RecentPageState extends ConsumerState<RecentPage> {
                 error: '$error',
                 onRetry: () => ref.invalidate(recentSongsProvider),
               ),
-              data: (entries) => entries.isEmpty
+              data: (allEntries) => allEntries.isEmpty
                   ? const _RecentEmpty()
+                  : _searching && filteredEntries.isEmpty
+                  ? const _RecentSearchEmpty()
                   : _segment == 0
-                  ? _RecentSongs(entries: entries)
-                  : _RecentAlbums(entries: entries),
+                  ? _RecentSongs(entries: filteredEntries)
+                  : _RecentAlbums(entries: filteredEntries),
             ),
           ),
         ],
@@ -258,6 +316,34 @@ class _RecentEmpty extends StatelessWidget {
             style: TextStyle(
               color: Theme.of(context).colorScheme.onSurfaceVariant,
             ),
+          ),
+        ],
+      ),
+    ),
+  );
+}
+
+class _RecentSearchEmpty extends StatelessWidget {
+  const _RecentSearchEmpty();
+
+  @override
+  Widget build(BuildContext context) => Center(
+    child: Padding(
+      padding: const EdgeInsets.only(bottom: 100),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(
+            Icons.search_off_rounded,
+            size: 52,
+            color: Theme.of(
+              context,
+            ).colorScheme.onSurfaceVariant.withValues(alpha: .4),
+          ),
+          const SizedBox(height: 12),
+          const Text(
+            '没有匹配的播放记录',
+            style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
           ),
         ],
       ),

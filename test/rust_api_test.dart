@@ -17,11 +17,11 @@ void main() {
     'rust',
     'target',
     'debug',
-    'xianyu_core.dll',
+    'xymusic_core.dll',
   );
   if (!File(dllPath).existsSync()) {
     test(
-      'Rust API 测试需要预先编译的 xianyu_core.dll',
+      'Rust API 测试需要预先编译的 xymusic_core.dll',
       () {},
       skip: '请先运行 cargo build --manifest-path rust/Cargo.toml',
     );

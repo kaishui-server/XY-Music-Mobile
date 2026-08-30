@@ -152,6 +152,7 @@ pub(crate) fn ensure_base_schema(conn: &Connection) -> Result<(), String> {
             id INTEGER PRIMARY KEY,
             song_path TEXT NOT NULL,
             played_at INTEGER NOT NULL,
+            played_ms INTEGER NOT NULL DEFAULT 0,
             event TEXT DEFAULT 'play'
         )",
         [],

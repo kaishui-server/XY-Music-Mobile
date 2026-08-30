@@ -302,7 +302,7 @@ class AccountPluginSync {
   }
 
   static String _accountId(AuthNotifier auth) {
-    final value = auth.currentUser?.ciyuanxiId?.trim() ?? '';
+    final value = auth.currentUser?.xymusicId?.trim() ?? '';
     if (value.isEmpty) throw AuthException('请先登录账号');
     return value;
   }

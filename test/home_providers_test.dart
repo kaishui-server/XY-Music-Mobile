@@ -32,7 +32,7 @@ void main() {
 
   test('排行榜上报同时包含累计、今日和本周听歌时长', () {
     final payload = buildListenStatsReportPayload(
-      ciyuanxiId: 'XY123',
+      xymusicId: 'XY123',
       totalDuration: 7200,
       dailyDuration: 600,
       weeklyDuration: 1800,

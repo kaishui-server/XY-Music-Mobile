@@ -1056,7 +1056,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let dir = std::env::temp_dir().join(format!("xianyu_remote_lyrics_test_{unique}"));
+        let dir = std::env::temp_dir().join(format!("xymusic_remote_lyrics_test_{unique}"));
         fs::create_dir_all(&dir).unwrap();
         let cached_audio = dir.join("Demo.flac");
         let cached_lrc = dir.join("Demo.lrc");

@@ -17,6 +17,7 @@ import '../../src/player/player_provider.dart';
 import '../../src/rust/api.dart';
 import '../../src/ui/xy_surface.dart';
 import '../../src/widgets/cover_image.dart';
+import '../../src/widgets/song_list_view.dart';
 import '../../src/widgets/top_notice.dart';
 
 enum _DuplicatePlaylistAction { merge, keepBoth }
@@ -58,6 +59,13 @@ class PlaylistsPage extends ConsumerStatefulWidget {
 class _PlaylistsPageState extends ConsumerState<PlaylistsPage> {
   bool _selectionMode = false;
   final Set<String> _selectedIds = <String>{};
+  final ScrollController _playlistsController = ScrollController();
+
+  @override
+  void dispose() {
+    _playlistsController.dispose();
+    super.dispose();
+  }
 
   void _toggleSelection(String id) {
     setState(() {
@@ -506,100 +514,112 @@ class _PlaylistsPageState extends ConsumerState<PlaylistsPage> {
                 onCreate: () => _create(context, ref),
                 onImport: () => _showImportOptions(context, ref),
               )
-            : ListView.separated(
-                padding: const EdgeInsets.fromLTRB(16, 8, 16, 98),
-                itemCount: playlists.length,
-                separatorBuilder: (_, _) => const SizedBox(height: 10),
-                itemBuilder: (context, index) {
-                  final playlist = playlists[index];
-                  return XyPanel(
-                    padding: EdgeInsets.zero,
-                    child: ListTile(
-                      minTileHeight: 72,
-                      leading: Row(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          if (_selectionMode)
-                            Checkbox(
-                              value: _selectedIds.contains(playlist.id),
-                              onChanged: (_) => _toggleSelection(playlist.id),
-                            ),
-                          Container(
-                            width: 48,
-                            height: 48,
-                            decoration: BoxDecoration(
-                              color: Theme.of(
-                                context,
-                              ).colorScheme.primary.withValues(alpha: 0.14),
-                              borderRadius: BorderRadius.circular(13),
-                            ),
-                            clipBehavior: Clip.antiAlias,
-                            child: playlist.songPaths.isNotEmpty
-                                ? CoverImage(
-                                    songPath: playlist.songPaths.first,
-                                    imageUrl: playlist.effectiveCoverUrl,
-                                    width: 48,
-                                    height: 48,
-                                    radius: 0,
-                                    icon: Icons.queue_music_rounded,
-                                  )
-                                : Icon(
-                                    Icons.queue_music_rounded,
-                                    color: Theme.of(
-                                      context,
-                                    ).colorScheme.primary,
-                                  ),
+            : Stack(
+                children: [
+                  ListView.separated(
+                    controller: _playlistsController,
+                    padding: const EdgeInsets.fromLTRB(16, 8, 16, 98),
+                    itemCount: playlists.length,
+                    separatorBuilder: (_, _) => const SizedBox(height: 10),
+                    itemBuilder: (context, index) {
+                      final playlist = playlists[index];
+                      return XyPanel(
+                        padding: EdgeInsets.zero,
+                        child: ListTile(
+                          minTileHeight: 72,
+                          leading: Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              if (_selectionMode)
+                                Checkbox(
+                                  value: _selectedIds.contains(playlist.id),
+                                  onChanged: (_) =>
+                                      _toggleSelection(playlist.id),
+                                ),
+                              Container(
+                                width: 48,
+                                height: 48,
+                                decoration: BoxDecoration(
+                                  color: Theme.of(
+                                    context,
+                                  ).colorScheme.primary.withValues(alpha: 0.14),
+                                  borderRadius: BorderRadius.circular(13),
+                                ),
+                                clipBehavior: Clip.antiAlias,
+                                child: playlist.songPaths.isNotEmpty
+                                    ? CoverImage(
+                                        songPath: playlist.songPaths.first,
+                                        imageUrl: playlist.effectiveCoverUrl,
+                                        width: 48,
+                                        height: 48,
+                                        radius: 0,
+                                        icon: Icons.queue_music_rounded,
+                                      )
+                                    : Icon(
+                                        Icons.queue_music_rounded,
+                                        color: Theme.of(
+                                          context,
+                                        ).colorScheme.primary,
+                                      ),
+                              ),
+                            ],
                           ),
-                        ],
-                      ),
-                      title: Text(
-                        playlist.name,
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: const TextStyle(fontWeight: FontWeight.w700),
-                      ),
-                      subtitle: Text('${playlist.songPaths.length} 首歌曲'),
-                      trailing: _selectionMode
-                          ? null
-                          : PopupMenuButton<String>(
-                              tooltip: '更多',
-                              onSelected: (action) {
-                                switch (action) {
-                                  case 'rename':
-                                    _rename(context, ref, playlist);
-                                  case 'delete':
-                                    _delete(context, ref, playlist);
-                                }
-                              },
-                              itemBuilder: (context) => const [
-                                PopupMenuItem(
-                                  value: 'rename',
-                                  child: ListTile(
-                                    contentPadding: EdgeInsets.zero,
-                                    leading: Icon(Icons.edit_outlined),
-                                    title: Text('重命名'),
-                                  ),
+                          title: Text(
+                            playlist.name,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: const TextStyle(fontWeight: FontWeight.w700),
+                          ),
+                          subtitle: Text('${playlist.songPaths.length} 首歌曲'),
+                          trailing: _selectionMode
+                              ? null
+                              : PopupMenuButton<String>(
+                                  tooltip: '更多',
+                                  onSelected: (action) {
+                                    switch (action) {
+                                      case 'rename':
+                                        _rename(context, ref, playlist);
+                                      case 'delete':
+                                        _delete(context, ref, playlist);
+                                    }
+                                  },
+                                  itemBuilder: (context) => const [
+                                    PopupMenuItem(
+                                      value: 'rename',
+                                      child: ListTile(
+                                        contentPadding: EdgeInsets.zero,
+                                        leading: Icon(Icons.edit_outlined),
+                                        title: Text('重命名'),
+                                      ),
+                                    ),
+                                    PopupMenuItem(
+                                      value: 'delete',
+                                      child: ListTile(
+                                        contentPadding: EdgeInsets.zero,
+                                        leading: Icon(Icons.delete_outline),
+                                        title: Text('删除歌单'),
+                                      ),
+                                    ),
+                                  ],
+                                  icon: const Icon(Icons.more_horiz_rounded),
                                 ),
-                                PopupMenuItem(
-                                  value: 'delete',
-                                  child: ListTile(
-                                    contentPadding: EdgeInsets.zero,
-                                    leading: Icon(Icons.delete_outline),
-                                    title: Text('删除歌单'),
-                                  ),
-                                ),
-                              ],
-                              icon: const Icon(Icons.more_horiz_rounded),
-                            ),
-                      onTap: () => _selectionMode
-                          ? _toggleSelection(playlist.id)
-                          : context.push('/home/playlists/${playlist.id}'),
-                      onLongPress: _selectionMode
-                          ? null
-                          : () => _enterSelection(playlist.id),
+                          onTap: () => _selectionMode
+                              ? _toggleSelection(playlist.id)
+                              : context.push('/home/playlists/${playlist.id}'),
+                          onLongPress: _selectionMode
+                              ? null
+                              : () => _enterSelection(playlist.id),
+                        ),
+                      );
+                    },
+                  ),
+                  ScrollToTopButton(
+                    controller: _playlistsController,
+                    hasMiniPlayer: ref.watch(
+                      playerProvider.select((state) => state.current != null),
                     ),
-                  );
-                },
+                  ),
+                ],
               ),
       ),
     );

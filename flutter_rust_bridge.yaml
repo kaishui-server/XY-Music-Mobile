@@ -1,4 +1,4 @@
 rust_input: crate::api
 rust_root: rust
-rust_output: '\\?\C:\Users\yiche\Desktop\Xianyu\XianYu-Music-Mobile\rust\src\frb_generated.rs'
+rust_output: rust/src/frb_generated.rs
 dart_output: lib/src/rust

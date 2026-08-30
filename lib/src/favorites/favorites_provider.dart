@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -129,6 +130,9 @@ class FavoritesNotifier extends StateNotifier<Set<String>> {
 
   Future<void> get ready => _loaded;
 
+  /// 当前收藏路径的只读快照，供账号云同步读取。
+  Set<String> get paths => Set.unmodifiable(state);
+
   Future<SharedPreferences> _prefs() => SharedPreferences.getInstance();
 
   Future<void> _load() async {
@@ -190,6 +194,25 @@ class FavoritesNotifier extends StateNotifier<Set<String>> {
     return added;
   }
 
+  /// 批量添加收藏（多选一键收藏）。已在收藏中的跳过，返回实际新增数量。
+  Future<int> addAll(Iterable<FavoriteSongSnapshot> songs) async {
+    await _loaded;
+    final next = state.toSet();
+    var added = 0;
+    for (final song in songs) {
+      if (next.contains(song.path)) continue;
+      next.add(song.path);
+      added++;
+      if (_needsSnapshot(song.path, song.pluginId)) {
+        _songSnapshots[song.path] = song;
+      }
+    }
+    if (added == 0) return 0;
+    state = next;
+    await _persist();
+    return added;
+  }
+
   bool _needsSnapshot(String path, String? pluginId) =>
       pluginId?.trim().isNotEmpty == true ||
       path.startsWith('plugin://') ||
@@ -223,6 +246,31 @@ class FavoritesNotifier extends StateNotifier<Set<String>> {
     await prefs.remove(_key);
     await prefs.remove(_songMetadataKey);
   }
+
+  /// 合并云端收藏。收藏在云端是独立数据，不会创建或写入“我喜欢”歌单。
+  Future<int> mergeCloudFavorites(
+    Iterable<FavoriteSongSnapshot> incoming,
+  ) async {
+    await _loaded;
+    final next = state.toSet();
+    var added = 0;
+    var changed = false;
+    for (final song in incoming) {
+      final path = song.path.trim();
+      if (path.isEmpty) continue;
+      if (next.add(path)) {
+        added++;
+        changed = true;
+      }
+      if (_songSnapshots[path] != song) changed = true;
+      _songSnapshots[path] = song;
+    }
+    if (changed) {
+      state = next;
+      await _persist();
+    }
+    return added;
+  }
 }
 
 final favoritesProvider = StateNotifierProvider<FavoritesNotifier, Set<String>>(
@@ -230,3 +278,20 @@ final favoritesProvider = StateNotifierProvider<FavoritesNotifier, Set<String>>(
     return FavoritesNotifier();
   },
 );
+
+/// 主页首帧后预热本地收藏歌曲查询。网络收藏使用已保存的快照，不需要
+/// 访问曲库；本地收藏则提前完成一次批量查询，避免进入收藏页时和转场同帧
+/// 触发数据库读取。
+void preloadFavoriteSongs(WidgetRef ref) {
+  unawaited(
+    () async {
+      final notifier = ref.read(favoritesProvider.notifier);
+      await notifier.ready;
+      final localPaths = notifier.paths
+          .where((path) => notifier.snapshotFor(path) == null)
+          .toList(growable: false);
+      if (localPaths.isEmpty) return;
+      await ref.read(libraryProvider.notifier).songsByPaths(localPaths);
+    }().catchError((_) {}),
+  );
+}

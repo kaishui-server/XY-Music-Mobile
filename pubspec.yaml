@@ -16,7 +16,13 @@ publish_to: 'none' # Remove this line if you wish to publish to pub.dev
 # https://developer.apple.com/library/archive/documentation/General/Reference/InfoPlistKeyReference/Articles/CoreFoundationKeys.html
 # In Windows, build-name is used as the major, minor, and patch parts
 # of the product and file versions while build-number is used as the build suffix.
-version: 1.1.0+2
+version: 1.3.1+131
+
+dependency_overrides:
+  # 本地补丁：暴露内部 SwitchAudioHandler（见 third_party/just_audio_background），
+  # 用于安装媒体会话桥接，为通知栏补上上一首/下一首控件。
+  just_audio_background:
+    path: third_party/just_audio_background
 
 environment:
   sdk: ^3.12.2
@@ -57,11 +63,16 @@ dependencies:
   # 系统媒体会话、后台播放、通知栏与锁屏播放控件
   just_audio_background: ^0.0.1-beta.17
   audio_session: ^0.1.25
+  # 媒体会话桥接：为本应用的“单 URL 播放”补上上一首/下一首控件
+  audio_service: ^0.18.19
+  rxdart: ^0.28.0
   # just_audio 的 Windows 平台实现；桌面调试时必须显式接入
   just_audio_windows: ^0.2.3
 
   # 轻量本地存储（设置项）
   shared_preferences: ^2.3.0
+  # Android 12 Material You 动态取色
+  dynamic_color: ^1.7.0
 
   # 本地沙箱执行 MusicFree 插件（搜索、音源解析）
   quickjs_engine: ^0.1.3
@@ -128,6 +139,7 @@ flutter:
   assets:
     - assets/icon/app_icon.png
     - assets/plugin_runtime.js
+    - assets/lx_plugin_runtime.js
 
   # To add assets to your application, add an assets section, like this:
   # assets:

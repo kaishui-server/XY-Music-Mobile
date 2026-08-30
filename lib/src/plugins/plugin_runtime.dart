@@ -24,6 +24,7 @@ class EnabledMusicPlugin {
     required this.path,
     this.isLx = false,
     this.lxSources = const [],
+    this.userVariables = const {},
   });
 
   final String id;
@@ -31,6 +32,9 @@ class EnabledMusicPlugin {
   final String path;
   final bool isLx;
   final List<String> lxSources;
+
+  /// 用户在插件管理中填写的用户变量值，加载插件时注入 env。
+  final Map<String, String> userVariables;
 }
 
 class PluginSearchSong {
@@ -134,6 +138,122 @@ List<String> pluginQualityCandidates(String? preferredQuality) => <String>{
   'super',
 }.toList();
 
+const _qualityDiscoveryFallback = [
+  '128k',
+  '192k',
+  '320k',
+  'flac',
+  'lossless',
+  'hires',
+  'hi-res',
+  'master',
+  'sq',
+  'ape',
+  'wav',
+  'dolby',
+  'atmos',
+];
+
+/// 从插件歌曲快照中提取插件声明的音质标识。不同 MusicFree/LX 插件
+/// 使用的字段并不统一，因此这里兼容 qualities、formats、_types 等常见
+/// 结构，同时保留插件自己的 token（例如 master、hires、24bit）。
+List<String> _qualityTokensFromRaw(dynamic value) {
+  final result = <String>{};
+  const containerKeys = {
+    'qualities',
+    'quality',
+    'formats',
+    'format',
+    'availablequalities',
+    'qualityoptions',
+    'audioqualities',
+    'types',
+    '_types',
+    'lx_types',
+  };
+  const qualityKeyPattern =
+      r'^(?:size|bitrate|quality|format|type)[_\-]?(\d+|flac|lossless|ape|wav|master|hires|hi-res|dolby|atmos).*$';
+
+  void add(dynamic token) {
+    final text = token?.toString().trim() ?? '';
+    if (text.isEmpty || text.length > 40) return;
+    if (RegExp(r'^(?:https?|https?)://', caseSensitive: false).hasMatch(text)) {
+      return;
+    }
+    result.add(text);
+  }
+
+  void visit(dynamic node, {bool collect = false}) {
+    if (node is List) {
+      for (final item in node) {
+        visit(item, collect: collect);
+      }
+      return;
+    }
+    if (node is! Map) {
+      if (collect && (node is String || node is num)) add(node);
+      return;
+    }
+    if (collect) {
+      add(
+        node['quality'] ??
+            node['format'] ??
+            node['type'] ??
+            node['code'] ??
+            node['value'] ??
+            node['id'],
+      );
+    }
+    for (final entry in node.entries) {
+      final key = entry.key.toString();
+      final lower = key.toLowerCase().replaceAll('-', '').replaceAll('_', '');
+      final value = entry.value;
+      if (containerKeys.contains(lower)) {
+        if (value is Map) {
+          for (final child in value.entries) {
+            add(child.key);
+            final childValue = child.value;
+            if (childValue is Map) {
+              add(
+                childValue['quality'] ??
+                    childValue['format'] ??
+                    childValue['type'] ??
+                    childValue['code'] ??
+                    childValue['value'] ??
+                    childValue['id'],
+              );
+            } else if (childValue is String &&
+                !RegExp(
+                  r'^https?://',
+                  caseSensitive: false,
+                ).hasMatch(childValue)) {
+              add(childValue);
+            }
+          }
+        } else {
+          visit(value, collect: true);
+        }
+      }
+      final match = RegExp(
+        qualityKeyPattern,
+        caseSensitive: false,
+      ).firstMatch(key);
+      if (match != null) {
+        final suffix = match.group(1) ?? '';
+        add(
+          suffix == '128' || suffix == '192' || suffix == '320'
+              ? '${suffix}k'
+              : suffix,
+        );
+      }
+      if (value is Map || value is List) visit(value, collect: false);
+    }
+  }
+
+  visit(value);
+  return result.toList();
+}
+
 Future<List<EnabledMusicPlugin>> loadEnabledMusicPlugins(Ref ref) async {
   const enabledKey = 'mobileEnabledPlugins';
   final dataDir = await ref.read(appDataDirProvider.future);
@@ -141,6 +261,7 @@ Future<List<EnabledMusicPlugin>> loadEnabledMusicPlugins(Ref ref) async {
   if (!directory.existsSync()) return const [];
   final prefs = await SharedPreferences.getInstance();
   final enabled = (prefs.getStringList(enabledKey) ?? const []).toSet();
+  final savedVariables = readPluginUserVariables(prefs);
   final plugins = <EnabledMusicPlugin>[];
   for (final file in directory.listSync().whereType<File>()) {
     if (p.extension(file.path).toLowerCase() != '.js') continue;
@@ -156,11 +277,53 @@ Future<List<EnabledMusicPlugin>> loadEnabledMusicPlugins(Ref ref) async {
         path: file.path,
         isLx: isLx,
         lxSources: isLx ? _detectLxSources(source) : const [],
+        userVariables: savedVariables[id] ?? const {},
       ),
     );
   }
+  // 插件管理页拖拽保存的顺序即搜索页 Tab 的优先级；未记录顺序的插件
+  // （新安装）按名称排序追加在末尾。
+  final orderedIds = prefs.getStringList(pluginOrderKey) ?? const [];
+  if (orderedIds.isNotEmpty) {
+    final byId = {for (final plugin in plugins) plugin.id: plugin};
+    final ordered = <EnabledMusicPlugin>[
+      for (final id in orderedIds)
+        if (byId.containsKey(id)) byId.remove(id)!,
+    ];
+    ordered.addAll(plugins.where((plugin) => byId.containsKey(plugin.id)));
+    return ordered;
+  }
   plugins.sort((a, b) => a.name.compareTo(b.name));
   return plugins;
+}
+
+/// SharedPreferences 中持久化插件拖拽顺序的键（插件 ID 列表，从上到下）。
+const pluginOrderKey = 'mobilePluginOrder';
+
+/// SharedPreferences 中持久化插件用户变量的键：{pluginId: {key: value}}。
+const pluginUserVariablesKey = 'mobilePluginUserVariablesV1';
+
+/// 读取全部插件的用户变量，只保留合法的字符串键值。
+Map<String, Map<String, String>> readPluginUserVariables(
+  SharedPreferences prefs,
+) {
+  try {
+    final raw = prefs.getString(pluginUserVariablesKey);
+    if (raw == null) return {};
+    final decoded = jsonDecode(raw);
+    if (decoded is! Map) return {};
+    return {
+      for (final entry in decoded.entries)
+        if (entry.value is Map)
+          entry.key.toString(): {
+            for (final variable in (entry.value as Map).entries)
+              if (variable.value is String)
+                variable.key.toString(): variable.value as String,
+          },
+    };
+  } catch (_) {
+    return {};
+  }
 }
 
 /// 即使插件已停用，也尽量从仍存在的脚本中读取原显示名；插件文件已删除时
@@ -186,6 +349,9 @@ bool _looksLikeLxPlugin(String source) {
   return lower.contains('lx.event.request') ||
       lower.contains('lx.event.on') ||
       lower.contains('globalthis.lx') ||
+      // 压缩/混淆后的落雪插件通常写成 globalThis['lx']，不能只依赖
+      // 点号形式，否则会被误判为 MusicFree 插件而无法加载。
+      RegExp(r'''globalthis\s*\[\s*['"]lx['"]\s*\]''').hasMatch(lower) ||
       lower.contains('event_names.request') ||
       lower.contains('server_script_config');
 }
@@ -216,11 +382,13 @@ class PluginRuntimeService {
   PluginRuntimeService({
     this.httpClient,
     this.runtimeBootstrap,
+    this.runtimeLxBootstrap,
     this.pluginSources = const {},
   });
 
   final http.BaseClient? httpClient;
   final String? runtimeBootstrap;
+  final String? runtimeLxBootstrap;
   final Map<String, String> pluginSources;
   JavascriptRuntime? _runtime;
   Future<void>? _initializing;
@@ -228,9 +396,11 @@ class PluginRuntimeService {
   bool _disposeRequested = false;
   Future<String>? _runtimeBootstrapTask;
   final Set<String> _loaded = {};
+  final Set<String> _loadedLx = {};
   final Map<String, Future<void>> _loadTasks = {};
   final Map<String, Future<String>> _pluginSourceTasks = {};
   final Map<String, _NeteaseTrackMeta> _neteaseTrackMetaCache = {};
+  final Map<String, Future<List<String>>> _qualityDiscoveryCache = {};
 
   bool get _runsPluginsInBackground =>
       httpClient == null && runtimeBootstrap == null;
@@ -253,6 +423,14 @@ class PluginRuntimeService {
         sourceUrl: 'xy_plugin_runtime.js',
       );
       if (result.isError) throw Exception(result.stringResult);
+      final lxBootstrap =
+          runtimeLxBootstrap ??
+          await rootBundle.loadString('assets/lx_plugin_runtime.js');
+      final lxResult = runtime.evaluate(
+        lxBootstrap,
+        sourceUrl: 'xy_lx_plugin_runtime.js',
+      );
+      if (lxResult.isError) throw Exception(lxResult.stringResult);
       _runtime = runtime;
     } catch (_) {
       runtime.dispose();
@@ -269,7 +447,8 @@ class PluginRuntimeService {
           final source = await _loadPluginSource(plugin);
           final code =
               '__xyLoadMusicFreePlugin('
-              '${jsonEncode(plugin.id)},${jsonEncode(source)},"{}")';
+              '${jsonEncode(plugin.id)},${jsonEncode(source)},'
+              '${jsonEncode(jsonEncode(plugin.userVariables))})';
           final result = _runtime!.evaluate(
             code,
             sourceUrl: p.basename(plugin.path),
@@ -291,6 +470,58 @@ class PluginRuntimeService {
       plugin.id,
       () => File(plugin.path).readAsString(),
     );
+  }
+
+  Future<void> _ensureLxPlugin(EnabledMusicPlugin plugin) {
+    if (_loadedLx.contains(plugin.id)) return Future.value();
+    return _loadTasks
+        .putIfAbsent('${plugin.id}:lx', () async {
+          await _ensureRuntime();
+          final source = await _loadPluginSource(plugin);
+          final result = _runtime!.evaluate(
+            '__xyLoadLxPlugin(${jsonEncode(plugin.id)},${jsonEncode(source)})',
+            sourceUrl: p.basename(plugin.path),
+          );
+          if (result.isError) {
+            throw Exception(_friendlyError(result.stringResult));
+          }
+          final decoded = _decodeResult(result.stringResult);
+          if (decoded is! Map || decoded['ok'] != true) {
+            throw Exception('LX 插件初始化返回格式无效');
+          }
+          _loadedLx.add(plugin.id);
+        })
+        .whenComplete(() => _loadTasks.remove('${plugin.id}:lx'));
+  }
+
+  Future<dynamic> _callLxOnCurrentIsolate(
+    EnabledMusicPlugin plugin,
+    Map<String, dynamic> request,
+  ) async {
+    _activeRuntimeOperations++;
+    try {
+      await _ensureLxPlugin(plugin);
+      final expression =
+          '__xyCallLxPlugin(${jsonEncode(plugin.id)},'
+          '${jsonEncode(request)})';
+      final promise = _runtime!.evaluate(expression);
+      if (promise.isError) {
+        throw Exception(_friendlyError(promise.stringResult));
+      }
+      final result = await _runtime!.handlePromise(
+        promise,
+        timeout: const Duration(seconds: 30),
+      );
+      if (result.isError) {
+        throw Exception(_friendlyError(result.stringResult));
+      }
+      return _decodeResult(result.stringResult);
+    } finally {
+      _activeRuntimeOperations--;
+      if (_activeRuntimeOperations == 0 && _disposeRequested) {
+        _disposeNow();
+      }
+    }
   }
 
   Future<dynamic> _callOnCurrentIsolate(
@@ -339,6 +570,9 @@ class PluginRuntimeService {
     final bootstrap = await (_runtimeBootstrapTask ??= rootBundle.loadString(
       'assets/plugin_runtime.js',
     ));
+    final lxBootstrap = await rootBundle.loadString(
+      'assets/lx_plugin_runtime.js',
+    );
     final pluginSource = await _loadPluginSource(plugin);
     final request = <String, String>{
       'operation': operation,
@@ -347,6 +581,8 @@ class PluginRuntimeService {
       'pluginPath': plugin.path,
       'pluginSource': pluginSource,
       'bootstrap': bootstrap,
+      'lxBootstrap': lxBootstrap,
+      'userVariables': jsonEncode(plugin.userVariables),
       'payload': jsonEncode(payload),
     };
     final responseText = await Isolate.run(
@@ -414,25 +650,101 @@ class PluginRuntimeService {
   ) async {
     if (plugin.isLx) return _searchLxPlugin(plugin, artist.title);
     try {
-      final response = _runsPluginsInBackground
-          ? await _runPluginOperation(plugin, 'getArtistWorks', {
-              'rawData': artist.rawData,
-              'page': 1,
-              'type': 'music',
+      Future<List<Map<String, dynamic>>> fetchPage(int page) async {
+        final response = _runsPluginsInBackground
+            ? await _runPluginOperation(plugin, 'getArtistWorks', {
+                'rawData': artist.rawData,
+                'page': page,
+                'type': 'music',
+              })
+            : await _callOnCurrentIsolate(plugin, 'getArtistWorks', [
+                artist.rawData,
+                page,
+                'music',
+              ]);
+        return _extractResultList(response);
+      }
+
+      // B 站用户作品接口默认每页约 20～30 首，必须继续请求后续页。
+      // 不能用“本页少于 20 首”作为结束条件：不同版本插件的 page size
+      // 不一致，恰好 20 首时会被误认为只有一页。发现空页或重复页后停止，
+      // 避免某些旧插件忽略 page 参数时死循环。
+      final pages = <Map<String, dynamic>>[];
+      final seenItemKeys = <String>{};
+      Object? pageError;
+      // B 站 UP 主作品数量可能远超一页；上限只用于防止异常插件忽略
+      // page 参数时无限请求，正常情况下会在空页或重复页提前结束。
+      final maxPages = _isBilibiliPlugin(plugin) ? 100 : 1;
+      for (var page = 1; page <= maxPages; page++) {
+        late final List<Map<String, dynamic>> current;
+        try {
+          current = await fetchPage(page);
+        } catch (error) {
+          // 某些插件在后续页触发限流/接口错误；保留已经成功取得的
+          // 页面，避免整个详情页回退到只返回 20 首的普通搜索结果。
+          pageError = error;
+          break;
+        }
+        if (current.isEmpty) break;
+        final newItems = current
+            .where((item) {
+              // B 站部分插件会把 UP 主 mid 放进通用 id 字段，导致同一
+              // 页内所有作品被误判为重复；视频 ID 必须优先使用。
+              final id =
+                  item['bvid'] ??
+                  item['aid'] ??
+                  item['cid'] ??
+                  item['videoId'] ??
+                  item['id'] ??
+                  item['songId'] ??
+                  item['musicId'] ??
+                  item['mid'];
+              final identity = id?.toString().trim() ?? '';
+              final description =
+                  '${item['title'] ?? item['name'] ?? ''}|'
+                  '${item['artist'] ?? item['author'] ?? ''}|'
+                  '${item['duration'] ?? item['length'] ?? ''}';
+              // 某些 B 站插件的通用 id 实际是 UP 主 mid；把标题等
+              // 描述字段并入去重键，既能保留同一 UP 主的不同作品，
+              // 又能识别后续页是否只是重复返回第一页。
+              final key = identity.isNotEmpty
+                  ? (_isBilibiliPlugin(plugin)
+                        ? '$identity|$description'
+                        : identity)
+                  : description;
+              return seenItemKeys.add(key);
             })
-          : await _callOnCurrentIsolate(plugin, 'getArtistWorks', [
-              artist.rawData,
-              1,
-              'music',
-            ]);
-      final list = _extractResultList(response);
+            .toList(growable: false);
+        if (newItems.isEmpty) break;
+        pages.addAll(newItems);
+      }
+      final list = pages;
       if (list.isNotEmpty) {
+        // 常见的 B 站插件忽略 page 参数，getArtistWorks 只返回第一页
+        // （约 30 条）。检测到翻页没有新增内容时，改由宿主直接调用
+        // B 站空间投稿接口拉取 UP 主的全部投稿。
+        if (_isBilibiliPlugin(plugin) && list.length <= 30) {
+          try {
+            final direct = await _fetchBilibiliSpaceArcs(artist.rawData);
+            if (direct.length > list.length) {
+              return direct
+                  .map(
+                    (raw) =>
+                        _toSearchSong(plugin.id, _resetMediaItem(plugin, raw)),
+                  )
+                  .toList();
+            }
+          } catch (_) {
+            // 直连接口不可用时保留插件返回的第一页结果。
+          }
+        }
         return list
             .map(
               (raw) => _toSearchSong(plugin.id, _resetMediaItem(plugin, raw)),
             )
             .toList();
       }
+      if (pageError != null) throw pageError;
     } catch (_) {
       // 与桌面端一致：详情接口不可用时回退到普通歌曲搜索。
     }
@@ -491,27 +803,36 @@ class PluginRuntimeService {
         artist: true,
       );
     }
-    // Bilibili 的“歌手”实际上是 UP 主。不同版本的 B 站插件有的沿用
-    // MusicFree 的 artist 类型，有的则使用 user 类型；先走桌面端的
-    // artist 流程，返回空时再兼容 user，避免把 B 站用户误当成歌曲歌手。
-    List<Map<String, dynamic>> list;
-    Object? artistError;
-    try {
-      list = await _searchMusicFreeType(plugin, keyword, 'artist');
-    } catch (error) {
-      artistError = error;
-      list = const [];
-    }
-    if (list.isEmpty && _isBilibiliPlugin(plugin)) {
+    // Bilibili 的“歌手”实际上是 UP 主。部分插件把用户搜索暴露为
+    // user 类型，另一些插件仍使用 artist 类型；优先尝试 user，并且
+    // 只接受带有 mid/uid/uname 等用户字段的结果，避免把视频搜索结果
+    // 误显示成歌手。
+    List<Map<String, dynamic>> list = const [];
+    Object? lastError;
+    if (_isBilibiliPlugin(plugin)) {
+      // B 站歌手分类实际对应用户/UP 主。即便 user 和 artist 类型都
+      // 返回了内容，也只能接受明确带用户身份字段的对象；不能把未匹配
+      // 的候选内容继续当作 UP 主，否则会把专辑或歌曲标题显示在这里。
+      for (final type in const ['user', 'artist']) {
+        try {
+          final candidate = await _searchMusicFreeType(plugin, keyword, type);
+          final users = candidate.where(_looksLikeBilibiliUser).toList();
+          if (users.isNotEmpty) {
+            list = users;
+            break;
+          }
+        } catch (error) {
+          lastError = error;
+        }
+      }
+    } else {
       try {
-        list = await _searchMusicFreeType(plugin, keyword, 'user');
+        list = await _searchMusicFreeType(plugin, keyword, 'artist');
       } catch (error) {
-        if (artistError != null) rethrow;
+        lastError = error;
       }
     }
-    if (list.isEmpty && artistError != null) {
-      throw artistError;
-    }
+    if (list.isEmpty && lastError != null) throw lastError;
     return list
         .map(
           (raw) => _toCatalogResult(
@@ -522,6 +843,51 @@ class PluginRuntimeService {
         )
         .where((item) => item.title.isNotEmpty)
         .toList();
+  }
+
+  static bool _looksLikeBilibiliUser(Map<String, dynamic> raw) {
+    const fields = [
+      'mid',
+      'uid',
+      'userId',
+      'user_id',
+      'uname',
+      'upic',
+      'userName',
+      'nickname',
+      'username',
+      // B 站插件会把 bili_user 结果标准化成 name/id/avatar，
+      // 而不是保留接口原始的 uname/mid 字段。
+      'id',
+      'name',
+      'avatar',
+      'avatarUrl',
+    ];
+    final hasIdentity = fields.any((key) {
+      final value = raw[key];
+      return value != null && value.toString().trim().isNotEmpty;
+    });
+    if (!hasIdentity) return false;
+    // 搜索接口有时会把视频对象混在 user/artist 响应中；这些字段说明
+    // 当前对象是歌曲/视频，而不是 UP 主资料。
+    const mediaFields = [
+      'bvid',
+      'aid',
+      'songmid',
+      'songId',
+      'musicId',
+      'duration',
+      'durationMs',
+      'album',
+      'albumId',
+      'singer',
+      'artist',
+      'songName',
+      'trackName',
+    ];
+    return !mediaFields.any(
+      (key) => raw[key]?.toString().trim().isNotEmpty == true,
+    );
   }
 
   /// 搜索插件专辑。MF 直接调用插件的 album 类型；LX 仅保留专辑名匹配的结果。
@@ -548,6 +914,80 @@ class PluginRuntimeService {
           ),
         )
         .where((item) => item.title.isNotEmpty)
+        .toList();
+  }
+
+  /// 搜索插件歌单/专辑，用于探索页的个性化歌单推荐和搜索页歌单分类。
+  /// 不同 MusicFree 插件对歌单类型的命名并不完全一致，优先尝试
+  /// sheet，空结果时再回退 playlist；推荐场景可额外回退 album。
+  Future<List<PluginCatalogResult>> searchPlaylists(
+    EnabledMusicPlugin plugin,
+    String keyword, {
+    bool includeAlbums = true,
+  }) async {
+    if (plugin.isLx) return const [];
+    List<Map<String, dynamic>> list = const [];
+    final types = includeAlbums
+        ? const ['sheet', 'playlist', 'album']
+        : const ['sheet', 'playlist'];
+    for (final type in types) {
+      try {
+        list = await _searchMusicFreeType(plugin, keyword, type);
+      } catch (_) {
+        continue;
+      }
+      if (list.isNotEmpty) break;
+    }
+    return list
+        .map(
+          (raw) => _toCatalogResult(
+            plugin.id,
+            _resetMediaItem(plugin, raw),
+            artist: false,
+          ),
+        )
+        .where((item) => item.title.isNotEmpty)
+        .toList();
+  }
+
+  /// 获取插件提供的热门榜单。MusicFree 插件统一通过 getTopLists 暴露榜单，
+  /// 结果可能是扁平列表，也可能按分类嵌套在 data 中，因此统一转换为目录项。
+  Future<List<PluginCatalogResult>> getTopLists(
+    EnabledMusicPlugin plugin,
+  ) async {
+    if (plugin.isLx) return const [];
+    final response = _runsPluginsInBackground
+        ? await _runPluginOperation(plugin, 'getTopLists', null)
+        : await _callOnCurrentIsolate(plugin, 'getTopLists', []);
+    return _extractTopListItems(response)
+        .map(
+          (raw) => _toCatalogResult(
+            plugin.id,
+            _resetMediaItem(plugin, raw),
+            artist: false,
+          ),
+        )
+        .where((item) => item.title.isNotEmpty)
+        .toList();
+  }
+
+  /// 获取某个热门榜单内的歌曲，用于推荐页混入不依赖个人喜好的
+  /// 大众热门内容（类似 BakaMusic 推荐歌单的获取思路）。
+  Future<List<PluginSearchSong>> getTopListSongs(
+    EnabledMusicPlugin plugin,
+    PluginCatalogResult chart, {
+    int limit = 40,
+  }) async {
+    if (plugin.isLx) return const [];
+    final songs = await _loadMusicFreePlaylistSongs(
+      plugin,
+      Map<String, dynamic>.from(chart.rawData),
+      kind: 'top',
+    );
+    return songs
+        .take(limit)
+        .map((raw) => _toSearchSong(plugin.id, _resetMediaItem(plugin, raw)))
+        .where((item) => item.title.trim().isNotEmpty)
         .toList();
   }
 
@@ -1067,6 +1507,55 @@ class PluginRuntimeService {
         value.contains('b站');
   }
 
+  final Map<String, bool> _mvSupportCache = {};
+
+  /// 判断 MusicFree 插件是否声明了 `getMvSource` 扩展。不执行插件脚本，
+  /// 直接扫描插件源码，供菜单展示前快速判断（与用户变量声明扫描同一思路）。
+  Future<bool> pluginSupportsMvSource(EnabledMusicPlugin plugin) async {
+    if (plugin.isLx) return false;
+    final cached = _mvSupportCache[plugin.id];
+    if (cached != null) return cached;
+    bool supported = false;
+    try {
+      final source = await _loadPluginSource(plugin);
+      supported = source.contains('getMvSource');
+    } catch (_) {
+      supported = false;
+    }
+    _mvSupportCache[plugin.id] = supported;
+    return supported;
+  }
+
+  /// 参考 BakaMusic 的 canPlayMusicVideo：歌曲需携带 MV 标识字段，
+  /// 插件才有机会解析出 MV 播放源。
+  static bool hasMvIdentifier(Map<String, dynamic>? rawData) {
+    if (rawData == null || rawData.isEmpty) return false;
+    const keys = [
+      'mv',
+      'mvId',
+      'mvid',
+      'mvHash',
+      'mvVid',
+      'mvCopyrightId',
+      'videoId',
+      'is_video',
+      'bvid',
+    ];
+
+    bool check(Map<dynamic, dynamic> data) => keys.any((key) {
+      final value = data[key];
+      if (value == null) return false;
+      if (value is bool) return value;
+      if (value is num) return value != 0;
+      final text = value.toString().trim();
+      return text.isNotEmpty && text != '0' && text != 'false';
+    });
+
+    if (check(rawData)) return true;
+    final nested = rawData['rawData'];
+    return nested is Map && check(nested);
+  }
+
   static bool _looksLikeNeteaseTrack(Map<String, dynamic> raw) {
     for (final node in _nestedTrackNodes(raw)) {
       for (final key in const ['platform', 'source', 'vendor']) {
@@ -1315,23 +1804,189 @@ class PluginRuntimeService {
     Map<String, dynamic> rawData, {
     String? preferredQuality,
   }) async {
-    if (plugin.isLx) {
-      return _resolveLxMediaSource(rawData, preferredQuality: preferredQuality);
+    Future<PluginMediaSource> resolve(String? quality) async {
+      if (plugin.isLx) {
+        return _resolveLxMediaSource(
+          plugin,
+          rawData,
+          preferredQuality: quality,
+        );
+      }
+      if (_runsPluginsInBackground) {
+        final response = await _runPluginOperation(
+          plugin,
+          'resolveMediaSource',
+          {'rawData': rawData, 'preferredQuality': quality},
+        );
+        final source = _toMediaSource(response);
+        if (source == null) throw Exception('插件没有返回可播放地址');
+        return source;
+      }
+      return _resolveMediaSourceOnCurrentIsolate(
+        plugin,
+        rawData,
+        preferredQuality: quality,
+      );
     }
-    if (_runsPluginsInBackground) {
-      final response = await _runPluginOperation(plugin, 'resolveMediaSource', {
-        'rawData': rawData,
-        'preferredQuality': preferredQuality,
-      });
-      final source = _toMediaSource(response);
-      if (source == null) throw Exception('插件没有返回可播放地址');
-      return source;
+
+    try {
+      return await resolve(preferredQuality);
+    } catch (error) {
+      // 音质偏好是跨歌曲保存的，但插件支持的档位是逐首歌曲变化的。
+      // 某些插件遇到不支持的 super/母带档位会直接抛错，导致原本可播
+      // 的歌曲也被判定为播放失败；失败时用最兼容的 320k 再解析一次。
+      final preferred = preferredQuality?.trim() ?? '';
+      if (preferred.isEmpty || preferred.toLowerCase() == '320k') rethrow;
+      try {
+        return await resolve('320k');
+      } catch (_) {
+        rethrow;
+      }
     }
-    return _resolveMediaSourceOnCurrentIsolate(
-      plugin,
-      rawData,
-      preferredQuality: preferredQuality,
+  }
+
+  /// 探测当前歌曲和插件实际支持的音质。插件没有统一的音质枚举协议，
+  /// 所以先读取歌曲返回的音质元数据，再对没有声明的插件 token 调用一次
+  /// getMediaSource；只有返回有效 URL 才会展示给用户。
+  Future<List<String>> discoverQualities(
+    EnabledMusicPlugin plugin,
+    Map<String, dynamic> rawData, {
+    String? preferredQuality,
+  }) {
+    final future = _qualityDiscoveryCache.putIfAbsent(
+      _qualityCacheKey(plugin, rawData),
+      () => _discoverQualitiesUncached(plugin, rawData),
     );
+    return future.then((qualities) {
+      final preferred = preferredQuality?.trim() ?? '';
+      // 探测结果可能只包含当前音质能够解析出的子集。始终保留歌曲
+      // 元数据中声明的全部音质，避免用户切换音质后重新打开选择器时，
+      // 未被本次探测返回的母带/Hi-Res 等选项被覆盖掉。
+      final declared = _qualityTokensFromRaw(rawData);
+      final merged = <String>{...declared, ...qualities};
+      if (preferred.isNotEmpty) merged.add(preferred);
+      return merged.isEmpty ? const ['320k'] : merged.toList();
+    });
+  }
+
+  /// 在歌曲进入播放流程后预先触发探测，避免打开选择器时再次请求插件。
+  void preloadQualities(
+    EnabledMusicPlugin plugin,
+    Map<String, dynamic> rawData, {
+    String? preferredQuality,
+  }) {
+    unawaited(
+      discoverQualities(
+        plugin,
+        rawData,
+        preferredQuality: preferredQuality,
+      ).catchError((_) => const <String>[]),
+    );
+  }
+
+  String _qualityCacheKey(
+    EnabledMusicPlugin plugin,
+    Map<String, dynamic> rawData,
+  ) {
+    final id =
+        (rawData['id'] ??
+                rawData['songId'] ??
+                rawData['songmid'] ??
+                rawData['mid'] ??
+                rawData['hash'] ??
+                rawData['url'] ??
+                '${rawData['title'] ?? rawData['name']}:${rawData['artist'] ?? rawData['singer']}')
+            .toString();
+    return '${plugin.id}|$id';
+  }
+
+  Future<List<String>> _discoverQualitiesUncached(
+    EnabledMusicPlugin plugin,
+    Map<String, dynamic> rawData,
+  ) async {
+    final declared = _qualityTokensFromRaw(rawData);
+    final candidates = <String>{
+      ...declared,
+      if (declared.isEmpty) ..._qualityDiscoveryFallback,
+    }.toList();
+    if (_runsPluginsInBackground && !plugin.isLx) {
+      try {
+        final response = await _runPluginOperation(
+          plugin,
+          'discoverQualities',
+          {'rawData': rawData, 'qualities': candidates},
+        );
+        if (response is List) {
+          final discovered = response
+              .map((value) => value.toString().trim())
+              .where((value) => value.isNotEmpty)
+              .toList();
+          if (discovered.isNotEmpty) {
+            // 插件探测通常只报告本次请求成功的音质，不能用它覆盖
+            // 歌曲返回的声明列表；两者取并集才能稳定保留所有选项。
+            return <String>{...declared, ...discovered}.toList();
+          }
+        }
+      } catch (_) {
+        // 后台探测失败时继续走当前 isolate 的兼容路径。
+      }
+    }
+    final supported = <String>[];
+    for (final quality in candidates) {
+      try {
+        final ok = plugin.isLx
+            ? await _probeLxQuality(plugin, rawData, quality)
+            : await _probeMusicFreeQuality(plugin, rawData, quality);
+        if (ok) supported.add(quality);
+      } catch (_) {
+        // 单一音质探测失败不应阻断整个选择器。
+      }
+    }
+    if (supported.isNotEmpty) return supported;
+    // 某些插件只在真正解析时返回地址，保留声明值让用户仍可选择；
+    // 没有任何声明时至少保留当前档位，播放逻辑会继续执行兼容回退。
+    if (declared.isNotEmpty) return declared;
+    return const ['320k'];
+  }
+
+  Future<bool> _probeMusicFreeQuality(
+    EnabledMusicPlugin plugin,
+    Map<String, dynamic> rawData,
+    String quality,
+  ) async {
+    dynamic response;
+    if (_runsPluginsInBackground) {
+      response = await _runPluginOperation(plugin, 'probeMediaSource', {
+        'rawData': rawData,
+        'quality': quality,
+      }).timeout(const Duration(seconds: 5));
+    } else {
+      response = await _callOnCurrentIsolate(plugin, 'getMediaSource', [
+        rawData,
+        quality,
+      ]).timeout(const Duration(seconds: 5));
+    }
+    return _toMediaSource(response) != null;
+  }
+
+  Future<bool> _probeLxQuality(
+    EnabledMusicPlugin plugin,
+    Map<String, dynamic> rawData,
+    String quality,
+  ) async {
+    final value = rawData['lx'];
+    if (value is! Map) return false;
+    final songInfo = Map<String, dynamic>.from(value);
+    try {
+      final response = await _callLxOnCurrentIsolate(plugin, {
+        'action': 'musicUrl',
+        'source': songInfo['source']?.toString() ?? '',
+        'info': {'type': quality, 'musicInfo': songInfo},
+      }).timeout(const Duration(seconds: 5));
+      final url = response?.toString().trim() ?? '';
+      if (_isHttpUrl(url)) return true;
+    } catch (_) {}
+    return false;
   }
 
   /// 获取 Bilibili 视频流。优先调用电脑版 MusicFree 插件提供的
@@ -1385,6 +2040,41 @@ class PluginRuntimeService {
     return _toVideoSource(response);
   }
 
+  /// 获取非 B 站插件歌曲的 MV 播放源。参考 BakaMusic 的
+  /// getMvSource 实现：直接调用 MusicFree 插件的 `getMvSource` 扩展，
+  /// 不附加 B 站 Referer 请求头。
+  Future<PluginVideoSource> resolveMvSource(
+    EnabledMusicPlugin plugin,
+    Map<String, dynamic> rawData, {
+    String? videoQuality,
+  }) async {
+    if (plugin.isLx) throw Exception('LX 插件不支持 MV 播放');
+    final response = _runsPluginsInBackground
+        ? await _runPluginOperation(plugin, 'resolveMvSource', {
+            'rawData': rawData,
+            'videoQuality': videoQuality ?? '1080P',
+          })
+        : await _callOnCurrentIsolate(plugin, 'getMvSource', [
+            _videoPluginItem(plugin, rawData),
+            videoQuality ?? '1080P',
+          ]);
+    final source = _toMvSource(response);
+    if (source == null) throw Exception('插件没有返回可播放的 MV 地址');
+    return source;
+  }
+
+  Future<PluginVideoSource?> _resolveMvSourceOnCurrentIsolate(
+    EnabledMusicPlugin plugin,
+    Map<String, dynamic> rawData, {
+    String? videoQuality,
+  }) async {
+    final response = await _callOnCurrentIsolate(plugin, 'getMvSource', [
+      _videoPluginItem(plugin, rawData),
+      videoQuality ?? '1080P',
+    ]);
+    return _toMvSource(response);
+  }
+
   static Map<String, dynamic> _videoPluginItem(
     EnabledMusicPlugin plugin,
     Map<String, dynamic> rawData,
@@ -1403,6 +2093,7 @@ class PluginRuntimeService {
   }
 
   Future<PluginMediaSource> _resolveLxMediaSource(
+    EnabledMusicPlugin plugin,
     Map<String, dynamic> rawData, {
     String? preferredQuality,
   }) async {
@@ -1410,7 +2101,28 @@ class PluginRuntimeService {
     if (value is! Map) throw Exception('LX 歌曲缺少音源元数据');
     final songInfo = Map<String, dynamic>.from(value);
     Object? lastError;
-    for (final quality in pluginQualityCandidates(preferredQuality)) {
+    final qualities = pluginQualityCandidates(preferredQuality);
+    // 先完整尝试插件自己的接口。自定义 LX 音源通常只支持部分音质，
+    // 不能因为第一档音质失败就立刻等待公共接口超时。
+    for (final quality in qualities) {
+      try {
+        final response = await _callLxOnCurrentIsolate(plugin, {
+          'action': 'musicUrl',
+          'source': songInfo['source']?.toString() ?? '',
+          'info': {'type': quality, 'musicInfo': songInfo},
+        });
+        final pluginUrl = response?.toString().trim() ?? '';
+        if (pluginUrl.startsWith('http://') ||
+            pluginUrl.startsWith('https://')) {
+          return PluginMediaSource(url: _normalizeMediaUrl(pluginUrl));
+        }
+      } catch (error) {
+        lastError = error;
+      }
+    }
+    // Older LX plugins may only expose the public resolver; keep it as a
+    // compatibility fallback after the custom handler has been exhausted.
+    for (final quality in qualities) {
       try {
         final response = await lxResolveUrl(
           songInfoJson: jsonEncode(songInfo),
@@ -1420,7 +2132,9 @@ class PluginRuntimeService {
         final url = decoded is Map
             ? decoded['url']?.toString().trim() ?? ''
             : '';
-        if (url.isNotEmpty) return PluginMediaSource(url: url);
+        if (url.isNotEmpty) {
+          return PluginMediaSource(url: _normalizeMediaUrl(url));
+        }
       } catch (error) {
         lastError = error;
       }
@@ -1621,7 +2335,7 @@ class PluginRuntimeService {
 
   static PluginMediaSource? _toMediaSource(dynamic value) {
     if (value is String && _isHttpUrl(value)) {
-      return PluginMediaSource(url: value);
+      return PluginMediaSource(url: _normalizeMediaUrl(value));
     }
     if (value is! Map) return null;
     final url = value['url']?.toString().trim() ?? '';
@@ -1634,7 +2348,7 @@ class PluginRuntimeService {
       }
     }
     return PluginMediaSource(
-      url: url,
+      url: _normalizeMediaUrl(url),
       headers: headers,
       lyrics: _extractLyrics(value),
     );
@@ -1692,6 +2406,224 @@ class PluginRuntimeService {
           ? value['mimeType'].toString().trim()
           : 'video/mp4',
     );
+  }
+
+  /// MV 播放源归一化。与 [_toVideoSource] 的区别：不强制注入 B 站
+  /// Referer/Origin，其他插件的 MV 服务器可能校验自己的 Referer。
+  static PluginVideoSource? _toMvSource(dynamic value) {
+    if (value is String && _isHttpUrl(value.trim())) {
+      return PluginVideoSource(url: value.trim());
+    }
+    if (value is! Map) return null;
+    final url =
+        (value['url'] ?? value['baseUrl'] ?? value['base_url'])
+            ?.toString()
+            .trim() ??
+        '';
+    if (!_isHttpUrl(url)) return null;
+    final headers = <String, String>{};
+    final rawHeaders = value['headers'];
+    if (rawHeaders is Map) {
+      for (final entry in rawHeaders.entries) {
+        headers[entry.key.toString()] = entry.value.toString();
+      }
+    }
+    final userAgent = value['userAgent']?.toString().trim() ?? '';
+    if (userAgent.isNotEmpty) {
+      headers.putIfAbsent('User-Agent', () => userAgent);
+    }
+    final backups = <String>[];
+    for (final key in const [
+      'backupUrls',
+      'backup_urls',
+      'backupUrl',
+      'backup_url',
+    ]) {
+      final raw = value[key];
+      if (raw is Iterable) {
+        backups.addAll(
+          raw
+              .map((item) => item.toString().trim())
+              .where((item) => _isHttpUrl(item)),
+        );
+      } else if (raw is String && _isHttpUrl(raw.trim())) {
+        backups.add(raw.trim());
+      }
+    }
+    return PluginVideoSource(
+      url: url,
+      backupUrls: backups,
+      headers: headers,
+      mimeType: value['mimeType']?.toString().trim().isNotEmpty == true
+          ? value['mimeType'].toString().trim()
+          : 'video/mp4',
+    );
+  }
+
+  static const _bilibiliSpaceHeaders = {
+    'User-Agent':
+        'Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 '
+        '(KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36',
+    'Referer': 'https://www.bilibili.com/',
+    'Origin': 'https://www.bilibili.com',
+  };
+
+  /// B 站 wbi 签名混淆表。签名算法：取 imgKey+subKey 按本表取前 32 位
+  /// 得 mixinKey，查询参数按 key 排序拼接后追加 mixinKey 取 md5。
+  static const _wbiMixinTable = [
+    46, 47, 18, 2, 53, 8, 23, 32, 15, 50, 10, 31, 58, 3, 45, 35, 27, 43, 5,
+    49, 33, 9, 42, 19, 29, 28, 14, 39, 12, 38, 41, 13, 37, 48, 7, 16, 24, 55,
+    40, 61, 26, 17, 0, 1, 60, 51, 30, 4, 22, 25, 54, 21, 56, 59, 6, 63, 57,
+    62, 11, 36, 20, 34, 44, 52,
+  ];
+
+  static String? _cachedWbiMixinKey;
+  static DateTime? _cachedWbiMixinKeyAt;
+
+  Future<String?> _bilibiliWbiMixinKey() async {
+    // wbi 密钥每天轮换，缓存一小时足够。
+    final cachedAt = _cachedWbiMixinKeyAt;
+    if (_cachedWbiMixinKey != null &&
+        cachedAt != null &&
+        DateTime.now().difference(cachedAt) < const Duration(hours: 1)) {
+      return _cachedWbiMixinKey;
+    }
+    final response = await _rawGet(
+      Uri.https('api.bilibili.com', '/x/web-interface/nav'),
+      headers: _bilibiliSpaceHeaders,
+    );
+    final decoded = jsonDecode(
+      utf8.decode(response.bodyBytes, allowMalformed: true),
+    );
+    if (decoded is! Map || decoded['data'] is! Map) return null;
+    final wbi = (decoded['data'] as Map)['wbi_img'];
+    if (wbi is! Map) return null;
+    String keyFromUrl(dynamic url) =>
+        url?.toString().split('/').last.split('.').first ?? '';
+    final combined =
+        keyFromUrl(wbi['img_url']) + keyFromUrl(wbi['sub_url']);
+    if (combined.length < 64) return null;
+    final buffer = StringBuffer();
+    for (final index in _wbiMixinTable) {
+      buffer.write(combined[index]);
+      if (buffer.length == 32) break;
+    }
+    final key = buffer.toString();
+    if (key.length != 32) return null;
+    _cachedWbiMixinKey = key;
+    _cachedWbiMixinKeyAt = DateTime.now();
+    return key;
+  }
+
+  String _wbiSignedQuery(Map<String, String> params, String mixinKey) {
+    final sortedKeys = params.keys.toList()..sort();
+    final query = sortedKeys
+        .map((key) => '$key=${Uri.encodeComponent(params[key]!)}')
+        .join('&');
+    final wRid = md5.convert(utf8.encode('$query$mixinKey')).toString();
+    return '$query&w_rid=$wRid';
+  }
+
+  /// 从 UP 主条目中提取 mid。
+  static String _extractBilibiliMid(Map<String, dynamic> raw) {
+    bool isMid(String value) => RegExp(r'^\d{2,16}$').hasMatch(value);
+    for (final key in const ['mid', 'uid', 'userId']) {
+      final value = raw[key]?.toString().trim() ?? '';
+      if (isMid(value)) return value;
+    }
+    for (final node in _nestedTrackNodes(raw)) {
+      for (final key in const ['mid', 'uid', 'userId']) {
+        final value = node[key]?.toString().trim() ?? '';
+        if (isMid(value)) return value;
+      }
+    }
+    // 兜底：某些插件把 mid 放在通用 id 字段。
+    for (final node in _nestedTrackNodes(raw)) {
+      final value = node['id']?.toString().trim() ?? '';
+      if (isMid(value)) return value;
+    }
+    return '';
+  }
+
+  /// 直接调用 B 站空间投稿接口，分页拉取 UP 主的全部投稿视频。
+  /// 插件的 getArtistWorks 大多忽略 page 参数只返回第一页，这里在
+  /// 翻页检测失效时作为兜底，保证可以看到 UP 主的更多作品。
+  Future<List<Map<String, dynamic>>> _fetchBilibiliSpaceArcs(
+    Map<String, dynamic> rawData,
+  ) async {
+    final mid = _extractBilibiliMid(rawData);
+    if (mid.isEmpty) return const [];
+    final mixinKey = await _bilibiliWbiMixinKey();
+    final result = <Map<String, dynamic>>[];
+    const ps = 30;
+    // 上限 50 页（1500 个投稿）防止异常数据导致无限请求。
+    for (var pn = 1; pn <= 50; pn++) {
+      final params = <String, String>{
+        'mid': mid,
+        'pn': '$pn',
+        'ps': '$ps',
+        'order': 'pubdate',
+        'platform': 'web',
+        'web_location': '1550101',
+        'order_avoided': 'true',
+      };
+      final query = mixinKey == null
+          ? params.entries
+                .map((entry) => '${entry.key}=${entry.value}')
+                .join('&')
+          : _wbiSignedQuery(params, mixinKey);
+      final queryMap = <String, String>{};
+      for (final pair in query.split('&')) {
+        final index = pair.indexOf('=');
+        if (index > 0) {
+          queryMap[pair.substring(0, index)] = pair.substring(index + 1);
+        }
+      }
+      final response = await _rawGet(
+        Uri.https('api.bilibili.com', '/x/space/wbi/arc/search', queryMap),
+        headers: _bilibiliSpaceHeaders,
+      );
+      if (response.statusCode < 200 || response.statusCode >= 300) {
+        throw Exception('Bilibili 空间接口失败：HTTP ${response.statusCode}');
+      }
+      final decoded = jsonDecode(
+        utf8.decode(response.bodyBytes, allowMalformed: true),
+      );
+      if (decoded is! Map) {
+        throw Exception('Bilibili 空间接口返回了无效数据');
+      }
+      final code = decoded['code'];
+      if (code is num && code != 0) {
+        throw Exception(
+          'Bilibili 空间接口失败'
+          '${decoded['message'] == null ? '' : '：${decoded['message']}'}',
+        );
+      }
+      final data = decoded['data'];
+      final vlist = data is Map && data['list'] is Map
+          ? (data['list'] as Map)['vlist']
+          : null;
+      if (vlist is! List || vlist.isEmpty) break;
+      for (final item in vlist) {
+        if (item is! Map) continue;
+        final bvid = item['bvid']?.toString().trim() ?? '';
+        if (bvid.isEmpty) continue;
+        result.add({
+          'id': bvid,
+          'bvid': bvid,
+          'title': item['title'],
+          'artist': item['author'],
+          'author': item['author'],
+          'album': 'B站投稿',
+          'length': item['length'],
+          'duration': item['length'],
+          'pic': item['pic'],
+          'cover': item['pic'],
+        });
+      }
+      if (vlist.length < ps) break;
+    }
+    return result;
   }
 
   Future<PluginVideoSource?> _resolveBilibiliVideoSource(
@@ -2008,14 +2940,18 @@ class PluginRuntimeService {
   static PluginMediaSource? _extractDirectUrl(Map<String, dynamic> raw) {
     for (final key in const ['url', 'playUrl', 'play_url', 'src']) {
       final value = raw[key]?.toString().trim() ?? '';
-      if (_isHttpUrl(value)) return PluginMediaSource(url: value);
+      if (_isHttpUrl(value)) {
+        return PluginMediaSource(url: _normalizeMediaUrl(value));
+      }
     }
     final qualities = raw['qualities'];
     if (qualities is Map) {
       for (final value in qualities.values) {
         if (value is Map) {
           final url = value['url']?.toString().trim() ?? '';
-          if (_isHttpUrl(url)) return PluginMediaSource(url: url);
+          if (_isHttpUrl(url)) {
+            return PluginMediaSource(url: _normalizeMediaUrl(url));
+          }
         }
       }
     }
@@ -2024,6 +2960,21 @@ class PluginRuntimeService {
 
   static bool _isHttpUrl(String value) =>
       value.startsWith('https://') || value.startsWith('http://');
+
+  /// 部分音源服务仍返回酷我 CDN 的明文地址。Android 新版播放器和部分
+  /// ROM 会在播放器层拒绝这类地址，即使应用已允许明文请求，最终表现为
+  /// 一直加载。该 CDN 同时提供 HTTPS，优先升级到 HTTPS；其他域名保留
+  /// 原地址，避免破坏只支持 HTTP 的插件音源。
+  static String _normalizeMediaUrl(String value) {
+    final normalized = value.trim();
+    final uri = Uri.tryParse(normalized);
+    final host = uri?.host.toLowerCase() ?? '';
+    if (uri?.scheme.toLowerCase() == 'http' &&
+        (host == 'car-bj.kuwo.cn' || host.endsWith('.kuwo.cn'))) {
+      return uri!.replace(scheme: 'https').toString();
+    }
+    return normalized;
+  }
 
   static String _normalizeImageUrl(String value) {
     var normalized = value.trim();
@@ -2330,10 +3281,16 @@ class PluginRuntimeService {
     _initializing = null;
     _disposeRequested = false;
     _loaded.clear();
+    _loadedLx.clear();
     _pluginSourceTasks.clear();
     _neteaseTrackMetaCache.clear();
+    _qualityDiscoveryCache.clear();
   }
 }
+
+/// 判断一个已启用插件是否为哔哩哔哩音源，供搜索页按平台显示“UP主”分类。
+bool isBilibiliPluginSource(EnabledMusicPlugin plugin) =>
+    PluginRuntimeService._isBilibiliPlugin(plugin);
 
 class _NeteaseTrackMeta {
   const _NeteaseTrackMeta({required this.coverUrl, required this.durationMs});
@@ -2350,6 +3307,21 @@ String extractPluginCoverUrl(Map<String, dynamic> raw) =>
 String neteasePicIdToCoverUrl(String picId) =>
     PluginRuntimeService._neteasePicIdToUrl(picId);
 
+Map<String, String> _decodeUserVariables(String? raw) {
+  if (raw == null || raw.isEmpty) return const {};
+  try {
+    final decoded = jsonDecode(raw);
+    if (decoded is! Map) return const {};
+    return {
+      for (final entry in decoded.entries)
+        if (entry.value is String)
+          entry.key.toString(): entry.value as String,
+    };
+  } catch (_) {
+    return const {};
+  }
+}
+
 Future<String> _executePluginOperationInBackground(
   Map<String, String> request,
 ) async {
@@ -2357,6 +3329,7 @@ Future<String> _executePluginOperationInBackground(
   final service = PluginRuntimeService(
     httpClient: client,
     runtimeBootstrap: request['bootstrap'],
+    runtimeLxBootstrap: request['lxBootstrap'],
     pluginSources: {request['pluginId'] ?? '': request['pluginSource'] ?? ''},
   );
   try {
@@ -2364,6 +3337,7 @@ Future<String> _executePluginOperationInBackground(
       id: request['pluginId'] ?? '',
       name: request['pluginName'] ?? '',
       path: request['pluginPath'] ?? '',
+      userVariables: _decodeUserVariables(request['userVariables']),
     );
     final payload = jsonDecode(request['payload'] ?? 'null');
     dynamic data;
@@ -2405,6 +3379,9 @@ Future<String> _executePluginOperationInBackground(
           ]);
           break;
         }
+      case 'getTopLists':
+        data = await service._callOnCurrentIsolate(plugin, 'getTopLists', []);
+        break;
       case 'resolveMediaSource':
         if (payload is! Map) throw Exception('歌曲信息格式无效');
         final wrappedRawData = payload['rawData'];
@@ -2425,6 +3402,50 @@ Future<String> _executePluginOperationInBackground(
           'lyrics': source.lyrics,
         };
         break;
+      case 'probeMediaSource':
+        if (payload is! Map || payload['rawData'] is! Map) {
+          throw Exception('歌曲信息格式无效');
+        }
+        final payloadMap = Map<String, dynamic>.from(payload);
+        final rawData = Map<String, dynamic>.from(payloadMap['rawData'] as Map);
+        final quality = payloadMap['quality']?.toString() ?? '';
+        final response = await service._callOnCurrentIsolate(
+          plugin,
+          'getMediaSource',
+          [rawData, quality],
+        );
+        data = PluginRuntimeService._toMediaSource(response) != null;
+        break;
+      case 'discoverQualities':
+        if (payload is! Map || payload['rawData'] is! Map) {
+          throw Exception('歌曲信息格式无效');
+        }
+        final payloadMap = Map<String, dynamic>.from(payload);
+        final rawData = Map<String, dynamic>.from(payloadMap['rawData'] as Map);
+        final values = payloadMap['qualities'] is List
+            ? (payloadMap['qualities'] as List)
+                  .map((value) => value.toString())
+                  .where((value) => value.trim().isNotEmpty)
+                  .toList()
+            : const <String>[];
+        final supported = <String>[];
+        for (final quality in values) {
+          try {
+            final response = await service
+                ._callOnCurrentIsolate(plugin, 'getMediaSource', [
+                  rawData,
+                  quality,
+                ])
+                .timeout(const Duration(seconds: 4));
+            if (PluginRuntimeService._toMediaSource(response) != null) {
+              supported.add(quality);
+            }
+          } catch (_) {
+            // 该档位不可用，继续探测其余档位。
+          }
+        }
+        data = supported;
+        break;
       case 'resolveVideoSource':
         if (payload is! Map || payload['rawData'] is! Map) {
           throw Exception('视频歌曲信息格式无效');
@@ -2437,6 +3458,25 @@ Future<String> _executePluginOperationInBackground(
           videoQuality: payloadMap['videoQuality']?.toString(),
         );
         if (source == null) throw Exception('插件没有返回视频地址');
+        data = {
+          'url': source.url,
+          'backupUrls': source.backupUrls,
+          'headers': source.headers,
+          'mimeType': source.mimeType,
+        };
+        break;
+      case 'resolveMvSource':
+        if (payload is! Map || payload['rawData'] is! Map) {
+          throw Exception('MV 歌曲信息格式无效');
+        }
+        final payloadMap = Map<String, dynamic>.from(payload);
+        final rawData = Map<String, dynamic>.from(payloadMap['rawData'] as Map);
+        final source = await service._resolveMvSourceOnCurrentIsolate(
+          plugin,
+          rawData,
+          videoQuality: payloadMap['videoQuality']?.toString(),
+        );
+        if (source == null) throw Exception('插件没有返回 MV 地址');
         data = {
           'url': source.url,
           'backupUrls': source.backupUrls,
@@ -2514,16 +3554,32 @@ class _PluginProxyHttpClient extends http.BaseClient {
   @override
   Future<http.StreamedResponse> send(http.BaseRequest request) async {
     final bodyBytes = await request.finalize().toBytes();
-    final responseJson = await pluginHttpRequest(
-      method: request.method,
-      url: request.url.toString(),
-      headersJson: jsonEncode(request.headers),
-      body: bodyBytes.isEmpty
-          ? null
-          : utf8.decode(bodyBytes, allowMalformed: true),
-      timeout: BigInt.from(20),
-      follow: 10,
-    );
+    String responseJson;
+    try {
+      responseJson = await pluginHttpRequest(
+        method: request.method,
+        url: request.url.toString(),
+        headersJson: jsonEncode(request.headers),
+        body: bodyBytes.isEmpty
+            ? null
+            : utf8.decode(bodyBytes, allowMalformed: true),
+        timeout: BigInt.from(20),
+        follow: 10,
+      );
+    } catch (error) {
+      // QuickJS XHR expects an HTTP response even when the native request
+      // cannot connect. Returning a synthetic 599 response lets the plugin
+      // reject the current operation normally instead of creating an
+      // unhandled isolate error that replaces the whole app screen.
+      final body = jsonEncode({'code': 599, 'message': error.toString()});
+      return http.StreamedResponse(
+        Stream.value(utf8.encode(encodePluginHttpBody(body))),
+        599,
+        headers: const {'content-type': 'application/json'},
+        request: request,
+        reasonPhrase: 'Plugin network request failed',
+      );
+    }
     final response = jsonDecode(responseJson) as Map<String, dynamic>;
     final responseBody = response['body']?.toString() ?? '';
     final headers = <String, String>{};

@@ -6,8 +6,10 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:permission_handler/permission_handler.dart';
 
 import '../../src/library/library_provider.dart';
+import '../../src/core/settings.dart';
 import '../../src/library/scan_settings_provider.dart';
 import '../../src/navigation/animated_page_route.dart';
+import '../../src/navigation/routes.dart';
 import '../../src/navigation/sidebar_controller.dart';
 import '../../src/widgets/song_list_view.dart';
 import '../../src/widgets/top_notice.dart';
@@ -129,12 +131,19 @@ class _LibraryPageState extends ConsumerState<LibraryPage>
   @override
   Widget build(BuildContext context) {
     final lib = ref.watch(libraryProvider);
+    final sidebarOnRight = ref.watch(
+      settingsProvider.select(
+        (value) => value.valueOrNull?.sidebarPosition == SidebarPosition.right,
+      ),
+    );
 
     return Scaffold(
       appBar: AppBar(
-        leading: const AppSidebarMenuButton(),
+        automaticallyImplyLeading: !sidebarOnRight,
+        leading: sidebarOnRight ? null : const AppSidebarMenuButton(),
         title: const Text('本地音乐'),
         actions: [
+          if (sidebarOnRight) const AppSidebarMenuButton(),
           if (_visibleTab == 3)
             IconButton(
               tooltip: '添加文件夹',
@@ -223,6 +232,40 @@ class _AllSongsTab extends ConsumerStatefulWidget {
 
 class _AllSongsTabState extends ConsumerState<_AllSongsTab> {
   String _query = '';
+  final TextEditingController _controller = TextEditingController();
+
+  /// 音乐库分支的顶层路径。切换到其它页面（侧栏分支、播放页、搜索页）
+  /// 再回来时搜索框内容应被清空；分支容器会保留各页面 State，TabBarView
+  /// 的销毁机制覆盖不到分支切换，所以在这里监听全局路由变化主动清理。
+  static const _libraryPathSegments = {
+    'library',
+    'local-music',
+    'artists',
+    'albums',
+    'folders',
+  };
+
+  void _handleRouteChanged() {
+    if (!mounted || _query.isEmpty && _controller.text.isEmpty) return;
+    final path = appRouter.routerDelegate.currentConfiguration.uri.path;
+    final segment = path.split('/').where((s) => s.isNotEmpty).firstOrNull;
+    if (segment != null && _libraryPathSegments.contains(segment)) return;
+    _controller.clear();
+    setState(() => _query = '');
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    appRouter.routerDelegate.addListener(_handleRouteChanged);
+  }
+
+  @override
+  void dispose() {
+    appRouter.routerDelegate.removeListener(_handleRouteChanged);
+    _controller.dispose();
+    super.dispose();
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -242,6 +285,7 @@ class _AllSongsTabState extends ConsumerState<_AllSongsTab> {
         Padding(
           padding: const EdgeInsets.fromLTRB(12, 8, 12, 4),
           child: TextField(
+            controller: _controller,
             onChanged: (v) => setState(() => _query = v.trim().toLowerCase()),
             decoration: InputDecoration(
               hintText: '搜索歌曲、歌手、专辑',

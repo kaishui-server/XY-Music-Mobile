@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:file_picker/file_picker.dart';
@@ -7,16 +8,20 @@ import 'package:go_router/go_router.dart';
 import 'package:path/path.dart' as p;
 
 import '../../src/core/settings.dart';
+import '../../src/player/android_storage.dart';
+import '../../src/core/platform_capabilities.dart';
 import '../../src/core/db_path.dart';
 import '../../src/auth/auth_provider.dart';
 import '../../src/navigation/sidebar_controller.dart';
 import '../../src/player/desktop_lyrics.dart';
 import '../../src/ui/xy_surface.dart';
+import '../../src/widgets/top_notice.dart';
 
 enum SettingsSection {
   root,
   account,
   appearance,
+  layout,
   playback,
   playbackDetail,
   lyrics,
@@ -69,6 +74,13 @@ const settingsSearchEntries = <SettingsSearchEntry>[
     keywords: '音量 音质 屏幕常亮',
   ),
   SettingsSearchEntry(
+    title: '布局',
+    path: ['布局'],
+    route: '/settings/layout',
+    icon: Icons.view_quilt_outlined,
+    keywords: '顶栏 侧边栏 位置 左上 右上',
+  ),
+  SettingsSearchEntry(
     title: '歌词',
     path: ['歌词'],
     route: '/settings/playback-detail',
@@ -95,6 +107,13 @@ const settingsSearchEntries = <SettingsSearchEntry>[
     route: '/settings/download',
     icon: Icons.download_outlined,
     keywords: '保存 路径 音质 歌词',
+  ),
+  SettingsSearchEntry(
+    title: '每次下载是否询问细节',
+    path: ['下载', '每次下载是否询问细节'],
+    route: '/settings/download',
+    icon: Icons.tune_rounded,
+    keywords: '询问 不询问 下载弹窗',
   ),
   SettingsSearchEntry(
     title: '其他',
@@ -130,6 +149,34 @@ const settingsSearchEntries = <SettingsSearchEntry>[
     route: '/settings/appearance',
     icon: Icons.color_lens_outlined,
     keywords: '颜色 强调色',
+  ),
+  SettingsSearchEntry(
+    title: '动态取色',
+    path: ['外观', '动态取色'],
+    route: '/settings/appearance',
+    icon: Icons.auto_awesome_outlined,
+    keywords: 'Material You 安卓12 系统颜色 壁纸取色',
+  ),
+  SettingsSearchEntry(
+    title: '播放详情页背景',
+    path: ['外观', '播放详情页背景'],
+    route: '/settings/appearance',
+    icon: Icons.wallpaper_outlined,
+    keywords: '封面模糊 壁纸模糊 流光 自定义图片',
+  ),
+  SettingsSearchEntry(
+    title: '侧边栏位置',
+    path: ['布局', '顶栏布局', '侧边栏位置'],
+    route: '/settings/layout',
+    icon: Icons.swap_horiz_rounded,
+    keywords: '左上 右上 菜单按钮',
+  ),
+  SettingsSearchEntry(
+    title: '侧边栏布局',
+    path: ['布局', '侧边栏布局'],
+    route: '/settings/layout',
+    icon: Icons.view_sidebar_outlined,
+    keywords: '菜单 显示 隐藏 开关 拖拽 排序',
   ),
   SettingsSearchEntry(
     title: '音量',
@@ -171,11 +218,18 @@ const settingsSearchEntries = <SettingsSearchEntry>[
     keywords: '逐字歌词 动画',
   ),
   SettingsSearchEntry(
+    title: '歌词字号',
+    path: ['歌词', '播放详情页歌词', '歌词字号'],
+    route: '/settings/lyrics',
+    icon: Icons.format_size_outlined,
+    keywords: '字体 大小 歌词大小',
+  ),
+  SettingsSearchEntry(
     title: '桌面歌词',
     path: ['歌词', '桌面歌词'],
     route: '/settings/desktop-lyrics',
     icon: Icons.subtitles_outlined,
-    keywords: '悬浮歌词 桌面歌词 浮窗',
+    keywords: '悬浮歌词 桌面歌词 浮窗 逐字效果',
   ),
   SettingsSearchEntry(
     title: '扫描文件夹',
@@ -350,6 +404,7 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
     final settings = ref.watch(settingsProvider).valueOrNull;
     final notifier = ref.read(settingsProvider.notifier);
     final auth = ref.watch(authProvider);
+    final dynamicColorSupported = ref.watch(dynamicColorSupportedProvider);
 
     final children = switch (section) {
       SettingsSection.root => [
@@ -373,6 +428,13 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
           title: '外观',
           subtitle: '主题模式与主题色',
           route: '/settings/appearance',
+        ),
+        _categoryTile(
+          context,
+          icon: Icons.view_quilt_outlined,
+          title: '布局',
+          subtitle: '顶栏位置与侧边栏排序',
+          route: '/settings/layout',
         ),
         _categoryTile(
           context,
@@ -449,16 +511,98 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
           ),
           onTap: () => _pickAccentColor(context, ref, settings),
         ),
+        _dynamicColorTile(
+          context,
+          settings: settings,
+          supported: dynamicColorSupported.valueOrNull == true,
+          loading: dynamicColorSupported.isLoading,
+          onChanged: (value) => notifier.setDynamicColor(value),
+        ),
         _tile(
           context,
           icon: Icons.wallpaper_outlined,
-          title: '自定义背景',
+          title: '自定义壁纸',
           trailing: Text(
             settings?.customBackgroundPath.trim().isNotEmpty == true
                 ? '已启用'
                 : '未设置',
           ),
           onTap: () => _editCustomBackground(context, ref, settings),
+        ),
+        _tile(
+          context,
+          icon: Icons.wallpaper_outlined,
+          title: '播放详情页背景',
+          trailing: DropdownButtonHideUnderline(
+            child: DropdownButton<PlayerDetailBackgroundMode>(
+              value:
+                  settings?.playerDetailBackgroundMode ??
+                  PlayerDetailBackgroundMode.coverBlur,
+              isDense: true,
+              alignment: AlignmentDirectional.centerEnd,
+              items: PlayerDetailBackgroundMode.values
+                  .map(
+                    (mode) => DropdownMenuItem<PlayerDetailBackgroundMode>(
+                      value: mode,
+                      child: Text(_playerDetailBackgroundLabel(mode)),
+                    ),
+                  )
+                  .toList(),
+              onChanged: (mode) {
+                if (mode != null) {
+                  unawaited(_setPlayerDetailBackground(context, ref, mode));
+                }
+              },
+            ),
+          ),
+        ),
+        _tile(
+          context,
+          icon: Icons.image_outlined,
+          title: '详情页自定义图片',
+          trailing: Text(
+            settings?.playerDetailCustomImagePath.trim().isNotEmpty == true
+                ? '已设置'
+                : '未设置',
+          ),
+          onTap: () => _pickPlayerDetailImage(context, ref),
+        ),
+      ],
+      SettingsSection.layout => [
+        Padding(
+          padding: const EdgeInsets.fromLTRB(16, 16, 16, 4),
+          child: Text(
+            '顶栏布局',
+            style: TextStyle(
+              fontSize: 13,
+              fontWeight: FontWeight.w700,
+              color: Theme.of(context).colorScheme.primary,
+            ),
+          ),
+        ),
+        _tile(
+          context,
+          icon: Icons.swap_horiz_rounded,
+          title: '侧边栏位置',
+          trailing: Text(
+            settings?.sidebarPosition == SidebarPosition.right ? '右上' : '左上',
+          ),
+          onTap: () => _pickSidebarPosition(context, ref, settings),
+        ),
+        Padding(
+          padding: const EdgeInsets.fromLTRB(16, 20, 16, 4),
+          child: Text(
+            '侧边栏布局',
+            style: TextStyle(
+              fontSize: 13,
+              fontWeight: FontWeight.w700,
+              color: Theme.of(context).colorScheme.primary,
+            ),
+          ),
+        ),
+        _SidebarLayoutEditor(
+          settings: settings ?? const AppSettings(),
+          notifier: notifier,
         ),
       ],
       SettingsSection.playback => [
@@ -576,6 +720,44 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
             ),
           ),
         ),
+        _tile(
+          context,
+          icon: Icons.format_align_left,
+          title: '显示位置',
+          trailing: DropdownButtonHideUnderline(
+            child: DropdownButton<LyricDisplayAlignment>(
+              value:
+                  settings?.lyricDisplayAlignment ?? LyricDisplayAlignment.left,
+              isDense: true,
+              alignment: AlignmentDirectional.centerEnd,
+              items: LyricDisplayAlignment.values
+                  .map(
+                    (alignment) => DropdownMenuItem<LyricDisplayAlignment>(
+                      value: alignment,
+                      child: Text(_lyricDisplayAlignmentLabel(alignment)),
+                    ),
+                  )
+                  .toList(),
+              onChanged: (alignment) {
+                if (alignment != null) {
+                  notifier.setLyricDisplayAlignment(alignment);
+                }
+              },
+            ),
+          ),
+        ),
+        _tile(
+          context,
+          icon: Icons.format_size_outlined,
+          title: '歌词字号',
+          trailing: Text(
+            (settings?.lyricFontSize ?? 18.0).toStringAsFixed(0),
+            style: TextStyle(
+              color: Theme.of(context).colorScheme.onSurfaceVariant,
+            ),
+          ),
+          onTap: () => _showLyricFontSizeSheet(context, ref),
+        ),
       ],
       SettingsSection.desktopLyrics => [
         _switchTile(
@@ -591,6 +773,13 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
           title: '软件内不显示桌面歌词',
           value: settings?.desktopLyricsHideInApp ?? true,
           onChanged: (value) => notifier.setDesktopLyricsHideInApp(value),
+        ),
+        _switchTile(
+          context,
+          icon: Icons.auto_awesome,
+          title: '显示逐字歌词效果',
+          value: settings?.desktopLyricsShowWordEffect ?? true,
+          onChanged: (value) => notifier.setDesktopLyricsShowWordEffect(value),
         ),
         _switchTile(
           context,
@@ -731,10 +920,16 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
           context,
           icon: Icons.folder,
           title: '下载路径',
-          trailing: Text(
-            settings?.downloadPath == null || settings!.downloadPath.isEmpty
-                ? '默认'
-                : '自定义',
+          trailing: SizedBox(
+            width: 168,
+            child: Text(
+              settings?.downloadPath == null || settings!.downloadPath.isEmpty
+                  ? '默认'
+                  : AndroidStorage.displayPath(settings.downloadPath),
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              textAlign: TextAlign.end,
+            ),
           ),
           onTap: () => _pickDownloadPath(context, ref, settings),
         ),
@@ -744,6 +939,25 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
           title: '下载音质',
           trailing: Text(settings?.downloadQuality ?? '320k'),
           onTap: () => _pickQuality(context, ref, settings, isOnline: false),
+        ),
+        _tile(
+          context,
+          icon: Icons.tune_rounded,
+          title: '每次下载是否询问细节',
+          trailing: DropdownButtonHideUnderline(
+            child: DropdownButton<bool>(
+              value: settings?.askDownloadDetails ?? true,
+              isDense: true,
+              alignment: AlignmentDirectional.centerEnd,
+              items: const [
+                DropdownMenuItem(value: true, child: Text('询问')),
+                DropdownMenuItem(value: false, child: Text('不询问')),
+              ],
+              onChanged: (value) {
+                if (value != null) notifier.setAskDownloadDetails(value);
+              },
+            ),
+          ),
         ),
         _switchTile(
           context,
@@ -765,7 +979,7 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
           context,
           icon: Icons.info_outline,
           title: '关于 XY Music',
-          trailing: const Text('1.1.0'),
+          trailing: const Text('1.3.1'),
           onTap: () => context.push('/settings/about'),
         ),
         _categoryTile(
@@ -797,10 +1011,20 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
 
     return Scaffold(
       appBar: AppBar(
-        leading: section == SettingsSection.root
+        automaticallyImplyLeading:
+            section != SettingsSection.root ||
+            settings?.sidebarPosition != SidebarPosition.right,
+        leading:
+            section == SettingsSection.root &&
+                settings?.sidebarPosition != SidebarPosition.right
             ? const AppSidebarMenuButton()
             : null,
         title: Text(_pageTitle),
+        actions: [
+          if (section == SettingsSection.root &&
+              settings?.sidebarPosition == SidebarPosition.right)
+            const AppSidebarMenuButton(),
+        ],
       ),
       body: ListView(
         padding: EdgeInsets.only(
@@ -916,6 +1140,7 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
     SettingsSection.root => '设置',
     SettingsSection.account => '账号',
     SettingsSection.appearance => '外观',
+    SettingsSection.layout => '布局',
     SettingsSection.playback => '播放',
     SettingsSection.playbackDetail => '歌词',
     SettingsSection.lyrics => '播放详情页歌词',
@@ -996,6 +1221,43 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
     );
   }
 
+  Widget _dynamicColorTile(
+    BuildContext context, {
+    required AppSettings? settings,
+    required bool supported,
+    required bool loading,
+    required ValueChanged<bool> onChanged,
+  }) {
+    final enabled = supported && !loading;
+    final subtitle = loading
+        ? '正在检测系统版本…'
+        : supported
+        ? '跟随 Android 12+ 系统壁纸颜色'
+        : '当前系统不支持（需要 Android 12 或更高版本）';
+    return SwitchListTile(
+      secondary: Icon(
+        Icons.auto_awesome_outlined,
+        color: enabled ? null : Theme.of(context).disabledColor,
+      ),
+      title: Text(
+        '动态取色',
+        style: enabled
+            ? null
+            : TextStyle(color: Theme.of(context).disabledColor),
+      ),
+      subtitle: Text(
+        subtitle,
+        style: TextStyle(
+          color: enabled
+              ? Theme.of(context).colorScheme.onSurfaceVariant
+              : Theme.of(context).disabledColor,
+        ),
+      ),
+      value: settings?.dynamicColor ?? false,
+      onChanged: enabled ? onChanged : null,
+    );
+  }
+
   Widget _themeLabel(AppSettings? s) {
     return Text(switch (s?.themeMode ?? ThemeModePreference.system) {
       ThemeModePreference.system => '跟随系统',
@@ -1009,6 +1271,141 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
     LyricWordEffectMode.progressive => '渐进填充',
     LyricWordEffectMode.none => '不显示逐字',
   };
+
+  String _lyricDisplayAlignmentLabel(LyricDisplayAlignment alignment) =>
+      switch (alignment) {
+        LyricDisplayAlignment.left => '靠左',
+        LyricDisplayAlignment.center => '居中',
+        LyricDisplayAlignment.right => '靠右',
+      };
+
+  /// 歌词字号调整弹窗：滑杆 + 歌词预览，与播放详情页更多菜单中的
+  /// “歌词字号”共用同一份设置，实时生效。
+  Future<void> _showLyricFontSizeSheet(BuildContext context, WidgetRef ref) {
+    return showModalBottomSheet<void>(
+      context: context,
+      showDragHandle: true,
+      isScrollControlled: true,
+      builder: (_) => _SettingsLyricFontSizeSheet(
+        initial:
+            ref.read(settingsProvider).valueOrNull?.lyricFontSize ?? 18.0,
+        onChanged: (value) =>
+            ref.read(settingsProvider.notifier).setLyricFontSize(value),
+      ),
+    );
+  }
+
+  String _playerDetailBackgroundLabel(PlayerDetailBackgroundMode mode) =>
+      switch (mode) {
+        PlayerDetailBackgroundMode.coverBlur => '封面模糊',
+        PlayerDetailBackgroundMode.wallpaperBlur => '壁纸模糊',
+        PlayerDetailBackgroundMode.flowingLight => '流光',
+        PlayerDetailBackgroundMode.customImage => '自定义图片',
+      };
+
+  Future<void> _setPlayerDetailBackground(
+    BuildContext context,
+    WidgetRef ref,
+    PlayerDetailBackgroundMode mode,
+  ) async {
+    final settings = ref.read(settingsProvider).valueOrNull;
+    final hasWallpaper =
+        settings?.customBackgroundPath.trim().isNotEmpty == true;
+    final hasDetailImage =
+        settings?.playerDetailCustomImagePath.trim().isNotEmpty == true;
+    final missingImage = mode == PlayerDetailBackgroundMode.wallpaperBlur
+        ? !hasWallpaper
+        : mode == PlayerDetailBackgroundMode.customImage && !hasDetailImage;
+    if (missingImage) {
+      if (context.mounted) {
+        XyNotice.show(
+          context,
+          message: mode == PlayerDetailBackgroundMode.wallpaperBlur
+              ? '未设置壁纸，请先在“自定义壁纸”中选择图片'
+              : '未设置详情页图片，请先选择详情页自定义图片',
+          type: XyNoticeType.warning,
+        );
+      }
+      return;
+    }
+    await ref
+        .read(settingsProvider.notifier)
+        .setPlayerDetailBackgroundMode(mode);
+  }
+
+  Future<void> _pickPlayerDetailImage(
+    BuildContext context,
+    WidgetRef ref,
+  ) async {
+    final picked = await FilePicker.platform.pickFiles(
+      type: FileType.image,
+      withData: true,
+    );
+    if (picked == null || picked.files.isEmpty) return;
+    final file = picked.files.single;
+    final bytes = file.bytes;
+    final sourcePath = file.path;
+    if ((bytes == null || bytes.isEmpty) && sourcePath == null) {
+      if (context.mounted) {
+        XyNotice.show(
+          context,
+          message: '无法读取图片，请重新选择',
+          type: XyNoticeType.warning,
+        );
+      }
+      return;
+    }
+    if ((bytes?.length ?? 0) > 20 * 1024 * 1024) {
+      if (context.mounted) {
+        XyNotice.show(
+          context,
+          message: '图片不能超过 20 MB',
+          type: XyNoticeType.warning,
+        );
+      }
+      return;
+    }
+    try {
+      final dataDir = await ref.read(appDataDirProvider.future);
+      final directory = Directory(p.join(dataDir, 'appearance'));
+      await directory.create(recursive: true);
+      final extension = p.extension(sourcePath ?? file.name).toLowerCase();
+      final safeExtension =
+          const ['.jpg', '.jpeg', '.png', '.webp', '.gif'].contains(extension)
+          ? extension
+          : '.jpg';
+      final target = File(
+        p.join(
+          directory.path,
+          'player_detail_${DateTime.now().microsecondsSinceEpoch}$safeExtension',
+        ),
+      );
+      if (bytes != null && bytes.isNotEmpty) {
+        await target.writeAsBytes(bytes, flush: true);
+      } else {
+        await File(sourcePath!).copy(target.path);
+      }
+      if (context.mounted) await precacheImage(FileImage(target), context);
+      await ref
+          .read(settingsProvider.notifier)
+          .setPlayerDetailCustomImagePath(target.path);
+      if (context.mounted) {
+        XyNotice.show(
+          context,
+          message: '详情页自定义图片已更新',
+          type: XyNoticeType.success,
+        );
+      }
+    } catch (error) {
+      if (context.mounted) {
+        XyNotice.show(
+          context,
+          message: '保存详情页图片失败：$error',
+          type: XyNoticeType.error,
+        );
+      }
+    }
+  }
 
   Future<void> _setDesktopLyrics(
     BuildContext context,
@@ -1283,6 +1680,49 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
     }
   }
 
+  Future<void> _pickSidebarPosition(
+    BuildContext context,
+    WidgetRef ref,
+    AppSettings? settings,
+  ) async {
+    final current = settings?.sidebarPosition ?? SidebarPosition.left;
+    final choice = await showModalBottomSheet<SidebarPosition>(
+      context: context,
+      builder: (sheetContext) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            ListTile(
+              leading: const Icon(Icons.align_horizontal_left_rounded),
+              title: const Text('左上'),
+              trailing: current == SidebarPosition.left
+                  ? Icon(
+                      Icons.check,
+                      color: Theme.of(sheetContext).colorScheme.primary,
+                    )
+                  : null,
+              onTap: () => Navigator.pop(sheetContext, SidebarPosition.left),
+            ),
+            ListTile(
+              leading: const Icon(Icons.align_horizontal_right_rounded),
+              title: const Text('右上'),
+              trailing: current == SidebarPosition.right
+                  ? Icon(
+                      Icons.check,
+                      color: Theme.of(sheetContext).colorScheme.primary,
+                    )
+                  : null,
+              onTap: () => Navigator.pop(sheetContext, SidebarPosition.right),
+            ),
+          ],
+        ),
+      ),
+    );
+    if (choice != null) {
+      await ref.read(settingsProvider.notifier).setSidebarPosition(choice);
+    }
+  }
+
   Future<void> _pickAccentColor(
     BuildContext context,
     WidgetRef ref,
@@ -1442,7 +1882,7 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   const Text(
-                    '自定义背景',
+                    '自定义壁纸',
                     style: TextStyle(fontSize: 19, fontWeight: FontWeight.w700),
                   ),
                   const SizedBox(height: 6),
@@ -1464,7 +1904,7 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
                         blur: blur,
                         child: Center(
                           child: Text(
-                            imagePath.isEmpty ? '尚未选择背景图片' : 'XY Music 背景预览',
+                            imagePath.isEmpty ? '尚未选择壁纸' : 'XY Music 壁纸预览',
                             style: const TextStyle(
                               color: Colors.white,
                               fontSize: 18,
@@ -1689,7 +2129,10 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
     AppSettings? s,
   ) async {
     final cur = s?.downloadPath ?? '';
-    final controller = TextEditingController(text: cur);
+    var selectedPath = cur;
+    final controller = TextEditingController(
+      text: AndroidStorage.displayPath(cur),
+    );
     final action = await showModalBottomSheet<Object?>(
       context: context,
       isScrollControlled: true,
@@ -1716,6 +2159,7 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
             const SizedBox(height: 12),
             TextField(
               controller: controller,
+              onChanged: (value) => selectedPath = value,
               decoration: const InputDecoration(
                 labelText: '路径',
                 hintText: '例如 /storage/emulated/0/Music',
@@ -1726,19 +2170,15 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
             OutlinedButton.icon(
               onPressed: () async {
                 try {
-                  final selected = await FilePicker.platform.getDirectoryPath();
+                  final selected = Platform.isAndroid
+                      ? await AndroidStorage.pickDirectory()
+                      : await FilePicker.platform.getDirectoryPath();
                   if (!ctx.mounted || selected == null) return;
-                  if (selected.startsWith('content://')) {
-                    ScaffoldMessenger.of(ctx).showSnackBar(
-                      const SnackBar(
-                        content: Text('该目录无法直接写入，请选择可访问的文件夹或手动输入路径'),
-                      ),
-                    );
-                    return;
-                  }
-                  controller.text = selected;
+                  selectedPath = selected;
+                  final displayPath = AndroidStorage.displayPath(selected);
+                  controller.text = displayPath;
                   controller.selection = TextSelection.collapsed(
-                    offset: selected.length,
+                    offset: displayPath.length,
                   );
                 } catch (error) {
                   if (!ctx.mounted) return;
@@ -1760,7 +2200,7 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
                 ),
                 const SizedBox(width: 8),
                 FilledButton(
-                  onPressed: () => Navigator.pop(ctx, controller.text.trim()),
+                  onPressed: () => Navigator.pop(ctx, selectedPath.trim()),
                   child: const Text('确定'),
                 ),
               ],
@@ -1909,10 +2349,219 @@ class _ColorDot extends StatelessWidget {
   }
 }
 
+class _SidebarLayoutEditor extends StatelessWidget {
+  const _SidebarLayoutEditor({required this.settings, required this.notifier});
+
+  final AppSettings settings;
+  final SettingsNotifier notifier;
+
+  @override
+  Widget build(BuildContext context) {
+    final order = normalizeSidebarItemOrder(
+      settings.sidebarItemOrder,
+    ).where((id) => id != kSidebarSettings).toList();
+    final hidden = settings.sidebarHiddenItems.toSet();
+    return Column(
+      children: [
+        ReorderableListView.builder(
+          shrinkWrap: true,
+          physics: const NeverScrollableScrollPhysics(),
+          buildDefaultDragHandles: false,
+          itemCount: order.length,
+          onReorderItem: (oldIndex, newIndex) {
+            final next = [...order];
+            final item = next.removeAt(oldIndex);
+            next.insert(newIndex, item);
+            unawaited(
+              notifier.setSidebarItemOrder([...next, kSidebarSettings]),
+            );
+          },
+          itemBuilder: (context, index) {
+            final id = order[index];
+            return ListTile(
+              key: ValueKey('sidebar-layout-$id'),
+              leading: Icon(_sidebarIcon(id)),
+              title: Text(_sidebarLabel(id)),
+              trailing: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Switch(
+                    value: !hidden.contains(id),
+                    onChanged: (value) =>
+                        unawaited(notifier.setSidebarItemVisible(id, value)),
+                  ),
+                  ReorderableDragStartListener(
+                    index: index,
+                    child: const Padding(
+                      padding: EdgeInsets.all(10),
+                      child: Icon(Icons.drag_handle_rounded),
+                    ),
+                  ),
+                ],
+              ),
+            );
+          },
+        ),
+        ListTile(
+          key: const ValueKey('sidebar-layout-settings-fixed'),
+          leading: const Icon(Icons.settings_outlined),
+          title: const Text('设置'),
+          subtitle: const Text('固定在侧边栏底部'),
+          trailing: Switch(
+            value: !hidden.contains(kSidebarSettings),
+            onChanged: (value) => unawaited(
+              notifier.setSidebarItemVisible(kSidebarSettings, value),
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  String _sidebarLabel(String id) => switch (id) {
+    kSidebarHome => '首页',
+    kSidebarExplore => '探索',
+    kSidebarLocalMusic => '本地音乐',
+    kSidebarFavorites => '我的收藏',
+    kSidebarRecent => '最近播放',
+    kSidebarPlugins => '插件管理',
+    kSidebarAccount => '账号',
+    kSidebarRecognize => '听歌识曲',
+    kSidebarPlaylists => '管理全部歌单',
+    kSidebarSettings => '设置',
+    _ => id,
+  };
+
+  IconData _sidebarIcon(String id) => switch (id) {
+    kSidebarHome => Icons.home_outlined,
+    kSidebarExplore => Icons.explore_outlined,
+    kSidebarLocalMusic => Icons.music_note_outlined,
+    kSidebarFavorites => Icons.favorite_border_rounded,
+    kSidebarRecent => Icons.history_rounded,
+    kSidebarPlugins => Icons.extension_outlined,
+    kSidebarAccount => Icons.account_circle_outlined,
+    kSidebarRecognize => Icons.mic_none_rounded,
+    kSidebarPlaylists => Icons.queue_music_rounded,
+    kSidebarSettings => Icons.settings_outlined,
+    _ => Icons.circle_outlined,
+  };
+}
+
 class _Choice {
   final String label;
   final dynamic value;
   const _Choice(this.label, this.value);
+}
+
+/// 歌词字号调整弹窗：滑杆 + 歌词预览。拖动即写入设置，
+/// 播放详情页歌词实时使用新字号渲染。
+class _SettingsLyricFontSizeSheet extends StatefulWidget {
+  const _SettingsLyricFontSizeSheet({
+    required this.initial,
+    required this.onChanged,
+  });
+
+  final double initial;
+  final ValueChanged<double> onChanged;
+
+  @override
+  State<_SettingsLyricFontSizeSheet> createState() =>
+      _SettingsLyricFontSizeSheetState();
+}
+
+class _SettingsLyricFontSizeSheetState
+    extends State<_SettingsLyricFontSizeSheet> {
+  late double _value;
+
+  @override
+  void initState() {
+    super.initState();
+    _value = widget.initial;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(20, 0, 20, 24),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Row(
+            children: [
+              Icon(Icons.format_size_outlined, color: scheme.primary),
+              const SizedBox(width: 12),
+              const Text('歌词字号', style: TextStyle(fontSize: 16)),
+              const Spacer(),
+              Text(
+                _value.toStringAsFixed(0),
+                style: TextStyle(
+                  fontSize: 15,
+                  fontWeight: FontWeight.w700,
+                  color: scheme.primary,
+                ),
+              ),
+            ],
+          ),
+          Slider(
+            value: _value,
+            min: 12,
+            max: 32,
+            divisions: 20,
+            label: _value.toStringAsFixed(0),
+            onChanged: (value) {
+              setState(() => _value = value);
+              widget.onChanged(value);
+            },
+          ),
+          const SizedBox(height: 6),
+          Container(
+            padding: const EdgeInsets.symmetric(vertical: 18, horizontal: 16),
+            decoration: BoxDecoration(
+              color: scheme.surfaceContainerHighest.withValues(alpha: .5),
+              borderRadius: BorderRadius.circular(14),
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Text(
+                  '正在播放的歌词行',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(
+                    fontSize: (_value + 6).clamp(12.0, 32.0),
+                    height: 1.3,
+                    fontWeight: FontWeight.w800,
+                    color: scheme.onSurface,
+                  ),
+                ),
+                const SizedBox(height: 6),
+                Text(
+                  '其他歌词行',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(
+                    fontSize: _value,
+                    height: 1.3,
+                    fontWeight: FontWeight.w600,
+                    color: scheme.onSurface.withValues(alpha: .45),
+                  ),
+                ),
+                const SizedBox(height: 5),
+                Text(
+                  '翻译歌词行',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(
+                    fontSize: (_value - 5).clamp(10.0, 26.0),
+                    color: scheme.onSurface.withValues(alpha: .4),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
 }
 
 class _CustomBackgroundResult {

@@ -334,12 +334,27 @@ class LibraryNotifier extends StateNotifier<LibraryState> {
   /// 已从库中移除的路径不会返回，因此结果可能少于传入路径数。
   Future<List<Song>> songsByPaths(List<String> paths) async {
     if (paths.isEmpty) return const [];
+    // 曲库启动时已经把歌曲目录加载到内存。优先从内存返回，避免收藏页和
+    // 最近播放页再次跨 Rust/SQLite 查询；只有不在当前目录缓存中的路径才
+    // 继续走数据库查询（例如刚扫描完成、尚未刷新目录的歌曲）。
+    final byPath = {for (final song in state.songs) song.path: song};
+    final cached = <Song>[];
+    final missing = <String>[];
+    for (final path in paths) {
+      final song = byPath[path];
+      if (song != null) {
+        cached.add(song);
+      } else {
+        missing.add(path);
+      }
+    }
+    if (missing.isEmpty) return cached;
     final dbPath = await _ref.read(dbPathProvider.future);
     final songsJson = await getLibrarySongsByPaths(
       dbPath: dbPath,
-      paths: paths,
+      paths: missing,
     );
-    return _parseSongs(songsJson);
+    return [...cached, ..._parseSongs(songsJson)];
   }
 
   /// 播放全部歌曲（或从指定索引开始）。

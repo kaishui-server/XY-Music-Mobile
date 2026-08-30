@@ -34,6 +34,13 @@ android {
             signingConfig = signingConfigs.getByName("debug")
         }
     }
+
+    packaging {
+        jniLibs {
+            // 压缩打包原生库（默认不压缩以加快加载），可显著减小 APK 体积
+            useLegacyPackaging = true
+        }
+    }
 }
 
 kotlin {

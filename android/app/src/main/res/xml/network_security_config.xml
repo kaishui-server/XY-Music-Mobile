@@ -1,5 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <network-security-config>
+    <!-- 插件音源由第三方动态返回，部分合法音源仍只提供 HTTP（例如酷我 CDN）。
+         允许播放器访问这些地址，否则 Android ExoPlayer 会静默失败并一直处于加载状态。 -->
+    <base-config cleartextTrafficPermitted="true" />
     <!-- just_audio 使用本机代理为插件音源附加 Referer/Cookie 等请求头。 -->
     <domain-config cleartextTrafficPermitted="true">
         <domain includeSubdomains="false">127.0.0.1</domain>
@@ -8,7 +11,8 @@
     <domain-config cleartextTrafficPermitted="true">
         <domain includeSubdomains="false">www2.kugou.kugou.com</domain>
     </domain-config>
-    <!-- XY Music 官方服务当前与桌面端一致，直接监听 HTTP 8081。仅对此 IP 放行明文请求。 -->
+    <!-- 兼容旧版客户端访问旧服务器地址；新版账号请求使用
+         https://cosn.xymusic.cc:8081/api，不依赖明文传输。 -->
     <domain-config cleartextTrafficPermitted="true">
         <domain includeSubdomains="false">156.233.228.213</domain>
     </domain-config>

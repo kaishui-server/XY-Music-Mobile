@@ -1,12 +1,19 @@
 package com.xymusic.mobile
 
 import android.app.Activity
+import android.content.ContentValues
 import android.content.Intent
 import android.media.projection.MediaProjectionManager
 import android.net.Uri
 import android.os.Build
+import android.os.Environment
+import android.provider.MediaStore
+import android.provider.DocumentsContract
 import android.provider.Settings
 import android.view.WindowManager
+import android.media.MediaScannerConnection
+import java.io.File
+import java.io.FileOutputStream
 import androidx.core.content.FileProvider
 import androidx.core.content.ContextCompat
 import com.ryanheise.audioservice.AudioServiceActivity
@@ -22,10 +29,14 @@ class MainActivity : AudioServiceActivity() {
         private const val APP_UPDATE_CHANNEL = "com.xymusic.mobile/app_update"
         private const val DESKTOP_LYRICS_CHANNEL = "com.xymusic.mobile/desktop_lyrics"
         private const val SCREEN_AWAKE_CHANNEL = "com.xymusic.mobile/screen_awake"
+        private const val GALLERY_CHANNEL = "com.xymusic.mobile/gallery"
+        private const val STORAGE_CHANNEL = "com.xymusic.mobile/storage"
         private const val CAPTURE_REQUEST = 4217
+        private const val DIRECTORY_REQUEST = 4218
     }
 
     private var pendingStartResult: MethodChannel.Result? = null
+    private var pendingDirectoryResult: MethodChannel.Result? = null
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
@@ -44,6 +55,137 @@ class MainActivity : AudioServiceActivity() {
                     }
                     result.success(true)
                 }
+            }
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, GALLERY_CHANNEL)
+            .setMethodCallHandler { call, result ->
+                if (call.method != "saveImage") {
+                    result.notImplemented()
+                    return@setMethodCallHandler
+                }
+                val bytes = call.argument<ByteArray>("bytes")
+                val fileName = call.argument<String>("fileName")?.trim().orEmpty()
+                    .ifEmpty { "xy_music_share_${System.currentTimeMillis()}.png" }
+                if (bytes == null || bytes.isEmpty()) {
+                    result.error("INVALID_IMAGE", "图片数据为空", null)
+                    return@setMethodCallHandler
+                }
+                try {
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                        val values = ContentValues().apply {
+                            put(MediaStore.Images.Media.DISPLAY_NAME, fileName)
+                            put(MediaStore.Images.Media.MIME_TYPE, "image/png")
+                            put(
+                                MediaStore.Images.Media.RELATIVE_PATH,
+                                Environment.DIRECTORY_PICTURES + "/XY Music",
+                            )
+                            put(MediaStore.Images.Media.IS_PENDING, 1)
+                        }
+                        val uri = contentResolver.insert(
+                            MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+                            values,
+                        ) ?: throw IllegalStateException("无法创建相册文件")
+                        try {
+                            contentResolver.openOutputStream(uri)?.use { it.write(bytes) }
+                                ?: throw IllegalStateException("无法写入相册文件")
+                            values.clear()
+                            values.put(MediaStore.Images.Media.IS_PENDING, 0)
+                            contentResolver.update(uri, values, null, null)
+                        } catch (error: Exception) {
+                            contentResolver.delete(uri, null, null)
+                            throw error
+                        }
+                    } else {
+                        val pictures = Environment.getExternalStoragePublicDirectory(
+                            Environment.DIRECTORY_PICTURES,
+                        )
+                        val directory = File(pictures, "XY Music")
+                        if (!directory.exists() && !directory.mkdirs()) {
+                            throw IllegalStateException("无法创建相册目录")
+                        }
+                        val target = File(directory, fileName)
+                        FileOutputStream(target).use { it.write(bytes) }
+                        MediaScannerConnection.scanFile(
+                            this,
+                            arrayOf(target.absolutePath),
+                            arrayOf("image/png"),
+                            null,
+                        )
+                    }
+                    result.success(true)
+                } catch (error: Exception) {
+                    result.error("SAVE_FAILED", error.message ?: "保存到相册失败", null)
+                }
+            }
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, STORAGE_CHANNEL)
+            .setMethodCallHandler { call, result ->
+                if (call.method == "pickDirectory") {
+                    if (pendingDirectoryResult != null) {
+                        result.error("BUSY", "文件夹选择正在进行", null)
+                        return@setMethodCallHandler
+                    }
+                    pendingDirectoryResult = result
+                    val intent = Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).apply {
+                        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                        addFlags(Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
+                        addFlags(Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION)
+                    }
+                    startActivityForResult(intent, DIRECTORY_REQUEST)
+                    return@setMethodCallHandler
+                }
+                if (call.method != "copyFileToDirectory") {
+                    result.notImplemented()
+                    return@setMethodCallHandler
+                }
+                val directoryUri = call.argument<String>("directoryUri")?.trim().orEmpty()
+                val sourcePath = call.argument<String>("sourcePath")?.trim().orEmpty()
+                val requestedName = call.argument<String>("fileName")?.trim().orEmpty()
+                val mimeType = call.argument<String>("mimeType")?.trim().orEmpty()
+                    .ifEmpty { "application/octet-stream" }
+                if (!directoryUri.startsWith("content://") || sourcePath.isEmpty()) {
+                    result.error("INVALID_STORAGE_REQUEST", "无效的目标文件夹或源文件", null)
+                    return@setMethodCallHandler
+                }
+                val source = File(sourcePath)
+                if (!source.isFile) {
+                    result.error("SOURCE_NOT_FOUND", "下载文件不存在", null)
+                    return@setMethodCallHandler
+                }
+                val safeName = requestedName
+                    .replace(Regex("[\\\\/:*?\"<>|]"), "_")
+                    .ifEmpty { "xy_music_${System.currentTimeMillis()}" }
+                Thread {
+                    try {
+                        val treeUri = Uri.parse(directoryUri)
+                        val parentDocumentUri = if (DocumentsContract.isTreeUri(treeUri)) {
+                            DocumentsContract.buildDocumentUriUsingTree(
+                                treeUri,
+                                DocumentsContract.getTreeDocumentId(treeUri),
+                            )
+                        } else {
+                            treeUri
+                        }
+                        val targetUri = DocumentsContract.createDocument(
+                            contentResolver,
+                            parentDocumentUri,
+                            mimeType,
+                            safeName,
+                        ) ?: throw IllegalStateException("系统无法创建目标文件")
+                        val output = contentResolver.openOutputStream(targetUri)
+                            ?: throw IllegalStateException("系统无法打开目标文件")
+                        source.inputStream().use { input ->
+                            output.use { out -> input.copyTo(out) }
+                        }
+                        runOnUiThread { result.success(targetUri.toString()) }
+                    } catch (error: Exception) {
+                        runOnUiThread {
+                            result.error(
+                                "STORAGE_WRITE_FAILED",
+                                error.message ?: "写入目标文件失败",
+                                null,
+                            )
+                        }
+                    }
+                }.start()
             }
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, DEVICE_INFO_CHANNEL)
             .setMethodCallHandler { call, result ->
@@ -204,6 +346,25 @@ class MainActivity : AudioServiceActivity() {
 
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode == DIRECTORY_REQUEST) {
+            val result = pendingDirectoryResult
+            pendingDirectoryResult = null
+            if (resultCode != Activity.RESULT_OK || data?.data == null) {
+                result?.success(null)
+                return
+            }
+            val uri = data.data!!
+            try {
+                val takeFlags = data.flags and
+                    (Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
+                contentResolver.takePersistableUriPermission(uri, takeFlags)
+            } catch (_: Exception) {
+                // Some document providers do not support persisted grants; the
+                // current activity grant is still valid for this session.
+            }
+            result?.success(uri.toString())
+            return
+        }
         if (requestCode != CAPTURE_REQUEST) return
         val result = pendingStartResult
         pendingStartResult = null

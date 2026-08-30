@@ -1307,7 +1307,7 @@ fn rebuild_statistics_aggregates(conn: &rusqlite::Connection) -> Result<(), Stri
         // resolve_song_identity 会用 song_path 作为 fallback 提取标题
         let mut stmt = conn
             .prepare(
-                "SELECT ph.song_path, s.title, s.artist, s.album, s.duration, s.track_number, ph.played_at, ph.played_seconds, ph.event
+                "SELECT ph.song_path, s.title, s.artist, s.album, s.duration, s.track_number, ph.played_at, CASE WHEN ph.played_ms > 0 THEN ph.played_ms ELSE ph.played_seconds * 1000 END, ph.event
                  FROM play_history ph
                  LEFT JOIN songs s ON s.path = ph.song_path
                  WHERE ph.event IN ('play', 'play_time')
@@ -1340,7 +1340,7 @@ fn rebuild_statistics_aggregates(conn: &rusqlite::Connection) -> Result<(), Stri
                 parse_track_number_value(row.5.as_deref()),
                 Some(&row.0),
             );
-            let listened_ms = row.7.max(0) * 1000;
+            let listened_ms = row.7.max(0);
             let count_as_play = row.8 == "play";
             let (is_full_play, is_skip) = if count_as_play {
                 derive_play_flags(listened_ms, identity.duration_ms)
@@ -1379,7 +1379,7 @@ fn load_portable_export(file_path: &str) -> Result<PortableStatisticsExport, Str
     let export: PortableStatisticsExport =
         serde_json::from_str(&raw).map_err(|_| "文件格式不正确或已损坏".to_string())?;
 
-    if export.format != "xianyu-stats" {
+    if export.format != "xymusic-stats" {
         return Err("文件格式不正确或已损坏".to_string());
     }
 
@@ -1663,7 +1663,7 @@ fn query_top_history_songs(
     }
 
     let sql_top_duration = format!(
-        "SELECT ph.song_path, COALESCE(SUM(ph.played_seconds), 0) AS duration
+        "SELECT ph.song_path, COALESCE(SUM(CASE WHEN ph.played_ms > 0 THEN ph.played_ms ELSE ph.played_seconds * 1000 END), 0) / 1000 AS duration
          FROM play_history ph
          WHERE ph.event IN ('play', 'play_time') {condition}
          GROUP BY ph.song_path
@@ -1671,9 +1671,7 @@ fn query_top_history_songs(
          LIMIT 5"
     );
     let mut top_songs_by_duration = Vec::new();
-    let mut stmt = conn
-        .prepare(&sql_top_duration)
-        .map_err(|e| e.to_string())?;
+    let mut stmt = conn.prepare(&sql_top_duration).map_err(|e| e.to_string())?;
     let rows = stmt
         .query_map([], |row| {
             Ok(TopSong {
@@ -1699,8 +1697,15 @@ fn insert_history_event(
 ) -> Result<(), String> {
     if let Some(song_id) = lookup_song_id(conn, normalized_path) {
         let inserted = conn.execute(
-            "INSERT INTO play_history (song_path, song_id, played_at, played_seconds, event) VALUES (?1, ?2, ?3, ?4, ?5)",
-            rusqlite::params![normalized_path, song_id, played_at, played_seconds, event],
+            "INSERT INTO play_history (song_path, song_id, played_at, played_ms, played_seconds, event) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                normalized_path,
+                song_id,
+                played_at,
+                played_seconds.saturating_mul(1000),
+                played_seconds,
+                event,
+            ],
         );
         if inserted.is_ok() {
             return Ok(());
@@ -1709,8 +1714,14 @@ fn insert_history_event(
     }
 
     let inserted = conn.execute(
-        "INSERT INTO play_history (song_path, played_at, played_seconds, event) VALUES (?1, ?2, ?3, ?4)",
-        rusqlite::params![normalized_path, played_at, played_seconds, event],
+        "INSERT INTO play_history (song_path, played_at, played_ms, played_seconds, event) VALUES (?1, ?2, ?3, ?4, ?5)",
+        rusqlite::params![
+            normalized_path,
+            played_at,
+            played_seconds.saturating_mul(1000),
+            played_seconds,
+            event,
+        ],
     );
     if inserted.is_ok() {
         return Ok(());
@@ -1726,6 +1737,10 @@ fn insert_history_event(
     Ok(())
 }
 
+/// 最近播放保留的最大歌曲数。写入新记录时裁掉更旧的多余记录，
+/// 让“最近播放”页始终只展示最近播放的 300 首。
+const RECENT_HISTORY_MAX_SONGS: i64 = 300;
+
 pub fn add_to_history(conn: &rusqlite::Connection, song_path: String) -> Result<(), String> {
     let normalized_path = normalize_path(&song_path);
     let now = SystemTime::now()
@@ -1733,7 +1748,31 @@ pub fn add_to_history(conn: &rusqlite::Connection, song_path: String) -> Result<
         .unwrap_or_default()
         .as_secs() as i64;
 
-    insert_history_event(&conn, &normalized_path, now, 0, "recent")
+    insert_history_event(&conn, &normalized_path, now, 0, "recent")?;
+    trim_recent_history(conn, RECENT_HISTORY_MAX_SONGS)
+}
+
+/// 按最近播放时间保留最新 max_songs 首（去重口径与 get_recent_history
+/// 一致：同一歌曲取最新播放时间），删除更旧的记录。
+fn trim_recent_history(conn: &rusqlite::Connection, max_songs: i64) -> Result<(), String> {
+    conn.execute(
+        "DELETE FROM play_history
+         WHERE event = 'recent'
+           AND TRIM(CAST(song_path AS TEXT)) != ''
+           AND TRIM(CAST(song_path AS TEXT)) NOT IN (
+             SELECT TRIM(CAST(song_path AS TEXT)) AS song_path
+             FROM play_history
+             WHERE event = 'recent'
+               AND song_path IS NOT NULL
+               AND TRIM(CAST(song_path AS TEXT)) != ''
+             GROUP BY TRIM(CAST(song_path AS TEXT))
+             ORDER BY MAX(CAST(played_at AS INTEGER)) DESC
+             LIMIT ?1
+           )",
+        rusqlite::params![max_songs],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 pub fn import_recent_history(
@@ -1763,6 +1802,7 @@ pub fn import_recent_history(
         insert_history_event(&tx, &song_path, played_at, 0, "recent")?;
     }
 
+    trim_recent_history(&tx, RECENT_HISTORY_MAX_SONGS)?;
     tx.commit().map_err(|e| e.to_string())
 }
 
@@ -1819,7 +1859,7 @@ pub fn export_statistics_file(
     let exported_at = now_iso_timestamp()?;
     let export_id = format!("stats-{}-{}", now_unix_seconds(), now_unix_millis());
     let payload = PortableStatisticsExport {
-        format: "xianyu-stats".to_string(),
+        format: "xymusic-stats".to_string(),
         version: SUPPORTED_STATS_VERSION,
         exported_at: exported_at.clone(),
         app_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -2405,14 +2445,22 @@ pub fn record_play(
         .unwrap_or_default()
         .as_secs() as i64;
 
-    let played_seconds = (payload.listened_ms.max(0) / 1000).max(0);
+    let listened_ms = payload.listened_ms.max(0);
+    let played_seconds = (listened_ms / 1000).max(0);
 
     // 定时刷写只累计时长；同一次实际播放仅保留一条 event='play' 记录。
     let count_as_play = payload.count_as_play.unwrap_or(true);
     let history_event = if count_as_play { "play" } else { "play_time" };
     tx.execute(
-        "INSERT INTO play_history (song_path, song_id, played_at, played_seconds, event) VALUES (?1, ?2, ?3, ?4, ?5)",
-        rusqlite::params![&normalized_path, song_id, now, played_seconds, history_event],
+        "INSERT INTO play_history (song_path, song_id, played_at, played_ms, played_seconds, event) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        rusqlite::params![
+            &normalized_path,
+            song_id,
+            now,
+            listened_ms,
+            played_seconds,
+            history_event,
+        ],
     )
     .map_err(|e| e.to_string())?;
 
@@ -2500,7 +2548,7 @@ pub fn get_behavior_stats(
 
     // 指标 A2: 播放总时长
     let sql_duration = format!(
-        "SELECT COALESCE(SUM(ph.played_seconds), 0) {} WHERE ph.event IN ('play', 'play_time') {}",
+        "SELECT COALESCE(SUM(CASE WHEN ph.played_ms > 0 THEN ph.played_ms ELSE ph.played_seconds * 1000 END), 0) / 1000 {} WHERE ph.event IN ('play', 'play_time') {}",
         base_join, time_condition
     );
     let total_duration: i64 = conn
@@ -2537,7 +2585,7 @@ pub fn get_behavior_stats(
 
     // 指标 B2: Top 5 歌曲 (按时长)
     let sql_top_duration = format!(
-        "SELECT ph.song_path, COALESCE(SUM(ph.played_seconds), 0) as duration
+        "SELECT ph.song_path, COALESCE(SUM(CASE WHEN ph.played_ms > 0 THEN ph.played_ms ELSE ph.played_seconds * 1000 END), 0) / 1000 as duration
          {} 
          WHERE ph.event IN ('play', 'play_time') {}
          GROUP BY ph.song_path
@@ -2659,7 +2707,7 @@ pub fn get_behavior_stats(
         // Output: day_offset (0-6), total_duration
         let sql_activity = format!(
             "SELECT CAST((ph.played_at - {}) / {} AS INTEGER) as day_offset, 
-                    COALESCE(SUM(ph.played_seconds), 0) as duration 
+                    COALESCE(SUM(CASE WHEN ph.played_ms > 0 THEN ph.played_ms ELSE ph.played_seconds * 1000 END), 0) / 1000 as duration
              FROM play_history ph
              WHERE ph.played_at >= {} AND ph.event IN ('play', 'play_time')
              GROUP BY day_offset",
@@ -2785,6 +2833,50 @@ mod playback_count_tests {
             .query_row("SELECT COUNT(*) FROM recent_plays", [], |row| row.get(0))
             .expect("read recent plays");
         assert_eq!(recent_count, 1);
+    }
+
+    #[test]
+    fn listen_duration_crosses_signed_32_bit_millisecond_boundary() {
+        let conn = rusqlite::Connection::open_in_memory().expect("open in-memory database");
+        crate::database::schema::ensure_base_schema(&conn).expect("create schema");
+        let identity = PortableSongIdentity {
+            title: "Long session".to_string(),
+            artist: "Artist".to_string(),
+            album: "Album".to_string(),
+            duration_ms: 0,
+            track_number: None,
+        };
+
+        // 2^31 ms 约为 35.8 分钟；统计累计不应在这个边界停止。
+        record_aggregate_play(
+            &conn,
+            &identity,
+            1_700_000_000,
+            2_147_483_000,
+            false,
+            false,
+            true,
+        )
+        .expect("record first long chunk");
+        record_aggregate_play(
+            &conn,
+            &identity,
+            1_700_000_001,
+            120_000,
+            false,
+            false,
+            false,
+        )
+        .expect("record chunk after 32-bit boundary");
+
+        let total_ms: i64 = conn
+            .query_row(
+                "SELECT total_play_time_ms FROM global_stats WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read total duration");
+        assert_eq!(total_ms, 2_147_603_000);
     }
 
     #[test]

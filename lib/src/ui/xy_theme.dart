@@ -55,36 +55,59 @@ SystemUiOverlayStyle xySystemUiOverlayStyle(Brightness brightness) {
 ThemeData buildXyTheme({
   required Brightness brightness,
   required Color accent,
+  ColorScheme? dynamicColorScheme,
 }) {
   final dark = brightness == Brightness.dark;
-  final background = dark ? XyColors.darkBackground : XyColors.lightBackground;
-  final surface = dark ? XyColors.darkSurface : XyColors.lightSurface;
-  final raised = dark
+  final fallbackBackground = dark
+      ? XyColors.darkBackground
+      : XyColors.lightBackground;
+  final fallbackSurface = dark ? XyColors.darkSurface : XyColors.lightSurface;
+  final fallbackRaised = dark
       ? XyColors.darkSurfaceRaised
       : XyColors.lightSurfaceRaised;
-  final border = dark ? XyColors.darkBorder : XyColors.lightBorder;
-  final onSurface = dark ? Colors.white : const Color(0xFF202020);
-  final muted = dark ? const Color(0xFFA9A9A9) : const Color(0xFF686868);
+  final fallbackBorder = dark ? XyColors.darkBorder : XyColors.lightBorder;
+  final fallbackOnSurface = dark ? Colors.white : const Color(0xFF202020);
+  final fallbackMuted = dark
+      ? const Color(0xFFA9A9A9)
+      : const Color(0xFF686868);
 
-  final scheme =
+  final fallbackScheme =
       ColorScheme.fromSeed(
         seedColor: accent,
         brightness: brightness,
-        surface: surface,
+        surface: fallbackSurface,
       ).copyWith(
         primary: accent,
         onPrimary: Colors.white,
-        surface: surface,
-        onSurface: onSurface,
-        onSurfaceVariant: muted,
-        outline: border,
-        outlineVariant: border,
-        surfaceContainerLowest: background,
-        surfaceContainerLow: surface,
-        surfaceContainer: surface,
-        surfaceContainerHigh: raised,
-        surfaceContainerHighest: raised,
+        surface: fallbackSurface,
+        onSurface: fallbackOnSurface,
+        onSurfaceVariant: fallbackMuted,
+        outline: fallbackBorder,
+        outlineVariant: fallbackBorder,
+        surfaceContainerLowest: fallbackBackground,
+        surfaceContainerLow: fallbackSurface,
+        surfaceContainer: fallbackSurface,
+        surfaceContainerHigh: fallbackRaised,
+        surfaceContainerHighest: fallbackRaised,
       );
+
+  // 动态取色方案由 Android 12 的系统壁纸提供。保持完整的系统方案，
+  // 这样 primary、surface 和文字对比度都会随用户的系统配色同步变化。
+  final scheme = dynamicColorScheme ?? fallbackScheme;
+  final surface = dynamicColorScheme == null ? fallbackSurface : scheme.surface;
+  final raised = dynamicColorScheme == null
+      ? fallbackRaised
+      : scheme.surfaceContainerHigh;
+  final border = dynamicColorScheme == null
+      ? fallbackBorder
+      : scheme.outlineVariant;
+  final onSurface = dynamicColorScheme == null
+      ? fallbackOnSurface
+      : scheme.onSurface;
+  final muted = dynamicColorScheme == null
+      ? fallbackMuted
+      : scheme.onSurfaceVariant;
+  final effectiveAccent = dynamicColorScheme?.primary ?? accent;
 
   final base = ThemeData(
     brightness: brightness,
@@ -161,13 +184,13 @@ ThemeData buildXyTheme({
       ),
       focusedBorder: OutlineInputBorder(
         borderRadius: BorderRadius.circular(XyRadii.medium),
-        borderSide: BorderSide(color: accent, width: 1.4),
+        borderSide: BorderSide(color: effectiveAccent, width: 1.4),
       ),
     ),
     filledButtonTheme: FilledButtonThemeData(
       style: FilledButton.styleFrom(
-        backgroundColor: accent,
-        foregroundColor: Colors.white,
+        backgroundColor: effectiveAccent,
+        foregroundColor: scheme.onPrimary,
         minimumSize: const Size(48, 44),
         shape: RoundedRectangleBorder(
           borderRadius: BorderRadius.circular(XyRadii.medium),
@@ -181,11 +204,11 @@ ThemeData buildXyTheme({
         foregroundColor: onSurface,
       ),
     ),
-    progressIndicatorTheme: ProgressIndicatorThemeData(color: accent),
+    progressIndicatorTheme: ProgressIndicatorThemeData(color: effectiveAccent),
     sliderTheme: base.sliderTheme.copyWith(
-      activeTrackColor: accent,
-      thumbColor: accent,
-      overlayColor: accent.withValues(alpha: 0.12),
+      activeTrackColor: effectiveAccent,
+      thumbColor: effectiveAccent,
+      overlayColor: effectiveAccent.withValues(alpha: 0.12),
     ),
     bottomSheetTheme: BottomSheetThemeData(
       backgroundColor: surface,
