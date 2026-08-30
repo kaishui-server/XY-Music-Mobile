@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:math';
 
@@ -286,6 +287,11 @@ class AuthNotifier extends StateNotifier<AuthState> {
   final Ref _ref;
   final Random _rand = Random();
   Future<_ClientMetadata>? _clientMetadataFuture;
+  final Completer<void> _initCompleter = Completer<void>();
+
+  /// 登录态从磁盘恢复完成后完成。云同步等启动期服务必须等待它，
+  /// 否则可能读到空的 currentUser 而错误地跳过初始化。
+  Future<void> get ready => _initCompleter.future;
 
   /// 当前已登录用户的只读快照，供同步等服务层读取，避免直接暴露
   /// StateNotifier 的受保护 state 成员。
@@ -373,6 +379,8 @@ class AuthNotifier extends StateNotifier<AuthState> {
       }
     } catch (_) {
       // 无凭证或初始化失败，保持未登录。
+    } finally {
+      if (!_initCompleter.isCompleted) _initCompleter.complete();
     }
   }
 

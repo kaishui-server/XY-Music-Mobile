@@ -19,6 +19,13 @@ class SongsListView extends ConsumerStatefulWidget {
   final ScrollController? controller;
   final Widget? footer;
 
+  /// 每首歌的“更多”面板里额外注入的操作标题（如最近播放页的
+  /// “从最近播放删除”）。回调执行删除，组件负责刷新。
+  final Future<void> Function(Song song)? onRemoveAction;
+
+  /// 注入操作显示的菜单标题。
+  final String? removeActionLabel;
+
   /// 列表内边距。全屏页可留出底部安全区，嵌在 shell 内的页面可避让底栏。
   final EdgeInsetsGeometry? padding;
   const SongsListView({
@@ -32,6 +39,8 @@ class SongsListView extends ConsumerStatefulWidget {
     this.onToggleSelection,
     this.controller,
     this.footer,
+    this.onRemoveAction,
+    this.removeActionLabel,
   });
 
   @override
@@ -296,6 +305,13 @@ class _SongsListViewState extends ConsumerState<SongsListView> {
                 Icons.info_outline,
                 '歌曲信息',
               ),
+              if (widget.onRemoveAction != null)
+                _actionTile(
+                  context,
+                  _SongAction.removeFromRecent,
+                  Icons.playlist_remove_outlined,
+                  widget.removeActionLabel ?? '移除',
+                ),
             ],
           ),
         ),
@@ -319,6 +335,9 @@ class _SongsListViewState extends ConsumerState<SongsListView> {
         return;
       case _SongAction.info:
         if (context.mounted) await _showSongInfo(context, song);
+        return;
+      case _SongAction.removeFromRecent:
+        await widget.onRemoveAction?.call(song);
         return;
     }
   }
@@ -503,4 +522,11 @@ class _ScrollToTopButtonState extends State<ScrollToTopButton> {
   }
 }
 
-enum _SongAction { play, playNext, addToQueue, favorite, info }
+enum _SongAction {
+  play,
+  playNext,
+  addToQueue,
+  favorite,
+  info,
+  removeFromRecent,
+}

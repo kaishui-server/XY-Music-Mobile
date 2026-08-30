@@ -7,6 +7,7 @@ import '../../src/core/settings.dart';
 import '../../src/navigation/sidebar_controller.dart';
 import '../../src/widgets/cover_image.dart';
 import '../../src/widgets/song_list_view.dart';
+import '../../src/widgets/top_notice.dart' show XyNotice, XyNoticeType;
 
 class RecentPage extends ConsumerStatefulWidget {
   const RecentPage({super.key});
@@ -194,6 +195,18 @@ class _RecentSongs extends ConsumerWidget {
             padding: const EdgeInsets.fromLTRB(10, 0, 10, 90),
             onPlay: (list, index) =>
                 ref.read(libraryProvider.notifier).playList(list, index),
+            removeActionLabel: '从最近播放删除',
+            onRemoveAction: (song) async {
+              await removeRecentSong(ref, song);
+              if (context.mounted) {
+                XyNotice.show(
+                  context,
+                  message: '已从最近播放删除',
+                  type: XyNoticeType.success,
+                  duration: const Duration(seconds: 1),
+                );
+              }
+            },
           ),
         ),
       ],

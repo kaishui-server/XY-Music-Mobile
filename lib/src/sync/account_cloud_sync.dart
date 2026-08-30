@@ -21,6 +21,7 @@ class AccountCloudSync {
   static const _maxSongsPerChunk = 500;
   static Timer? _autoTimer;
   static bool _autoUploading = false;
+  static int _autoStartGeneration = 0;
 
   /// 默认使用 30 分钟，减少后台请求；用户手动选择的频率不会被覆盖。
   static const defaultFrequency = CloudSyncFrequency.thirtyMinutes;
@@ -87,6 +88,16 @@ class AccountCloudSync {
     FavoritesNotifier? favorites,
   }) async {
     stopAutoUpload();
+    // 启动时登录凭证是异步从磁盘恢复的；不等 ready 就读 currentUser
+    // 会拿到空账号并直接放弃，导致定时器从未启动（也就永远不会定时上传）。
+    final generation = ++_autoStartGeneration;
+    try {
+      await auth.ready.timeout(const Duration(seconds: 10));
+    } catch (_) {
+      // init 卡死（如 Rust 调用挂起）时超时放弃，本次不启动定时器。
+      return;
+    }
+    if (generation != _autoStartGeneration) return; // 已有更新的启动请求
     final accountId = auth.currentUser?.xymusicId?.trim() ?? '';
     if (accountId.isEmpty || !await isEnabled(accountId)) return;
     final selected = await frequency(accountId);

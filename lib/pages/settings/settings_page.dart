@@ -1860,7 +1860,12 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
                 await File(sourcePath!).copy(target.path);
               }
               if (context.mounted) {
-                await precacheImage(FileImage(target), context);
+                // 全分辨率解码会让一张高像素照片占用上百 MB 内存，
+                // 与根节点背景保持一致，按 1440 宽预缓存。
+                await precacheImage(
+                  ResizeImage(FileImage(target), width: 1440),
+                  context,
+                );
               }
               if (context.mounted) {
                 setSheetState(() => imagePath = target.path);

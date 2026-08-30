@@ -22,6 +22,7 @@ import '../../src/player/player_provider.dart';
 import '../../src/player/desktop_lyrics.dart';
 import '../../src/player/downloaded_song_store.dart';
 import '../../src/player/android_storage.dart';
+import '../../src/player/download_quality.dart';
 import '../../src/player/video_playback_session.dart';
 import '../../src/playlists/playlists_provider.dart';
 import '../../src/plugins/plugin_runtime.dart';
@@ -1934,6 +1935,13 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
         destPath: destination,
         headersJson: jsonEncode(source.headers),
       );
+      // 校验真实音质：magic bytes 检测实际格式，纠正扩展名并记录降级。
+      final verified = await verifyDownloadedAudioQuality(
+        savedPath: savedPath,
+        selectedQuality: quality,
+        durationSec: (item.durationMs / 1000).round(),
+        songTitle: item.title,
+      );
       final lyrics = await _lyricsForDownload(item);
       final coverUrl = item.coverUrl?.trim() ?? '';
       await finalizeDownloadExtras(
@@ -1941,12 +1949,12 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
           if ((settings?.downloadLyrics ?? true) && lyrics.isNotEmpty)
             'lyricsText': lyrics,
           if ((settings?.downloadLyrics ?? true) && lyrics.isNotEmpty)
-            'lyricsPath': p.setExtension(savedPath, '.lrc'),
+            'lyricsPath': p.setExtension(verified.path, '.lrc'),
           if (coverUrl.startsWith('http://') || coverUrl.startsWith('https://'))
             'coverUrl': coverUrl,
           'embedCover': true,
           'metadata': {
-            'filePath': savedPath,
+            'filePath': verified.path,
             'title': item.title,
             'artist': item.artist,
             'album': item.album,
@@ -1954,15 +1962,15 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
           },
         }),
       );
-      var finalPath = savedPath;
+      var finalPath = verified.path;
       if (usesSafDirectory) {
         finalPath = await AndroidStorage.copyFileToDirectory(
           directoryUri: directory,
-          sourcePath: savedPath,
-          fileName: p.basename(savedPath),
+          sourcePath: verified.path,
+          fileName: p.basename(verified.path),
           mimeType: 'audio/*',
         );
-        final lrcPath = p.setExtension(savedPath, '.lrc');
+        final lrcPath = p.setExtension(verified.path, '.lrc');
         if (await File(lrcPath).exists()) {
           await AndroidStorage.copyFileToDirectory(
             directoryUri: directory,
@@ -1972,7 +1980,7 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
           );
         }
         try {
-          await File(savedPath).delete();
+          await File(verified.path).delete();
           if (await File(lrcPath).exists()) await File(lrcPath).delete();
         } catch (_) {}
       }
@@ -1985,7 +1993,7 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
           durationMs: item.durationMs,
           downloadedAt: DateTime.now().millisecondsSinceEpoch,
           sourcePath: item.path,
-          quality: quality,
+          quality: verified.quality,
           coverUrl: item.coverUrl,
           lyricsRaw: lyrics.isEmpty ? null : lyrics,
         ),
@@ -1993,8 +2001,14 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
       if (mounted) {
         XyNotice.show(
           context,
-          message: '下载完成：${p.basename(savedPath)}',
-          type: XyNoticeType.success,
+          message: verified.warning ??
+              '下载完成：${p.basename(verified.path)}',
+          type: verified.warning == null
+              ? XyNoticeType.success
+              : XyNoticeType.warning,
+          duration: verified.warning == null
+              ? const Duration(milliseconds: 2600)
+              : const Duration(milliseconds: 5000),
         );
       }
     } catch (error) {

@@ -26,6 +26,12 @@
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher"
         android:networkSecurityConfig="@xml/network_security_config">
+        <!-- Android 10（API 29）老 GPU 驱动上，Impeller 的 GLES 图片纹理上传
+             路径会 SIGABRT 崩溃（flutter/flutter#188472），自定义壁纸等大图
+             必现。禁用 Impeller 回退 Skia 渲染器规避。 -->
+        <meta-data
+            android:name="io.flutter.embedding.android.EnableImpeller"
+            android:value="false"/>
         <activity
             android:name=".MainActivity"
             android:exported="true"

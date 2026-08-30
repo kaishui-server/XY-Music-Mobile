@@ -12,6 +12,7 @@ import '../../src/favorites/favorites_provider.dart';
 import '../../src/library/library_provider.dart';
 import '../../src/player/downloaded_song_store.dart';
 import '../../src/player/android_storage.dart';
+import '../../src/player/download_quality.dart';
 import '../../src/player/player_provider.dart';
 import '../../src/playlists/playlists_provider.dart';
 import '../../src/rust/api.dart';
@@ -397,6 +398,7 @@ class _PlaylistDetailPageState extends ConsumerState<PlaylistDetailPage> {
     var success = 0;
     var skipped = 0;
     var failed = 0;
+    final downgraded = <String>[];
     try {
       final usesSafDirectory = AndroidStorage.isTreeUri(options.directory);
       final workDirectory = usesSafDirectory
@@ -431,6 +433,14 @@ class _PlaylistDetailPageState extends ConsumerState<PlaylistDetailPage> {
             destPath: destination,
             headersJson: jsonEncode(source.headers),
           );
+          // 校验真实音质：magic bytes 检测实际格式，纠正扩展名并记录降级。
+          final verified = await verifyDownloadedAudioQuality(
+            savedPath: savedPath,
+            selectedQuality: options.quality,
+            durationSec: song.duration,
+            songTitle: song.title,
+          );
+          if (verified.warning != null) downgraded.add(verified.warning!);
           final lyrics = song.lyricsRaw?.trim() ?? '';
           final coverUrl = song.coverUrl?.trim() ?? '';
           await finalizeDownloadExtras(
@@ -438,13 +448,13 @@ class _PlaylistDetailPageState extends ConsumerState<PlaylistDetailPage> {
               if ((settings?.downloadLyrics ?? true) && lyrics.isNotEmpty)
                 'lyricsText': lyrics,
               if ((settings?.downloadLyrics ?? true) && lyrics.isNotEmpty)
-                'lyricsPath': p.setExtension(savedPath, '.lrc'),
+                'lyricsPath': p.setExtension(verified.path, '.lrc'),
               if (coverUrl.startsWith('http://') ||
                   coverUrl.startsWith('https://'))
                 'coverUrl': coverUrl,
               'embedCover': true,
               'metadata': {
-                'filePath': savedPath,
+                'filePath': verified.path,
                 'title': song.title,
                 'artist': song.artist,
                 'album': song.album,
@@ -452,15 +462,15 @@ class _PlaylistDetailPageState extends ConsumerState<PlaylistDetailPage> {
               },
             }),
           );
-          var finalPath = savedPath;
+          var finalPath = verified.path;
           if (usesSafDirectory) {
             finalPath = await AndroidStorage.copyFileToDirectory(
               directoryUri: options.directory,
-              sourcePath: savedPath,
-              fileName: p.basename(savedPath),
+              sourcePath: verified.path,
+              fileName: p.basename(verified.path),
               mimeType: 'audio/*',
             );
-            final lrcPath = p.setExtension(savedPath, '.lrc');
+            final lrcPath = p.setExtension(verified.path, '.lrc');
             if (await File(lrcPath).exists()) {
               await AndroidStorage.copyFileToDirectory(
                 directoryUri: options.directory,
@@ -470,7 +480,7 @@ class _PlaylistDetailPageState extends ConsumerState<PlaylistDetailPage> {
               );
             }
             try {
-              await File(savedPath).delete();
+              await File(verified.path).delete();
               if (await File(lrcPath).exists()) await File(lrcPath).delete();
             } catch (_) {}
           }
@@ -483,7 +493,7 @@ class _PlaylistDetailPageState extends ConsumerState<PlaylistDetailPage> {
               durationMs: song.duration * 1000,
               downloadedAt: DateTime.now().millisecondsSinceEpoch,
               sourcePath: song.path,
-              quality: options.quality,
+              quality: verified.quality,
               coverUrl: song.coverUrl,
               lyricsRaw: lyrics.isEmpty ? null : lyrics,
             ),
@@ -494,11 +504,20 @@ class _PlaylistDetailPageState extends ConsumerState<PlaylistDetailPage> {
         }
       }
       if (mounted) {
+        final summary =
+            '批量下载完成：成功 $success 首'
+            '${skipped > 0 ? '，本地歌曲跳过 $skipped 首' : ''}'
+            '${failed > 0 ? '，失败 $failed 首' : ''}'
+            '${downgraded.isNotEmpty ? '，${downgraded.length} 首低于所选音质' : ''}';
         XyNotice.show(
           context,
-          message:
-              '批量下载完成：成功 $success 首${skipped > 0 ? '，本地歌曲跳过 $skipped 首' : ''}${failed > 0 ? '，失败 $failed 首' : ''}',
-          type: failed > 0 ? XyNoticeType.warning : XyNoticeType.success,
+          message: downgraded.isEmpty ? summary : '$summary\n${downgraded.first}',
+          type: failed > 0 || downgraded.isNotEmpty
+              ? XyNoticeType.warning
+              : XyNoticeType.success,
+          duration: downgraded.isEmpty
+              ? const Duration(milliseconds: 2600)
+              : const Duration(milliseconds: 5000),
         );
         _closeSelection();
       }

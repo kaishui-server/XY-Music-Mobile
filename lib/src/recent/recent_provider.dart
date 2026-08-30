@@ -115,6 +115,16 @@ Future<void> clearRecentSongs(WidgetRef ref) async {
   ref.invalidate(recentSongsProvider);
 }
 
+/// 从最近播放中移除单首歌曲：同时删除 SQLite 播放历史和网络歌曲快照，
+/// 保留统计与收藏数据。
+Future<void> removeRecentSong(WidgetRef ref, Song song) async {
+  final dbPath = await ref.read(dbPathProvider.future);
+  await statsRemoveFromRecentHistory(dbPath: dbPath, songPaths: [song.path]);
+  await forgetRecentSongSnapshot(song.path);
+  ref.read(recentHistoryRevisionProvider.notifier).state++;
+  ref.invalidate(recentSongsProvider);
+}
+
 bool _isNetworkRecentPath(String path, RecentSongSnapshot? snapshot) =>
     snapshot?.pluginId?.trim().isNotEmpty == true ||
     path.startsWith('plugin://') ||

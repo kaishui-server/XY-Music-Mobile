@@ -107,6 +107,25 @@ Future<void> clearRecentSongSnapshots() {
   return operation;
 }
 
+/// 移除单首歌曲的最近播放快照（用户从最近播放列表删除时调用）。
+Future<void> forgetRecentSongSnapshot(String path) {
+  final operation = _recentSnapshotWriteQueue.then((_) async {
+    final prefs = await SharedPreferences.getInstance();
+    final snapshots = _decodeSnapshots(prefs.getString(_recentSongMetadataKey));
+    if (snapshots.remove(path) != null) {
+      await prefs.setString(
+        _recentSongMetadataKey,
+        jsonEncode(
+          snapshots.map((path, value) => MapEntry(path, value.toJson())),
+          toEncodable: (value) => value.toString(),
+        ),
+      );
+    }
+  });
+  _recentSnapshotWriteQueue = operation.catchError((_) {});
+  return operation;
+}
+
 Map<String, RecentSongSnapshot> _decodeSnapshots(String? raw) {
   if (raw == null || raw.trim().isEmpty) return {};
   try {
