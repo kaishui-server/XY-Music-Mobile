@@ -659,9 +659,6 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
         controller != null && VideoPlaybackSession.controller == controller;
     final shouldResume = _resumeAudioAfterVideo;
     final songPath = _videoSongPath;
-    // 视频播放期间音频播放器一直停在进入视频前的位置；关闭视频前先
-    // 读取视频当前时间，随后把音频播放器定位到同一位置，避免回跳。
-    final videoPosition = controller?.value.position;
     await notifier.disableVideoMediaBridge();
     _videoController = null;
     _videoSongPath = null;
@@ -686,13 +683,10 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
       return;
     }
     final current = ref.read(playerProvider).current;
-    if (songPath != null &&
-        videoPosition != null &&
-        videoPosition.inMilliseconds >= 0 &&
-        current?.path == songPath) {
-      await notifier.seek(videoPosition.inMilliseconds / 1000.0);
-    }
     if (shouldResume && current?.path == songPath) {
+      // 桥接期间静音音频与歌曲共享同一时间线，直接从音频自身位置继续。
+      // 不能用视频进度定位音频：MV 视频与音频时长不同，视频时钟越过
+      // 音频自然末尾后音频已 completed，此时定位回跳/重播都会出错。
       await notifier.resumeAfterVideo();
     }
     _videoClosing = false;

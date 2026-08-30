@@ -85,6 +85,7 @@ dependencies:
   permission_handler: ^11.3.0
   # 头像上传前压缩图片，避免超过服务端审核接口大小限制
   image: ^4.2.0
+  lpinyin: ^2.0.3
 
 dev_dependencies:
   flutter_test:

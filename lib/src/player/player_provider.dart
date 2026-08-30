@@ -1018,7 +1018,16 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
       if (now.difference(_lastVideoMediaSeek) >= const Duration(seconds: 1)) {
         _lastVideoMediaSeek = now;
         final drift = (_player.position - value.position).inMilliseconds.abs();
-        if (drift > 600) await _player.seek(value.position);
+        if (drift > 600) {
+          final audioDurationMs = _player.duration?.inMilliseconds ?? 0;
+          // MV 视频与音频是两路不同时长的内容，漂移校准不得把静音音频
+          // 拖过其自然末尾：音频一旦提前 completed，关闭视频后 play()
+          // 会把整曲从头重播。
+          if (audioDurationMs <= 0 ||
+              value.position.inMilliseconds < audioDurationMs - 250) {
+            await _player.seek(value.position);
+          }
+        }
       }
     } finally {
       _syncingVideoMediaBridge = false;
@@ -1053,6 +1062,14 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
       return;
     }
     if (controller.value.isCompleted) return;
+    // MV 视频常比音频长。视频进度越过音频末尾后不再 seek+play：
+    // just_audio 在 completed 状态下 play() 会把静音音频从头重播，
+    // 与每秒一次的进度校准 seek 相互触发，形成无声的重播循环。
+    final audioDurationMs = _player.duration?.inMilliseconds ?? 0;
+    final videoMs = controller.value.position.inMilliseconds;
+    if (audioDurationMs > 0 && videoMs >= audioDurationMs - 250) {
+      return;
+    }
     try {
       await _player.seek(controller.value.position);
       if (controller.value.isPlaying) {

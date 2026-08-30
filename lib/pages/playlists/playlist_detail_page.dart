@@ -5,6 +5,7 @@ import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
+import 'package:lpinyin/lpinyin.dart';
 import 'package:path/path.dart' as p;
 
 import '../../src/core/settings.dart';
@@ -33,6 +34,17 @@ class PlaylistDetailPage extends ConsumerStatefulWidget {
   ConsumerState<PlaylistDetailPage> createState() => _PlaylistDetailPageState();
 }
 
+/// 歌单内歌曲排序方式。
+enum _SongSortOrder {
+  added('添加顺序'),
+  timeDesc('时间从新到旧'),
+  titleAsc('歌名 A-Z'),
+  titleDesc('歌名 Z-A');
+
+  const _SongSortOrder(this.label);
+  final String label;
+}
+
 class _PlaylistDetailPageState extends ConsumerState<PlaylistDetailPage> {
   final Set<String> _selectedPaths = <String>{};
   List<Song> _songs = const <Song>[];
@@ -43,6 +55,7 @@ class _PlaylistDetailPageState extends ConsumerState<PlaylistDetailPage> {
   final FocusNode _searchFocus = FocusNode();
   bool _searchMode = false;
   String _query = '';
+  _SongSortOrder _sortOrder = _SongSortOrder.added;
 
   /// 歌曲列表加载缓存：future 只跟随歌单内容指纹创建一次，
   /// 勾选/搜索等 setState 不会重复触发数据库查询和全屏转圈。
@@ -91,6 +104,66 @@ class _PlaylistDetailPageState extends ConsumerState<PlaylistDetailPage> {
       _query = '';
       _searchController.clear();
     });
+  }
+
+  /// 按当前排序方式整理歌曲列表。时间排序基于歌单的添加顺序
+  /// （songPaths 本身按添加先后存储），歌名排序使用拼音避免中文乱序。
+  List<Song> _applySort(List<Song> songs) {
+    switch (_sortOrder) {
+      case _SongSortOrder.added:
+        return songs;
+      case _SongSortOrder.timeDesc:
+        return songs.reversed.toList();
+      case _SongSortOrder.titleAsc:
+      case _SongSortOrder.titleDesc:
+        final descending = _sortOrder == _SongSortOrder.titleDesc;
+        final sorted = [...songs]..sort((a, b) {
+            final result = _pinyinKey(a.title).compareTo(_pinyinKey(b.title));
+            return descending ? -result : result;
+          });
+        return sorted;
+    }
+  }
+
+  String _pinyinKey(String title) =>
+      PinyinHelper.getPinyinE(title.trim(), separator: ' ').toLowerCase();
+
+  Future<void> _showSortSheet() async {
+    final order = await showModalBottomSheet<_SongSortOrder>(
+      context: context,
+      useRootNavigator: true,
+      showDragHandle: true,
+      builder: (context) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Padding(
+              padding: const EdgeInsets.fromLTRB(20, 0, 20, 8),
+              child: Align(
+                alignment: Alignment.centerLeft,
+                child: Text(
+                  '歌曲排序',
+                  style: Theme.of(context).textTheme.titleMedium,
+                ),
+              ),
+            ),
+            for (final value in _SongSortOrder.values)
+              ListTile(
+                title: Text(value.label),
+                leading: Icon(
+                  value == _sortOrder
+                      ? Icons.radio_button_checked_rounded
+                      : Icons.radio_button_off_rounded,
+                ),
+                onTap: () => Navigator.pop(context, value),
+              ),
+            const SizedBox(height: 8),
+          ],
+        ),
+      ),
+    );
+    if (order == null || order == _sortOrder) return;
+    setState(() => _sortOrder = order);
   }
 
   void _toggleSelection(Song song) {
@@ -250,6 +323,16 @@ class _PlaylistDetailPageState extends ConsumerState<PlaylistDetailPage> {
               ),
             ),
             IconButton(
+              tooltip: '排序',
+              onPressed: _showSortSheet,
+              icon: Icon(
+                Icons.sort_rounded,
+                color: _sortOrder == _SongSortOrder.added
+                    ? null
+                    : Theme.of(context).colorScheme.primary,
+              ),
+            ),
+            IconButton(
               tooltip: '搜索',
               onPressed: _enterSearch,
               icon: const Icon(Icons.search_rounded),
@@ -267,7 +350,7 @@ class _PlaylistDetailPageState extends ConsumerState<PlaylistDetailPage> {
           final songs = snapshot.data ?? const <Song>[];
           _songs = songs;
           final query = _query;
-          final visibleSongs = query.isEmpty
+          final visibleSongs = _applySort(query.isEmpty
               ? songs
               : songs
                     .where(
@@ -276,7 +359,7 @@ class _PlaylistDetailPageState extends ConsumerState<PlaylistDetailPage> {
                           song.artist.toLowerCase().contains(query) ||
                           song.album.toLowerCase().contains(query),
                     )
-                    .toList();
+                    .toList());
           _visibleSongs = visibleSongs;
           return Column(
             children: [
@@ -285,7 +368,8 @@ class _PlaylistDetailPageState extends ConsumerState<PlaylistDetailPage> {
                 songs: songs,
                 onPlayAll: songs.isEmpty
                     ? null
-                    : () => ref.read(libraryProvider.notifier).playAll(songs),
+                    : () =>
+                        ref.read(libraryProvider.notifier).playAll(_applySort(songs)),
               ),
               if (songs.isEmpty)
                 Expanded(
@@ -398,7 +482,10 @@ class _PlaylistDetailPageState extends ConsumerState<PlaylistDetailPage> {
     var success = 0;
     var skipped = 0;
     var failed = 0;
+    var completed = 0;
+    final total = selected.length;
     final downgraded = <String>[];
+    final failureReasons = <String>[];
     try {
       final usesSafDirectory = AndroidStorage.isTreeUri(options.directory);
       final workDirectory = usesSafDirectory
@@ -412,6 +499,7 @@ class _PlaylistDetailPageState extends ConsumerState<PlaylistDetailPage> {
           skipped++;
           continue;
         }
+        final failedBefore = failed;
         try {
           final source = await notifier.resolveDownloadSourceFor(
             song.toQueueItem(),
@@ -499,8 +587,23 @@ class _PlaylistDetailPageState extends ConsumerState<PlaylistDetailPage> {
             ),
           );
           success++;
-        } catch (_) {
+        } catch (error) {
           failed++;
+          failureReasons.add('${song.title}：$error');
+        }
+        completed++;
+        if (mounted) {
+          final reason = failed > failedBefore
+              ? '：${failureReasons.last.split('：').skip(1).join('：')}'
+              : '';
+          XyNotice.show(
+            context,
+            message: '${failed > failedBefore ? '歌曲《${song.title}》下载失败$reason' : '歌曲《${song.title}》下载完成'}（$completed/$total）',
+            type: failed > failedBefore
+                ? XyNoticeType.error
+                : XyNoticeType.success,
+            compact: true,
+          );
         }
       }
       if (mounted) {
@@ -509,15 +612,19 @@ class _PlaylistDetailPageState extends ConsumerState<PlaylistDetailPage> {
             '${skipped > 0 ? '，本地歌曲跳过 $skipped 首' : ''}'
             '${failed > 0 ? '，失败 $failed 首' : ''}'
             '${downgraded.isNotEmpty ? '，${downgraded.length} 首低于所选音质' : ''}';
+        final details = <String>[
+          if (failureReasons.isNotEmpty) '失败原因：${failureReasons.join('；')}',
+          if (downgraded.isNotEmpty) downgraded.first,
+        ].join('\n');
         XyNotice.show(
           context,
-          message: downgraded.isEmpty ? summary : '$summary\n${downgraded.first}',
+          message: details.isEmpty ? summary : '$summary\n$details',
           type: failed > 0 || downgraded.isNotEmpty
               ? XyNoticeType.warning
               : XyNoticeType.success,
-          duration: downgraded.isEmpty
+          duration: details.isEmpty
               ? const Duration(milliseconds: 2600)
-              : const Duration(milliseconds: 5000),
+              : const Duration(milliseconds: 6000),
         );
         _closeSelection();
       }
