@@ -724,33 +724,153 @@ fn tx_string_field(item: &serde_json::Value, keys: &[&str]) -> String {
     String::new()
 }
 
-fn tx_pick_search_raw_list(data: &serde_json::Value) -> Option<&serde_json::Value> {
-    const PATHS: &[&str] = &[
-        "/body/song/list",
-        "/body/song/songlist",
-        "/body/song/itemlist",
-        "/body/song/items",
-        "/body/song/item_song",
-        "/body/songlist/list",
-        "/body/songlist/songlist",
-        "/body/songlist/itemlist",
-        "/body/songlist/items",
-        "/body/songlist",
-        "/body/item_song",
-        "/song/list",
-        "/songlist",
-        "/item_song",
-    ];
+/// 从 TX 节点中提取歌曲数组：节点本身是数组直接返回；
+/// 否则依次尝试 list/songlist/item_song 等常见嵌套键（与电脑端
+/// pickArrayFromTxNode 一致）。
+fn pick_array_from_tx_node(node: &serde_json::Value) -> Option<&serde_json::Value> {
+    if node.as_array().is_some() {
+        return Some(node);
+    }
+    if !node.is_object() {
+        return None;
+    }
+    for key in [
+        "list", "songlist", "itemlist", "items", "item_song", "item_audio", "grp",
+        "song", "songInfo", "musicInfo", "item", "docs", "records", "results",
+        "result", "value", "values", "data",
+    ] {
+        if let Some(child) = node.get(key) {
+            if child.as_array().is_some() {
+                return Some(child);
+            }
+        }
+    }
+    None
+}
 
-    for path in PATHS {
-        if let Some(value) = data.pointer(path) {
-            if value.as_array().map_or(false, |arr| !arr.is_empty()) {
-                return Some(value);
+/// 从 direct_result / direct_result2 直达结果中提取歌曲列表。
+/// 该字段可能是对象（{ song:{list}, item_song:{list} }），也可能是数组
+/// （直接结果分组，每组形如 { type:'song', grp:[...] }，仅歌曲类型分组内
+/// 是真正可播放的歌曲）。与电脑端 pickTxDirectResultList 一致。
+fn pick_tx_direct_result_list(dr: &serde_json::Value) -> Option<Vec<LxSearchItem>> {
+    if !dr.is_object() && !dr.is_array() {
+        return None;
+    }
+    let groups: Vec<&serde_json::Value> = match dr.as_array() {
+        Some(arr) => arr.iter().collect(),
+        None => vec![dr],
+    };
+    for group in groups {
+        if !group.is_object() {
+            continue;
+        }
+        let target = ["grp", "song", "item_song", "item_audio"]
+            .iter()
+            .find_map(|key| group.get(*key))
+            .unwrap_or(group);
+        if let Some(arr) = pick_array_from_tx_node(target) {
+            let items = tx_handle_result(arr);
+            if !items.is_empty() {
+                return Some(items);
+            }
+        }
+    }
+    None
+}
+
+/// 深度兜底搜索：BFS 遍历响应树寻找歌曲列表，深度上限 6
+/// （与电脑端 findTxSongListDeep 一致）。
+fn find_tx_song_list_deep(root: &serde_json::Value) -> Vec<LxSearchItem> {
+    let mut queue: std::collections::VecDeque<(&serde_json::Value, usize)> =
+        std::collections::VecDeque::new();
+    queue.push_back((root, 0));
+    while let Some((node, depth)) = queue.pop_front() {
+        if node.as_array().is_some() {
+            let items = tx_handle_result(node);
+            if !items.is_empty() {
+                return items;
+            }
+            if depth < 6 {
+                if let Some(arr) = node.as_array() {
+                    for item in arr.iter().take(80) {
+                        queue.push_back((item, depth + 1));
+                    }
+                }
+            }
+            continue;
+        }
+        if !node.is_object() {
+            continue;
+        }
+        if let Some(arr) = pick_array_from_tx_node(node) {
+            let items = tx_handle_result(arr);
+            if !items.is_empty() {
+                return items;
+            }
+        }
+        if depth >= 6 {
+            continue;
+        }
+        for key in [
+            "song", "songlist", "item_song", "item_audio", "grp",
+            "direct_result", "direct_result2", "musicInfo", "songInfo",
+            "list", "items", "data", "docs", "records", "result",
+        ] {
+            if let Some(child) = node.get(key) {
+                queue.push_back((child, depth + 1));
+            }
+        }
+    }
+    Vec::new()
+}
+
+/// 从搜索响应 data 中提取歌曲列表，覆盖常规路径、direct_result/
+/// direct_result2 直达结果和深度兜底（与电脑端 pickTxSearchRawList 对齐）。
+fn tx_extract_search_songs(data: &serde_json::Value) -> Vec<LxSearchItem> {
+    // 常规候选路径：Desktop 接口通常返回 body.song.list；Mobile 接口
+    // 降级响应中歌曲只出现在 direct_result2 直达结果里。
+    const CANDIDATE_PATHS: &[&str] = &[
+        "/body/song/list", "/body/song/songlist", "/body/song/itemlist",
+        "/body/song/items", "/body/song/item_song",
+        "/body/songlist/list", "/body/songlist/songlist",
+        "/body/songlist/itemlist", "/body/songlist/items", "/body/songlist",
+        "/body/item_song/list", "/body/item_song",
+        "/body/item_audio/list", "/body/item_audio",
+        "/body/direct_result/song/list", "/body/direct_result/item_song/list",
+        "/body/direct_result/item_song",
+        "/body/direct_result2/song/list", "/body/direct_result2/item_song/list",
+        "/body/direct_result2/item_song",
+        "/song/list", "/song", "/songlist/list", "/songlist",
+        "/item_song/list", "/item_song",
+    ];
+    for path in CANDIDATE_PATHS {
+        if let Some(node) = data.pointer(path) {
+            if let Some(arr) = pick_array_from_tx_node(node) {
+                let items = tx_handle_result(arr);
+                if !items.is_empty() {
+                    return items;
+                }
             }
         }
     }
 
-    None
+    // direct_result / direct_result2 分组提取（body 级优先，data 级兜底）
+    for key in ["direct_result", "direct_result2"] {
+        let body_node = data.pointer(&format!("/body/{}", key));
+        let data_node = data.get(key);
+        for node in [body_node, data_node].into_iter().flatten() {
+            if let Some(items) = pick_tx_direct_result_list(node) {
+                return items;
+            }
+        }
+    }
+
+    // 深度兜底：常规路径均未命中时在响应树中搜索
+    let root = data
+        .get("body")
+        .filter(|body| !body.is_null())
+        .unwrap_or(data);
+    find_tx_song_list_deep(root)
 }
 
 fn tx_handle_result(raw_list: &serde_json::Value) -> Vec<LxSearchItem> {
@@ -934,16 +1054,49 @@ fn tx_handle_result(raw_list: &serde_json::Value) -> Vec<LxSearchItem> {
 }
 
 async fn search_tx(keyword: &str, limit: u32) -> Result<Vec<LxSearchItem>, String> {
+    // 与电脑端 searchTx 对齐：仅使用 Mobile 接口（落雪官方验证有效）。
+    // 请求两次会累积 QQ 音乐的风控（reqCode 2001），导致结果随机失败，
+    // 故不再先请求 Desktop 接口。风控/空列表时退避重试（最多 4 次），
+    // 重试耗尽后走经典 Web 接口兜底，避免直接失败。
+    for retry in 0..=4 {
+        let (items, req_code) = request_tx_search_mobile(keyword, limit)
+            .await
+            .unwrap_or((Vec::new(), None));
+        if !items.is_empty() {
+            return Ok(items);
+        }
+        // 风控(2001)/空列表时等待重试：2001 表示被风控，需更长间隔；
+        // 空列表通常是降级响应，稍后重试。
+        let backoff_ms = if req_code == Some(2001) {
+            2000 * (retry as u64 + 1)
+        } else {
+            500 * (retry as u64 + 1)
+        };
+        tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+    }
+    // Mobile 接口被持续风控(reqCode 2001)，走经典 Web 接口兜底，避免直接失败
+    tx_search_web_fallback(keyword, limit).await
+}
+
+/// Mobile 搜索接口请求（与电脑端 requestTxSearch/createTxSearchRequestData 一致）。
+/// 仅使用移动端接口，需携带完整设备参数，否则会返回降级响应
+/// （常规 item_song 为空、歌曲只出现在 direct_result2 直达结果里）。
+async fn request_tx_search_mobile(
+    keyword: &str,
+    limit: u32,
+) -> Result<(Vec<LxSearchItem>, Option<i64>), String> {
     let request_data = serde_json::json!({
         "comm": {
-            "ct": "24", "cv": "4747474", "v": "4747474", "tmeAppID": "qqmusic",
-            "format": "json", "inCharset": "utf-8", "outCharset": "utf-8",
-            "platform": "yqq.json", "needNewCode": 0,
-            "uin": "0", "guid": "0",
+            "ct": "11", "cv": "14090508", "v": "14090508", "tmeAppID": "qqmusic",
+            "phonetype": "EBG-AN10", "deviceScore": "553.47", "devicelevel": "50", "newdevicelevel": "20",
+            "rom": "HuaWei/EMOTION/EmotionUI_14.2.0", "os_ver": "12",
+            "OpenUDID": "0", "OpenUDID2": "0", "QIMEI36": "0", "udid": "0", "chid": "0", "aid": "0",
+            "oaid": "0", "taid": "0", "tid": "0", "wid": "0", "uid": "0", "sid": "0",
+            "modeSwitch": "6", "teenMode": "0", "ui_mode": "2", "nettype": "1020", "v4ip": "",
         },
         "req": {
             "module": "music.search.SearchCgiService",
-            "method": "DoSearchForQQMusicDesktop",
+            "method": "DoSearchForQQMusicMobile",
             "param": {
                 "search_type": 0,
                 "searchid": format!("{}", chrono_like_random()),
@@ -963,59 +1116,6 @@ async fn search_tx(keyword: &str, limit: u32) -> Result<Vec<LxSearchItem>, Strin
         &url,
         &request_str,
         &[
-            ("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"),
-            ("Content-Type", "application/json"),
-            ("Referer", "https://y.qq.com/"),
-        ],
-    )
-    .await?;
-
-    // 检查响应
-    if body.get("code").and_then(|v| v.as_i64()) != Some(0)
-        || body.pointer("/req/code").and_then(|v| v.as_i64()) != Some(0)
-    {
-        return Err("TX search: invalid response code".to_string());
-    }
-
-    // Desktop 接口通常返回 body.song.list；部分环境会返回 body.songlist 或 item_song。
-    let data = body
-        .pointer("/req/data")
-        .unwrap_or(&serde_json::Value::Null);
-    let mut result = tx_pick_search_raw_list(data)
-        .map(tx_handle_result)
-        .unwrap_or_default();
-    if !result.is_empty() {
-        return Ok(result);
-    }
-
-    let mobile_request_data = serde_json::json!({
-        "comm": {
-            "ct": "24", "cv": "4747474", "v": "4747474", "tmeAppID": "qqmusic",
-            "format": "json", "inCharset": "utf-8", "outCharset": "utf-8",
-            "platform": "yqq.json", "needNewCode": 0,
-            "uin": "0", "guid": "0",
-        },
-        "req": {
-            "module": "music.search.SearchCgiService",
-            "method": "DoSearchForQQMusicMobile",
-            "param": {
-                "search_type": 0,
-                "searchid": format!("{}", chrono_like_random()),
-                "query": keyword,
-                "page_num": 1,
-                "num_per_page": limit,
-                "highlight": 0, "nqc_flag": 0, "multi_zhida": 0, "cat": 2, "grp": 1, "sin": 0, "sem": 0,
-            },
-        },
-    });
-    let mobile_request_str =
-        serde_json::to_string(&mobile_request_data).map_err(|e| e.to_string())?;
-    let mobile_sign = zzc_sign(&mobile_request_str);
-    let mobile_url = format!("https://u.y.qq.com/cgi-bin/musics.fcg?sign={}", mobile_sign);
-    let mobile_body = http_post_json(
-        &mobile_url,
-        &mobile_request_str,
-        &[
             ("User-Agent", "Mozilla/5.0 (Linux; Android 12; EBG-AN10) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/107.0.5304.141 Mobile Safari/537.36"),
             ("Content-Type", "application/json"),
             ("Referer", "https://y.qq.com/"),
@@ -1023,18 +1123,41 @@ async fn search_tx(keyword: &str, limit: u32) -> Result<Vec<LxSearchItem>, Strin
     )
     .await?;
 
-    if mobile_body.get("code").and_then(|v| v.as_i64()) == Some(0)
-        && mobile_body.pointer("/req/code").and_then(|v| v.as_i64()) == Some(0)
-    {
-        let mobile_data = mobile_body
-            .pointer("/req/data")
-            .unwrap_or(&serde_json::Value::Null);
-        result = tx_pick_search_raw_list(mobile_data)
-            .map(tx_handle_result)
-            .unwrap_or_default();
-    }
+    let req_code = body
+        .pointer("/req/code")
+        .and_then(|v| v.as_i64());
+    let data = body.pointer("/req/data").unwrap_or(&serde_json::Value::Null);
+    Ok((tx_extract_search_songs(data), req_code))
+}
 
-    Ok(result)
+/// 经典 Web 搜索接口兜底：不依赖新签名(Mobile)风控体系，
+/// Mobile 被持续风控时使用（与电脑端 txSearchWebFallback 一致）。
+async fn tx_search_web_fallback(
+    keyword: &str,
+    limit: u32,
+) -> Result<Vec<LxSearchItem>, String> {
+    let url = format!(
+        "https://c.y.qq.com/soso/fcgi-bin/client_search_cp?format=json&inCharset=utf-8&outCharset=utf-8&cr=1&platform=h5&catZhida=0&w={}&p=1&n={}",
+        urlencoding::encode(keyword),
+        limit
+    );
+    let result = http_get_json(
+        &url,
+        &[
+            ("User-Agent", "Mozilla/5.0 (iPhone; CPU iPhone OS 14_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.0 Mobile/15E148 Safari/604.1"),
+            ("Referer", "https://y.qq.com/"),
+        ],
+    )
+    .await?;
+
+    let raw_list = result
+        .pointer("/data/song/list")
+        .unwrap_or(&serde_json::Value::Null);
+    let items = tx_handle_result(raw_list);
+    if items.is_empty() {
+        return Err("TX web fallback: 无有效歌曲".to_string());
+    }
+    Ok(items)
 }
 
 /// 生成一个类似 Date.now().toString().slice(2) 的随机 ID
