@@ -431,7 +431,19 @@ class XyMobileSidebar extends ConsumerWidget {
                   color: dark ? XyColors.darkBorder : XyColors.lightBorder,
                 ),
                 Padding(
-                  padding: const EdgeInsets.fromLTRB(12, 7, 12, 9),
+                  padding: const EdgeInsets.fromLTRB(12, 7, 12, 0),
+                  child: _SidebarTile(
+                    destination: const _SidebarDestination(
+                      '下载管理',
+                      Icons.download_rounded,
+                      '/settings/downloads',
+                    ),
+                    selected: currentPath == '/settings/downloads',
+                    onTap: () => onNavigate('/settings/downloads'),
+                  ),
+                ),
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(12, 0, 12, 9),
                   child: _SidebarTile(
                     destination: destinations[kSidebarSettings]!,
                     selected: currentPath == '/settings',

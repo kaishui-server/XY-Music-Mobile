@@ -20,6 +20,7 @@ import '../../src/auth/auth_provider.dart';
 import '../../src/favorites/favorites_provider.dart';
 import '../../src/player/player_provider.dart';
 import '../../src/player/desktop_lyrics.dart';
+import '../../src/player/download_history_store.dart';
 import '../../src/player/downloaded_song_store.dart';
 import '../../src/player/android_storage.dart';
 import '../../src/player/download_quality.dart';
@@ -1899,6 +1900,19 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
       message: '下载已开始 ${item.title}',
       type: XyNoticeType.success,
     );
+    // 下载历史记录：进度、实际音质、失败原因均可在“下载管理”页回溯。
+    final historyNotifier = ref.read(downloadHistoryProvider.notifier);
+    final historyId = historyNotifier.begin(
+      title: item.title,
+      artist: item.artist,
+      album: item.album,
+      quality: quality,
+      durationMs: item.durationMs,
+      sourcePath: item.path,
+      pluginId: item.pluginId,
+      pluginData: item.pluginData,
+      coverUrl: item.coverUrl,
+    );
     try {
       final workDirectory = usesSafDirectory
           ? await resolveDownloadStagingDirectory()
@@ -1924,10 +1938,17 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
         // 用户已确认重新下载时直接覆盖旧文件，避免生成 "(1)" 副本。
         overwriteExisting: reDownloading,
       );
-      final savedPath = await downloadOnlineSong(
+      final savedPath = await trackDownloadProgress(
+        history: historyNotifier,
+        entryId: historyId,
         url: source.url,
+        headers: source.headers,
         destPath: destination,
-        headersJson: jsonEncode(source.headers),
+        download: () => downloadOnlineSong(
+          url: source.url,
+          destPath: destination,
+          headersJson: jsonEncode(source.headers),
+        ),
       );
       // 校验真实音质：magic bytes 检测实际格式，纠正扩展名并记录降级。
       final verified = await verifyDownloadedAudioQuality(
@@ -1992,6 +2013,11 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
           lyricsRaw: lyrics.isEmpty ? null : lyrics,
         ),
       );
+      historyNotifier.complete(
+        historyId,
+        savedPath: finalPath,
+        actualQuality: verified.quality,
+      );
       if (mounted) {
         XyNotice.show(
           context,
@@ -2006,6 +2032,7 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
         );
       }
     } catch (error) {
+      historyNotifier.fail(historyId, _errorText(error));
       if (mounted) {
         XyNotice.show(
           context,
@@ -2268,9 +2295,9 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
         onAddToPlaylist: current == null
             ? null
             : () => unawaited(_addToPlaylist(current)),
-        onLyricsOffset: current == null
+        onLinkLyrics: current == null
             ? null
-            : () => unawaited(_pickLyricsOffset(current)),
+            : () => unawaited(_linkLyrics(current)),
         onDesktopLyrics: () => unawaited(_toggleDesktopLyrics()),
         videoActive: videoActive,
         videoController: videoActive ? _videoController : null,
@@ -4905,7 +4932,7 @@ class _GlassControlCard extends ConsumerWidget {
     this.showMetadata = true,
     this.onDownload,
     this.onAddToPlaylist,
-    this.onLyricsOffset,
+    this.onLinkLyrics,
     this.onDesktopLyrics,
     this.videoActive = false,
     this.videoController,
@@ -4915,7 +4942,7 @@ class _GlassControlCard extends ConsumerWidget {
   final bool showMetadata;
   final VoidCallback? onDownload;
   final VoidCallback? onAddToPlaylist;
-  final VoidCallback? onLyricsOffset;
+  final VoidCallback? onLinkLyrics;
   final VoidCallback? onDesktopLyrics;
   final bool videoActive;
   final VideoPlayerController? videoController;
@@ -4943,7 +4970,7 @@ class _GlassControlCard extends ConsumerWidget {
                   showMetadata: showMetadata,
                   onDownload: onDownload,
                   onAddToPlaylist: onAddToPlaylist,
-                  onLyricsOffset: onLyricsOffset,
+                  onLinkLyrics: onLinkLyrics,
                   onDesktopLyrics: onDesktopLyrics,
                 ),
                 if (errorMessage != null) ...[
@@ -5015,14 +5042,14 @@ class _TitleRow extends ConsumerWidget {
     this.showMetadata = true,
     this.onDownload,
     this.onAddToPlaylist,
-    this.onLyricsOffset,
+    this.onLinkLyrics,
     this.onDesktopLyrics,
   });
   final QueueItem current;
   final bool showMetadata;
   final VoidCallback? onDownload;
   final VoidCallback? onAddToPlaylist;
-  final VoidCallback? onLyricsOffset;
+  final VoidCallback? onLinkLyrics;
   final VoidCallback? onDesktopLyrics;
 
   @override
@@ -5085,9 +5112,9 @@ class _TitleRow extends ConsumerWidget {
         if (!showMetadata)
           _quickAction(
             context,
-            icon: Icons.sync_alt_rounded,
-            tooltip: '歌词偏移',
-            onPressed: onLyricsOffset,
+            icon: Icons.lyrics_outlined,
+            tooltip: '关联歌词',
+            onPressed: onLinkLyrics,
           ),
         if (!showMetadata)
           _quickAction(

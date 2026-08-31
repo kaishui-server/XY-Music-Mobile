@@ -11,6 +11,7 @@ import 'package:path/path.dart' as p;
 import '../../src/core/settings.dart';
 import '../../src/favorites/favorites_provider.dart';
 import '../../src/library/library_provider.dart';
+import '../../src/player/download_history_store.dart';
 import '../../src/player/downloaded_song_store.dart';
 import '../../src/player/android_storage.dart';
 import '../../src/player/download_quality.dart';
@@ -493,6 +494,7 @@ class _PlaylistDetailPageState extends ConsumerState<PlaylistDetailPage> {
           : options.directory;
       await Directory(workDirectory).create(recursive: true);
       final notifier = ref.read(playerProvider.notifier);
+      final historyNotifier = ref.read(downloadHistoryProvider.notifier);
       for (final song in selected) {
         if (playbackSourceTypeFor(song.toQueueItem()) ==
             PlaybackSourceType.localFile) {
@@ -500,6 +502,17 @@ class _PlaylistDetailPageState extends ConsumerState<PlaylistDetailPage> {
           continue;
         }
         final failedBefore = failed;
+        final historyId = historyNotifier.begin(
+          title: song.title,
+          artist: song.artist,
+          album: song.album,
+          quality: options.quality,
+          durationMs: song.duration * 1000,
+          sourcePath: song.path,
+          pluginId: song.pluginId,
+          pluginData: song.pluginData,
+          coverUrl: song.coverUrl,
+        );
         try {
           final source = await notifier.resolveDownloadSourceFor(
             song.toQueueItem(),
@@ -516,10 +529,17 @@ class _PlaylistDetailPageState extends ConsumerState<PlaylistDetailPage> {
             fileNameStyle: 'artist-title',
             overwriteExisting: false,
           );
-          final savedPath = await downloadOnlineSong(
+          final savedPath = await trackDownloadProgress(
+            history: historyNotifier,
+            entryId: historyId,
             url: source.url,
+            headers: source.headers,
             destPath: destination,
-            headersJson: jsonEncode(source.headers),
+            download: () => downloadOnlineSong(
+              url: source.url,
+              destPath: destination,
+              headersJson: jsonEncode(source.headers),
+            ),
           );
           // 校验真实音质：magic bytes 检测实际格式，纠正扩展名并记录降级。
           final verified = await verifyDownloadedAudioQuality(
@@ -586,10 +606,16 @@ class _PlaylistDetailPageState extends ConsumerState<PlaylistDetailPage> {
               lyricsRaw: lyrics.isEmpty ? null : lyrics,
             ),
           );
+          historyNotifier.complete(
+            historyId,
+            savedPath: finalPath,
+            actualQuality: verified.quality,
+          );
           success++;
         } catch (error) {
           failed++;
           failureReasons.add('${song.title}：$error');
+          historyNotifier.fail(historyId, error.toString());
         }
         completed++;
         if (mounted) {

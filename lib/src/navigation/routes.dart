@@ -9,6 +9,7 @@ import '../../pages/search/search_page.dart';
 import '../../pages/favorites/favorites_page.dart';
 import '../../pages/recent/recent_page.dart';
 import '../../pages/settings/settings_page.dart';
+import '../../pages/settings/download_manager_page.dart';
 import '../../pages/player/player_page.dart';
 import '../../pages/account/account_page.dart';
 import '../../pages/account/cloud_sync_page.dart';
@@ -161,6 +162,13 @@ final appRouter = GoRouter(
                   _instantPage(state, const SettingsPage()),
               // 设置及其子页面统一隐藏迷你播放条。
               routes: [
+                GoRoute(
+                  path: 'downloads',
+                  pageBuilder: (context, state) => _instantPage(
+                    state,
+                    const DownloadManagerPage(),
+                  ),
+                ),
                 GoRoute(
                   path: 'account-services',
                   pageBuilder: (context, state) => _instantPage(
