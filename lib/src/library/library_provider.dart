@@ -178,9 +178,23 @@ class LibraryState {
 class LibraryNotifier extends StateNotifier<LibraryState> {
   LibraryNotifier(this._ref) : super(const LibraryState()) {
     load();
+    _rescanOnStartup();
   }
 
   final Ref _ref;
+
+  /// 每次进入软件后台重扫一次本地文件夹，确保新增/删除/修改的文件
+  /// 同步进库；扫描结束后 load() 会自动刷新界面。启动扫描失败不影响
+  /// 本地音乐展示，用户可通过刷新按钮手动重试。
+  Future<void> _rescanOnStartup() async {
+    try {
+      // 等待设置加载完成，保证扫描格式白名单与用户配置一致。
+      await _ref.read(settingsProvider.future);
+      await scanAllFolders();
+    } catch (_) {
+      // 静默失败：启动扫描仅用于同步磁盘变更，不向用户报错。
+    }
+  }
 
   Future<void> load() async {
     state = state.copyWith(loading: true, error: null);
@@ -241,7 +255,18 @@ class LibraryNotifier extends StateNotifier<LibraryState> {
   };
 
   /// 扫描全部已配置目录，按选定格式白名单入库，返回扫描到的歌曲总数。
-  Future<int> scanAllFolders() async {
+  ///
+  /// 启动后台扫描与用户手动刷新可能并发触发，这里用共享 Future 去重，
+  /// 并发调用只会等待同一次扫描完成，避免重复扫盘。
+  Future<int> scanAllFolders() {
+    return _scanInFlight ??= _doScanAllFolders().whenComplete(() {
+      _scanInFlight = null;
+    });
+  }
+
+  Future<int>? _scanInFlight;
+
+  Future<int> _doScanAllFolders() async {
     final dbPath = await _ref.read(dbPathProvider.future);
     final settings = _ref.read(settingsProvider).valueOrNull;
     final selectedFormats = settings?.scanFormats ?? kSupportedScanFormats;

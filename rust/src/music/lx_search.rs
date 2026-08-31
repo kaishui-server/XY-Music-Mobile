@@ -444,15 +444,7 @@ fn kw_handle_result(raw_data: &serde_json::Value) -> Option<Vec<LxSearchItem>> {
         let artist = decode_name(info.get("ARTIST").and_then(|v| v.as_str()).unwrap_or(""))
             .replace('&', "、");
         let album = info.get("ALBUM").and_then(|v| v.as_str()).unwrap_or("");
-        let album_id = info
-            .get("ALBUMID")
-            .and_then(|v| v.as_str())
-            .or_else(|| {
-                info.get("ALBUMID")
-                    .and_then(|v| v.as_i64().map(|_| ""))
-                    .map(|_| "")
-            })
-            .unwrap_or("");
+        let album_id = tx_string_field(info, &["ALBUMID"]);
 
         let web_albumpic_short = info
             .get("web_albumpic_short")
@@ -622,19 +614,8 @@ fn kg_filter_data(raw: &serde_json::Value) -> LxSearchItem {
         )),
         name: decode_name(raw.get("SongName").and_then(|v| v.as_str()).unwrap_or("")),
         album_name: decode_name(raw.get("AlbumName").and_then(|v| v.as_str()).unwrap_or("")),
-        album_id: serde_json::Value::String(
-            raw.get("AlbumID")
-                .and_then(|v| v.as_str())
-                .or_else(|| raw.get("AlbumID").and_then(|v| v.as_i64()).map(|_| ""))
-                .unwrap_or("")
-                .to_string(),
-        ),
-        songmid: raw
-            .get("Audioid")
-            .and_then(|v| v.as_str())
-            .or_else(|| raw.get("Audioid").and_then(|v| v.as_i64()).map(|_| ""))
-            .unwrap_or("")
-            .to_string(),
+        album_id: serde_json::Value::String(tx_string_field(raw, &["AlbumID"])),
+        songmid: tx_string_field(raw, &["Audioid"]),
         source: "kg".into(),
         interval: format_play_time(duration),
         img,
@@ -654,11 +635,7 @@ fn kg_handle_result(raw_data: &serde_json::Value) -> Vec<LxSearchItem> {
 
     if let Some(arr) = raw_data.as_array() {
         for item in arr {
-            let audioid = item
-                .get("Audioid")
-                .and_then(|v| v.as_str())
-                .or_else(|| item.get("Audioid").and_then(|v| v.as_i64()).map(|_| ""))
-                .unwrap_or("");
+            let audioid = tx_string_field(item, &["Audioid"]);
             let file_hash = item.get("FileHash").and_then(|v| v.as_str()).unwrap_or("");
             let key = format!("{}{}", audioid, file_hash);
             if ids.contains(&key) {
@@ -670,11 +647,7 @@ fn kg_handle_result(raw_data: &serde_json::Value) -> Vec<LxSearchItem> {
             // 处理 Grp 子项
             if let Some(grp) = item.get("Grp").and_then(|v| v.as_array()) {
                 for child in grp {
-                    let child_audioid = child
-                        .get("Audioid")
-                        .and_then(|v| v.as_str())
-                        .or_else(|| child.get("Audioid").and_then(|v| v.as_i64()).map(|_| ""))
-                        .unwrap_or("");
+                    let child_audioid = tx_string_field(child, &["Audioid"]);
                     let child_hash = child.get("FileHash").and_then(|v| v.as_str()).unwrap_or("");
                     let child_key = format!("{}{}", child_audioid, child_hash);
                     if ids.contains(&child_key) {
@@ -1172,6 +1145,65 @@ fn chrono_like_random() -> u64 {
     val
 }
 
+/// 网易云 picId 加密路径段（与官方 CDN 路径一致，对齐电脑端 coverUrl.ts）。
+/// picId 与 magic 逐字符 XOR 后取 MD5，再做 URL-safe Base64（/→_、+→-）。
+fn netease_pic_id_encrypt(pic_id: &str) -> String {
+    const MAGIC: &[u8] = b"3go8&$8*3*3h0k(2)2";
+    let id = pic_id.as_bytes();
+    let xored: Vec<u8> = id
+        .iter()
+        .zip(MAGIC.iter().cycle())
+        .map(|(c, m)| c ^ m)
+        .collect();
+    let digest = md5::compute(&xored);
+    base64::engine::general_purpose::STANDARD
+        .encode(digest.0)
+        .replace('/', "_")
+        .replace('+', "-")
+}
+
+/// 判断 picId 是否可靠：picId 常超过 Number.MAX_SAFE_INTEGER，JSON 解析成
+/// number 会丢精度导致拼出的 CDN 路径错误，只接受纯数字字符串或安全整数。
+fn netease_pic_id_reliable(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::String(s) => {
+            let t = s.trim();
+            if !t.is_empty() && t != "0" && t.chars().all(|c| c.is_ascii_digit()) {
+                Some(t.to_string())
+            } else {
+                None
+            }
+        }
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                if i != 0 {
+                    Some(i.to_string())
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// 由网易云 album 的 picId 字段拼封面 CDN URL。
+/// 覆盖 picId_str / pic_str / picId / pic 多种字段名（与电脑端一致）。
+fn netease_pic_id_to_url(album: &serde_json::Value) -> Option<String> {
+    for key in ["picId_str", "pic_str", "picId", "pic"] {
+        if let Some(id) = album.get(key).and_then(netease_pic_id_reliable) {
+            return Some(format!(
+                "https://p1.music.126.net/{}/{}.jpg",
+                netease_pic_id_encrypt(&id),
+                id
+            ));
+        }
+    }
+    None
+}
+
 async fn search_wy(keyword: &str, limit: u32) -> Result<Vec<LxSearchItem>, String> {
     let url = format!(
         "https://music.163.com/api/search/get/web?s={}&type=1&offset=0&limit={}",
@@ -1257,10 +1289,15 @@ async fn search_wy(keyword: &str, limit: u32) -> Result<Vec<LxSearchItem>, Strin
             .cloned()
             .unwrap_or(serde_json::Value::Null);
 
+        // 网易云搜索接口 album 通常不返回 picUrl，只有 picId（超大整数，
+        // JSON 解析丢精度后不可用）。优先 picUrl（http 统一转 https），
+        // 其次按 picId 拼官方 CDN 路径（与电脑端 searchWy 一致）。
         let img = al
             .get("picUrl")
             .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
+            .map(|s| s.replacen("http://", "https://", 1))
+            .filter(|s| !s.is_empty())
+            .or_else(|| netease_pic_id_to_url(&al));
 
         let singer = ar
             .iter()
@@ -1330,11 +1367,7 @@ fn mg_filter_data(raw_data: &serde_json::Value) -> Vec<LxSearchItem> {
     };
 
     for data in flat {
-        let song_id = data
-            .get("songId")
-            .and_then(|v| v.as_str())
-            .or_else(|| data.get("songId").and_then(|v| v.as_i64()).map(|_| ""))
-            .unwrap_or("");
+        let song_id = tx_string_field(data, &["songId"]);
         let copyright_id = data
             .get("copyrightId")
             .and_then(|v| v.as_str())

@@ -29,6 +29,30 @@ class _LibraryPageState extends ConsumerState<LibraryPage>
   late final TabController _tab;
   late int _visibleTab;
   bool _addingFolder = false;
+  bool _scanning = false;
+
+  /// 顶栏刷新：重新扫描全部已配置文件夹，同步磁盘上的新增/删除后刷新列表。
+  Future<void> _onRefresh() async {
+    if (_scanning) return;
+    setState(() => _scanning = true);
+    try {
+      final count = await ref
+          .read(libraryProvider.notifier)
+          .scanAllFolders();
+      if (!mounted) return;
+      XyNotice.show(
+        context,
+        message: '刷新完成，共 $count 首',
+        type: XyNoticeType.success,
+        duration: const Duration(seconds: 2),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      XyNotice.show(context, message: '刷新失败：$e', type: XyNoticeType.error);
+    } finally {
+      if (mounted) setState(() => _scanning = false);
+    }
+  }
 
   @override
   void initState() {
@@ -163,8 +187,17 @@ class _LibraryPageState extends ConsumerState<LibraryPage>
               icon: const Icon(Icons.search_rounded),
             ),
           IconButton(
-            icon: const Icon(Icons.refresh),
-            onPressed: () => ref.read(libraryProvider.notifier).load(),
+            tooltip: '刷新',
+            // 刷新需重新扫描文件夹以同步磁盘上的新增/删除，仅 load()
+            // 只会重读数据库，无法带出文件夹里的新内容。
+            onPressed: _scanning ? null : _onRefresh,
+            icon: _scanning
+                ? const SizedBox(
+                    width: 20,
+                    height: 20,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  )
+                : const Icon(Icons.refresh),
           ),
         ],
         bottom: TabBar(
