@@ -2270,6 +2270,7 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
                 key: ValueKey('lyrics:${current.path}'),
                 item: current,
                 offsetTenths: _lyricsOffsetTenths,
+                onLinkLyrics: () => unawaited(_linkLyrics(current)),
               ),
           ],
         ),
@@ -4290,9 +4291,13 @@ class _LyricsView extends ConsumerStatefulWidget {
     super.key,
     required this.item,
     required this.offsetTenths,
+    this.onLinkLyrics,
   });
   final QueueItem item;
   final int offsetTenths;
+
+  /// 歌词页“暂无歌词”空态下的快捷关联歌词回调。
+  final VoidCallback? onLinkLyrics;
 
   @override
   ConsumerState<_LyricsView> createState() => _LyricsViewState();
@@ -4375,12 +4380,20 @@ class _LyricsViewState extends ConsumerState<_LyricsView>
     } else if (widget.item.pluginId != null && !widget.item.lyricsAttempted) {
       content = _lyricsEmpty(context, '正在获取歌词…');
     } else if (widget.item.pluginId != null) {
-      content = _lyricsEmpty(context, '暂无歌词');
+      content = _lyricsEmpty(
+        context,
+        '暂无歌词',
+        onLinkLyrics: widget.onLinkLyrics,
+      );
     } else {
       final lyrics = ref.watch(_lyricsProvider(widget.item.path));
       content = lyrics.when(
         loading: () => const Center(child: CircularProgressIndicator()),
-        error: (_, _) => _lyricsEmpty(context, '暂无歌词'),
+        error: (_, _) => _lyricsEmpty(
+          context,
+          '暂无歌词',
+          onLinkLyrics: widget.onLinkLyrics,
+        ),
         data: (lines) =>
             _buildLines(lines, position, effectMode, textAlign, baseFontSize),
       );
@@ -4396,7 +4409,7 @@ class _LyricsViewState extends ConsumerState<_LyricsView>
     double baseFontSize,
   ) {
     if (lines.isEmpty) {
-      return _lyricsEmpty(context, '暂无歌词');
+      return _lyricsEmpty(context, '暂无歌词', onLinkLyrics: widget.onLinkLyrics);
     }
     _latestLines = lines;
     var active = lines.lastIndexWhere((line) => line.time <= position);
@@ -4648,20 +4661,41 @@ class _LyricsViewState extends ConsumerState<_LyricsView>
     );
   }
 
-  Widget _lyricsEmpty(BuildContext context, String message) => Center(
+  /// 空态文案；传入 [onLinkLyrics] 时（暂无歌词）不显示 logo，
+  /// 改为显示“关联歌词”快捷按钮。
+  Widget _lyricsEmpty(
+    BuildContext context,
+    String message, {
+    VoidCallback? onLinkLyrics,
+  }) => Center(
     child: Column(
       mainAxisSize: MainAxisSize.min,
       children: [
-        Icon(
-          Icons.lyrics_outlined,
-          size: 52,
-          color: Colors.white.withValues(alpha: .3),
-        ),
-        const SizedBox(height: 12),
+        if (onLinkLyrics == null) ...[
+          Icon(
+            Icons.lyrics_outlined,
+            size: 52,
+            color: Colors.white.withValues(alpha: .3),
+          ),
+          const SizedBox(height: 12),
+        ],
         Text(
           message,
           style: TextStyle(color: Colors.white.withValues(alpha: .5)),
         ),
+        if (onLinkLyrics != null) ...[
+          const SizedBox(height: 20),
+          OutlinedButton.icon(
+            onPressed: onLinkLyrics,
+            icon: const Icon(Icons.lyrics_outlined, size: 20),
+            label: const Text('关联歌词'),
+            style: OutlinedButton.styleFrom(
+              foregroundColor: Colors.white,
+              side: BorderSide(color: Colors.white.withValues(alpha: .4)),
+              padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 10),
+            ),
+          ),
+        ],
       ],
     ),
   );
@@ -5408,7 +5442,52 @@ class _Controls extends ConsumerWidget {
       context: context,
       showDragHandle: true,
       isScrollControlled: true,
-      builder: (context) => SafeArea(
+      builder: (context) => _QueueSheet(player: player),
+    );
+  }
+}
+
+/// 播放队列底部弹窗：打开时自动定位到当前正在播放的歌曲。
+class _QueueSheet extends ConsumerStatefulWidget {
+  const _QueueSheet({required this.player});
+
+  final PlaybackState player;
+
+  @override
+  ConsumerState<_QueueSheet> createState() => _QueueSheetState();
+}
+
+class _QueueSheetState extends ConsumerState<_QueueSheet> {
+  /// 队列项固定高度（两行 ListTile 的标准高度），保证滚动定位精确。
+  static const double _itemExtent = 72;
+  final _scrollController = ScrollController();
+
+  @override
+  void initState() {
+    super.initState();
+    // 首帧布局完成后才能拿到 viewport 与 maxScrollExtent，再定位当前歌曲。
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || !_scrollController.hasClients) return;
+      final index = widget.player.queueIndex;
+      if (index < 0 || index >= widget.player.queue.length) return;
+      final viewport = _scrollController.position.viewportDimension;
+      // 让当前歌曲尽量落在可视区中间。
+      final target = (index * _itemExtent - (viewport - _itemExtent) / 2)
+          .clamp(0.0, _scrollController.position.maxScrollExtent);
+      if (target > 0) _scrollController.jumpTo(target);
+    });
+  }
+
+  @override
+  void dispose() {
+    _scrollController.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final player = widget.player;
+    return SafeArea(
         child: SizedBox(
           height: MediaQuery.sizeOf(context).height * .66,
           child: Column(
@@ -5438,6 +5517,8 @@ class _Controls extends ConsumerWidget {
               const Divider(height: 1),
               Expanded(
                 child: ListView.builder(
+                  controller: _scrollController,
+                  itemExtent: _itemExtent,
                   padding: const EdgeInsets.only(bottom: 16),
                   itemCount: player.queue.length,
                   itemBuilder: (context, index) {
@@ -5494,7 +5575,6 @@ class _Controls extends ConsumerWidget {
             ],
           ),
         ),
-      ),
-    );
+      );
   }
 }
