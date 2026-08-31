@@ -601,9 +601,12 @@ class PluginRuntimeService {
 
   Future<List<PluginSearchSong>> search(
     EnabledMusicPlugin plugin,
-    String keyword,
-  ) async {
-    if (plugin.isLx) return _searchLxPlugin(plugin, keyword);
+    String keyword, {
+    String? lxSource,
+  }) async {
+    if (plugin.isLx) {
+      return _searchLxPlugin(plugin, keyword, onlySource: lxSource);
+    }
     dynamic response;
     Object? pluginError;
     try {
@@ -646,9 +649,12 @@ class PluginRuntimeService {
   /// 插件未实现详情接口时才回退到按歌手名搜索。
   Future<List<PluginSearchSong>> getArtistSongs(
     EnabledMusicPlugin plugin,
-    PluginCatalogResult artist,
-  ) async {
-    if (plugin.isLx) return _searchLxPlugin(plugin, artist.title);
+    PluginCatalogResult artist, {
+    String? lxSource,
+  }) async {
+    if (plugin.isLx) {
+      return _searchLxPlugin(plugin, artist.title, onlySource: lxSource);
+    }
     try {
       Future<List<Map<String, dynamic>>> fetchPage(int page) async {
         final response = _runsPluginsInBackground
@@ -755,9 +761,12 @@ class PluginRuntimeService {
   /// 插件未实现详情接口时才回退到按专辑名搜索并过滤。
   Future<List<PluginSearchSong>> getAlbumSongs(
     EnabledMusicPlugin plugin,
-    PluginCatalogResult album,
-  ) async {
-    if (plugin.isLx) return _searchLxPlugin(plugin, album.title);
+    PluginCatalogResult album, {
+    String? lxSource,
+  }) async {
+    if (plugin.isLx) {
+      return _searchLxPlugin(plugin, album.title, onlySource: lxSource);
+    }
     try {
       final response = _runsPluginsInBackground
           ? await _runPluginOperation(plugin, 'getAlbumInfo', {
@@ -792,10 +801,15 @@ class PluginRuntimeService {
   /// 搜索插件歌手。MF 直接调用插件的 artist 类型；LX 仅保留歌手名匹配的结果。
   Future<List<PluginCatalogResult>> searchArtists(
     EnabledMusicPlugin plugin,
-    String keyword,
-  ) async {
+    String keyword, {
+    String? lxSource,
+  }) async {
     if (plugin.isLx) {
-      final songs = await _searchLxPlugin(plugin, keyword);
+      final songs = await _searchLxPlugin(
+        plugin,
+        keyword,
+        onlySource: lxSource,
+      );
       return _aggregateLxCatalog(
         plugin.id,
         songs,
@@ -893,10 +907,15 @@ class PluginRuntimeService {
   /// 搜索插件专辑。MF 直接调用插件的 album 类型；LX 仅保留专辑名匹配的结果。
   Future<List<PluginCatalogResult>> searchAlbums(
     EnabledMusicPlugin plugin,
-    String keyword,
-  ) async {
+    String keyword, {
+    String? lxSource,
+  }) async {
     if (plugin.isLx) {
-      final songs = await _searchLxPlugin(plugin, keyword);
+      final songs = await _searchLxPlugin(
+        plugin,
+        keyword,
+        onlySource: lxSource,
+      );
       return _aggregateLxCatalog(
         plugin.id,
         songs,
@@ -1159,11 +1178,15 @@ class PluginRuntimeService {
 
   Future<List<PluginSearchSong>> _searchLxPlugin(
     EnabledMusicPlugin plugin,
-    String keyword,
-  ) async {
-    final sources = plugin.lxSources.isEmpty
+    String keyword, {
+    String? onlySource,
+  }) async {
+    var sources = plugin.lxSources.isEmpty
         ? const ['kw', 'kg', 'tx', 'wy', 'mg']
         : plugin.lxSources;
+    if (onlySource != null && onlySource.isNotEmpty) {
+      sources = sources.contains(onlySource) ? [onlySource] : const [];
+    }
     final results = <PluginSearchSong>[];
     final seen = <String>{};
     Object? lastError;

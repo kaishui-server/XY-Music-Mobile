@@ -56,6 +56,88 @@ class _PluginSearchState {
 
 enum _SearchCategory { songs, artists, albums, playlists }
 
+/// 搜索来源 Tab 的展示模型，与电脑版 Search.vue 的 SourceItem 对应。
+///
+/// MusicFree 插件一个插件一个 Tab；LX 插件内含多个平台音源
+/// （kw/kg/tx/wy/mg），多平台时按平台拆成独立 Tab，搜索请求只查
+/// 对应平台，避免所有平台结果混在一个插件名下。
+class _SearchSourceTab {
+  const _SearchSourceTab({
+    required this.plugin,
+    required this.name,
+    required this.key,
+    this.lxSource,
+  });
+
+  final EnabledMusicPlugin plugin;
+
+  /// Tab 标题：多平台 LX 显示平台名，其余显示插件名。
+  final String name;
+
+  /// 状态存储键：插件 id 或“插件id__平台id”，保证各 Tab 状态独立。
+  final String key;
+
+  /// LX 插件拆分后的具体平台标识，非 LX 插件为 null。
+  final String? lxSource;
+}
+
+/// LX 平台显示名，与电脑版 lxMusicSdk 的 LX_SOURCE_NAMES 一致。
+const _lxSourceNames = <String, String>{
+  'kw': '小蜗音乐',
+  'kg': '小枸音乐',
+  'tx': '小秋音乐',
+  'wy': '小芸音乐',
+  'mg': '小蜜音乐',
+};
+
+/// 把已启用插件列表转换成搜索 Tab 列表（仿电脑版 refreshPluginSourceList）。
+List<_SearchSourceTab> _buildSearchSourceTabs(
+  List<EnabledMusicPlugin> plugins,
+) {
+  final tabs = <_SearchSourceTab>[];
+  for (final plugin in plugins) {
+    if (!plugin.isLx) {
+      tabs.add(
+        _SearchSourceTab(plugin: plugin, name: plugin.name, key: plugin.id),
+      );
+      continue;
+    }
+    final sources = plugin.lxSources.isEmpty
+        ? const ['kw', 'kg', 'tx', 'wy', 'mg']
+        : plugin.lxSources
+              .where(_lxSourceNames.containsKey)
+              .toList(growable: false);
+    if (sources.isEmpty) {
+      tabs.add(
+        _SearchSourceTab(plugin: plugin, name: plugin.name, key: plugin.id),
+      );
+      continue;
+    }
+    if (sources.length == 1) {
+      tabs.add(
+        _SearchSourceTab(
+          plugin: plugin,
+          name: plugin.name,
+          key: plugin.id,
+          lxSource: sources.first,
+        ),
+      );
+      continue;
+    }
+    for (final source in sources) {
+      tabs.add(
+        _SearchSourceTab(
+          plugin: plugin,
+          name: _lxSourceNames[source]!,
+          key: '${plugin.id}__$source',
+          lxSource: source,
+        ),
+      );
+    }
+  }
+  return tabs;
+}
+
 class _SearchPageState extends ConsumerState<SearchPage>
     with SingleTickerProviderStateMixin {
   static const _historyKey = 'network_search_history_v1';
@@ -222,13 +304,13 @@ class _SearchPageState extends ConsumerState<SearchPage>
     }
   }
 
-  String _stateKey(String pluginId, _SearchCategory category) =>
-      '$pluginId:${category.name}';
+  String _stateKey(String tabKey, _SearchCategory category) =>
+      '$tabKey:${category.name}';
 
-  _PluginSearchState _stateFor(
-    EnabledMusicPlugin plugin,
+  _PluginSearchState _stateForTab(
+    _SearchSourceTab tab,
     _SearchCategory category,
-  ) => _states[_stateKey(plugin.id, category)] ?? const _PluginSearchState();
+  ) => _states[_stateKey(tab.key, category)] ?? const _PluginSearchState();
 
   Future<void> _search(String input) async {
     final keyword = input.trim();
@@ -238,48 +320,49 @@ class _SearchPageState extends ConsumerState<SearchPage>
     final token = ++_queryToken;
     final plugins = await ref.read(enabledMusicPluginsProvider.future);
     if (!mounted || token != _queryToken) return;
+    final tabs = _buildSearchSourceTabs(plugins);
     setState(() {
-      for (final plugin in plugins) {
-        _states[_stateKey(plugin.id, _SearchCategory.songs)] =
+      for (final tab in tabs) {
+        _states[_stateKey(tab.key, _SearchCategory.songs)] =
             const _PluginSearchState(loading: true, searched: true);
-        _states[_stateKey(plugin.id, _SearchCategory.artists)] =
+        _states[_stateKey(tab.key, _SearchCategory.artists)] =
             const _PluginSearchState();
-        _states[_stateKey(plugin.id, _SearchCategory.albums)] =
+        _states[_stateKey(tab.key, _SearchCategory.albums)] =
             const _PluginSearchState();
-        _states[_stateKey(plugin.id, _SearchCategory.playlists)] =
+        _states[_stateKey(tab.key, _SearchCategory.playlists)] =
             const _PluginSearchState();
       }
     });
     if (_selectedCategory != _SearchCategory.songs) {
-      for (var pluginIndex = 0; pluginIndex < plugins.length; pluginIndex++) {
+      for (var tabIndex = 0; tabIndex < tabs.length; tabIndex++) {
         _ensureCategorySearch(
-          plugins,
-          pluginIndex: pluginIndex,
+          tabs,
+          pluginIndex: tabIndex,
           category: _selectedCategory,
         );
       }
     }
     await Future.wait(
-      plugins.map((plugin) => _searchPlugin(plugin, keyword, token)),
+      tabs.map((tab) => _searchTabSource(tab, keyword, token)),
     );
   }
 
-  Future<void> _searchPlugin(
-    EnabledMusicPlugin plugin,
+  Future<void> _searchTabSource(
+    _SearchSourceTab tab,
     String keyword,
     int token,
   ) async {
     try {
       final result = await ref
           .read(pluginRuntimeProvider)
-          .search(plugin, keyword);
+          .search(tab.plugin, keyword, lxSource: tab.lxSource);
       final songs = result
           .where((item) => item.title.trim().isNotEmpty)
-          .map((item) => _songFromPlugin(plugin, item))
+          .map((item) => _songFromPlugin(tab.plugin, item))
           .toList();
       if (!mounted || token != _queryToken) return;
       setState(() {
-        _states[_stateKey(plugin.id, _SearchCategory.songs)] =
+        _states[_stateKey(tab.key, _SearchCategory.songs)] =
             _PluginSearchState(songs: songs, searched: true);
       });
       unawaited(
@@ -287,7 +370,7 @@ class _SearchPageState extends ConsumerState<SearchPage>
             .read(authProvider.notifier)
             .reportSearch(
               keyword: keyword,
-              source: plugin.id,
+              source: tab.plugin.id,
               resultCount: songs.length,
             )
             .catchError((_) {}),
@@ -296,7 +379,7 @@ class _SearchPageState extends ConsumerState<SearchPage>
       if (!mounted || token != _queryToken) return;
       setState(() {
         _states[_stateKey(
-          plugin.id,
+          tab.key,
           _SearchCategory.songs,
         )] = _PluginSearchState(
           searched: true,
@@ -323,10 +406,11 @@ class _SearchPageState extends ConsumerState<SearchPage>
   }
 
   Future<void> _openCatalogResult(
-    EnabledMusicPlugin plugin,
+    _SearchSourceTab tab,
     _SearchCategory category,
     PluginCatalogResult item,
   ) async {
+    final plugin = tab.plugin;
     final keyword = item.title.trim();
     if (keyword.isEmpty) return;
     // 与电脑版一致：先进入详情页，再在详情页内调用插件详情接口，
@@ -344,10 +428,12 @@ class _SearchPageState extends ConsumerState<SearchPage>
               _SearchCategory.artists => await runtime.getArtistSongs(
                 plugin,
                 item,
+                lxSource: tab.lxSource,
               ),
               _SearchCategory.albums => await runtime.getAlbumSongs(
                 plugin,
                 item,
+                lxSource: tab.lxSource,
               ),
               _SearchCategory.playlists => await _loadPlaylistSongs(
                 runtime,
@@ -394,20 +480,29 @@ class _SearchPageState extends ConsumerState<SearchPage>
   }
 
   Future<void> _searchPluginCategory(
-    EnabledMusicPlugin plugin,
+    _SearchSourceTab tab,
     _SearchCategory category,
     String keyword,
     int token,
   ) async {
-    final key = _stateKey(plugin.id, category);
+    final plugin = tab.plugin;
+    final key = _stateKey(tab.key, category);
     setState(() {
       _states[key] = const _PluginSearchState(loading: true, searched: true);
     });
     try {
       final runtime = ref.read(pluginRuntimeProvider);
       final catalog = switch (category) {
-        _SearchCategory.artists => await runtime.searchArtists(plugin, keyword),
-        _SearchCategory.albums => await runtime.searchAlbums(plugin, keyword),
+        _SearchCategory.artists => await runtime.searchArtists(
+          plugin,
+          keyword,
+          lxSource: tab.lxSource,
+        ),
+        _SearchCategory.albums => await runtime.searchAlbums(
+          plugin,
+          keyword,
+          lxSource: tab.lxSource,
+        ),
         _SearchCategory.playlists => await runtime.searchPlaylists(
           plugin,
           keyword,
@@ -431,25 +526,23 @@ class _SearchPageState extends ConsumerState<SearchPage>
   }
 
   void _ensureCategorySearch(
-    List<EnabledMusicPlugin> plugins, {
+    List<_SearchSourceTab> tabs, {
     int? pluginIndex,
     _SearchCategory? category,
   }) {
     final index = pluginIndex ?? _selectedPluginIndex;
     final selected = category ?? _selectedCategory;
-    if (index < 0 ||
-        index >= plugins.length ||
-        selected == _SearchCategory.songs) {
+    if (index < 0 || index >= tabs.length || selected == _SearchCategory.songs) {
       return;
     }
-    final plugin = plugins[index];
-    final state = _stateFor(plugin, selected);
+    final tab = tabs[index];
+    final state = _stateForTab(tab, selected);
     if (state.loading || state.searched || _controller.text.trim().isEmpty) {
       return;
     }
     final token = _queryToken;
     unawaited(
-      _searchPluginCategory(plugin, selected, _controller.text.trim(), token),
+      _searchPluginCategory(tab, selected, _controller.text.trim(), token),
     );
   }
 
@@ -578,18 +671,19 @@ class _SearchPageState extends ConsumerState<SearchPage>
   }
 
   Widget _tabBody(
-    EnabledMusicPlugin plugin, {
+    _SearchSourceTab tab, {
     required bool showMiniPlayer,
     required _SearchCategory category,
   }) {
+    final plugin = tab.plugin;
     final scheme = Theme.of(context).colorScheme;
-    final state = _stateFor(plugin, category);
+    final state = _stateForTab(tab, category);
     if (!state.searched) {
       return Center(
         child: Text(
           category == _SearchCategory.songs
-              ? '输入关键词，从 ${plugin.name} 搜索网络音乐'
-              : '点击上方“${_categoryLabelForPlugin(category, plugin)}”开始搜索 ${plugin.name} 分类结果',
+              ? '输入关键词，从 ${tab.name} 搜索网络音乐'
+              : '点击上方“${_categoryLabelForPlugin(category, plugin)}”开始搜索 ${tab.name} 分类结果',
           textAlign: TextAlign.center,
           style: TextStyle(color: scheme.onSurfaceVariant),
         ),
@@ -601,7 +695,7 @@ class _SearchPageState extends ConsumerState<SearchPage>
     if (state.error != null) {
       return _MessageState(
         icon: Icons.cloud_off_outlined,
-        title: '${plugin.name} 搜索失败',
+        title: '${tab.name} 搜索失败',
         message: state.error!,
         actionLabel: '重试',
         onAction: () => _search(_controller.text),
@@ -621,7 +715,7 @@ class _SearchPageState extends ConsumerState<SearchPage>
         category: category,
         categoryLabel: _categoryLabelForPlugin(category, plugin),
         showMiniPlayer: showMiniPlayer,
-        onTap: (item) => _openCatalogResult(plugin, category, item),
+        onTap: (item) => _openCatalogResult(tab, category, item),
       );
     }
     return SongsListView(
@@ -683,6 +777,9 @@ class _SearchPageState extends ConsumerState<SearchPage>
   Widget build(BuildContext context) {
     final pluginsValue = ref.watch(enabledMusicPluginsProvider);
     final plugins = pluginsValue.valueOrNull ?? const <EnabledMusicPlugin>[];
+    // 插件列表先按 LX 平台拆分成搜索 Tab：多平台 LX 插件每个平台
+    // 一个 Tab，其余插件一个插件一个 Tab（仿电脑版行为）。
+    final tabs = _buildSearchSourceTabs(plugins);
     final showingHistory = _controller.text.trim().isEmpty;
     final showMiniPlayer =
         ref.watch(playerProvider.select((state) => state.current != null)) &&
@@ -694,7 +791,7 @@ class _SearchPageState extends ConsumerState<SearchPage>
       ),
     );
     return DefaultTabController(
-      length: plugins.isEmpty ? 1 : plugins.length,
+      length: tabs.isEmpty ? 1 : tabs.length,
       child: Scaffold(
         appBar: AppBar(
           automaticallyImplyLeading:
@@ -732,7 +829,7 @@ class _SearchPageState extends ConsumerState<SearchPage>
           // 否则输入第一个字符时 AppBar 底部从无到有挂载（高度突增 92px），
           // 输入法组词期间发生布局重排会导致键盘被强制收起，输入被打断。
           // body 仍按是否有文本在历史页/结果页之间切换。
-          bottom: plugins.isEmpty
+          bottom: tabs.isEmpty
               ? null
               : PreferredSize(
                   preferredSize: const Size.fromHeight(92),
@@ -744,10 +841,10 @@ class _SearchPageState extends ConsumerState<SearchPage>
                         tabAlignment: TabAlignment.start,
                         onTap: (index) {
                           setState(() => _selectedPluginIndex = index);
-                          _ensureCategorySearch(plugins, pluginIndex: index);
+                          _ensureCategorySearch(tabs, pluginIndex: index);
                         },
                         tabs: [
-                          for (final plugin in plugins) Tab(text: plugin.name),
+                          for (final tab in tabs) Tab(text: tab.name),
                         ],
                       ),
                       TabBar(
@@ -757,16 +854,15 @@ class _SearchPageState extends ConsumerState<SearchPage>
                           setState(() {
                             _selectedCategory = category;
                           });
-                          // 分类搜索结果按插件分别展示，切换分类时预取所有插件，
-                          // 这样用户左右切换一级插件 Tab 不会看到未加载的空页。
+                          // 分类搜索结果按来源 Tab 分别展示，切换分类时预取
+                          // 所有 Tab，这样用户左右切换一级 Tab 不会看到
+                          // 未加载的空页。
                           for (
-                            var pluginIndex = 0;
-                            pluginIndex < plugins.length;
-                            pluginIndex++
+                            var tabIndex = 0; tabIndex < tabs.length; tabIndex++
                           ) {
                             _ensureCategorySearch(
-                              plugins,
-                              pluginIndex: pluginIndex,
+                              tabs,
+                              pluginIndex: tabIndex,
                               category: category,
                             );
                           }
@@ -775,11 +871,11 @@ class _SearchPageState extends ConsumerState<SearchPage>
                           const Tab(text: '歌曲'),
                           Tab(
                             text:
-                                plugins.isNotEmpty &&
+                                tabs.isNotEmpty &&
                                     _selectedPluginIndex >= 0 &&
-                                    _selectedPluginIndex < plugins.length &&
+                                    _selectedPluginIndex < tabs.length &&
                                     isBilibiliPluginSource(
-                                      plugins[_selectedPluginIndex],
+                                      tabs[_selectedPluginIndex].plugin,
                                     )
                                 ? 'UP主'
                                 : '歌手',
@@ -817,9 +913,9 @@ class _SearchPageState extends ConsumerState<SearchPage>
                   }
                   return TabBarView(
                     children: [
-                      for (final plugin in loadedPlugins)
+                      for (final tab in tabs)
                         _tabBody(
-                          plugin,
+                          tab,
                           category: _selectedCategory,
                           showMiniPlayer: showMiniPlayer,
                         ),
