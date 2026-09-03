@@ -87,6 +87,9 @@ class _FeedbackPageState extends ConsumerState<FeedbackPage> {
         type: FileType.image,
         allowMultiple: true,
         withData: true,
+        // 禁用插件压缩：其原生实现写入公共 Pictures 目录，Android 10
+        // 分区存储下无权限会直接崩溃。页面自身有压缩逻辑。
+        compressionQuality: 0,
       );
       if (result == null || result.files.isEmpty) return;
       final files = result.files.take(6 - _images.length).toList();

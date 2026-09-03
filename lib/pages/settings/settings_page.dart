@@ -1340,6 +1340,10 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
     final picked = await FilePicker.platform.pickFiles(
       type: FileType.image,
       withData: true,
+      // 插件默认 compressionQuality=30，会在原生层把图片压缩后写入
+      // 公共 Pictures 目录——Android 10 分区存储下无写权限直接
+      // IOException 权限被拒绝崩溃（vivo V1821A 实测）。传 0 跳过。
+      compressionQuality: 0,
     );
     if (picked == null || picked.files.isEmpty) return;
     final file = picked.files.single;
@@ -1808,6 +1812,8 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
             final picked = await FilePicker.platform.pickFiles(
               type: FileType.image,
               withData: true,
+              // 同上：禁用插件压缩，避免写公共 Pictures 目录被拒导致闪退。
+              compressionQuality: 0,
             );
             if (picked == null || picked.files.isEmpty) return;
             final file = picked.files.single;

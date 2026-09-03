@@ -102,6 +102,7 @@ class MobilePlaylist {
     required this.createdAt,
     this.coverUrl,
     this.songSnapshots = const {},
+    this.customOrder,
   });
 
   final String id;
@@ -110,6 +111,10 @@ class MobilePlaylist {
   final DateTime createdAt;
   final String? coverUrl;
   final Map<String, PlaylistSongSnapshot> songSnapshots;
+
+  /// 用户手动拖拽后的自定义顺序（完整歌曲路径列表）。null 表示从未
+  /// 自定义过，「自定义」排序回退为 songPaths 的原始顺序。
+  final List<String>? customOrder;
 
   /// 歌单没有单独设置封面时，默认使用第一首歌的封面。
   String? get effectiveCoverUrl {
@@ -124,6 +129,7 @@ class MobilePlaylist {
     List<String>? songPaths,
     String? coverUrl,
     Map<String, PlaylistSongSnapshot>? songSnapshots,
+    List<String>? customOrder,
   }) {
     return MobilePlaylist(
       id: id,
@@ -132,6 +138,7 @@ class MobilePlaylist {
       createdAt: createdAt,
       coverUrl: coverUrl ?? this.coverUrl,
       songSnapshots: songSnapshots ?? this.songSnapshots,
+      customOrder: customOrder ?? this.customOrder,
     );
   }
 
@@ -144,6 +151,7 @@ class MobilePlaylist {
     'songSnapshots': songSnapshots.map(
       (path, snapshot) => MapEntry(path, snapshot.toJson()),
     ),
+    if (customOrder != null) 'customOrder': customOrder,
   };
 
   factory MobilePlaylist.fromJson(Map<String, dynamic> json) {
@@ -163,6 +171,7 @@ class MobilePlaylist {
               return MapEntry(key.toString(), snapshot);
             })
           : const {},
+      customOrder: (json['customOrder'] as List?)?.cast<String>(),
     );
   }
 }
@@ -411,9 +420,44 @@ class PlaylistsNotifier extends StateNotifier<List<MobilePlaylist>> {
           item.copyWith(
             songPaths: item.songPaths.where((value) => value != path).toList(),
             songSnapshots: Map.of(item.songSnapshots)..remove(path),
+            customOrder: item.customOrder
+                ?.where((value) => value != path)
+                .toList(),
           )
         else
           item,
+    ];
+    await _save();
+  }
+
+  /// 批量移除歌曲（多选删除）。仅移出歌单，不删除音乐文件；一次持久化，
+  /// 避免逐首 removeSong 反复写盘。
+  Future<void> removeSongs(String id, List<String> paths) async {
+    if (paths.isEmpty) return;
+    final removing = paths.toSet();
+    state = [
+      for (final item in state)
+        if (item.id == id)
+          item.copyWith(
+            songPaths:
+                item.songPaths.where((value) => !removing.contains(value)).toList(),
+            songSnapshots: Map.of(item.songSnapshots)
+              ..removeWhere((value, _) => removing.contains(value)),
+            customOrder: item.customOrder
+                ?.where((value) => !removing.contains(value))
+                .toList(),
+          )
+        else
+          item,
+    ];
+    await _save();
+  }
+
+  /// 保存「自定义」排序结果（拖拽排序后的完整路径顺序）。
+  Future<void> setCustomOrder(String id, List<String> order) async {
+    state = [
+      for (final item in state)
+        if (item.id == id) item.copyWith(customOrder: order) else item,
     ];
     await _save();
   }

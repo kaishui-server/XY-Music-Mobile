@@ -195,9 +195,10 @@ class _OnlineCatalogDetailPageState
                         showFavoriteButton: true,
                         padding: EdgeInsets.only(
                           top: 6,
+                          // 底部留出迷你播放栏与浮动按钮组的空间。
                           bottom:
                               MediaQuery.of(context).padding.bottom +
-                              (current ? 104 : 16),
+                              (current ? 148 : 16),
                         ),
                         footer: _visibleSongCount < _songs.length
                             ? Padding(

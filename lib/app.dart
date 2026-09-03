@@ -132,7 +132,7 @@ class _XyMusicAppState extends ConsumerState<XyMusicApp> {
       _decodedBackgroundPath = null;
       final old = _decodedBackgroundImage;
       _decodedBackgroundImage = null;
-      old?.dispose();
+      _disposeBackgroundImage(old);
       return;
     }
     if (path == _decodedBackgroundPath || path == _precachedBackgroundPath) {
@@ -142,9 +142,19 @@ class _XyMusicAppState extends ConsumerState<XyMusicApp> {
     _precachedBackgroundPath = path;
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted || generation != _backgroundLoadGeneration) return;
-      precacheImage(FileImage(File(path)), context).ignore();
+      // 不要在此处对原图做全分辨率 precacheImage：一张高像素照片
+      // （例如 48MP）会分配近 200MB 解码纹理，低端机设置壁纸瞬间
+      // 直接 OOM 原生崩溃（表现为"设置后闪退"）。显示链路全部按
+      // 1440 宽解码（_decodeBackground 与 XyAppBackground 均已限制）。
       _decodeBackground(path, generation);
     });
+  }
+
+  /// 释放旧背景图。光栅缓存可能仍引用上一帧的纹理，立即 dispose
+  /// 存在 use-after-free 风险，延迟到下一帧结束后再释放。
+  void _disposeBackgroundImage(ui.Image? image) {
+    if (image == null) return;
+    WidgetsBinding.instance.addPostFrameCallback((_) => image.dispose());
   }
 
   Future<void> _decodeBackground(String path, int generation) async {
@@ -162,7 +172,7 @@ class _XyMusicAppState extends ConsumerState<XyMusicApp> {
       final old = _decodedBackgroundImage;
       _decodedBackgroundImage = frame.image;
       _decodedBackgroundPath = path;
-      old?.dispose();
+      _disposeBackgroundImage(old);
       setState(() {});
     } catch (_) {
       if (generation == _backgroundLoadGeneration &&

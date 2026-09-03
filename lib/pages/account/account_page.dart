@@ -486,6 +486,9 @@ class _AccountPageState extends ConsumerState<AccountPage>
     final result = await FilePicker.platform.pickFiles(
       type: FileType.image,
       withData: true,
+      // 禁用插件压缩：其原生实现写入公共 Pictures 目录，Android 10
+      // 分区存储下无权限会直接崩溃。
+      compressionQuality: 0,
     );
     if (result == null || result.files.isEmpty || !mounted) return;
     final bytes = result.files.single.bytes;

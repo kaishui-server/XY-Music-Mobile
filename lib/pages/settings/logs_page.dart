@@ -1,8 +1,8 @@
 import 'dart:convert';
-import 'dart:typed_data';
 
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import '../../src/logging/app_log_store.dart';
 import '../../src/widgets/top_notice.dart';
@@ -36,6 +36,8 @@ class _LogsPageState extends State<LogsPage> {
   bool _warningOnly = false;
   bool _loading = true;
   bool _exporting = false;
+  List<CrashReport> _crashes = const [];
+  bool _exportingCrashes = false;
 
   @override
   void initState() {
@@ -45,12 +47,133 @@ class _LogsPageState extends State<LogsPage> {
 
   Future<void> _loadSettings() async {
     await _store.initialize();
+    final crashes = await _store.crashReports();
     if (!mounted) return;
     setState(() {
       _maxEntries = _store.maxEntries;
       _warningOnly = _store.warningOnly;
+      _crashes = crashes;
       _loading = false;
     });
+  }
+
+  Future<void> _reloadCrashes() async {
+    final crashes = await _store.crashReports();
+    if (!mounted) return;
+    setState(() => _crashes = crashes);
+  }
+
+  Future<void> _viewCrash(CrashReport report) async {
+    final content = await _store.readCrashReport(report);
+    if (!mounted) return;
+    await showDialog<void>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: Text(report.name),
+        scrollable: true,
+        content: SizedBox(
+          width: double.maxFinite,
+          child: SingleChildScrollView(
+            child: SelectionArea(
+              child: Text(
+                content.isEmpty ? '（空文件）' : content,
+                style: const TextStyle(
+                  fontFamily: 'monospace',
+                  fontSize: 12,
+                  height: 1.4,
+                ),
+              ),
+            ),
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () {
+              Clipboard.setData(ClipboardData(text: content));
+              XyNotice.show(dialogContext, message: '崩溃内容已复制');
+            },
+            child: const Text('复制'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext),
+            child: const Text('关闭'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _deleteCrash(CrashReport report) async {
+    await _store.deleteCrashReport(report);
+    await _reloadCrashes();
+    if (mounted) XyNotice.show(context, message: '已删除 ${report.name}');
+  }
+
+  Future<void> _clearCrashes() async {
+    if (_crashes.isEmpty) {
+      XyNotice.show(context, message: '当前没有崩溃记录');
+      return;
+    }
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('清空崩溃记录？'),
+        content: const Text('将删除本机保存的全部崩溃记录，删除后无法恢复。'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext, false),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(dialogContext, true),
+            child: const Text('清空'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true) return;
+    await _store.clearCrashReports();
+    await _reloadCrashes();
+    if (!mounted) return;
+    XyNotice.show(context, message: '崩溃记录已清空');
+  }
+
+  Future<void> _exportCrashes() async {
+    if (_exportingCrashes) return;
+    if (_crashes.isEmpty) {
+      XyNotice.show(context, message: '当前没有可导出的崩溃记录');
+      return;
+    }
+    setState(() => _exportingCrashes = true);
+    try {
+      final text = await _store.exportCrashReports();
+      final path = await FilePicker.platform.saveFile(
+        dialogTitle: '导出崩溃记录',
+        fileName:
+            'xy_music_crash_${DateTime.now().millisecondsSinceEpoch}.txt',
+        type: FileType.custom,
+        allowedExtensions: const ['txt'],
+        bytes: Uint8List.fromList(utf8.encode(text)),
+      );
+      if (!mounted || path == null || path.isEmpty) return;
+      XyNotice.show(context, message: '崩溃记录已导出（${_crashes.length} 份）');
+    } catch (error) {
+      if (mounted) {
+        XyNotice.show(
+          context,
+          message: '导出崩溃记录失败：$error',
+          type: XyNoticeType.error,
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _exportingCrashes = false);
+    }
+  }
+
+  String _formatCrashTime(DateTime time) {
+    String two(int value) => value.toString().padLeft(2, '0');
+    return '${time.year}-${two(time.month)}-${two(time.day)} '
+        '${two(time.hour)}:${two(time.minute)}';
   }
 
   List<AppLogEntry> _query({bool errorsOnly = false}) =>
@@ -191,6 +314,103 @@ class _LogsPageState extends State<LogsPage> {
                         value: _warningOnly,
                         onChanged: _setWarningOnly,
                       ),
+                    ],
+                  ),
+                ),
+                const SizedBox(height: 20),
+                _sectionTitle(context, '崩溃记录'),
+                Card(
+                  child: Column(
+                    children: [
+                      ListTile(
+                        leading: Icon(
+                          Icons.bug_report_outlined,
+                          color: _crashes.isEmpty
+                              ? Theme.of(context).colorScheme.onSurfaceVariant
+                              : Theme.of(context).colorScheme.error,
+                        ),
+                        title: Text(
+                          _crashes.isEmpty
+                              ? '暂无崩溃记录'
+                              : '共 ${_crashes.length} 份崩溃记录',
+                        ),
+                        subtitle: const Text('记录应用闪退、停止运行时的崩溃代码，最多保留 20 份'),
+                        trailing: _exportingCrashes
+                            ? const SizedBox(
+                                width: 20,
+                                height: 20,
+                                child: CircularProgressIndicator(strokeWidth: 2),
+                              )
+                            : const Icon(Icons.file_download_outlined),
+                        onTap: _exportingCrashes ? null : _exportCrashes,
+                      ),
+                      for (final report in _crashes.take(10))
+                        Column(
+                          children: [
+                            const Divider(height: 1, indent: 56),
+                            ListTile(
+                              dense: true,
+                              leading: const Icon(
+                                Icons.description_outlined,
+                                size: 20,
+                              ),
+                              title: Text(
+                                _formatCrashTime(report.time),
+                                style: const TextStyle(fontSize: 13),
+                              ),
+                              subtitle: Text(
+                                '${report.name} · ${(report.size / 1024).toStringAsFixed(1)} KB',
+                                style: const TextStyle(fontSize: 11),
+                              ),
+                              trailing: Row(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  IconButton(
+                                    tooltip: '查看',
+                                    icon: const Icon(
+                                      Icons.visibility_outlined,
+                                      size: 20,
+                                    ),
+                                    onPressed: () => _viewCrash(report),
+                                  ),
+                                  IconButton(
+                                    tooltip: '删除',
+                                    icon: Icon(
+                                      Icons.delete_outline_rounded,
+                                      size: 20,
+                                      color: Theme.of(context).colorScheme.error,
+                                    ),
+                                    onPressed: () => _deleteCrash(report),
+                                  ),
+                                ],
+                              ),
+                              onTap: () => _viewCrash(report),
+                            ),
+                          ],
+                        ),
+                      if (_crashes.length > 10)
+                        Padding(
+                          padding: const EdgeInsets.fromLTRB(16, 4, 16, 8),
+                          child: Text(
+                            '仅显示最近 10 份，导出可获取全部 ${_crashes.length} 份',
+                            style: TextStyle(
+                              fontSize: 11,
+                              color: Theme.of(context).colorScheme.onSurfaceVariant,
+                            ),
+                          ),
+                        ),
+                      if (_crashes.isNotEmpty) ...[
+                        const Divider(height: 1, indent: 56),
+                        ListTile(
+                          dense: true,
+                          leading: Icon(
+                            Icons.delete_sweep_outlined,
+                            color: Theme.of(context).colorScheme.error,
+                          ),
+                          title: const Text('清空崩溃记录', style: TextStyle(fontSize: 13)),
+                          onTap: _clearCrashes,
+                        ),
+                      ],
                     ],
                   ),
                 ),

@@ -124,20 +124,30 @@ class FavoritesNotifier extends StateNotifier<Set<String>> {
 
   static const _key = 'favoritePaths';
   static const _songMetadataKey = 'favoriteSongMetadataV1';
+  static const _customOrderKey = 'favoriteCustomOrderV1';
 
   late final Future<void> _loaded;
   final Map<String, FavoriteSongSnapshot> _songSnapshots = {};
+
+  /// 用户手动拖拽后的自定义顺序；null 表示从未自定义过。
+  List<String>? _customOrder;
 
   Future<void> get ready => _loaded;
 
   /// 当前收藏路径的只读快照，供账号云同步读取。
   Set<String> get paths => Set.unmodifiable(state);
 
+  /// 「自定义」排序顺序（拖拽排序后的完整路径顺序）。
+  List<String>? get customOrder =>
+      _customOrder == null ? null : List.unmodifiable(_customOrder!);
+
   Future<SharedPreferences> _prefs() => SharedPreferences.getInstance();
 
   Future<void> _load() async {
     final prefs = await _prefs();
     final paths = (prefs.getStringList(_key) ?? const <String>[]).toSet();
+    final order = prefs.getStringList(_customOrderKey);
+    if (order != null && order.isNotEmpty) _customOrder = order;
     final rawMetadata = prefs.getString(_songMetadataKey);
     if (rawMetadata != null && rawMetadata.isNotEmpty) {
       try {
@@ -188,10 +198,37 @@ class FavoritesNotifier extends StateNotifier<Set<String>> {
       }
     } else {
       _songSnapshots.remove(path);
+      _customOrder = _customOrder?.where((value) => value != path).toList();
     }
     state = next;
     await _persist();
     return added;
+  }
+
+  /// 批量取消收藏（多选删除）。返回实际移除的数量。
+  Future<int> removeAll(Iterable<String> paths) async {
+    await _loaded;
+    final next = state.toSet();
+    var removed = 0;
+    for (final path in paths) {
+      if (next.remove(path)) {
+        removed++;
+        _songSnapshots.remove(path);
+      }
+    }
+    if (removed == 0) return 0;
+    _customOrder = _customOrder?.where(next.contains).toList();
+    state = next;
+    await _persist();
+    return removed;
+  }
+
+  /// 保存「自定义」排序结果（拖拽排序后的完整路径顺序）。
+  Future<void> setCustomOrder(List<String> order) async {
+    await _loaded;
+    // 只保留仍在收藏中的路径，保持与收藏集合一致。
+    _customOrder = order.where(state.contains).toList();
+    await _persist();
   }
 
   /// 批量添加收藏（多选一键收藏）。已在收藏中的跳过，返回实际新增数量。
@@ -223,6 +260,11 @@ class FavoritesNotifier extends StateNotifier<Set<String>> {
   Future<void> _persist() async {
     final prefs = await _prefs();
     await prefs.setStringList(_key, state.toList());
+    if (_customOrder == null || _customOrder!.isEmpty) {
+      await prefs.remove(_customOrderKey);
+    } else {
+      await prefs.setStringList(_customOrderKey, _customOrder!);
+    }
     if (_songSnapshots.isEmpty) {
       await prefs.remove(_songMetadataKey);
     } else {
@@ -242,9 +284,11 @@ class FavoritesNotifier extends StateNotifier<Set<String>> {
     await _loaded;
     state = const {};
     _songSnapshots.clear();
+    _customOrder = null;
     final prefs = await _prefs();
     await prefs.remove(_key);
     await prefs.remove(_songMetadataKey);
+    await prefs.remove(_customOrderKey);
   }
 
   /// 合并云端收藏。收藏在云端是独立数据，不会创建或写入“我喜欢”歌单。

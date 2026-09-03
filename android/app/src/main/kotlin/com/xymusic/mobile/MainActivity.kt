@@ -38,8 +38,15 @@ class MainActivity : AudioServiceActivity() {
     private var pendingStartResult: MethodChannel.Result? = null
     private var pendingDirectoryResult: MethodChannel.Result? = null
 
+    override fun onCreate(savedInstanceState: android.os.Bundle?) {
+        super.onCreate(savedInstanceState)
+        // 尽早安装，捕获进程内所有线程的未捕获异常并写入崩溃文件。
+        CrashHandler.install(this)
+    }
+
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
+        StoragePermissionBridge.register(this, flutterEngine)
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, SCREEN_AWAKE_CHANNEL)
             .setMethodCallHandler { call, result ->
                 if (call.method != "setKeepScreenOn") {
@@ -189,6 +196,10 @@ class MainActivity : AudioServiceActivity() {
             }
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, DEVICE_INFO_CHANNEL)
             .setMethodCallHandler { call, result ->
+                if (call.method == "getCrashDir") {
+                    result.success(CrashHandler.crashDir(this).absolutePath)
+                    return@setMethodCallHandler
+                }
                 if (call.method != "getDeviceInfo") {
                     result.notImplemented()
                     return@setMethodCallHandler
@@ -342,6 +353,15 @@ class MainActivity : AudioServiceActivity() {
         pendingStartResult = result
         val manager = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
         startActivityForResult(manager.createScreenCaptureIntent(), CAPTURE_REQUEST)
+    }
+
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<out String>,
+        grantResults: IntArray,
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        StoragePermissionBridge.onRequestPermissionsResult(requestCode, grantResults)
     }
 
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {

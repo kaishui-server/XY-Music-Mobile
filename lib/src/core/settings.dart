@@ -65,6 +65,7 @@ enum LyricWordEffectMode { wordByWord, progressive, none }
 enum LyricDisplayAlignment { left, center, right }
 
 /// 扫描支持的主流音频格式大类（与 Rust 白名单展开对应）。
+/// wma/ape 与 MusicFree 的本地音乐支持格式对齐（opus 归入 ogg 大类）。
 const kSupportedScanFormats = <String>[
   'flac',
   'mp3',
@@ -73,6 +74,8 @@ const kSupportedScanFormats = <String>[
   'm4a',
   'ogg',
   'aiff',
+  'wma',
+  'ape',
 ];
 
 /// 移动端只使用 0=列表循环、1=单曲循环、2=随机播放。

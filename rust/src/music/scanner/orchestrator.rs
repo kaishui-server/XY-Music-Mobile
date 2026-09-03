@@ -52,15 +52,15 @@ pub fn scan_single_directory_internal(
 
     if !scan_diff.has_disk_songs && !folder_is_accessible {
         // 目录完全读不到：老文件夹可能是断连/路径变更；新添加的文件夹则
-        // 多为 Android 分区存储权限不足（未授予“所有文件访问”时，通过
-        // 文件路径访问用户自建目录会被系统静默过滤成空）。两种情况都不
-        // 能静默返回 0 首，否则用户会看到“已扫描到 0 首”却无任何提示。
+        // 多为存储权限不足。注意此处不能引导用户去开「所有文件访问」：
+        // Android 10 及以下（如 vivo NEX 双屏版 8.1）根本没有该设置项，
+        // 详细引导由 Dart 层按系统版本生成（StoragePermission.deniedHint）。
+        // 两种情况都不能静默返回 0 首，否则用户会看到“已扫描到 0 首”
+        // 却无任何提示。
         let error = if original_db_count > 0 {
             "文件夹可能已断开连接或路径错误，未执行删除操作".to_string()
         } else {
-            format!(
-                "无法读取文件夹 {normalized_folder}：请在系统设置中授予本应用“所有文件访问”权限后重试"
-            )
+            format!("无法读取文件夹 {normalized_folder}：请检查本应用的存储权限后重试")
         };
         if let Some(reporter) = reporter.as_ref() {
             reporter.emit_error(error.clone());

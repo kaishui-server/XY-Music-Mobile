@@ -795,8 +795,10 @@ class _SearchPageState extends ConsumerState<SearchPage>
       showFavoriteButton: true,
       padding: EdgeInsets.only(
         top: 6,
-        bottom:
-            MediaQuery.of(context).padding.bottom + (showMiniPlayer ? 104 : 12),
+        // 底部留出迷你播放栏与浮动按钮组的空间（内嵌 Shell 时由
+        // Shell 的迷你播放栏覆盖，同样需要预留）。
+        bottom: MediaQuery.of(context).padding.bottom +
+            (ref.read(playerProvider).current != null ? 148 : 12),
       ),
       onPlay: _playNetworkSongs,
     );

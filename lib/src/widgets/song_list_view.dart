@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
@@ -19,6 +21,12 @@ class SongsListView extends ConsumerStatefulWidget {
   final ScrollController? controller;
   final Widget? footer;
 
+  /// 开启后列表支持拖拽排序（行首出现手柄）。回调语义与
+  /// ReorderableListView.onReorderItem 一致：newIndex 已按移除
+  /// oldIndex 项后的目标位置给出，无需手动减一。传 null 表示当前
+  /// 场景不允许拖拽（如搜索过滤中）。
+  final void Function(int oldIndex, int newIndex)? onReorder;
+
   /// 每首歌的“更多”面板里额外注入的操作标题（如最近播放页的
   /// “从最近播放删除”）。回调执行删除，组件负责刷新。
   final Future<void> Function(Song song)? onRemoveAction;
@@ -39,6 +47,7 @@ class SongsListView extends ConsumerStatefulWidget {
     this.onToggleSelection,
     this.controller,
     this.footer,
+    this.onReorder,
     this.onRemoveAction,
     this.removeActionLabel,
   });
@@ -50,13 +59,20 @@ class SongsListView extends ConsumerStatefulWidget {
 class _SongsListViewState extends ConsumerState<SongsListView> {
   ScrollController? _internalController;
 
+  /// 定位正在播放歌曲后的短暂高亮行（歌曲路径），超时自动清除。
+  String? _highlightPath;
+  Timer? _highlightTimer;
+
+  /// 行高按首行实测修正：行内有 48dp 的 IconButton，实际高度可能
+  /// 大于估算值（44 + 7×2 + 3×2 = 64）。写死会让定位滚动位置随
+  /// 行数累积偏差，越靠下的歌曲偏得越多。
+  double _rowExtent = 64;
+
+  /// 首行测量 Key：布局完成后读取真实行高修正 _rowExtent。
+  final GlobalKey _firstRowKey = GlobalKey();
+
   ScrollController get _controller =>
       widget.controller ?? (_internalController ??= ScrollController());
-
-  @override
-  void initState() {
-    super.initState();
-  }
 
   @override
   void didUpdateWidget(covariant SongsListView oldWidget) {
@@ -69,8 +85,49 @@ class _SongsListViewState extends ConsumerState<SongsListView> {
 
   @override
   void dispose() {
+    _highlightTimer?.cancel();
     _internalController?.dispose();
     super.dispose();
+  }
+
+  /// 定位到正在播放的歌曲：滚动到对应行并短暂高亮。定位按钮的
+  /// 显隐由 _FloatingListButtons 根据滚动位置自动维护（接近即隐藏）。
+  void _locatePlaying() {
+    final path = ref.read(playerProvider).current?.path;
+    final index =
+        path == null ? -1 : widget.songs.indexWhere((s) => s.path == path);
+    if (index < 0) {
+      XyNotice.show(
+        context,
+        message: '正在播放的歌曲不在此列表中',
+        duration: const Duration(seconds: 2),
+      );
+      return;
+    }
+    if (!_controller.hasClients) return;
+    final target = (index * _rowExtent)
+        .clamp(0.0, _controller.position.maxScrollExtent)
+        .toDouble();
+    _controller.animateTo(
+      target,
+      duration: const Duration(milliseconds: 420),
+      curve: Curves.easeOutCubic,
+    );
+    setState(() => _highlightPath = path);
+    _highlightTimer?.cancel();
+    _highlightTimer = Timer(const Duration(milliseconds: 1600), () {
+      if (mounted) setState(() => _highlightPath = null);
+    });
+  }
+
+  /// 布局完成后用首行真实高度修正行高估算值，保证定位滚动准确。
+  void _measureFirstRow() {
+    if (!mounted) return;
+    final size = _firstRowKey.currentContext?.size;
+    if (size == null || size.height <= 0) return;
+    if ((size.height - _rowExtent).abs() > 0.5) {
+      setState(() => _rowExtent = size.height);
+    }
   }
 
   @override
@@ -82,140 +139,209 @@ class _SongsListViewState extends ConsumerState<SongsListView> {
     final hasCurrentSong = ref.watch(
       playerProvider.select((state) => state.current != null),
     );
+    final playingPath = ref.watch(
+      playerProvider.select((state) => state.current?.path),
+    );
+    // 播放歌曲在列表中时给出目标行位置，定位按钮据此判断远近。
+    int playingIndex = -1;
+    if (playingPath != null) {
+      playingIndex = widget.songs.indexWhere((s) => s.path == playingPath);
+    }
+    final playingTarget = playingIndex < 0 ? null : playingIndex * _rowExtent;
+    // 布局完成后测量首行真实高度，修正定位滚动的行高估算。
+    WidgetsBinding.instance.addPostFrameCallback((_) => _measureFirstRow());
+    // 列表类型只取决于 onReorder：多选/普通模式共用同一棵滚动视图，
+    // 避免进入多选时因切换 ListView/ReorderableListView 丢失滚动位置。
+    final reorderable = widget.onReorder != null;
     return Stack(
       children: [
-        ListView.builder(
-          controller: _controller,
-          padding: widget.padding,
-          itemCount: widget.songs.length + (widget.footer == null ? 0 : 1),
-          itemBuilder: (context, i) {
-            if (i == widget.songs.length) return widget.footer!;
-            final s = widget.songs[i];
-            final isFavorite = favorites.contains(s.path);
-            // RepaintBoundary 把每行圈成独立重绘范围：多选勾选或收藏状态
-            // 变化时只重绘对应行，避免整个列表跟着重绘造成卡顿。
-            return RepaintBoundary(
-              child: Padding(
-                padding: const EdgeInsets.symmetric(
-                  horizontal: 2,
-                  vertical: 3,
-                ),
-                child: Material(
-                  color: Colors.transparent,
-                  borderRadius: BorderRadius.circular(13),
-                  child: InkWell(
-                    onTap: () => widget.selectionMode
-                        ? widget.onToggleSelection?.call(s)
-                        : widget.onPlay?.call(widget.songs, i),
-                    onLongPress: widget.selectionMode
-                        ? () => widget.onToggleSelection?.call(s)
-                        : () => _showSongActions(context, ref, s, i),
-                    borderRadius: BorderRadius.circular(13),
-                    child: Padding(
-                      padding: const EdgeInsets.fromLTRB(8, 7, 4, 7),
-                      child: Row(
-                        children: [
-                          if (widget.selectionMode)
-                            Padding(
-                              padding: const EdgeInsets.only(right: 4),
-                              child: Checkbox(
-                                value: widget.isSelected?.call(s) ?? false,
-                                onChanged: (_) =>
-                                    widget.onToggleSelection?.call(s),
-                                visualDensity: VisualDensity.compact,
-                              ),
-                            ),
-                          SongCover(song: s),
-                          const SizedBox(width: 11),
-                          Expanded(
-                            child: Column(
-                              crossAxisAlignment: CrossAxisAlignment.start,
-                              children: [
-                                Row(
-                                  children: [
-                                    Expanded(
-                                      child: Text(
-                                        s.title,
-                                        maxLines: 1,
-                                        overflow: TextOverflow.ellipsis,
-                                        style: const TextStyle(
-                                          fontSize: 15,
-                                          fontWeight: FontWeight.w600,
-                                        ),
-                                      ),
-                                    ),
-                                    if (!widget.showFavoriteButton &&
-                                        isFavorite) ...[
-                                      const SizedBox(width: 5),
-                                      const Icon(
-                                        Icons.favorite,
-                                        size: 14,
-                                        color: Color(0xFFEC4141),
-                                      ),
-                                    ],
-                                  ],
-                                ),
-                                const SizedBox(height: 3),
-                                Text(
-                                  _subtitle(s),
-                                  maxLines: 1,
-                                  overflow: TextOverflow.ellipsis,
-                                  style: TextStyle(
-                                    fontSize: 12,
-                                    color: Theme.of(
-                                      context,
-                                    ).colorScheme.onSurfaceVariant,
-                                  ),
-                                ),
-                              ],
-                            ),
-                          ),
-                          const SizedBox(width: 8),
-                          Text(
-                            _fmt(s.duration),
-                            style: TextStyle(
-                              fontSize: 11,
-                              color: Theme.of(context)
-                                  .colorScheme
-                                  .onSurfaceVariant
-                                  .withValues(alpha: .65),
-                            ),
-                          ),
-                          if (!widget.selectionMode &&
-                              widget.showFavoriteButton)
-                            IconButton(
-                              tooltip: isFavorite ? '取消收藏' : '收藏',
-                              icon: Icon(
-                                isFavorite
-                                    ? Icons.favorite
-                                    : Icons.favorite_border,
-                                size: 21,
-                                color: const Color(0xFFEC4141),
-                              ),
-                              onPressed: () =>
-                                  _toggleFavorite(context, ref, s),
-                            ),
-                          if (!widget.selectionMode)
-                            IconButton(
-                              tooltip: '更多',
-                              icon: const Icon(Icons.more_vert, size: 20),
-                              onPressed: () =>
-                                  _showSongActions(context, ref, s, i),
-                            ),
-                        ],
-                      ),
-                    ),
-                  ),
-                ),
-              ),
-            );
-          },
-        ),
-        ScrollToTopButton(
+        if (reorderable)
+          ReorderableListView.builder(
+            scrollController: _controller,
+            padding: widget.padding as EdgeInsets?,
+            itemCount: widget.songs.length + (widget.footer == null ? 0 : 1),
+            onReorderItem: widget.onReorder!,
+            itemBuilder: (context, i) => _buildRow(
+              context,
+              i,
+              favorites: favorites,
+              dragIndex:
+                  i < widget.songs.length && !widget.selectionMode ? i : -1,
+            ),
+          )
+        else
+          ListView.builder(
+            controller: _controller,
+            padding: widget.padding,
+            itemCount: widget.songs.length + (widget.footer == null ? 0 : 1),
+            itemBuilder: (context, i) => _buildRow(
+              context,
+              i,
+              favorites: favorites,
+              dragIndex: -1,
+            ),
+          ),
+        _FloatingListButtons(
           controller: _controller,
           hasMiniPlayer: hasCurrentSong,
+          playingTarget: playingTarget,
+          onLocatePlaying: _locatePlaying,
         ),
       ],
+    );
+  }
+
+  /// 构建第 i 行（i == songs.length 时为 footer）。dragIndex >= 0 时
+  /// 行首显示拖拽手柄；footer 行传 -1 不显示手柄。
+  Widget _buildRow(
+    BuildContext context,
+    int i, {
+    required Set<String> favorites,
+    required int dragIndex,
+  }) {
+    if (i == widget.songs.length) {
+      return KeyedSubtree(key: const ValueKey('songs-footer'), child: widget.footer!);
+    }
+    final s = widget.songs[i];
+    final isFavorite = favorites.contains(s.path);
+    final highlighted = _highlightPath == s.path;
+    // RepaintBoundary 把每行圈成独立重绘范围：多选勾选或收藏状态
+    // 变化时只重绘对应行，避免整个列表跟着重绘造成卡顿。
+    return RepaintBoundary(
+      key: ValueKey(s.path),
+      child: Padding(
+        // 首行挂测量 Key，布局后读取真实行高。
+        key: i == 0 ? _firstRowKey : null,
+        padding: const EdgeInsets.symmetric(
+          horizontal: 2,
+          vertical: 3,
+        ),
+        child: Material(
+          color: highlighted
+              ? Theme.of(context).colorScheme.primary.withValues(alpha: .16)
+              : Colors.transparent,
+          borderRadius: BorderRadius.circular(13),
+          child: InkWell(
+            onTap: () => widget.selectionMode
+                ? widget.onToggleSelection?.call(s)
+                : widget.onPlay?.call(widget.songs, i),
+            onLongPress: widget.selectionMode
+                ? () => widget.onToggleSelection?.call(s)
+                : () => _showSongActions(context, ref, s, i),
+            borderRadius: BorderRadius.circular(13),
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(8, 7, 4, 7),
+              child: Row(
+                children: [
+                  if (widget.selectionMode)
+                    Padding(
+                      padding: const EdgeInsets.only(right: 4),
+                      child: Checkbox(
+                        value: widget.isSelected?.call(s) ?? false,
+                        onChanged: (_) =>
+                            widget.onToggleSelection?.call(s),
+                        visualDensity: VisualDensity.compact,
+                      ),
+                    )
+                  else if (dragIndex >= 0)
+                    // 与插件管理列表一致的拖拽手柄：只有手柄区域可发起排序。
+                    ReorderableDragStartListener(
+                      index: dragIndex,
+                      child: SizedBox(
+                        width: 34,
+                        height: 44,
+                        child: Icon(
+                          Icons.drag_indicator_rounded,
+                          size: 22,
+                          color: Theme.of(
+                            context,
+                          ).colorScheme.onSurfaceVariant,
+                        ),
+                      ),
+                    ),
+                  SongCover(song: s),
+                  const SizedBox(width: 11),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Row(
+                          children: [
+                            Expanded(
+                              child: Text(
+                                s.title,
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: const TextStyle(
+                                  fontSize: 15,
+                                  fontWeight: FontWeight.w600,
+                                ),
+                              ),
+                            ),
+                            if (!widget.showFavoriteButton &&
+                                isFavorite) ...[
+                              const SizedBox(width: 5),
+                              const Icon(
+                                Icons.favorite,
+                                size: 14,
+                                color: Color(0xFFEC4141),
+                              ),
+                            ],
+                          ],
+                        ),
+                        const SizedBox(height: 3),
+                        Text(
+                          _subtitle(s),
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(
+                            fontSize: 12,
+                            color: Theme.of(
+                              context,
+                            ).colorScheme.onSurfaceVariant,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Text(
+                    _fmt(s.duration),
+                    style: TextStyle(
+                      fontSize: 11,
+                      color: Theme.of(context)
+                          .colorScheme
+                          .onSurfaceVariant
+                          .withValues(alpha: .65),
+                    ),
+                  ),
+                  if (!widget.selectionMode &&
+                      widget.showFavoriteButton)
+                    IconButton(
+                      tooltip: isFavorite ? '取消收藏' : '收藏',
+                      icon: Icon(
+                        isFavorite
+                            ? Icons.favorite
+                            : Icons.favorite_border,
+                        size: 21,
+                        color: const Color(0xFFEC4141),
+                      ),
+                      onPressed: () =>
+                          _toggleFavorite(context, ref, s),
+                    ),
+                  if (!widget.selectionMode)
+                    IconButton(
+                      tooltip: '更多',
+                      icon: const Icon(Icons.more_vert, size: 20),
+                      onPressed: () =>
+                          _showSongActions(context, ref, s, i),
+                    ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      ),
     );
   }
 
@@ -522,6 +648,143 @@ class _ScrollToTopButtonState extends State<ScrollToTopButton> {
   }
 }
 
+/// 歌曲列表右下角的浮动按钮组：回到顶部 / 回到底部 / 定位正在播放。
+/// 紧贴迷你播放栏上沿；已到顶（或到底）时对应按钮自动隐藏，滚动
+/// 位置离正在播放歌曲较远时定位按钮显示，接近（约半屏内）时隐藏。
+class _FloatingListButtons extends StatefulWidget {
+  const _FloatingListButtons({
+    required this.controller,
+    required this.hasMiniPlayer,
+    required this.playingTarget,
+    required this.onLocatePlaying,
+  });
+
+  final ScrollController controller;
+
+  /// 正在播放歌曲不在列表中（或未播放）时定位按钮整体隐藏。
+  final bool hasMiniPlayer;
+
+  /// 正在播放歌曲行的目标滚动偏移（index × 行高）。
+  final double? playingTarget;
+  final VoidCallback onLocatePlaying;
+
+  @override
+  State<_FloatingListButtons> createState() => _FloatingListButtonsState();
+}
+
+class _FloatingListButtonsState extends State<_FloatingListButtons> {
+  bool _canTop = false;
+  bool _canBottom = false;
+  bool _showLocate = false;
+
+  @override
+  void initState() {
+    super.initState();
+    widget.controller.addListener(_handleScroll);
+    // 首帧布局完成后才有 maxScrollExtent / viewport，才能判断状态。
+    WidgetsBinding.instance.addPostFrameCallback((_) => _handleScroll());
+  }
+
+  @override
+  void didUpdateWidget(covariant _FloatingListButtons oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.controller != widget.controller) {
+      oldWidget.controller.removeListener(_handleScroll);
+      widget.controller.addListener(_handleScroll);
+      _canTop = false;
+      _canBottom = false;
+      _showLocate = false;
+    }
+    // 切歌或列表重排后重算远近。
+    if (oldWidget.playingTarget != widget.playingTarget) {
+      WidgetsBinding.instance.addPostFrameCallback((_) => _handleScroll());
+    }
+  }
+
+  @override
+  void dispose() {
+    widget.controller.removeListener(_handleScroll);
+    super.dispose();
+  }
+
+  void _handleScroll() {
+    if (!mounted || !widget.controller.hasClients) return;
+    final position = widget.controller.position;
+    final canTop = position.pixels > 24;
+    final canBottom = position.maxScrollExtent - position.pixels > 24;
+    final target = widget.playingTarget;
+    final bool showLocate;
+    if (target == null) {
+      showLocate = false;
+    } else {
+      final clamped = target.clamp(0.0, position.maxScrollExtent);
+      // 距目标不超过半屏视为“已在播放歌曲附近”。
+      showLocate =
+          (position.pixels - clamped).abs() > position.viewportDimension * .5;
+    }
+    if (canTop != _canTop ||
+        canBottom != _canBottom ||
+        showLocate != _showLocate) {
+      setState(() {
+        _canTop = canTop;
+        _canBottom = canBottom;
+        _showLocate = showLocate;
+      });
+    }
+  }
+
+  void _scrollTo(double offset) {
+    if (!widget.controller.hasClients) return;
+    widget.controller.animateTo(
+      offset.clamp(0.0, widget.controller.position.maxScrollExtent),
+      duration: const Duration(milliseconds: 360),
+      curve: Curves.easeOutCubic,
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (!_canTop && !_canBottom && !_showLocate) {
+      return const SizedBox.shrink();
+    }
+    return Positioned(
+      right: 12,
+      // 迷你播放栏位于 safeBottom+20、高 64，上沿即 safeBottom+84；
+      // 按钮组留 8px 间距贴在其上侧。
+      bottom:
+          MediaQuery.paddingOf(context).bottom +
+          (widget.hasMiniPlayer ? 92 : 12),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          if (_canTop)
+            FloatingActionButton.small(
+              heroTag: null,
+              tooltip: '回到顶部',
+              onPressed: () => _scrollTo(0),
+              child: const Icon(Icons.keyboard_arrow_up_rounded),
+            ),
+          if (_canBottom)
+            FloatingActionButton.small(
+              heroTag: null,
+              tooltip: '回到底部',
+              onPressed: () =>
+                  _scrollTo(widget.controller.position.maxScrollExtent),
+              child: const Icon(Icons.keyboard_arrow_down_rounded),
+            ),
+          if (_showLocate)
+            FloatingActionButton.small(
+              heroTag: null,
+              tooltip: '定位正在播放',
+              onPressed: widget.onLocatePlaying,
+              child: const Icon(Icons.my_location_rounded, size: 18),
+            ),
+        ],
+      ),
+    );
+  }
+}
+
 enum _SongAction {
   play,
   playNext,
@@ -529,4 +792,136 @@ enum _SongAction {
   favorite,
   info,
   removeFromRecent,
+}
+
+/// 歌曲列表排序键。custom = 自定义顺序（手动拖拽），为默认排序。
+enum SongSortKey {
+  custom('自定义'),
+  added('按添加时间'),
+  title('按歌曲名');
+
+  const SongSortKey(this.label);
+  final String label;
+}
+
+/// 排序状态：排序键 + 正倒序（仅 added/title 有效，custom 无方向）。
+class SongSort {
+  const SongSort(this.key, {this.descending = false});
+
+  final SongSortKey key;
+  final bool descending;
+
+  /// 单击菜单项时的切换规则：点击已选中的键切换正倒序；首次选择某键
+  /// 时使用该键的默认方向（添加时间默认倒序/最新在前，歌名默认正序）。
+  SongSort toggle(SongSortKey tapped) {
+    if (tapped == key) {
+      return SongSort(tapped, descending: !descending);
+    }
+    return SongSort(tapped, descending: tapped == SongSortKey.added);
+  }
+}
+
+/// 管理菜单中的附加操作（如收藏页的“清空收藏”）。
+class SongMenuAction {
+  const SongMenuAction({
+    required this.id,
+    required this.label,
+    this.icon,
+    this.isDestructive = false,
+  });
+
+  final String id;
+  final String label;
+  final IconData? icon;
+  final bool isDestructive;
+}
+
+/// 歌曲列表右上角“排序”菜单：歌曲排序（简化为三个键，单击同类项
+/// 切换正倒序）+ 可选的附加管理操作。
+class SongSortMenuButton extends StatelessWidget {
+  const SongSortMenuButton({
+    super.key,
+    required this.sort,
+    required this.onSortChanged,
+    this.actions = const <SongMenuAction>[],
+    this.onAction,
+  });
+
+  final SongSort sort;
+  final ValueChanged<SongSort> onSortChanged;
+  final List<SongMenuAction> actions;
+  final ValueChanged<SongMenuAction>? onAction;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return PopupMenuButton<String>(
+      tooltip: '歌曲排序',
+      icon: const Icon(Icons.sort_rounded),
+      position: PopupMenuPosition.under,
+      onSelected: (value) {
+        if (value.startsWith('sort:')) {
+          final key = SongSortKey.values.firstWhere(
+            (k) => k.name == value.substring(5),
+          );
+          onSortChanged(sort.toggle(key));
+        } else {
+          for (final action in actions) {
+            if (action.id == value) onAction?.call(action);
+          }
+        }
+      },
+      itemBuilder: (context) => [
+        for (final key in SongSortKey.values)
+          PopupMenuItem(
+            value: 'sort:${key.name}',
+            height: 48,
+            child: Row(
+              children: [
+                Icon(
+                  key == sort.key
+                      ? Icons.radio_button_checked_rounded
+                      : Icons.radio_button_off_rounded,
+                  size: 20,
+                  color: key == sort.key ? scheme.primary : scheme.onSurfaceVariant,
+                ),
+                const SizedBox(width: 10),
+                Text(key.label),
+                if (key == sort.key && key != SongSortKey.custom) ...[
+                  const SizedBox(width: 6),
+                  Text(
+                    sort.descending ? '倒序' : '正序',
+                    style: TextStyle(fontSize: 12, color: scheme.primary),
+                  ),
+                ],
+              ],
+            ),
+          ),
+        if (actions.isNotEmpty) const PopupMenuDivider(),
+        for (final action in actions)
+          PopupMenuItem(
+            value: action.id,
+            height: 48,
+            child: Row(
+              children: [
+                if (action.icon != null) ...[
+                  Icon(
+                    action.icon,
+                    size: 20,
+                    color: action.isDestructive ? scheme.error : null,
+                  ),
+                  const SizedBox(width: 10),
+                ],
+                Text(
+                  action.label,
+                  style: TextStyle(
+                    color: action.isDestructive ? scheme.error : null,
+                  ),
+                ),
+              ],
+            ),
+          ),
+      ],
+    );
+  }
 }

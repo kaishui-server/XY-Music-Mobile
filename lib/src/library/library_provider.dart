@@ -6,6 +6,7 @@ import '../core/db_path.dart';
 import '../core/settings.dart';
 import '../player/player_provider.dart';
 import '../rust/api.dart';
+import 'local_scanner.dart';
 
 /// 曲库歌曲（小而美：仅保留播放/展示所需字段）。
 class Song {
@@ -183,6 +184,9 @@ class LibraryNotifier extends StateNotifier<LibraryState> {
 
   final Ref _ref;
 
+  /// 扫描编排器（MusicFree 式：令牌取消 + 目录级容错 + 权限预检）。
+  final LocalMusicScanner _scanner = LocalMusicScanner();
+
   /// 每次进入软件后台重扫一次本地文件夹，确保新增/删除/修改的文件
   /// 同步进库；扫描结束后 load() 会自动刷新界面。启动扫描失败不影响
   /// 本地音乐展示，用户可通过刷新按钮手动重试。
@@ -244,14 +248,17 @@ class LibraryNotifier extends StateNotifier<LibraryState> {
   }
 
   /// 格式大类 → 实际扩展名白名单（与 Rust is_ext_allowed 对应）。
+  /// wma/ape/opus 与 MusicFree 的本地音乐支持格式对齐。
   static const _formatExtensions = <String, List<String>>{
     'flac': ['flac'],
     'mp3': ['mp3'],
     'wav': ['wav'],
     'aac': ['aac'],
     'm4a': ['m4a', 'm4b', 'mp4'],
-    'ogg': ['ogg', 'oga'],
+    'ogg': ['ogg', 'oga', 'opus'],
     'aiff': ['aif', 'aiff'],
+    'wma': ['wma'],
+    'ape': ['ape'],
   };
 
   /// 扫描全部已配置目录，按选定格式白名单入库，返回扫描到的歌曲总数。
@@ -283,28 +290,20 @@ class LibraryNotifier extends StateNotifier<LibraryState> {
         .where((p) => p.isNotEmpty)
         .toList();
 
-    var total = 0;
-    final errors = <String>[];
-    for (final folder in folders) {
-      try {
-        final songsJson = await scanMusicFolder(
-          dbPath: dbPath,
-          folderPath: folder,
-          minimumDurationSeconds: minDuration > 0 ? minDuration : null,
-          allowedFormats: allowed,
-        );
-        total += (jsonDecode(songsJson) as List).length;
-      } catch (e) {
-        // 单个目录失败不阻断其它目录，但记录错误以便暴露给用户。
-        errors.add('$folder: $e');
-      }
-    }
+    // 编排（权限预检 + 令牌取消 + 单目录容错）由 LocalMusicScanner
+    // 完成，设计参考 MusicFree 的 localMusicSheet.ts。
+    final summary = await _scanner.scanAll(
+      dbPath: dbPath,
+      folders: folders,
+      allowedFormats: allowed,
+      minimumDurationSeconds: minDuration > 0 ? minDuration : null,
+    );
     await load();
     // 一首都没扫到且有错误时，抛出以便 UI 展示真实原因。
-    if (total == 0 && errors.isNotEmpty) {
-      throw Exception('扫描失败：${errors.first}');
+    if (summary.foundSongs == 0 && summary.errors.isNotEmpty) {
+      throw Exception('扫描失败：${summary.errors.first}');
     }
-    return total;
+    return summary.foundSongs;
   }
 
   /// 按歌手取歌曲列表。

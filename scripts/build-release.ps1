@@ -1,4 +1,4 @@
-﻿#requires -version 5.1
+﻿﻿#requires -version 5.1
 param(
     [switch]$SkipBuild,
     [string]$SourceRoot = ""
@@ -46,13 +46,38 @@ $apkDir  = Join-Path $buildRoot "build\app\outputs\flutter-apk"
 $apkFile = Join-Path $apkDir "app-arm64-v8a-release.apk"
 
 # ---------- 环境变量（构建所需） ----------
-$env:ANDROID_HOME     = "$env:LOCALAPPDATA\Android\Sdk"
-$env:ANDROID_SDK_ROOT = "$env:LOCALAPPDATA\Android\Sdk"
-$env:JAVA_HOME        = "D:\Program Files\Java\jdk-25.0.2"
-$env:Path = "C:\Windows\System32;C:\Windows;C:\flutter\sdk_tmp\flutter\bin\cache\dart-sdk\bin;C:\flutter\sdk_tmp\flutter\bin;" + `
-            "$env:LOCALAPPDATA\Android\Sdk\platform-tools;" + `
+# 本机工具链位置：Flutter=D:\Software\flutter，JDK=D:\Software\Java，Android SDK=D:\Software\Android\Sdk
+$env:ANDROID_HOME     = "D:\Software\Android\Sdk"
+$env:ANDROID_SDK_ROOT = "D:\Software\Android\Sdk"
+$env:JAVA_HOME        = "D:\Software\Java\jdk-25.0.4.1+1"
+# 国内镜像，保证 pub get 与 Dart SDK 工件下载可靠
+$env:PUB_HOSTED_URL       = "https://pub.flutter-io.cn"
+$env:FLUTTER_STORAGE_BASE_URL = "https://storage.flutter-io.cn"
+$env:Path = "C:\Windows\System32;C:\Windows;D:\Software\flutter\bin;" + `
+            "$env:JAVA_HOME\bin;" + `
+            "D:\Software\Android\Sdk\platform-tools;" + `
             [Environment]::GetEnvironmentVariable("Path","Machine") + ";" + `
             [Environment]::GetEnvironmentVariable("Path","User")
+
+# ---------- 0. 递增构建号 ----------
+# 版本名保持不变，构建号每次构建 +1，且强制不低于 5001（首构从 2218
+# 跳到 5001）。改动写回源码 pubspec.yaml，随 git 提交持久化，保证
+# 下次构建必然大于本次。
+if (-not $SkipBuild) {
+    $sourcePubspec = Join-Path $realSource "pubspec.yaml"
+    $versionLine = Select-String -Path $sourcePubspec -Pattern "^version:" | Select-Object -First 1
+    if (-not $versionLine) { throw "[build-release] pubspec.yaml 中未找到 version 行" }
+    $currentVersion = ($versionLine.Line -replace "^version:\s*", "" -split "\+")[0]
+    $currentBuild = 0
+    if ($versionLine.Line -match "\+(\d+)\s*$") { $currentBuild = [int]$Matches[1] }
+    $nextBuild = [Math]::Max($currentBuild + 1, 5001)
+    $newLine = "version: $currentVersion+$nextBuild"
+    # 用无 BOM 的 UTF-8 写回，避免 PowerShell 5.1 的 UTF8 编码带 BOM 破坏 YAML 解析。
+    $newContent = (Get-Content $sourcePubspec) |
+        ForEach-Object { if ($_ -match "^version:") { $newLine } else { $_ } }
+    [System.IO.File]::WriteAllLines($sourcePubspec, $newContent, (New-Object System.Text.UTF8Encoding($false)))
+    Write-Host "[build-release] 构建号: $currentBuild -> $nextBuild（版本名 $currentVersion 不变）" -ForegroundColor Cyan
+}
 
 # ---------- 1. 同步源码到 ASCII 构建目录 ----------
 if (-not $SkipBuild) {
@@ -74,7 +99,7 @@ if (-not $SkipBuild) {
     Write-Host "[build-release] 执行 flutter build apk --release --split-per-abi ..." -ForegroundColor Cyan
     Push-Location $buildRoot
     try {
-        & "D:\flutter\bin\flutter.bat" build apk --release --split-per-abi
+        & "D:\Software\flutter\bin\flutter.bat" build apk --release --split-per-abi
         if ($LASTEXITCODE -ne 0) { throw "[build-release] flutter build 失败 (exit=$LASTEXITCODE)" }
     } finally {
         Pop-Location

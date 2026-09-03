@@ -3,10 +3,12 @@ import 'dart:io';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-import 'package:permission_handler/permission_handler.dart';
 
+import '../../src/library/library_provider.dart';
+import '../../src/library/native_storage_permission.dart';
 import '../../src/library/scan_settings_provider.dart';
 import '../../src/widgets/top_notice.dart';
+import '../library/folder_browser_page.dart';
 
 /// 扫描目录管理页：添加/删除本地音乐扫描目录。
 class ScanFoldersPage extends ConsumerStatefulWidget {
@@ -24,37 +26,50 @@ class _ScanFoldersPageState extends ConsumerState<ScanFoldersPage> {
     XyNotice.show(context, message: msg, duration: const Duration(seconds: 2));
   }
 
-  /// 申请存储权限：Android 11+ 优先「所有文件访问」，回退媒体/存储权限。
-  Future<bool> _ensureStoragePermission() async {
-    if (!Platform.isAndroid) return true;
-    // 优先所有文件访问权限（扫描任意目录需要真实路径）。
-    if (await Permission.manageExternalStorage.isGranted) return true;
-    final manage = await Permission.manageExternalStorage.request();
-    if (manage.isGranted) return true;
-    // 回退：媒体音频 / 传统存储权限。
-    final audio = await Permission.audio.request();
-    if (audio.isGranted) return true;
-    final storage = await Permission.storage.request();
-    return storage.isGranted;
-  }
-
   Future<void> _addFolder() async {
     setState(() => _adding = true);
     try {
-      final granted = await _ensureStoragePermission();
-      if (!granted) {
-        _toast('未授予存储权限，无法扫描本地文件夹');
+      // 权限走原生桥（MusicFree 同款），按系统版本申请真实所需权限。
+      if (!await NativeStoragePermission.ensure()) {
+        _toast(await NativeStoragePermission.deniedHint);
         return;
       }
-      final dir = await FilePicker.platform.getDirectoryPath();
-      if (dir == null) return; // 用户取消
-      // SAF 返回的 content:// URI 无法用于文件系统扫描。
-      if (dir.startsWith('content://')) {
-        _toast('请授予「所有文件访问」权限后重新选择文件夹');
+      String? dir;
+      if (Platform.isAndroid) {
+        // 自建目录浏览器（MusicFree fileSelector 同款）：返回真实
+        // 文件路径且与扫描走同一套权限。
+        if (!mounted) return;
+        dir = await Navigator.of(context).push<String>(
+          MaterialPageRoute(builder: (_) => const FolderBrowserPage()),
+        );
+      } else {
+        dir = await FilePicker.platform.getDirectoryPath();
+      }
+      if (dir == null || dir.startsWith('content://')) return; // 用户取消
+      // 非 Android（SAF 路径）校验可读性；Android 浏览器能列出即已可读。
+      if (!Platform.isAndroid &&
+          !await NativeStoragePermission.isReadableDirectory(dir)) {
+        _toast('无法读取所选文件夹');
         return;
       }
       await ref.read(scanFoldersProvider.notifier).addFolder(dir);
-      _toast('已添加扫描目录');
+      // 添加即扫描（与 MusicFree 导入即扫一致）：不扫的话歌曲要等用户
+      // 手动到音乐库下拉刷新才出现，看起来就像“文件夹加进来了但歌没进来”。
+      _toast('已添加扫描目录，开始扫描...');
+      try {
+        final count = await ref.read(libraryProvider.notifier).scanAllFolders();
+        if (!mounted) return;
+        if (count == 0) {
+          // 权限已由扫描编排器预检过，这里 0 首就是目录里确实没有
+          // 受支持格式的音频文件。
+          _toast('已添加目录，但未扫描到歌曲，请确认目录内有受支持格式的音频文件');
+        } else {
+          _toast('已添加目录，共扫描到 $count 首歌曲');
+        }
+      } on Exception catch (e) {
+        if (!mounted) return;
+        _toast('扫描失败：${e.toString().replaceFirst('Exception: ', '')}');
+      }
     } catch (e) {
       _toast('添加失败：$e');
     } finally {

@@ -3,10 +3,10 @@ import 'dart:io';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-import 'package:permission_handler/permission_handler.dart';
 
 import '../../src/favorites/favorites_provider.dart';
 import '../../src/library/library_provider.dart';
+import '../../src/library/native_storage_permission.dart';
 import '../../src/core/settings.dart';
 import '../../src/library/scan_settings_provider.dart';
 import '../../src/navigation/animated_page_route.dart';
@@ -15,6 +15,7 @@ import '../../src/navigation/sidebar_controller.dart';
 import '../../src/rust/api.dart';
 import '../../src/widgets/song_list_view.dart';
 import '../../src/widgets/top_notice.dart';
+import 'folder_browser_page.dart';
 import 'song_list_page.dart';
 
 /// 本地音乐“歌曲”Tab 的多选模式开关。AppBar 右上角的多选按钮与 Tab
@@ -97,42 +98,41 @@ class _LibraryPageState extends ConsumerState<LibraryPage>
     });
   }
 
-  Future<bool> _ensureStoragePermission() async {
-    if (!Platform.isAndroid) return true;
-    if (await Permission.manageExternalStorage.isGranted) return true;
-    if ((await Permission.manageExternalStorage.request()).isGranted) {
-      return true;
-    }
-    if ((await Permission.audio.request()).isGranted) return true;
-    return (await Permission.storage.request()).isGranted;
-  }
-
   Future<void> _addFolder() async {
     if (_addingFolder) return;
     setState(() => _addingFolder = true);
     try {
-      if (!await _ensureStoragePermission()) {
-        throw Exception('未授予存储权限，无法扫描本地文件夹');
+      // 权限走原生桥（MusicFree 同款），按系统版本申请真实所需权限。
+      if (!await NativeStoragePermission.ensure()) {
+        throw Exception(await NativeStoragePermission.deniedHint);
       }
-      final directory = await FilePicker.platform.getDirectoryPath();
-      if (directory == null) return;
-      if (directory.startsWith('content://')) {
-        throw Exception('请授予“所有文件访问”权限后重新选择文件夹');
+      String? directory;
+      if (Platform.isAndroid) {
+        // 自建目录浏览器（MusicFree fileSelector 同款）：返回真实
+        // 文件路径且与扫描走同一套权限，避免 SAF content:// URI
+        // 无法扫描、选择器能浏览扫描却 EACCES 的割裂问题。
+        if (!mounted) return;
+        directory = await Navigator.of(context).push<String>(
+          MaterialPageRoute(builder: (_) => const FolderBrowserPage()),
+        );
+      } else {
+        directory = await FilePicker.platform.getDirectoryPath();
+      }
+      if (directory == null || directory.startsWith('content://')) return;
+      // 非 Android（SAF 路径）校验可读性；Android 浏览器能列出即已可读。
+      if (!Platform.isAndroid &&
+          !await NativeStoragePermission.isReadableDirectory(directory)) {
+        throw Exception('无法读取所选文件夹');
       }
       await ref.read(scanFoldersProvider.notifier).addFolder(directory);
       final count = await ref.read(libraryProvider.notifier).scanAllFolders();
       if (!mounted) return;
       if (count == 0) {
-        // 未授予“所有文件访问”权限时，Android 分区存储会把用户自建
-        // 目录过滤成空，扫描静默得到 0 首。这里给出明确引导而不是报
-        // “已扫描到 0 首”让用户误以为功能损坏。
-        final granted = await Permission.manageExternalStorage.isGranted;
-        if (!mounted) return;
+        // 权限已由扫描编排器预检过，这里 0 首就是目录里确实没有
+        // 受支持格式的音频文件。
         XyNotice.show(
           context,
-          message: granted
-              ? '文件夹已添加，但未扫描到歌曲，请确认目录内有受支持格式的音频文件'
-              : '未扫描到歌曲：请授予“所有文件访问”权限后点击刷新重试',
+          message: '文件夹已添加，但未扫描到歌曲，请确认目录内有受支持格式的音频文件',
           type: XyNoticeType.warning,
         );
         return;
@@ -507,6 +507,10 @@ class _AllSongsTabState extends ConsumerState<_AllSongsTab> {
               ? const Center(child: Text('没有匹配的歌曲'))
               : SongsListView(
                   songs: songs,
+                  // 底部留出迷你播放栏与浮动按钮组的空间。
+                  padding: EdgeInsets.only(
+                    bottom: MediaQuery.paddingOf(context).bottom + 148,
+                  ),
                   onPlay: (list, i) =>
                       ref.read(libraryProvider.notifier).playList(list, i),
                   selectionMode: selectionMode,

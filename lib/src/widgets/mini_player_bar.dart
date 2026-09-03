@@ -10,6 +10,7 @@ import '../player/player_provider.dart';
 import '../player/video_playback_session.dart';
 import '../ui/xy_theme.dart';
 import 'cover_image.dart';
+import 'queue_sheet.dart';
 
 double safeMiniPlayerProgress(double position, double duration) {
   if (!position.isFinite || !duration.isFinite || duration <= 0) return 0;
@@ -205,6 +206,11 @@ class MiniPlayerBar extends ConsumerWidget {
                         }
                         unawaited(ref.read(playerProvider.notifier).next());
                       },
+                    ),
+                    _PlayerButton(
+                      icon: Icons.queue_music_rounded,
+                      label: '播放队列',
+                      onTap: () => showQueueSheet(context, ref),
                     ),
                     const SizedBox(width: 3),
                   ],

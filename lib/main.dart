@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:audio_session/audio_session.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/foundation.dart';
@@ -10,6 +12,20 @@ import 'app.dart';
 import 'src/logging/app_log_store.dart';
 
 Future<void> main() async {
+  // runZonedGuarded 兜住 zone 内逃逸的异步异常，交给日志系统落盘
+  // （崩溃文件），避免进程被静默杀死而无任何记录。
+  runZonedGuarded(() async {
+    await _bootstrapApp();
+  }, (error, stack) {
+    AppLogStore.instance.add(
+      'main zone 未捕获异常\n$error\n$stack',
+      level: AppLogLevel.error,
+    );
+    AppLogStore.instance.recordCrash('main zone 异常', error, stack);
+  });
+}
+
+Future<void> _bootstrapApp() async {
   WidgetsFlutterBinding.ensureInitialized();
   // 某些使用 AudioServiceActivity 的 Android ROM 不会自动执行
   // file_picker 的 Dart 插件注册，首次调用 FilePicker.platform 时会抛出
