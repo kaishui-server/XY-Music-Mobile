@@ -46,16 +46,42 @@ $apkDir  = Join-Path $buildRoot "build\app\outputs\flutter-apk"
 $apkFile = Join-Path $apkDir "app-arm64-v8a-release.apk"
 
 # ---------- 环境变量（构建所需） ----------
-# 本机工具链位置：Flutter=D:\Software\flutter，JDK=D:\Software\Java，Android SDK=D:\Software\Android\Sdk
-$env:ANDROID_HOME     = "D:\Software\Android\Sdk"
-$env:ANDROID_SDK_ROOT = "D:\Software\Android\Sdk"
-$env:JAVA_HOME        = "D:\Software\Java\jdk-25.0.4.1+1"
+# 工具链自动探测：优先历史配置路径（另一台工作机），本机不存在时回退到
+# 常见安装位置，保证两台电脑共用同一脚本。Flutter 需要 JDK 17+。
+$flutterBat = "D:\Software\flutter\bin\flutter.bat"
+if (-not (Test-Path $flutterBat)) {
+    foreach ($p in @("C:\flutter\flutter\bin\flutter.bat")) {
+        if (Test-Path $p) { $flutterBat = $p; break }
+    }
+}
+$androidSdk = "D:\Software\Android\Sdk"
+if (-not (Test-Path $androidSdk)) {
+    $cand = Join-Path $env:LOCALAPPDATA "Android\Sdk"
+    if (Test-Path $cand) { $androidSdk = $cand }
+}
+$javaHome = "D:\Software\Java\jdk-25.0.4.1+1"
+if (-not (Test-Path $javaHome)) {
+    foreach ($p in @(
+        "C:\Program Files\Eclipse Adoptium\jdk-17.0.20.8-hotspot",
+        "C:\Program Files\Microsoft\jdk-21.0.9.10-hotspot"
+    )) {
+        if (Test-Path $p) { $javaHome = $p; break }
+    }
+}
+$flutterBinDir = Split-Path -Parent $flutterBat
+Write-Host "[build-release] Flutter: $flutterBat" -ForegroundColor DarkGray
+Write-Host "[build-release] Android SDK: $androidSdk" -ForegroundColor DarkGray
+Write-Host "[build-release] JAVA_HOME: $javaHome" -ForegroundColor DarkGray
+
+$env:ANDROID_HOME     = $androidSdk
+$env:ANDROID_SDK_ROOT = $androidSdk
+$env:JAVA_HOME        = $javaHome
 # 国内镜像，保证 pub get 与 Dart SDK 工件下载可靠
 $env:PUB_HOSTED_URL       = "https://pub.flutter-io.cn"
 $env:FLUTTER_STORAGE_BASE_URL = "https://storage.flutter-io.cn"
-$env:Path = "C:\Windows\System32;C:\Windows;D:\Software\flutter\bin;" + `
+$env:Path = "C:\Windows\System32;C:\Windows;$flutterBinDir;" + `
             "$env:JAVA_HOME\bin;" + `
-            "D:\Software\Android\Sdk\platform-tools;" + `
+            "$androidSdk\platform-tools;" + `
             [Environment]::GetEnvironmentVariable("Path","Machine") + ";" + `
             [Environment]::GetEnvironmentVariable("Path","User")
 
@@ -99,7 +125,7 @@ if (-not $SkipBuild) {
     Write-Host "[build-release] 执行 flutter build apk --release --split-per-abi ..." -ForegroundColor Cyan
     Push-Location $buildRoot
     try {
-        & "D:\Software\flutter\bin\flutter.bat" build apk --release --split-per-abi
+        & $flutterBat build apk --release --split-per-abi
         if ($LASTEXITCODE -ne 0) { throw "[build-release] flutter build 失败 (exit=$LASTEXITCODE)" }
     } finally {
         Pop-Location

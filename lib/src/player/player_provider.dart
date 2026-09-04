@@ -1846,6 +1846,13 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
     return selected;
   }
 
+  /// 深链分享播放等场景的公开入口：按标题/歌手/时长在启用的插件中
+  /// 搜索可用音源并解析出可播放的 QueueItem（复用重连的匹配逻辑）。
+  Future<({QueueItem item, String pluginName})?> findOnlineReplacement(
+    QueueItem original,
+  ) =>
+      _findPluginReplacement(original);
+
   Future<({QueueItem item, String pluginName})?> _findPluginReplacement(
     QueueItem original,
   ) async {

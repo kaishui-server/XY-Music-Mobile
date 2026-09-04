@@ -29,6 +29,7 @@ import '../../src/playlists/playlists_provider.dart';
 import '../../src/plugins/plugin_runtime.dart';
 import '../../src/rust/api.dart';
 import '../../src/rust/music/types.dart';
+import '../../src/share/share_sheet.dart';
 import '../../src/widgets/cover_image.dart';
 import '../../src/widgets/queue_sheet.dart';
 import '../../src/widgets/top_notice.dart';
@@ -942,35 +943,20 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
   }
 
   Future<void> _showShareSheet(QueueItem item) async {
-    await showModalBottomSheet<void>(
-      context: context,
-      useRootNavigator: true,
-      showDragHandle: true,
-      useSafeArea: true,
-      builder: (sheetContext) => SafeArea(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            const ListTile(
-              leading: Icon(Icons.share_outlined),
-              title: Text('分享歌曲'),
-            ),
-            ListTile(
-              leading: const Icon(Icons.image_outlined),
-              title: const Text('保存为分享图片'),
-              onTap: () {
-                Navigator.pop(sheetContext);
-                unawaited(_createShareImagePreview(item));
-              },
-            ),
-            ListTile(
-              leading: const Icon(Icons.chat_outlined),
-              title: const Text('分享链接到QQ'),
-              onTap: () => Navigator.pop(sheetContext),
-            ),
-          ],
+    await showSongShareSheet(
+      context,
+      ref: ref,
+      song: item,
+      extraActions: [
+        ListTile(
+          leading: const Icon(Icons.image_outlined),
+          title: const Text('保存为分享图片'),
+          onTap: () {
+            Navigator.pop(context);
+            unawaited(_createShareImagePreview(item));
+          },
         ),
-      ),
+      ],
     );
   }
 

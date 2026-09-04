@@ -8,6 +8,7 @@ import 'package:dynamic_color/dynamic_color.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'src/core/rust_init.dart';
+import 'src/deeplink/deep_link_handler.dart';
 import 'src/core/settings.dart';
 import 'src/library/library_provider.dart';
 import 'src/navigation/routes.dart';
@@ -83,6 +84,8 @@ class _XyMusicAppState extends ConsumerState<XyMusicApp> {
     // 每次进入软件即触发本地音乐后台重扫（LibraryNotifier 构造时执行），
     // 不等用户打开本地音乐页。
     Future.microtask(() => ref.read(libraryProvider.notifier));
+    // 分享深链（xymusic://song?...）：注册原生回调 + 取回冷启动深链。
+    Future.microtask(() => XyDeepLink.init(ref, appRouter));
   }
 
   @override

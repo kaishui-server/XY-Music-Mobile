@@ -31,22 +31,58 @@ class MainActivity : AudioServiceActivity() {
         private const val SCREEN_AWAKE_CHANNEL = "com.xymusic.mobile/screen_awake"
         private const val GALLERY_CHANNEL = "com.xymusic.mobile/gallery"
         private const val STORAGE_CHANNEL = "com.xymusic.mobile/storage"
+        private const val DEEPLINK_CHANNEL = "com.xymusic.mobile/deeplink"
         private const val CAPTURE_REQUEST = 4217
         private const val DIRECTORY_REQUEST = 4218
     }
 
     private var pendingStartResult: MethodChannel.Result? = null
     private var pendingDirectoryResult: MethodChannel.Result? = null
+    private var deepLinkChannel: MethodChannel? = null
+    private var pendingDeepLink: String? = null
 
     override fun onCreate(savedInstanceState: android.os.Bundle?) {
         super.onCreate(savedInstanceState)
         // 尽早安装，捕获进程内所有线程的未捕获异常并写入崩溃文件。
         CrashHandler.install(this)
+        // 冷启动深链暂存：Flutter 引擎就绪后由 getInitialDeepLink 取走。
+        pendingDeepLink = extractDeepLink(intent)
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        // 热启动深链：直接转发给 Flutter 侧处理。
+        extractDeepLink(intent)?.let { raw ->
+            deepLinkChannel?.invokeMethod("onDeepLink", raw)
+        }
+    }
+
+    /// 提取 xymusic:// 深链（分享落地页拉起播放）。
+    private fun extractDeepLink(intent: Intent?): String? {
+        val data = intent?.data ?: return null
+        val scheme = data.scheme ?: return null
+        if (!scheme.equals("xymusic", ignoreCase = true)) return null
+        val raw = data.toString()
+        return raw.ifEmpty { null }
     }
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
         StoragePermissionBridge.register(this, flutterEngine)
+        deepLinkChannel = MethodChannel(
+            flutterEngine.dartExecutor.binaryMessenger,
+            DEEPLINK_CHANNEL,
+        ).also { channel ->
+            channel.setMethodCallHandler { call, result ->
+                if (call.method != "getInitialDeepLink") {
+                    result.notImplemented()
+                    return@setMethodCallHandler
+                }
+                val initial = pendingDeepLink
+                pendingDeepLink = null
+                result.success(initial)
+            }
+        }
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, SCREEN_AWAKE_CHANNEL)
             .setMethodCallHandler { call, result ->
                 if (call.method != "setKeepScreenOn") {
