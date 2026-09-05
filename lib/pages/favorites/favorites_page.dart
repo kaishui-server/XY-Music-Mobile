@@ -7,6 +7,8 @@ import '../../src/core/settings.dart';
 import '../../src/library/library_provider.dart';
 import '../../src/player/player_provider.dart';
 import '../../src/navigation/sidebar_controller.dart';
+import '../../src/widgets/batch_download.dart';
+import '../../src/widgets/frosted_search_field.dart';
 import '../../src/widgets/song_list_view.dart';
 import '../../src/widgets/top_notice.dart';
 
@@ -27,6 +29,7 @@ class _FavoritesPageState extends ConsumerState<FavoritesPage> {
   final Set<String> _selectedPaths = <String>{};
   bool _selectionMode = false;
   bool _deleting = false;
+  bool _downloading = false;
   // 播放器状态每秒更新一次。没有这个集合时，build 会反复安排同一批
   // SharedPreferences 写入，进入收藏页时容易出现连续卡顿。
   final Set<String> _snapshotSyncQueued = <String>{};
@@ -40,29 +43,6 @@ class _FavoritesPageState extends ConsumerState<FavoritesPage> {
       _songsFuture = ref.read(libraryProvider.notifier).songsByPaths(paths);
     }
     return _songsFuture!;
-  }
-
-  Future<void> _clear(BuildContext context) async {
-    final confirmed = await showDialog<bool>(
-      context: context,
-      builder: (context) => AlertDialog(
-        title: const Text('清空收藏'),
-        content: const Text('确定取消收藏全部歌曲吗？音乐文件不会被删除。'),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context, false),
-            child: const Text('取消'),
-          ),
-          FilledButton(
-            onPressed: () => Navigator.pop(context, true),
-            child: const Text('清空'),
-          ),
-        ],
-      ),
-    );
-    if (confirmed == true) {
-      await ref.read(favoritesProvider.notifier).clear();
-    }
   }
 
   void _toggleSelection(Song song) {
@@ -135,6 +115,22 @@ class _FavoritesPageState extends ConsumerState<FavoritesPage> {
     if (mounted) setState(() {});
   }
 
+  /// 多选批量下载：复用歌单页共享的批量下载组件（含音质/目录弹窗）。
+  Future<void> _downloadSelected() async {
+    if (_downloading || _selectedPaths.isEmpty) return;
+    final selected = _sortedSongs
+        .where((song) => _selectedPaths.contains(song.path))
+        .toList();
+    if (selected.isEmpty) return;
+    setState(() => _downloading = true);
+    try {
+      await runBatchDownload(context, ref, songs: selected);
+      if (mounted) _exitSelection();
+    } finally {
+      if (mounted) setState(() => _downloading = false);
+    }
+  }
+
   List<Song> _sortedSongs = const <Song>[];
 
   @override
@@ -192,6 +188,18 @@ class _FavoritesPageState extends ConsumerState<FavoritesPage> {
           if (sidebarOnRight) const AppSidebarMenuButton(),
           if (_selectionMode) ...[
             IconButton(
+              tooltip: '批量下载',
+              onPressed: _downloading || _selectedPaths.isEmpty
+                  ? null
+                  : _downloadSelected,
+              icon: _downloading
+                  ? const SizedBox.square(
+                      dimension: 20,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    )
+                  : const Icon(Icons.download_rounded),
+            ),
+            IconButton(
               tooltip: '删除所选收藏',
               onPressed: _deleting || _selectedPaths.isEmpty
                   ? null
@@ -223,19 +231,6 @@ class _FavoritesPageState extends ConsumerState<FavoritesPage> {
             SongSortMenuButton(
               sort: _sort,
               onSortChanged: (sort) => setState(() => _sort = sort),
-              actions: [
-                SongMenuAction(
-                  id: 'clear',
-                  label: '清空收藏',
-                  icon: Icons.delete_sweep_outlined,
-                  isDestructive: true,
-                ),
-              ],
-              onAction: (action) {
-                if (action.id == 'clear' && favPaths.isNotEmpty) {
-                  _clear(context);
-                }
-              },
             ),
           ],
         ],
@@ -367,25 +362,12 @@ class _FavoritesPageState extends ConsumerState<FavoritesPage> {
                           ),
                         )
                       else
-                        Padding(
+                        FrostedSearchField(
+                          controller: null,
+                          hintText: '搜索歌曲、歌手或专辑',
+                          onChanged: (value) =>
+                              setState(() => _query = value),
                           padding: const EdgeInsets.fromLTRB(16, 4, 16, 4),
-                          child: TextField(
-                            onChanged: (value) =>
-                                setState(() => _query = value),
-                            textInputAction: TextInputAction.search,
-                            decoration: InputDecoration(
-                              hintText: '搜索歌曲、歌手或专辑',
-                              prefixIcon: const Icon(Icons.search_rounded),
-                              suffixIcon: _query.isEmpty
-                                  ? null
-                                  : IconButton(
-                                      tooltip: '清除搜索',
-                                      onPressed: () =>
-                                          setState(() => _query = ''),
-                                      icon: const Icon(Icons.clear_rounded),
-                                    ),
-                            ),
-                          ),
                         ),
                       if (!_selectionMode)
                         Padding(

@@ -12,6 +12,7 @@ import '../../src/navigation/animated_page_route.dart';
 import '../../src/navigation/sidebar_controller.dart';
 import '../../src/player/player_provider.dart';
 import '../../src/plugins/plugin_runtime.dart';
+import '../../src/widgets/frosted_search_field.dart';
 import '../../src/widgets/mini_player_bar.dart';
 import '../../src/widgets/song_list_view.dart';
 import '../../src/widgets/top_notice.dart';
@@ -303,7 +304,8 @@ class _SearchPageState extends ConsumerState<SearchPage>
   _PluginSearchState _stateForTab(
     _SearchSourceTab tab,
     _SearchCategory category,
-  ) => _states[_stateKey(_tabKeyFor(tab), category)] ??
+  ) =>
+      _states[_stateKey(_tabKeyFor(tab), category)] ??
       const _PluginSearchState();
 
   Future<void> _search(String input) async {
@@ -336,9 +338,7 @@ class _SearchPageState extends ConsumerState<SearchPage>
         );
       }
     }
-    await Future.wait(
-      tabs.map((tab) => _searchTabSource(tab, keyword, token)),
-    );
+    await Future.wait(tabs.map((tab) => _searchTabSource(tab, keyword, token)));
   }
 
   Future<void> _searchTabSource(
@@ -358,8 +358,10 @@ class _SearchPageState extends ConsumerState<SearchPage>
           .toList();
       if (!mounted || token != _queryToken) return;
       setState(() {
-        _states[_stateKey(tabKey, _SearchCategory.songs)] =
-            _PluginSearchState(songs: songs, searched: true);
+        _states[_stateKey(tabKey, _SearchCategory.songs)] = _PluginSearchState(
+          songs: songs,
+          searched: true,
+        );
       });
       unawaited(
         ref
@@ -374,10 +376,7 @@ class _SearchPageState extends ConsumerState<SearchPage>
     } catch (error) {
       if (!mounted || token != _queryToken) return;
       setState(() {
-        _states[_stateKey(
-          tabKey,
-          _SearchCategory.songs,
-        )] = _PluginSearchState(
+        _states[_stateKey(tabKey, _SearchCategory.songs)] = _PluginSearchState(
           searched: true,
           error: error.toString().replaceFirst('Exception: ', ''),
         );
@@ -530,7 +529,9 @@ class _SearchPageState extends ConsumerState<SearchPage>
   }) {
     final index = pluginIndex ?? _selectedPluginIndex;
     final selected = category ?? _selectedCategory;
-    if (index < 0 || index >= tabs.length || selected == _SearchCategory.songs) {
+    if (index < 0 ||
+        index >= tabs.length ||
+        selected == _SearchCategory.songs) {
       return;
     }
     final tab = tabs[index];
@@ -797,7 +798,8 @@ class _SearchPageState extends ConsumerState<SearchPage>
         top: 6,
         // 底部留出迷你播放栏与浮动按钮组的空间（内嵌 Shell 时由
         // Shell 的迷你播放栏覆盖，同样需要预留）。
-        bottom: MediaQuery.of(context).padding.bottom +
+        bottom:
+            MediaQuery.of(context).padding.bottom +
             (ref.read(playerProvider).current != null ? 148 : 12),
       ),
       onPlay: _playNetworkSongs,
@@ -873,27 +875,19 @@ class _SearchPageState extends ConsumerState<SearchPage>
           leading: widget.showSidebarButton && !sidebarOnRight
               ? const AppSidebarMenuButton()
               : null,
-          title: TextField(
+          title: FrostedSearchField(
             controller: _controller,
             focusNode: _searchFocusNode,
             autofocus: widget.initialQuery.isEmpty,
-            textInputAction: TextInputAction.search,
+            hintText: '搜索网络歌曲、歌手、专辑、歌单',
             onChanged: _onChanged,
+            onSubmitted: _onSubmitted,
             // 空实现：覆盖框架默认的“收到键盘动作即失焦收起键盘”行为，
             // 由 _onSubmitted 自行决定何时收起键盘。
             onEditingComplete: () {},
-            onSubmitted: _onSubmitted,
-            decoration: InputDecoration(
-              hintText: '搜索网络歌曲、歌手、专辑、歌单',
-              border: InputBorder.none,
-              suffixIcon: _controller.text.isEmpty
-                  ? null
-                  : IconButton(
-                      tooltip: '清除',
-                      onPressed: _clear,
-                      icon: const Icon(Icons.clear, size: 20),
-                    ),
-            ),
+            showClearSuffix: true,
+            onCleared: _clear,
+            padding: EdgeInsets.zero,
           ),
           actions: [
             if (widget.showSidebarButton && sidebarOnRight)
@@ -917,9 +911,7 @@ class _SearchPageState extends ConsumerState<SearchPage>
                           setState(() => _selectedPluginIndex = index);
                           _ensureCategorySearch(tabs, pluginIndex: index);
                         },
-                        tabs: [
-                          for (final tab in tabs) _buildSourceTab(tab),
-                        ],
+                        tabs: [for (final tab in tabs) _buildSourceTab(tab)],
                       ),
                       TabBar(
                         controller: _categoryController,
@@ -932,7 +924,9 @@ class _SearchPageState extends ConsumerState<SearchPage>
                           // 所有 Tab，这样用户左右切换一级 Tab 不会看到
                           // 未加载的空页。
                           for (
-                            var tabIndex = 0; tabIndex < tabs.length; tabIndex++
+                            var tabIndex = 0;
+                            tabIndex < tabs.length;
+                            tabIndex++
                           ) {
                             _ensureCategorySearch(
                               tabs,

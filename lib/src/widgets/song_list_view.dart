@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:ui';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -6,6 +7,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../favorites/favorites_provider.dart';
 import '../library/library_provider.dart';
 import '../player/player_provider.dart';
+import '../plugins/plugin_runtime.dart';
 import 'cover_image.dart';
 import 'top_notice.dart';
 
@@ -94,8 +96,9 @@ class _SongsListViewState extends ConsumerState<SongsListView> {
   /// 显隐由 _FloatingListButtons 根据滚动位置自动维护（接近即隐藏）。
   void _locatePlaying() {
     final path = ref.read(playerProvider).current?.path;
-    final index =
-        path == null ? -1 : widget.songs.indexWhere((s) => s.path == path);
+    final index = path == null
+        ? -1
+        : widget.songs.indexWhere((s) => s.path == path);
     if (index < 0) {
       XyNotice.show(
         context,
@@ -136,6 +139,13 @@ class _SongsListViewState extends ConsumerState<SongsListView> {
       return const Center(child: Text('暂无歌曲'));
     }
     final favorites = ref.watch(favoritesProvider);
+    // 插件歌曲在副标题中显示来源插件名（如歌单中的网络音源歌曲）。
+    final pluginNames = <String, String>{
+      for (final plugin
+          in ref.watch(enabledMusicPluginsProvider).valueOrNull ??
+              const <EnabledMusicPlugin>[])
+        plugin.id: plugin.name,
+    };
     final hasCurrentSong = ref.watch(
       playerProvider.select((state) => state.current != null),
     );
@@ -165,8 +175,10 @@ class _SongsListViewState extends ConsumerState<SongsListView> {
               context,
               i,
               favorites: favorites,
-              dragIndex:
-                  i < widget.songs.length && !widget.selectionMode ? i : -1,
+              pluginNames: pluginNames,
+              dragIndex: i < widget.songs.length && !widget.selectionMode
+                  ? i
+                  : -1,
             ),
           )
         else
@@ -178,6 +190,7 @@ class _SongsListViewState extends ConsumerState<SongsListView> {
               context,
               i,
               favorites: favorites,
+              pluginNames: pluginNames,
               dragIndex: -1,
             ),
           ),
@@ -197,14 +210,20 @@ class _SongsListViewState extends ConsumerState<SongsListView> {
     BuildContext context,
     int i, {
     required Set<String> favorites,
+    required Map<String, String> pluginNames,
     required int dragIndex,
   }) {
     if (i == widget.songs.length) {
-      return KeyedSubtree(key: const ValueKey('songs-footer'), child: widget.footer!);
+      return KeyedSubtree(
+        key: const ValueKey('songs-footer'),
+        child: widget.footer!,
+      );
     }
     final s = widget.songs[i];
     final isFavorite = favorites.contains(s.path);
     final highlighted = _highlightPath == s.path;
+    // 来源插件名（与导入的插件名一致），以标签形式展示在歌名旁。
+    final sourceTag = _sourceTagLabel(s, pluginNames);
     // RepaintBoundary 把每行圈成独立重绘范围：多选勾选或收藏状态
     // 变化时只重绘对应行，避免整个列表跟着重绘造成卡顿。
     return RepaintBoundary(
@@ -212,10 +231,7 @@ class _SongsListViewState extends ConsumerState<SongsListView> {
       child: Padding(
         // 首行挂测量 Key，布局后读取真实行高。
         key: i == 0 ? _firstRowKey : null,
-        padding: const EdgeInsets.symmetric(
-          horizontal: 2,
-          vertical: 3,
-        ),
+        padding: const EdgeInsets.symmetric(horizontal: 2, vertical: 3),
         child: Material(
           color: highlighted
               ? Theme.of(context).colorScheme.primary.withValues(alpha: .16)
@@ -238,8 +254,7 @@ class _SongsListViewState extends ConsumerState<SongsListView> {
                       padding: const EdgeInsets.only(right: 4),
                       child: Checkbox(
                         value: widget.isSelected?.call(s) ?? false,
-                        onChanged: (_) =>
-                            widget.onToggleSelection?.call(s),
+                        onChanged: (_) => widget.onToggleSelection?.call(s),
                         visualDensity: VisualDensity.compact,
                       ),
                     )
@@ -253,9 +268,7 @@ class _SongsListViewState extends ConsumerState<SongsListView> {
                         child: Icon(
                           Icons.drag_indicator_rounded,
                           size: 22,
-                          color: Theme.of(
-                            context,
-                          ).colorScheme.onSurfaceVariant,
+                          color: Theme.of(context).colorScheme.onSurfaceVariant,
                         ),
                       ),
                     ),
@@ -278,28 +291,31 @@ class _SongsListViewState extends ConsumerState<SongsListView> {
                                 ),
                               ),
                             ),
-                            if (!widget.showFavoriteButton &&
-                                isFavorite) ...[
-                              const SizedBox(width: 5),
-                              const Icon(
-                                Icons.favorite,
-                                size: 14,
-                                color: Color(0xFFEC4141),
-                              ),
-                            ],
                           ],
                         ),
                         const SizedBox(height: 3),
-                        Text(
-                          _subtitle(s),
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: TextStyle(
-                            fontSize: 12,
-                            color: Theme.of(
-                              context,
-                            ).colorScheme.onSurfaceVariant,
-                          ),
+                        Row(
+                          children: [
+                            Expanded(
+                              child: Text(
+                                _subtitle(s),
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: TextStyle(
+                                  fontSize: 12,
+                                  color: Theme.of(
+                                    context,
+                                  ).colorScheme.onSurfaceVariant,
+                                ),
+                              ),
+                            ),
+                            // 来源插件名标签（参考 MusicFree）放在副行末尾。
+                            if (sourceTag != null)
+                              Padding(
+                                padding: const EdgeInsets.only(left: 6),
+                                child: _SourceTag(label: sourceTag),
+                              ),
+                          ],
                         ),
                       ],
                     ),
@@ -309,32 +325,26 @@ class _SongsListViewState extends ConsumerState<SongsListView> {
                     _fmt(s.duration),
                     style: TextStyle(
                       fontSize: 11,
-                      color: Theme.of(context)
-                          .colorScheme
-                          .onSurfaceVariant
-                          .withValues(alpha: .65),
+                      color: Theme.of(
+                        context,
+                      ).colorScheme.onSurfaceVariant.withValues(alpha: .65),
                     ),
                   ),
-                  if (!widget.selectionMode &&
-                      widget.showFavoriteButton)
+                  if (!widget.selectionMode && widget.showFavoriteButton)
                     IconButton(
                       tooltip: isFavorite ? '取消收藏' : '收藏',
                       icon: Icon(
-                        isFavorite
-                            ? Icons.favorite
-                            : Icons.favorite_border,
+                        isFavorite ? Icons.favorite : Icons.favorite_border,
                         size: 21,
                         color: const Color(0xFFEC4141),
                       ),
-                      onPressed: () =>
-                          _toggleFavorite(context, ref, s),
+                      onPressed: () => _toggleFavorite(context, ref, s),
                     ),
                   if (!widget.selectionMode)
                     IconButton(
                       tooltip: '更多',
                       icon: const Icon(Icons.more_vert, size: 20),
-                      onPressed: () =>
-                          _showSongActions(context, ref, s, i),
+                      onPressed: () => _showSongActions(context, ref, s, i),
                     ),
                 ],
               ),
@@ -346,11 +356,18 @@ class _SongsListViewState extends ConsumerState<SongsListView> {
   }
 
   String _subtitle(Song song) {
-    final parts = [
-      song.artist,
-      song.album,
-    ].where((part) => part.trim().isNotEmpty).toList();
+    final parts = [song.artist, song.album]
+        .where((part) => part.trim().isNotEmpty)
+        .toList();
     return parts.isEmpty ? '未知艺术家' : parts.join(' · ');
+  }
+
+  /// 来源插件名标签文本：优先显示导入时解析的插件名（与插件管理一致），
+  /// 插件已卸载时回退显示插件 ID，便于用户辨认歌曲来源。
+  String? _sourceTagLabel(Song song, Map<String, String> pluginNames) {
+    final id = song.pluginId?.trim() ?? '';
+    if (id.isEmpty) return null;
+    return pluginNames[id] ?? id;
   }
 
   Future<void> _showSongActions(
@@ -360,6 +377,16 @@ class _SongsListViewState extends ConsumerState<SongsListView> {
     int index,
   ) async {
     final isFavorite = ref.read(favoritesProvider).contains(song.path);
+    // 操作面板头部副标题与列表行保持一致，同样显示来源插件名。
+    var pluginNames = const <String, String>{};
+    try {
+      final plugins = await ref.read(enabledMusicPluginsProvider.future);
+      pluginNames = {
+        for (final plugin in plugins) plugin.id: plugin.name,
+      };
+    } catch (_) {}
+    final sourceTag = _sourceTagLabel(song, pluginNames);
+    if (!context.mounted) return;
     final action = await showModalBottomSheet<_SongAction>(
       context: context,
       // 列表位于 Shell 的分支 Navigator 中，而迷你播放栏叠在分支之上。
@@ -393,15 +420,26 @@ class _SongsListViewState extends ConsumerState<SongsListView> {
                             ),
                           ),
                           const SizedBox(height: 3),
-                          Text(
-                            _subtitle(song),
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                            style: TextStyle(
-                              color: Theme.of(
-                                context,
-                              ).colorScheme.onSurfaceVariant,
-                            ),
+                          Row(
+                            children: [
+                              Expanded(
+                                child: Text(
+                                  _subtitle(song),
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: TextStyle(
+                                    color: Theme.of(
+                                      context,
+                                    ).colorScheme.onSurfaceVariant,
+                                  ),
+                                ),
+                              ),
+                              if (sourceTag != null)
+                                Padding(
+                                  padding: const EdgeInsets.only(left: 6),
+                                  child: _SourceTag(label: sourceTag),
+                                ),
+                            ],
                           ),
                         ],
                       ),
@@ -553,6 +591,41 @@ class _SongsListViewState extends ConsumerState<SongsListView> {
   }
 }
 
+/// 歌曲来源插件名标签（参考 MusicFree 的来源标记）：
+/// 歌名右侧的小圆角标签，显示导入插件时的名称。
+class _SourceTag extends StatelessWidget {
+  const _SourceTag({required this.label});
+
+  final String label;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return ConstrainedBox(
+      // 插件名过长时省略，避免挤压歌名。
+      constraints: const BoxConstraints(maxWidth: 68),
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
+        decoration: BoxDecoration(
+          color: scheme.primary.withValues(alpha: .12),
+          borderRadius: BorderRadius.circular(4),
+        ),
+        child: Text(
+          label,
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+          style: TextStyle(
+            fontSize: 10,
+            height: 1.5,
+            fontWeight: FontWeight.w500,
+            color: scheme.primary,
+          ),
+        ),
+      ),
+    );
+  }
+}
+
 class SongCover extends StatelessWidget {
   const SongCover({super.key, required this.song, this.size = 44});
   final Song song;
@@ -633,16 +706,34 @@ class _ScrollToTopButtonState extends State<ScrollToTopButton> {
   @override
   Widget build(BuildContext context) {
     if (!_visible) return const SizedBox.shrink();
+    final scheme = Theme.of(context).colorScheme;
+    // 与歌曲列表浮动按钮一致的单个毛玻璃圆形按钮（无描边），
+    // 左移避开行尾“更多”菜单按钮。
     return Positioned(
-      right: 20,
+      right: 64,
       bottom:
           MediaQuery.paddingOf(context).bottom +
           (widget.hasMiniPlayer ? 104 : 24),
-      child: FloatingActionButton.small(
-        heroTag: null,
-        tooltip: '回到顶部',
-        onPressed: _scrollToTop,
-        child: const Icon(Icons.keyboard_arrow_up_rounded),
+      child: ClipOval(
+        child: BackdropFilter(
+          filter: ImageFilter.blur(sigmaX: 5, sigmaY: 5),
+          child: Material(
+            color: scheme.surfaceContainerHighest.withValues(alpha: .45),
+            shape: const CircleBorder(),
+            clipBehavior: Clip.antiAlias,
+            child: InkWell(
+              onTap: _scrollToTop,
+              child: const Tooltip(
+                message: '回到顶部',
+                child: SizedBox(
+                  width: 42,
+                  height: 42,
+                  child: Icon(Icons.keyboard_arrow_up_rounded),
+                ),
+              ),
+            ),
+          ),
+        ),
       ),
     );
   }
@@ -747,39 +838,79 @@ class _FloatingListButtonsState extends State<_FloatingListButtons> {
     if (!_canTop && !_canBottom && !_showLocate) {
       return const SizedBox.shrink();
     }
+    final scheme = Theme.of(context).colorScheme;
     return Positioned(
-      right: 12,
+      // 略微左移避开行尾“更多”菜单按钮：按钮宽 48dp + 列表/行内边距
+      // 约 62dp，故距右边缘 64dp 起排，悬浮按钮不再压住菜单按钮。
+      right: 64,
       // 迷你播放栏位于 safeBottom+20、高 64，上沿即 safeBottom+84；
       // 按钮组留 8px 间距贴在其上侧。
       bottom:
           MediaQuery.paddingOf(context).bottom +
           (widget.hasMiniPlayer ? 92 : 12),
-      child: Row(
+      // 毛玻璃按钮：单个圆形独立排列（无边框组合容器、无描边），
+      // 5px 高斯模糊 + 半透明蒙层，与搜索框观感统一。
+      child: Column(
         mainAxisSize: MainAxisSize.min,
         children: [
           if (_canTop)
-            FloatingActionButton.small(
-              heroTag: null,
+            _frostedButton(
+              scheme: scheme,
               tooltip: '回到顶部',
+              icon: Icons.keyboard_arrow_up_rounded,
               onPressed: () => _scrollTo(0),
-              child: const Icon(Icons.keyboard_arrow_up_rounded),
             ),
           if (_canBottom)
-            FloatingActionButton.small(
-              heroTag: null,
+            _frostedButton(
+              scheme: scheme,
               tooltip: '回到底部',
+              icon: Icons.keyboard_arrow_down_rounded,
               onPressed: () =>
                   _scrollTo(widget.controller.position.maxScrollExtent),
-              child: const Icon(Icons.keyboard_arrow_down_rounded),
             ),
           if (_showLocate)
-            FloatingActionButton.small(
-              heroTag: null,
+            _frostedButton(
+              scheme: scheme,
               tooltip: '定位正在播放',
+              icon: Icons.my_location_rounded,
+              iconSize: 20,
               onPressed: widget.onLocatePlaying,
-              child: const Icon(Icons.my_location_rounded, size: 18),
             ),
         ],
+      ),
+    );
+  }
+
+  /// 单个毛玻璃圆形按钮：无描边，纵向排列时留 10px 间距。
+  Widget _frostedButton({
+    required ColorScheme scheme,
+    required String tooltip,
+    required IconData icon,
+    double iconSize = 24,
+    required VoidCallback onPressed,
+  }) {
+    return Padding(
+      padding: const EdgeInsets.only(top: 10),
+      child: ClipOval(
+        child: BackdropFilter(
+          filter: ImageFilter.blur(sigmaX: 5, sigmaY: 5),
+          child: Material(
+            color: scheme.surfaceContainerHighest.withValues(alpha: .45),
+            shape: const CircleBorder(),
+            clipBehavior: Clip.antiAlias,
+            child: InkWell(
+              onTap: onPressed,
+              child: Tooltip(
+                message: tooltip,
+                child: SizedBox(
+                  width: 42,
+                  height: 42,
+                  child: Icon(icon, size: iconSize),
+                ),
+              ),
+            ),
+          ),
+        ),
       ),
     );
   }
@@ -883,7 +1014,9 @@ class SongSortMenuButton extends StatelessWidget {
                       ? Icons.radio_button_checked_rounded
                       : Icons.radio_button_off_rounded,
                   size: 20,
-                  color: key == sort.key ? scheme.primary : scheme.onSurfaceVariant,
+                  color: key == sort.key
+                      ? scheme.primary
+                      : scheme.onSurfaceVariant,
                 ),
                 const SizedBox(width: 10),
                 Text(key.label),

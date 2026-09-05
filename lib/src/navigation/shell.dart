@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -17,6 +18,69 @@ import 'sidebar_controller.dart';
 const _showArtistAndAlbumShortcuts = false;
 const _showPlaylistSection = false;
 int? _activeRelinkProposalId;
+
+/// 侧边栏与自定义底栏共用的目的地映射（id → 名称/图标/路由）。
+const _sidebarDestinations = <String, _SidebarDestination>{
+  kSidebarHome: _SidebarDestination('首页', Icons.home_outlined, '/home'),
+  kSidebarExplore: _SidebarDestination('探索', Icons.explore_outlined, '/home/explore'),
+  kSidebarLocalMusic: _SidebarDestination(
+    '本地音乐',
+    Icons.music_note_outlined,
+    '/local-music',
+  ),
+  kSidebarCloudMusic: _SidebarDestination(
+    '云端音乐',
+    Icons.cloud_outlined,
+    '/cloud-music',
+  ),
+  kSidebarLibrary: _SidebarDestination(
+    '音乐库',
+    Icons.library_music_outlined,
+    '/settings/library',
+  ),
+  kSidebarFavorites: _SidebarDestination(
+    '我的收藏',
+    Icons.favorite_border_rounded,
+    '/home/favorites',
+  ),
+  kSidebarRecent: _SidebarDestination(
+    '最近播放',
+    Icons.history_rounded,
+    '/home/recent',
+  ),
+  kSidebarPlugins: _SidebarDestination(
+    '插件管理',
+    Icons.extension_outlined,
+    '/settings/plugins?from=sidebar',
+  ),
+  kSidebarAccount: _SidebarDestination(
+    '账号',
+    Icons.account_circle_outlined,
+    '/account?from=sidebar',
+  ),
+  kSidebarRecognize: _SidebarDestination(
+    '听歌识曲',
+    Icons.mic_none_rounded,
+    '/home/recognize',
+  ),
+  kSidebarPlaylists: _SidebarDestination(
+    '管理全部歌单',
+    Icons.queue_music_rounded,
+    '/home/playlists',
+  ),
+  kSidebarSettings: _SidebarDestination('设置', Icons.settings_outlined, '/settings'),
+};
+
+/// 目的地是否对应当前路由（忽略查询参数，支持子路由高亮）。
+bool _destinationSelected(String currentPath, String path) {
+  final normalized = path.split('?').first;
+  if (normalized == '/home') return currentPath == '/home';
+  return currentPath == normalized || currentPath.startsWith('$normalized/');
+}
+
+/// 自定义底栏的高度与悬浮间距（迷你播放栏据此让位）。
+const kBottomBarHeight = 60.0;
+const kBottomBarBottomGap = 12.0;
 
 /// 电脑端侧栏与迷你播放器在手机上的对应结构。
 class AppShell extends ConsumerWidget {
@@ -59,6 +123,15 @@ class AppShell extends ConsumerWidget {
     final sidebarOnRight =
         ref.watch(settingsProvider).valueOrNull?.sidebarPosition ==
         SidebarPosition.right;
+    final shellSettings = ref.watch(settingsProvider).valueOrNull;
+    final bottomBarItemIds = shellSettings?.bottomBarItemIds ?? const <String>[];
+    final bottomBarVisible =
+        (shellSettings?.bottomBarEnabled ?? false) &&
+        bottomBarItemIds.length >= 2;
+    // 底栏可见时抬高页面安全区底部内边距，列表内容不被悬浮底栏遮挡。
+    final extraBottomPadding = bottomBarVisible
+        ? kBottomBarHeight + kBottomBarBottomGap * 2
+        : 0.0;
 
     void navigate(String path) {
       Navigator.of(appScaffoldKey.currentContext!).pop();
@@ -80,14 +153,137 @@ class AppShell extends ConsumerWidget {
           : null,
       body: Stack(
         children: [
-          navigationShell,
-          if (showMiniPlayer)
+          MediaQuery(
+            data: MediaQuery.of(context).copyWith(
+              padding: MediaQuery.of(context).padding.copyWith(
+                bottom: safeBottom + extraBottomPadding,
+              ),
+            ),
+            child: navigationShell,
+          ),
+          if (bottomBarVisible)
             Positioned(
               left: 12,
               right: 12,
-              bottom: safeBottom + 20,
+              bottom: safeBottom + kBottomBarBottomGap,
+              child: XyBottomBar(
+                itemIds: bottomBarItemIds,
+                currentPath: currentPath,
+              ),
+            ),
+          if (showMiniPlayer)
+            AnimatedPositioned(
+              duration: const Duration(milliseconds: 220),
+              curve: Curves.easeOutCubic,
+              left: 12,
+              right: 12,
+              bottom: safeBottom +
+                  (bottomBarVisible
+                      ? kBottomBarHeight + kBottomBarBottomGap * 2
+                      : 20),
               child: const MiniPlayerBar(),
             ),
+        ],
+      ),
+    );
+  }
+}
+
+/// 自定义底栏：与迷你播放栏同款的毛玻璃悬浮条，展示用户挑选的目的地。
+/// 默认关闭，在「设置-布局」完成条目自定义（≥2 项）后自动开启。
+class XyBottomBar extends StatelessWidget {
+  const XyBottomBar({
+    super.key,
+    required this.itemIds,
+    required this.currentPath,
+  });
+
+  final List<String> itemIds;
+  final String currentPath;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final dark = theme.brightness == Brightness.dark;
+    final items = itemIds
+        .map((id) => _sidebarDestinations[id])
+        .whereType<_SidebarDestination>()
+        .toList();
+    return ClipRRect(
+      borderRadius: BorderRadius.circular(XyRadii.large),
+      child: BackdropFilter.grouped(
+        filter: ui.ImageFilter.blur(sigmaX: 12, sigmaY: 12),
+        child: Container(
+          height: kBottomBarHeight,
+          decoration: BoxDecoration(
+            color: theme.colorScheme.surface.withValues(
+              alpha: dark ? .34 : .48,
+            ),
+            borderRadius: BorderRadius.circular(XyRadii.large),
+            border: Border.all(
+              color: dark ? XyColors.darkBorder : XyColors.lightBorder,
+            ),
+            boxShadow: [
+              BoxShadow(
+                color: Colors.black.withValues(alpha: dark ? 0.3 : 0.09),
+                blurRadius: 24,
+                offset: const Offset(0, 8),
+              ),
+            ],
+          ),
+          child: Row(
+            children: [
+              for (final item in items)
+                Expanded(
+                  child: _BottomBarDestination(
+                    destination: item,
+                    selected: _destinationSelected(currentPath, item.path),
+                    onTap: () => context.go(item.path),
+                  ),
+                ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _BottomBarDestination extends StatelessWidget {
+  const _BottomBarDestination({
+    required this.destination,
+    required this.selected,
+    required this.onTap,
+  });
+
+  final _SidebarDestination destination;
+  final bool selected;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final color = selected
+        ? theme.colorScheme.primary
+        : theme.colorScheme.onSurfaceVariant;
+    return InkWell(
+      onTap: onTap,
+      borderRadius: BorderRadius.circular(XyRadii.medium),
+      child: Column(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          Icon(destination.icon, size: 22, color: color),
+          const SizedBox(height: 3),
+          Text(
+            destination.label,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: TextStyle(
+              fontSize: 10.5,
+              fontWeight: selected ? FontWeight.w700 : FontWeight.w500,
+              color: color,
+            ),
+          ),
         ],
       ),
     );
@@ -188,14 +384,7 @@ class XyMobileSidebar extends ConsumerWidget {
     if (name != null) await ref.read(playlistsProvider.notifier).create(name);
   }
 
-  bool _selected(String path) {
-    // 抽屉目的地可能带有 from=sidebar 查询参数，而 shell 传入的
-    // currentPath 是不含查询参数的 uri.path；先统一比较纯路径，确保
-    // “账号”和“插件管理”从侧边栏进入后也能正确高亮。
-    final normalized = path.split('?').first;
-    if (normalized == '/home') return currentPath == '/home';
-    return currentPath == normalized || currentPath.startsWith('$normalized/');
-  }
+  bool _selected(String path) => _destinationSelected(currentPath, path);
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
@@ -205,58 +394,6 @@ class XyMobileSidebar extends ConsumerWidget {
     final playlists = ref.watch(playlistsProvider);
     final width = MediaQuery.sizeOf(context).width * 0.5;
 
-    final destinations = <String, _SidebarDestination>{
-      kSidebarHome: const _SidebarDestination(
-        '首页',
-        Icons.home_outlined,
-        '/home',
-      ),
-      kSidebarExplore: const _SidebarDestination(
-        '探索',
-        Icons.explore_outlined,
-        '/home/explore',
-      ),
-      kSidebarLocalMusic: const _SidebarDestination(
-        '本地音乐',
-        Icons.music_note_outlined,
-        '/local-music',
-      ),
-      kSidebarFavorites: const _SidebarDestination(
-        '我的收藏',
-        Icons.favorite_border_rounded,
-        '/home/favorites',
-      ),
-      kSidebarRecent: const _SidebarDestination(
-        '最近播放',
-        Icons.history_rounded,
-        '/home/recent',
-      ),
-      kSidebarPlugins: const _SidebarDestination(
-        '插件管理',
-        Icons.extension_outlined,
-        '/settings/plugins?from=sidebar',
-      ),
-      kSidebarAccount: const _SidebarDestination(
-        '账号',
-        Icons.account_circle_outlined,
-        '/account?from=sidebar',
-      ),
-      kSidebarRecognize: const _SidebarDestination(
-        '听歌识曲',
-        Icons.mic_none_rounded,
-        '/home/recognize',
-      ),
-      kSidebarPlaylists: const _SidebarDestination(
-        '管理全部歌单',
-        Icons.queue_music_rounded,
-        '/home/playlists',
-      ),
-      kSidebarSettings: const _SidebarDestination(
-        '设置',
-        Icons.settings_outlined,
-        '/settings',
-      ),
-    };
     final hiddenItems =
         settings?.sidebarHiddenItems.toSet() ?? const <String>{};
     final showSettings = !hiddenItems.contains(kSidebarSettings);
@@ -265,7 +402,7 @@ class XyMobileSidebar extends ConsumerWidget {
               settings?.sidebarItemOrder ?? kDefaultSidebarItemOrder,
             )
             .where((id) => id != kSidebarSettings && !hiddenItems.contains(id))
-            .map((id) => destinations[id])
+            .map((id) => _sidebarDestinations[id])
             .whereType<_SidebarDestination>()
             .toList();
     if (_showArtistAndAlbumShortcuts) {
@@ -445,7 +582,7 @@ class XyMobileSidebar extends ConsumerWidget {
                 Padding(
                   padding: const EdgeInsets.fromLTRB(12, 0, 12, 9),
                   child: _SidebarTile(
-                    destination: destinations[kSidebarSettings]!,
+                    destination: _sidebarDestinations[kSidebarSettings]!,
                     selected: currentPath == '/settings',
                     onTap: () => onNavigate('/settings'),
                   ),

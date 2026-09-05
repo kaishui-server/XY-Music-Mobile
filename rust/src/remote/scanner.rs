@@ -1,7 +1,7 @@
+use super::alist;
 use super::cache;
 use super::repository::{replace_remote_files, update_song_cache_path, update_sync_status};
 use super::types::{RemoteFileEntry, RemoteSourceCredentials, RemoteSyncResult};
-use super::webdav;
 use crate::music::scanner::{apply_scan_changes, parse_song_from_file};
 use crate::music::types::Song;
 use crate::music::utils::{i64_to_bool, i64_to_u64_opt, i64_to_u8_opt};
@@ -479,7 +479,7 @@ pub(crate) async fn sync_source(
         false,
         false,
     );
-    let files = match webdav::collect_audio_files(&source).await {
+    let files = match alist::collect_audio_files(&source).await {
         Ok(files) => files,
         Err(error) => {
             if let Ok(conn) = db_conn.lock() {

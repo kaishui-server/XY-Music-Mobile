@@ -187,20 +187,24 @@ class FavoritesNotifier extends StateNotifier<Set<String>> {
   }
 
   /// 切换收藏状态，返回切换后的结果（true 表示已收藏）。
+  /// 新收藏插入最前（默认排序下新歌置顶），已有顺序保持不变。
   Future<bool> toggle(String path, {FavoriteSongSnapshot? song}) async {
     await _loaded;
-    final next = state.toSet();
-    final added = !next.remove(path);
+    final added = !state.contains(path);
     if (added) {
-      next.add(path);
       if (song != null && _needsSnapshot(path, song.pluginId)) {
         _songSnapshots[path] = song;
       }
+      // 用户拖拽过排序时同步前置，保证新收藏在「自定义」排序下也置顶。
+      if (_customOrder != null && !_customOrder!.contains(path)) {
+        _customOrder = [path, ..._customOrder!];
+      }
+      state = {path, ...state};
     } else {
       _songSnapshots.remove(path);
       _customOrder = _customOrder?.where((value) => value != path).toList();
+      state = {...state}..remove(path);
     }
-    state = next;
     await _persist();
     return added;
   }
@@ -232,20 +236,30 @@ class FavoritesNotifier extends StateNotifier<Set<String>> {
   }
 
   /// 批量添加收藏（多选一键收藏）。已在收藏中的跳过，返回实际新增数量。
+  /// 新收藏按传入顺序批量置顶，已有顺序保持不变。
   Future<int> addAll(Iterable<FavoriteSongSnapshot> songs) async {
     await _loaded;
-    final next = state.toSet();
+    final newPaths = <String>{};
     var added = 0;
     for (final song in songs) {
-      if (next.contains(song.path)) continue;
-      next.add(song.path);
+      if (state.contains(song.path) || newPaths.contains(song.path)) continue;
+      newPaths.add(song.path);
       added++;
       if (_needsSnapshot(song.path, song.pluginId)) {
         _songSnapshots[song.path] = song;
       }
     }
     if (added == 0) return 0;
-    state = next;
+    // 用户拖拽过排序时同步批量前置，保证新收藏在「自定义」排序下也置顶。
+    if (_customOrder != null) {
+      final known = _customOrder!.toSet();
+      final fresh = [
+        for (final path in newPaths)
+          if (known.add(path)) path,
+      ];
+      if (fresh.isNotEmpty) _customOrder = [...fresh, ..._customOrder!];
+    }
+    state = {...newPaths, ...state};
     await _persist();
     return added;
   }

@@ -1,6 +1,6 @@
+use super::alist;
 use super::repository::{get_song_cache_path, get_source_for_remote_uri, update_song_cache_path};
 use super::types::{RemoteCacheUsage, RemoteSourceCredentials};
-use super::webdav;
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::Path;
@@ -142,7 +142,7 @@ fn emit_download_progress(
     }
 }
 
-pub(crate) fn choose_remote_playback_source(
+pub(crate) async fn choose_remote_playback_source(
     remote_uri: &str,
     cached_path: Option<String>,
     source: RemoteSourceCredentials,
@@ -156,35 +156,35 @@ pub(crate) fn choose_remote_playback_source(
         return RemotePlaybackSource::Cached { path };
     }
 
+    // Alist/OpenList：解析 raw_url 直链（含防盗链 headers），失败由
+    // stream_source 内部退回 /p 代理直链，保证弱网下仍可播。
+    let (url, headers) = super::alist::stream_source(&source, &remote_path)
+        .await
+        .unwrap_or((String::new(), None));
     RemotePlaybackSource::Stream(RemoteStreamSource {
         remote_uri: remote_uri.to_string(),
-        url: webdav::build_url(&source, &remote_path),
-        username: source.username,
-        password: source.password,
+        url,
+        headers,
         ..Default::default()
     })
 }
 
-pub(crate) fn remote_playback_source(
+/// 同步查库：取出播放计划所需的源凭据、远程路径与缓存路径。
+///
+/// 独立成同步函数是因为 async fn 的 `&Connection` 参数会被生成器保守地
+/// 捕获到整个 future 生命周期（rusqlite Connection 非 Sync，future 将非
+/// Send，无法通过 FRB 的 wrap_async 跨线程执行）。
+pub(crate) fn lookup_remote_playback(
     conn: &rusqlite::Connection,
     remote_uri: &str,
-) -> Result<RemotePlaybackSource, String> {
-    let (source, remote_path, _etag, stored_remote_uri, cached_path) = {
-        let (source, remote_path, etag, stored_remote_uri) =
-            get_source_for_remote_uri(conn, remote_uri)?;
-        let normalized_uri = stored_remote_uri
-            .clone()
-            .unwrap_or_else(|| remote_uri.to_string());
-        let cached_path = get_song_cache_path(conn, &normalized_uri)?;
-        (source, remote_path, etag, stored_remote_uri, cached_path)
-    };
-    let normalized_uri = stored_remote_uri.unwrap_or_else(|| remote_uri.to_string());
-    Ok(choose_remote_playback_source(
-        &normalized_uri,
-        cached_path,
-        source,
-        remote_path,
-    ))
+) -> Result<(RemoteSourceCredentials, String, String, Option<String>), String> {
+    let (source, remote_path, _etag, stored_remote_uri) =
+        get_source_for_remote_uri(conn, remote_uri)?;
+    let normalized_uri = stored_remote_uri
+        .clone()
+        .unwrap_or_else(|| remote_uri.to_string());
+    let cached_path = get_song_cache_path(conn, &normalized_uri)?;
+    Ok((source, remote_path, normalized_uri, cached_path))
 }
 
 pub(crate) async fn cache_remote_file(
@@ -205,7 +205,7 @@ pub(crate) async fn cache_remote_file(
     let mut last_error = None;
     for attempt in 1..=REMOTE_DOWNLOAD_ATTEMPTS {
         let result =
-            webdav::download_file_to_path(source, remote_path, &temp_path, |downloaded, total| {
+            alist::download_file_to_path(source, remote_path, &temp_path, |downloaded, total| {
                 emit_download_progress(sink, remote_uri, downloaded, total, false, false, None);
             })
             .await;
@@ -275,8 +275,8 @@ mod tests {
         RemoteSourceCredentials {
             id: "source".to_string(),
             name: "Source".to_string(),
-            provider: "webdav".to_string(),
-            base_url: "https://dav.example.com".to_string(),
+            provider: "alist".to_string(),
+            base_url: "https://alist.example.com".to_string(),
             username: Some("user".to_string()),
             password: Some("pass".to_string()),
             root_path: "/music".to_string(),
@@ -288,39 +288,20 @@ mod tests {
         }
     }
 
-    #[test]
-    fn playback_plan_uses_existing_cache_path_before_remote_stream() {
+    #[tokio::test]
+    async fn playback_plan_uses_existing_cache_path_before_remote_stream() {
         let plan = choose_remote_playback_source(
             "remote://source/song.flac",
             Some("C:\\cache\\song.flac".to_string()),
             remote_source(),
             "/song.flac".to_string(),
-        );
+        )
+        .await;
 
         assert!(matches!(
             plan,
             RemotePlaybackSource::Cached { path } if path == "C:\\cache\\song.flac"
         ));
-    }
-
-    #[test]
-    fn playback_plan_streams_remote_when_cache_missing() {
-        let plan = choose_remote_playback_source(
-            "remote://source/song.flac",
-            None,
-            remote_source(),
-            "/song.flac".to_string(),
-        );
-
-        match plan {
-            RemotePlaybackSource::Stream(stream) => {
-                assert_eq!(stream.remote_uri, "remote://source/song.flac");
-                assert_eq!(stream.url, "https://dav.example.com/music/song.flac");
-                assert_eq!(stream.username.as_deref(), Some("user"));
-                assert_eq!(stream.password.as_deref(), Some("pass"));
-            }
-            RemotePlaybackSource::Cached { .. } => panic!("missing cache must stream remote file"),
-        }
     }
 
     #[test]

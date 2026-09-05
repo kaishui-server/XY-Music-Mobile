@@ -175,6 +175,31 @@ class MainActivity : AudioServiceActivity() {
                     startActivityForResult(intent, DIRECTORY_REQUEST)
                     return@setMethodCallHandler
                 }
+                if (call.method == "deleteFile") {
+                    val target = call.argument<String>("uri")?.trim().orEmpty()
+                    if (!target.startsWith("content://")) {
+                        result.error("INVALID_STORAGE_REQUEST", "无效的目标文件", null)
+                        return@setMethodCallHandler
+                    }
+                    Thread {
+                        try {
+                            val deleted = DocumentsContract.deleteDocument(
+                                contentResolver,
+                                Uri.parse(target),
+                            )
+                            runOnUiThread { result.success(deleted) }
+                        } catch (error: Exception) {
+                            runOnUiThread {
+                                result.error(
+                                    "STORAGE_DELETE_FAILED",
+                                    error.message ?: "删除目标文件失败",
+                                    null,
+                                )
+                            }
+                        }
+                    }.start()
+                    return@setMethodCallHandler
+                }
                 if (call.method != "copyFileToDirectory") {
                     result.notImplemented()
                     return@setMethodCallHandler

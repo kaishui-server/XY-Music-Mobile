@@ -105,7 +105,7 @@ class AboutPage extends ConsumerWidget {
                 context,
                 Icons.memory,
                 '跨平台音频核心',
-                'Rust DSP、QMC2、WebDAV 与音乐库',
+                'Rust DSP、QMC2、云端音乐与音乐库',
               ),
               const Divider(height: 1),
               _row(context, Icons.shield_outlined, '隐私与数据', '音乐库和听歌统计默认保存在本机'),

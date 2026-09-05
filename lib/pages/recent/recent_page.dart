@@ -6,6 +6,7 @@ import '../../src/recent/recent_provider.dart';
 import '../../src/core/settings.dart';
 import '../../src/navigation/sidebar_controller.dart';
 import '../../src/widgets/cover_image.dart';
+import '../../src/widgets/frosted_search_field.dart';
 import '../../src/widgets/song_list_view.dart';
 import '../../src/widgets/top_notice.dart' show XyNotice, XyNoticeType;
 
@@ -74,15 +75,12 @@ class _RecentPageState extends ConsumerState<RecentPage> {
         automaticallyImplyLeading: !sidebarOnRight,
         leading: sidebarOnRight ? null : const AppSidebarMenuButton(),
         title: _searching
-            ? TextField(
+            ? FrostedSearchField(
                 controller: _searchController,
                 autofocus: true,
-                textInputAction: TextInputAction.search,
-                decoration: const InputDecoration(
-                  hintText: '搜索最近播放',
-                  border: InputBorder.none,
-                ),
+                hintText: '搜索最近播放',
                 onChanged: (value) => setState(() => _query = value.trim()),
+                padding: EdgeInsets.zero,
               )
             : const Text('最近播放'),
         actions: [
@@ -98,9 +96,7 @@ class _RecentPageState extends ConsumerState<RecentPage> {
                 }
               });
             },
-            icon: Icon(
-              _searching ? Icons.close_rounded : Icons.search_rounded,
-            ),
+            icon: Icon(_searching ? Icons.close_rounded : Icons.search_rounded),
           ),
           IconButton(
             tooltip: '清空记录',

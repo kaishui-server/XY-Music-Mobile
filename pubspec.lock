@@ -1084,6 +1084,13 @@ packages:
       url: "https://pub.flutter-io.cn"
     source: hosted
     version: "3.4.1+2"
+  tencent_kit:
+    dependency: "direct main"
+    description:
+      path: "third_party/tencent_kit"
+      relative: true
+    source: path
+    version: "6.2.0"
   term_glyph:
     dependency: transitive
     description:

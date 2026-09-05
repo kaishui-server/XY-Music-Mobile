@@ -1,5 +1,5 @@
-import 'dart:convert';
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
 
@@ -781,6 +781,10 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
         } else if (_expectedAudioPlayingFromVideo == playing) {
           // 这是视频状态同步产生的音频事件，不要再反向操作视频。
           _expectedAudioPlayingFromVideo = null;
+        } else if (!playing && _expectedAudioPlayingFromVideo == true) {
+          // 桥接起播序列：音频尚未真正播放前，seek/buffering 会发出
+          // playing=false 事件。它不是系统媒体的暂停命令，若在此反向
+          // 暂停视频，MV 会在起播瞬间被误暂停。忽略并等待起播事件。
         } else {
           // 通知栏、锁屏或灵动岛直接控制的是 just_audio。视频播放期间
           // 将该操作反向转发给视频控制器，系统按钮才能真正生效。
@@ -802,6 +806,45 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
     if (state != AppLifecycleState.resumed) {
       _flushCurrentPlaybackStats();
     }
+    _guardVideoSessionOnLifecycle(state);
+  }
+
+  /// 后台久置自动关闭视频（应用级守护）。挂在 PlayerNotifier 而非播放
+  /// 详情页上：详情页退出后视频会话仍存活，页面级监听随 dispose 失效，
+  /// 覆盖不了“离开详情页后切后台久置”的场景。ExoPlayer 的 MediaCodec
+  /// 表面在后台久置后会被系统回收，恢复渲染时抛 MediaCodecVideoRenderer
+  /// error；与其等用户操作时报“视频播放失败”，不如回前台时主动收尾
+  /// 并恢复音频播放。
+  DateTime? _videoBackgroundedAt;
+  static const _videoBackgroundCloseThreshold = Duration(seconds: 90);
+
+  void _guardVideoSessionOnLifecycle(AppLifecycleState state) {
+    final hasVideo = VideoPlaybackSession.controller != null ||
+        VideoPlaybackSession.songPath != null;
+    switch (state) {
+      case AppLifecycleState.paused:
+      case AppLifecycleState.hidden:
+        if (hasVideo) _videoBackgroundedAt = DateTime.now();
+      case AppLifecycleState.resumed:
+        final backgroundedAt = _videoBackgroundedAt;
+        _videoBackgroundedAt = null;
+        if (backgroundedAt == null || !hasVideo) break;
+        if (DateTime.now().difference(backgroundedAt) <
+            _videoBackgroundCloseThreshold) {
+          break;
+        }
+        unawaited(_closeVideoAfterBackgroundSuspension());
+      default:
+        break;
+    }
+  }
+
+  Future<void> _closeVideoAfterBackgroundSuspension() async {
+    final shouldResumeAudio = VideoPlaybackSession.resumeAudioAfterVideo;
+    await VideoPlaybackSession.stopForTrackAction();
+    await disableVideoMediaBridge();
+    // 之前音频被视频桥接静音，关闭视频后从当前位置恢复播放。
+    if (shouldResumeAudio) await resumeAfterVideo();
   }
 
   Future<void> _syncDesktopLyrics() async {
@@ -964,11 +1007,17 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
     }
     _videoMediaBridgeActive = true;
     _lastVideoMediaSeek = DateTime.fromMillisecondsSinceEpoch(0);
-    await _player.setVolume(0);
-    await _player.seek(controller.value.position);
-    if (controller.value.isPlaying) {
+    // 必须在进入 await 前登记预期播放态：setVolume/seek 期间视频进度
+    // 监听会触发镜像同步并提前起播音频，若此刻才写标记，起播序列中
+    // 的 seek 事件（playing=false）会与标记不匹配而被当作暂停命令。
+    final videoPlaying = controller.value.isPlaying;
+    if (videoPlaying) {
       _manualPause = false;
       _expectedAudioPlayingFromVideo = true;
+    }
+    await _player.setVolume(0);
+    await _player.seek(controller.value.position);
+    if (videoPlaying) {
       unawaited(_startPlayback(_playRequestId, path));
     } else {
       _manualPause = true;
@@ -1303,6 +1352,33 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
     final queue = [...state.queue, item];
     state = state.copyWith(queue: queue);
     await _persistSession();
+  }
+
+  /// 清空播放队列并停止播放。播放模式、倍速、音质、睡眠定时等
+  /// 设置项保留，仅重置队列与播放状态。
+  Future<void> clearQueue() async {
+    if (state.queue.isEmpty && state.current == null) return;
+    // 结束临时视频会话，避免视频伴音残留。
+    if (VideoPlaybackSession.controller != null) {
+      await VideoPlaybackSession.stopForTrackAction();
+      await disableVideoMediaBridge();
+    }
+    _flushPlaybackStats(state);
+    // stop() 会发出 playing=false，先抑制自动下一首。
+    _manualPause = true;
+    ++_playRequestId;
+    _preparedSourceRequestId = null;
+    try {
+      await _player.stop();
+    } catch (_) {}
+    state = PlaybackState(
+      playMode: state.playMode,
+      playbackSpeed: state.playbackSpeed,
+      currentQuality: state.currentQuality,
+      sleepTimerEndsAt: state.sleepTimerEndsAt,
+    );
+    await _persistSession();
+    unawaited(_syncDesktopLyrics());
   }
 
   Future<void> _playAt(int index) async {
@@ -2275,6 +2351,12 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
     int? requestId,
   }) async {
     final trimmed = rawPath.trim();
+    // 网盘挂载歌曲（remote:// URI）：先解析播放来源，命中缓存播本地
+    // 缓存文件，未缓存则流式播放 Alist/OpenList 直链。
+    if (trimmed.startsWith('remote://')) {
+      await _setRemoteAudioSource(trimmed, mediaItem, requestId: requestId);
+      return;
+    }
     if (trimmed.startsWith('content://')) {
       try {
         await _enqueueSourceOperation(() async {
@@ -2317,6 +2399,74 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
     if ((await Permission.audio.request()).isGranted) return;
     if ((await Permission.storage.request()).isGranted) return;
     await Permission.manageExternalStorage.request();
+  }
+
+  /// 远程挂载歌曲的播放解析：已缓存返回本地路径直接播；未缓存则解析
+  /// Alist/OpenList 直链并附带防盗链 headers 流式播放。
+  Future<void> _setRemoteAudioSource(
+    String remoteUri,
+    MediaItem mediaItem, {
+    int? requestId,
+  }) async {
+    String planJson;
+    try {
+      final dbPath = await _ref.read(dbPathProvider.future);
+      planJson = await remotePlaybackSource(
+        dbPath: dbPath,
+        remoteUri: remoteUri,
+      );
+    } catch (error) {
+      throw _LocalPlaybackException('网盘歌曲解析失败：$error');
+    }
+    final plan = jsonDecode(planJson) as Map<String, dynamic>;
+    final kind = plan['kind'] as String? ?? '';
+    if (kind == 'cached') {
+      final cachedPath = plan['path'] as String? ?? '';
+      try {
+        await _enqueueSourceOperation(() async {
+          if (requestId != null && requestId != _playRequestId) return;
+          await _player.setFilePath(cachedPath, tag: mediaItem);
+        });
+      } catch (_) {
+        throw const _LocalPlaybackException('网盘缓存文件无法播放，请清理缓存后重试');
+      }
+      return;
+    }
+
+    final url = plan['url'] as String? ?? '';
+    if (url.isEmpty) {
+      throw const _LocalPlaybackException('网盘歌曲缺少播放地址');
+    }
+    // Alist/OpenList 播放计划：优先使用服务端返回的防盗链 headers
+    // （raw_url 直链的 UA/Referer/Cookie 等），叠加 Basic 认证兜底。
+    final headers = <String, String>{
+      if (plan['headers'] case final Map<String, dynamic> extraHeaders)
+        for (final entry in extraHeaders.entries)
+          if (entry.value != null) entry.key: entry.value.toString(),
+      if (plan['userAgent'] case final String userAgent?
+          when userAgent.isNotEmpty)
+        'User-Agent': userAgent,
+      if (plan['referer'] case final String referer? when referer.isNotEmpty)
+        'Referer': referer,
+    };
+    final username = plan['username'] as String?;
+    final password = plan['password'] as String?;
+    if (username != null &&
+        username.isNotEmpty &&
+        !headers.containsKey('Authorization')) {
+      final token = base64Encode(utf8.encode('$username:${password ?? ''}'));
+      headers['Authorization'] = 'Basic $token';
+    }
+    try {
+      await _setPlayerUrl(
+        url,
+        headers: headers.isEmpty ? null : headers,
+        tag: mediaItem,
+        requestId: requestId,
+      );
+    } catch (_) {
+      throw const _LocalPlaybackException('网盘歌曲无法播放，请检查网络或账号密码');
+    }
   }
 
   /// 洛雪插件自有歌曲的解析（对齐 BakaMusic 的命名空间隔离：洛雪音源
@@ -3193,7 +3343,8 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
     );
     state = state.copyWith(queue: queue, current: queue[index]);
     if (playbackSourceTypeFor(item) == PlaybackSourceType.localFile &&
-        !item.path.startsWith('content://')) {
+        !item.path.startsWith('content://') &&
+        !item.path.startsWith('remote://')) {
       try {
         final sidecarPath = p.setExtension(item.path, '.lrc');
         if (restoredLyrics.isEmpty) {

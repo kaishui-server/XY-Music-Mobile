@@ -2,6 +2,7 @@
 //
 // 分享以网页卡片落地页深链进行：接收方打开链接拉起 App 并播放歌曲。
 // 打开菜单不阻塞，点击对应目标时才现场生成分享链接与封面缩略图。
+import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 
@@ -12,62 +13,133 @@ import 'package:image/image.dart' as img;
 
 import '../auth/auth_provider.dart';
 import '../player/player_provider.dart';
+import '../rust/api.dart';
+import '../widgets/cover_image.dart';
 import '../widgets/top_notice.dart';
 import 'qq_share_service.dart';
 import 'share_service.dart';
 
-/// 弹出歌曲分享菜单：QQ 好友 / QQ 空间 / 复制链接。
+/// 弹出歌曲分享菜单（居中弹窗，参考弦予音乐弹窗式菜单设计）：
+/// QQ 好友 / QQ 空间 / 复制链接。
 ///
 /// [extraActions] 允许调用方追加菜单项（如播放页的「保存为分享图片」），
-/// 在 QQ 分享项之后、复制链接之前插入。
+/// 在 QQ 分享项之后、复制链接之前插入；建议使用 [shareMenuRow] 构建，
+/// 与弹窗内其余条目样式保持一致。
 Future<void> showSongShareSheet(
   BuildContext context, {
   required WidgetRef ref,
   required QueueItem song,
   List<Widget> extraActions = const [],
 }) async {
-  await showModalBottomSheet<void>(
+  await showDialog<void>(
     context: context,
     useRootNavigator: true,
-    showDragHandle: true,
-    useSafeArea: true,
-    builder: (sheetContext) => SafeArea(
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        crossAxisAlignment: CrossAxisAlignment.start,
+    builder: (dialogContext) => Dialog(
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(24)),
+      child: ConstrainedBox(
+        constraints: const BoxConstraints(maxWidth: 360),
+        child: SingleChildScrollView(
+          padding: const EdgeInsets.fromLTRB(20, 18, 20, 12),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                '分享',
+                style: TextStyle(
+                  fontSize: 15,
+                  fontWeight: FontWeight.w600,
+                  color: Theme.of(dialogContext).colorScheme.onSurface,
+                ),
+              ),
+              const SizedBox(height: 6),
+              shareMenuRow(
+                dialogContext,
+                leading: _qqBadge('assets/share_qq.png', fit: BoxFit.contain),
+                title: '分享到 QQ 好友',
+                subtitle: '以音乐卡片形式发送',
+                onTap: () {
+                  Navigator.pop(dialogContext);
+                  _shareViaQQ(context, ref, song, scene: _kSceneQQ);
+                },
+              ),
+              shareMenuRow(
+                dialogContext,
+                leading: _qqBadge('assets/share_qzone.jpg'),
+                title: '分享到 QQ 空间',
+                subtitle: 'QQ 空间支持网页分享，不支持音乐卡片',
+                onTap: () {
+                  Navigator.pop(dialogContext);
+                  _shareViaQQ(context, ref, song, scene: _kSceneQZone);
+                },
+              ),
+              ...extraActions,
+              shareMenuRow(
+                dialogContext,
+                leading: const Icon(Icons.link_outlined),
+                title: '复制分享链接',
+                onTap: () {
+                  Navigator.pop(dialogContext);
+                  _copyLink(context, ref, song);
+                },
+              ),
+            ],
+          ),
+        ),
+      ),
+    ),
+  );
+}
+
+/// 分享弹窗的条目行：图标 + 标题（可带副标题说明）+ 右箭头，
+/// 与播放页更多菜单弹窗的行样式一致，供 [showSongShareSheet] 与
+/// 调用方的 [showSongShareSheet.extraActions] 统一外观。
+Widget shareMenuRow(
+  BuildContext context, {
+  required Widget leading,
+  required String title,
+  String? subtitle,
+  VoidCallback? onTap,
+}) {
+  final scheme = Theme.of(context).colorScheme;
+  return InkWell(
+    onTap: onTap,
+    borderRadius: BorderRadius.circular(10),
+    child: Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 10),
+      child: Row(
         children: [
-          const Padding(
-            padding: EdgeInsets.fromLTRB(20, 4, 20, 10),
-            child: Text('分享', style: TextStyle(fontSize: 17, fontWeight: FontWeight.w700)),
+          SizedBox(width: 20, height: 20, child: Center(child: leading)),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  title,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    fontSize: 14,
+                    fontWeight: FontWeight.w600,
+                    color: scheme.onSurface,
+                  ),
+                ),
+                if (subtitle?.isNotEmpty == true)
+                  Text(
+                    subtitle!,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(fontSize: 11, color: scheme.outline),
+                  ),
+              ],
+            ),
           ),
-          ListTile(
-            leading: _qqBadge('assets/share_qq.png', fit: BoxFit.contain),
-            title: const Text('分享到 QQ 好友'),
-            subtitle: const Text('以音乐卡片形式发送'),
-            onTap: () {
-              Navigator.pop(sheetContext);
-              _shareViaQQ(context, ref, song, scene: _kSceneQQ);
-            },
+          Icon(
+            Icons.chevron_right_rounded,
+            size: 20,
+            color: scheme.outline,
           ),
-          ListTile(
-            leading: _qqBadge('assets/share_qzone.jpg'),
-            title: const Text('分享到 QQ 空间'),
-            subtitle: const Text('QQ 空间支持网页分享，不支持音乐卡片'),
-            onTap: () {
-              Navigator.pop(sheetContext);
-              _shareViaQQ(context, ref, song, scene: _kSceneQZone);
-            },
-          ),
-          ...extraActions,
-          ListTile(
-            leading: const Icon(Icons.link_outlined),
-            title: const Text('复制分享链接'),
-            onTap: () {
-              Navigator.pop(sheetContext);
-              _copyLink(context, ref, song);
-            },
-          ),
-          const SizedBox(height: 8),
         ],
       ),
     ),
@@ -125,11 +197,13 @@ String _buildShareText(WidgetRef ref, QueueItem song, String url) {
 Future<void> _copyLink(
     BuildContext context, WidgetRef ref, QueueItem song) async {
   final url = await _ensureUrl(ref, song);
+  if (!context.mounted) return;
   if (url.isEmpty) {
     _notice(context, '生成分享链接失败', XyNoticeType.error);
     return;
   }
   await Clipboard.setData(ClipboardData(text: _buildShareText(ref, song, url)));
+  if (!context.mounted) return;
   _notice(context, '分享文案已复制', XyNoticeType.success);
 }
 
@@ -141,6 +215,7 @@ Future<void> _shareViaQQ(
   required int scene,
 }) async {
   final url = await _ensureUrl(ref, song);
+  if (!context.mounted) return;
   if (url.isEmpty) {
     _notice(context, '生成分享链接失败', XyNoticeType.error);
     return;
@@ -148,8 +223,10 @@ Future<void> _shareViaQQ(
 
   final qq = ref.read(qqShareServiceProvider);
   if (!await qq.isQQInstalled()) {
+    if (!context.mounted) return;
     await Clipboard.setData(
         ClipboardData(text: _buildShareText(ref, song, url)));
+    if (!context.mounted) return;
     _notice(context, '未安装 QQ，分享链接已复制', XyNoticeType.warning);
     return;
   }
@@ -178,6 +255,7 @@ Future<void> _shareViaQQ(
     coverPath: coverPath,
     musicUrl: useMusicCard ? url : null,
   );
+  if (!context.mounted) return;
 
   switch (result) {
     case QqShareResult.success:
@@ -187,14 +265,16 @@ Future<void> _shareViaQQ(
     default:
       await Clipboard.setData(
           ClipboardData(text: _buildShareText(ref, song, url)));
+      if (!context.mounted) return;
       _notice(context, '分享失败，链接已复制', XyNoticeType.warning);
   }
 }
 
 /// 取封面本地文件：优先本地封面（coverUrl 为 file:// 或绝对路径），
-/// 其次在线封面下载到临时目录。拿不到返回 null（此时仅分享文本链接）。
+/// 其次在线封面（带浏览器 UA/Referer 直连，失败走 Rust 图片代理兜底，
+/// 规避网易云等 CDN 的防盗链 403）。拿不到返回 null（此时仅分享文本链接）。
 Future<File?> _localCoverFile(QueueItem song) async {
-  final text = song.coverUrl?.trim() ?? '';
+  final text = normalizeCoverImageUrl(song.coverUrl);
   if (text.isNotEmpty &&
       !text.startsWith('content://') &&
       !(text.startsWith('http://') || text.startsWith('https://'))) {
@@ -214,22 +294,9 @@ Future<File?> _localCoverFile(QueueItem song) async {
 
 /// 下载在线封面到临时文件（QQ 卡片缩略图无法直接用远程防盗链 URL）。
 Future<File?> _downloadCoverToTemp(String url) async {
+  Uint8List? bytes = await _fetchCoverBytes(url);
+  if (bytes == null || bytes.isEmpty) return null;
   try {
-    final client = HttpClient()
-      ..connectionTimeout = const Duration(seconds: 8);
-    final req = await client.getUrl(Uri.parse(url));
-    final res = await req.close();
-    if (res.statusCode != 200) {
-      client.close();
-      return null;
-    }
-    final builder = BytesBuilder(copy: false);
-    await for (final chunk in res) {
-      builder.add(chunk);
-    }
-    client.close();
-    final bytes = builder.takeBytes();
-    if (bytes.isEmpty) return null;
     final dir = Directory.systemTemp;
     final file = File(
         '${dir.path}/xy_share_${DateTime.now().millisecondsSinceEpoch}.jpg');
@@ -238,6 +305,42 @@ Future<File?> _downloadCoverToTemp(String url) async {
   } catch (_) {
     return null;
   }
+}
+
+/// 在线封面字节：先带浏览器请求头直连（网易云 CDN 对默认 UA 返回 403），
+/// 失败后走 Rust 图片代理兜底（部分运营商网络直连 126.net 也会 403）。
+Future<Uint8List?> _fetchCoverBytes(String url) async {
+  try {
+    final client = HttpClient()
+      ..connectionTimeout = const Duration(seconds: 8);
+    final req = await client.getUrl(Uri.parse(url));
+    final headers = coverImageNetworkHeaders(url);
+    headers?.forEach(req.headers.set);
+    final res = await req.close();
+    if (res.statusCode == 200) {
+      final builder = BytesBuilder(copy: false);
+      await for (final chunk in res) {
+        builder.add(chunk);
+      }
+      client.close();
+      final bytes = builder.takeBytes();
+      if (bytes.isNotEmpty) return Uint8List.fromList(bytes);
+    } else {
+      client.close();
+    }
+  } catch (_) {}
+  try {
+    final dataUrl = await proxyImage(
+      url: url,
+      referer: 'https://music.163.com/',
+    );
+    final comma = dataUrl.indexOf(',');
+    if (comma > 0 && dataUrl.substring(0, comma).contains(';base64')) {
+      final decoded = base64Decode(dataUrl.substring(comma + 1));
+      if (decoded.isNotEmpty) return decoded;
+    }
+  } catch (_) {}
+  return null;
 }
 
 /// 压缩封面到 ≤256px JPEG（QQ 卡片缩略图规格，避免大图被 QQ 拒绝或拉取失败）。

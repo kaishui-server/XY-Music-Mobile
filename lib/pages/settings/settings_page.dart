@@ -15,6 +15,8 @@ import '../../src/auth/auth_provider.dart';
 import '../../src/navigation/sidebar_controller.dart';
 import '../../src/player/desktop_lyrics.dart';
 import '../../src/ui/xy_surface.dart';
+import '../../src/widgets/color_picker_sheet.dart';
+import '../../src/widgets/frosted_search_field.dart';
 import '../../src/widgets/top_notice.dart';
 
 enum SettingsSection {
@@ -95,11 +97,18 @@ const settingsSearchEntries = <SettingsSearchEntry>[
     keywords: '插件 安装 启用 卸载 更新',
   ),
   SettingsSearchEntry(
+    title: '云端音乐',
+    path: ['云端音乐'],
+    route: '/cloud-music',
+    icon: Icons.cloud_outlined,
+    keywords: '网盘 Alist OpenList 挂载 云端 同步 远程',
+  ),
+  SettingsSearchEntry(
     title: '音乐库',
     path: ['音乐库'],
     route: '/settings/library',
     icon: Icons.library_music_outlined,
-    keywords: '本地 扫描 文件夹 远程 WebDAV',
+    keywords: '本地 扫描 文件夹',
   ),
   SettingsSearchEntry(
     title: '下载',
@@ -239,13 +248,6 @@ const settingsSearchEntries = <SettingsSearchEntry>[
     keywords: '添加目录 本地音乐',
   ),
   SettingsSearchEntry(
-    title: '远程音乐库',
-    path: ['音乐库', '远程音乐库'],
-    route: '/settings/remote-library',
-    icon: Icons.cloud_outlined,
-    keywords: 'NAS 网盘 WebDAV',
-  ),
-  SettingsSearchEntry(
     title: '扫描格式',
     path: ['音乐库', '扫描格式'],
     route: '/settings/library',
@@ -329,16 +331,16 @@ const settingsSearchEntries = <SettingsSearchEntry>[
     keywords: 'js 文件 插件',
   ),
   SettingsSearchEntry(
-    title: 'WebDAV 音乐库',
-    path: ['音乐库', '远程音乐库', 'WebDAV 音乐库'],
-    route: '/settings/remote-library',
+    title: '挂载网盘源',
+    path: ['云端音乐', '挂载网盘源'],
+    route: '/cloud-music',
     icon: Icons.dns_outlined,
-    keywords: 'NAS 网盘 服务器',
+    keywords: 'TVBox Alist OpenList 网盘 服务器 挂载',
   ),
   SettingsSearchEntry(
     title: '播放缓存',
-    path: ['音乐库', '远程音乐库', '播放缓存'],
-    route: '/settings/remote-library',
+    path: ['云端音乐', '播放缓存'],
+    route: '/cloud-music',
     icon: Icons.cached_outlined,
     keywords: '清理缓存',
   ),
@@ -449,13 +451,6 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
           title: '歌词',
           subtitle: '播放详情页中的歌词显示设置',
           route: '/settings/playback-detail',
-        ),
-        _categoryTile(
-          context,
-          icon: Icons.library_music_outlined,
-          title: '音乐库',
-          subtitle: '本地扫描与远程音乐库',
-          route: '/settings/library',
         ),
         _categoryTile(
           context,
@@ -601,6 +596,21 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
           ),
         ),
         _SidebarLayoutEditor(
+          settings: settings ?? const AppSettings(),
+          notifier: notifier,
+        ),
+        Padding(
+          padding: const EdgeInsets.fromLTRB(16, 20, 16, 4),
+          child: Text(
+            '自定义底栏',
+            style: TextStyle(
+              fontSize: 13,
+              fontWeight: FontWeight.w700,
+              color: Theme.of(context).colorScheme.primary,
+            ),
+          ),
+        ),
+        _BottomBarLayoutEditor(
           settings: settings ?? const AppSettings(),
           notifier: notifier,
         ),
@@ -895,13 +905,6 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
         ),
         _tile(
           context,
-          icon: Icons.cloud_outlined,
-          title: '远程音乐库',
-          trailing: const Text('WebDAV'),
-          onTap: () => context.push('/settings/remote-library'),
-        ),
-        _tile(
-          context,
           icon: Icons.audiotrack,
           title: '扫描格式',
           trailing: Text('${settings?.scanFormats.length ?? 0} 种'),
@@ -1035,24 +1038,16 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
           if (section == SettingsSection.root) ...[
             Padding(
               padding: const EdgeInsets.fromLTRB(16, 0, 16, 10),
-              child: TextField(
+              child: FrostedSearchField(
                 controller: _searchController,
-                textInputAction: TextInputAction.search,
+                hintText: '搜索设置',
                 onChanged: (value) => setState(() => _query = value.trim()),
-                decoration: InputDecoration(
-                  hintText: '搜索设置',
-                  prefixIcon: const Icon(Icons.search_rounded),
-                  suffixIcon: _query.isEmpty
-                      ? null
-                      : IconButton(
-                          tooltip: '清除',
-                          icon: const Icon(Icons.close_rounded),
-                          onPressed: () {
-                            _searchController.clear();
-                            setState(() => _query = '');
-                          },
-                        ),
-                ),
+                showClearSuffix: true,
+                onCleared: () {
+                  _searchController.clear();
+                  setState(() => _query = '');
+                },
+                padding: EdgeInsets.zero,
               ),
             ),
             if (_query.isNotEmpty) ..._searchResultTiles(context),
@@ -1280,17 +1275,19 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
       };
 
   /// 歌词字号调整弹窗：滑杆 + 歌词预览，与播放详情页更多菜单中的
-  /// “歌词字号”共用同一份设置，实时生效。
+  /// “歌词字号”共用同一份设置，实时生效；歌词与迷你歌词同步调整。
   Future<void> _showLyricFontSizeSheet(BuildContext context, WidgetRef ref) {
     return showModalBottomSheet<void>(
       context: context,
       showDragHandle: true,
       isScrollControlled: true,
       builder: (_) => _SettingsLyricFontSizeSheet(
-        initial:
-            ref.read(settingsProvider).valueOrNull?.lyricFontSize ?? 18.0,
-        onChanged: (value) =>
-            ref.read(settingsProvider.notifier).setLyricFontSize(value),
+        initial: ref.read(settingsProvider).valueOrNull?.lyricFontSize ?? 18.0,
+        onChanged: (value) {
+          final notifier = ref.read(settingsProvider.notifier);
+          notifier.setLyricFontSize(value);
+          notifier.setMiniLyricFontSize(value);
+        },
       ),
     );
   }
@@ -1784,12 +1781,55 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
                           : null,
                     ),
                   ),
+                // 自定义调色入口：未命中预设色时也允许从当前色继续微调。
+                InkWell(
+                  onTap: () => Navigator.pop(context, -1),
+                  borderRadius: BorderRadius.circular(20),
+                  child: Container(
+                    width: 40,
+                    height: 40,
+                    decoration: BoxDecoration(
+                      shape: BoxShape.circle,
+                      border: Border.all(
+                        color: colors.contains(cur)
+                            ? Colors.transparent
+                            : Theme.of(context).colorScheme.primary,
+                        width: 3,
+                      ),
+                      gradient: const SweepGradient(
+                        colors: [
+                          Color(0xFFFF0000),
+                          Color(0xFFFFFF00),
+                          Color(0xFF00FF00),
+                          Color(0xFF00FFFF),
+                          Color(0xFF0000FF),
+                          Color(0xFFFF00FF),
+                          Color(0xFFFF0000),
+                        ],
+                      ),
+                    ),
+                    child: const Icon(
+                      Icons.colorize_rounded,
+                      color: Colors.white,
+                      size: 20,
+                    ),
+                  ),
+                ),
               ],
             ),
           ],
         ),
       ),
     );
+    if (choice == -1) {
+      // 自定义调色：打开 HSV 调色弹窗，从当前主题色起步。
+      if (!context.mounted) return;
+      final custom = await showCustomColorPicker(context, initialColor: cur);
+      if (custom != null) {
+        await ref.read(settingsProvider.notifier).setAccentColor(custom);
+      }
+      return;
+    }
     if (choice != null) {
       await ref.read(settingsProvider.notifier).setAccentColor(choice);
     }
@@ -2428,35 +2468,152 @@ class _SidebarLayoutEditor extends StatelessWidget {
       ],
     );
   }
-
-  String _sidebarLabel(String id) => switch (id) {
-    kSidebarHome => '首页',
-    kSidebarExplore => '探索',
-    kSidebarLocalMusic => '本地音乐',
-    kSidebarFavorites => '我的收藏',
-    kSidebarRecent => '最近播放',
-    kSidebarPlugins => '插件管理',
-    kSidebarAccount => '账号',
-    kSidebarRecognize => '听歌识曲',
-    kSidebarPlaylists => '管理全部歌单',
-    kSidebarSettings => '设置',
-    _ => id,
-  };
-
-  IconData _sidebarIcon(String id) => switch (id) {
-    kSidebarHome => Icons.home_outlined,
-    kSidebarExplore => Icons.explore_outlined,
-    kSidebarLocalMusic => Icons.music_note_outlined,
-    kSidebarFavorites => Icons.favorite_border_rounded,
-    kSidebarRecent => Icons.history_rounded,
-    kSidebarPlugins => Icons.extension_outlined,
-    kSidebarAccount => Icons.account_circle_outlined,
-    kSidebarRecognize => Icons.mic_none_rounded,
-    kSidebarPlaylists => Icons.queue_music_rounded,
-    kSidebarSettings => Icons.settings_outlined,
-    _ => Icons.circle_outlined,
-  };
 }
+
+/// 自定义底栏编辑器：挑选 2-5 个目的地并拖动排序。
+/// 底栏默认关闭；选满 2 项后自动开启（「完成自定义设置后打开」）。
+class _BottomBarLayoutEditor extends StatelessWidget {
+  const _BottomBarLayoutEditor({required this.settings, required this.notifier});
+
+  final AppSettings settings;
+  final SettingsNotifier notifier;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final selected = settings.bottomBarItemIds;
+    final selectedSet = selected.toSet();
+    final candidates = normalizeSidebarItemOrder(settings.sidebarItemOrder)
+        .where((id) => !selectedSet.contains(id))
+        .toList();
+    final atLeastMin = selected.length >= 2;
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        ListTile(
+          leading: const Icon(Icons.space_dashboard_outlined),
+          title: const Text('启用底栏'),
+          subtitle: Text(
+            atLeastMin
+                ? '底部悬浮导航栏，最多 $kBottomBarItemLimit 个项目'
+                : '至少选择 2 个项目后自动开启',
+          ),
+          trailing: Switch(
+            value: settings.bottomBarEnabled && atLeastMin,
+            onChanged: atLeastMin
+                ? (value) => unawaited(notifier.setBottomBarEnabled(value))
+                : null,
+          ),
+        ),
+        if (selected.isNotEmpty) ...[
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 6, 16, 2),
+            child: Text(
+              '已选项目（拖动排序，关闭移除）',
+              style: TextStyle(fontSize: 12, color: scheme.onSurfaceVariant),
+            ),
+          ),
+          ReorderableListView.builder(
+            shrinkWrap: true,
+            physics: const NeverScrollableScrollPhysics(),
+            buildDefaultDragHandles: false,
+            itemCount: selected.length,
+            onReorderItem: (oldIndex, newIndex) {
+              final next = [...selected];
+              final item = next.removeAt(oldIndex);
+              next.insert(newIndex, item);
+              unawaited(notifier.setBottomBarItems(next));
+            },
+            itemBuilder: (context, index) {
+              final id = selected[index];
+              return ListTile(
+                key: ValueKey('bottom-bar-$id'),
+                leading: Icon(_sidebarIcon(id)),
+                title: Text(_sidebarLabel(id)),
+                trailing: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Switch(
+                      value: true,
+                      onChanged: (_) => unawaited(
+                        notifier.setBottomBarItems(
+                          selected.where((e) => e != id).toList(),
+                        ),
+                      ),
+                    ),
+                    ReorderableDragStartListener(
+                      index: index,
+                      child: const Padding(
+                        padding: EdgeInsets.all(10),
+                        child: Icon(Icons.drag_handle_rounded),
+                      ),
+                    ),
+                  ],
+                ),
+              );
+            },
+          ),
+        ],
+        Padding(
+          padding: const EdgeInsets.fromLTRB(16, 6, 16, 2),
+          child: Text(
+            selected.length >= kBottomBarItemLimit
+                ? '已达 $kBottomBarItemLimit 个上限'
+                : '可添加的项目',
+            style: TextStyle(fontSize: 12, color: scheme.onSurfaceVariant),
+          ),
+        ),
+        for (final id in candidates)
+          ListTile(
+            dense: true,
+            leading: Icon(_sidebarIcon(id)),
+            title: Text(_sidebarLabel(id)),
+            trailing: Switch(
+              value: false,
+              onChanged: selected.length >= kBottomBarItemLimit
+                  ? null
+                  : (_) => unawaited(
+                      notifier.setBottomBarItems([...selected, id]),
+                    ),
+            ),
+          ),
+      ],
+    );
+  }
+}
+
+String _sidebarLabel(String id) => switch (id) {
+  kSidebarHome => '首页',
+  kSidebarExplore => '探索',
+  kSidebarLocalMusic => '本地音乐',
+  kSidebarCloudMusic => '云端音乐',
+  kSidebarLibrary => '音乐库',
+  kSidebarFavorites => '我的收藏',
+  kSidebarRecent => '最近播放',
+  kSidebarPlugins => '插件管理',
+  kSidebarAccount => '账号',
+  kSidebarRecognize => '听歌识曲',
+  kSidebarPlaylists => '管理全部歌单',
+  kSidebarSettings => '设置',
+  _ => id,
+};
+
+IconData _sidebarIcon(String id) => switch (id) {
+  kSidebarHome => Icons.home_outlined,
+  kSidebarExplore => Icons.explore_outlined,
+  kSidebarLocalMusic => Icons.music_note_outlined,
+  kSidebarCloudMusic => Icons.cloud_outlined,
+  kSidebarLibrary => Icons.library_music_outlined,
+  kSidebarFavorites => Icons.favorite_border_rounded,
+  kSidebarRecent => Icons.history_rounded,
+  kSidebarPlugins => Icons.extension_outlined,
+  kSidebarAccount => Icons.account_circle_outlined,
+  kSidebarRecognize => Icons.mic_none_rounded,
+  kSidebarPlaylists => Icons.queue_music_rounded,
+  kSidebarSettings => Icons.settings_outlined,
+  _ => Icons.circle_outlined,
+};
 
 class _Choice {
   final String label;

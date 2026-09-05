@@ -60,4 +60,13 @@ class AndroidStorage {
     }
     return result;
   }
+
+  /// 删除 SAF 树里的一个文件（content:// 文档 URI）。
+  static Future<bool> deleteFileInDirectory(String uri) async {
+    if (!Platform.isAndroid) return false;
+    final result = await _channel.invokeMethod<bool>('deleteFile', {
+      'uri': uri,
+    });
+    return result == true;
+  }
 }

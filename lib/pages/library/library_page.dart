@@ -13,6 +13,7 @@ import '../../src/navigation/animated_page_route.dart';
 import '../../src/navigation/routes.dart';
 import '../../src/navigation/sidebar_controller.dart';
 import '../../src/rust/api.dart';
+import '../../src/widgets/frosted_search_field.dart';
 import '../../src/widgets/song_list_view.dart';
 import '../../src/widgets/top_notice.dart';
 import 'folder_browser_page.dart';
@@ -438,20 +439,10 @@ class _AllSongsTabState extends ConsumerState<_AllSongsTab> {
     return Column(
       children: [
         if (!selectionMode)
-          Padding(
+          FrostedSearchField(
+            controller: _controller,
+            onChanged: (v) => setState(() => _query = v.trim().toLowerCase()),
             padding: const EdgeInsets.fromLTRB(12, 8, 12, 4),
-            child: TextField(
-              controller: _controller,
-              onChanged: (v) => setState(() => _query = v.trim().toLowerCase()),
-              decoration: InputDecoration(
-                hintText: '搜索歌曲、歌手、专辑',
-                prefixIcon: const Icon(Icons.search),
-                isDense: true,
-                border: OutlineInputBorder(
-                  borderRadius: BorderRadius.circular(24),
-                ),
-              ),
-            ),
           )
         else
           Padding(

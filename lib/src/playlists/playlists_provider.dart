@@ -319,11 +319,34 @@ class PlaylistsNotifier extends StateNotifier<List<MobilePlaylist>> {
     await _save();
   }
 
+  /// 把 [incoming] 中尚未存在于 [existing] 的新路径按传入顺序插入列表顶部。
+  /// 已存在的路径保持原位置不变，返回原列表表示没有任何新增。
+  List<String> _prependNewPaths(
+    List<String> existing,
+    Iterable<String> incoming,
+  ) {
+    final known = existing.toSet();
+    final fresh = <String>[];
+    for (final path in incoming) {
+      if (path.trim().isEmpty) continue;
+      if (known.add(path)) fresh.add(path);
+    }
+    if (fresh.isEmpty) return existing;
+    return [...fresh, ...existing];
+  }
+
+  /// 添加歌曲到歌单。新歌曲默认插入列表顶部，已在歌单中的保持原位置；
+  /// 用户拖拽过排序时同步把新歌前置到自定义顺序，保证置顶可见。
   Future<void> addSongs(String id, Iterable<String> paths) async {
     state = [
       for (final item in state)
         if (item.id == id)
-          item.copyWith(songPaths: {...item.songPaths, ...paths}.toList())
+          item.copyWith(
+            songPaths: _prependNewPaths(item.songPaths, paths),
+            customOrder: item.customOrder == null
+                ? null
+                : _prependNewPaths(item.customOrder!, paths),
+          )
         else
           item,
     ];
@@ -374,6 +397,7 @@ class PlaylistsNotifier extends StateNotifier<List<MobilePlaylist>> {
   /// 将当前播放队列中的歌曲加入歌单，同时保存网络歌曲所需的完整快照。
   /// 仅保存 path 会导致网络歌曲重新打开歌单时丢失插件信息，因此这里保留
   /// 插件、封面和歌词等元数据，确保歌单中的网络歌曲可以继续播放。
+  /// 新歌曲默认插入列表顶部（含用户拖拽过的自定义顺序）。
   ///
   /// 返回 true 表示新添加；false 表示歌曲已在该歌单中（未重复添加）。
   Future<bool> addQueueItem(String id, QueueItem item) async {
@@ -397,7 +421,10 @@ class PlaylistsNotifier extends StateNotifier<List<MobilePlaylist>> {
       for (final playlist in state)
         if (playlist.id == id)
           playlist.copyWith(
-            songPaths: {...playlist.songPaths, item.path}.toList(),
+            songPaths: _prependNewPaths(playlist.songPaths, [item.path]),
+            customOrder: playlist.customOrder == null
+                ? null
+                : _prependNewPaths(playlist.customOrder!, [item.path]),
             coverUrl:
                 (playlist.coverUrl?.trim().isNotEmpty ?? false) ||
                     playlist.songPaths.isNotEmpty

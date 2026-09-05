@@ -15,7 +15,7 @@ import '../../pages/account/account_page.dart';
 import '../../pages/account/cloud_sync_page.dart';
 import '../../pages/statistics/statistics_page.dart';
 import '../../pages/settings/about_page.dart';
-import '../../pages/settings/remote_library_page.dart';
+import '../../pages/cloud/cloud_music_page.dart';
 import '../../pages/settings/plugins_page.dart';
 import '../../pages/settings/scan_folders_page.dart';
 import '../../pages/settings/logs_page.dart';
@@ -122,6 +122,11 @@ final appRouter = GoRouter(
               path: '/library',
               pageBuilder: (context, state) =>
                   _instantPage(state, const LibraryPage()),
+            ),
+            GoRoute(
+              path: '/cloud-music',
+              pageBuilder: (context, state) =>
+                  _instantPage(state, const CloudMusicPage()),
             ),
             GoRoute(
               path: '/local-music',
@@ -272,8 +277,7 @@ final appRouter = GoRouter(
                 ),
                 GoRoute(
                   path: 'remote-library',
-                  pageBuilder: (context, state) =>
-                      _instantPage(state, const RemoteLibraryPage()),
+                  redirect: (context, state) => '/cloud-music',
                 ),
                 GoRoute(
                   path: 'scan-folders',

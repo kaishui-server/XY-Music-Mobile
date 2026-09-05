@@ -41,6 +41,30 @@ class _QueueSheetState extends ConsumerState<QueueSheet> {
     super.dispose();
   }
 
+  /// 清空播放队列（二次确认）：停止播放并重置队列，其他播放设置保留。
+  Future<void> _confirmClear() async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('清空播放队列'),
+        content: const Text('确定清空播放队列并停止播放吗？'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext, false),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(dialogContext, true),
+            child: const Text('清空'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) return;
+    Navigator.pop(context);
+    await ref.read(playerProvider.notifier).clearQueue();
+  }
+
   @override
   Widget build(BuildContext context) {
     final player = widget.player;
@@ -68,6 +92,15 @@ class _QueueSheetState extends ConsumerState<QueueSheet> {
                         color: Theme.of(context).colorScheme.onSurfaceVariant,
                       ),
                     ),
+                    if (player.queue.isNotEmpty) ...[
+                      const SizedBox(width: 4),
+                      IconButton(
+                        tooltip: '清空播放队列',
+                        visualDensity: VisualDensity.compact,
+                        onPressed: () => _confirmClear(),
+                        icon: const Icon(Icons.delete_sweep_outlined),
+                      ),
+                    ],
                   ],
                 ),
               ),

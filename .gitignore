@@ -67,3 +67,6 @@ android/build/
 package-lock.json
 # Widget Preview related
 .widget_preview/
+
+# Local NDK toolchain shim (build workaround, machine-specific)
+.toolchain-shim/

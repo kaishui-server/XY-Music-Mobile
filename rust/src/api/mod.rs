@@ -340,60 +340,44 @@ pub fn write_audio_metadata(request_json: String) -> Result<(), String> {
 }
 
 // =========================================================================
-// WebDAV 云盘（第四批）
+// 云端音乐源：Alist/OpenList 网盘 + TVBox 接口订阅（第四批）
 // =========================================================================
 
-/// 解析 WebDAV 源 JSON 为凭据结构。
+/// 解析云端音乐源 JSON 为凭据结构。
 fn parse_remote_source(
     json: &str,
 ) -> Result<crate::remote::types::RemoteSourceCredentials, String> {
-    serde_json::from_str(json).map_err(|e| format!("WebDAV 源 JSON 无效: {e}"))
+    serde_json::from_str(json).map_err(|e| format!("云端音乐源 JSON 无效: {e}"))
 }
 
-/// 列出 WebDAV 目录内容。
+/// 测试 Alist/OpenList 网盘源连接（登录并浏览根目录）。
 ///
-/// - `source_json`：WebDAV 源凭据（camelCase，含 `baseUrl`/`username`/`password`/`rootPath`）
+/// - `source_json`：源凭据（camelCase，含 `baseUrl`/`username`/`password`/`rootPath`）
+pub async fn alist_test_connection(source_json: String) -> Result<(), String> {
+    let source = parse_remote_source(&source_json)?;
+    crate::remote::alist::test_connection(&source).await
+}
+
+/// 列出 Alist/OpenList 网盘目录内容（浏览远端文件夹）。
+///
 /// - `path`：远程目录路径（如 `/` 或 `/专辑`）
 ///
 /// 返回 [`RemoteFileEntry`] 数组的 JSON（camelCase，含 `remotePath`/`name`/`size`/`isDir`）。
-pub async fn webdav_list_directory(source_json: String, path: String) -> Result<String, String> {
+pub async fn alist_list_directory(source_json: String, path: String) -> Result<String, String> {
     let source = parse_remote_source(&source_json)?;
-    let client = crate::remote::webdav::shared_client();
-    let entries = crate::remote::webdav::list_directory(&client, &source, &path).await?;
+    let client = crate::remote::alist::shared_client();
+    let entries = crate::remote::alist::list_directory(&client, &source, &path).await?;
     serde_json::to_string(&entries).map_err(|e| e.to_string())
 }
 
-/// 测试 WebDAV 连接（列出根目录）。
-pub async fn webdav_test_connection(source_json: String) -> Result<(), String> {
-    let source = parse_remote_source(&source_json)?;
-    crate::remote::webdav::test_connection(&source).await
-}
-
-/// 递归扫描 WebDAV 源下的所有音频文件。
+/// 拉取并解析 TVBox 接口配置，识别可挂载的网盘站点。
 ///
-/// 返回 [`RemoteFileEntry`] 数组的 JSON（仅音频文件，不含目录）。
-pub async fn webdav_collect_audio_files(source_json: String) -> Result<String, String> {
-    let source = parse_remote_source(&source_json)?;
-    let files = crate::remote::webdav::collect_audio_files(&source).await?;
-    serde_json::to_string(&files).map_err(|e| e.to_string())
-}
-
-/// 从 WebDAV 断点续传下载文件到本地路径。
-///
-/// 目标文件已存在部分字节时从断点继续（RANGE 请求）。
-pub async fn webdav_download_file(
-    source_json: String,
-    remote_path: String,
-    target_path: String,
-) -> Result<(), String> {
-    let source = parse_remote_source(&source_json)?;
-    crate::remote::webdav::download_file_to_path(
-        &source,
-        &remote_path,
-        std::path::Path::new(&target_path),
-        |_downloaded, _total| {},
-    )
-    .await
+/// 返回 `TvboxSubscription` JSON（camelCase：`sites[]`（含 `likelyAlist`/
+/// `baseUrl`）、`rootIsAlist`、`rootUrl`）。TVBox 配置含 `sites` 时返回站点
+/// 列表；地址本身是 Alist/OpenList 服务器时 `rootIsAlist=true` 可直接挂载。
+pub async fn tvbox_fetch_sites(config_url: String) -> Result<String, String> {
+    let subscription = crate::remote::tvbox::fetch_subscription(&config_url).await?;
+    serde_json::to_string(&subscription).map_err(|e| e.to_string())
 }
 
 // =========================================================================
@@ -876,7 +860,7 @@ pub fn scan_folder_tree(
 }
 
 // =========================================================================
-// WebDAV 远程源管理（第七批）
+// 云端音乐源管理（第七批）
 // =========================================================================
 
 /// 列出全部远程源（返回 [`RemoteSource`] 数组 JSON）。
@@ -937,13 +921,24 @@ pub fn clear_remote_cache(cache_root: String) -> Result<String, String> {
     serde_json::to_string(&usage).map_err(|e| e.to_string())
 }
 
-/// 解析远程音乐播放来源：已缓存返回本地路径，未缓存返回直链流。
+/// 解析远程音乐播放来源：已缓存返回本地路径，未缓存返回 Alist 直链流。
 ///
 /// 返回 `{"kind":"cached","path":...}` 或 `{"kind":"stream","url":...,...}` JSON。
-pub fn remote_playback_source(db_path: String, remote_uri: String) -> Result<String, String> {
-    let conn = open_scan_conn(&db_path)?;
-    let source = crate::remote::cache::remote_playback_source(&conn, &remote_uri)?;
-    serde_json::to_string(&source).map_err(|e| e.to_string())
+pub async fn remote_playback_source(db_path: String, remote_uri: String) -> Result<String, String> {
+    // 查库在块作用域内同步完成并 drop 连接，避免非 Sync 的 Connection
+    // 跨 await 导致 future 非 Send。
+    let (source, remote_path, normalized_uri, cached_path) = {
+        let conn = open_scan_conn(&db_path)?;
+        crate::remote::cache::lookup_remote_playback(&conn, &remote_uri)?
+    };
+    let plan = crate::remote::cache::choose_remote_playback_source(
+        &normalized_uri,
+        cached_path,
+        source,
+        remote_path,
+    )
+    .await;
+    serde_json::to_string(&plan).map_err(|e| e.to_string())
 }
 
 /// 预下载远程文件到缓存并回写 `songs.cache_path`。

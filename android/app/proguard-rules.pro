@@ -1,20 +1,24 @@
-# Flutter 引擎 Java 侧 keep 兜底（引擎本体是 native，dex 增量极小）
+# XY Music R8 keep 规则（配合 minifyEnabled 收缩 Java/Kotlin 层体积）
+# QQ OpenSDK（com.tencent.**）由 third_party/tencent_kit 的
+# consumer-vendor-rules.pro 自动 keep，无需在此重复。
+
+# Flutter 嵌入层与插件注册表：MethodChannel 编解码器经反射构造
 -keep class io.flutter.** { *; }
--dontwarn io.flutter.**
+-keep class io.flutter.plugins.** { *; }
 
-# 平台通道与 MethodChannel 反射调用的入口类
+# 应用自身的原生桥（MainActivity / StoragePermissionBridge / QQ 分享回调）
 -keep class com.xymusic.mobile.** { *; }
--dontwarn com.xymusic.mobile.**
 
-# 音频前台服务/通知（audio_service），被系统以反射方式拉起
--keep class com.ryanheise.audioservice.** { *; }
--dontwarn com.ryanheise.audioservice.**
+# QQ OpenSDK 回调依赖的 support 兼容 shim（manifest FileProvider 已 keep，
+# 这里兜底防止参数签名被裁剪）
+-keep class android.support.v4.content.** { *; }
 
-# tencent_kit（QQ 分享）内置的 TencentOpenSDK 引用 okhttp3 作可选 HTTP 客户端，
-# 但插件未声明 okhttp 依赖；SDK 运行时缺 okhttp 会回退 HttpURLConnection
-# （debug 构建无 okhttp 也能正常分享），故仅跳过 R8 缺失类检查，不额外引入依赖。
+# 保留行号信息便于线上崩溃归因（不做完整混淆映射回传）
+-keepattributes SourceFile,LineNumberTable
+
+# 以下为「可选依赖」缺失告警：类不在 classpath 上但相关代码路径不会执行，
+# R8 需要 dontwarn 才能继续收缩。
+# Flutter 嵌入层的 Play Store 延迟组件（未接入 Play Core 动态分发）
+-dontwarn com.google.android.play.core.**
+# QQ OpenSDK（lite jar）的 okhttp 网络层（运行时缺失时回退内置 HTTP）
 -dontwarn okhttp3.**
-
-# QQ OpenSDK 3.5.19 运行时硬编码调用 android.support.v4.content.FileProvider
-# （app 内有对应的继承 androidx 的存根类），防止 R8 误删
--keep class android.support.v4.content.FileProvider { *; }

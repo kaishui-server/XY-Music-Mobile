@@ -1,8 +1,9 @@
+pub(crate) mod alist;
 pub(crate) mod cache;
 pub(crate) mod repository;
 pub(crate) mod scanner;
+pub mod tvbox;
 pub mod types;
-pub mod webdav;
 
 use std::time::{SystemTime, UNIX_EPOCH};
 

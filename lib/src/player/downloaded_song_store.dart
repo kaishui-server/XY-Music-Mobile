@@ -104,6 +104,30 @@ Future<void> rememberDownloadedSongSnapshot(DownloadedSongSnapshot snapshot) {
   return operation;
 }
 
+/// 删除一条已下载歌曲的快照记录（删除下载文件时调用，
+/// 避免“已下载过”检测继续命中失效路径）。
+Future<void> forgetDownloadedSongSnapshot(String path) {
+  final key = path.trim();
+  if (key.isEmpty) return Future.value();
+  final operation = _downloadedSongsWriteQueue.then((_) async {
+    final preferences = await SharedPreferences.getInstance();
+    final current = <String, dynamic>{};
+    try {
+      final raw = preferences.getString(_downloadedSongsKey);
+      final decoded = raw == null ? null : jsonDecode(raw);
+      if (decoded is Map) current.addAll(Map<String, dynamic>.from(decoded));
+    } catch (_) {}
+    if (current.remove(key) != null) {
+      await preferences.setString(
+        _downloadedSongsKey,
+        jsonEncode(current),
+      );
+    }
+  });
+  _downloadedSongsWriteQueue = operation.catchError((_) {});
+  return operation;
+}
+
 Future<String> resolveMusicDownloadDirectory(AppSettings? settings) async {
   final configured = settings?.downloadPath.trim() ?? '';
   if (configured.isNotEmpty) return configured;

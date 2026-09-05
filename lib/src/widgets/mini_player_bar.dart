@@ -6,6 +6,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 import 'package:video_player/video_player.dart';
 
+import '../lyrics/lyrics_models.dart';
 import '../player/player_provider.dart';
 import '../player/video_playback_session.dart';
 import '../ui/xy_theme.dart';
@@ -147,7 +148,10 @@ class MiniPlayerBar extends ConsumerWidget {
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
                           Text(
-                            current.title,
+                            // 歌手名拼进标题行，保证副行滚动歌词时歌手名仍可见。
+                            current.artist.isEmpty
+                                ? current.title
+                                : '${current.title} - ${current.artist}',
                             maxLines: 1,
                             overflow: TextOverflow.ellipsis,
                             style: const TextStyle(
@@ -156,20 +160,18 @@ class MiniPlayerBar extends ConsumerWidget {
                             ),
                           ),
                           const SizedBox(height: 3),
-                          Text(
-                            player.errorMessage ??
-                                (current.artist.isEmpty
-                                    ? '未知歌手'
-                                    : current.artist),
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                            style: TextStyle(
-                              fontSize: 11,
-                              color: player.errorMessage == null
-                                  ? theme.colorScheme.onSurfaceVariant
-                                  : theme.colorScheme.error,
-                            ),
-                          ),
+                          if (player.errorMessage != null)
+                            Text(
+                              player.errorMessage!,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: TextStyle(
+                                fontSize: 11,
+                                color: theme.colorScheme.error,
+                              ),
+                            )
+                          else
+                            _MiniBarLyrics(item: current),
                         ],
                       ),
                     ),
@@ -294,6 +296,59 @@ class _PlayerButton extends StatelessWidget {
               ),
             ),
           ),
+        ),
+      ),
+    );
+  }
+}
+
+/// 底栏迷你歌词：随播放进度滚动显示当前歌词行。
+/// 歌手名已并入标题行（歌曲名 - 歌手名）始终显示；本行固定字号单行，
+/// 无歌词（含插件歌曲未内嵌歌词）时显示「暂无歌词」占位。
+class _MiniBarLyrics extends ConsumerWidget {
+  const _MiniBarLyrics({required this.item});
+
+  final QueueItem item;
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final position = ref.watch(
+      playerProvider.select((state) => state.position),
+    );
+    final embedded = item.lyricsRaw?.trim() ?? '';
+    final AsyncValue<List<LyricLine>> lyrics;
+    if (embedded.isNotEmpty) {
+      lyrics = ref.watch(embeddedLyricsProvider(embedded));
+    } else if (item.pluginId == null) {
+      lyrics = ref.watch(songLyricsProvider(item.path));
+    } else {
+      lyrics = const AsyncData(<LyricLine>[]);
+    }
+    const fallback = '暂无歌词';
+    var lineTime = -1.0;
+    var text = lyrics.when(
+      // 加载期间保持空白占位，避免「暂无歌词」与歌词间的占位闪烁。
+      loading: () => ' ',
+      error: (_, _) => fallback,
+      data: (lines) {
+        if (lines.isEmpty) return fallback;
+        var active = lyricActiveIndex(lines, position);
+        lineTime = lines[active].time;
+        final line = lines[active].text.trim();
+        return line.isEmpty ? fallback : line;
+      },
+    );
+    if (text == fallback) lineTime = -1.0;
+    return AnimatedSwitcher(
+      duration: const Duration(milliseconds: 280),
+      child: Text(
+        text,
+        key: ValueKey('bar:${item.path}:$lineTime'),
+        maxLines: 1,
+        overflow: TextOverflow.ellipsis,
+        style: TextStyle(
+          fontSize: 11,
+          color: Theme.of(context).colorScheme.onSurfaceVariant,
         ),
       ),
     );

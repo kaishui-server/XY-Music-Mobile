@@ -12,10 +12,12 @@ import '../../src/player/download_quality.dart';
 import '../../src/player/downloaded_song_store.dart';
 import '../../src/player/player_provider.dart';
 import '../../src/rust/api.dart';
+import '../../src/widgets/frosted_search_field.dart';
 import '../../src/widgets/top_notice.dart';
 
 /// 下载管理页：展示最近 500 条下载记录（分页每页 50 条），
-/// 支持搜索、查看实时进度/实际音质、重新下载与失败详情。
+/// 支持搜索、实时进度/实际音质、暂停/继续、重新下载、失败详情、
+/// 单条与批量删除（可选同时删除本地音乐文件）。
 class DownloadManagerPage extends ConsumerStatefulWidget {
   const DownloadManagerPage({super.key});
 
@@ -33,6 +35,10 @@ class _DownloadManagerPageState extends ConsumerState<DownloadManagerPage> {
   int _page = 0;
   bool _redownloading = false;
 
+  /// 多选删除模式：长按列表项进入。
+  bool _selectionMode = false;
+  final Set<String> _selectedIds = {};
+
   @override
   void dispose() {
     _searchController.dispose();
@@ -43,6 +49,26 @@ class _DownloadManagerPageState extends ConsumerState<DownloadManagerPage> {
     setState(() {
       _query = value;
       _page = 0;
+    });
+  }
+
+  void _enterSelection(String id) {
+    setState(() {
+      _selectionMode = true;
+      _selectedIds.add(id);
+    });
+  }
+
+  void _exitSelection() {
+    setState(() {
+      _selectionMode = false;
+      _selectedIds.clear();
+    });
+  }
+
+  void _toggleSelection(String id) {
+    setState(() {
+      if (!_selectedIds.add(id)) _selectedIds.remove(id);
     });
   }
 
@@ -103,9 +129,13 @@ class _DownloadManagerPageState extends ConsumerState<DownloadManagerPage> {
     );
   }
 
-  Future<void> _redownload(DownloadHistoryEntry entry) async {
+  /// 重新下载，或继续一条已暂停的记录（复用原记录，不新增）。
+  Future<void> _redownload(
+    DownloadHistoryEntry entry, {
+    bool resume = false,
+  }) async {
     if (_redownloading) {
-      XyNotice.show(context, message: '已有重新下载任务进行中，请稍候');
+      XyNotice.show(context, message: '已有下载任务进行中，请稍候');
       return;
     }
     if (entry.sourcePath.trim().isEmpty) {
@@ -121,9 +151,22 @@ class _DownloadManagerPageState extends ConsumerState<DownloadManagerPage> {
       XyNotice.show(context, message: '该歌曲已是本地文件，无需重新下载');
       return;
     }
-    setState(() => _redownloading = true);
     final historyNotifier = ref.read(downloadHistoryProvider.notifier);
-    final historyId = historyNotifier.restart(entry.id);
+    final String historyId;
+    if (resume) {
+      if (!historyNotifier.resumeEntry(entry.id)) {
+        XyNotice.show(context, message: '任务状态已变化，请刷新后重试');
+        return;
+      }
+      historyId = entry.id;
+    } else {
+      if (historyNotifier.hasActiveDownload(entry.sourcePath)) {
+        XyNotice.show(context, message: '《${entry.title}》正在下载中，请在列表中查看进度');
+        return;
+      }
+      historyId = historyNotifier.restart(entry.id);
+    }
+    setState(() => _redownloading = true);
     try {
       final settings = ref.read(settingsProvider).valueOrNull;
       final directory = await resolveMusicDownloadDirectory(settings);
@@ -169,8 +212,7 @@ class _DownloadManagerPageState extends ConsumerState<DownloadManagerPage> {
       final coverUrl = entry.coverUrl?.trim() ?? '';
       await finalizeDownloadExtras(
         requestJson: jsonEncode({
-          if (coverUrl.startsWith('http://') ||
-              coverUrl.startsWith('https://'))
+          if (coverUrl.startsWith('http://') || coverUrl.startsWith('https://'))
             'coverUrl': coverUrl,
           'embedCover': true,
           'metadata': {
@@ -221,13 +263,20 @@ class _DownloadManagerPageState extends ConsumerState<DownloadManagerPage> {
         );
       }
     } catch (error) {
-      historyNotifier.fail(historyId, error.toString());
-      if (mounted) {
-        XyNotice.show(
-          context,
-          message: '重新下载失败：$error',
-          type: XyNoticeType.error,
-        );
+      if (error is DownloadPausedSignal) {
+        // 用户主动暂停：状态已标记，不提示失败。
+        if (mounted) {
+          XyNotice.show(context, message: '已暂停：${entry.title}');
+        }
+      } else {
+        historyNotifier.fail(historyId, error.toString());
+        if (mounted) {
+          XyNotice.show(
+            context,
+            message: '重新下载失败：$error',
+            type: XyNoticeType.error,
+          );
+        }
       }
     } finally {
       if (mounted) setState(() => _redownloading = false);
@@ -255,6 +304,116 @@ class _DownloadManagerPageState extends ConsumerState<DownloadManagerPage> {
     );
   }
 
+  /// 删除一个本地音频文件（支持普通路径与 SAF content:// 文档），
+  /// 顺带清理同名 .lrc 歌词文件。
+  Future<void> _deleteLocalFile(String? path) async {
+    final target = path?.trim() ?? '';
+    if (target.isEmpty) return;
+    if (target.toLowerCase().startsWith('content://')) {
+      try {
+        await AndroidStorage.deleteFileInDirectory(target);
+      } catch (_) {}
+      return;
+    }
+    try {
+      final file = File(target);
+      if (await file.exists()) await file.delete();
+      final lrc = File(p.setExtension(target, '.lrc'));
+      if (await lrc.exists()) await lrc.delete();
+    } catch (_) {}
+  }
+
+  /// 删除记录（带确认弹窗）：可选择是否同时删除本地音乐文件。
+  Future<void> _confirmDelete(List<DownloadHistoryEntry> targets) async {
+    if (targets.isEmpty) return;
+    var deleteFiles = false;
+    final hasCompletedFile = targets.any(
+      (entry) =>
+          entry.status == DownloadHistoryStatus.completed &&
+          (entry.savedPath ?? '').trim().isNotEmpty,
+    );
+    final confirmed = await showDialog<bool>(
+      context: context,
+      useRootNavigator: true,
+      builder: (dialogContext) => StatefulBuilder(
+        builder: (dialogContext, setDialogState) => AlertDialog(
+          title: Text(
+            targets.length == 1 ? '删除下载记录' : '删除 ${targets.length} 条下载记录',
+          ),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                targets.length == 1
+                    ? '确定删除《${targets.first.title.isEmpty ? '未知歌曲' : targets.first.title}》的下载记录吗？'
+                    : '确定删除选中的 ${targets.length} 条下载记录吗？',
+              ),
+              if (hasCompletedFile)
+                CheckboxListTile(
+                  value: deleteFiles,
+                  onChanged: (value) =>
+                      setDialogState(() => deleteFiles = value ?? false),
+                  title: const Text('同时删除本地音乐文件'),
+                  subtitle: const Text('从存储中移除已下载完成的音频文件'),
+                  controlAffinity: ListTileControlAffinity.leading,
+                  contentPadding: EdgeInsets.zero,
+                ),
+            ],
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(dialogContext, false),
+              child: const Text('取消'),
+            ),
+            FilledButton(
+              style: FilledButton.styleFrom(
+                backgroundColor: Theme.of(dialogContext).colorScheme.error,
+              ),
+              onPressed: () => Navigator.pop(dialogContext, true),
+              child: const Text('删除'),
+            ),
+          ],
+        ),
+      ),
+    );
+    if (confirmed != true) return;
+    await _deleteEntries(targets, deleteLocalFiles: deleteFiles);
+  }
+
+  Future<void> _deleteEntries(
+    List<DownloadHistoryEntry> targets, {
+    required bool deleteLocalFiles,
+  }) async {
+    final historyNotifier = ref.read(downloadHistoryProvider.notifier);
+    // 下载中的任务先置取消标记再删记录，拦截其后台收尾与完成提示。
+    final removed = historyNotifier.removeEntries(
+      targets.map((entry) => entry.id).toSet(),
+    );
+    var removedFiles = 0;
+    for (final entry in removed) {
+      if (entry.status == DownloadHistoryStatus.completed && deleteLocalFiles) {
+        await _deleteLocalFile(entry.savedPath);
+        await forgetDownloadedSongSnapshot(entry.savedPath ?? '');
+        removedFiles++;
+      } else if (entry.status == DownloadHistoryStatus.downloading ||
+          entry.status == DownloadHistoryStatus.paused) {
+        // 半成品文件无论是否勾选都清理，避免残缺音频混入本地乐库。
+        await _deleteLocalFile(entry.localPath);
+      }
+    }
+    if (_selectionMode) _exitSelection();
+    if (mounted) {
+      XyNotice.show(
+        context,
+        message: deleteLocalFiles && removedFiles > 0
+            ? '已删除 ${removed.length} 条记录和 $removedFiles 个本地文件'
+            : '已删除 ${removed.length} 条记录',
+        type: XyNoticeType.success,
+      );
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
@@ -272,25 +431,54 @@ class _DownloadManagerPageState extends ConsumerState<DownloadManagerPage> {
 
     return Scaffold(
       appBar: AppBar(
-        title: const Text('下载管理'),
-        bottom: PreferredSize(
-          preferredSize: const Size.fromHeight(58),
-          child: Padding(
-            padding: const EdgeInsets.fromLTRB(16, 0, 16, 10),
-            child: TextField(
-              controller: _searchController,
-              onChanged: _onSearchChanged,
-              decoration: InputDecoration(
-                hintText: '搜索歌曲、歌手、专辑',
-                prefixIcon: const Icon(Icons.search),
-                isDense: true,
-                border: OutlineInputBorder(
-                  borderRadius: BorderRadius.circular(24),
+        title: Text(_selectionMode ? '已选择 ${_selectedIds.length} 项' : '下载管理'),
+        leading: _selectionMode
+            ? IconButton(
+                tooltip: '退出多选',
+                onPressed: _exitSelection,
+                icon: const Icon(Icons.close_rounded),
+              )
+            : null,
+        actions: _selectionMode
+            ? [
+                IconButton(
+                  tooltip:
+                      _selectedIds.length >= entries.length &&
+                          entries.isNotEmpty
+                      ? '取消全选'
+                      : '全选',
+                  onPressed: entries.isEmpty
+                      ? null
+                      : () => setState(() {
+                          if (_selectedIds.length >= entries.length) {
+                            _selectedIds.clear();
+                          } else {
+                            _selectedIds
+                              ..clear()
+                              ..addAll(entries.map((e) => e.id));
+                          }
+                        }),
+                  icon: Icon(
+                    _selectedIds.length >= entries.length && entries.isNotEmpty
+                        ? Icons.deselect_rounded
+                        : Icons.select_all_rounded,
+                  ),
+                ),
+              ]
+            : null,
+        bottom: _selectionMode
+            ? null
+            : PreferredSize(
+                preferredSize: const Size.fromHeight(58),
+                child: Padding(
+                  padding: const EdgeInsets.fromLTRB(16, 0, 16, 10),
+                  child: FrostedSearchField(
+                    controller: _searchController,
+                    onChanged: _onSearchChanged,
+                    padding: EdgeInsets.zero,
+                  ),
                 ),
               ),
-            ),
-          ),
-        ),
       ),
       body: entries.isEmpty
           ? Center(
@@ -309,7 +497,45 @@ class _DownloadManagerPageState extends ConsumerState<DownloadManagerPage> {
                         _buildTile(theme, pageEntries[index]),
                   ),
                 ),
-                if (totalPages > 1)
+                if (_selectionMode)
+                  SafeArea(
+                    top: false,
+                    child: Padding(
+                      padding: const EdgeInsets.fromLTRB(16, 4, 16, 10),
+                      child: Row(
+                        children: [
+                          Text(
+                            '已选 ${_selectedIds.length} 项',
+                            style: TextStyle(
+                              color: theme.colorScheme.onSurfaceVariant,
+                            ),
+                          ),
+                          const Spacer(),
+                          FilledButton.icon(
+                            style: FilledButton.styleFrom(
+                              backgroundColor: theme.colorScheme.error,
+                            ),
+                            onPressed: _selectedIds.isEmpty
+                                ? null
+                                : () => _confirmDelete(
+                                    entries
+                                        .where(
+                                          (entry) =>
+                                              _selectedIds.contains(entry.id),
+                                        )
+                                        .toList(),
+                                  ),
+                            icon: const Icon(
+                              Icons.delete_sweep_outlined,
+                              size: 20,
+                            ),
+                            label: const Text('批量删除'),
+                          ),
+                        ],
+                      ),
+                    ),
+                  )
+                else if (totalPages > 1)
                   SafeArea(
                     top: false,
                     child: Padding(
@@ -351,20 +577,35 @@ class _DownloadManagerPageState extends ConsumerState<DownloadManagerPage> {
 
   Widget _buildTile(ThemeData theme, DownloadHistoryEntry entry) {
     final isDownloading = entry.status == DownloadHistoryStatus.downloading;
+    final isPaused = entry.status == DownloadHistoryStatus.paused;
     final isFailed = entry.status == DownloadHistoryStatus.failed;
     final time = entry.finishedAt ?? entry.startedAt;
-    final qualityText = entry.actualQuality != null &&
+    final qualityText =
+        entry.actualQuality != null &&
             entry.actualQuality!.toLowerCase() != entry.quality.toLowerCase()
         ? '${_qualityLabel(entry.quality)} → 实际 ${_qualityLabel(entry.actualQuality!)}'
         : _qualityLabel(entry.actualQuality ?? entry.quality);
+    final selected = _selectedIds.contains(entry.id);
 
     return ListTile(
       contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
-      leading: isDownloading
+      onTap: _selectionMode ? () => _toggleSelection(entry.id) : null,
+      onLongPress: _selectionMode ? null : () => _enterSelection(entry.id),
+      leading: _selectionMode
+          ? Checkbox(
+              value: selected,
+              onChanged: (_) => _toggleSelection(entry.id),
+            )
+          : isDownloading
           ? const SizedBox(
               width: 24,
               height: 24,
               child: CircularProgressIndicator(strokeWidth: 2.4),
+            )
+          : isPaused
+          ? Icon(
+              Icons.pause_circle_outline_rounded,
+              color: Colors.orange.shade700,
             )
           : Icon(
               isFailed
@@ -393,7 +634,7 @@ class _DownloadManagerPageState extends ConsumerState<DownloadManagerPage> {
               color: theme.colorScheme.onSurfaceVariant,
             ),
           ),
-          if (isDownloading) ...[
+          if (isDownloading || isPaused) ...[
             const SizedBox(height: 6),
             Row(
               children: [
@@ -406,9 +647,7 @@ class _DownloadManagerPageState extends ConsumerState<DownloadManagerPage> {
                 ),
                 const SizedBox(width: 8),
                 Text(
-                  entry.totalBytes > 0
-                      ? '${(entry.progress * 100).toStringAsFixed(0)}%'
-                      : _formatBytes(entry.downloadedBytes),
+                  '${isPaused ? '已暂停 ' : ''}${entry.totalBytes > 0 ? '${(entry.progress * 100).toStringAsFixed(0)}%' : _formatBytes(entry.downloadedBytes)}',
                   style: TextStyle(
                     fontSize: 11,
                     color: theme.colorScheme.onSurfaceVariant,
@@ -431,22 +670,51 @@ class _DownloadManagerPageState extends ConsumerState<DownloadManagerPage> {
           ],
         ],
       ),
-      trailing: Row(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          if (isFailed)
-            TextButton(
-              onPressed: () => _showErrorDetail(entry),
-              child: const Text('查看详情'),
+      trailing: _selectionMode
+          ? null
+          : Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                if (isDownloading)
+                  IconButton(
+                    tooltip: '暂停',
+                    visualDensity: VisualDensity.compact,
+                    onPressed: () => ref
+                        .read(downloadHistoryProvider.notifier)
+                        .pause(entry.id),
+                    icon: const Icon(Icons.pause_rounded, size: 22),
+                  ),
+                if (isPaused)
+                  IconButton(
+                    tooltip: '继续下载',
+                    visualDensity: VisualDensity.compact,
+                    onPressed: _redownloading
+                        ? null
+                        : () => _redownload(entry, resume: true),
+                    icon: const Icon(Icons.play_arrow_rounded, size: 24),
+                  ),
+                if (isFailed)
+                  IconButton(
+                    tooltip: '查看失败详情',
+                    visualDensity: VisualDensity.compact,
+                    onPressed: () => _showErrorDetail(entry),
+                    icon: const Icon(Icons.info_outline_rounded, size: 21),
+                  ),
+                if (!isDownloading)
+                  IconButton(
+                    tooltip: '重新下载',
+                    visualDensity: VisualDensity.compact,
+                    onPressed: _redownloading ? null : () => _redownload(entry),
+                    icon: const Icon(Icons.download_rounded, size: 21),
+                  ),
+                IconButton(
+                  tooltip: '删除记录',
+                  visualDensity: VisualDensity.compact,
+                  onPressed: () => _confirmDelete([entry]),
+                  icon: const Icon(Icons.delete_outline_rounded, size: 21),
+                ),
+              ],
             ),
-          if (!isDownloading)
-            IconButton(
-              tooltip: '重新下载',
-              onPressed: _redownloading ? null : () => _redownload(entry),
-              icon: const Icon(Icons.download_rounded, size: 21),
-            ),
-        ],
-      ),
     );
   }
 }

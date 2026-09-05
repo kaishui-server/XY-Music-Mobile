@@ -18,6 +18,8 @@ enum SidebarPosition { left, right }
 const kSidebarHome = 'home';
 const kSidebarExplore = 'explore';
 const kSidebarLocalMusic = 'localMusic';
+const kSidebarCloudMusic = 'cloudMusic';
+const kSidebarLibrary = 'library';
 const kSidebarFavorites = 'favorites';
 const kSidebarRecent = 'recent';
 const kSidebarPlugins = 'plugins';
@@ -30,6 +32,8 @@ const kDefaultSidebarItemOrder = <String>[
   kSidebarHome,
   kSidebarExplore,
   kSidebarLocalMusic,
+  kSidebarCloudMusic,
+  kSidebarLibrary,
   kSidebarFavorites,
   kSidebarRecent,
   kSidebarPlugins,
@@ -48,6 +52,22 @@ List<String> normalizeSidebarItemOrder(Iterable<String> stored) {
   }
   for (final id in kDefaultSidebarItemOrder) {
     if (!normalized.contains(id)) normalized.add(id);
+  }
+  return normalized;
+}
+
+/// 自定义底栏最多同时展示的目的地数量（Material 导航规范：2-5 个）。
+const kBottomBarItemLimit = 5;
+
+/// 归一化底栏条目：过滤合法目的地 id、去重并限制数量上限。
+List<String> normalizeBottomBarItemIds(Iterable<String> stored) {
+  final normalized = <String>[];
+  for (final id in stored) {
+    if (kDefaultSidebarItemOrder.contains(id) &&
+        !normalized.contains(id) &&
+        normalized.length < kBottomBarItemLimit) {
+      normalized.add(id);
+    }
   }
   return normalized;
 }
@@ -102,6 +122,8 @@ class AppSettings {
     this.sidebarPosition = SidebarPosition.left,
     this.sidebarItemOrder = kDefaultSidebarItemOrder,
     this.sidebarHiddenItems = const <String>[],
+    this.bottomBarEnabled = false,
+    this.bottomBarItemIds = const <String>[],
     this.customBackgroundPath = '',
     this.customBackgroundBlur = 18.0,
     this.playerDetailCustomImagePath = '',
@@ -113,6 +135,7 @@ class AppSettings {
     this.lyricWordEffectMode = LyricWordEffectMode.progressive,
     this.lyricDisplayAlignment = LyricDisplayAlignment.left,
     this.lyricFontSize = 18.0,
+    this.miniLyricFontSize = 14.0,
     this.desktopLyricsEnabled = false,
     this.desktopLyricsHideInApp = true,
     this.desktopLyricsShowWordEffect = true,
@@ -146,6 +169,12 @@ class AppSettings {
   final SidebarPosition sidebarPosition;
   final List<String> sidebarItemOrder;
   final List<String> sidebarHiddenItems;
+
+  /// 自定义底栏开关：默认关闭，完成条目自定义（≥2 项）后自动开启。
+  final bool bottomBarEnabled;
+
+  /// 底栏展示的目的地 id（顺序即显示顺序，2-5 个）。
+  final List<String> bottomBarItemIds;
   final String customBackgroundPath;
   final double customBackgroundBlur;
   final String playerDetailCustomImagePath;
@@ -159,6 +188,9 @@ class AppSettings {
 
   /// 播放详情页歌词的基础字号（未选中行）。选中行在此基础上放大。
   final double lyricFontSize;
+
+  /// 播放页封面下方迷你歌词的主行字号；超过单行阈值时自动只显示主行。
+  final double miniLyricFontSize;
   final bool desktopLyricsEnabled;
   final bool desktopLyricsHideInApp;
   final bool desktopLyricsShowWordEffect;
@@ -193,6 +225,8 @@ class AppSettings {
     SidebarPosition? sidebarPosition,
     List<String>? sidebarItemOrder,
     List<String>? sidebarHiddenItems,
+    bool? bottomBarEnabled,
+    List<String>? bottomBarItemIds,
     String? customBackgroundPath,
     double? customBackgroundBlur,
     String? playerDetailCustomImagePath,
@@ -204,6 +238,7 @@ class AppSettings {
     LyricWordEffectMode? lyricWordEffectMode,
     LyricDisplayAlignment? lyricDisplayAlignment,
     double? lyricFontSize,
+    double? miniLyricFontSize,
     bool? desktopLyricsEnabled,
     bool? desktopLyricsHideInApp,
     bool? desktopLyricsShowWordEffect,
@@ -238,6 +273,8 @@ class AppSettings {
       sidebarPosition: sidebarPosition ?? this.sidebarPosition,
       sidebarItemOrder: sidebarItemOrder ?? this.sidebarItemOrder,
       sidebarHiddenItems: sidebarHiddenItems ?? this.sidebarHiddenItems,
+      bottomBarEnabled: bottomBarEnabled ?? this.bottomBarEnabled,
+      bottomBarItemIds: bottomBarItemIds ?? this.bottomBarItemIds,
       customBackgroundPath: customBackgroundPath ?? this.customBackgroundPath,
       customBackgroundBlur: customBackgroundBlur ?? this.customBackgroundBlur,
       playerDetailCustomImagePath:
@@ -254,6 +291,7 @@ class AppSettings {
       lyricDisplayAlignment:
           lyricDisplayAlignment ?? this.lyricDisplayAlignment,
       lyricFontSize: lyricFontSize ?? this.lyricFontSize,
+      miniLyricFontSize: miniLyricFontSize ?? this.miniLyricFontSize,
       desktopLyricsEnabled: desktopLyricsEnabled ?? this.desktopLyricsEnabled,
       desktopLyricsHideInApp:
           desktopLyricsHideInApp ?? this.desktopLyricsHideInApp,
@@ -313,6 +351,10 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
               .where(kDefaultSidebarItemOrder.contains)
               .toSet()
               .toList(),
+      bottomBarEnabled: prefs.getBool('bottomBarEnabled') ?? false,
+      bottomBarItemIds: normalizeBottomBarItemIds(
+        prefs.getStringList('bottomBarItemIds') ?? const [],
+      ),
       customBackgroundPath: prefs.getString('customBackgroundPath') ?? '',
       customBackgroundBlur: prefs.getDouble('customBackgroundBlur') ?? 18.0,
       playerDetailCustomImagePath:
@@ -442,6 +484,8 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
         normalizeSidebarItemOrder(next.sidebarItemOrder),
       ),
       prefs.setStringList('sidebarHiddenItems', next.sidebarHiddenItems),
+      prefs.setBool('bottomBarEnabled', next.bottomBarEnabled),
+      prefs.setStringList('bottomBarItemIds', next.bottomBarItemIds),
       prefs.setString('customBackgroundPath', next.customBackgroundPath),
       prefs.setDouble('customBackgroundBlur', next.customBackgroundBlur),
       prefs.setString(
@@ -459,6 +503,7 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
       prefs.setInt('lyricWordEffectMode', next.lyricWordEffectMode.index),
       prefs.setInt('lyricDisplayAlignment', next.lyricDisplayAlignment.index),
       prefs.setDouble('lyricFontSize', next.lyricFontSize),
+      prefs.setDouble('miniLyricFontSize', next.miniLyricFontSize),
       prefs.setBool('desktopLyricsEnabled', next.desktopLyricsEnabled),
       prefs.setBool('desktopLyricsHideInApp', next.desktopLyricsHideInApp),
       prefs.setBool(
@@ -549,6 +594,33 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
     return _save(current.copyWith(sidebarHiddenItems: hidden.toList()));
   }
 
+  /// 手动开关底栏；条目不足 2 个时无法开启（保持关闭）。
+  Future<void> setBottomBarEnabled(bool value) {
+    final current = state.valueOrNull ?? const AppSettings();
+    if (value && current.bottomBarItemIds.length < 2) {
+      return Future.value();
+    }
+    return _save(current.copyWith(bottomBarEnabled: value));
+  }
+
+  /// 更新底栏条目（顺序即显示顺序）。
+  ///
+  /// 「完成自定义设置后打开」：条目从不足 2 个增加到 ≥2 个时自动开启；
+  /// 降回不足 2 个时自动关闭；手动关闭后仅调整顺序/增删（保持 ≥2 个）
+  /// 不改变开关状态。
+  Future<void> setBottomBarItems(List<String> ids) {
+    final current = state.valueOrNull ?? const AppSettings();
+    final normalized = normalizeBottomBarItemIds(ids);
+    final wasBelowMin = current.bottomBarItemIds.length < 2;
+    final nowAtLeastMin = normalized.length >= 2;
+    return _save(
+      current.copyWith(
+        bottomBarItemIds: normalized,
+        bottomBarEnabled: nowAtLeastMin && (wasBelowMin || current.bottomBarEnabled),
+      ),
+    );
+  }
+
   Future<void> setCustomBackgroundPath(String path) => _save(
     (state.valueOrNull ?? const AppSettings()).copyWith(
       customBackgroundPath: path,
@@ -604,6 +676,14 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
   Future<void> setLyricFontSize(double value) => _save(
     (state.valueOrNull ?? const AppSettings()).copyWith(
       lyricFontSize: value.clamp(12.0, 32.0).toDouble(),
+    ),
+  );
+
+  /// 迷你歌词字号约束在 10~24；封面下方展示区域固定 56dp 高，
+  /// 超过 20 时副行（翻译/下一句）自动隐藏，只保留主行。
+  Future<void> setMiniLyricFontSize(double value) => _save(
+    (state.valueOrNull ?? const AppSettings()).copyWith(
+      miniLyricFontSize: value.clamp(10.0, 24.0).toDouble(),
     ),
   );
   Future<void> setDesktopLyricsEnabled(bool value) => _save(

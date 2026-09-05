@@ -13,7 +13,7 @@ use super::types::{
 use super::utils::normalize_path;
 use crate::remote::cache::is_remote_uri;
 use crate::remote::repository::{get_song_cache_path, get_source_for_remote_uri};
-use crate::remote::webdav;
+use crate::remote::alist;
 use crate::security::path_validator;
 use encoding_rs::{GBK, UTF_16BE, UTF_16LE};
 use lofty::config::WriteOptions;
@@ -387,7 +387,7 @@ async fn read_remote_song_lyrics_raw(ctx: RemoteLyricsCtx) -> String {
     if let Some(lyrics) = ctx.local_lyrics {
         return lyrics;
     }
-    webdav::read_text_file(&ctx.source, &ctx.lrc_path)
+    alist::read_text_file(&ctx.source, &ctx.lrc_path)
         .await
         .ok()
         .flatten()
@@ -497,6 +497,9 @@ pub async fn save_song_lyrics(
     source: LyricsStorageSource,
     source_path: Option<String>,
 ) -> Result<String, String> {
+    if is_remote_uri(&path) {
+        return Err("网盘歌曲暂不支持写入歌词文件".to_string());
+    }
     let path_obj = Path::new(&path);
     if !path_obj.exists() {
         return Err("Song file does not exist".to_string());

@@ -149,7 +149,9 @@ pub(crate) fn get_source(
                 Ok(RemoteSourceCredentials {
                     id: row.get(0)?,
                     name: row.get(1)?,
-                    provider: row.get(2)?,
+                    provider: normalize_provider(&row.get::<_, String>(2)?)
+                        .unwrap_or("alist")
+                        .to_string(),
                     base_url: row.get(3)?,
                     username: row.get(4)?,
                     password: row.get(5)?,
@@ -198,13 +200,21 @@ pub(crate) fn get_source_for_remote_uri(
     Ok((source, remote_path, etag, Some(remote_uri)))
 }
 
+/// 归一化 provider：旧版 WebDAV 源统一迁移为 alist 驱动
+/// （Alist/OpenList 服务器 REST 接口与原 WebDAV 地址同源，可直接接管）。
+pub(crate) fn normalize_provider(provider: &str) -> Option<&'static str> {
+    match provider.trim() {
+        "alist" | "webdav" => Some("alist"),
+        _ => None,
+    }
+}
+
 pub(crate) fn save_source(
     conn: &rusqlite::Connection,
     input: RemoteSourceInput,
 ) -> Result<RemoteSource, String> {
-    if input.provider != "webdav" {
-        return Err("第一版仅支持 WebDAV".to_string());
-    }
+    let provider = normalize_provider(&input.provider)
+        .ok_or_else(|| "仅支持 Alist/OpenList 网盘源".to_string())?;
 
     let now = now_seconds();
     let id = input.id.unwrap_or_else(|| Uuid::new_v4().to_string());
@@ -243,7 +253,7 @@ pub(crate) fn save_source(
         params![
             &id,
             name,
-            "webdav",
+            provider,
             base_url,
             &input.username,
             &db_password,

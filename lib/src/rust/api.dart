@@ -157,44 +157,32 @@ Future<String> readAudioMetadata({required String filePath}) =>
 Future<void> writeAudioMetadata({required String requestJson}) =>
     RustLib.instance.api.crateApiWriteAudioMetadata(requestJson: requestJson);
 
-/// 列出 WebDAV 目录内容。
+/// 测试 Alist/OpenList 网盘源连接（登录并浏览根目录）。
 ///
-/// - `source_json`：WebDAV 源凭据（camelCase，含 `baseUrl`/`username`/`password`/`rootPath`）
+/// - `source_json`：源凭据（camelCase，含 `baseUrl`/`username`/`password`/`rootPath`）
+Future<void> alistTestConnection({required String sourceJson}) =>
+    RustLib.instance.api.crateApiAlistTestConnection(sourceJson: sourceJson);
+
+/// 列出 Alist/OpenList 网盘目录内容（浏览远端文件夹）。
+///
 /// - `path`：远程目录路径（如 `/` 或 `/专辑`）
 ///
 /// 返回 [`RemoteFileEntry`] 数组的 JSON（camelCase，含 `remotePath`/`name`/`size`/`isDir`）。
-Future<String> webdavListDirectory({
+Future<String> alistListDirectory({
   required String sourceJson,
   required String path,
-}) => RustLib.instance.api.crateApiWebdavListDirectory(
+}) => RustLib.instance.api.crateApiAlistListDirectory(
   sourceJson: sourceJson,
   path: path,
 );
 
-/// 测试 WebDAV 连接（列出根目录）。
-Future<void> webdavTestConnection({required String sourceJson}) =>
-    RustLib.instance.api.crateApiWebdavTestConnection(sourceJson: sourceJson);
-
-/// 递归扫描 WebDAV 源下的所有音频文件。
+/// 拉取并解析 TVBox 接口配置，识别可挂载的网盘站点。
 ///
-/// 返回 [`RemoteFileEntry`] 数组的 JSON（仅音频文件，不含目录）。
-Future<String> webdavCollectAudioFiles({required String sourceJson}) => RustLib
-    .instance
-    .api
-    .crateApiWebdavCollectAudioFiles(sourceJson: sourceJson);
-
-/// 从 WebDAV 断点续传下载文件到本地路径。
-///
-/// 目标文件已存在部分字节时从断点继续（RANGE 请求）。
-Future<void> webdavDownloadFile({
-  required String sourceJson,
-  required String remotePath,
-  required String targetPath,
-}) => RustLib.instance.api.crateApiWebdavDownloadFile(
-  sourceJson: sourceJson,
-  remotePath: remotePath,
-  targetPath: targetPath,
-);
+/// 返回 `TvboxSubscription` JSON（camelCase：`sites[]`（含 `likelyAlist`/
+/// `baseUrl`）、`rootIsAlist`、`rootUrl`）。TVBox 配置含 `sites` 时返回站点
+/// 列表；地址本身是 Alist/OpenList 服务器时 `rootIsAlist=true` 可直接挂载。
+Future<String> tvboxFetchSites({required String configUrl}) =>
+    RustLib.instance.api.crateApiTvboxFetchSites(configUrl: configUrl);
 
 /// 提取音频文件内置的 ReplayGain 标签。
 ///
@@ -523,7 +511,7 @@ Future<String> getRemoteCacheUsage({required String cacheRoot}) =>
 Future<String> clearRemoteCache({required String cacheRoot}) =>
     RustLib.instance.api.crateApiClearRemoteCache(cacheRoot: cacheRoot);
 
-/// 解析远程音乐播放来源：已缓存返回本地路径，未缓存返回直链流。
+/// 解析远程音乐播放来源：已缓存返回本地路径，未缓存返回 Alist 直链流。
 ///
 /// 返回 `{"kind":"cached","path":...}` 或 `{"kind":"stream","url":...,...}` JSON。
 Future<String> remotePlaybackSource({
