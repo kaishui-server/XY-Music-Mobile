@@ -401,6 +401,13 @@ class AuthNotifier extends StateNotifier<AuthState> {
     );
     final j = jsonDecode(res) as Map<String, dynamic>;
     final code = (j['code'] as num?)?.toInt() ?? -1;
+    if (code == 401) {
+      // 登录态失效（token 过期/服务端重置）：清空本地登录态，
+      // 引导用户重新登录，避免后续请求持续 401。
+      await authClearCredentials(dataDir: dir);
+      state = AuthState();
+      throw AuthException('登录已过期，请重新登录');
+    }
     if (code != 200) {
       throw AuthException(
         (j['msg'] as String?)?.isNotEmpty == true

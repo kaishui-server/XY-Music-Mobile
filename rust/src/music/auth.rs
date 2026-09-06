@@ -188,6 +188,7 @@ pub struct AuthCredentials {
 ///
 /// 自动构造 URL：`{base_url}/?action={action}`，
 /// 生成 MD5 签名头（X-Timestamp / X-Nonce / X-Sign），
+/// 已登录时附带 `Authorization: Bearer <token>`（服务端用户级接口凭此鉴权），
 /// 返回完整的响应 JSON（`{ code, msg, data }`）。
 ///
 /// - `data_dir`：调用方传入的应用数据目录
@@ -201,14 +202,16 @@ pub async fn authed_request(
     let base_url = read_base_url(data_dir);
     let url = format!("{}/?action={}", base_url, action);
     let api_secret = read_api_secret(data_dir);
+    let bearer_token = read_token(data_dir);
 
-    do_signed_post(&url, &action, body, fetch_timeout_ms, &api_secret).await
+    do_signed_post(&url, &action, body, fetch_timeout_ms, &api_secret, bearer_token.as_deref()).await
 }
 
 /// 向任意 URL 发起带签名的 POST 请求（壁纸等非账号 API 端点）。
 ///
 /// 签名算法与 `authed_request` 完全一致：
 /// `sign = md5(timestamp + nonce + body + api_secret)`
+/// 已登录时同样附带 `Authorization: Bearer <token>`。
 pub async fn signed_post_json(
     data_dir: &Path,
     url: String,
@@ -216,16 +219,18 @@ pub async fn signed_post_json(
     fetch_timeout_ms: Option<u64>,
 ) -> Result<Value, String> {
     let api_secret = read_api_secret(data_dir);
-    do_signed_post(&url, "signedPostJson", body, fetch_timeout_ms, &api_secret).await
+    let bearer_token = read_token(data_dir);
+    do_signed_post(&url, "signedPostJson", body, fetch_timeout_ms, &api_secret, bearer_token.as_deref()).await
 }
 
-/// 内部：执行带签名的 POST 请求
+/// 内部：执行带签名的 POST 请求（已登录时附带 Bearer token）
 async fn do_signed_post(
     url: &str,
     action: &str,
     body: Value,
     fetch_timeout_ms: Option<u64>,
     api_secret: &str,
+    bearer_token: Option<&str>,
 ) -> Result<Value, String> {
     let body_str = serde_json::to_string(&body).unwrap_or_default();
     let headers = build_signed_headers(&body_str, api_secret);
@@ -234,14 +239,19 @@ async fn do_signed_post(
     let client = http_client().as_ref().map_err(|e| e.clone())?;
     let start = std::time::Instant::now();
 
-    let response = client
+    let mut request = client
         .post(url)
         .timeout(Duration::from_millis(timeout_ms))
         .header("Content-Type", "application/json")
         .header("X-Timestamp", &headers.timestamp)
         .header("X-Nonce", &headers.nonce)
         .header("X-Sign", &headers.sign)
-        .body(body_str)
+        .body(body_str);
+    if let Some(token) = bearer_token.filter(|t| !t.is_empty()) {
+        request = request.bearer_auth(token);
+    }
+
+    let response = request
         .send()
         .await
         .map_err(|e| {

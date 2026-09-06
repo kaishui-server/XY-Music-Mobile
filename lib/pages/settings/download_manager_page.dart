@@ -39,6 +39,12 @@ class _DownloadManagerPageState extends ConsumerState<DownloadManagerPage> {
   bool _selectionMode = false;
   final Set<String> _selectedIds = {};
 
+  /// 已完成记录的文件大小缓存（entry.id → 字节数，0 表示无可用大小）。
+  final Map<String, int> _fileSizes = {};
+
+  /// 正在读取文件大小的记录，防止重复 stat。
+  final Set<String> _fileSizeInFlight = {};
+
   @override
   void dispose() {
     _searchController.dispose();
@@ -91,6 +97,32 @@ class _DownloadManagerPageState extends ConsumerState<DownloadManagerPage> {
     return value >= 100 || unit == 0
         ? '${value.toStringAsFixed(0)} ${units[unit]}'
         : '${value.toStringAsFixed(1)} ${units[unit]}';
+  }
+
+  /// 为已完成记录读取实际文件大小：普通路径直接 stat；
+  /// SAF content:// 路径无法直接 stat，回退用下载时记录的 totalBytes
+  /// （封面/元数据内嵌前的体积，略有偏差但足够展示）。
+  void _ensureFileSize(DownloadHistoryEntry entry) {
+    if (entry.status != DownloadHistoryStatus.completed) return;
+    if (_fileSizes.containsKey(entry.id) ||
+        _fileSizeInFlight.contains(entry.id)) {
+      return;
+    }
+    _fileSizeInFlight.add(entry.id);
+    Future<int> resolve() async {
+      final path = entry.savedPath?.trim() ?? '';
+      if (path.isNotEmpty && !path.toLowerCase().startsWith('content://')) {
+        try {
+          return await File(path).length();
+        } catch (_) {}
+      }
+      return entry.totalBytes;
+    }
+
+    resolve().then((size) {
+      if (!mounted) return;
+      setState(() => _fileSizes[entry.id] = size);
+    }).whenComplete(() => _fileSizeInFlight.remove(entry.id));
   }
 
   String _qualityLabel(String quality) {
@@ -586,6 +618,11 @@ class _DownloadManagerPageState extends ConsumerState<DownloadManagerPage> {
         ? '${_qualityLabel(entry.quality)} → 实际 ${_qualityLabel(entry.actualQuality!)}'
         : _qualityLabel(entry.actualQuality ?? entry.quality);
     final selected = _selectedIds.contains(entry.id);
+    // 懒加载已完成记录的实际文件大小（结果写入缓存后重建展示）。
+    _ensureFileSize(entry);
+    final sizeBytes = entry.status == DownloadHistoryStatus.completed
+        ? _fileSizes[entry.id] ?? 0
+        : 0;
 
     return ListTile(
       contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
@@ -626,7 +663,12 @@ class _DownloadManagerPageState extends ConsumerState<DownloadManagerPage> {
         children: [
           const SizedBox(height: 2),
           Text(
-            '${entry.artist} · $qualityText · ${_formatTime(time)}',
+            [
+              entry.artist,
+              qualityText,
+              if (sizeBytes > 0) _formatBytes(sizeBytes),
+              _formatTime(time),
+            ].join(' · '),
             maxLines: 1,
             overflow: TextOverflow.ellipsis,
             style: TextStyle(
@@ -647,7 +689,16 @@ class _DownloadManagerPageState extends ConsumerState<DownloadManagerPage> {
                 ),
                 const SizedBox(width: 8),
                 Text(
-                  '${isPaused ? '已暂停 ' : ''}${entry.totalBytes > 0 ? '${(entry.progress * 100).toStringAsFixed(0)}%' : _formatBytes(entry.downloadedBytes)}',
+                  [
+                    if (isPaused) '已暂停',
+                    if (entry.totalBytes > 0)
+                      '${(entry.progress * 100).toStringAsFixed(0)}%'
+                    else
+                      _formatBytes(entry.downloadedBytes),
+                    // 下载中同时展示已下载/总大小，方便预估体积。
+                    if (entry.totalBytes > 0)
+                      '${_formatBytes(entry.downloadedBytes)} / ${_formatBytes(entry.totalBytes)}',
+                  ].join(' · '),
                   style: TextStyle(
                     fontSize: 11,
                     color: theme.colorScheme.onSurfaceVariant,

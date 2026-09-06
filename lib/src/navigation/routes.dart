@@ -13,6 +13,11 @@ import '../../pages/settings/download_manager_page.dart';
 import '../../pages/player/player_page.dart';
 import '../../pages/account/account_page.dart';
 import '../../pages/account/cloud_sync_page.dart';
+import '../../pages/account/cloud_data_page.dart';
+import '../../pages/account/cloud_data_playlists_page.dart';
+import '../../pages/account/cloud_data_favorites_page.dart';
+import '../../pages/account/cloud_data_plugins_page.dart';
+import '../../pages/account/cloud_data_user_page.dart';
 import '../../pages/statistics/statistics_page.dart';
 import '../../pages/settings/about_page.dart';
 import '../../pages/cloud/cloud_music_page.dart';
@@ -312,6 +317,55 @@ final appRouter = GoRouter(
                   path: 'cloud-sync',
                   pageBuilder: (context, state) =>
                       _instantPage(state, const CloudSyncPage()),
+                  routes: [
+                    GoRoute(
+                      path: 'cloud-data',
+                      pageBuilder: (context, state) =>
+                          _instantPage(state, const CloudDataPage()),
+                      routes: [
+                        GoRoute(
+                          path: 'playlists',
+                          pageBuilder: (context, state) => _instantPage(
+                            state,
+                            const CloudDataPlaylistsPage(),
+                          ),
+                          routes: [
+                            GoRoute(
+                              path: ':id',
+                              pageBuilder: (context, state) => _instantPage(
+                                state,
+                                CloudDataPlaylistDetailPage(
+                                  playlistId:
+                                      Uri.decodeComponent(state.pathParameters['id'] ?? ''),
+                                ),
+                              ),
+                            ),
+                          ],
+                        ),
+                        GoRoute(
+                          path: 'favorites',
+                          pageBuilder: (context, state) => _instantPage(
+                            state,
+                            const CloudDataFavoritesPage(),
+                          ),
+                        ),
+                        GoRoute(
+                          path: 'plugins',
+                          pageBuilder: (context, state) => _instantPage(
+                            state,
+                            const CloudDataPluginsPage(),
+                          ),
+                        ),
+                        GoRoute(
+                          path: 'user',
+                          pageBuilder: (context, state) => _instantPage(
+                            state,
+                            const CloudDataUserPage(),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ],
                 ),
               ],
             ),
