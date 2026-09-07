@@ -17,11 +17,16 @@ import '../plugins/plugin_runtime.dart';
 /// 反转 Base64 保存，避免上传时被网关误判为可执行脚本。下载时会自动
 /// 写入移动端插件目录，并恢复云端的启用状态和来源地址。
 class AccountPluginSync {
-  // v2：旧版本会在上传失败时错误保存哈希，升级后必须强制重试一次。
-  static const _lastHashPrefix = 'account_cloud_sync_plugins_hash_v2_';
+  // v3：v2 时期云端数据可能被清空（如管理端 clear_sync_data）而本地哈希
+  // 仍命中，导致插件永久不再上传；升级后强制重传一次重建云端快照。
+  static const _lastHashPrefix = 'account_cloud_sync_plugins_hash_v3_';
   static const _enabledKey = 'mobileEnabledPlugins';
   static const _sourceUrlsKey = 'mobilePluginSourceUrlsV1';
   static const _maxPluginBytes = 5 * 1024 * 1024;
+
+  /// 最近一次 plugin_sync_download 拿到的云端插件索引（id → 版本）。
+  /// sync() 会把它传给 uploadIfChanged，用于确认云端快照未被清空。
+  static Map<String, String>? _lastCloudPlugins;
 
   static String _key(String accountId) => '$_lastHashPrefix${accountId.trim()}';
 
@@ -31,7 +36,11 @@ class AccountPluginSync {
   ) async {
     // 先下载再上传，避免新设备的空插件目录覆盖云端已有插件。
     final downloaded = await download(auth, container);
-    final uploaded = await uploadIfChanged(auth, container);
+    final uploaded = await uploadIfChanged(
+      auth,
+      container,
+      cloudPlugins: _lastCloudPlugins,
+    );
     return PluginSyncResult(
       downloadedPlugins: downloaded.downloadedPlugins,
       uploadedPlugins: uploaded?.uploadedPlugins ?? 0,
@@ -42,14 +51,21 @@ class AccountPluginSync {
 
   static Future<PluginSyncResult?> uploadIfChanged(
     AuthNotifier auth,
-    ProviderContainer container,
-  ) async {
+    ProviderContainer container, {
+    Map<String, String>? cloudPlugins,
+  }) async {
     final accountId = _accountId(auth);
     final plugins = await _readLocalPlugins(container);
     final hash = _hash(plugins);
     final prefs = await SharedPreferences.getInstance();
     if (prefs.getString(_key(accountId)) == hash) {
-      return PluginSyncResult(noChange: true);
+      if (plugins.isEmpty) return PluginSyncResult(noChange: true);
+      // 自动同步路径（无云端快照可比对）或云端快照已覆盖全部本地插件时跳过；
+      // 云端数据被清空/回滚后，仅凭本地哈希会让上传永久跳过，
+      // 「查看云数据」将一直显示 0，因此云端缺失时强制重传。
+      if (cloudPlugins == null || _cloudCovers(cloudPlugins, plugins)) {
+        return PluginSyncResult(noChange: true);
+      }
     }
     final result = await _upload(auth, accountId, plugins);
     // 只有全部插件都成功上传后才记录哈希；部分失败时保留重试机会，
@@ -59,6 +75,16 @@ class AccountPluginSync {
     }
     return result;
   }
+
+  /// 云端快照是否已包含全部本地插件（按 id + 版本号比对）。
+  static bool _cloudCovers(
+    Map<String, String> cloudPlugins,
+    List<Map<String, dynamic>> local,
+  ) => local.every((plugin) {
+    final id = plugin['id']?.toString() ?? '';
+    if (id.isEmpty) return false;
+    return cloudPlugins[id] == (plugin['version']?.toString() ?? '0');
+  });
 
   static Future<PluginSyncResult> upload(
     AuthNotifier auth,
@@ -112,7 +138,16 @@ class AccountPluginSync {
       'user_id': accountId,
     }, fetchTimeoutMs: 60000);
     final raw = data['plugins'];
-    if (raw is! List || raw.isEmpty) return result;
+    if (raw is! List || raw.isEmpty) {
+      _lastCloudPlugins = const <String, String>{};
+      return result;
+    }
+    // 记录云端插件索引，供 uploadIfChanged 校验云端快照覆盖情况。
+    _lastCloudPlugins = {
+      for (final value in raw.whereType<Map>())
+        if (value['id'] != null)
+          value['id'].toString(): value['version']?.toString() ?? '0',
+    };
 
     final dataDir = await container.read(appDataDirProvider.future);
     final pluginDir = Directory(p.join(dataDir, 'plugins'));

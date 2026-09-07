@@ -2,9 +2,11 @@ import 'dart:async';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:go_router/go_router.dart';
 
 import '../../src/auth/auth_provider.dart';
 import '../../src/favorites/favorites_provider.dart';
+import '../../src/player/player_provider.dart';
 import '../../src/playlists/playlists_provider.dart';
 import '../../src/sync/account_cloud_sync.dart';
 import '../../src/widgets/top_notice.dart';
@@ -143,12 +145,22 @@ class _CloudSyncPageState extends ConsumerState<CloudSyncPage> {
   @override
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
+    // 悬浮迷你播放栏高 64 + 距底 20：有播放时底部多留空间，避免末尾
+    // 的「查看云数据」卡片被底栏遮住；无播放时保持原有紧凑留白。
+    final hasPlayback = ref.watch(
+      playerProvider.select((state) => state.current != null),
+    );
     return Scaffold(
       appBar: AppBar(leading: const BackButton(), title: const Text('账号云同步')),
       body: _loading
           ? const Center(child: CircularProgressIndicator())
           : ListView(
-              padding: const EdgeInsets.fromLTRB(16, 20, 16, 32),
+              padding: EdgeInsets.only(
+                left: 16,
+                top: 20,
+                right: 16,
+                bottom: MediaQuery.paddingOf(context).bottom + (hasPlayback ? 104 : 32),
+              ),
               children: [
                 Container(
                   padding: const EdgeInsets.all(18),
@@ -219,6 +231,39 @@ class _CloudSyncPageState extends ConsumerState<CloudSyncPage> {
                     _syncing
                         ? '同步中…'
                         : (_cooldown > 0 ? '请等待 $_cooldown 秒' : '立即手动同步'),
+                  ),
+                ),
+                const SizedBox(height: 28),
+                const Text(
+                  '云数据',
+                  style: TextStyle(fontSize: 17, fontWeight: FontWeight.w700),
+                ),
+                const SizedBox(height: 8),
+                Text(
+                  '查看当前账号在云端保存的歌单、收藏、插件和账号信息。',
+                  style: TextStyle(color: scheme.onSurfaceVariant),
+                ),
+                const SizedBox(height: 14),
+                Card(
+                  margin: EdgeInsets.zero,
+                  elevation: 0,
+                  color: scheme.surfaceContainerLow,
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(14),
+                  ),
+                  child: ListTile(
+                    onTap: () =>
+                        context.push('/account/cloud-sync/cloud-data'),
+                    leading: Icon(Icons.manage_search, color: scheme.primary),
+                    title: const Text(
+                      '查看云数据',
+                      style: TextStyle(fontWeight: FontWeight.w600),
+                    ),
+                    subtitle: const Text('歌单 · 收藏 · 插件 · 用户'),
+                    trailing: Icon(
+                      Icons.chevron_right,
+                      color: scheme.onSurfaceVariant,
+                    ),
                   ),
                 ),
               ],
