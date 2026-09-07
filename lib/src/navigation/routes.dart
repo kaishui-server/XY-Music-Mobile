@@ -16,6 +16,7 @@ import '../../pages/account/cloud_sync_page.dart';
 import '../../pages/statistics/statistics_page.dart';
 import '../../pages/settings/about_page.dart';
 import '../../pages/cloud/cloud_music_page.dart';
+import '../../pages/cloud/cloud_browser_page.dart';
 import '../../pages/settings/plugins_page.dart';
 import '../../pages/settings/scan_folders_page.dart';
 import '../../pages/settings/logs_page.dart';
@@ -127,6 +128,17 @@ final appRouter = GoRouter(
               path: '/cloud-music',
               pageBuilder: (context, state) =>
                   _instantPage(state, const CloudMusicPage()),
+              routes: [
+                GoRoute(
+                  path: 'browse/:sourceId',
+                  pageBuilder: (context, state) => _instantPage(
+                    state,
+                    CloudBrowserPage(
+                      sourceId: state.pathParameters['sourceId']!,
+                    ),
+                  ),
+                ),
+              ],
             ),
             GoRoute(
               path: '/local-music',

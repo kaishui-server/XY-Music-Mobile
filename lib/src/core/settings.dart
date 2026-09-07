@@ -19,13 +19,13 @@ const kSidebarHome = 'home';
 const kSidebarExplore = 'explore';
 const kSidebarLocalMusic = 'localMusic';
 const kSidebarCloudMusic = 'cloudMusic';
-const kSidebarLibrary = 'library';
 const kSidebarFavorites = 'favorites';
 const kSidebarRecent = 'recent';
 const kSidebarPlugins = 'plugins';
 const kSidebarAccount = 'account';
 const kSidebarRecognize = 'recognize';
 const kSidebarPlaylists = 'playlists';
+const kSidebarDownloads = 'downloads';
 const kSidebarSettings = 'settings';
 
 const kDefaultSidebarItemOrder = <String>[
@@ -33,13 +33,13 @@ const kDefaultSidebarItemOrder = <String>[
   kSidebarExplore,
   kSidebarLocalMusic,
   kSidebarCloudMusic,
-  kSidebarLibrary,
   kSidebarFavorites,
   kSidebarRecent,
   kSidebarPlugins,
   kSidebarAccount,
   kSidebarRecognize,
   kSidebarPlaylists,
+  kSidebarDownloads,
   kSidebarSettings,
 ];
 
@@ -124,6 +124,7 @@ class AppSettings {
     this.sidebarHiddenItems = const <String>[],
     this.bottomBarEnabled = false,
     this.bottomBarItemIds = const <String>[],
+    this.bottomBarShowLabels = true,
     this.customBackgroundPath = '',
     this.customBackgroundBlur = 18.0,
     this.playerDetailCustomImagePath = '',
@@ -175,6 +176,9 @@ class AppSettings {
 
   /// 底栏展示的目的地 id（顺序即显示顺序，2-5 个）。
   final List<String> bottomBarItemIds;
+
+  /// 底栏是否显示条目文字；关闭后仅显示图标（紧凑样式）。
+  final bool bottomBarShowLabels;
   final String customBackgroundPath;
   final double customBackgroundBlur;
   final String playerDetailCustomImagePath;
@@ -227,6 +231,7 @@ class AppSettings {
     List<String>? sidebarHiddenItems,
     bool? bottomBarEnabled,
     List<String>? bottomBarItemIds,
+    bool? bottomBarShowLabels,
     String? customBackgroundPath,
     double? customBackgroundBlur,
     String? playerDetailCustomImagePath,
@@ -275,6 +280,7 @@ class AppSettings {
       sidebarHiddenItems: sidebarHiddenItems ?? this.sidebarHiddenItems,
       bottomBarEnabled: bottomBarEnabled ?? this.bottomBarEnabled,
       bottomBarItemIds: bottomBarItemIds ?? this.bottomBarItemIds,
+      bottomBarShowLabels: bottomBarShowLabels ?? this.bottomBarShowLabels,
       customBackgroundPath: customBackgroundPath ?? this.customBackgroundPath,
       customBackgroundBlur: customBackgroundBlur ?? this.customBackgroundBlur,
       playerDetailCustomImagePath:
@@ -355,6 +361,7 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
       bottomBarItemIds: normalizeBottomBarItemIds(
         prefs.getStringList('bottomBarItemIds') ?? const [],
       ),
+      bottomBarShowLabels: prefs.getBool('bottomBarShowLabels') ?? true,
       customBackgroundPath: prefs.getString('customBackgroundPath') ?? '',
       customBackgroundBlur: prefs.getDouble('customBackgroundBlur') ?? 18.0,
       playerDetailCustomImagePath:
@@ -486,6 +493,7 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
       prefs.setStringList('sidebarHiddenItems', next.sidebarHiddenItems),
       prefs.setBool('bottomBarEnabled', next.bottomBarEnabled),
       prefs.setStringList('bottomBarItemIds', next.bottomBarItemIds),
+      prefs.setBool('bottomBarShowLabels', next.bottomBarShowLabels),
       prefs.setString('customBackgroundPath', next.customBackgroundPath),
       prefs.setDouble('customBackgroundBlur', next.customBackgroundBlur),
       prefs.setString(
@@ -620,6 +628,13 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
       ),
     );
   }
+
+  /// 底栏条目文字显示开关：关闭后底栏仅显示图标。
+  Future<void> setBottomBarShowLabels(bool value) => _save(
+    (state.valueOrNull ?? const AppSettings()).copyWith(
+      bottomBarShowLabels: value,
+    ),
+  );
 
   Future<void> setCustomBackgroundPath(String path) => _save(
     (state.valueOrNull ?? const AppSettings()).copyWith(

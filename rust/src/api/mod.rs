@@ -380,6 +380,30 @@ pub async fn tvbox_fetch_sites(config_url: String) -> Result<String, String> {
     serde_json::to_string(&subscription).map_err(|e| e.to_string())
 }
 
+/// 按数据库中保存的凭据浏览远程网盘目录（云端音乐文件浏览器）。
+///
+/// - `source_id`：已保存的远程源 id
+/// - `path`：相对源根目录的路径（如 `/`）
+///
+/// 与 [`alist_list_directory`] 不同，本接口从数据库读取源凭据（含密码），
+/// 无需调用方回传密码。返回 [`RemoteFileEntry`] 数组 JSON（camelCase，
+/// 含 `remotePath`/`name`/`size`/`isDir`）。
+pub async fn remote_browse_directory(
+    db_path: String,
+    source_id: String,
+    path: String,
+) -> Result<String, String> {
+    // 查库在块作用域内同步完成并 drop 连接，避免非 Sync 的 Connection
+    // 跨 await 导致 future 非 Send。
+    let source = {
+        let conn = open_scan_conn(&db_path)?;
+        crate::remote::repository::get_source(&conn, &source_id)?
+    };
+    let client = crate::remote::alist::shared_client();
+    let entries = crate::remote::alist::list_directory(&client, &source, &path).await?;
+    serde_json::to_string(&entries).map_err(|e| e.to_string())
+}
+
 // =========================================================================
 // 响度归一化（第四批）
 // =========================================================================

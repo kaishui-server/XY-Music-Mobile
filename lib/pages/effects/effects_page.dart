@@ -100,7 +100,13 @@ class _EqualizerView extends ConsumerWidget {
   Widget build(BuildContext context, WidgetRef ref) {
     final notifier = ref.read(effectsProvider.notifier);
     return ListView(
-      padding: const EdgeInsets.fromLTRB(16, 0, 16, 90),
+      // 悬浮元素遮挡高度已注入 MediaQuery.padding。
+      padding: EdgeInsets.fromLTRB(
+        16,
+        0,
+        16,
+        MediaQuery.paddingOf(context).bottom + 16,
+      ),
       children: [
         _GlassCard(
           child: Row(
@@ -268,7 +274,13 @@ class _SpatialEffectsView extends ConsumerWidget {
   Widget build(BuildContext context, WidgetRef ref) {
     final notifier = ref.read(effectsProvider.notifier);
     return ListView(
-      padding: const EdgeInsets.fromLTRB(16, 0, 16, 90),
+      // 悬浮元素遮挡高度已注入 MediaQuery.padding。
+      padding: EdgeInsets.fromLTRB(
+        16,
+        0,
+        16,
+        MediaQuery.paddingOf(context).bottom + 16,
+      ),
       children: [
         Text(
           '快捷音效',

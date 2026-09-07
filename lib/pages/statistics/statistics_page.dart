@@ -129,7 +129,13 @@ class _StatisticsContent extends StatelessWidget {
             .map((value) => (value as num).toDouble())
             .toList();
     return ListView(
-      padding: const EdgeInsets.fromLTRB(16, 6, 16, 28),
+      // 悬浮元素遮挡高度已注入 MediaQuery.padding。
+      padding: EdgeInsets.fromLTRB(
+        16,
+        6,
+        16,
+        MediaQuery.paddingOf(context).bottom + 24,
+      ),
       children: [
         Container(
           padding: const EdgeInsets.all(18),

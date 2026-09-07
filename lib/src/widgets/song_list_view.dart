@@ -309,26 +309,30 @@ class _SongsListViewState extends ConsumerState<SongsListView> {
                                 ),
                               ),
                             ),
-                            // 来源插件名标签（参考 MusicFree）放在副行末尾。
-                            if (sourceTag != null)
-                              Padding(
-                                padding: const EdgeInsets.only(left: 6),
-                                child: _SourceTag(label: sourceTag),
-                              ),
                           ],
                         ),
                       ],
                     ),
                   ),
                   const SizedBox(width: 8),
-                  Text(
-                    _fmt(s.duration),
-                    style: TextStyle(
-                      fontSize: 11,
-                      color: Theme.of(
-                        context,
-                      ).colorScheme.onSurfaceVariant.withValues(alpha: .65),
-                    ),
+                  // 来源插件名标签（参考 MusicFree）置于时长上端、右对齐，
+                  // 与时长组成右侧纵向小列，不再挤压副标题行。
+                  Column(
+                    mainAxisSize: MainAxisSize.min,
+                    crossAxisAlignment: CrossAxisAlignment.end,
+                    children: [
+                      if (sourceTag != null) _SourceTag(label: sourceTag),
+                      const SizedBox(height: 2),
+                      Text(
+                        _fmt(s.duration),
+                        style: TextStyle(
+                          fontSize: 11,
+                          color: Theme.of(
+                            context,
+                          ).colorScheme.onSurfaceVariant.withValues(alpha: .65),
+                        ),
+                      ),
+                    ],
                   ),
                   if (!widget.selectionMode && widget.showFavoriteButton)
                     IconButton(

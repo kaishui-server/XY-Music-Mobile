@@ -154,7 +154,13 @@ class _ExploreHotChartsSection extends ConsumerWidget {
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     return Padding(
-      padding: const EdgeInsets.fromLTRB(16, 0, 16, 110),
+      // 探索页最后一个区块：底部读取注入的悬浮元素遮挡高度。
+      padding: EdgeInsets.fromLTRB(
+        16,
+        0,
+        16,
+        MediaQuery.paddingOf(context).bottom + 20,
+      ),
       child: XyPanel(
         padding: const EdgeInsets.fromLTRB(14, 8, 14, 14),
         blurSigma: 14,
@@ -449,7 +455,13 @@ class _RecommendationFullSongsState
               children: [
                 ListView(
                   controller: _controller,
-                  padding: const EdgeInsets.fromLTRB(16, 14, 16, 110),
+                  // 悬浮元素遮挡高度已注入 MediaQuery.padding。
+                  padding: EdgeInsets.fromLTRB(
+                    16,
+                    14,
+                    16,
+                    MediaQuery.paddingOf(context).bottom + 20,
+                  ),
                   children: [
                     _RecommendationList(songs: shown),
                     if (shown.length < songs.length && shown.length < 150)
@@ -519,7 +531,13 @@ class _RecommendationFullPlaylistsState
               children: [
                 ListView(
                   controller: _controller,
-                  padding: const EdgeInsets.fromLTRB(16, 14, 16, 110),
+                  // 悬浮元素遮挡高度已注入 MediaQuery.padding。
+                  padding: EdgeInsets.fromLTRB(
+                    16,
+                    14,
+                    16,
+                    MediaQuery.paddingOf(context).bottom + 20,
+                  ),
                   children: [
                     _RecommendationPlaylistList(playlists: shown),
                     if (shown.length < playlists.length && shown.length < 150)
@@ -1073,7 +1091,13 @@ class _RecommendedPlaylistPageState
               children: [
                 ListView(
                   controller: _songsController,
-                  padding: const EdgeInsets.fromLTRB(16, 14, 16, 110),
+                  // 悬浮元素遮挡高度已注入 MediaQuery.padding。
+                  padding: EdgeInsets.fromLTRB(
+                    16,
+                    14,
+                    16,
+                    MediaQuery.paddingOf(context).bottom + 20,
+                  ),
                   children: [
                     _RemotePlaylistHeroHeader(
                       playlist: widget.playlist,
@@ -1207,6 +1231,7 @@ Future<void> _addSongsToLocalPlaylist(
 ) async {
   final target = await showModalBottomSheet<String>(
     context: context,
+    useRootNavigator: true,
     isScrollControlled: true,
     useSafeArea: true,
     showDragHandle: true,

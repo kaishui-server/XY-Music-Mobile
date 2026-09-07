@@ -89,15 +89,10 @@ String _displayLinesToLrc(dynamic payload) {
 
 enum _PlayerMenuAction {
   share,
-  download,
-  quality,
   playlist,
   linkLyrics,
   sleepTimer,
   playbackSpeed,
-  toggleDesktopLyrics,
-  playVideo,
-  playMv,
 }
 
 enum _LyricsSourceAction { plugin, local, cancel }
@@ -245,7 +240,6 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
   String? _videoSongPath;
   bool _videoLoading = false;
   bool _videoClosing = false;
-  bool _videoIsMv = false;
   bool _resumeAudioAfterVideo = false;
   /// MV 横屏播放开关：开启后锁定横向屏幕方向，关闭或退出视频时恢复。
   bool _videoLandscape = false;
@@ -291,7 +285,6 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
     _videoController = VideoPlaybackSession.controller;
     _videoSongPath = VideoPlaybackSession.songPath;
     _videoLoading = VideoPlaybackSession.loading;
-    _videoIsMv = VideoPlaybackSession.isMv;
     _resumeAudioAfterVideo = VideoPlaybackSession.resumeAudioAfterVideo;
     _videoError = VideoPlaybackSession.error;
     VideoPlaybackSession.revision.addListener(_syncVideoSession);
@@ -326,7 +319,6 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
         _videoSongPath = null;
         _videoError = null;
         _videoLoading = false;
-        _videoIsMv = false;
         _resumeAudioAfterVideo = false;
       }
       if (mounted && !_videoClosing) setState(() {});
@@ -533,7 +525,6 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
       _videoSongPath = item.path;
       _videoLoading = true;
       _videoClosing = false;
-      _videoIsMv = isMv;
       _resumeAudioAfterVideo = resumeAudio;
       _videoError = null;
     });
@@ -616,7 +607,6 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
       setState(() {
         _videoSongPath = null;
         _videoLoading = false;
-        _videoIsMv = false;
         _videoError = errorText;
       });
       VideoPlaybackSession.songPath = null;
@@ -659,7 +649,6 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
     _videoSongPath = null;
     _videoLoading = false;
     _videoError = null;
-    _videoIsMv = false;
     _resumeAudioAfterVideo = false;
     VideoPlaybackSession.songPath = null;
     VideoPlaybackSession.controller = null;
@@ -709,23 +698,14 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
   }
 
   /// 更多菜单：居中弹窗（参考弦予音乐歌词调节弹窗的单弹窗多面板设计）。
-  /// 主菜单 + 歌词字号/歌词偏移子面板在同一弹窗内经 setState 切换，
-  /// 避免「先 pop 再 push」的路由叠换白屏；其余条目 pop 后走原有流程。
-  /// MV 可用性复用歌手名旁按钮的缓存判定（_mvButtonVisible），
-  /// 保证菜单项与按钮显隐一致。
+  /// 主菜单 + 歌词偏移子面板在同一弹窗内经 setState 切换，避免「先 pop 再
+  /// push」的路由叠换白屏；其余条目 pop 后走原有流程。
+  /// 下载/音质/字号/桌面歌词/MV 等播放页已有专属按钮的功能不在此重复。
   Future<void> _showMoreMenu(QueueItem item) async {
-    final isLocalSong =
-        playbackSourceTypeFor(item) == PlaybackSourceType.localFile;
     final action = await showDialog<_PlayerMenuAction>(
       context: context,
       useRootNavigator: true,
       builder: (dialogContext) => _PlayerMoreMenuDialog(
-        item: item,
-        isLocalSong: isLocalSong,
-        mvAvailable: _mvButtonVisible(item),
-        videoActive: _videoSongPath == item.path,
-        videoIsMv: _videoIsMv,
-        videoLoading: _videoLoading,
         initialOffsetTenths: _lyricsOffsetTenths,
         onApplyOffset: (tenths) =>
             unawaited(_applyLyricsOffset(item, tenths)),
@@ -735,10 +715,6 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
     switch (action) {
       case _PlayerMenuAction.share:
         await _showShareSheet(item);
-      case _PlayerMenuAction.download:
-        await _downloadCurrent(item);
-      case _PlayerMenuAction.quality:
-        await _pickPlaybackQuality();
       case _PlayerMenuAction.playlist:
         await _addToPlaylist(item);
       case _PlayerMenuAction.linkLyrics:
@@ -747,20 +723,6 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
         await _pickSleepTimer();
       case _PlayerMenuAction.playbackSpeed:
         await _pickPlaybackSpeed();
-      case _PlayerMenuAction.toggleDesktopLyrics:
-        await _toggleDesktopLyrics();
-      case _PlayerMenuAction.playVideo:
-        if (_videoSongPath == item.path) {
-          await _closeBilibiliVideo();
-        } else {
-          await _startBilibiliVideo(item);
-        }
-      case _PlayerMenuAction.playMv:
-        if (_videoSongPath == item.path) {
-          await _closeBilibiliVideo();
-        } else {
-          await _startBilibiliVideo(item, isMv: true);
-        }
     }
   }
 
@@ -2764,31 +2726,18 @@ class _QualitySelectorState extends State<_QualitySelector> {
   }
 }
 
-/// 更多菜单弹窗的子面板：main 主菜单，fontSize/offset 为内嵌子面板。
-enum _MoreMenuPanel { main, fontSize, offset }
+/// 更多菜单弹窗的子面板：main 主菜单，offset 为内嵌子面板。
+enum _MoreMenuPanel { main, offset }
 
 /// 播放页更多菜单弹窗：参考弦予音乐歌词调节弹窗的单弹窗多面板设计。
-/// 主菜单与歌词字号/歌词偏移子面板在同一弹窗内经 setState 切换
-/// （子面板左上角返回箭头回主菜单），避免「先 pop 再 push 新弹窗」
-/// 造成切换瞬间的白屏盖屏。字号/偏移调节实时生效，无需确认按钮。
+/// 主菜单与歌词偏移子面板在同一弹窗内经 setState 切换（子面板左上角
+/// 返回箭头回主菜单），避免「先 pop 再 push 新弹窗」造成切换瞬间的
+/// 白屏盖屏。偏移调节实时生效，无需确认按钮。
 class _PlayerMoreMenuDialog extends ConsumerStatefulWidget {
   const _PlayerMoreMenuDialog({
-    required this.item,
-    required this.isLocalSong,
-    required this.mvAvailable,
-    required this.videoActive,
-    required this.videoIsMv,
-    required this.videoLoading,
     required this.initialOffsetTenths,
     required this.onApplyOffset,
   });
-
-  final QueueItem item;
-  final bool isLocalSong;
-  final bool mvAvailable;
-  final bool videoActive;
-  final bool videoIsMv;
-  final bool videoLoading;
   final int initialOffsetTenths;
 
   /// 偏移子面板每次变动的实时应用回调（由宿主页面静默保存）。
@@ -2813,14 +2762,15 @@ class _PlayerMoreMenuDialogState extends ConsumerState<_PlayerMoreMenuDialog> {
   @override
   Widget build(BuildContext context) {
     return Dialog(
-      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(24)),
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(22)),
+      // 菜单条目已精简（重复功能砍去），放宽最大宽度并放大字号，
+      // 小屏机型仍无需滚动即可读完整部菜单。
       child: ConstrainedBox(
-        constraints: const BoxConstraints(maxWidth: 360),
+        constraints: const BoxConstraints(maxWidth: 340),
         child: SingleChildScrollView(
-          padding: const EdgeInsets.fromLTRB(20, 18, 20, 14),
+          padding: const EdgeInsets.fromLTRB(14, 12, 14, 10),
           child: switch (_panel) {
             _MoreMenuPanel.main => _buildMain(context),
-            _MoreMenuPanel.fontSize => _buildFontSize(context),
             _MoreMenuPanel.offset => _buildOffset(context),
           },
         ),
@@ -2829,40 +2779,49 @@ class _PlayerMoreMenuDialogState extends ConsumerState<_PlayerMoreMenuDialog> {
   }
 
   /// 子面板标题行：返回箭头 + 标题（偏移面板右侧附「重置」）。
+  /// 固定高度的标题行 + 定宽返回按钮，保证箭头与标题垂直居中对齐。
   Widget _panelHeader(
     BuildContext context,
     String title, {
     Widget? trailing,
   }) {
     final scheme = Theme.of(context).colorScheme;
-    return Row(
-      children: [
-        IconButton(
-          visualDensity: VisualDensity.compact,
-          padding: EdgeInsets.zero,
-          constraints: const BoxConstraints(),
-          icon: Icon(
-            Icons.arrow_back_ios_new_rounded,
-            size: 18,
-            color: scheme.onSurfaceVariant,
+    return SizedBox(
+      height: 32,
+      child: Row(
+        children: [
+          SizedBox(
+            width: 32,
+            height: 32,
+            child: IconButton(
+              visualDensity: VisualDensity.compact,
+              padding: EdgeInsets.zero,
+              constraints: const BoxConstraints(),
+              icon: const Icon(
+                Icons.arrow_back_ios_new_rounded,
+                size: 15,
+              ),
+              color: scheme.onSurfaceVariant,
+              onPressed: () => setState(() => _panel = _MoreMenuPanel.main),
+            ),
           ),
-          onPressed: () => setState(() => _panel = _MoreMenuPanel.main),
-        ),
-        const SizedBox(width: 4),
-        Text(
-          title,
-          style: TextStyle(
-            fontSize: 15,
-            fontWeight: FontWeight.w600,
-            color: scheme.onSurface,
+          const SizedBox(width: 2),
+          Text(
+            title,
+            style: TextStyle(
+              fontSize: 16,
+              fontWeight: FontWeight.w600,
+              color: scheme.onSurface,
+            ),
           ),
-        ),
-        if (trailing != null) ...[const Spacer(), trailing],
-      ],
+          if (trailing != null) ...[const Spacer(), trailing],
+        ],
+      ),
     );
   }
 
-  /// 主菜单条目行：图标 + 标题 + 当前值 + 右箭头（弦予菜单行样式）。
+  /// 主菜单条目行：图标 + 标题 + 当前值（弦予菜单行样式，无右箭头）。
+  /// 条目精简后放大字号与行距，保证小屏机型一屏读完。
   Widget _menuRow(
     BuildContext context, {
     required IconData icon,
@@ -2875,18 +2834,18 @@ class _PlayerMoreMenuDialogState extends ConsumerState<_PlayerMoreMenuDialog> {
       onTap: onTap,
       borderRadius: BorderRadius.circular(10),
       child: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 11),
+        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 9),
         child: Row(
           children: [
             Icon(icon, size: 20, color: scheme.onSurfaceVariant),
-            const SizedBox(width: 12),
+            const SizedBox(width: 11),
             Flexible(
               child: Text(
                 title,
                 maxLines: 1,
                 overflow: TextOverflow.ellipsis,
                 style: TextStyle(
-                  fontSize: 14,
+                  fontSize: 15,
                   fontWeight: FontWeight.w600,
                   color: scheme.onSurface,
                 ),
@@ -2904,11 +2863,6 @@ class _PlayerMoreMenuDialogState extends ConsumerState<_PlayerMoreMenuDialog> {
                   ),
                 ),
               ),
-            Icon(
-              Icons.chevron_right_rounded,
-              size: 20,
-              color: scheme.outline,
-            ),
           ],
         ),
       ),
@@ -2917,15 +2871,12 @@ class _PlayerMoreMenuDialogState extends ConsumerState<_PlayerMoreMenuDialog> {
 
   Widget _buildMain(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
-    final settings = ref.watch(settingsProvider).valueOrNull;
     final sleepTimerEndsAt = ref.watch(
       playerProvider.select((state) => state.sleepTimerEndsAt),
     );
     final playbackSpeed = ref.watch(
       playerProvider.select((state) => state.playbackSpeed),
     );
-    final item = widget.item;
-    final desktopLyricsEnabled = settings?.desktopLyricsEnabled == true;
 
     Widget popRow(_PlayerMenuAction action, IconData icon, String title,
             {String? value}) =>
@@ -2941,29 +2892,19 @@ class _PlayerMoreMenuDialogState extends ConsumerState<_PlayerMoreMenuDialog> {
       mainAxisSize: MainAxisSize.min,
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        Text(
-          '更多操作',
-          style: TextStyle(
-            fontSize: 15,
-            fontWeight: FontWeight.w600,
-            color: scheme.onSurface,
+        Padding(
+          padding: const EdgeInsets.only(left: 6),
+          child: Text(
+            '更多操作',
+            style: TextStyle(
+              fontSize: 16,
+              fontWeight: FontWeight.w600,
+              color: scheme.onSurface,
+            ),
           ),
         ),
-        const SizedBox(height: 8),
+        const SizedBox(height: 6),
         popRow(_PlayerMenuAction.share, Icons.share_outlined, '分享'),
-        if (!widget.isLocalSong) ...[
-          popRow(
-            _PlayerMenuAction.download,
-            Icons.download_rounded,
-            '下载',
-          ),
-          popRow(
-            _PlayerMenuAction.quality,
-            Icons.high_quality_rounded,
-            '选择音质',
-            value: _qualityLabel(settings?.onlineDefaultQuality ?? '320k'),
-          ),
-        ],
         popRow(
           _PlayerMenuAction.playlist,
           Icons.playlist_add_rounded,
@@ -2977,13 +2918,6 @@ class _PlayerMoreMenuDialogState extends ConsumerState<_PlayerMoreMenuDialog> {
           value: lyricsOffsetLabel(_offsetTenths),
           onTap: () => setState(() => _panel = _MoreMenuPanel.offset),
         ),
-        _menuRow(
-          context,
-          icon: Icons.format_size_rounded,
-          title: '歌词字号',
-          value: (settings?.lyricFontSize ?? 18).toStringAsFixed(0),
-          onTap: () => setState(() => _panel = _MoreMenuPanel.fontSize),
-        ),
         popRow(
           _PlayerMenuAction.sleepTimer,
           Icons.timer_outlined,
@@ -2995,119 +2929,6 @@ class _PlayerMoreMenuDialogState extends ConsumerState<_PlayerMoreMenuDialog> {
           Icons.speed_rounded,
           '倍速',
           value: '${_formatPlaybackSpeed(playbackSpeed)}x',
-        ),
-        popRow(
-          _PlayerMenuAction.toggleDesktopLyrics,
-          desktopLyricsEnabled
-              ? Icons.desktop_access_disabled_outlined
-              : Icons.desktop_windows_outlined,
-          desktopLyricsEnabled ? '关闭桌面歌词' : '开启桌面歌词',
-        ),
-        if (widget.mvAvailable)
-          popRow(
-            _isBilibiliQueueItem(item)
-                ? _PlayerMenuAction.playVideo
-                : _PlayerMenuAction.playMv,
-            widget.videoActive
-                ? Icons.stop_circle_outlined
-                : Icons.ondemand_video_outlined,
-            widget.videoActive
-                ? (widget.videoIsMv ? '关闭MV' : '关闭视频')
-                : (_isBilibiliQueueItem(item) ? '播放视频' : '播放MV'),
-            value: widget.videoLoading ? '解析中' : null,
-          ),
-      ],
-    );
-  }
-
-  /// 歌词字号子面板：滑杆实时调节（歌词与迷你歌词共用）+ 效果预览。
-  Widget _buildFontSize(BuildContext context) {
-    final scheme = Theme.of(context).colorScheme;
-    final notifier = ref.read(settingsProvider.notifier);
-    final value = ref.watch(
-          settingsProvider.select(
-            (state) => state.valueOrNull?.lyricFontSize,
-          ),
-        ) ??
-        18.0;
-    return Column(
-      mainAxisSize: MainAxisSize.min,
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        _panelHeader(context, '歌词字号'),
-        const SizedBox(height: 6),
-        Row(
-          children: [
-            Icon(Icons.format_size_rounded, size: 18, color: scheme.outline),
-            const SizedBox(width: 8),
-            Text(
-              '歌词与迷你歌词共用同一字号',
-              style: TextStyle(fontSize: 11, color: scheme.outline),
-            ),
-            const Spacer(),
-            Text(
-              value.toStringAsFixed(0),
-              style: TextStyle(
-                fontSize: 15,
-                fontWeight: FontWeight.w700,
-                color: scheme.primary,
-              ),
-            ),
-          ],
-        ),
-        Slider(
-          value: value.clamp(12.0, 32.0),
-          min: 12,
-          max: 32,
-          divisions: 20,
-          label: value.toStringAsFixed(0),
-          onChanged: (next) {
-            notifier.setLyricFontSize(next);
-            notifier.setMiniLyricFontSize(next);
-          },
-        ),
-        const SizedBox(height: 2),
-        Container(
-          padding: const EdgeInsets.symmetric(vertical: 14, horizontal: 16),
-          decoration: BoxDecoration(
-            color: scheme.surfaceContainerHighest.withValues(alpha: .5),
-            borderRadius: BorderRadius.circular(14),
-          ),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: [
-              Text(
-                '正在播放的歌词行',
-                textAlign: TextAlign.center,
-                style: TextStyle(
-                  fontSize: math.min(32, value + 6),
-                  height: 1.3,
-                  fontWeight: FontWeight.w800,
-                  color: scheme.onSurface,
-                ),
-              ),
-              const SizedBox(height: 6),
-              Text(
-                '其他歌词行',
-                textAlign: TextAlign.center,
-                style: TextStyle(
-                  fontSize: value,
-                  height: 1.3,
-                  fontWeight: FontWeight.w600,
-                  color: scheme.onSurface.withValues(alpha: .45),
-                ),
-              ),
-              const SizedBox(height: 5),
-              Text(
-                '翻译歌词行',
-                textAlign: TextAlign.center,
-                style: TextStyle(
-                  fontSize: (value - 5).clamp(10.0, 26.0),
-                  color: scheme.onSurface.withValues(alpha: .4),
-                ),
-              ),
-            ],
-          ),
         ),
       ],
     );
@@ -3127,13 +2948,18 @@ class _PlayerMoreMenuDialogState extends ConsumerState<_PlayerMoreMenuDialog> {
             onPressed: _offsetTenths == 0
                 ? null
                 : () => _changeOffset(-_offsetTenths),
-            child: const Text('重置'),
+            style: TextButton.styleFrom(
+              visualDensity: VisualDensity.compact,
+              minimumSize: const Size(0, 32),
+              padding: const EdgeInsets.symmetric(horizontal: 10),
+            ),
+            child: const Text('重置', style: TextStyle(fontSize: 12)),
           ),
         ),
-        const SizedBox(height: 6),
+        const SizedBox(height: 4),
         Container(
           width: double.infinity,
-          padding: const EdgeInsets.symmetric(vertical: 12),
+          padding: const EdgeInsets.symmetric(vertical: 9),
           decoration: BoxDecoration(
             color: scheme.surfaceContainerHighest.withValues(alpha: .5),
             borderRadius: BorderRadius.circular(12),
@@ -3142,7 +2968,7 @@ class _PlayerMoreMenuDialogState extends ConsumerState<_PlayerMoreMenuDialog> {
             lyricsOffsetLabel(_offsetTenths),
             textAlign: TextAlign.center,
             style: TextStyle(
-              fontSize: 16,
+              fontSize: 14,
               fontWeight: FontWeight.w700,
               color: scheme.onSurface,
             ),
@@ -3166,17 +2992,17 @@ class _PlayerMoreMenuDialogState extends ConsumerState<_PlayerMoreMenuDialog> {
           child: Row(
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
-              Text('延后 10 秒', style: TextStyle(fontSize: 11)),
-              Text('同步', style: TextStyle(fontSize: 11)),
-              Text('提前 10 秒', style: TextStyle(fontSize: 11)),
+              Text('延后 10 秒', style: TextStyle(fontSize: 10)),
+              Text('同步', style: TextStyle(fontSize: 10)),
+              Text('提前 10 秒', style: TextStyle(fontSize: 10)),
             ],
           ),
         ),
-        const SizedBox(height: 10),
+        const SizedBox(height: 8),
         Wrap(
           alignment: WrapAlignment.center,
-          spacing: 8,
-          runSpacing: 8,
+          spacing: 7,
+          runSpacing: 7,
           children: [
             for (final (label, delta) in [
               ('-1秒', -10),
@@ -3187,17 +3013,17 @@ class _PlayerMoreMenuDialogState extends ConsumerState<_PlayerMoreMenuDialog> {
               ('+1秒', 10),
             ])
               ActionChip(
-                label: Text(label, style: const TextStyle(fontSize: 12)),
+                label: Text(label, style: const TextStyle(fontSize: 11)),
                 visualDensity: VisualDensity.compact,
                 onPressed: () => _changeOffset(delta),
               ),
           ],
         ),
-        const SizedBox(height: 8),
+        const SizedBox(height: 6),
         Text(
           '偏移实时保存，仅对当前歌曲生效并记忆。',
           textAlign: TextAlign.center,
-          style: TextStyle(fontSize: 11, color: scheme.outline),
+          style: TextStyle(fontSize: 10, color: scheme.outline),
         ),
       ],
     );

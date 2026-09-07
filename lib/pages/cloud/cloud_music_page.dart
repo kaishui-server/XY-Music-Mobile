@@ -2,19 +2,19 @@ import 'dart:convert';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:go_router/go_router.dart';
 import 'package:path/path.dart' as p;
 
 import '../../src/core/db_path.dart';
-import '../../src/library/library_provider.dart';
 import '../../src/rust/api.dart';
-import '../../src/widgets/song_list_view.dart';
 import '../../src/widgets/top_notice.dart';
 
-/// 云端音乐：搜索 + 源管理一体。
+/// 云端音乐：网盘连接管理。
 ///
-/// 直填 Alist/OpenList 服务器地址挂载自建网盘，同步后网盘音频进入
-/// 音乐库（remote:// URI），本页就地搜索播放。
-/// （TVBox 接口订阅与第三方站点挂载已暂时移除，仅保留自建网盘直连。）
+/// 参考 musicxx 的连接模型：添加 Alist/OpenList 服务器连接（名称/地址/
+/// 账号密码/起始目录），点击连接进入网盘文件浏览器，浏览目录并直接
+/// 播放音频（remote:// URI 流式播放，长按可缓存离线）。
+/// 旧的「挂载同步入库」模式已移除，云端歌曲仅在文件浏览器内播放。
 class CloudMusicPage extends ConsumerStatefulWidget {
   const CloudMusicPage({super.key});
 
@@ -29,26 +29,20 @@ class _CloudSource {
     required this.baseUrl,
     required this.username,
     required this.rootPath,
-    required this.lastSyncAt,
-    required this.lastSyncError,
   });
 
   final String id;
   final String name;
   final String baseUrl;
-  final String username;
+  final String? username;
   final String rootPath;
-  final int? lastSyncAt;
-  final String? lastSyncError;
 
   factory _CloudSource.fromJson(Map<String, dynamic> json) => _CloudSource(
     id: json['id'] as String? ?? '',
     name: json['name'] as String? ?? '',
     baseUrl: json['baseUrl'] as String? ?? '',
-    username: json['username'] as String? ?? '',
+    username: json['username'] as String?,
     rootPath: json['rootPath'] as String? ?? '/',
-    lastSyncAt: (json['lastSyncAt'] as num?)?.toInt(),
-    lastSyncError: json['lastSyncError'] as String?,
   );
 }
 
@@ -73,65 +67,15 @@ final _cloudCacheProvider = FutureProvider.autoDispose<Map<String, dynamic>>((
 });
 
 class _CloudMusicPageState extends ConsumerState<CloudMusicPage> {
-  final TextEditingController _searchController = TextEditingController();
-  final Set<String> _syncing = {};
-  String _query = '';
-
-  @override
-  void dispose() {
-    _searchController.dispose();
-    super.dispose();
-  }
-
-  void _onSearchChanged(String value) =>
-      setState(() => _query = value.trim());
-
-  /// 云端歌曲 = 音乐库中 remote:// URI 的歌曲（网盘挂载同步入库）。
-  List<Song> get _cloudSongs {
-    final songs = ref.read(libraryProvider).songs;
-    return songs.where((song) => song.path.startsWith('remote://')).toList();
-  }
-
-  List<Song> get _filteredSongs {
-    if (_query.isEmpty) return const [];
-    final keyword = _query.toLowerCase();
-    return _cloudSongs
-        .where(
-          (song) =>
-              song.title.toLowerCase().contains(keyword) ||
-              song.artist.toLowerCase().contains(keyword) ||
-              song.album.toLowerCase().contains(keyword),
-        )
-        .toList();
-  }
-
-  Future<void> _sync(_CloudSource source) async {
-    setState(() => _syncing.add(source.id));
-    try {
-      final dbPath = await ref.read(dbPathProvider.future);
-      final dataDir = await ref.read(appDataDirProvider.future);
-      final raw = await syncRemoteSource(
-        dbPath: dbPath,
-        cacheRoot: p.join(dataDir, 'remote-cache'),
-        sourceId: source.id,
-      );
-      final result = jsonDecode(raw) as Map<String, dynamic>;
-      await ref.read(libraryProvider.notifier).load();
-      ref.invalidate(_cloudSourcesProvider);
-      if (mounted) _message('同步完成：${result['parsedSongs'] ?? 0} 首歌曲');
-    } catch (error) {
-      if (mounted) _message('同步失败：$error', error: true);
-    } finally {
-      if (mounted) setState(() => _syncing.remove(source.id));
-    }
-  }
-
   Future<void> _remove(_CloudSource source) async {
     final confirmed = await showDialog<bool>(
       context: context,
       builder: (context) => AlertDialog(
-        title: const Text('移除云端音乐源'),
-        content: Text('确定移除“${source.name}”及其索引吗？网盘上的文件不会被删除。'),
+        title: const Text('移除网盘连接'),
+        content: Text(
+          '确定移除“${source.name}”吗？网盘上的文件不会被删除，'
+          '本地的播放缓存也会保留。',
+        ),
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(context, false),
@@ -147,7 +91,6 @@ class _CloudMusicPageState extends ConsumerState<CloudMusicPage> {
     if (confirmed != true) return;
     final dbPath = await ref.read(dbPathProvider.future);
     await removeRemoteSource(dbPath: dbPath, sourceId: source.id);
-    await ref.read(libraryProvider.notifier).load();
     ref.invalidate(_cloudSourcesProvider);
   }
 
@@ -169,155 +112,73 @@ class _CloudMusicPageState extends ConsumerState<CloudMusicPage> {
     final sources = ref.watch(_cloudSourcesProvider);
     final cache = ref.watch(_cloudCacheProvider).valueOrNull;
     final cacheBytes = (cache?['bytes'] as num?)?.toInt() ?? 0;
-    final showResults = _query.isNotEmpty;
 
     return Scaffold(
       appBar: AppBar(
         title: const Text('云端音乐'),
         actions: [
           IconButton(
-            tooltip: '挂载网盘方法',
-            onPressed: _showMountGuide,
+            tooltip: '连接网盘方法',
+            onPressed: _showGuide,
             icon: const Icon(Icons.help_outline),
           ),
           IconButton(
-            tooltip: '添加网盘源',
+            tooltip: '添加网盘连接',
             onPressed: () => _showAddSheet(),
             icon: const Icon(Icons.add),
           ),
         ],
       ),
-      body: Column(
-        children: [
-          Padding(
-            padding: const EdgeInsets.fromLTRB(16, 6, 16, 10),
-            child: TextField(
-              controller: _searchController,
-              onChanged: _onSearchChanged,
-              textInputAction: TextInputAction.search,
-              decoration: InputDecoration(
-                hintText: '搜索网盘歌曲（标题 / 歌手 / 专辑）',
-                prefixIcon: const Icon(Icons.search),
-                suffixIcon: _query.isEmpty
-                    ? null
-                    : IconButton(
-                        icon: const Icon(Icons.close_rounded),
-                        onPressed: () {
-                          _searchController.clear();
-                          _onSearchChanged('');
-                        },
-                      ),
-                border: OutlineInputBorder(
-                  borderRadius: BorderRadius.circular(14),
-                ),
-                isDense: true,
-              ),
-            ),
-          ),
-          Expanded(
-            child: showResults
-                ? _buildResults()
-                : _buildManagement(sources, cacheBytes, cache),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildResults() {
-    final songs = _filteredSongs;
-    if (songs.isEmpty) {
-      return Center(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
+      body: RefreshIndicator(
+        onRefresh: () async {
+          ref.invalidate(_cloudSourcesProvider);
+          await ref.read(_cloudSourcesProvider.future);
+        },
+        child: ListView(
+          physics: const AlwaysScrollableScrollPhysics(),
+          padding: const EdgeInsets.fromLTRB(16, 8, 16, 32),
           children: [
-            Icon(
-              Icons.search_off_rounded,
-              size: 46,
-              color: Theme.of(
-                context,
-              ).colorScheme.onSurfaceVariant.withValues(alpha: .4),
-            ),
-            const SizedBox(height: 10),
-            const Text('没有匹配的网盘歌曲', style: TextStyle(fontWeight: FontWeight.w600)),
-            const SizedBox(height: 4),
-            Text(
-              '先在下方添加并同步网盘源',
-              style: TextStyle(
-                fontSize: 12,
-                color: Theme.of(context).colorScheme.onSurfaceVariant,
+            sources.when(
+              loading: () => const Padding(
+                padding: EdgeInsets.symmetric(vertical: 40),
+                child: Center(child: CircularProgressIndicator()),
               ),
+              error: (error, _) => Padding(
+                padding: const EdgeInsets.symmetric(vertical: 40),
+                child: Center(child: Text('加载失败：$error')),
+              ),
+              data: (items) => items.isEmpty
+                  ? _CloudEmpty(onAdd: () => _showAddSheet())
+                  : Column(
+                children: [
+                  for (final source in items)
+                    Padding(
+                      padding: const EdgeInsets.only(bottom: 10),
+                      child: _CloudSourceCard(
+                        source: source,
+                        onOpen: () => context.push(
+                          '/cloud-music/browse/${source.id}',
+                        ),
+                        onEdit: () => _showEditSheet(source),
+                        onRemove: () => _remove(source),
+                      ),
+                    ),
+                ],
+              ),
+            ),
+            _CacheCard(
+              bytes: cacheBytes,
+              files: (cache?['files'] as num?)?.toInt() ?? 0,
+              onClear: cacheBytes > 0 ? _clearCache : null,
             ),
           ],
         ),
-      );
-    }
-    return SongsListView(
-      songs: songs,
-      padding: EdgeInsets.only(
-        left: 10,
-        right: 10,
-        bottom: MediaQuery.paddingOf(context).bottom + 148,
-      ),
-      onPlay: (list, i) =>
-          ref.read(libraryProvider.notifier).playList(list, i),
-    );
-  }
-
-  Widget _buildManagement(
-    AsyncValue<List<_CloudSource>> sources,
-    int cacheBytes,
-    Map<String, dynamic>? cache,
-  ) {
-    return RefreshIndicator(
-      onRefresh: () async {
-        ref.invalidate(_cloudSourcesProvider);
-        await ref.read(_cloudSourcesProvider.future);
-      },
-      child: ListView(
-        physics: const AlwaysScrollableScrollPhysics(),
-        padding: const EdgeInsets.fromLTRB(16, 2, 16, 32),
-        children: [
-          sources.when(
-            loading: () => const Padding(
-              padding: EdgeInsets.symmetric(vertical: 40),
-              child: Center(child: CircularProgressIndicator()),
-            ),
-            error: (error, _) => Padding(
-              padding: const EdgeInsets.symmetric(vertical: 40),
-              child: Center(child: Text('加载失败：$error')),
-            ),
-            data: (items) => items.isEmpty
-                ? _CloudEmpty(onAdd: () => _showAddSheet())
-                : Column(
-                    children: [
-                      for (final source in items)
-                        Padding(
-                          padding: const EdgeInsets.only(bottom: 10),
-                          child: _CloudSourceCard(
-                            source: source,
-                            syncing: _syncing.contains(source.id),
-                            onSync: () => _sync(source),
-                            onEdit: () => _showEditSheet(source),
-                            onRemove: () => _remove(source),
-                          ),
-                        ),
-                    ],
-                  ),
-          ),
-          _CacheCard(
-            bytes: cacheBytes,
-            files: (cache?['files'] as num?)?.toInt() ?? 0,
-            onClear: cacheBytes > 0 ? _clearCache : null,
-          ),
-        ],
       ),
     );
   }
 
   // -------------------------------------------------------------------------
-  // 添加源：直接填写 Alist/OpenList 凭据表单
-  // （TVBox 接口订阅与站点解析已暂时移除）
+  // 添加 / 编辑连接：填写 Alist/OpenList 凭据表单
   // -------------------------------------------------------------------------
 
   Future<void> _showAddSheet() async {
@@ -325,6 +186,7 @@ class _CloudMusicPageState extends ConsumerState<CloudMusicPage> {
       context: context,
       isScrollControlled: true,
       useSafeArea: true,
+      useRootNavigator: true,
       showDragHandle: true,
       builder: (context) => const _SourceEditorSheet(),
     );
@@ -336,19 +198,21 @@ class _CloudMusicPageState extends ConsumerState<CloudMusicPage> {
       context: context,
       isScrollControlled: true,
       useSafeArea: true,
+      useRootNavigator: true,
       showDragHandle: true,
       builder: (context) => _SourceEditorSheet(source: source),
     );
     if (saved == true) ref.invalidate(_cloudSourcesProvider);
   }
 
-  Future<void> _showMountGuide() async {
+  Future<void> _showGuide() async {
     await showModalBottomSheet<void>(
       context: context,
       isScrollControlled: true,
       useSafeArea: true,
+      useRootNavigator: true,
       showDragHandle: true,
-      builder: (context) => const SingleChildScrollView(child: _MountGuideSheet()),
+      builder: (context) => const SingleChildScrollView(child: _GuideSheet()),
     );
   }
 }
@@ -374,10 +238,10 @@ class _CloudEmpty extends StatelessWidget {
             color: scheme.onSurfaceVariant.withValues(alpha: .4),
           ),
           const SizedBox(height: 12),
-          const Text('还没有挂载网盘', style: TextStyle(fontWeight: FontWeight.w600)),
+          const Text('还没有网盘连接', style: TextStyle(fontWeight: FontWeight.w600)),
           const SizedBox(height: 5),
           Text(
-            '填写 Alist / OpenList 服务器地址\n挂载后即可搜索播放网盘音频',
+            '填写 Alist / OpenList 服务器地址\n连接后即可浏览并播放网盘音频',
             textAlign: TextAlign.center,
             style: TextStyle(fontSize: 12, color: scheme.onSurfaceVariant),
           ),
@@ -385,7 +249,7 @@ class _CloudEmpty extends StatelessWidget {
           FilledButton.tonalIcon(
             onPressed: onAdd,
             icon: const Icon(Icons.add, size: 18),
-            label: const Text('添加网盘源'),
+            label: const Text('添加网盘连接'),
           ),
         ],
       ),
@@ -396,14 +260,12 @@ class _CloudEmpty extends StatelessWidget {
 class _CloudSourceCard extends StatelessWidget {
   const _CloudSourceCard({
     required this.source,
-    required this.syncing,
-    required this.onSync,
+    required this.onOpen,
     required this.onEdit,
     required this.onRemove,
   });
   final _CloudSource source;
-  final bool syncing;
-  final VoidCallback onSync;
+  final VoidCallback onOpen;
   final VoidCallback onEdit;
   final VoidCallback onRemove;
 
@@ -411,98 +273,67 @@ class _CloudSourceCard extends StatelessWidget {
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
     return Container(
-      padding: const EdgeInsets.all(14),
       decoration: BoxDecoration(
         color: scheme.surfaceContainer,
         borderRadius: BorderRadius.circular(17),
-        border: Border.all(
-          color: source.lastSyncError == null
-              ? scheme.outlineVariant.withValues(alpha: .3)
-              : scheme.error.withValues(alpha: .45),
-        ),
       ),
-      child: Column(
-        children: [
-          Row(
-            children: [
-              Container(
-                width: 46,
-                height: 46,
-                decoration: BoxDecoration(
-                  color: const Color(0x20477BD6),
-                  borderRadius: BorderRadius.circular(14),
-                ),
-                child: const Icon(Icons.cloud_queue, color: Color(0xFF477BD6)),
-              ),
-              const SizedBox(width: 12),
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(
-                      source.name,
-                      style: const TextStyle(
-                        fontSize: 16,
-                        fontWeight: FontWeight.w700,
-                      ),
-                    ),
-                    const SizedBox(height: 3),
-                    Text(
-                      source.baseUrl,
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: TextStyle(
-                        fontSize: 12,
-                        color: scheme.onSurfaceVariant,
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-              PopupMenuButton<String>(
-                onSelected: (value) =>
-                    value == 'edit' ? onEdit() : onRemove(),
-                itemBuilder: (_) => const [
-                  PopupMenuItem(value: 'edit', child: Text('编辑')),
-                  PopupMenuItem(value: 'remove', child: Text('移除')),
-                ],
-              ),
-            ],
-          ),
-          if (source.lastSyncError != null)
-            Padding(
-              padding: const EdgeInsets.only(top: 10),
-              child: Row(
-                children: [
-                  Icon(Icons.error_outline, size: 16, color: scheme.error),
-                  const SizedBox(width: 6),
-                  Expanded(
-                    child: Text(
-                      source.lastSyncError!,
-                      maxLines: 2,
-                      overflow: TextOverflow.ellipsis,
-                      style: TextStyle(fontSize: 12, color: scheme.error),
-                    ),
+      child: Material(
+        color: Colors.transparent,
+        borderRadius: BorderRadius.circular(17),
+        child: InkWell(
+          onTap: onOpen,
+          borderRadius: BorderRadius.circular(17),
+          child: Padding(
+            padding: const EdgeInsets.all(14),
+            child: Row(
+              children: [
+                Container(
+                  width: 46,
+                  height: 46,
+                  decoration: BoxDecoration(
+                    color: const Color(0x20477BD6),
+                    borderRadius: BorderRadius.circular(14),
                   ),
-                ],
-              ),
-            ),
-          const SizedBox(height: 12),
-          SizedBox(
-            width: double.infinity,
-            child: FilledButton.tonalIcon(
-              onPressed: syncing ? null : onSync,
-              icon: syncing
-                  ? const SizedBox(
-                      width: 18,
-                      height: 18,
-                      child: CircularProgressIndicator(strokeWidth: 2),
-                    )
-                  : const Icon(Icons.sync),
-              label: Text(syncing ? '正在同步…' : '立即同步'),
+                  child: const Icon(Icons.cloud_queue, color: Color(0xFF477BD6)),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        source.name,
+                        style: const TextStyle(
+                          fontSize: 16,
+                          fontWeight: FontWeight.w700,
+                        ),
+                      ),
+                      const SizedBox(height: 3),
+                      Text(
+                        source.baseUrl,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                          fontSize: 12,
+                          color: scheme.onSurfaceVariant,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                IconButton(
+                  tooltip: '编辑或移除',
+                  onPressed: onEdit,
+                  icon: const Icon(Icons.edit_outlined, size: 20),
+                ),
+                Icon(
+                  Icons.chevron_right_rounded,
+                  color: scheme.onSurfaceVariant,
+                ),
+              ],
             ),
           ),
-        ],
+        ),
       ),
     );
   }
@@ -690,7 +521,7 @@ class _SourceEditorSheetState extends ConsumerState<_SourceEditorSheet> {
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               Text(
-                widget.source == null ? '挂载网盘' : '编辑网盘源',
+                widget.source == null ? '添加网盘连接' : '编辑网盘连接',
                 style: const TextStyle(fontSize: 22, fontWeight: FontWeight.w800),
               ),
               const SizedBox(height: 18),
@@ -749,9 +580,9 @@ class _SourceEditorSheetState extends ConsumerState<_SourceEditorSheet> {
               TextFormField(
                 controller: _root,
                 decoration: const InputDecoration(
-                  labelText: '音乐根目录',
+                  labelText: '起始目录',
                   hintText: '/',
-                  helperText: '只索引该目录下的音频（如 /music）',
+                  helperText: '打开连接时从该目录开始浏览（如 /music）',
                   prefixIcon: Icon(Icons.folder_outlined),
                   border: OutlineInputBorder(),
                 ),
@@ -794,27 +625,27 @@ class _SourceEditorSheetState extends ConsumerState<_SourceEditorSheet> {
 }
 
 // ---------------------------------------------------------------------------
-// 挂载指引
+// 连接指引
 // ---------------------------------------------------------------------------
 
-class _MountGuideSheet extends StatelessWidget {
-  const _MountGuideSheet();
+class _GuideSheet extends StatelessWidget {
+  const _GuideSheet();
 
   static const _steps = <(String, String)>[
     (
       '方式一：直连 Alist / OpenList',
       '在电脑、NAS 或服务器上部署 Alist（或 OpenList），在后台「存储」中'
-          '添加百度网盘、夸克、阿里云盘、115 等网盘后，直接填服务器地址挂载。',
+          '添加百度网盘、夸克、阿里云盘、115 等网盘后，直接填服务器地址连接。',
     ),
     (
-      '账号与根目录',
+      '账号与起始目录',
       'Alist 登录账号填入用户名密码；游客可访问的站点可留空。'
-          '「音乐根目录」限定只索引该目录下的音频文件。',
+      '「起始目录」决定打开连接时进入的网盘目录。',
     ),
     (
-      '同步与播放',
-      '保存后点击「立即同步」建立索引，之后可像本地音乐一样搜索、'
-          '浏览和播放网盘歌曲，播放过的文件自动进入本地缓存。',
+      '浏览与播放',
+      '保存后点击连接进入网盘文件浏览器，像文件管理器一样浏览目录，'
+          '点击音频文件即可流式播放，长按可缓存到本地离线播放。',
     ),
   ];
 
@@ -828,13 +659,13 @@ class _MountGuideSheet extends StatelessWidget {
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           const Text(
-            '挂载网盘听歌',
+            '连接网盘听歌',
             style: TextStyle(fontSize: 20, fontWeight: FontWeight.w800),
           ),
           const SizedBox(height: 8),
           Text(
             '百度、夸克、阿里云盘等网盘不开放直接访问，'
-            '通过 Alist / OpenList 桥接即可挂载：',
+            '通过 Alist / OpenList 桥接即可连接：',
             style: TextStyle(fontSize: 13, color: scheme.onSurfaceVariant),
           ),
           const SizedBox(height: 16),

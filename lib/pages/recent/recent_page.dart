@@ -188,8 +188,13 @@ class _RecentSongs extends ConsumerWidget {
         Expanded(
           child: SongsListView(
             songs: songs,
-            // 底部留出迷你播放栏与浮动按钮组的空间。
-            padding: const EdgeInsets.fromLTRB(10, 0, 10, 148),
+            // 悬浮元素遮挡高度已注入 MediaQuery.padding。
+            padding: EdgeInsets.fromLTRB(
+              10,
+              0,
+              10,
+              MediaQuery.paddingOf(context).bottom + 12,
+            ),
             onPlay: (list, index) =>
                 ref.read(libraryProvider.notifier).playList(list, index),
             removeActionLabel: '从最近播放删除',

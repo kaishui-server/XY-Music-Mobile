@@ -1279,6 +1279,9 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
   Future<void> _showLyricFontSizeSheet(BuildContext context, WidgetRef ref) {
     return showModalBottomSheet<void>(
       context: context,
+      // 自定义底栏/迷你播放栏叠在 Shell 顶层 Stack；使用根 Navigator
+      // 让弹窗覆盖它们，避免底部内容被悬浮底栏遮挡。
+      useRootNavigator: true,
       showDragHandle: true,
       isScrollControlled: true,
       builder: (_) => _SettingsLyricFontSizeSheet(
@@ -1574,6 +1577,7 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
     ];
     final choice = await showModalBottomSheet<int>(
       context: context,
+      useRootNavigator: true,
       builder: (sheetContext) => Padding(
         padding: const EdgeInsets.all(16),
         child: Column(
@@ -1658,8 +1662,9 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
     final cur = s?.themeMode ?? ThemeModePreference.system;
     final choice = await showModalBottomSheet<_Choice>(
       context: context,
-      builder: (_) => _choiceSheet(
-        context,
+      useRootNavigator: true,
+      builder: (sheetContext) => _choiceSheet(
+        sheetContext,
         const [
           _Choice('跟随系统', ThemeModePreference.system),
           _Choice('浅色', ThemeModePreference.light),
@@ -1689,6 +1694,7 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
     final current = settings?.sidebarPosition ?? SidebarPosition.left;
     final choice = await showModalBottomSheet<SidebarPosition>(
       context: context,
+      useRootNavigator: true,
       builder: (sheetContext) => SafeArea(
         child: Column(
           mainAxisSize: MainAxisSize.min,
@@ -1744,7 +1750,9 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
     ];
     final choice = await showModalBottomSheet<int>(
       context: context,
-      builder: (_) => Padding(
+      // 使用根 Navigator：色板弹窗覆盖悬浮底栏/迷你播放栏，避免被遮挡。
+      useRootNavigator: true,
+      builder: (sheetContext) => Padding(
         padding: const EdgeInsets.all(16),
         child: Column(
           mainAxisSize: MainAxisSize.min,
@@ -1757,7 +1765,7 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
               children: [
                 for (final c in colors)
                   InkWell(
-                    onTap: () => Navigator.pop(context, c),
+                    onTap: () => Navigator.pop(sheetContext, c),
                     borderRadius: BorderRadius.circular(20),
                     child: Container(
                       width: 40,
@@ -1767,7 +1775,7 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
                         shape: BoxShape.circle,
                         border: Border.all(
                           color: c == cur
-                              ? Theme.of(context).colorScheme.primary
+                              ? Theme.of(sheetContext).colorScheme.primary
                               : Colors.transparent,
                           width: 3,
                         ),
@@ -1783,7 +1791,7 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
                   ),
                 // 自定义调色入口：未命中预设色时也允许从当前色继续微调。
                 InkWell(
-                  onTap: () => Navigator.pop(context, -1),
+                  onTap: () => Navigator.pop(sheetContext, -1),
                   borderRadius: BorderRadius.circular(20),
                   child: Container(
                     width: 40,
@@ -1793,7 +1801,7 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
                       border: Border.all(
                         color: colors.contains(cur)
                             ? Colors.transparent
-                            : Theme.of(context).colorScheme.primary,
+                            : Theme.of(sheetContext).colorScheme.primary,
                         width: 3,
                       ),
                       gradient: const SweepGradient(
@@ -1844,6 +1852,7 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
     var blur = settings?.customBackgroundBlur ?? 18.0;
     final result = await showModalBottomSheet<_CustomBackgroundResult>(
       context: context,
+      useRootNavigator: true,
       isScrollControlled: true,
       showDragHandle: true,
       builder: (sheetContext) => StatefulBuilder(
@@ -2035,8 +2044,9 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
         : s?.downloadQuality ?? '320k';
     final choice = await showModalBottomSheet<_Choice>(
       context: context,
-      builder: (_) => _choiceSheet(
-        context,
+      useRootNavigator: true,
+      builder: (sheetContext) => _choiceSheet(
+        sheetContext,
         const [
           _Choice('128k', '128k'),
           _Choice('192k', '192k'),
@@ -2071,8 +2081,9 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
     ];
     final choice = await showModalBottomSheet<_Choice>(
       context: context,
-      builder: (_) => _choiceSheet(
-        context,
+      useRootNavigator: true,
+      builder: (sheetContext) => _choiceSheet(
+        sheetContext,
         choices,
         cur,
         labelOf: (v) => switch (v) {
@@ -2109,7 +2120,8 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
     };
     final result = await showModalBottomSheet<Set<String>>(
       context: context,
-      builder: (_) => StatefulBuilder(
+      useRootNavigator: true,
+      builder: (sheetContext) => StatefulBuilder(
         builder: (context, setModalState) {
           return SafeArea(
             child: SingleChildScrollView(
@@ -2186,6 +2198,7 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
     );
     final action = await showModalBottomSheet<Object?>(
       context: context,
+      useRootNavigator: true,
       isScrollControlled: true,
       builder: (ctx) => Padding(
         padding: EdgeInsets.only(
@@ -2410,7 +2423,7 @@ class _SidebarLayoutEditor extends StatelessWidget {
   Widget build(BuildContext context) {
     final order = normalizeSidebarItemOrder(
       settings.sidebarItemOrder,
-    ).where((id) => id != kSidebarSettings).toList();
+    ).where((id) => id != kSidebarSettings && id != kSidebarDownloads).toList();
     final hidden = settings.sidebarHiddenItems.toSet();
     return Column(
       children: [
@@ -2452,6 +2465,18 @@ class _SidebarLayoutEditor extends StatelessWidget {
               ),
             );
           },
+        ),
+        ListTile(
+          key: const ValueKey('sidebar-layout-downloads-fixed'),
+          leading: const Icon(Icons.download_rounded),
+          title: const Text('下载管理'),
+          subtitle: const Text('固定在侧边栏底部'),
+          trailing: Switch(
+            value: !hidden.contains(kSidebarDownloads),
+            onChanged: (value) => unawaited(
+              notifier.setSidebarItemVisible(kSidebarDownloads, value),
+            ),
+          ),
         ),
         ListTile(
           key: const ValueKey('sidebar-layout-settings-fixed'),
@@ -2503,6 +2528,18 @@ class _BottomBarLayoutEditor extends StatelessWidget {
             value: settings.bottomBarEnabled && atLeastMin,
             onChanged: atLeastMin
                 ? (value) => unawaited(notifier.setBottomBarEnabled(value))
+                : null,
+          ),
+        ),
+        ListTile(
+          leading: const Icon(Icons.label_outline_rounded),
+          title: const Text('显示底栏文字'),
+          subtitle: const Text('关闭后仅显示图标（紧凑模式）'),
+          trailing: Switch(
+            value: settings.bottomBarShowLabels,
+            onChanged: settings.bottomBarEnabled && atLeastMin
+                ? (value) =>
+                      unawaited(notifier.setBottomBarShowLabels(value))
                 : null,
           ),
         ),
@@ -2588,13 +2625,13 @@ String _sidebarLabel(String id) => switch (id) {
   kSidebarExplore => '探索',
   kSidebarLocalMusic => '本地音乐',
   kSidebarCloudMusic => '云端音乐',
-  kSidebarLibrary => '音乐库',
   kSidebarFavorites => '我的收藏',
   kSidebarRecent => '最近播放',
   kSidebarPlugins => '插件管理',
   kSidebarAccount => '账号',
   kSidebarRecognize => '听歌识曲',
   kSidebarPlaylists => '管理全部歌单',
+  kSidebarDownloads => '下载管理',
   kSidebarSettings => '设置',
   _ => id,
 };
@@ -2604,13 +2641,13 @@ IconData _sidebarIcon(String id) => switch (id) {
   kSidebarExplore => Icons.explore_outlined,
   kSidebarLocalMusic => Icons.music_note_outlined,
   kSidebarCloudMusic => Icons.cloud_outlined,
-  kSidebarLibrary => Icons.library_music_outlined,
   kSidebarFavorites => Icons.favorite_border_rounded,
   kSidebarRecent => Icons.history_rounded,
   kSidebarPlugins => Icons.extension_outlined,
   kSidebarAccount => Icons.account_circle_outlined,
   kSidebarRecognize => Icons.mic_none_rounded,
   kSidebarPlaylists => Icons.queue_music_rounded,
+  kSidebarDownloads => Icons.download_rounded,
   kSidebarSettings => Icons.settings_outlined,
   _ => Icons.circle_outlined,
 };

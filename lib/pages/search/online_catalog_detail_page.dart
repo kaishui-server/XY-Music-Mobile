@@ -232,6 +232,7 @@ class _OnlineCatalogDetailPageState
     if (_songs.isEmpty || !mounted) return;
     final target = await showModalBottomSheet<String>(
       context: context,
+      useRootNavigator: true,
       isScrollControlled: true,
       useSafeArea: true,
       showDragHandle: true,

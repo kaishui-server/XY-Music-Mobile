@@ -184,6 +184,24 @@ Future<String> alistListDirectory({
 Future<String> tvboxFetchSites({required String configUrl}) =>
     RustLib.instance.api.crateApiTvboxFetchSites(configUrl: configUrl);
 
+/// 按数据库中保存的凭据浏览远程网盘目录（云端音乐文件浏览器）。
+///
+/// - `source_id`：已保存的远程源 id
+/// - `path`：相对源根目录的路径（如 `/`）
+///
+/// 与 [`alist_list_directory`] 不同，本接口从数据库读取源凭据（含密码），
+/// 无需调用方回传密码。返回 [`RemoteFileEntry`] 数组 JSON（camelCase，
+/// 含 `remotePath`/`name`/`size`/`isDir`）。
+Future<String> remoteBrowseDirectory({
+  required String dbPath,
+  required String sourceId,
+  required String path,
+}) => RustLib.instance.api.crateApiRemoteBrowseDirectory(
+  dbPath: dbPath,
+  sourceId: sourceId,
+  path: path,
+);
+
 /// 提取音频文件内置的 ReplayGain 标签。
 ///
 /// 返回 JSON `{"gainDb": <f32>, "peakDb": <f32>|null}`；无标签返回 `"null"`。

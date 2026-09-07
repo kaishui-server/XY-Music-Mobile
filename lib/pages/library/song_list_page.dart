@@ -26,9 +26,9 @@ class SongListPage extends ConsumerWidget {
           final songs = snap.data ?? const <Song>[];
           return SongsListView(
             songs: songs,
-            // 底部留出迷你播放栏与浮动按钮组的空间。
+            // 悬浮元素遮挡高度已注入 MediaQuery.padding，这里只留呼吸空间。
             padding: EdgeInsets.only(
-              bottom: MediaQuery.paddingOf(context).bottom + 148,
+              bottom: MediaQuery.paddingOf(context).bottom + 12,
             ),
             onPlay: (list, i) =>
                 ref.read(libraryProvider.notifier).playList(list, i),

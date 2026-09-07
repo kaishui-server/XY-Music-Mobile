@@ -33,11 +33,6 @@ const _sidebarDestinations = <String, _SidebarDestination>{
     Icons.cloud_outlined,
     '/cloud-music',
   ),
-  kSidebarLibrary: _SidebarDestination(
-    '音乐库',
-    Icons.library_music_outlined,
-    '/settings/library',
-  ),
   kSidebarFavorites: _SidebarDestination(
     '我的收藏',
     Icons.favorite_border_rounded,
@@ -68,6 +63,11 @@ const _sidebarDestinations = <String, _SidebarDestination>{
     Icons.queue_music_rounded,
     '/home/playlists',
   ),
+  kSidebarDownloads: _SidebarDestination(
+    '下载管理',
+    Icons.download_rounded,
+    '/settings/downloads',
+  ),
   kSidebarSettings: _SidebarDestination('设置', Icons.settings_outlined, '/settings'),
 };
 
@@ -81,6 +81,10 @@ bool _destinationSelected(String currentPath, String path) {
 /// 自定义底栏的高度与悬浮间距（迷你播放栏据此让位）。
 const kBottomBarHeight = 60.0;
 const kBottomBarBottomGap = 12.0;
+
+/// 迷你播放栏高度与无底栏时距屏幕底部的间距（与 MiniPlayerBar 内部一致）。
+const kMiniPlayerHeight = 64.0;
+const kMiniPlayerBottomGap = 20.0;
 
 /// 电脑端侧栏与迷你播放器在手机上的对应结构。
 class AppShell extends ConsumerWidget {
@@ -120,6 +124,11 @@ class AppShell extends ConsumerWidget {
     });
     final safeBottom = MediaQuery.paddingOf(context).bottom;
     final showMiniPlayer = shouldShowMiniPlayerForPath(currentPath);
+    // 迷你播放栏仅在「有歌在播」时真正渲染，注入的遮挡高度需同步，
+    // 否则未播放时列表底部会多出一段空白。
+    final miniPlayerVisible =
+        showMiniPlayer &&
+        ref.watch(playerProvider.select((state) => state.current != null));
     final sidebarOnRight =
         ref.watch(settingsProvider).valueOrNull?.sidebarPosition ==
         SidebarPosition.right;
@@ -128,10 +137,15 @@ class AppShell extends ConsumerWidget {
     final bottomBarVisible =
         (shellSettings?.bottomBarEnabled ?? false) &&
         bottomBarItemIds.length >= 2;
-    // 底栏可见时抬高页面安全区底部内边距，列表内容不被悬浮底栏遮挡。
-    final extraBottomPadding = bottomBarVisible
-        ? kBottomBarHeight + kBottomBarBottomGap * 2
-        : 0.0;
+    // 悬浮元素（底栏+迷你播放栏）在系统安全区之上占用的总高度，注入
+    // MediaQuery.padding.bottom：页面 SafeArea 或显式读取该值即可让
+    // 底部内容不被悬浮元素遮挡（修复插件管理/本地音乐等页面被盖住）。
+    final extraBottomPadding =
+        (bottomBarVisible ? kBottomBarHeight + kBottomBarBottomGap * 2 : 0.0) +
+        (miniPlayerVisible
+            ? kMiniPlayerHeight +
+                  (bottomBarVisible ? 0.0 : kMiniPlayerBottomGap)
+            : 0.0);
 
     void navigate(String path) {
       Navigator.of(appScaffoldKey.currentContext!).pop();
@@ -191,7 +205,8 @@ class AppShell extends ConsumerWidget {
 
 /// 自定义底栏：与迷你播放栏同款的毛玻璃悬浮条，展示用户挑选的目的地。
 /// 默认关闭，在「设置-布局」完成条目自定义（≥2 项）后自动开启。
-class XyBottomBar extends StatelessWidget {
+/// 关闭「显示底栏文字」后仅显示图标（紧凑模式）。
+class XyBottomBar extends ConsumerWidget {
   const XyBottomBar({
     super.key,
     required this.itemIds,
@@ -202,9 +217,15 @@ class XyBottomBar extends StatelessWidget {
   final String currentPath;
 
   @override
-  Widget build(BuildContext context) {
+  Widget build(BuildContext context, WidgetRef ref) {
     final theme = Theme.of(context);
     final dark = theme.brightness == Brightness.dark;
+    final showLabels =
+        ref.watch(
+          settingsProvider.select(
+            (value) => value.valueOrNull?.bottomBarShowLabels ?? true,
+          ),
+        );
     final items = itemIds
         .map((id) => _sidebarDestinations[id])
         .whereType<_SidebarDestination>()
@@ -238,6 +259,7 @@ class XyBottomBar extends StatelessWidget {
                   child: _BottomBarDestination(
                     destination: item,
                     selected: _destinationSelected(currentPath, item.path),
+                    showLabel: showLabels,
                     onTap: () => context.go(item.path),
                   ),
                 ),
@@ -253,11 +275,13 @@ class _BottomBarDestination extends StatelessWidget {
   const _BottomBarDestination({
     required this.destination,
     required this.selected,
+    required this.showLabel,
     required this.onTap,
   });
 
   final _SidebarDestination destination;
   final bool selected;
+  final bool showLabel;
   final VoidCallback onTap;
 
   @override
@@ -272,18 +296,20 @@ class _BottomBarDestination extends StatelessWidget {
       child: Column(
         mainAxisAlignment: MainAxisAlignment.center,
         children: [
-          Icon(destination.icon, size: 22, color: color),
-          const SizedBox(height: 3),
-          Text(
-            destination.label,
-            maxLines: 1,
-            overflow: TextOverflow.ellipsis,
-            style: TextStyle(
-              fontSize: 10.5,
-              fontWeight: selected ? FontWeight.w700 : FontWeight.w500,
-              color: color,
+          Icon(destination.icon, size: showLabel ? 22 : 24, color: color),
+          if (showLabel) ...[
+            const SizedBox(height: 3),
+            Text(
+              destination.label,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(
+                fontSize: 10.5,
+                fontWeight: selected ? FontWeight.w700 : FontWeight.w500,
+                color: color,
+              ),
             ),
-          ),
+          ],
         ],
       ),
     );
@@ -397,11 +423,17 @@ class XyMobileSidebar extends ConsumerWidget {
     final hiddenItems =
         settings?.sidebarHiddenItems.toSet() ?? const <String>{};
     final showSettings = !hiddenItems.contains(kSidebarSettings);
+    final showDownloads = !hiddenItems.contains(kSidebarDownloads);
     final primaryItems =
         normalizeSidebarItemOrder(
               settings?.sidebarItemOrder ?? kDefaultSidebarItemOrder,
             )
-            .where((id) => id != kSidebarSettings && !hiddenItems.contains(id))
+            .where(
+              (id) =>
+                  id != kSidebarSettings &&
+                  id != kSidebarDownloads &&
+                  !hiddenItems.contains(id),
+            )
             .map((id) => _sidebarDestinations[id])
             .whereType<_SidebarDestination>()
             .toList();
@@ -562,31 +594,29 @@ class XyMobileSidebar extends ConsumerWidget {
                   ],
                 ),
               ),
-              if (showSettings) ...[
+              if (showSettings || showDownloads) ...[
                 Divider(
                   height: 1,
                   color: dark ? XyColors.darkBorder : XyColors.lightBorder,
                 ),
-                Padding(
-                  padding: const EdgeInsets.fromLTRB(12, 7, 12, 0),
-                  child: _SidebarTile(
-                    destination: const _SidebarDestination(
-                      '下载管理',
-                      Icons.download_rounded,
-                      '/settings/downloads',
+                if (showDownloads)
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(12, 7, 12, 0),
+                    child: _SidebarTile(
+                      destination: _sidebarDestinations[kSidebarDownloads]!,
+                      selected: currentPath == '/settings/downloads',
+                      onTap: () => onNavigate('/settings/downloads'),
                     ),
-                    selected: currentPath == '/settings/downloads',
-                    onTap: () => onNavigate('/settings/downloads'),
                   ),
-                ),
-                Padding(
-                  padding: const EdgeInsets.fromLTRB(12, 0, 12, 9),
-                  child: _SidebarTile(
-                    destination: _sidebarDestinations[kSidebarSettings]!,
-                    selected: currentPath == '/settings',
-                    onTap: () => onNavigate('/settings'),
+                if (showSettings)
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(12, 0, 12, 9),
+                    child: _SidebarTile(
+                      destination: _sidebarDestinations[kSidebarSettings]!,
+                      selected: currentPath == '/settings',
+                      onTap: () => onNavigate('/settings'),
+                    ),
                   ),
-                ),
               ],
             ],
           ),

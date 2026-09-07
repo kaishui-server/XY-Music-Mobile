@@ -1,4 +1,7 @@
 rust_input: crate::api
 rust_root: rust
-rust_output: rust/src/frb_generated.rs
+# 注意：不要显式配置 rust_output。FRB 2.12 在 Windows 上会对 rust_root 做
+# canonicalize（\\?\ 前缀）但不处理显式 rust_output，两者前缀不匹配导致
+# "prefix not found"；省略后走默认路径 rust/src/frb_generated.rs（与显式值
+# 相同）且与 canonicalize 前缀一致，生成正常。
 dart_output: lib/src/rust

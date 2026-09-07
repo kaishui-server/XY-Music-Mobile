@@ -240,7 +240,11 @@ class _LibraryPageState extends ConsumerState<LibraryPage>
         ),
       ),
       body: Padding(
-        padding: const EdgeInsets.only(bottom: 90),
+        // 读取注入的悬浮元素遮挡高度（底栏/迷你播放栏），文件夹等
+        // 不自管底部内边距的 Tab 不被悬浮元素盖住。
+        padding: EdgeInsets.only(
+          bottom: MediaQuery.paddingOf(context).bottom + 6,
+        ),
         child: lib.loading
             ? const Center(child: CircularProgressIndicator())
             : lib.error != null
@@ -498,10 +502,9 @@ class _AllSongsTabState extends ConsumerState<_AllSongsTab> {
               ? const Center(child: Text('没有匹配的歌曲'))
               : SongsListView(
                   songs: songs,
-                  // 底部留出迷你播放栏与浮动按钮组的空间。
-                  padding: EdgeInsets.only(
-                    bottom: MediaQuery.paddingOf(context).bottom + 148,
-                  ),
+                  // 悬浮元素遮挡高度已由外层 body 统一注入 MediaQuery，
+                  // 这里只需少量呼吸空间。
+                  padding: const EdgeInsets.only(bottom: 12),
                   onPlay: (list, i) =>
                       ref.read(libraryProvider.notifier).playList(list, i),
                   selectionMode: selectionMode,

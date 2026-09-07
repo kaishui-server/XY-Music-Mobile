@@ -279,7 +279,13 @@ class _LogsPageState extends State<LogsPage> {
       body: _loading
           ? const Center(child: CircularProgressIndicator())
           : ListView(
-              padding: const EdgeInsets.fromLTRB(16, 8, 16, 28),
+              // 悬浮元素遮挡高度已注入 MediaQuery.padding。
+              padding: EdgeInsets.fromLTRB(
+                16,
+                8,
+                16,
+                MediaQuery.paddingOf(context).bottom + 24,
+              ),
               children: [
                 _sectionTitle(context, '日志保存'),
                 Card(

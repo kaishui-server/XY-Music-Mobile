@@ -409,12 +409,12 @@ class _FavoritesPageState extends ConsumerState<FavoritesPage> {
                               )
                             : SongsListView(
                                 songs: filteredSongs,
-                                // 底部留出迷你播放栏与浮动按钮组的空间。
-                                padding: const EdgeInsets.fromLTRB(
+                                // 悬浮元素遮挡高度已注入 MediaQuery.padding。
+                                padding: EdgeInsets.fromLTRB(
                                   10,
                                   0,
                                   10,
-                                  148,
+                                  MediaQuery.paddingOf(context).bottom + 12,
                                 ),
                                 selectionMode: _selectionMode,
                                 isSelected: (song) =>

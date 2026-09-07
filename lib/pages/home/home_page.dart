@@ -242,7 +242,13 @@ class _HomePageState extends ConsumerState<HomePage> {
                   },
                   child: ListView(
                     physics: const AlwaysScrollableScrollPhysics(),
-                    padding: const EdgeInsets.fromLTRB(16, 14, 16, 100),
+                    // 悬浮元素遮挡高度已注入 MediaQuery.padding。
+                    padding: EdgeInsets.fromLTRB(
+                      16,
+                      14,
+                      16,
+                      MediaQuery.paddingOf(context).bottom + 16,
+                    ),
                     children: const [
                       _NowPlayingModule(),
                       Padding(

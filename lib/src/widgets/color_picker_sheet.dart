@@ -9,6 +9,8 @@ Future<int?> showCustomColorPicker(
 }) {
   return showModalBottomSheet<int>(
     context: context,
+    // 根 Navigator：调色弹窗覆盖悬浮底栏/迷你播放栏，避免被遮挡。
+    useRootNavigator: true,
     isScrollControlled: true,
     showDragHandle: true,
     builder: (_) => _CustomColorPickerSheet(initialColor: initialColor),

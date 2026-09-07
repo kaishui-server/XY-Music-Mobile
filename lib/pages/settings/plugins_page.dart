@@ -1074,7 +1074,14 @@ class _PluginsPageState extends ConsumerState<PluginsPage> {
                     ),
                     if (items.isEmpty)
                       SliverPadding(
-                        padding: const EdgeInsets.fromLTRB(16, 0, 16, 24),
+                        // 读取注入的悬浮元素遮挡高度（底栏/迷你播放栏），
+                        // 最后一个插件不被悬浮元素盖住。
+                        padding: EdgeInsets.fromLTRB(
+                          16,
+                          0,
+                          16,
+                          MediaQuery.paddingOf(context).bottom + 24,
+                        ),
                         sliver: SliverToBoxAdapter(
                           child: _EmptyPlugins(
                             onOnline: _installFromUrl,
@@ -1084,7 +1091,12 @@ class _PluginsPageState extends ConsumerState<PluginsPage> {
                       )
                     else
                       SliverPadding(
-                        padding: const EdgeInsets.fromLTRB(16, 0, 16, 24),
+                        padding: EdgeInsets.fromLTRB(
+                          16,
+                          0,
+                          16,
+                          MediaQuery.paddingOf(context).bottom + 24,
+                        ),
                         sliver: SliverReorderableList(
                           onReorderItem: (oldIndex, newIndex) => ref
                               .read(_pluginsProvider.notifier)

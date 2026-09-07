@@ -49,6 +49,8 @@ app.*.map.json
 
 # Release binaries — use GitHub Releases instead of committing APKs
 /releases/
+*.apk
+*.aab
 
 # Flutter Rust Bridge generated cache
 *.g.dart.tmp

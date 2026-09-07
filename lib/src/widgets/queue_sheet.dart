@@ -174,6 +174,8 @@ Future<void> showQueueSheet(BuildContext context, WidgetRef ref) {
   final player = ref.read(playerProvider);
   return showModalBottomSheet<void>(
     context: context,
+    // 根 Navigator：播放队列弹窗覆盖悬浮底栏/迷你播放栏，避免被遮挡。
+    useRootNavigator: true,
     showDragHandle: true,
     isScrollControlled: true,
     builder: (context) => QueueSheet(player: player),
