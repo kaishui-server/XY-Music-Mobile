@@ -29,10 +29,22 @@ android {
         // （此前在此处加 ndk abiFilters 会与 splits 配置冲突，AGP 直接报错）。
     }
 
+    signingConfigs {
+        // 显式使用项目根目录的 debug.keystore 签名（用户提供的正式签名，
+        // beta1 起的所有版本均用它），避免 Gradle 回退到 ~/.android/
+        // 下自动生成的临时 debug keystore 导致签名不一致、无法覆盖安装。
+        create("release") {
+            storeFile = rootProject.file("../debug.keystore")
+            storePassword = "android"
+            keyAlias = "androiddebugkey"
+            keyPassword = "android"
+        }
+    }
+
     buildTypes {
         release {
             // Signing with the debug keys, so `flutter run --release` works.
-            signingConfig = signingConfigs.getByName("debug")
+            signingConfig = signingConfigs.getByName("release")
             // R8 代码压缩 + 资源压缩：裁剪未使用的 Java/Kotlin 字节码与 Android
             // 资源，控制 APK 体积（QQ OpenSDK 的 keep 规则由 tencent_kit 的
             // consumer-vendor-rules.pro 自动带入）。

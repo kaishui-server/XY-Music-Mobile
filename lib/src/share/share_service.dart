@@ -152,7 +152,7 @@ class ShareService {
   /// 构造 create_share 请求体。
   ///
   /// song_id 为来源 path 的稳定标识；source 按播放协议提取——
-  /// lx://<source>/<songmid> → 音源 key（kw/wy/kg/tx/mg），
+  /// `lx://<source>/<songmid>` → 音源 key（kw/wy/kg/tx/mg），
   /// pluginId → 插件 id，本地歌曲标记为 local。
   /// 服务端透传进深链，客户端据此显示来源并选择播放路径。
   Map<String, dynamic> _buildBody(QueueItem song, String cover) {

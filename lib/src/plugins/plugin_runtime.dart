@@ -138,6 +138,66 @@ List<String> pluginQualityCandidates(String? preferredQuality) => <String>{
   'super',
 }.toList();
 
+/// 音质档位的展示标签（设置页、播放页音质选择器共用）。
+/// 档位集合对齐 MusicFree：96k / 128k / 192k / 320k / flac / flac24bit /
+/// hires / vinyl / dolby / atmos / atmos_plus / master，另兼容插件侧
+/// 仍会返回的 lossless / sq / ape / wav / hi-res / standard / high 等别名。
+/// 注意同组别名（如 flac / lossless / sq）必须映射到同一标签，播放页
+/// 依赖标签去重；dolby 与 atmos 是两档不同音质，标签必须可区分。
+String qualityDisplayLabel(String quality) {
+  final lower = quality.trim().toLowerCase();
+  if (lower == '96k') return '低清 96k';
+  if (lower == '128k' || lower == 'standard') return '标准 128k';
+  if (lower == '192k') return '较高 192k';
+  if (lower == '320k' || lower == 'high') return '高品质 320k';
+  if (lower == 'flac' || lower == 'lossless' || lower == 'sq') {
+    return '无损 FLAC';
+  }
+  if (lower == 'flac24bit') return '无损 FLAC Hires';
+  if (lower == 'hires' || lower == 'hi-res' || lower.contains('24bit')) {
+    return 'Hi-Res 无损';
+  }
+  if (lower == 'vinyl') return '黑胶转录';
+  if (lower == 'atmos_plus') return '全景声 2.0';
+  if (lower == 'atmos') return '全景声';
+  if (lower == 'dolby') return '杜比全景声';
+  if (lower.contains('master')) return '超清母带';
+  if (lower == 'ape') return 'APE 无损';
+  if (lower == 'wav') return 'WAV 无损';
+  return quality;
+}
+
+/// 音质档位排序权重（低 → 高），播放页/下载弹窗按此排序展示，
+/// 与设置页“在线默认音质”的档位顺序保持一致。未知档位排在最后。
+int qualityTierRank(String quality) {
+  final lower = quality.trim().toLowerCase();
+  const ranks = <String, int>{
+    '96k': 0,
+    '128k': 1,
+    'standard': 1,
+    '192k': 2,
+    '320k': 3,
+    'high': 3,
+    'flac': 4,
+    'lossless': 4,
+    'sq': 4,
+    'ape': 4,
+    'wav': 4,
+    'flac24bit': 5,
+    'hires': 6,
+    'hi-res': 6,
+    'vinyl': 7,
+    'dolby': 8,
+    'atmos': 9,
+    'atmos_plus': 10,
+    'master': 11,
+  };
+  if (ranks.containsKey(lower)) return ranks[lower]!;
+  if (lower.contains('master')) return 11;
+  if (lower.contains('24bit')) return 5;
+  return 12;
+}
+
 const _qualityDiscoveryFallback = [
   '128k',
   '192k',
@@ -1685,6 +1745,27 @@ class PluginRuntimeService {
     }).toList();
   }
 
+  /// 后台 isolate 注入的 HTTP 客户端（_PluginBackgroundHttpClient）为
+  /// QuickJS XHR 桥接安全把响应体包装成 `__XY_HTTP_BODY_BASE64__` +
+  /// Base64。Dart 侧直连接口复用同一客户端时，解析前必须剥离包装，
+  /// 否则 jsonDecode 抛异常被上层 catch 吞掉，网易云元数据补全 / QQ
+  /// 搜索直连在后台路径会静默失效。
+  static String _decodeResponseBody(List<int> bodyBytes) {
+    final body = utf8.decode(bodyBytes, allowMalformed: true);
+    const prefix = '__XY_HTTP_BODY_BASE64__';
+    if (body.startsWith(prefix)) {
+      try {
+        return utf8.decode(
+          base64Decode(body.substring(prefix.length)),
+          allowMalformed: true,
+        );
+      } catch (_) {
+        return body;
+      }
+    }
+    return body;
+  }
+
   Future<void> _fetchNeteaseTrackMeta(http.Client client, Uri uri) async {
     final response = await client
         .get(
@@ -1698,9 +1779,7 @@ class PluginRuntimeService {
         )
         .timeout(const Duration(seconds: 20));
     if (response.statusCode < 200 || response.statusCode >= 300) return;
-    final decoded = jsonDecode(
-      utf8.decode(response.bodyBytes, allowMalformed: true),
-    );
+    final decoded = jsonDecode(_decodeResponseBody(response.bodyBytes));
     final songs = decoded is Map ? decoded['songs'] : null;
     if (songs is! List) return;
     for (final value in songs.whereType<Map>()) {
@@ -1752,9 +1831,7 @@ class PluginRuntimeService {
       if (response.statusCode < 200 || response.statusCode >= 300) {
         throw Exception('HTTP ${response.statusCode}');
       }
-      final decoded = jsonDecode(
-        utf8.decode(response.bodyBytes, allowMalformed: true),
-      );
+      final decoded = jsonDecode(_decodeResponseBody(response.bodyBytes));
       if (decoded is! Map || decoded['code'] != 0) {
         throw Exception('接口返回状态异常');
       }
@@ -1888,7 +1965,14 @@ class PluginRuntimeService {
       final declared = _qualityTokensFromRaw(rawData);
       final merged = <String>{...declared, ...qualities};
       if (preferred.isNotEmpty) merged.add(preferred);
-      return merged.isEmpty ? const ['320k'] : merged.toList();
+      if (merged.isEmpty) return const ['320k'];
+      // 按档位从低到高排序：插件返回的 token 顺序不可控（受 JSON 键序、
+      // 探测时序影响），不排序时选择器会出现“母带在无损前面”等乱序。
+      return merged.toList()
+        ..sort((a, b) {
+          final rank = qualityTierRank(a).compareTo(qualityTierRank(b));
+          return rank != 0 ? rank : a.compareTo(b);
+        });
     });
   }
 
@@ -2199,6 +2283,25 @@ class PluginRuntimeService {
       return response?.toString() ?? '';
     }
     return _getLyricsOnCurrentIsolate(plugin, rawData);
+  }
+
+  /// MusicFree 插件评论：getMusicComments(musicItem, page)。
+  /// 插件未声明该方法时抛出含方法名的异常，由调用方回退平台直连评论。
+  Future<dynamic> getMusicComments(
+    EnabledMusicPlugin plugin,
+    Map<String, dynamic> musicItem,
+    int page,
+  ) {
+    if (_runsPluginsInBackground) {
+      return _runPluginOperation(plugin, 'getMusicComments', {
+        'musicItem': musicItem,
+        'page': page,
+      });
+    }
+    return _callOnCurrentIsolate(plugin, 'getMusicComments', [
+      musicItem,
+      page,
+    ]);
   }
 
   Future<String> _getLxLyrics(Map<String, dynamic> rawData) async {
@@ -3512,6 +3615,22 @@ Future<String> _executePluginOperationInBackground(
         data = await service._getLyricsOnCurrentIsolate(
           plugin,
           Map<String, dynamic>.from(payload),
+        );
+        break;
+      case 'getMusicComments':
+        if (payload is! Map || payload['musicItem'] is! Map) {
+          throw Exception('歌曲信息格式无效');
+        }
+        final payloadMap = Map<String, dynamic>.from(payload);
+        data = await service._callOnCurrentIsolate(
+          plugin,
+          'getMusicComments',
+          [
+            Map<String, dynamic>.from(payloadMap['musicItem'] as Map),
+            payloadMap['page'] is num
+                ? (payloadMap['page'] as num).toInt()
+                : 1,
+          ],
         );
         break;
       case 'importPlaylist':

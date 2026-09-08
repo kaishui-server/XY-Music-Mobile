@@ -1824,6 +1824,34 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
     await _playAt(index);
   }
 
+  /// 无网络/在线音源失败时直接切换到本地替代并续播，不弹提案询问：
+  /// 替换会像手动接受提案一样持久保存关联，下次播放同一首自动用本地。
+  Future<void> _autoRelinkToLocal({
+    required int queueIndex,
+    required QueueItem original,
+    required QueueItem replacement,
+  }) async {
+    if (queueIndex < 0 || queueIndex >= state.queue.length) return;
+    if (state.queue[queueIndex].path != original.path) return;
+
+    await _saveAssociatedReplacement(original.path, replacement);
+    final queue = [...state.queue];
+    queue[queueIndex] = replacement;
+    state = state.copyWith(
+      queue: queue,
+      current: queueIndex == state.queueIndex
+          ? replacement
+          : state.current,
+      duration: queueIndex == state.queueIndex
+          ? replacement.durationMs / 1000.0
+          : state.duration,
+      errorMessage: null,
+    );
+    unawaited(_persistSession());
+    _publishNotice('在线音源不可用，已自动切换为本地文件播放');
+    await _playAt(queueIndex);
+  }
+
   void dismissRelinkProposal(PlaybackRelinkProposal proposal) {
     final pending = _ref.read(playbackRelinkProposalProvider);
     if (pending?.id != proposal.id) return;
@@ -3152,6 +3180,22 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
       return;
     }
     _lastFailureKey = failureKey;
+    // 无网络或在线音源获取失败：优先在本地（下载目录、本地曲库）找
+    // 同名歌曲替代，找到则直接自动切换播放并弹通知提示（不再弹“本地
+    // 替代”提案询问），找不到才按播放失败设置停止或跳下一首。
+    if (queueIndex < state.queue.length) {
+      final item = state.queue[queueIndex];
+      final localReplacement = await _findLocalReplacement(item);
+      if (requestId != _playRequestId) return;
+      if (localReplacement != null) {
+        await _autoRelinkToLocal(
+          queueIndex: queueIndex,
+          original: item,
+          replacement: localReplacement,
+        );
+        return;
+      }
+    }
     state = state.copyWith(
       isPlaying: false,
       isLoading: false,

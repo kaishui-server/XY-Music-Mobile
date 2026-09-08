@@ -216,7 +216,7 @@ class _ShareLinkPreviewDialog extends StatelessWidget {
                     width: 140,
                     height: 140,
                     fit: BoxFit.cover,
-                    errorBuilder: (_, __, ___) => Container(
+                    errorBuilder: (_, _, _) => Container(
                       width: 140,
                       height: 140,
                       color: scheme.surfaceContainerHighest,

@@ -607,56 +607,20 @@ class _AccountPageState extends ConsumerState<AccountPage>
 
   Widget _buildAuthForm(BuildContext context, AuthState auth) {
     final scheme = Theme.of(context).colorScheme;
+    // 键盘弹出时收起品牌头部并收紧 Tab 上下留白，把高度让给表单。
+    // 此前固定头部会把 Expanded(TabBarView) 挤到接近 0 高度，小屏设备
+    // 上表现为“一输入、页面就变空白”。
+    final keyboardOpen = MediaQuery.viewInsetsOf(context).bottom > 0;
     return Column(
       children: [
-        // 品牌头部
-        Padding(
-          padding: const EdgeInsets.fromLTRB(24, 24, 24, 8),
-          child: Column(
-            children: [
-              Container(
-                width: 64,
-                height: 64,
-                decoration: BoxDecoration(
-                  gradient: LinearGradient(
-                    colors: [
-                      scheme.primary,
-                      scheme.primary.withValues(alpha: 0.7),
-                    ],
-                    begin: Alignment.topLeft,
-                    end: Alignment.bottomRight,
-                  ),
-                  borderRadius: BorderRadius.circular(18),
-                  boxShadow: [
-                    BoxShadow(
-                      color: scheme.primary.withValues(alpha: 0.3),
-                      blurRadius: 16,
-                      offset: const Offset(0, 6),
-                    ),
-                  ],
-                ),
-                child: Icon(
-                  Icons.music_note,
-                  size: 34,
-                  color: scheme.onPrimary,
-                ),
-              ),
-              const SizedBox(height: 12),
-              const Text(
-                'XY Music',
-                style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
-              ),
-              const SizedBox(height: 2),
-              Text(
-                '登录后可在多端共享歌单等信息',
-                style: TextStyle(fontSize: 13, color: scheme.onSurfaceVariant),
-              ),
-            ],
-          ),
-        ),
+        // 品牌头部（键盘弹出时收起）
+        if (!keyboardOpen) _brandHeader(context, scheme),
         // 分段式 Tab
         Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 12),
+          padding: EdgeInsets.symmetric(
+            horizontal: 24,
+            vertical: keyboardOpen ? 4 : 12,
+          ),
           child: Container(
             decoration: BoxDecoration(
               color: scheme.surfaceContainerHighest,
@@ -688,6 +652,47 @@ class _AccountPageState extends ConsumerState<AccountPage>
           ),
         ),
       ],
+    );
+  }
+
+  /// 登录/注册页顶部的品牌标识区。键盘弹出时会被收起以给表单让出高度。
+  Widget _brandHeader(BuildContext context, ColorScheme scheme) {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(24, 24, 24, 8),
+      child: Column(
+        children: [
+          Container(
+            width: 64,
+            height: 64,
+            decoration: BoxDecoration(
+              gradient: LinearGradient(
+                colors: [scheme.primary, scheme.primary.withValues(alpha: 0.7)],
+                begin: Alignment.topLeft,
+                end: Alignment.bottomRight,
+              ),
+              borderRadius: BorderRadius.circular(18),
+              boxShadow: [
+                BoxShadow(
+                  color: scheme.primary.withValues(alpha: 0.3),
+                  blurRadius: 16,
+                  offset: const Offset(0, 6),
+                ),
+              ],
+            ),
+            child: Icon(Icons.music_note, size: 34, color: scheme.onPrimary),
+          ),
+          const SizedBox(height: 12),
+          const Text(
+            'XY Music',
+            style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
+          ),
+          const SizedBox(height: 2),
+          Text(
+            '登录后可在多端共享歌单等信息',
+            style: TextStyle(fontSize: 13, color: scheme.onSurfaceVariant),
+          ),
+        ],
+      ),
     );
   }
 

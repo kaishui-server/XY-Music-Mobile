@@ -6,6 +6,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../favorites/favorites_provider.dart';
 import '../library/library_provider.dart';
+import '../navigation/shell.dart';
 import '../player/player_provider.dart';
 import '../plugins/plugin_runtime.dart';
 import 'cover_image.dart';
@@ -38,6 +39,16 @@ class SongsListView extends ConsumerStatefulWidget {
 
   /// 列表内边距。全屏页可留出底部安全区，嵌在 shell 内的页面可避让底栏。
   final EdgeInsetsGeometry? padding;
+
+  /// 是否显示右下角浮动按钮组（回到顶部/回到底部/定位正在播放）。
+  /// 搜索结果等场景可关闭。
+  final bool showFloatingButtons;
+
+  /// 页面是否自绘迷你播放栏（如搜索结果详情页）。Shell 内页面无需
+  /// 传值：底栏+迷你播放栏的遮挡高度已注入 MediaQuery.padding.bottom，
+  /// 浮动按钮组直接贴其上沿即可；自绘播放栏的页面传 true，按钮组
+  /// 额外叠加播放栏高度避让。
+  final bool ownMiniPlayerBar;
   const SongsListView({
     super.key,
     required this.songs,
@@ -52,6 +63,8 @@ class SongsListView extends ConsumerStatefulWidget {
     this.onReorder,
     this.onRemoveAction,
     this.removeActionLabel,
+    this.showFloatingButtons = true,
+    this.ownMiniPlayerBar = false,
   });
 
   @override
@@ -176,6 +189,7 @@ class _SongsListViewState extends ConsumerState<SongsListView> {
               i,
               favorites: favorites,
               pluginNames: pluginNames,
+              playingPath: playingPath,
               dragIndex: i < widget.songs.length && !widget.selectionMode
                   ? i
                   : -1,
@@ -191,15 +205,18 @@ class _SongsListViewState extends ConsumerState<SongsListView> {
               i,
               favorites: favorites,
               pluginNames: pluginNames,
+              playingPath: playingPath,
               dragIndex: -1,
             ),
           ),
-        _FloatingListButtons(
-          controller: _controller,
-          hasMiniPlayer: hasCurrentSong,
-          playingTarget: playingTarget,
-          onLocatePlaying: _locatePlaying,
-        ),
+        if (widget.showFloatingButtons)
+          _FloatingListButtons(
+            controller: _controller,
+            hasMiniPlayer: hasCurrentSong,
+            ownMiniPlayerBar: widget.ownMiniPlayerBar,
+            playingTarget: playingTarget,
+            onLocatePlaying: _locatePlaying,
+          ),
       ],
     );
   }
@@ -211,6 +228,7 @@ class _SongsListViewState extends ConsumerState<SongsListView> {
     int i, {
     required Set<String> favorites,
     required Map<String, String> pluginNames,
+    required String? playingPath,
     required int dragIndex,
   }) {
     if (i == widget.songs.length) {
@@ -222,6 +240,8 @@ class _SongsListViewState extends ConsumerState<SongsListView> {
     final s = widget.songs[i];
     final isFavorite = favorites.contains(s.path);
     final highlighted = _highlightPath == s.path;
+    // 正在播放的歌曲歌名以主题色显示，便于在各歌单中快速辨认。
+    final isPlaying = playingPath != null && playingPath == s.path;
     // 来源插件名（与导入的插件名一致），以标签形式展示在歌名旁。
     final sourceTag = _sourceTagLabel(s, pluginNames);
     // RepaintBoundary 把每行圈成独立重绘范围：多选勾选或收藏状态
@@ -285,9 +305,12 @@ class _SongsListViewState extends ConsumerState<SongsListView> {
                                 s.title,
                                 maxLines: 1,
                                 overflow: TextOverflow.ellipsis,
-                                style: const TextStyle(
+                                style: TextStyle(
                                   fontSize: 15,
                                   fontWeight: FontWeight.w600,
+                                  color: isPlaying
+                                      ? Theme.of(context).colorScheme.primary
+                                      : null,
                                 ),
                               ),
                             ),
@@ -303,9 +326,16 @@ class _SongsListViewState extends ConsumerState<SongsListView> {
                                 overflow: TextOverflow.ellipsis,
                                 style: TextStyle(
                                   fontSize: 12,
-                                  color: Theme.of(
-                                    context,
-                                  ).colorScheme.onSurfaceVariant,
+                                  // 正在播放的歌曲副标题（歌手-专辑）
+                                  // 同步主题色，仅降低不透明度保持层级。
+                                  color: isPlaying
+                                      ? Theme.of(context)
+                                          .colorScheme
+                                          .primary
+                                          .withValues(alpha: .85)
+                                      : Theme.of(
+                                          context,
+                                        ).colorScheme.onSurfaceVariant,
                                 ),
                               ),
                             ),
@@ -750,6 +780,7 @@ class _FloatingListButtons extends StatefulWidget {
   const _FloatingListButtons({
     required this.controller,
     required this.hasMiniPlayer,
+    required this.ownMiniPlayerBar,
     required this.playingTarget,
     required this.onLocatePlaying,
   });
@@ -758,6 +789,9 @@ class _FloatingListButtons extends StatefulWidget {
 
   /// 正在播放歌曲不在列表中（或未播放）时定位按钮整体隐藏。
   final bool hasMiniPlayer;
+
+  /// 页面自绘迷你播放栏（未注入遮挡高度）时，按钮组需叠加播放栏高度。
+  final bool ownMiniPlayerBar;
 
   /// 正在播放歌曲行的目标滚动偏移（index × 行高）。
   final double? playingTarget;
@@ -847,11 +881,19 @@ class _FloatingListButtonsState extends State<_FloatingListButtons> {
       // 略微左移避开行尾“更多”菜单按钮：按钮宽 48dp + 列表/行内边距
       // 约 62dp，故距右边缘 64dp 起排，悬浮按钮不再压住菜单按钮。
       right: 64,
-      // 迷你播放栏位于 safeBottom+20、高 64，上沿即 safeBottom+84；
-      // 按钮组留 8px 间距贴在其上侧。
+      // Shell 内页面的 padding.bottom 已注入底栏+迷你播放栏的遮挡
+      // 高度（迷你播放栏上沿恰好与之一致，底栏显示时随之抬高），
+      // 按钮组留 8px 间距贴在其上侧；自绘播放栏的独立页面则需
+      // 叠加播放栏高度（底部间距 20 + 栏高 64）再留 8px 间距。
+      // 未播放时贴着 padding 底部即可。
       bottom:
           MediaQuery.paddingOf(context).bottom +
-          (widget.hasMiniPlayer ? 92 : 12),
+          (widget.hasMiniPlayer
+              ? (widget.ownMiniPlayerBar
+                      ? kMiniPlayerBottomGap + kMiniPlayerHeight
+                      : 0) +
+                  8
+              : 12),
       // 毛玻璃按钮：单个圆形独立排列（无边框组合容器、无描边），
       // 5px 高斯模糊 + 半透明蒙层，与搜索框观感统一。
       child: Column(
@@ -933,13 +975,15 @@ enum _SongAction {
 enum SongSortKey {
   custom('自定义'),
   added('按添加时间'),
-  title('按歌曲名');
+  title('按歌曲名'),
+  artist('按艺术家'),
+  album('按专辑名');
 
   const SongSortKey(this.label);
   final String label;
 }
 
-/// 排序状态：排序键 + 正倒序（仅 added/title 有效，custom 无方向）。
+/// 排序状态：排序键 + 正倒序（custom 无方向，其余键均可正倒序）。
 class SongSort {
   const SongSort(this.key, {this.descending = false});
 
@@ -947,7 +991,7 @@ class SongSort {
   final bool descending;
 
   /// 单击菜单项时的切换规则：点击已选中的键切换正倒序；首次选择某键
-  /// 时使用该键的默认方向（添加时间默认倒序/最新在前，歌名默认正序）。
+  /// 时使用该键的默认方向（添加时间默认倒序/最新在前，其余键默认正序）。
   SongSort toggle(SongSortKey tapped) {
     if (tapped == key) {
       return SongSort(tapped, descending: !descending);

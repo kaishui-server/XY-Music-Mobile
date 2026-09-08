@@ -80,6 +80,7 @@ class _RecentPageState extends ConsumerState<RecentPage> {
                 autofocus: true,
                 hintText: '搜索最近播放',
                 onChanged: (value) => setState(() => _query = value.trim()),
+                showClearSuffix: true,
                 padding: EdgeInsets.zero,
               )
             : const Text('最近播放'),

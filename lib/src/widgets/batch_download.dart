@@ -10,6 +10,7 @@ import '../core/settings.dart';
 import '../library/library_provider.dart';
 import '../player/android_storage.dart';
 import '../player/download_history_store.dart';
+import '../plugins/plugin_runtime.dart' show qualityDisplayLabel;
 import '../player/download_quality.dart';
 import '../player/downloaded_song_store.dart';
 import '../player/player_provider.dart';
@@ -22,10 +23,14 @@ class BatchDownloadOptions {
     required this.directory,
     required this.quality,
     this.dontAskAgain = false,
+    this.writeMetadata = true,
   });
   final String directory;
   final String quality;
   final bool dontAskAgain;
+
+  /// 下载后向音频文件写入元数据标签（标题/艺术家/专辑/歌词/封面）。
+  final bool writeMetadata;
 }
 
 /// 批量下载选项弹窗：选择下载位置与音质，可勾选“不再弹出”。
@@ -34,10 +39,12 @@ class BatchDownloadOptionsDialog extends StatefulWidget {
     super.key,
     required this.initialDirectory,
     required this.initialQuality,
+    this.initialWriteMetadata = true,
     this.title = '批量下载',
   });
   final String initialDirectory;
   final String initialQuality;
+  final bool initialWriteMetadata;
   final String title;
 
   @override
@@ -51,9 +58,26 @@ class _BatchDownloadOptionsDialogState
   late String _directoryValue;
   late String _quality;
   bool _dontAskAgain = false;
+  late bool _writeMetadata;
   String? _error;
   bool _choosing = false;
-  static const _qualities = ['128k', '192k', '320k', 'flac'];
+
+  /// 音质档位与设置页“下载音质”一致（低 → 高，共 12 档，最高为超清
+  /// 母带）；实际能否下载到该档位取决于插件支持，失败时自动降级。
+  static const _qualities = [
+    '96k',
+    '128k',
+    '192k',
+    '320k',
+    'flac',
+    'flac24bit',
+    'hires',
+    'vinyl',
+    'dolby',
+    'atmos',
+    'atmos_plus',
+    'master',
+  ];
 
   @override
   void initState() {
@@ -63,6 +87,7 @@ class _BatchDownloadOptionsDialogState
       text: AndroidStorage.displayPath(widget.initialDirectory),
     );
     _quality = _normalize(widget.initialQuality);
+    _writeMetadata = widget.initialWriteMetadata;
   }
 
   @override
@@ -101,6 +126,7 @@ class _BatchDownloadOptionsDialogState
         directory: directory,
         quality: _quality,
         dontAskAgain: _dontAskAgain,
+        writeMetadata: _writeMetadata,
       ),
     );
   }
@@ -111,7 +137,7 @@ class _BatchDownloadOptionsDialogState
       title: Text(widget.title),
       content: SizedBox(
         width: 360,
-        height: 220,
+        height: 320,
         child: SingleChildScrollView(
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
@@ -194,6 +220,23 @@ class _BatchDownloadOptionsDialogState
               ),
               const SizedBox(height: 8),
               CheckboxListTile(
+                value: _writeMetadata,
+                onChanged: (value) =>
+                    setState(() => _writeMetadata = value == true),
+                contentPadding: EdgeInsets.zero,
+                visualDensity: VisualDensity.compact,
+                materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                controlAffinity: ListTileControlAffinity.leading,
+                title: const Text(
+                  '写入元数据（封面、歌词等标签）',
+                  style: TextStyle(fontSize: 13),
+                ),
+                subtitle: const Text(
+                  '将标题/艺术家/专辑/歌词/封面写入音频文件',
+                  style: TextStyle(fontSize: 11),
+                ),
+              ),
+              CheckboxListTile(
                 value: _dontAskAgain,
                 onChanged: (value) =>
                     setState(() => _dontAskAgain = value == true),
@@ -224,20 +267,24 @@ class _BatchDownloadOptionsDialogState
     );
   }
 
-  static String _normalize(String value) => switch (value.trim()) {
+  static String _normalize(String value) => switch (value.trim().toLowerCase()) {
+    '96k' => '96k',
     '128k' || 'standard' => '128k',
     '192k' => '192k',
-    'flac' || 'lossless' => 'flac',
+    '320k' || 'high' => '320k',
+    'flac' || 'lossless' || 'sq' => 'flac',
+    'flac24bit' => 'flac24bit',
+    'hires' || 'hi-res' => 'hires',
+    'vinyl' => 'vinyl',
+    'dolby' => 'dolby',
+    'atmos' => 'atmos',
+    'atmos_plus' => 'atmos_plus',
+    'master' => 'master',
     _ => '320k',
   };
 
-  static String _qualityLabel(String quality) => switch (quality) {
-    '128k' => '标准 128k',
-    '192k' => '较高 192k',
-    '320k' => '高品质 320k',
-    'flac' => '无损 FLAC',
-    _ => quality,
-  };
+  static String _qualityLabel(String quality) =>
+      qualityDisplayLabel(quality);
 }
 
 /// 批量下载选中的歌曲（收藏页与歌单详情页共用）。
@@ -259,16 +306,19 @@ Future<void> runBatchDownload(
           builder: (context) => BatchDownloadOptionsDialog(
             initialDirectory: initialDirectory,
             initialQuality: settings?.downloadQuality ?? '320k',
+            initialWriteMetadata: settings?.downloadWriteMetadata ?? true,
           ),
         )
       : BatchDownloadOptions(
           directory: initialDirectory,
           quality: settings?.downloadQuality ?? '320k',
+          writeMetadata: settings?.downloadWriteMetadata ?? true,
         );
   if (!context.mounted || options == null) return;
   final settingsNotifier = ref.read(settingsProvider.notifier);
   await settingsNotifier.setDownloadPath(options.directory.trim());
   await settingsNotifier.setDownloadQuality(options.quality);
+  await settingsNotifier.setDownloadWriteMetadata(options.writeMetadata);
   if (options.dontAskAgain) {
     await settingsNotifier.setAskDownloadDetails(false);
   }
@@ -358,14 +408,15 @@ Future<void> runBatchDownload(
             if (coverUrl.startsWith('http://') ||
                 coverUrl.startsWith('https://'))
               'coverUrl': coverUrl,
-            'embedCover': true,
-            'metadata': {
-              'filePath': verified.path,
-              'title': song.title,
-              'artist': song.artist,
-              'album': song.album,
-              if (lyrics.isNotEmpty) 'lyrics': lyrics,
-            },
+            'embedCover': options.writeMetadata,
+            if (options.writeMetadata)
+              'metadata': {
+                'filePath': verified.path,
+                'title': song.title,
+                'artist': song.artist,
+                'album': song.album,
+                if (lyrics.isNotEmpty) 'lyrics': lyrics,
+              },
           }),
         );
         var finalPath = verified.path;

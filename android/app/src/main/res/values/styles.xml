@@ -17,7 +17,10 @@
 
          This Theme is only used starting with V2 of Flutter's Android embedding. -->
     <style name="NormalTheme" parent="@android:style/Theme.Light.NoTitleBar">
-        <item name="android:windowBackground">?android:colorBackground</item>
+        <!-- 窗口底色与应用浅色背景（#F5F5F5）一致：键盘弹出等 resize
+             过渡帧不再露出 Theme.Light 的纯白色，消除表单页输入时的
+             白色遮挡。 -->
+        <item name="android:windowBackground">@color/xy_window_background</item>
         <item name="android:windowDrawsSystemBarBackgrounds">true</item>
         <item name="android:statusBarColor">@android:color/transparent</item>
         <item name="android:navigationBarColor">@android:color/transparent</item>

@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 窗口底色与应用深色主题背景（XyColors.darkBackground）一致：
+         键盘弹出 resize 的过渡帧里露出的不再是亮色，避免暗色界面
+         输入时出现刺眼的遮挡块。 -->
+    <color name="xy_window_background">#1F1F1F</color>
+</resources>

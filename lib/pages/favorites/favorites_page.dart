@@ -22,6 +22,8 @@ class FavoritesPage extends ConsumerStatefulWidget {
 
 class _FavoritesPageState extends ConsumerState<FavoritesPage> {
   String _query = '';
+  // 搜索框控制器：供一键清除按钮清空输入。
+  final TextEditingController _searchController = TextEditingController();
   SongSort _sort = const SongSort(SongSortKey.custom);
   Future<List<Song>>? _songsFuture;
   int? _songsFutureKey;
@@ -43,6 +45,12 @@ class _FavoritesPageState extends ConsumerState<FavoritesPage> {
       _songsFuture = ref.read(libraryProvider.notifier).songsByPaths(paths);
     }
     return _songsFuture!;
+  }
+
+  @override
+  void dispose() {
+    _searchController.dispose();
+    super.dispose();
   }
 
   void _toggleSelection(Song song) {
@@ -225,6 +233,7 @@ class _FavoritesPageState extends ConsumerState<FavoritesPage> {
                         _selectionMode = true;
                         // 进入多选时清掉搜索过滤，保证全选覆盖整个收藏。
                         _query = '';
+                        _searchController.clear();
                       }),
               icon: const Icon(Icons.library_add_check_rounded),
             ),
@@ -268,12 +277,22 @@ class _FavoritesPageState extends ConsumerState<FavoritesPage> {
                           _sort.descending ? addedOrder.reversed : addedOrder;
                       songs = [for (final path in ordered) ?songsByPath[path]];
                     case SongSortKey.title:
+                    case SongSortKey.artist:
+                    case SongSortKey.album:
+                      String sortKey(Song song) => switch (_sort.key) {
+                        SongSortKey.artist => _pinyinKey(song.artist),
+                        SongSortKey.album => _pinyinKey(song.album),
+                        _ => _pinyinKey(song.title),
+                      };
                       final all = [
                         for (final path in addedOrder) ?songsByPath[path],
                       ];
                       all.sort((a, b) {
-                        final result = _pinyinKey(a.title)
-                            .compareTo(_pinyinKey(b.title));
+                        var result = sortKey(a).compareTo(sortKey(b));
+                        if (result == 0) {
+                          result = _pinyinKey(a.title)
+                              .compareTo(_pinyinKey(b.title));
+                        }
                         return _sort.descending ? -result : result;
                       });
                       songs = all;
@@ -363,10 +382,11 @@ class _FavoritesPageState extends ConsumerState<FavoritesPage> {
                         )
                       else
                         FrostedSearchField(
-                          controller: null,
+                          controller: _searchController,
                           hintText: '搜索歌曲、歌手或专辑',
                           onChanged: (value) =>
                               setState(() => _query = value),
+                          showClearSuffix: true,
                           padding: const EdgeInsets.fromLTRB(16, 4, 16, 4),
                         ),
                       if (!_selectionMode)

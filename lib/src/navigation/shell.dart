@@ -157,6 +157,12 @@ class AppShell extends ConsumerWidget {
     return Scaffold(
       key: appScaffoldKey,
       extendBody: true,
+      // 键盘避让交给各页面自己的 Scaffold：Shell 与页面是双层 Scaffold
+      // 嵌套，若两层都默认避让 viewInsets，body 会被连续压缩两次
+      // （表单被推到“键盘高度×2”处），键盘上方露出一块与键盘等大的
+      // 浅色空白（观感即“白色遮挡”），所有机型必现。此处不避让，
+      // 底栏/迷你播放栏在键盘弹出时被系统键盘自然覆盖。
+      resizeToAvoidBottomInset: false,
       drawerScrimColor: Colors.black.withValues(alpha: 0.58),
       drawerEdgeDragWidth: MediaQuery.sizeOf(context).width * 0.16,
       drawer: sidebarOnRight

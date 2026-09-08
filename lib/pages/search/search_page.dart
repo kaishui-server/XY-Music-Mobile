@@ -794,13 +794,14 @@ class _SearchPageState extends ConsumerState<SearchPage>
     return SongsListView(
       songs: state.songs,
       showFavoriteButton: true,
+      // 搜索结果列表不显示右下角浮动按钮组（定位/回顶/回底）。
+      showFloatingButtons: false,
       padding: EdgeInsets.only(
         top: 6,
-        // 底部留出迷你播放栏与浮动按钮组的空间（内嵌 Shell 时由
-        // Shell 的迷你播放栏覆盖，同样需要预留）。
+        // 底部留出迷你播放栏的空间（上沿约 safeBottom+84，再留少量余量）。
         bottom:
             MediaQuery.of(context).padding.bottom +
-            (ref.read(playerProvider).current != null ? 148 : 12),
+            (ref.read(playerProvider).current != null ? 104 : 12),
       ),
       onPlay: _playNetworkSongs,
     );

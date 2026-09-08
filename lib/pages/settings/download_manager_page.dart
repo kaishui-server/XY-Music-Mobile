@@ -507,6 +507,7 @@ class _DownloadManagerPageState extends ConsumerState<DownloadManagerPage> {
                   child: FrostedSearchField(
                     controller: _searchController,
                     onChanged: _onSearchChanged,
+                    showClearSuffix: true,
                     padding: EdgeInsets.zero,
                   ),
                 ),

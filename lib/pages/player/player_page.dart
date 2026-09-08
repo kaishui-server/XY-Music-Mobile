@@ -34,6 +34,7 @@ import '../../src/share/share_sheet.dart';
 import '../../src/widgets/cover_image.dart';
 import '../../src/widgets/queue_sheet.dart';
 import '../../src/widgets/top_notice.dart';
+import 'comment_sheet.dart';
 
 const _pluginLyricsSearchMemoryKey = 'pluginLyricsSearchQueriesV1';
 
@@ -93,6 +94,7 @@ enum _PlayerMenuAction {
   linkLyrics,
   sleepTimer,
   playbackSpeed,
+  comments,
 }
 
 enum _LyricsSourceAction { plugin, local, cancel }
@@ -112,11 +114,15 @@ class _DownloadOptions {
     required this.directory,
     required this.quality,
     this.dontAskAgain = false,
+    this.writeMetadata = true,
   });
 
   final String directory;
   final String quality;
   final bool dontAskAgain;
+
+  /// 下载后向音频文件写入元数据标签（标题/艺术家/专辑/歌词/封面）。
+  final bool writeMetadata;
 }
 
 String _formatSleepDuration(Duration duration) {
@@ -152,23 +158,7 @@ String lyricsOffsetLabel(int offsetTenths) {
 }
 
 /// 音质选项的展示标签（更多菜单与下载选项弹窗共用）。
-String _qualityLabel(String quality) {
-  final lower = quality.trim().toLowerCase();
-  if (lower == '128k' || lower == 'standard') return '标准 128k';
-  if (lower == '192k') return '较高 192k';
-  if (lower == '320k' || lower == 'high') return '高品质 320k';
-  if (lower == 'flac' || lower == 'lossless' || lower == 'sq') {
-    return '无损 FLAC';
-  }
-  if (lower.contains('master')) return '超清母带';
-  if (lower == 'hires' || lower == 'hi-res' || lower.contains('24bit')) {
-    return 'Hi-Res 高清';
-  }
-  if (lower == 'ape') return 'APE 无损';
-  if (lower == 'wav') return 'WAV 无损';
-  if (lower == 'dolby' || lower == 'atmos') return '杜比全景声';
-  return quality;
-}
+String _qualityLabel(String quality) => qualityDisplayLabel(quality);
 
 /// 定时关闭剩余时长的展示标签（随倒计时实时变化）。
 String _sleepTimerLabel(DateTime? endsAt) {
@@ -723,6 +713,13 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
         await _pickSleepTimer();
       case _PlayerMenuAction.playbackSpeed:
         await _pickPlaybackSpeed();
+      case _PlayerMenuAction.comments:
+        await showModalBottomSheet<void>(
+          context: context,
+          useRootNavigator: true,
+          isScrollControlled: true,
+          builder: (_) => CommentSheet(song: item),
+        );
     }
   }
 
@@ -1248,21 +1245,28 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
 
   /// 按显示名称去重音质选项。插件可能同时返回 flac/lossless/sq 等映射到
   /// 同一档位名称的别名 token（master 系列同理），不去重时选择器会出现
-  /// 两个“无损 FLAC”或两个“超清母带”。同组别名保留当前选中的 token，
-  /// 保证勾选状态能正确回显；没有选中值时保留第一个。
+  /// 两个“无损 FLAC”或两个“超清母带”。同组别名若包含当前选中的
+  /// token，则用选中 token 替换该组保留项，保证勾选状态能正确回显；
+  /// 最终顺序由调用方按档位排序。
   List<String> _dedupeQualityByLabel(
     List<String> qualities,
     String preferred,
   ) {
     final trimmed = preferred.trim();
-    final ordered = [
-      if (trimmed.isNotEmpty && qualities.contains(trimmed)) trimmed,
-      ...qualities.where((value) => value != trimmed),
-    ];
     final seenLabels = <String>{};
     final result = <String>[];
-    for (final value in ordered) {
-      if (seenLabels.add(_qualityLabel(value))) result.add(value);
+    for (final value in qualities) {
+      final label = _qualityLabel(value);
+      if (!seenLabels.add(label)) continue;
+      // 同组别名的第一个保留项：若之后发现选中的 token 同组，会替换它。
+      result.add(value);
+    }
+    if (trimmed.isNotEmpty &&
+        qualities.contains(trimmed) &&
+        !result.contains(trimmed)) {
+      final label = _qualityLabel(trimmed);
+      final index = result.indexWhere((v) => _qualityLabel(v) == label);
+      if (index >= 0) result[index] = trimmed;
     }
     return result;
   }
@@ -1292,7 +1296,14 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
           .timeout(const Duration(seconds: 12), onTimeout: () => const <String>[]);
       final result = <String>{...discovered, ...fallback};
       final list = result.isEmpty ? const ['320k'] : result.toList();
-      return _dedupeQualityByLabel(list, current);
+      // 去重后再按档位（低 → 高）排序：兜底追加的当前音质 token 会落在
+      // 列表末尾，且超时/异常路径直接返回未排序列表，统一排一次保证
+      // 选择器始终“低清在上、超清母带在最下”。
+      return _dedupeQualityByLabel(list, current)
+        ..sort((a, b) {
+          final rank = qualityTierRank(a).compareTo(qualityTierRank(b));
+          return rank != 0 ? rank : a.compareTo(b);
+        });
     } catch (_) {
       return fallback.isEmpty ? const ['320k'] : fallback.toList();
     }
@@ -1667,12 +1678,14 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
           initialDirectory: initialDirectory,
           initialQuality: settings?.downloadQuality ?? playback.currentQuality,
           qualities: qualities,
+          initialWriteMetadata: settings?.downloadWriteMetadata ?? true,
         ),
       );
     } else {
       options = _DownloadOptions(
         directory: initialDirectory,
         quality: settings?.downloadQuality ?? playback.currentQuality,
+        writeMetadata: settings?.downloadWriteMetadata ?? true,
       );
     }
     if (!mounted || options == null) return;
@@ -1689,6 +1702,7 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
     final settingsNotifier = ref.read(settingsProvider.notifier);
     await settingsNotifier.setDownloadPath(directory);
     await settingsNotifier.setDownloadQuality(quality);
+    await settingsNotifier.setDownloadWriteMetadata(options.writeMetadata);
     if (options.dontAskAgain) {
       await settingsNotifier.setAskDownloadDetails(false);
     }
@@ -1765,14 +1779,15 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
             'lyricsPath': p.setExtension(verified.path, '.lrc'),
           if (coverUrl.startsWith('http://') || coverUrl.startsWith('https://'))
             'coverUrl': coverUrl,
-          'embedCover': true,
-          'metadata': {
-            'filePath': verified.path,
-            'title': item.title,
-            'artist': item.artist,
-            'album': item.album,
-            if (lyrics.isNotEmpty) 'lyrics': lyrics,
-          },
+          'embedCover': options.writeMetadata,
+          if (options.writeMetadata)
+            'metadata': {
+              'filePath': verified.path,
+              'title': item.title,
+              'artist': item.artist,
+              'album': item.album,
+              if (lyrics.isNotEmpty) 'lyrics': lyrics,
+            },
         }),
       );
       var finalPath = verified.path;
@@ -1946,6 +1961,12 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
     // 播放进度每 40–80ms 更新一次；这里只监听歌曲对象，避免进度变化导致
     // 全屏背景、封面和模糊层一起高频重建。
     final current = ref.watch(playerProvider.select((state) => state.current));
+    // 播放页封面样式：经典方形 / 圆形旋转 / 沉浸式 / 黑胶唱片（外观设置）。
+    final coverStyle =
+        ref.watch(
+          settingsProvider.select((s) => s.valueOrNull?.playerCoverStyle),
+        ) ??
+        PlayerCoverStyle.classic;
     _loadLyricsOffsetFor(current);
     // 换歌时检测 MV 可用性（同步前缀先重置旧结果，按钮判定见
     // _mvButtonVisible），检测完成后再通过 setState 刷新按钮显隐。
@@ -2058,12 +2079,31 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
             }
           },
           children: [
-            _BigCover(
-              key: ValueKey('cover:${current?.path ?? ''}'),
-              item: current,
-              offsetTenths: _lyricsOffsetTenths,
-              onTap: current == null ? null : _toggleLyrics,
-            ),
+            if (coverStyle == PlayerCoverStyle.immersive)
+              _ImmersiveCoverPage(
+                key: ValueKey('cover:${current?.path ?? ''}'),
+                item: current,
+                offsetTenths: _lyricsOffsetTenths,
+                // 竖屏时封面本体铺到屏幕顶端（见 _ImmersiveTopCover），
+                // 这里退化为透明手势占位；横屏仍由页面自己绘制。
+                paintCover: isLandscape,
+                onTap: current == null ? null : _toggleLyrics,
+                onLongPress: current == null
+                    ? null
+                    : () => unawaited(_showMoreMenu(current)),
+              )
+            else
+              _BigCover(
+                key: ValueKey('cover:${current?.path ?? ''}'),
+                item: current,
+                offsetTenths: _lyricsOffsetTenths,
+                style: coverStyle,
+                onTap: current == null ? null : _toggleLyrics,
+                // 长按封面直接弹出“更多”菜单，与右上角更多按钮一致。
+                onLongPress: current == null
+                    ? null
+                    : () => unawaited(_showMoreMenu(current)),
+              ),
             if (current == null)
               const Center(
                 child: Text('暂无歌词', style: TextStyle(color: Colors.white54)),
@@ -2114,6 +2154,18 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
         children: [
           // 电脑版详情页同款：封面铺满、重度模糊并叠加暗色氛围层。
           _PlayerDetailBackground(current: current),
+          // 沉浸式竖屏：封面顶到屏幕顶端，标题行浮在封面上（否则
+          // header 区域露出背景，显得封面“没有覆盖上部”）。
+          // 仅封面页显示；歌词页不叠沉浸式封面，露出模糊背景。
+          if (coverStyle == PlayerCoverStyle.immersive &&
+              !isLandscape &&
+              current != null &&
+              !_showLyrics)
+            Positioned(
+              top: 0,
+              left: 0,
+              child: _ImmersiveTopCover(item: current, side: viewport.width),
+            ),
           SafeArea(
             child: isLandscape
                 ? Column(
@@ -2337,11 +2389,13 @@ class _DownloadOptionsDialog extends StatefulWidget {
     required this.initialDirectory,
     required this.initialQuality,
     required this.qualities,
+    this.initialWriteMetadata = true,
   });
 
   final String initialDirectory;
   final String initialQuality;
   final List<String> qualities;
+  final bool initialWriteMetadata;
 
   @override
   State<_DownloadOptionsDialog> createState() => _DownloadOptionsDialogState();
@@ -2353,6 +2407,7 @@ class _DownloadOptionsDialogState extends State<_DownloadOptionsDialog> {
   late final List<String> _qualities;
   late String _quality;
   bool _dontAskAgain = false;
+  late bool _writeMetadata;
   bool _choosingDirectory = false;
   String? _error;
 
@@ -2367,6 +2422,7 @@ class _DownloadOptionsDialogState extends State<_DownloadOptionsDialog> {
         ? const ['320k']
         : widget.qualities.toSet().toList();
     _quality = _normalizeQuality(widget.initialQuality, _qualities);
+    _writeMetadata = widget.initialWriteMetadata;
   }
 
   @override
@@ -2412,6 +2468,7 @@ class _DownloadOptionsDialogState extends State<_DownloadOptionsDialog> {
         directory: directory,
         quality: _quality,
         dontAskAgain: _dontAskAgain,
+        writeMetadata: _writeMetadata,
       ),
     );
   }
@@ -2499,6 +2556,23 @@ class _DownloadOptionsDialogState extends State<_DownloadOptionsDialog> {
                   onSelected: (quality) => setState(() => _quality = quality),
                 ),
                 const SizedBox(height: 8),
+                CheckboxListTile(
+                  value: _writeMetadata,
+                  onChanged: (value) =>
+                      setState(() => _writeMetadata = value == true),
+                  contentPadding: EdgeInsets.zero,
+                  visualDensity: VisualDensity.compact,
+                  materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                  controlAffinity: ListTileControlAffinity.leading,
+                  title: const Text(
+                    '写入元数据（封面、歌词等标签）',
+                    style: TextStyle(fontSize: 13),
+                  ),
+                  subtitle: const Text(
+                    '将标题/艺术家/专辑/歌词/封面写入音频文件',
+                    style: TextStyle(fontSize: 11),
+                  ),
+                ),
                 CheckboxListTile(
                   value: _dontAskAgain,
                   onChanged: (value) =>
@@ -2929,6 +3003,11 @@ class _PlayerMoreMenuDialogState extends ConsumerState<_PlayerMoreMenuDialog> {
           Icons.speed_rounded,
           '倍速',
           value: '${_formatPlaybackSpeed(playbackSpeed)}x',
+        ),
+        popRow(
+          _PlayerMenuAction.comments,
+          Icons.mode_comment_outlined,
+          '查看评论',
         ),
       ],
     );
@@ -4299,19 +4378,27 @@ class _VideoProgressTrackShape extends RoundedRectSliderTrackShape {
   }
 }
 
-class _BigCover extends StatelessWidget {
+class _BigCover extends ConsumerWidget {
   const _BigCover({
     super.key,
     this.item,
     required this.offsetTenths,
+    this.style = PlayerCoverStyle.classic,
     this.onTap,
+    this.onLongPress,
   });
   final QueueItem? item;
   final int offsetTenths;
+  final PlayerCoverStyle style;
   final VoidCallback? onTap;
 
+  /// 长按封面弹出播放页“更多”菜单（分享/收藏到歌单/关联歌词等）。
+  final VoidCallback? onLongPress;
+
   @override
-  Widget build(BuildContext context) {
+  Widget build(BuildContext context, WidgetRef ref) {
+    // 圆形旋转 / 黑胶需要感知播放状态：播放时旋转、暂停时停在当前角度。
+    final playing = ref.watch(playerProvider.select((s) => s.isPlaying));
     return LayoutBuilder(
       builder: (context, constraints) {
         final normalSide = math.min(
@@ -4338,7 +4425,8 @@ class _BigCover extends StatelessWidget {
                 child: Stack(
                   clipBehavior: Clip.none,
                   children: [
-                    if (showCoverExtras)
+                    // 方形封面下缘的“桌面反光”，仅经典样式使用。
+                    if (showCoverExtras && style == PlayerCoverStyle.classic)
                       Positioned(
                         top: side - 2,
                         left: 7,
@@ -4360,34 +4448,20 @@ class _BigCover extends StatelessWidget {
                     Positioned(
                       top: 0,
                       left: 0,
-                      child: Semantics(
-                        button: onTap != null,
-                        label: onTap == null ? null : '显示歌词',
-                        child: Container(
-                          width: side,
-                          height: side,
-                          decoration: BoxDecoration(
-                            borderRadius: BorderRadius.circular(24),
-                            boxShadow: const [
-                              BoxShadow(
-                                color: Color(0x99000000),
-                                blurRadius: 44,
-                                spreadRadius: -8,
-                                offset: Offset(0, 24),
-                              ),
-                            ],
+                      child: switch (style) {
+                        // 圆形旋转封面（参考 MusicFree）：25 秒一圈，
+                        // 播放时匀速旋转、暂停时停住，切歌（key 变化）归零。
+                        PlayerCoverStyle.circle => _buildCircle(playing, side),
+                        // 黑胶唱片（参考 BakaMusic）：盘面 24 秒一圈。
+                        PlayerCoverStyle.vinyl => _VinylCover(
+                            item: item,
+                            playing: playing,
+                            size: side,
+                            onTap: onTap,
+                            onLongPress: onLongPress,
                           ),
-                          child: Material(
-                            color: Colors.transparent,
-                            borderRadius: BorderRadius.circular(24),
-                            clipBehavior: Clip.antiAlias,
-                            child: InkWell(
-                              onTap: onTap,
-                              child: _cover(side, radius: 24),
-                            ),
-                          ),
-                        ),
-                      ),
+                        _ => _buildClassic(side),
+                      },
                     ),
                     if (item != null && showCoverExtras)
                       Positioned(
@@ -4409,6 +4483,74 @@ class _BigCover extends StatelessWidget {
           ],
         );
       },
+    );
+  }
+
+  Widget _buildClassic(double side) {
+    return Semantics(
+      button: onTap != null,
+      label: onTap == null ? null : '显示歌词',
+      child: Container(
+        width: side,
+        height: side,
+        decoration: BoxDecoration(
+          borderRadius: BorderRadius.circular(24),
+          boxShadow: const [
+            BoxShadow(
+              color: Color(0x99000000),
+              blurRadius: 44,
+              spreadRadius: -8,
+              offset: Offset(0, 24),
+            ),
+          ],
+        ),
+        child: Material(
+          color: Colors.transparent,
+          borderRadius: BorderRadius.circular(24),
+          clipBehavior: Clip.antiAlias,
+          child: InkWell(
+            onTap: onTap,
+            onLongPress: onLongPress,
+            child: _cover(side, radius: 24),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildCircle(bool playing, double side) {
+    return Semantics(
+      button: onTap != null,
+      label: onTap == null ? null : '显示歌词',
+      child: Container(
+        width: side,
+        height: side,
+        decoration: const BoxDecoration(
+          shape: BoxShape.circle,
+          boxShadow: [
+            BoxShadow(
+              color: Color(0x99000000),
+              blurRadius: 44,
+              spreadRadius: -8,
+              offset: Offset(0, 24),
+            ),
+          ],
+        ),
+        child: _SpinningCover(
+          playing: playing,
+          period: const Duration(seconds: 25),
+          child: Material(
+            color: Colors.transparent,
+            shape: const CircleBorder(),
+            clipBehavior: Clip.antiAlias,
+            child: InkWell(
+              onTap: onTap,
+              onLongPress: onLongPress,
+              child: _cover(side, radius: side / 2),
+            ),
+          ),
+        ),
+      ),
     );
   }
 
@@ -4437,6 +4579,492 @@ class _BigCover extends StatelessWidget {
       icon: Icons.music_note_rounded,
     );
   }
+}
+
+/// 匀速旋转容器：播放时转、暂停时停在当前角度；换歌时由父级的
+/// ValueKey 触发重建，角度自然归零。手势命中区域不受旋转影响。
+class _SpinningCover extends StatefulWidget {
+  const _SpinningCover({
+    required this.child,
+    required this.playing,
+    this.period = const Duration(seconds: 25),
+  });
+
+  final Widget child;
+  final bool playing;
+  final Duration period;
+
+  @override
+  State<_SpinningCover> createState() => _SpinningCoverState();
+}
+
+class _SpinningCoverState extends State<_SpinningCover>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _controller = AnimationController(
+    vsync: this,
+    duration: widget.period,
+  );
+
+  @override
+  void initState() {
+    super.initState();
+    if (widget.playing) _controller.repeat();
+  }
+
+  @override
+  void didUpdateWidget(_SpinningCover oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (widget.playing == oldWidget.playing) return;
+    if (widget.playing) {
+      _controller.repeat();
+    } else {
+      // stop() 保留当前角度，恢复播放时从停住的位置继续转。
+      _controller.stop();
+    }
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AnimatedBuilder(
+      animation: _controller,
+      builder: (context, child) =>
+          Transform.rotate(angle: _controller.value * 2 * math.pi, child: child),
+      child: widget.child,
+    );
+  }
+}
+
+/// 沉浸式封面页（参考 MusicFree）：屏宽方形清晰封面铺在内容区顶部，
+/// 底部渐隐融入模糊背景，下方保留迷你歌词。点击封面切换歌词页。
+class _ImmersiveCoverPage extends StatelessWidget {
+  const _ImmersiveCoverPage({
+    super.key,
+    this.item,
+    required this.offsetTenths,
+    this.onTap,
+    this.onLongPress,
+    this.paintCover = true,
+  });
+
+  final QueueItem? item;
+  final int offsetTenths;
+  final VoidCallback? onTap;
+  final VoidCallback? onLongPress;
+
+  /// false 时封面区域退化为透明占位（保留手势与尺寸，迷你歌词位置
+  /// 不变）：封面本体由播放页外层 Stack 绘制，铺到屏幕顶端。
+  final bool paintCover;
+
+  @override
+  Widget build(BuildContext context) {
+    final current = item;
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        // 封面尽量铺满内容区宽度（MusicFree 的沉浸式封面高=屏宽），
+        // 但要给迷你歌词留出空间；空间不足时按高度收缩。
+        final side = math.min(
+          constraints.maxWidth,
+          math.max(80.0, constraints.maxHeight - 68),
+        );
+        return Column(
+          children: [
+            // 顶部 62% 清晰可见，之下渐隐（MusicFree
+            // IMMERSIVE_CLEAR_VISIBLE_RATIO = 0.62）。
+            Semantics(
+              button: onTap != null,
+              label: onTap == null ? null : '显示歌词',
+              child: SizedBox(
+                width: side,
+                height: side,
+                child: paintCover
+                    ? ShaderMask(
+                        blendMode: BlendMode.dstIn,
+                        shaderCallback: (bounds) => const LinearGradient(
+                          begin: Alignment.topCenter,
+                          end: Alignment.bottomCenter,
+                          colors: [
+                            Colors.white,
+                            Colors.white,
+                            Colors.transparent,
+                          ],
+                          stops: [0, .62, 1],
+                        ).createShader(bounds),
+                        child: Material(
+                          color: Colors.transparent,
+                          clipBehavior: Clip.antiAlias,
+                          child: InkWell(
+                            onTap: onTap,
+                            onLongPress: onLongPress,
+                            child: current == null
+                                ? const ColoredBox(
+                                    color: Color(0xFF272A31),
+                                    child: Center(
+                                      child: Icon(
+                                        Icons.music_note_rounded,
+                                        color: Colors.white54,
+                                      ),
+                                    ),
+                                  )
+                                : CoverImage(
+                                    key: ValueKey(
+                                      'immersive:${current.path}:${current.coverUrl ?? ''}',
+                                    ),
+                                    songPath: current.path,
+                                    imageUrl: current.coverUrl,
+                                    width: side,
+                                    height: side,
+                                    radius: 0,
+                                    highQuality: true,
+                                    icon: Icons.music_note_rounded,
+                                  ),
+                          ),
+                        ),
+                      )
+                    : Material(
+                        color: Colors.transparent,
+                        child: InkWell(
+                          onTap: onTap,
+                          onLongPress: onLongPress,
+                        ),
+                      ),
+              ),
+            ),
+            if (current != null)
+              SizedBox(
+                height: 56,
+                child: AbsorbPointer(
+                  child: _MiniLyrics(
+                    item: current,
+                    offsetTenths: offsetTenths,
+                  ),
+                ),
+              ),
+          ],
+        );
+      },
+    );
+  }
+}
+
+/// 沉浸式封面的全幅顶层：铺满屏宽、顶到屏幕顶端（覆盖状态栏下方
+/// 的标题行背后），同样应用 62% 清晰 + 底部渐隐，顶部叠加轻微暗色
+/// 渐变保证白色标题文字可读。
+class _ImmersiveTopCover extends StatelessWidget {
+  const _ImmersiveTopCover({required this.item, required this.side});
+
+  final QueueItem item;
+  final double side;
+
+  @override
+  Widget build(BuildContext context) {
+    return SizedBox(
+      width: side,
+      height: side,
+      child: ShaderMask(
+        blendMode: BlendMode.dstIn,
+        shaderCallback: (bounds) => const LinearGradient(
+          begin: Alignment.topCenter,
+          end: Alignment.bottomCenter,
+          colors: [Colors.white, Colors.white, Colors.transparent],
+          stops: [0, .62, 1],
+        ).createShader(bounds),
+        child: Stack(
+          fit: StackFit.expand,
+          children: [
+            CoverImage(
+              key: ValueKey(
+                'immersiveTop:${item.path}:${item.coverUrl ?? ''}',
+              ),
+              songPath: item.path,
+              imageUrl: item.coverUrl,
+              width: side,
+              height: side,
+              radius: 0,
+              highQuality: true,
+              icon: Icons.music_note_rounded,
+            ),
+            // 顶部可读性渐变（标题文字浮在封面上）。
+            const DecoratedBox(
+              decoration: BoxDecoration(
+                gradient: LinearGradient(
+                  begin: Alignment.topCenter,
+                  end: Alignment.bottomCenter,
+                  colors: [Color(0x59000000), Colors.transparent],
+                  stops: [0, .28],
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// 黑胶唱片封面（参考 BakaMusic）：旋转唱片（盘面纹理 + 61.8% 标签 +
+/// 4.6% 中心孔）。
+class _VinylCover extends StatelessWidget {
+  const _VinylCover({
+    this.item,
+    required this.playing,
+    required this.size,
+    this.onTap,
+    this.onLongPress,
+  });
+
+  final QueueItem? item;
+  final bool playing;
+  final double size;
+  final VoidCallback? onTap;
+  final VoidCallback? onLongPress;
+
+  @override
+  Widget build(BuildContext context) {
+    return Semantics(
+      button: onTap != null,
+      label: onTap == null ? null : '显示歌词',
+      child: SizedBox(
+        width: size,
+        height: size,
+        child: Stack(
+          clipBehavior: Clip.none,
+          children: [
+            // 唱片本体：播放时 24 秒匀速转一圈，暂停时停住。
+            _SpinningCover(
+              playing: playing,
+              period: const Duration(seconds: 24),
+              child: DecoratedBox(
+                decoration: const BoxDecoration(
+                  shape: BoxShape.circle,
+                  boxShadow: [
+                    BoxShadow(
+                      color: Color(0xB2000000),
+                      blurRadius: 44,
+                      spreadRadius: -10,
+                      offset: Offset(0, 22),
+                    ),
+                  ],
+                ),
+                child: CustomPaint(
+                  size: Size.square(size),
+                  painter: _VinylDiscPainter(),
+                  child: Center(
+                    child: _VinylLabel(item: item, size: size),
+                  ),
+                ),
+              ),
+            ),
+            // 扇形高光固定在屏幕空间（光源不随唱片旋转），叠加在盘面之上。
+            Positioned.fill(
+              child: IgnorePointer(
+                child: CustomPaint(painter: _VinylSheenPainter()),
+              ),
+            ),
+            // 手势层盖在最上，避免旋转层干扰点击。
+            Positioned.fill(
+              child: InkWell(
+                onTap: onTap,
+                onLongPress: onLongPress,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// 黑胶标签区：61.8% 直径的深色圆底 + 92% 封面 + 中心孔。
+class _VinylLabel extends StatelessWidget {
+  const _VinylLabel({required this.item, required this.size});
+
+  final QueueItem? item;
+  final double size;
+
+  @override
+  Widget build(BuildContext context) {
+    final label = size * .618;
+    final current = item;
+    return SizedBox(
+      width: label,
+      height: label,
+      child: Stack(
+        alignment: Alignment.center,
+        children: [
+          // 标签圆底（径向深灰）。
+          DecoratedBox(
+            decoration: const BoxDecoration(
+              shape: BoxShape.circle,
+              gradient: RadialGradient(
+                colors: [Color(0xF52C2C30), Color(0xFA111114)],
+              ),
+              boxShadow: [
+                BoxShadow(
+                  color: Color(0x59000000),
+                  blurRadius: 18,
+                  spreadRadius: -6,
+                ),
+              ],
+            ),
+          ),
+          // 封面（92%）叠一层轻微压暗/提饱和，模拟唱片印刷质感。
+          SizedBox(
+            width: label * .92,
+            height: label * .92,
+            child: current == null
+                ? const Center(
+                    child: Icon(
+                      Icons.music_note_rounded,
+                      color: Colors.white54,
+                    ),
+                  )
+                : ClipOval(
+                    child: ColorFiltered(
+                      colorFilter: const ColorFilter.matrix([
+                        0.9, 0, 0, 0, 0, //
+                        0, 0.9, 0, 0, 0, //
+                        0, 0, 0.9, 0, 0, //
+                        0, 0, 0, 1.08, 0, //
+                      ]),
+                      child: CoverImage(
+                        key: ValueKey(
+                          'vinyl:${current.path}:${current.coverUrl ?? ''}',
+                        ),
+                        songPath: current.path,
+                        imageUrl: current.coverUrl,
+                        width: label * .92,
+                        height: label * .92,
+                        radius: label * .46,
+                        highQuality: true,
+                        icon: Icons.music_note_rounded,
+                      ),
+                    ),
+                  ),
+          ),
+          // 中心孔（4.6%）：深色内芯 + 白色微光描边。
+          Container(
+            width: size * .046,
+            height: size * .046,
+            decoration: const BoxDecoration(
+              shape: BoxShape.circle,
+              gradient: RadialGradient(
+                colors: [Color(0xFF060608), Color(0xFF121216)],
+              ),
+              boxShadow: [
+                BoxShadow(
+                  color: Color(0x12FFFFFF),
+                  blurRadius: 6,
+                  spreadRadius: 1,
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// 黑胶盘面：径向渐变底色 + 密集音轨环 + 斜向高光 + 边缘描边。
+class _VinylDiscPainter extends CustomPainter {
+  @override
+  void paint(Canvas canvas, Size size) {
+    final side = size.width;
+    final center = Offset(side / 2, side / 2);
+    final radius = side / 2;
+
+    // 盘面底色（BakaMusic：中心 #111 → 52% #080808 → 边缘 #171717）。
+    canvas.drawCircle(
+      center,
+      radius,
+      Paint()
+        ..shader = const RadialGradient(
+          colors: [
+            Color(0xFF111111),
+            Color(0xFF080808),
+            Color(0xFF171717),
+          ],
+          stops: [0, .52, 1],
+        ).createShader(Offset.zero & size),
+    );
+
+    // 音轨环：从标签外缘到盘沿，每 3.5px 一圈 1px 细环。
+    final groove = Paint()
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 1
+      ..color = const Color(0x0DFFFFFF);
+    for (var r = radius * .36; r < radius * .99; r += 3.5) {
+      canvas.drawCircle(center, r, groove);
+    }
+
+    // 高光不画在旋转层：真实黑胶的反光来自固定光源与音轨衍射，
+    // 在唱片上呈现为固定的扇形亮区（见 _VinylSheenPainter），随盘面
+    // 一起旋转的线性高光会显得“反光跟着唱片转”，不自然。
+
+    // 边缘 1px 白描边 + 内侧压暗。
+    canvas.drawCircle(
+      center,
+      radius - .5,
+      Paint()
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 1
+        ..color = const Color(0x14FFFFFF),
+    );
+    canvas.drawCircle(
+      center,
+      radius - 6,
+      Paint()
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 12
+        ..color = const Color(0x5C000000),
+    );
+  }
+
+  @override
+  bool shouldRepaint(covariant _VinylDiscPainter oldDelegate) => false;
+}
+
+/// 黑胶扇形高光：固定在屏幕空间的两个对称楔形亮区（左上/右下对角）。
+/// 细密音轨像衍射光栅一样把光源反射成沿径向的扇形光芒，只出现在
+/// 标签外侧的音轨环带上，且不随唱片旋转。
+class _VinylSheenPainter extends CustomPainter {
+  const _VinylSheenPainter();
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final side = size.width;
+    final center = Offset(side / 2, side / 2);
+    final radius = side / 2;
+    final labelRadius = side * .618 / 2;
+
+    // 角度渐变（屏幕坐标 0°=右、90°=下）：两峰相差 180°，峰位在 45°
+    // （右下）/225°（左上）对角，各宽约 60°，对应左上光源的衍射反射。
+    final paint = Paint()
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = radius - labelRadius
+      ..blendMode = BlendMode.plus
+      ..shader = const SweepGradient(
+        colors: [
+          Color(0x00FFFFFF),
+          Color(0x22FFFFFF),
+          Color(0x00FFFFFF),
+          Color(0x00FFFFFF),
+          Color(0x22FFFFFF),
+          Color(0x00FFFFFF),
+        ],
+        stops: [.04, .125, .21, .54, .625, .71],
+      ).createShader(Offset.zero & size);
+    canvas.drawCircle(center, (radius + labelRadius) / 2, paint);
+  }
+
+  @override
+  bool shouldRepaint(covariant _VinylSheenPainter oldDelegate) => false;
 }
 
 class _MiniLyrics extends ConsumerWidget {

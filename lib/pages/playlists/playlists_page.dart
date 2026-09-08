@@ -9,7 +9,6 @@ import 'package:path/path.dart' as p;
 import 'package:permission_handler/permission_handler.dart';
 
 import '../../src/playlists/playlists_provider.dart';
-import '../../src/playlists/network_playlist_import.dart';
 import '../../src/playlists/musicfree_backup_import.dart';
 import '../../src/library/library_provider.dart';
 import '../../src/plugins/plugin_runtime.dart';
@@ -705,7 +704,9 @@ class _NetworkPlaylistImportDialogState
     extends ConsumerState<_NetworkPlaylistImportDialog> {
   final _idController = TextEditingController();
   final _renameController = TextEditingController();
-  String _selectedSourceId = 'builtin:wy';
+  // 歌单来源：仅支持已启用的插件（内置直连来源已移除，避免与
+  // 同平台插件在下拉里表现为重复项）。
+  String? _selectedSourceId;
   String? _error;
   bool _importing = false;
 
@@ -716,11 +717,20 @@ class _NetworkPlaylistImportDialogState
     super.dispose();
   }
 
+  /// 当前有效的来源 id：选中插件仍启用则用之，否则回退第一个插件。
+  /// 默认未手动选择时即第一个插件。
+  String? _effectiveSourceId(List<EnabledMusicPlugin> plugins) {
+    if (plugins.any((plugin) => 'plugin:${plugin.id}' == _selectedSourceId)) {
+      return _selectedSourceId;
+    }
+    return plugins.isNotEmpty ? 'plugin:${plugins.first.id}' : null;
+  }
+
   Future<void> _submit(List<EnabledMusicPlugin> plugins) async {
     final input = _idController.text.trim();
     if (input.isEmpty || _importing) return;
-    final sourceId = _selectedSourceId;
-    if (sourceId.isEmpty) {
+    final sourceId = _effectiveSourceId(plugins);
+    if (sourceId == null || sourceId.isEmpty) {
       setState(() => _error = '请选择歌单来源');
       return;
     }
@@ -732,58 +742,40 @@ class _NetworkPlaylistImportDialogState
       late final String importedName;
       late final String importedCover;
       late final List<Song> songs;
-      if (sourceId.startsWith('builtin:')) {
-        final service = NetworkPlaylistImportService();
-        try {
-          final result = await service.importPlaylist(
-            sourceId.substring('builtin:'.length),
-            input,
-          );
-          importedName = result.name;
-          importedCover = result.coverUrl;
-          songs = result.songs;
-        } finally {
-          service.dispose();
-        }
-      } else {
-        final pluginId = sourceId.substring('plugin:'.length);
-        final plugin = plugins.firstWhere(
-          (item) => item.id == pluginId,
-          orElse: () => throw Exception('所选插件已停用或删除'),
-        );
-        final result = await ref
-            .read(pluginRuntimeProvider)
-            .importPlaylist(plugin, input);
-        importedName = result.name;
-        importedCover = result.coverUrl;
-        songs = result.songs
-            .where((item) => item.title.trim().isNotEmpty)
-            .map(
-              (item) => Song(
-                path: pluginSongPath(plugin, item),
-                title: item.title,
-                artist: item.artist,
-                album: item.album,
-                albumKey: item.album,
-                duration: (item.durationMs / 1000).round(),
-                format: '网络',
-                coverUrl: item.coverUrl,
-                pluginId: plugin.id,
-                pluginData: item.rawData,
-                lyricsRaw: _embeddedLyrics(item.rawData),
-              ),
-            )
-            .toList();
-      }
+      final pluginId = sourceId.substring('plugin:'.length);
+      final plugin = plugins.firstWhere(
+        (item) => item.id == pluginId,
+        orElse: () => throw Exception('所选插件已停用或删除'),
+      );
+      final result = await ref
+          .read(pluginRuntimeProvider)
+          .importPlaylist(plugin, input);
+      importedName = result.name;
+      importedCover = result.coverUrl;
+      songs = result.songs
+          .where((item) => item.title.trim().isNotEmpty)
+          .map(
+            (item) => Song(
+              path: pluginSongPath(plugin, item),
+              title: item.title,
+              artist: item.artist,
+              album: item.album,
+              albumKey: item.album,
+              duration: (item.durationMs / 1000).round(),
+              format: '网络',
+              coverUrl: item.coverUrl,
+              pluginId: plugin.id,
+              pluginData: item.rawData,
+              lyricsRaw: _embeddedLyrics(item.rawData),
+            ),
+          )
+          .toList();
       if (songs.isEmpty) throw Exception('歌单中没有可导入的歌曲');
       final rename = _renameController.text.trim();
       final name = rename.isEmpty ? importedName : rename;
       final notifier = ref.read(playlistsProvider.notifier);
-      // 内置网络接口沿用原有导入行为；插件歌单需要额外处理同名合并，
-      // 与 MusicFree 备份导入保持一致。
-      final existing = sourceId.startsWith('plugin:')
-          ? await notifier.findByName(name)
-          : null;
+      // 插件导入需要处理同名歌单合并，与 MusicFree 备份导入保持一致。
+      final existing = await notifier.findByName(name);
       if (existing != null) {
         if (!mounted) return;
         final action = await _confirmDuplicatePlaylist(context, name);
@@ -853,6 +845,9 @@ class _NetworkPlaylistImportDialogState
   Widget build(BuildContext context) {
     final pluginsValue = ref.watch(enabledMusicPluginsProvider);
     final plugins = pluginsValue.valueOrNull ?? const <EnabledMusicPlugin>[];
+    // 插件列表变化（停用/删除）后保证选中项始终有效；默认选第一个。
+    final effectiveSelected = _effectiveSourceId(plugins);
+
     return AlertDialog(
       title: const Text('从网络导入歌单'),
       content: SizedBox(
@@ -862,34 +857,38 @@ class _NetworkPlaylistImportDialogState
             mainAxisSize: MainAxisSize.min,
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
-              DropdownButtonFormField<String>(
-                initialValue: _selectedSourceId,
-                decoration: const InputDecoration(
-                  labelText: '选择歌单来源',
-                  prefixIcon: Icon(Icons.cloud_rounded),
+              if (plugins.isEmpty)
+                Padding(
+                  padding: const EdgeInsets.symmetric(vertical: 12),
+                  child: Text(
+                    '尚未启用任何插件，请先在 设置 → 插件 中安装并启用音乐插件后再导入网络歌单。',
+                    style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                      color: Theme.of(context).colorScheme.onSurfaceVariant,
+                    ),
+                  ),
+                )
+              else
+                DropdownButtonFormField<String>(
+                  initialValue: effectiveSelected,
+                  decoration: const InputDecoration(
+                    labelText: '选择歌单来源',
+                    prefixIcon: Icon(Icons.cloud_rounded),
+                  ),
+                  items: [
+                    for (final plugin in plugins)
+                      DropdownMenuItem(
+                        value: 'plugin:${plugin.id}',
+                        child: Text(
+                          plugin.name,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ),
+                  ],
+                  onChanged: _importing
+                      ? null
+                      : (value) => setState(() => _selectedSourceId = value),
                 ),
-                items: [
-                  for (final source in builtinPlaylistSources)
-                    DropdownMenuItem(
-                      value: 'builtin:${source.id}',
-                      child: Text(source.name),
-                    ),
-                  for (final plugin in plugins)
-                    DropdownMenuItem(
-                      value: 'plugin:${plugin.id}',
-                      child: Text(
-                        plugin.name,
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                      ),
-                    ),
-                ],
-                onChanged: _importing
-                    ? null
-                    : (value) => setState(
-                        () => _selectedSourceId = value ?? 'builtin:wy',
-                      ),
-              ),
               const SizedBox(height: 14),
               TextField(
                 controller: _idController,
@@ -914,7 +913,7 @@ class _NetworkPlaylistImportDialogState
                 ),
               ),
               Text(
-                '内置支持网易云、QQ音乐、酷我、酷狗，仅可导入公开歌单。',
+                '来源为已启用的插件，仅可导入公开歌单。',
                 style: Theme.of(context).textTheme.bodySmall?.copyWith(
                   color: Theme.of(context).colorScheme.onSurfaceVariant,
                 ),
@@ -936,7 +935,9 @@ class _NetworkPlaylistImportDialogState
           child: const Text('取消'),
         ),
         FilledButton(
-          onPressed: _importing ? null : () => _submit(plugins),
+          onPressed: _importing || plugins.isEmpty
+              ? null
+              : () => _submit(plugins),
           child: _importing
               ? const SizedBox.square(
                   dimension: 18,

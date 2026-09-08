@@ -197,9 +197,9 @@ Future<DownloadQualityVerification> verifyDownloadedAudioQuality({
 
 String _qualityDisplayName(String quality) => switch (quality) {
   'flac' => '无损 FLAC',
-  'flac24bit' => '无损 FLAC 24bit',
-  'hires' || 'hi-res' => 'Hi-Res',
-  'master' => '母带',
-  'vinyl' => '黑胶',
+  'flac24bit' => '无损 FLAC Hires',
+  'hires' || 'hi-res' => 'Hi-Res 无损',
+  'master' => '超清母带',
+  'vinyl' => '黑胶转录',
   _ => quality,
 };

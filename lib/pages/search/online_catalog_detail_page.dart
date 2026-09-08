@@ -193,6 +193,9 @@ class _OnlineCatalogDetailPageState
                         songs: _songs.take(_visibleSongCount).toList(),
                         controller: _songsController,
                         showFavoriteButton: true,
+                        // 本页自绘迷你播放栏（未注入遮挡高度），浮动按钮组
+                        // 需自行避让播放栏。
+                        ownMiniPlayerBar: true,
                         padding: EdgeInsets.only(
                           top: 6,
                           // 底部留出迷你播放栏与浮动按钮组的空间。

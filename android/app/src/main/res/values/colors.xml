@@ -1,4 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <color name="ic_launcher_background">#FFFFFF</color>
+    <!-- 窗口底色与应用浅色主题背景一致：键盘弹出 resize 的过渡帧里
+         Flutter UI 尚未重绘时露出 windowBackground，此前继承
+         Theme.Light 的纯白色，在登录/注册等表单页表现为白色遮挡。 -->
+    <color name="xy_window_background">#F5F5F5</color>
 </resources>

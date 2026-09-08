@@ -12,6 +12,10 @@ enum PlayerDetailBackgroundMode {
   customImage,
 }
 
+/// 播放详情页封面样式：经典方形、圆形旋转（参考 MusicFree）、沉浸式
+/// （参考 MusicFree）、黑胶唱片（参考 BakaMusic）。
+enum PlayerCoverStyle { classic, circle, immersive, vinyl }
+
 /// 首页顶栏侧边栏按钮的位置。
 enum SidebarPosition { left, right }
 
@@ -129,6 +133,7 @@ class AppSettings {
     this.customBackgroundBlur = 18.0,
     this.playerDetailCustomImagePath = '',
     this.playerDetailBackgroundMode = PlayerDetailBackgroundMode.coverBlur,
+    this.playerCoverStyle = PlayerCoverStyle.classic,
     this.showQualityBadges = true,
     this.onlineDefaultQuality = '320k',
     this.libraryMinDurationSeconds = 0,
@@ -152,6 +157,7 @@ class AppSettings {
     this.downloadQuality = '320k',
     this.askDownloadDetails = true,
     this.downloadLyrics = true,
+    this.downloadWriteMetadata = true,
     this.organizeRule = '{Artist}/{Album}/{Title}',
     this.scanFormats = kSupportedScanFormats,
   });
@@ -183,6 +189,7 @@ class AppSettings {
   final double customBackgroundBlur;
   final String playerDetailCustomImagePath;
   final PlayerDetailBackgroundMode playerDetailBackgroundMode;
+  final PlayerCoverStyle playerCoverStyle;
   final bool showQualityBadges;
   final String onlineDefaultQuality;
   final int libraryMinDurationSeconds;
@@ -213,6 +220,9 @@ class AppSettings {
   final String downloadQuality;
   final bool askDownloadDetails;
   final bool downloadLyrics;
+
+  /// 下载后向音频文件写入元数据标签（标题/艺术家/专辑/歌词/封面）。
+  final bool downloadWriteMetadata;
   final String organizeRule;
   final List<String> scanFormats;
 
@@ -236,6 +246,7 @@ class AppSettings {
     double? customBackgroundBlur,
     String? playerDetailCustomImagePath,
     PlayerDetailBackgroundMode? playerDetailBackgroundMode,
+    PlayerCoverStyle? playerCoverStyle,
     bool? showQualityBadges,
     String? onlineDefaultQuality,
     int? libraryMinDurationSeconds,
@@ -259,6 +270,7 @@ class AppSettings {
     String? downloadQuality,
     bool? askDownloadDetails,
     bool? downloadLyrics,
+    bool? downloadWriteMetadata,
     String? organizeRule,
     List<String>? scanFormats,
   }) {
@@ -287,6 +299,7 @@ class AppSettings {
           playerDetailCustomImagePath ?? this.playerDetailCustomImagePath,
       playerDetailBackgroundMode:
           playerDetailBackgroundMode ?? this.playerDetailBackgroundMode,
+      playerCoverStyle: playerCoverStyle ?? this.playerCoverStyle,
       showQualityBadges: showQualityBadges ?? this.showQualityBadges,
       onlineDefaultQuality: onlineDefaultQuality ?? this.onlineDefaultQuality,
       libraryMinDurationSeconds:
@@ -323,6 +336,8 @@ class AppSettings {
       downloadQuality: downloadQuality ?? this.downloadQuality,
       askDownloadDetails: askDownloadDetails ?? this.askDownloadDetails,
       downloadLyrics: downloadLyrics ?? this.downloadLyrics,
+      downloadWriteMetadata:
+          downloadWriteMetadata ?? this.downloadWriteMetadata,
       organizeRule: organizeRule ?? this.organizeRule,
       scanFormats: scanFormats ?? this.scanFormats,
     );
@@ -369,6 +384,9 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
       playerDetailBackgroundMode: _playerDetailBackgroundModeFromInt(
         prefs.getInt('playerDetailBackgroundMode') ?? 0,
       ),
+      playerCoverStyle: _playerCoverStyleFromInt(
+        prefs.getInt('playerCoverStyle') ?? 0,
+      ),
       showQualityBadges: prefs.getBool('showQualityBadges') ?? true,
       onlineDefaultQuality: prefs.getString('onlineDefaultQuality') ?? '320k',
       libraryMinDurationSeconds: prefs.getInt('libraryMinDurationSeconds') ?? 0,
@@ -406,6 +424,7 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
       downloadQuality: prefs.getString('downloadQuality') ?? '320k',
       askDownloadDetails: prefs.getBool('askDownloadDetails') ?? true,
       downloadLyrics: prefs.getBool('downloadLyrics') ?? true,
+      downloadWriteMetadata: prefs.getBool('downloadWriteMetadata') ?? true,
       organizeRule:
           prefs.getString('organizeRule') ?? '{Artist}/{Album}/{Title}',
       scanFormats: prefs.getStringList('scanFormats') ?? kSupportedScanFormats,
@@ -427,6 +446,13 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
       v == SidebarPosition.right.index
       ? SidebarPosition.right
       : SidebarPosition.left;
+
+  PlayerCoverStyle _playerCoverStyleFromInt(int value) {
+    if (value >= 0 && value < PlayerCoverStyle.values.length) {
+      return PlayerCoverStyle.values[value];
+    }
+    return PlayerCoverStyle.classic;
+  }
 
   PlayerDetailBackgroundMode _playerDetailBackgroundModeFromInt(int value) {
     if (value >= 0 && value < PlayerDetailBackgroundMode.values.length) {
@@ -504,6 +530,7 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
         'playerDetailBackgroundMode',
         next.playerDetailBackgroundMode.index,
       ),
+      prefs.setInt('playerCoverStyle', next.playerCoverStyle.index),
       prefs.setBool('showQualityBadges', next.showQualityBadges),
       prefs.setString('onlineDefaultQuality', next.onlineDefaultQuality),
       prefs.setInt('libraryMinDurationSeconds', next.libraryMinDurationSeconds),
@@ -548,6 +575,7 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
       prefs.setString('downloadQuality', next.downloadQuality),
       prefs.setBool('askDownloadDetails', next.askDownloadDetails),
       prefs.setBool('downloadLyrics', next.downloadLyrics),
+      prefs.setBool('downloadWriteMetadata', next.downloadWriteMetadata),
       prefs.setString('organizeRule', next.organizeRule),
       prefs.setStringList('scanFormats', next.scanFormats),
     ]);
@@ -657,6 +685,11 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
           playerDetailBackgroundMode: mode,
         ),
       );
+  Future<void> setPlayerCoverStyle(PlayerCoverStyle style) => _save(
+    (state.valueOrNull ?? const AppSettings()).copyWith(
+      playerCoverStyle: style,
+    ),
+  );
   Future<void> setShowQualityBadges(bool v) => _save(
     (state.valueOrNull ?? const AppSettings()).copyWith(showQualityBadges: v),
   );
@@ -774,6 +807,11 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
   );
   Future<void> setDownloadLyrics(bool v) => _save(
     (state.valueOrNull ?? const AppSettings()).copyWith(downloadLyrics: v),
+  );
+  Future<void> setDownloadWriteMetadata(bool v) => _save(
+    (state.valueOrNull ?? const AppSettings()).copyWith(
+      downloadWriteMetadata: v,
+    ),
   );
   Future<void> setOrganizeRule(String r) => _save(
     (state.valueOrNull ?? const AppSettings()).copyWith(organizeRule: r),

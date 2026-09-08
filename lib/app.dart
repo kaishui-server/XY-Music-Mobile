@@ -72,6 +72,14 @@ class _XyMusicAppState extends ConsumerState<XyMusicApp> {
   ui.Image? _decodedBackgroundImage;
   int _backgroundLoadGeneration = 0;
 
+  /// 视口“全高”记录，仅在视口变大（键盘收起 / 首次布局）时刷新。
+  /// 部分系统（Android 15+ 上 adjustResize 与 edge-to-edge 并存）既压缩了
+  /// 原生视图高度、又上报了 IME insets：页面 Scaffold 再按 insets 避让一次
+  /// 等于双重避让，表单被推出屏幕，键盘上方空出一块与键盘等大的区域
+  /// （浅色背景下表现为“白色遮挡”）。检测到视口高度明显缩水即说明原生侧
+  /// 已经 resize，将上报给子树的 insets 归零，避免双重计算。
+  Size? _viewportWithoutKeyboard;
+
   @override
   void initState() {
     super.initState();
@@ -212,20 +220,48 @@ class _XyMusicAppState extends ConsumerState<XyMusicApp> {
         );
         final theme = _lightTheme!;
         final darkTheme = _darkTheme!;
-        Widget appBuilder(BuildContext context, Widget? child) =>
-            _systemUiBuilder(
-              context,
-              BackdropGroup(
-                child: XyAppBackground(
-                  imagePath: backgroundPath,
-                  blur: backgroundBlur,
-                  decodedImage: _decodedBackgroundPath == backgroundPath
-                      ? _decodedBackgroundImage
-                      : null,
-                  child: child ?? const SizedBox.shrink(),
-                ),
+        Widget appBuilder(BuildContext context, Widget? child) {
+          final mediaQuery = MediaQuery.of(context);
+          final rawInsets = mediaQuery.viewInsets.bottom;
+          // 只在视口“变大”（键盘收起 / 首次布局）时刷新全高记录。
+          // adjustResize 下原生压缩 FlutterView 可能先于 IME insets 上报：
+          // 那一帧 size 已缩水而 insets 仍为 0，若此刻记录会把缩水高度
+          // 当成全高，后续归零判断永远不成立，双重避让（键盘上方露出
+          // 与键盘等大的浅色 Scaffold 背景）复现。
+          final recorded = _viewportWithoutKeyboard;
+          if (recorded == null ||
+              (mediaQuery.size.width == recorded.width &&
+                  mediaQuery.size.height > recorded.height)) {
+            _viewportWithoutKeyboard = mediaQuery.size;
+          }
+          final viewport = _viewportWithoutKeyboard;
+          // 宽度需一致才比较高度，避免横竖屏切换时误判为“已 resize”。
+          final keyboardResolved = viewport != null &&
+                  mediaQuery.size.width == viewport.width &&
+                  mediaQuery.size.height < viewport.height - 50
+              ? 0.0
+              : rawInsets;
+          return _systemUiBuilder(
+            context,
+            BackdropGroup(
+              child: XyAppBackground(
+                imagePath: backgroundPath,
+                blur: backgroundBlur,
+                decodedImage: _decodedBackgroundPath == backgroundPath
+                    ? _decodedBackgroundImage
+                    : null,
+                child: child == null
+                    ? const SizedBox.shrink()
+                    : MediaQuery(
+                        data: mediaQuery.copyWith(
+                          viewInsets: EdgeInsets.only(bottom: keyboardResolved),
+                        ),
+                        child: child,
+                      ),
               ),
-            );
+            ),
+          );
+        }
 
         // 初始化完成后交由 go_router 接管；未完成时展示加载/错误界面。
         if (init.hasValue) {

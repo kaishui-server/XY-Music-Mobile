@@ -14,6 +14,7 @@ import '../../src/core/db_path.dart';
 import '../../src/auth/auth_provider.dart';
 import '../../src/navigation/sidebar_controller.dart';
 import '../../src/player/desktop_lyrics.dart';
+import '../../src/plugins/plugin_runtime.dart';
 import '../../src/ui/xy_surface.dart';
 import '../../src/widgets/color_picker_sheet.dart';
 import '../../src/widgets/frosted_search_field.dart';
@@ -172,6 +173,13 @@ const settingsSearchEntries = <SettingsSearchEntry>[
     route: '/settings/appearance',
     icon: Icons.wallpaper_outlined,
     keywords: '封面模糊 壁纸模糊 流光 自定义图片',
+  ),
+  SettingsSearchEntry(
+    title: '播放页封面样式',
+    path: ['外观', '播放页封面样式'],
+    route: '/settings/appearance',
+    icon: Icons.album_outlined,
+    keywords: '经典方形 圆形旋转 沉浸式 黑胶唱片 封面',
   ),
   SettingsSearchEntry(
     title: '侧边栏位置',
@@ -562,6 +570,35 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
           ),
           onTap: () => _pickPlayerDetailImage(context, ref),
         ),
+        _tile(
+          context,
+          icon: Icons.album_outlined,
+          title: '播放页封面样式',
+          trailing: DropdownButtonHideUnderline(
+            child: DropdownButton<PlayerCoverStyle>(
+              value: settings?.playerCoverStyle ?? PlayerCoverStyle.classic,
+              isDense: true,
+              alignment: AlignmentDirectional.centerEnd,
+              items: PlayerCoverStyle.values
+                  .map(
+                    (style) => DropdownMenuItem<PlayerCoverStyle>(
+                      value: style,
+                      child: Text(_playerCoverStyleLabel(style)),
+                    ),
+                  )
+                  .toList(),
+              onChanged: (style) {
+                if (style != null) {
+                  unawaited(
+                    ref
+                        .read(settingsProvider.notifier)
+                        .setPlayerCoverStyle(style),
+                  );
+                }
+              },
+            ),
+          ),
+        ),
       ],
       SettingsSection.layout => [
         Padding(
@@ -626,7 +663,9 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
           context,
           icon: Icons.high_quality,
           title: '在线默认音质',
-          trailing: Text(settings?.onlineDefaultQuality ?? '320k'),
+          trailing: Text(
+            qualityDisplayLabel(settings?.onlineDefaultQuality ?? '320k'),
+          ),
           onTap: () => _pickQuality(context, ref, settings, isOnline: true),
         ),
         _tile(
@@ -940,7 +979,9 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
           context,
           icon: Icons.download,
           title: '下载音质',
-          trailing: Text(settings?.downloadQuality ?? '320k'),
+          trailing: Text(
+            qualityDisplayLabel(settings?.downloadQuality ?? '320k'),
+          ),
           onTap: () => _pickQuality(context, ref, settings, isOnline: false),
         ),
         _tile(
@@ -968,6 +1009,14 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
           title: '同时下载歌词',
           value: settings?.downloadLyrics ?? true,
           onChanged: (v) => notifier.setDownloadLyrics(v),
+        ),
+        _switchTile(
+          context,
+          icon: Icons.library_music_outlined,
+          title: '下载时写入元数据',
+          subtitle: '将封面、歌词、标题等标签写入音频文件',
+          value: settings?.downloadWriteMetadata ?? true,
+          onChanged: (v) => notifier.setDownloadWriteMetadata(v),
         ),
       ],
       SettingsSection.other => [
@@ -1032,7 +1081,9 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
       body: ListView(
         padding: EdgeInsets.only(
           top: section == SettingsSection.root ? 8 : 4,
-          bottom: 24,
+          // 消费 Shell 注入的悬浮底栏/播放栏高度（padding.bottom），
+          // 否则布局页等底部的设置项会被自定义底栏盖住。
+          bottom: 24 + MediaQuery.paddingOf(context).bottom,
         ),
         children: [
           if (section == SettingsSection.root) ...[
@@ -1207,10 +1258,12 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
     required String title,
     required bool value,
     required ValueChanged<bool> onChanged,
+    String? subtitle,
   }) {
     return SwitchListTile(
       secondary: Icon(icon),
       title: Text(title),
+      subtitle: subtitle == null ? null : Text(subtitle),
       value: value,
       onChanged: onChanged,
     );
@@ -1302,6 +1355,13 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
         PlayerDetailBackgroundMode.flowingLight => '流光',
         PlayerDetailBackgroundMode.customImage => '自定义图片',
       };
+
+  String _playerCoverStyleLabel(PlayerCoverStyle style) => switch (style) {
+    PlayerCoverStyle.classic => '经典方形',
+    PlayerCoverStyle.circle => '圆形旋转',
+    PlayerCoverStyle.immersive => '沉浸式',
+    PlayerCoverStyle.vinyl => '黑胶唱片',
+  };
 
   Future<void> _setPlayerDetailBackground(
     BuildContext context,
@@ -2042,19 +2102,33 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
     final cur = isOnline
         ? s?.onlineDefaultQuality ?? '320k'
         : s?.downloadQuality ?? '320k';
+    // 音质档位对齐 MusicFree（低 → 高），完整 12 档；实际能否取到
+    // 该档位取决于插件支持，播放时会自动降级。
+    const qualityKeys = [
+      '96k',
+      '128k',
+      '192k',
+      '320k',
+      'flac',
+      'flac24bit',
+      'hires',
+      'vinyl',
+      'dolby',
+      'atmos',
+      'atmos_plus',
+      'master',
+    ];
     final choice = await showModalBottomSheet<_Choice>(
       context: context,
       useRootNavigator: true,
       builder: (sheetContext) => _choiceSheet(
         sheetContext,
-        const [
-          _Choice('128k', '128k'),
-          _Choice('192k', '192k'),
-          _Choice('320k', '320k'),
-          _Choice('标准无损', 'flac'),
+        [
+          for (final key in qualityKeys)
+            _Choice(qualityDisplayLabel(key), key),
         ],
         cur,
-        labelOf: (v) => v as String,
+        labelOf: (v) => qualityDisplayLabel(v as String),
       ),
     );
     if (choice != null) {

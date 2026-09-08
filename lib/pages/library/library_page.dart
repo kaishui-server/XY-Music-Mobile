@@ -446,6 +446,7 @@ class _AllSongsTabState extends ConsumerState<_AllSongsTab> {
           FrostedSearchField(
             controller: _controller,
             onChanged: (v) => setState(() => _query = v.trim().toLowerCase()),
+            showClearSuffix: true,
             padding: const EdgeInsets.fromLTRB(12, 8, 12, 4),
           )
         else

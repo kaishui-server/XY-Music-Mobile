@@ -87,17 +87,28 @@ class _PlaylistDetailPageState extends ConsumerState<PlaylistDetailPage> {
   }
 
   /// 按当前排序方式整理歌曲列表。时间排序基于歌单的添加顺序
-  /// （songPaths 本身按添加先后存储），歌名排序使用拼音避免中文乱序，
-  /// 自定义排序优先使用拖拽保存的 customOrder，未记录过的新歌按添加
-  /// 顺序追加在末尾。
+  /// （songPaths 本身按添加先后存储），歌名/艺术家/专辑排序使用拼音
+  /// 避免中文乱序，自定义排序优先使用拖拽保存的 customOrder，未记录过
+  /// 的新歌按添加顺序追加在末尾。
   List<Song> _applySort(List<Song> songs, MobilePlaylist playlist) {
     switch (_sort.key) {
       case SongSortKey.added:
         return _sort.descending ? songs.reversed.toList() : songs;
       case SongSortKey.title:
+      case SongSortKey.artist:
+      case SongSortKey.album:
+        String sortKey(Song song) => switch (_sort.key) {
+          SongSortKey.artist => _pinyinKey(song.artist),
+          SongSortKey.album => _pinyinKey(song.album),
+          _ => _pinyinKey(song.title),
+        };
         final sorted = [...songs]
           ..sort((a, b) {
-            final result = _pinyinKey(a.title).compareTo(_pinyinKey(b.title));
+            var result = sortKey(a).compareTo(sortKey(b));
+            if (result == 0) {
+              // 艺术家/专辑相同时回落到歌名，保持组内稳定。
+              result = _pinyinKey(a.title).compareTo(_pinyinKey(b.title));
+            }
             return _sort.descending ? -result : result;
           });
         return sorted;
@@ -266,14 +277,8 @@ class _PlaylistDetailPageState extends ConsumerState<PlaylistDetailPage> {
                 hintText: '搜索歌单中的歌曲',
                 onChanged: (value) =>
                     setState(() => _query = value.trim().toLowerCase()),
-                suffix: _query.isEmpty
-                    ? null
-                    : IconButton(
-                        tooltip: '关闭搜索',
-                        visualDensity: VisualDensity.compact,
-                        icon: const Icon(Icons.close_rounded, size: 18),
-                        onPressed: _exitSearch,
-                      ),
+                // 清除按钮与操作栏「取消」按钮分工：前者清文本，后者退出搜索。
+                showClearSuffix: true,
                 padding: EdgeInsets.zero,
               )
             : Text(
