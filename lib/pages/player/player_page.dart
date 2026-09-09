@@ -238,8 +238,9 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
   bool _screenAwake = false;
   bool _showLyrics = false;
 
-  /// 横屏沉浸式歌词下临时弹出的播放控制栏（点按歌词区切换显隐）。
+  /// 横屏沉浸式歌词下临时弹出的播放控制栏（单击弹出，5 秒无操作自动隐藏）。
   bool _landscapeControlsVisible = false;
+  Timer? _immersiveBarTimer;
   int? _detailPointerId;
   Offset? _detailPointerStart;
   Offset? _detailPointerLast;
@@ -2037,6 +2038,7 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
     }
     _unbindVideoController(_videoController);
     _detailPageController.dispose();
+    _immersiveBarTimer?.cancel();
     super.dispose();
   }
 
@@ -2087,6 +2089,9 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
 
     final viewport = MediaQuery.sizeOf(context);
     final isLandscape = viewport.width > viewport.height;
+    final isFav = current == null
+        ? false
+        : ref.watch(favoritesProvider).contains(current.path);
 
     final detailHeader = Padding(
       padding: const EdgeInsets.symmetric(horizontal: 4),
@@ -2133,7 +2138,20 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
               ],
             ),
           ),
-          // 封面样式一键切换（横竖屏都有）：图标随当前样式变化。
+          // 横屏封面页也有收藏入口：右侧按钮列直接复用顶部 isFav。
+          IconButton(
+            tooltip: isFav ? '取消收藏' : '收藏',
+            icon: Icon(
+              isFav ? Icons.favorite : Icons.favorite_border,
+              color: isFav ? const Color(0xFFEC4141) : Colors.white,
+            ),
+            onPressed: current == null
+                ? null
+                : () => ref.read(favoritesProvider.notifier).toggle(
+                      current.path,
+                      song: FavoriteSongSnapshot.fromQueueItem(current),
+                    ),
+          ),
           IconButton(
             tooltip: '切换封面样式（${coverStyleLabel(coverStyle)}）',
             icon: Icon(coverStyleIcon(coverStyle), color: Colors.white),
@@ -2288,7 +2306,8 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
       );
     }
 
-    // 横屏右半屏：普通模式歌词 + 常驻控制栏；沉浸式仅歌词，点按弹出控制栏。
+    // 横屏右半屏：普通模式歌词 + 常驻控制栏；沉浸式仅歌词，单击弹出
+    // 播放栏，5 秒无操作自动隐藏。
     Widget buildLandscapeRightPane() {
       final lyrics = buildLandscapeLyrics();
       if (!landscapeImmersive) {
@@ -2299,27 +2318,48 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
           ],
         );
       }
+      // 显示控制栏：设 visible=true + 启动/重启 5 秒隐藏定时器。
+      void showBar() {
+        _immersiveBarTimer?.cancel();
+        setState(() => _landscapeControlsVisible = true);
+        _immersiveBarTimer = Timer(const Duration(seconds: 5), () {
+          if (mounted) setState(() => _landscapeControlsVisible = false);
+        });
+      }
+      // 隐藏控制栏：取消定时器 + 设 visible=false。
+      void hideBar() {
+        _immersiveBarTimer?.cancel();
+        _immersiveBarTimer = null;
+        if (mounted) setState(() => _landscapeControlsVisible = false);
+      }
+      // 重置倒计时（控制栏内任何交互都触发）。
+      void keepBar() {
+        if (!_landscapeControlsVisible) return;
+        _immersiveBarTimer?.cancel();
+        _immersiveBarTimer = Timer(const Duration(seconds: 5), () {
+          if (mounted && _landscapeControlsVisible) {
+            setState(() => _landscapeControlsVisible = false);
+          }
+        });
+      }
+
       final barVisible = _landscapeControlsVisible;
       return Stack(
         children: [
           Positioned.fill(
             child: GestureDetector(
               behavior: HitTestBehavior.opaque,
-              // 播放栏可见时，点歌词空白处收起；歌词行自身的点按 seek
-              // 在手势竞技场中先于外层胜出，不受影响。
-              onTap: barVisible
-                  ? () => setState(() => _landscapeControlsVisible = false)
-                  : null,
+              // 播放栏可见时，点歌词空白处立即收起。
+              onTap: barVisible ? hideBar : null,
               child: lyrics,
             ),
           ),
           if (!barVisible)
-            // 播放栏隐藏时叠加透明点按层：任意单击（含歌词行）弹出播放栏。
-            // translucent 让点击继续传递给下层，歌词垂直滚动不受影响。
+            // 播放栏隐藏时叠加透明点按层：任意单击弹出播放栏。
             Positioned.fill(
               child: GestureDetector(
                 behavior: HitTestBehavior.translucent,
-                onTap: () => setState(() => _landscapeControlsVisible = true),
+                onTap: showBar,
               ),
             ),
           Positioned(
@@ -2332,15 +2372,21 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
                 duration: const Duration(milliseconds: 240),
                 curve: Curves.easeOutCubic,
                 opacity: barVisible ? 1 : 0,
-                child: DecoratedBox(
-                  decoration: const BoxDecoration(
-                    gradient: LinearGradient(
-                      begin: Alignment.bottomCenter,
-                      end: Alignment.topCenter,
-                      colors: [Color(0x8C000000), Color(0x2E000000)],
+                // Listener 监听控制栏内任意 PointerDown，重置 5 秒倒计时，
+                // 避免用户正在操作时栏突然消失。
+                child: Listener(
+                  behavior: HitTestBehavior.opaque,
+                  onPointerDown: (_) => keepBar(),
+                  child: DecoratedBox(
+                    decoration: const BoxDecoration(
+                      gradient: LinearGradient(
+                        begin: Alignment.bottomCenter,
+                        end: Alignment.topCenter,
+                        colors: [Color(0x8C000000), Color(0x2E000000)],
+                      ),
                     ),
+                    child: scaledLandscapeControls(),
                   ),
-                  child: scaledLandscapeControls(),
                 ),
               ),
             ),
@@ -4117,8 +4163,8 @@ class _PlayerDetailBackground extends ConsumerWidget {
               ),
     };
 
-    // 流光模式本身即明亮氛围（颜色取自封面主色），叠加的暗色遮罩
-    // 显著减淡，避免把流光压回暗色；其余背景模式维持原有可读性遮罩。
+    // 流光模式本身即明亮氛围（颜色取自封面主色 + 封面模糊提亮），
+    // 叠加的提亮遮罩让整体更通透；其余背景模式维持原有可读性遮罩。
     final flowing = mode == PlayerDetailBackgroundMode.flowingLight ||
         (mode == PlayerDetailBackgroundMode.wallpaperBlur &&
             wallpaperPath.isEmpty) ||
@@ -4130,16 +4176,20 @@ class _PlayerDetailBackground extends ConsumerWidget {
         fit: StackFit.expand,
         children: [
           Positioned.fill(child: backdrop),
-          ColoredBox(
-            color: Color(0xFF080A0F).withValues(alpha: flowing ? .18 : .58),
-          ),
+          if (flowing)
+            // 流光模式：白色提亮遮罩，让背景整体明亮通透（参考 MusicFree）。
+            ColoredBox(color: Colors.white.withValues(alpha: .32))
+          else
+            ColoredBox(
+              color: Color(0xFF080A0F).withValues(alpha: .58),
+            ),
           DecoratedBox(
             decoration: BoxDecoration(
               gradient: LinearGradient(
                 begin: Alignment.topCenter,
                 end: Alignment.bottomCenter,
                 colors: flowing
-                    ? [Color(0x00000000), Color(0x00000000), Color(0x33000000)]
+                    ? [Color(0x00FFFFFF), Color(0x00FFFFFF), Color(0x38FFFFFF)]
                     : [Color(0x29000000), Color(0x12000000), Color(0xA6000000)],
                 stops: [0, .48, 1],
               ),
@@ -4362,13 +4412,53 @@ class _FlowingLightBackgroundState extends ConsumerState<_FlowingLightBackground
   }
 
   @override
-  Widget build(BuildContext context) => AnimatedBuilder(
-    animation: Listenable.merge([_controller, _colorController]),
-    builder: (_, _) => CustomPaint(
-      painter: _FlowingLightPainter(_controller.value, _currentColors()),
-      child: const SizedBox.expand(),
-    ),
-  );
+  Widget build(BuildContext context) {
+    final item = widget.item;
+    return AnimatedBuilder(
+      animation: Listenable.merge([_controller, _colorController]),
+      builder: (_, __) {
+        // 封面模糊打底：放大 + 重度模糊 + 半透明，成为明亮的底色。
+        Widget blurCover;
+        if (item == null) {
+          blurCover = const ColoredBox(color: Colors.white);
+        } else {
+          blurCover = Transform.scale(
+            scale: 1.24,
+            child: Opacity(
+              opacity: .82,
+              child: ImageFiltered(
+                imageFilter: ui.ImageFilter.blur(sigmaX: 32, sigmaY: 32),
+                child: CoverImage(
+                  key: ValueKey('flowing:${item.path}:${item.coverUrl}'),
+                  songPath: item.path,
+                  imageUrl: item.coverUrl,
+                  width: double.infinity,
+                  height: double.infinity,
+                  radius: 0,
+                  cacheWidth: 256,
+                  icon: Icons.music_note_rounded,
+                ),
+              ),
+            ),
+          );
+        }
+        return Stack(
+          fit: StackFit.expand,
+          children: [
+            Positioned.fill(child: blurCover),
+            // 彩色发光 blob（透明底色 + Plus 混合叠加）。
+            CustomPaint(
+              painter: _FlowingLightPainter(
+                _controller.value,
+                _currentColors(),
+              ),
+              child: const SizedBox.expand(),
+            ),
+          ],
+        );
+      },
+    );
+  }
 }
 
 class _FlowingLightPainter extends CustomPainter {
@@ -4384,23 +4474,24 @@ class _FlowingLightPainter extends CustomPainter {
 
   @override
   void paint(Canvas canvas, Size size) {
-    canvas.drawColor(const Color(0xFF0B0D12), BlendMode.srcOver);
+    // 不再画深色底——底色由外层封面模糊层提供；blob 用较低 alpha
+    // 叠加，避免在亮色底上显得过于厚重。
     final phase = progress * math.pi * 2;
     final points = [
       (
         Offset(size.width * (.18 + .18 * math.sin(phase)), size.height * .12),
-        _blobColor(0, .72),
+        _blobColor(0, .42),
       ),
       (
         Offset(size.width * (.82 + .16 * math.cos(phase)), size.height * .62),
-        _blobColor(1, .58),
+        _blobColor(1, .34),
       ),
       (
         Offset(
           size.width * (.45 + .2 * math.sin(phase + 1)),
           size.height * .95,
         ),
-        _blobColor(2, .50),
+        _blobColor(2, .30),
       ),
       if (colors.length > 3)
         (
@@ -4408,12 +4499,12 @@ class _FlowingLightPainter extends CustomPainter {
             size.width * (.32 + .22 * math.cos(phase + 2)),
             size.height * (.38 + .18 * math.sin(phase + 3)),
           ),
-          _blobColor(3, .42),
+          _blobColor(3, .24),
         ),
     ];
     // plus 混合让重叠区域亮度叠加，形成流光的通透感。
     for (final (center, color) in points) {
-      final radius = math.max(size.width, size.height) * .78;
+      final radius = math.max(size.width, size.height) * .68;
       final paint = Paint()
         ..shader = ui.Gradient.radial(center, radius, [
           color,
