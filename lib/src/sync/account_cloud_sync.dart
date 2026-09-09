@@ -23,6 +23,12 @@ class AccountCloudSync {
   static bool _autoUploading = false;
   static int _autoStartGeneration = 0;
 
+  /// 最近一次 file_sync_download 拿到的云端歌单索引（id → 歌曲 path
+  /// 集合）与收藏 path 集合。sync() 先下载再上传，uploadIfChanged 据此
+  /// 校验云端快照是否覆盖本地数据——云端被清空/删除后强制重传。
+  static Map<String, Set<String>>? _lastCloudPlaylistSongs;
+  static Set<String>? _lastCloudFavoritePaths;
+
   /// 默认使用 30 分钟，减少后台请求；用户手动选择的频率不会被覆盖。
   static const defaultFrequency = CloudSyncFrequency.thirtyMinutes;
 
@@ -151,8 +157,11 @@ class AccountCloudSync {
   }
 
   /// 只有歌单快照发生变化时才上传，避免定时任务重复覆盖同一份云数据。
-  /// 返回 null 表示与上次上传完全一致。
-  static Future<CloudSyncResult?> uploadIfChanged(
+  ///
+  /// 云端数据被清空/部分删除而本地哈希仍命中时，会强制重传一次重建
+  /// 云端快照（与插件同步 v3 的保护一致），否则「查看云数据」会一直
+  /// 显示 0、其它设备也永远拉不到歌单。
+  static Future<CloudSyncResult> uploadIfChanged(
     AuthNotifier auth,
     PlaylistsNotifier playlists, {
     FavoritesNotifier? favorites,
@@ -167,7 +176,19 @@ class AccountCloudSync {
     final hash = _payloadHash(payload, favoritePayload);
     final prefs = await SharedPreferences.getInstance();
     if (prefs.getString(_key(_lastUploadHashPrefix, accountId)) == hash) {
-      return const CloudSyncResult(noChange: true);
+      if (payload.isEmpty && favoritePayload.isEmpty) {
+        return const CloudSyncResult(noChange: true);
+      }
+      // 未先下载（无云端快照可比对）或云端已覆盖全部本地数据时跳过；
+      // 云端数据被清空/回滚后，仅凭本地哈希会让上传永久跳过，
+      // 因此云端缺失本地已有数据时强制重传。
+      final cloudSongs = _lastCloudPlaylistSongs;
+      final cloudFavorites = _lastCloudFavoritePaths;
+      if (cloudSongs == null ||
+          cloudFavorites == null ||
+          _cloudCovers(cloudSongs, cloudFavorites, payload, favoritePayload)) {
+        return const CloudSyncResult(noChange: true);
+      }
     }
     final result = await _uploadPayload(
       auth,
@@ -177,6 +198,30 @@ class AccountCloudSync {
     );
     await prefs.setString(_key(_lastUploadHashPrefix, accountId), hash);
     return result;
+  }
+
+  /// 云端快照是否已包含全部本地歌单与收藏（歌单按 id + 歌曲 path、
+  /// 收藏按 path 比对）。
+  static bool _cloudCovers(
+    Map<String, Set<String>> cloudPlaylistSongs,
+    Set<String> cloudFavoritePaths,
+    List<Map<String, dynamic>> payload,
+    List<Map<String, dynamic>> favoritePayload,
+  ) {
+    for (final playlist in payload) {
+      final cloudSongs = cloudPlaylistSongs['${playlist['id']}'];
+      if (cloudSongs == null) return false;
+      for (final song in playlist['songs'] as List) {
+        if (song is! Map) continue;
+        final path = song['path']?.toString() ?? '';
+        if (path.isNotEmpty && !cloudSongs.contains(path)) return false;
+      }
+    }
+    for (final favorite in favoritePayload) {
+      final path = favorite['path']?.toString() ?? '';
+      if (path.isNotEmpty && !cloudFavoritePaths.contains(path)) return false;
+    }
+    return true;
   }
 
   static Future<CloudSyncResult> _uploadPayload(
@@ -260,6 +305,25 @@ class AccountCloudSync {
       'user_id': accountId,
     }, fetchTimeoutMs: 60000);
     final raw = data['playlists'];
+    // 记录云端歌单索引（id → 歌曲 path 集合），供 uploadIfChanged 校验
+    // 云端快照覆盖情况；云端歌单被清空/删除时据此强制重传。
+    final cloudPlaylistSongs = <String, Set<String>>{};
+    if (raw is List) {
+      for (final value in raw.whereType<Map>()) {
+        final cloudId = value['id']?.toString().trim() ?? '';
+        if (cloudId.isEmpty) continue;
+        final cloudSongPaths = <String>{};
+        final cloudRawSongs = value['songs'];
+        if (cloudRawSongs is List) {
+          for (final song in cloudRawSongs.whereType<Map>()) {
+            final path = song['path']?.toString() ?? '';
+            if (path.isNotEmpty) cloudSongPaths.add(path);
+          }
+        }
+        cloudPlaylistSongs[cloudId] = cloudSongPaths;
+      }
+    }
+    _lastCloudPlaylistSongs = cloudPlaylistSongs;
     var downloadedSongs = 0;
     var downloadedPlaylists = 0;
     final legacyFavorites = <FavoriteSongSnapshot>[];
@@ -304,29 +368,37 @@ class AccountCloudSync {
       }
     }
     var downloadedFavorites = 0;
-    if (favorites != null) {
-      final rawFavorites = data['favorites'];
-      final favoriteSongs = <FavoriteSongSnapshot>[];
-      if (rawFavorites is List) {
-        for (final value in rawFavorites) {
-          if (value is Map) {
-            final normalized = _normalizeSong(Map<String, dynamic>.from(value));
-            final snapshot = FavoriteSongSnapshot.fromJson(normalized);
-            if (snapshot.path.isNotEmpty) favoriteSongs.add(snapshot);
-          } else if (value is String && value.trim().isNotEmpty) {
-            favoriteSongs.add(
-              FavoriteSongSnapshot(
-                path: value.trim(),
-                title: value.trim().split(RegExp(r'[\\/]')).last,
-                artist: '',
-                album: '',
-                duration: 0,
-                format: '本地',
-              ),
-            );
-          }
+    final rawFavorites = data['favorites'];
+    // 记录云端收藏 path 集合（与歌单索引同理，供覆盖校验）。
+    final cloudFavoritePaths = <String>{};
+    final favoriteSongs = <FavoriteSongSnapshot>[];
+    if (rawFavorites is List) {
+      for (final value in rawFavorites) {
+        if (value is Map) {
+          final path = value['path']?.toString() ?? '';
+          if (path.isNotEmpty) cloudFavoritePaths.add(path);
+          if (favorites == null) continue;
+          final normalized = _normalizeSong(Map<String, dynamic>.from(value));
+          final snapshot = FavoriteSongSnapshot.fromJson(normalized);
+          if (snapshot.path.isNotEmpty) favoriteSongs.add(snapshot);
+        } else if (value is String && value.trim().isNotEmpty) {
+          cloudFavoritePaths.add(value.trim());
+          if (favorites == null) continue;
+          favoriteSongs.add(
+            FavoriteSongSnapshot(
+              path: value.trim(),
+              title: value.trim().split(RegExp(r'[\\/]')).last,
+              artist: '',
+              album: '',
+              duration: 0,
+              format: '本地',
+            ),
+          );
         }
       }
+    }
+    _lastCloudFavoritePaths = cloudFavoritePaths;
+    if (favorites != null) {
       downloadedFavorites = await favorites.mergeCloudFavorites([
         ...legacyFavorites,
         ...favoriteSongs,
@@ -352,7 +424,7 @@ class AccountCloudSync {
       playlists,
       favorites: favorites,
     );
-    if (uploaded == null) {
+    if (uploaded.noChange) {
       return CloudSyncResult(
         noChange: true,
         downloadedPlaylists: downloaded.downloadedPlaylists,
