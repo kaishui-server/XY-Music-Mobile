@@ -4163,8 +4163,9 @@ class _PlayerDetailBackground extends ConsumerWidget {
               ),
     };
 
-    // 流光模式本身即明亮氛围（颜色取自封面主色 + 封面模糊提亮），
-    // 叠加的提亮遮罩让整体更通透；其余背景模式维持原有可读性遮罩。
+    // 流光模式本身即明亮氛围（颜色取自封面主色 + 封面模糊）；
+    // 只保留极轻的提亮遮罩，过强会让整屏过曝（beta9 修正）。其余
+    // 背景模式维持原有可读性遮罩。
     final flowing = mode == PlayerDetailBackgroundMode.flowingLight ||
         (mode == PlayerDetailBackgroundMode.wallpaperBlur &&
             wallpaperPath.isEmpty) ||
@@ -4177,8 +4178,8 @@ class _PlayerDetailBackground extends ConsumerWidget {
         children: [
           Positioned.fill(child: backdrop),
           if (flowing)
-            // 流光模式：白色提亮遮罩，让背景整体明亮通透（参考 MusicFree）。
-            ColoredBox(color: Colors.white.withValues(alpha: .32))
+            // 流光模式：极轻提亮，保持通透但避免过曝。
+            ColoredBox(color: Colors.white.withValues(alpha: .08))
           else
             ColoredBox(
               color: Color(0xFF080A0F).withValues(alpha: .58),
@@ -4189,7 +4190,7 @@ class _PlayerDetailBackground extends ConsumerWidget {
                 begin: Alignment.topCenter,
                 end: Alignment.bottomCenter,
                 colors: flowing
-                    ? [Color(0x00FFFFFF), Color(0x00FFFFFF), Color(0x38FFFFFF)]
+                    ? [Color(0x00FFFFFF), Color(0x00FFFFFF), Color(0x1FFFFFFF)]
                     : [Color(0x29000000), Color(0x12000000), Color(0xA6000000)],
                 stops: [0, .48, 1],
               ),
@@ -4366,12 +4367,12 @@ class _FlowingLightBackgroundState extends ConsumerState<_FlowingLightBackground
       return;
     }
     try {
-      // colorBoost 偏高、depth 偏低，让色板保持高饱和的亮色调，
-      // 与流光的发光氛围匹配。
+      // colorBoost 适中即可：过高会让色板过亮，叠加 plus 混合的
+      // blob 后整屏过曝（beta8 曝光事故）。
       final raw = await extractPalette(
         source: source,
         count: BigInt.from(4),
-        colorBoost: 78,
+        colorBoost: 46,
         depth: 30,
       );
       if (!mounted || request != _paletteRequest) return;
@@ -4416,28 +4417,26 @@ class _FlowingLightBackgroundState extends ConsumerState<_FlowingLightBackground
     final item = widget.item;
     return AnimatedBuilder(
       animation: Listenable.merge([_controller, _colorController]),
-      builder: (_, __) {
-        // 封面模糊打底：放大 + 重度模糊 + 半透明，成为明亮的底色。
+      builder: (_, _) {
+        // 封面模糊打底：放大 + 重度模糊，不透明地铺满，色调纯来自
+        // 封面本身；提亮/压暗交给外层遮罩控制，避免底色串白过曝。
         Widget blurCover;
         if (item == null) {
           blurCover = const ColoredBox(color: Colors.white);
         } else {
           blurCover = Transform.scale(
             scale: 1.24,
-            child: Opacity(
-              opacity: .82,
-              child: ImageFiltered(
-                imageFilter: ui.ImageFilter.blur(sigmaX: 32, sigmaY: 32),
-                child: CoverImage(
-                  key: ValueKey('flowing:${item.path}:${item.coverUrl}'),
-                  songPath: item.path,
-                  imageUrl: item.coverUrl,
-                  width: double.infinity,
-                  height: double.infinity,
-                  radius: 0,
-                  cacheWidth: 256,
-                  icon: Icons.music_note_rounded,
-                ),
+            child: ImageFiltered(
+              imageFilter: ui.ImageFilter.blur(sigmaX: 32, sigmaY: 32),
+              child: CoverImage(
+                key: ValueKey('flowing:${item.path}:${item.coverUrl}'),
+                songPath: item.path,
+                imageUrl: item.coverUrl,
+                width: double.infinity,
+                height: double.infinity,
+                radius: 0,
+                cacheWidth: 256,
+                icon: Icons.music_note_rounded,
               ),
             ),
           );
@@ -4474,24 +4473,24 @@ class _FlowingLightPainter extends CustomPainter {
 
   @override
   void paint(Canvas canvas, Size size) {
-    // 不再画深色底——底色由外层封面模糊层提供；blob 用较低 alpha
-    // 叠加，避免在亮色底上显得过于厚重。
+    // 不再画深色底——底色由外层封面模糊层提供；blob 以极低 alpha 的
+    // plus 叠加提供流动色彩即可，alpha 过高会在亮色底上整屏过曝。
     final phase = progress * math.pi * 2;
     final points = [
       (
         Offset(size.width * (.18 + .18 * math.sin(phase)), size.height * .12),
-        _blobColor(0, .42),
+        _blobColor(0, .13),
       ),
       (
         Offset(size.width * (.82 + .16 * math.cos(phase)), size.height * .62),
-        _blobColor(1, .34),
+        _blobColor(1, .10),
       ),
       (
         Offset(
           size.width * (.45 + .2 * math.sin(phase + 1)),
           size.height * .95,
         ),
-        _blobColor(2, .30),
+        _blobColor(2, .07),
       ),
       if (colors.length > 3)
         (
@@ -4499,7 +4498,7 @@ class _FlowingLightPainter extends CustomPainter {
             size.width * (.32 + .22 * math.cos(phase + 2)),
             size.height * (.38 + .18 * math.sin(phase + 3)),
           ),
-          _blobColor(3, .24),
+          _blobColor(3, .05),
         ),
     ];
     // plus 混合让重叠区域亮度叠加，形成流光的通透感。
