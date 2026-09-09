@@ -82,18 +82,22 @@ class _XySlidePageTransition extends StatelessWidget {
             children: [
               child,
               // 入场页左缘阴影：动画进行中可见，落定后淡出。
+              // IgnorePointer 确保装饰层永不参与命中测试，
+              // 否则透明度为 0 时仍会吞掉整页点击。
               FadeTransition(
                 opacity: ReverseAnimation(incoming),
-                child: const Align(
-                  alignment: Alignment.centerLeft,
-                  child: SizedBox(
-                    width: 24,
-                    child: DecoratedBox(
-                      decoration: BoxDecoration(
-                        gradient: LinearGradient(
-                          begin: Alignment.centerLeft,
-                          end: Alignment.centerRight,
-                          colors: [Colors.black45, Colors.transparent],
+                child: const IgnorePointer(
+                  child: Align(
+                    alignment: Alignment.centerLeft,
+                    child: SizedBox(
+                      width: 24,
+                      child: DecoratedBox(
+                        decoration: BoxDecoration(
+                          gradient: LinearGradient(
+                            begin: Alignment.centerLeft,
+                            end: Alignment.centerRight,
+                            colors: [Colors.black45, Colors.transparent],
+                          ),
                         ),
                       ),
                     ),
@@ -101,11 +105,15 @@ class _XySlidePageTransition extends StatelessWidget {
                 ),
               ),
               // 被覆盖页压暗：跟随覆盖进度加深，最多 24%。
+              // ColoredBox 对命中测试始终不透明，必须用 IgnorePointer
+              // 隔离，否则动画落定后整页按钮都点不动。
               FadeTransition(
                 opacity: covered.drive(
                   Tween<double>(begin: 0, end: .24),
                 ),
-                child: const ColoredBox(color: Colors.black),
+                child: const IgnorePointer(
+                  child: ColoredBox(color: Colors.black),
+                ),
               ),
             ],
           ),
