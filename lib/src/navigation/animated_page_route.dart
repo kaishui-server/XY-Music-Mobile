@@ -20,32 +20,45 @@ CurvedAnimation _xyCurve(Animation<double> parent) => CurvedAnimation(
 );
 
 /// 页面切换过渡入口：按设置中的切换模式分发。
+///
+/// 动画落定后（入场完成且未被新页面覆盖）直接裸返回页面本身：
+/// 不包裹任何过渡层（Slide/Fade/遮罩），从结构上杜绝装饰层
+/// 遮挡点击与滚动的可能。
 Widget xyPageTransition(
   BuildContext context,
   Animation<double> animation,
   Animation<double> secondaryAnimation,
   Widget child,
 ) {
-  switch (xyPageTransitionMode) {
-    case PageTransitionMode.slide:
-      return _XySlidePageTransition(
-        animation: animation,
-        secondaryAnimation: secondaryAnimation,
-        child: child,
-      );
-    case PageTransitionMode.stack:
-      return _XyStackPageTransition(
-        animation: animation,
-        secondaryAnimation: secondaryAnimation,
-        child: child,
-      );
-    case PageTransitionMode.cube:
-      return _XyCubePageTransition(
-        animation: animation,
-        secondaryAnimation: secondaryAnimation,
-        child: child,
-      );
-  }
+  return AnimatedBuilder(
+    animation: Listenable.merge([animation, secondaryAnimation]),
+    child: child,
+    builder: (context, child) {
+      final settled =
+          animation.value >= 1 && secondaryAnimation.value <= 0;
+      if (settled) return child!;
+      switch (xyPageTransitionMode) {
+        case PageTransitionMode.slide:
+          return _XySlidePageTransition(
+            animation: animation,
+            secondaryAnimation: secondaryAnimation,
+            child: child!,
+          );
+        case PageTransitionMode.stack:
+          return _XyStackPageTransition(
+            animation: animation,
+            secondaryAnimation: secondaryAnimation,
+            child: child!,
+          );
+        case PageTransitionMode.cube:
+          return _XyCubePageTransition(
+            animation: animation,
+            secondaryAnimation: secondaryAnimation,
+            child: child!,
+          );
+      }
+    },
+  );
 }
 
 /// 平移：前后两页同步水平推移，边界始终相接。
