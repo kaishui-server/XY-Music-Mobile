@@ -147,22 +147,8 @@ class AppShell extends ConsumerWidget {
                   (bottomBarVisible ? 0.0 : kMiniPlayerBottomGap)
             : 0.0);
 
-    void navigate(String path) {
-      final scaffoldContext = appScaffoldKey.currentContext;
-      // 先收起抽屉，等关闭动画结束后再切换页面，避免抽屉与页面
-      // 切换动画同时进行造成“页面叠加”的观感。
-      if (scaffoldContext != null) {
-        final scaffold = Scaffold.of(scaffoldContext);
-        if (scaffold.isDrawerOpen || scaffold.isEndDrawerOpen) {
-          Navigator.of(scaffoldContext).pop();
-          Future<void>.delayed(const Duration(milliseconds: 260), () {
-            if (context.mounted) context.go(path);
-          });
-          return;
-        }
-      }
-      context.go(path);
-    }
+    void navigate(String path) =>
+        navigateFromSidebar(context, appScaffoldKey, path);
 
     return Scaffold(
       key: appScaffoldKey,
