@@ -28,13 +28,10 @@ class ExplorePage extends ConsumerStatefulWidget {
 }
 
 class _ExplorePageState extends ConsumerState<ExplorePage> {
-  // 推荐和热门榜单会同时触发多个插件请求/QuickJS 运行时初始化。
-  // 让探索页先完成首帧和页面转场，再挂载这些重内容，避免从首页进入时
-  // 主线程短暂阻塞造成“卡一下”。数据 provider 仍会缓存结果，后续进入不会
-  // 重复等待这段时间。
-  var _showRecommendation = false;
+  // 热门榜单会触发多个插件请求/QuickJS 运行时初始化。让探索页先完成
+  // 首帧和页面转场，再挂载重内容，避免从首页进入时主线程短暂阻塞造成
+  // “卡一下”。数据 provider 仍会缓存结果，后续进入不会重复等待这段时间。
   var _showHotCharts = false;
-  Timer? _recommendationTimer;
   Timer? _hotChartsTimer;
 
   @override
@@ -42,12 +39,9 @@ class _ExplorePageState extends ConsumerState<ExplorePage> {
     super.initState();
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
-      // 两个毛玻璃模块都包含图片和插件结果，若在同一帧挂载会在页面转场
-      // 结束时产生明显掉帧。错峰挂载，数据请求仍由 provider 在后台预热。
-      _recommendationTimer = Timer(const Duration(milliseconds: 420), () {
-        if (mounted) setState(() => _showRecommendation = true);
-      });
-      _hotChartsTimer = Timer(const Duration(milliseconds: 820), () {
+      // 热门榜单模块包含图片和插件结果，若在页面转场结束的同帧挂载会
+      // 产生明显掉帧。延迟挂载，数据请求仍由 provider 在后台预热。
+      _hotChartsTimer = Timer(const Duration(milliseconds: 420), () {
         if (mounted) setState(() => _showHotCharts = true);
       });
     });
@@ -55,7 +49,6 @@ class _ExplorePageState extends ConsumerState<ExplorePage> {
 
   @override
   void dispose() {
-    _recommendationTimer?.cancel();
     _hotChartsTimer?.cancel();
     super.dispose();
   }
@@ -92,50 +85,6 @@ class _ExplorePageState extends ConsumerState<ExplorePage> {
                 ),
               ),
               SliverToBoxAdapter(
-                child: _showRecommendation
-                    ? Padding(
-                        padding: const EdgeInsets.fromLTRB(16, 14, 16, 12),
-                        child: XyPanel(
-                          padding: const EdgeInsets.fromLTRB(14, 8, 14, 16),
-                          blurSigma: 14,
-                          color: Theme.of(context).colorScheme.surface
-                              .withValues(
-                                alpha:
-                                    Theme.of(context).brightness ==
-                                        Brightness.dark
-                                    ? .30
-                                    : .42,
-                              ),
-                          child: Column(
-                            children: [
-                              Row(
-                                children: [
-                                  const Expanded(
-                                    child: Text(
-                                      '猜你想听',
-                                      style: TextStyle(
-                                        fontSize: 20,
-                                        fontWeight: FontWeight.w800,
-                                        letterSpacing: -.2,
-                                      ),
-                                    ),
-                                  ),
-                                  const _RecommendationRefreshButton(),
-                                ],
-                              ),
-                              const SizedBox(height: 8),
-                              _RecommendationTabs(
-                                onMore: () => context.push(
-                                  '/home/explore/recommendations',
-                                ),
-                              ),
-                            ],
-                          ),
-                        ),
-                      )
-                    : const _ExploreDeferredSectionPlaceholder(height: 164),
-              ),
-              SliverToBoxAdapter(
                 child: _showHotCharts
                     ? const _ExploreHotChartsSection()
                     : const _ExploreDeferredSectionPlaceholder(height: 180),
@@ -143,6 +92,47 @@ class _ExplorePageState extends ConsumerState<ExplorePage> {
             ],
           ),
         ),
+      ),
+    );
+  }
+}
+
+/// 「猜你想听」推荐面板：根据本地偏好生成的歌曲/歌单推荐卡片。
+/// 原探索页卡片已迁移为首页固定模块，组件保留在此供首页复用。
+class GuessYouLikePanel extends StatelessWidget {
+  const GuessYouLikePanel({super.key, this.onMore});
+
+  /// 「查看更多」回调，通常跳转到完整推荐页。
+  final VoidCallback? onMore;
+
+  @override
+  Widget build(BuildContext context) {
+    return XyPanel(
+      padding: const EdgeInsets.fromLTRB(14, 8, 14, 16),
+      blurSigma: 14,
+      color: Theme.of(context).colorScheme.surface.withValues(
+        alpha: Theme.of(context).brightness == Brightness.dark ? .30 : .42,
+      ),
+      child: Column(
+        children: [
+          Row(
+            children: [
+              const Expanded(
+                child: Text(
+                  '猜你想听',
+                  style: TextStyle(
+                    fontSize: 20,
+                    fontWeight: FontWeight.w800,
+                    letterSpacing: -.2,
+                  ),
+                ),
+              ),
+              const _RecommendationRefreshButton(),
+            ],
+          ),
+          const SizedBox(height: 8),
+          _RecommendationTabs(onMore: onMore),
+        ],
       ),
     );
   }

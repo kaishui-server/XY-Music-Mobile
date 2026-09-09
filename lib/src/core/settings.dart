@@ -16,8 +16,38 @@ enum PlayerDetailBackgroundMode {
 /// （参考 MusicFree）、黑胶唱片（参考 BakaMusic）。
 enum PlayerCoverStyle { classic, circle, immersive, vinyl }
 
+/// 页面切换动画模式：平移（前后页同步推移）、层叠（前页滑入覆盖后页）、
+/// 方块（两页绕相邻边缘做 3D 翻面）。
+enum PageTransitionMode { slide, stack, cube }
+
 /// 首页顶栏侧边栏按钮的位置。
 enum SidebarPosition { left, right }
+
+/// 首页可自定义显隐的模块 id。探索页同款「猜你想听」推荐面板固定展示，
+/// 不参与自定义。
+const kHomeModuleNowPlaying = 'nowPlaying';
+const kHomeModuleHotComment = 'hotComment';
+const kHomeModuleStatistics = 'statistics';
+const kHomeModuleLeaderboard = 'leaderboard';
+
+const kDefaultHomeModules = <String>[
+  kHomeModuleNowPlaying,
+  kHomeModuleHotComment,
+  kHomeModuleStatistics,
+  kHomeModuleLeaderboard,
+];
+
+/// 归一化首页模块列表：过滤合法 id 并去重。列表表示「已启用」的模块，
+/// 不在列表中的模块视为已关闭，因此不做缺省补回；默认值在读取时判断。
+List<String> normalizeHomeModules(Iterable<String> stored) {
+  final normalized = <String>[];
+  for (final id in stored) {
+    if (kDefaultHomeModules.contains(id) && !normalized.contains(id)) {
+      normalized.add(id);
+    }
+  }
+  return normalized;
+}
 
 const kSidebarHome = 'home';
 const kSidebarExplore = 'explore';
@@ -134,6 +164,9 @@ class AppSettings {
     this.playerDetailCustomImagePath = '',
     this.playerDetailBackgroundMode = PlayerDetailBackgroundMode.coverBlur,
     this.playerCoverStyle = PlayerCoverStyle.classic,
+    this.pageTransitionMode = PageTransitionMode.slide,
+    this.landscapeImmersiveLyrics = false,
+    this.homeModules = kDefaultHomeModules,
     this.showQualityBadges = true,
     this.onlineDefaultQuality = '320k',
     this.libraryMinDurationSeconds = 0,
@@ -190,6 +223,13 @@ class AppSettings {
   final String playerDetailCustomImagePath;
   final PlayerDetailBackgroundMode playerDetailBackgroundMode;
   final PlayerCoverStyle playerCoverStyle;
+  final PageTransitionMode pageTransitionMode;
+
+  /// 横屏播放页沉浸式歌词：开启后右侧仅显示歌词，点按弹出播放栏。
+  final bool landscapeImmersiveLyrics;
+
+  /// 首页已启用的模块 id（猜你想听固定展示，不在列表中即关闭）。
+  final List<String> homeModules;
   final bool showQualityBadges;
   final String onlineDefaultQuality;
   final int libraryMinDurationSeconds;
@@ -247,6 +287,9 @@ class AppSettings {
     String? playerDetailCustomImagePath,
     PlayerDetailBackgroundMode? playerDetailBackgroundMode,
     PlayerCoverStyle? playerCoverStyle,
+    PageTransitionMode? pageTransitionMode,
+    bool? landscapeImmersiveLyrics,
+    List<String>? homeModules,
     bool? showQualityBadges,
     String? onlineDefaultQuality,
     int? libraryMinDurationSeconds,
@@ -300,6 +343,10 @@ class AppSettings {
       playerDetailBackgroundMode:
           playerDetailBackgroundMode ?? this.playerDetailBackgroundMode,
       playerCoverStyle: playerCoverStyle ?? this.playerCoverStyle,
+      pageTransitionMode: pageTransitionMode ?? this.pageTransitionMode,
+      landscapeImmersiveLyrics:
+          landscapeImmersiveLyrics ?? this.landscapeImmersiveLyrics,
+      homeModules: homeModules ?? this.homeModules,
       showQualityBadges: showQualityBadges ?? this.showQualityBadges,
       onlineDefaultQuality: onlineDefaultQuality ?? this.onlineDefaultQuality,
       libraryMinDurationSeconds:
@@ -387,6 +434,14 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
       playerCoverStyle: _playerCoverStyleFromInt(
         prefs.getInt('playerCoverStyle') ?? 0,
       ),
+      pageTransitionMode: _pageTransitionModeFromInt(
+        prefs.getInt('pageTransitionMode') ?? 0,
+      ),
+      landscapeImmersiveLyrics:
+          prefs.getBool('landscapeImmersiveLyrics') ?? false,
+      homeModules: prefs.getStringList('homeModules') == null
+          ? kDefaultHomeModules
+          : normalizeHomeModules(prefs.getStringList('homeModules')!),
       showQualityBadges: prefs.getBool('showQualityBadges') ?? true,
       onlineDefaultQuality: prefs.getString('onlineDefaultQuality') ?? '320k',
       libraryMinDurationSeconds: prefs.getInt('libraryMinDurationSeconds') ?? 0,
@@ -452,6 +507,13 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
       return PlayerCoverStyle.values[value];
     }
     return PlayerCoverStyle.classic;
+  }
+
+  PageTransitionMode _pageTransitionModeFromInt(int value) {
+    if (value >= 0 && value < PageTransitionMode.values.length) {
+      return PageTransitionMode.values[value];
+    }
+    return PageTransitionMode.slide;
   }
 
   PlayerDetailBackgroundMode _playerDetailBackgroundModeFromInt(int value) {
@@ -531,6 +593,12 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
         next.playerDetailBackgroundMode.index,
       ),
       prefs.setInt('playerCoverStyle', next.playerCoverStyle.index),
+      prefs.setInt('pageTransitionMode', next.pageTransitionMode.index),
+      prefs.setBool(
+        'landscapeImmersiveLyrics',
+        next.landscapeImmersiveLyrics,
+      ),
+      prefs.setStringList('homeModules', next.homeModules),
       prefs.setBool('showQualityBadges', next.showQualityBadges),
       prefs.setString('onlineDefaultQuality', next.onlineDefaultQuality),
       prefs.setInt('libraryMinDurationSeconds', next.libraryMinDurationSeconds),
@@ -690,6 +758,31 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
       playerCoverStyle: style,
     ),
   );
+  Future<void> setPageTransitionMode(PageTransitionMode mode) => _save(
+    (state.valueOrNull ?? const AppSettings()).copyWith(
+      pageTransitionMode: mode,
+    ),
+  );
+  Future<void> setLandscapeImmersiveLyrics(bool value) => _save(
+    (state.valueOrNull ?? const AppSettings()).copyWith(
+      landscapeImmersiveLyrics: value,
+    ),
+  );
+
+  /// 首页模块显隐：开启时按默认顺序追加，关闭时移除。
+  Future<void> setHomeModuleEnabled(String id, bool enabled) {
+    final current = state.valueOrNull ?? const AppSettings();
+    final modules = current.homeModules.toSet();
+    if (enabled) {
+      modules.add(id);
+    } else {
+      modules.remove(id);
+    }
+    final ordered = kDefaultHomeModules
+        .where(modules.contains)
+        .toList(growable: false);
+    return _save(current.copyWith(homeModules: ordered));
+  }
   Future<void> setShowQualityBadges(bool v) => _save(
     (state.valueOrNull ?? const AppSettings()).copyWith(showQualityBadges: v),
   );

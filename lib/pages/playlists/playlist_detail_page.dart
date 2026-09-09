@@ -6,10 +6,12 @@ import 'package:lpinyin/lpinyin.dart';
 import '../../src/favorites/favorites_provider.dart';
 import '../../src/library/library_provider.dart';
 import '../../src/playlists/playlists_provider.dart';
+import '../../src/plugins/plugin_runtime.dart';
 import '../../src/widgets/batch_download.dart';
 import '../../src/widgets/cover_image.dart';
 import '../../src/widgets/frosted_search_field.dart';
 import '../../src/widgets/song_list_view.dart';
+import '../../src/widgets/source_switch.dart';
 import '../../src/widgets/top_notice.dart' show XyNotice, XyNoticeType;
 
 class PlaylistDetailPage extends ConsumerStatefulWidget {
@@ -31,6 +33,9 @@ class _PlaylistDetailPageState extends ConsumerState<PlaylistDetailPage> {
   List<Song> _visibleSongs = const <Song>[];
   bool _selectionMode = false;
   bool _downloading = false;
+  bool _switchingSource = false;
+  int _switchingDone = 0;
+  int _switchingTotal = 0;
   late final TextEditingController _searchController;
   final FocusNode _searchFocus = FocusNode();
   bool _searchMode = false;
@@ -282,7 +287,9 @@ class _PlaylistDetailPageState extends ConsumerState<PlaylistDetailPage> {
                 padding: EdgeInsets.zero,
               )
             : Text(
-                _selectionMode && _selectedPaths.isNotEmpty
+                _switchingSource
+                    ? '换源中 $_switchingDone/$_switchingTotal'
+                    : _selectionMode && _selectedPaths.isNotEmpty
                     ? '已选 ${_selectedPaths.length} 首'
                     : playlist.name,
               ),
@@ -290,42 +297,20 @@ class _PlaylistDetailPageState extends ConsumerState<PlaylistDetailPage> {
           if (_searchMode)
             TextButton(onPressed: _exitSearch, child: const Text('取消'))
           else ...[
-            if (_selectionMode)
+            // 多选操作集中在底部横排菜单（参考闲鱼音乐），AppBar 只保留
+            // 退出多选、排序与搜索。
+            if (_selectionMode && !_switchingSource)
               IconButton(
-                tooltip: '添加到收藏',
-                onPressed: _selectedPaths.isEmpty ? null : _favoriteSelected,
-                icon: const _FavoriteAddIcon(),
+                tooltip: '取消多选',
+                onPressed: _closeSelection,
+                icon: const Icon(Icons.close_rounded),
               ),
-            if (_selectionMode)
+            if (!_selectionMode)
               IconButton(
-                tooltip: '批量下载',
-                onPressed: _selectedPaths.isEmpty || _downloading
-                    ? null
-                    : _downloadSelected,
-                icon: _downloading
-                    ? const SizedBox.square(
-                        dimension: 20,
-                        child: CircularProgressIndicator(strokeWidth: 2),
-                      )
-                    : const Icon(Icons.download_rounded),
+                tooltip: '多选',
+                onPressed: () => setState(() => _selectionMode = true),
+                icon: const Icon(Icons.library_add_check_rounded),
               ),
-            if (_selectionMode)
-              IconButton(
-                tooltip: '移出歌单',
-                onPressed: _selectedPaths.isEmpty ? null : _removeSelected,
-                icon: const Icon(Icons.delete_outline_rounded),
-              ),
-            IconButton(
-              tooltip: _selectionMode ? '取消多选' : '多选',
-              onPressed: _selectionMode
-                  ? _closeSelection
-                  : () => setState(() => _selectionMode = true),
-              icon: Icon(
-                _selectionMode
-                    ? Icons.close_rounded
-                    : Icons.library_add_check_rounded,
-              ),
-            ),
             SongSortMenuButton(
               sort: _sort,
               onSortChanged: (sort) => setState(() => _sort = sort),
@@ -414,30 +399,22 @@ class _PlaylistDetailPageState extends ConsumerState<PlaylistDetailPage> {
                                   ? '${songs.length} 首歌曲'
                                   : '${visibleSongs.length} / ${songs.length} 首歌曲',
                             ),
-                            if (_selectionMode) ...[
-                              const SizedBox(width: 10),
-                              TextButton(
-                                onPressed: _toggleAll,
-                                child: Text(
-                                  _selectedPaths.length == visibleSongs.length
-                                      ? '取消全选'
-                                      : '全选',
-                                ),
-                              ),
-                            ],
-                            if (!_selectionMode) const Spacer(),
+                            const Spacer(),
                           ],
                         ),
                       ),
                       Expanded(
                         child: SongsListView(
                           songs: visibleSongs,
-                          // 悬浮元素遮挡高度已注入 MediaQuery.padding。
+                          // 悬浮元素遮挡高度已注入 MediaQuery.padding；
+                          // 多选时底部横排菜单自带安全区 padding，列表留 12 即可。
                           padding: EdgeInsets.fromLTRB(
                             10,
                             0,
                             10,
-                            MediaQuery.paddingOf(context).bottom + 12,
+                            _selectionMode
+                                ? 12
+                                : MediaQuery.paddingOf(context).bottom + 12,
                           ),
                           selectionMode: _selectionMode,
                           isSelected: (song) =>
@@ -456,11 +433,132 @@ class _PlaylistDetailPageState extends ConsumerState<PlaylistDetailPage> {
                     ],
                   ),
                 ),
+              // 多选底部横排菜单（参考闲鱼音乐）：全选/收藏/下载/换源/移出。
+              // 底部 padding 取注入后的 MediaQuery（系统安全区+自定义底栏
+              // 与迷你播放栏的遮挡高度），保证不被悬浮元素盖住。
+              if (_selectionMode)
+                _SelectionBottomBar(
+                  allSelected: visibleSongs.isNotEmpty &&
+                      _selectedPaths.length == visibleSongs.length &&
+                      visibleSongs.every(
+                        (song) => _selectedPaths.contains(song.path),
+                      ),
+                  hasSelection: _selectedPaths.isNotEmpty,
+                  busy: _downloading || _switchingSource,
+                  downloading: _downloading,
+                  switchingSource: _switchingSource,
+                  switchProgress: '$_switchingDone/$_switchingTotal',
+                  onToggleAll: _toggleAll,
+                  onFavorite: _favoriteSelected,
+                  onDownload: _downloadSelected,
+                  onSwitchSource: _switchSourceSelected,
+                  onRemove: _removeSelected,
+                ),
             ],
           );
         },
       ),
     );
+  }
+
+  /// 多选批量换源：选择目标插件后逐首搜索同名歌曲，原位替换歌单歌曲。
+  Future<void> _switchSourceSelected() async {
+    if (_selectedPaths.isEmpty || _switchingSource) return;
+    final selected = _songs
+        .where((song) => _selectedPaths.contains(song.path))
+        .toList();
+    if (selected.isEmpty) return;
+    final plugins = await ref.read(enabledMusicPluginsProvider.future);
+    if (!mounted) return;
+    if (plugins.isEmpty) {
+      XyNotice.show(
+        context,
+        message: '请先在 设置 → 插件 中启用插件',
+        type: XyNoticeType.warning,
+      );
+      return;
+    }
+    final plugin = await showSourcePluginPicker(context, plugins);
+    if (plugin == null || !mounted) return;
+    setState(() {
+      _switchingSource = true;
+      _switchingDone = 0;
+      _switchingTotal = selected.length;
+    });
+    var replaced = 0;
+    final missed = <String>[];
+    for (final song in selected) {
+      if (!mounted) return;
+      setState(() => _switchingDone++);
+      try {
+        final candidates = await searchReplacementCandidates(
+          ref,
+          plugin,
+          title: song.title,
+          artist: song.artist,
+          durationMs: song.duration * 1000,
+        );
+        if (candidates.isEmpty) {
+          missed.add(song.title);
+          continue;
+        }
+        await ref
+            .read(playlistsProvider.notifier)
+            .replaceSong(
+              widget.playlistId,
+              song.path,
+              replacementToSong(plugin, candidates.first),
+            );
+        replaced++;
+      } catch (_) {
+        missed.add(song.title);
+      }
+    }
+    if (!mounted) return;
+    setState(() => _switchingSource = false);
+    _closeSelection();
+    if (missed.isEmpty) {
+      XyNotice.show(
+        context,
+        message: '换源完成：$replaced 首已切换到 ${plugin.name}',
+        type: XyNoticeType.success,
+      );
+    } else {
+      await showDialog<void>(
+        context: context,
+        useRootNavigator: true,
+        builder: (dialogContext) => AlertDialog(
+          title: const Text('换源完成'),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text('成功换源 $replaced 首，${missed.length} 首未找到匹配结果：'),
+              const SizedBox(height: 10),
+              ConstrainedBox(
+                constraints: const BoxConstraints(maxHeight: 240),
+                child: SingleChildScrollView(
+                  child: Text(
+                    missed.take(50).join('\n') +
+                        (missed.length > 50 ? '\n…' : ''),
+                    style: TextStyle(
+                      fontSize: 13,
+                      color: Theme.of(dialogContext).colorScheme.onSurfaceVariant,
+                    ),
+                  ),
+                ),
+              ),
+            ],
+          ),
+          actions: [
+            FilledButton(
+              onPressed: () => Navigator.pop(dialogContext),
+              child: const Text('确定'),
+            ),
+          ],
+        ),
+      );
+    }
   }
 
   Future<void> _downloadSelected() async {
@@ -593,6 +691,144 @@ class _FavoriteAddIcon extends StatelessWidget {
             child: Icon(Icons.add_circle_rounded, size: 13),
           ),
         ],
+      ),
+    );
+  }
+}
+
+/// 多选模式的底部横排图标菜单（参考闲鱼音乐）：全选 / 收藏 / 下载 /
+/// 换源 / 移出。批量操作进行中时对应按钮显示进度并禁用其余操作。
+class _SelectionBottomBar extends StatelessWidget {
+  const _SelectionBottomBar({
+    required this.allSelected,
+    required this.hasSelection,
+    required this.busy,
+    required this.downloading,
+    required this.switchingSource,
+    required this.switchProgress,
+    required this.onToggleAll,
+    required this.onFavorite,
+    required this.onDownload,
+    required this.onSwitchSource,
+    required this.onRemove,
+  });
+
+  final bool allSelected;
+  final bool hasSelection;
+  final bool busy;
+  final bool downloading;
+  final bool switchingSource;
+  final String switchProgress;
+  final VoidCallback onToggleAll;
+  final VoidCallback onFavorite;
+  final VoidCallback onDownload;
+  final VoidCallback onSwitchSource;
+  final VoidCallback onRemove;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    Widget item({
+      required Widget icon,
+      required String label,
+      required VoidCallback? onTap,
+    }) {
+      final enabled = onTap != null;
+      return Expanded(
+        child: InkWell(
+          onTap: onTap,
+          borderRadius: BorderRadius.circular(12),
+          child: Padding(
+            padding: const EdgeInsets.symmetric(vertical: 6),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                SizedBox(
+                  height: 26,
+                  child: Center(
+                    child: IconTheme.merge(
+                      data: IconThemeData(
+                        size: 23,
+                        color: enabled
+                            ? scheme.onSurface
+                            : scheme.onSurfaceVariant.withValues(alpha: .45),
+                      ),
+                      child: icon,
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 4),
+                Text(
+                  label,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    fontSize: 11,
+                    fontWeight: FontWeight.w500,
+                    color: enabled
+                        ? scheme.onSurface
+                        : scheme.onSurfaceVariant.withValues(alpha: .45),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      );
+    }
+
+    return Material(
+      color: scheme.surfaceContainer,
+      child: SafeArea(
+        top: false,
+        // Shell 已把自定义底栏+迷你播放栏的遮挡高度注入 MediaQuery.padding，
+        // SafeArea 据此把菜单抬到悬浮元素之上。
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(6, 4, 6, 4),
+          child: Row(
+            children: [
+              item(
+                icon: Icon(
+                  allSelected
+                      ? Icons.deselect_rounded
+                      : Icons.select_all_rounded,
+                ),
+                label: allSelected ? '取消全选' : '全选',
+                onTap: busy ? null : onToggleAll,
+              ),
+              item(
+                icon: const _FavoriteAddIcon(),
+                label: '收藏',
+                onTap: busy || !hasSelection ? null : onFavorite,
+              ),
+              item(
+                icon: downloading
+                    ? const SizedBox.square(
+                        dimension: 20,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      )
+                    : const Icon(Icons.download_rounded),
+                label: downloading ? '下载中' : '下载',
+                onTap: busy || !hasSelection ? null : onDownload,
+              ),
+              item(
+                icon: switchingSource
+                    ? const SizedBox.square(
+                        dimension: 20,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      )
+                    : const Icon(Icons.swap_horiz_rounded),
+                label: switchingSource ? switchProgress : '换源',
+                onTap: busy || !hasSelection ? null : onSwitchSource,
+              ),
+              item(
+                icon: const Icon(Icons.delete_outline_rounded),
+                label: '移出',
+                onTap: busy || !hasSelection ? null : onRemove,
+              ),
+            ],
+          ),
+        ),
       ),
     );
   }

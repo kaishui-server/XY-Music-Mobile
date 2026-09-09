@@ -148,10 +148,20 @@ class AppShell extends ConsumerWidget {
             : 0.0);
 
     void navigate(String path) {
-      Navigator.of(appScaffoldKey.currentContext!).pop();
-      Future<void>.microtask(() async {
-        if (context.mounted) context.go(path);
-      });
+      final scaffoldContext = appScaffoldKey.currentContext;
+      // 先收起抽屉，等关闭动画结束后再切换页面，避免抽屉与页面
+      // 切换动画同时进行造成“页面叠加”的观感。
+      if (scaffoldContext != null) {
+        final scaffold = Scaffold.of(scaffoldContext);
+        if (scaffold.isDrawerOpen || scaffold.isEndDrawerOpen) {
+          Navigator.of(scaffoldContext).pop();
+          Future<void>.delayed(const Duration(milliseconds: 260), () {
+            if (context.mounted) context.go(path);
+          });
+          return;
+        }
+      }
+      context.go(path);
     }
 
     return Scaffold(
@@ -165,6 +175,9 @@ class AppShell extends ConsumerWidget {
       resizeToAvoidBottomInset: false,
       drawerScrimColor: Colors.black.withValues(alpha: 0.58),
       drawerEdgeDragWidth: MediaQuery.sizeOf(context).width * 0.16,
+      // 右侧抽屉禁用边缘拖拽：Android 手势导航的右缘返回滑动会被抽屉
+      // 拖拽抢占，产生“返回时页面叠加/侧栏残影”的问题。
+      endDrawerEnableOpenDragGesture: false,
       drawer: sidebarOnRight
           ? null
           : XyMobileSidebar(currentPath: currentPath, onNavigate: navigate),

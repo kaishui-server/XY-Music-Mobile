@@ -6,6 +6,7 @@ import 'package:go_router/go_router.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:video_player/video_player.dart';
 
+import '../explore/explore_page.dart';
 import '../../src/auth/auth_provider.dart';
 import '../../src/favorites/favorites_provider.dart';
 import '../../src/home/home_providers.dart';
@@ -212,6 +213,14 @@ class _HomePageState extends ConsumerState<HomePage> {
 
   @override
   Widget build(BuildContext context) {
+    // 猜你想听固定展示；正在播放、热评推荐、听歌统计、听歌排行榜
+    // 按设置中的模块开关动态显隐。
+    final homeModules =
+        ref.watch(
+          settingsProvider.select((value) => value.valueOrNull?.homeModules),
+        ) ??
+        kDefaultHomeModules;
+    Widget moduleGap() => const SizedBox(height: 22);
     return Scaffold(
       body: XyPageBackground(
         child: SafeArea(
@@ -249,19 +258,28 @@ class _HomePageState extends ConsumerState<HomePage> {
                       16,
                       MediaQuery.paddingOf(context).bottom + 16,
                     ),
-                    children: const [
-                      _NowPlayingModule(),
-                      Padding(
-                        padding: EdgeInsets.symmetric(vertical: 18),
-                        child: Center(
-                          child: SizedBox(width: 44, child: Divider(height: 1)),
+                    children: [
+                      GuessYouLikePanel(
+                        onMore: () => context.push(
+                          '/home/explore/recommendations',
                         ),
                       ),
-                      _HotCommentModule(),
-                      SizedBox(height: 22),
-                      _ListeningStatisticsModule(),
-                      SizedBox(height: 22),
-                      _LeaderboardModule(),
+                      if (homeModules.contains(kHomeModuleNowPlaying)) ...[
+                        moduleGap(),
+                        const _NowPlayingModule(),
+                      ],
+                      if (homeModules.contains(kHomeModuleHotComment)) ...[
+                        moduleGap(),
+                        const _HotCommentModule(),
+                      ],
+                      if (homeModules.contains(kHomeModuleStatistics)) ...[
+                        moduleGap(),
+                        const _ListeningStatisticsModule(),
+                      ],
+                      if (homeModules.contains(kHomeModuleLeaderboard)) ...[
+                        moduleGap(),
+                        const _LeaderboardModule(),
+                      ],
                     ],
                   ),
                 ),

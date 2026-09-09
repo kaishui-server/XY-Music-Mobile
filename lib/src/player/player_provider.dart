@@ -1824,6 +1824,33 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
     await _playAt(index);
   }
 
+  /// 手动换源：把队列中 path 为 [originalPath] 的歌曲替换为 [replacement]
+  /// （其他插件的搜索结果），持久保存关联并立即重新播放。返回是否找到
+  /// 对应队列项。
+  Future<bool> switchSource(
+    String originalPath,
+    QueueItem replacement,
+  ) async {
+    final index = state.queue.indexWhere((item) => item.path == originalPath);
+    if (index < 0) return false;
+    await _saveAssociatedReplacement(originalPath, replacement);
+    final queue = [...state.queue];
+    queue[index] = replacement;
+    state = state.copyWith(
+      queue: queue,
+      current: index == state.queueIndex ? replacement : state.current,
+      duration: index == state.queueIndex
+          ? replacement.durationMs / 1000.0
+          : state.duration,
+      errorMessage: null,
+    );
+    unawaited(_persistSession());
+    if (index == state.queueIndex) {
+      await _playAt(index);
+    }
+    return true;
+  }
+
   /// 无网络/在线音源失败时直接切换到本地替代并续播，不弹提案询问：
   /// 替换会像手动接受提案一样持久保存关联，下次播放同一首自动用本地。
   Future<void> _autoRelinkToLocal({

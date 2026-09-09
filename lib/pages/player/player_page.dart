@@ -5,6 +5,7 @@ import 'dart:math' as math;
 import 'dart:ui' as ui;
 
 import 'package:file_picker/file_picker.dart';
+import 'package:flutter/foundation.dart' show listEquals;
 import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart';
 import 'package:flutter/services.dart';
@@ -33,6 +34,7 @@ import '../../src/rust/music/types.dart';
 import '../../src/share/share_sheet.dart';
 import '../../src/widgets/cover_image.dart';
 import '../../src/widgets/queue_sheet.dart';
+import '../../src/widgets/source_switch.dart';
 import '../../src/widgets/top_notice.dart';
 import 'comment_sheet.dart';
 
@@ -92,6 +94,7 @@ enum _PlayerMenuAction {
   share,
   playlist,
   linkLyrics,
+  switchSource,
   sleepTimer,
   playbackSpeed,
   comments,
@@ -160,6 +163,22 @@ String lyricsOffsetLabel(int offsetTenths) {
 /// 音质选项的展示标签（更多菜单与下载选项弹窗共用）。
 String _qualityLabel(String quality) => qualityDisplayLabel(quality);
 
+/// 播放页封面样式的展示标签（样式切换按钮提示共用）。
+String coverStyleLabel(PlayerCoverStyle style) => switch (style) {
+  PlayerCoverStyle.classic => '经典方形',
+  PlayerCoverStyle.circle => '圆形旋转',
+  PlayerCoverStyle.immersive => '沉浸式',
+  PlayerCoverStyle.vinyl => '黑胶唱片',
+};
+
+/// 播放页封面样式切换按钮的图标。
+IconData coverStyleIcon(PlayerCoverStyle style) => switch (style) {
+  PlayerCoverStyle.classic => Icons.crop_square_rounded,
+  PlayerCoverStyle.circle => Icons.circle_outlined,
+  PlayerCoverStyle.immersive => Icons.blur_on_rounded,
+  PlayerCoverStyle.vinyl => Icons.album_rounded,
+};
+
 /// 定时关闭剩余时长的展示标签（随倒计时实时变化）。
 String _sleepTimerLabel(DateTime? endsAt) {
   if (endsAt == null) return '未开启';
@@ -218,6 +237,9 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
   ProviderSubscription<bool>? _playingSubscription;
   bool _screenAwake = false;
   bool _showLyrics = false;
+
+  /// 横屏沉浸式歌词下临时弹出的播放控制栏（点按歌词区切换显隐）。
+  bool _landscapeControlsVisible = false;
   int? _detailPointerId;
   Offset? _detailPointerStart;
   Offset? _detailPointerLast;
@@ -353,6 +375,24 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
 
   void _toggleLyrics() {
     _showDetailPage(!_showLyrics);
+  }
+
+  /// 播放页封面样式一键切换：经典 → 圆形 → 沉浸式 → 黑胶 循环，
+  /// 与外观设置里的下拉选择共用同一份持久化配置。
+  void _cycleCoverStyle() {
+    final current =
+        ref.watch(settingsProvider).valueOrNull?.playerCoverStyle ??
+        PlayerCoverStyle.classic;
+    final next = PlayerCoverStyle.values[
+        (current.index + 1) % PlayerCoverStyle.values.length];
+    unawaited(ref.read(settingsProvider.notifier).setPlayerCoverStyle(next));
+    XyNotice.show(
+      context,
+      message: '封面样式：${coverStyleLabel(next)}',
+      type: XyNoticeType.success,
+      compact: true,
+      blur: true,
+    );
   }
 
   void _loadLyricsOffsetFor(QueueItem? item) {
@@ -692,6 +732,8 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
   /// push」的路由叠换白屏；其余条目 pop 后走原有流程。
   /// 下载/音质/字号/桌面歌词/MV 等播放页已有专属按钮的功能不在此重复。
   Future<void> _showMoreMenu(QueueItem item) async {
+    // 沉浸式歌词开关只在横屏展示（横屏分栏才有“仅歌词”形态）。
+    final viewport = MediaQuery.sizeOf(context);
     final action = await showDialog<_PlayerMenuAction>(
       context: context,
       useRootNavigator: true,
@@ -699,6 +741,7 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
         initialOffsetTenths: _lyricsOffsetTenths,
         onApplyOffset: (tenths) =>
             unawaited(_applyLyricsOffset(item, tenths)),
+        showImmersiveLyricsToggle: viewport.width > viewport.height,
       ),
     );
     if (!mounted || action == null) return;
@@ -709,6 +752,8 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
         await _addToPlaylist(item);
       case _PlayerMenuAction.linkLyrics:
         await _linkLyrics(item);
+      case _PlayerMenuAction.switchSource:
+        await _switchSource(item);
       case _PlayerMenuAction.sleepTimer:
         await _pickSleepTimer();
       case _PlayerMenuAction.playbackSpeed:
@@ -721,6 +766,45 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
           builder: (_) => CommentSheet(song: item),
         );
     }
+  }
+
+  /// 换源：选择目标插件搜索同名歌曲，替换当前播放并保存关联。
+  Future<void> _switchSource(QueueItem item) async {
+    final plugins = await ref.read(enabledMusicPluginsProvider.future);
+    if (!mounted) return;
+    if (plugins.isEmpty) {
+      XyNotice.show(
+        context,
+        message: '请先在 设置 → 插件 中启用插件',
+        type: XyNoticeType.warning,
+      );
+      return;
+    }
+    final plugin = await showSourcePluginPicker(
+      context,
+      plugins,
+      excludePluginId: item.pluginId,
+    );
+    if (plugin == null || !mounted) return;
+    final replacement = await showReplacementPicker(
+      context,
+      ref,
+      plugin,
+      title: item.title,
+      artist: item.artist,
+    );
+    if (replacement == null || !mounted) return;
+    final applied = await ref
+        .read(playerProvider.notifier)
+        .switchSource(item.path, replacementToQueueItem(plugin, replacement));
+    if (!mounted) return;
+    XyNotice.show(
+      context,
+      message: applied
+          ? '已切换到 ${plugin.name} 音源'
+          : '当前播放队列中已没有这首歌',
+      type: applied ? XyNoticeType.success : XyNoticeType.warning,
+    );
   }
 
   Future<void> _showShareSheet(QueueItem item) async {
@@ -2041,10 +2125,19 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
                       fontSize: 11,
                     ),
                   ),
-                const SizedBox(height: 4),
-                _DetailPageIndicator(showLyrics: _showLyrics),
+                // 横屏左右分栏同时展示封面与歌词，无需翻页指示点。
+                if (!isLandscape) ...[
+                  const SizedBox(height: 4),
+                  _DetailPageIndicator(showLyrics: _showLyrics),
+                ],
               ],
             ),
+          ),
+          // 封面样式一键切换（横竖屏都有）：图标随当前样式变化。
+          IconButton(
+            tooltip: '切换封面样式（${coverStyleLabel(coverStyle)}）',
+            icon: Icon(coverStyleIcon(coverStyle), color: Colors.white),
+            onPressed: _cycleCoverStyle,
           ),
           IconButton(
             tooltip: '更多',
@@ -2085,8 +2178,8 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
                 item: current,
                 offsetTenths: _lyricsOffsetTenths,
                 // 竖屏时封面本体铺到屏幕顶端（见 _ImmersiveTopCover），
-                // 这里退化为透明手势占位；横屏仍由页面自己绘制。
-                paintCover: isLandscape,
+                // 这里退化为透明手势占位（横屏由左侧封面栏直接绘制）。
+                paintCover: false,
                 onTap: current == null ? null : _toggleLyrics,
                 onLongPress: current == null
                     ? null
@@ -2121,12 +2214,8 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
     );
 
     final detailControls = Padding(
-      padding: EdgeInsets.fromLTRB(
-        isLandscape ? 8 : 16,
-        0,
-        isLandscape ? 8 : 16,
-        isLandscape ? 8 : 20,
-      ),
+      // 仅竖屏使用：控制卡固定在底部，横屏走 buildLandscapeControls。
+      padding: const EdgeInsets.fromLTRB(16, 0, 16, 20),
       child: _GlassControlCard(
         notifier: notifier,
         current: current,
@@ -2146,6 +2235,119 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
       ),
     );
     final detailContent = detailPager;
+
+    // 横屏沉浸式歌词：开启后右半屏只显示歌词，点按弹出播放栏。
+    final landscapeImmersive =
+        ref.watch(
+          settingsProvider.select(
+            (s) => s.valueOrNull?.landscapeImmersiveLyrics,
+          ),
+        ) ??
+        false;
+
+    // 横屏右栏的播放控制卡：标题/歌手已在顶部展示，仅保留操作按钮行。
+    Widget buildLandscapeControls() => Padding(
+      padding: const EdgeInsets.fromLTRB(10, 0, 10, 10),
+      child: _GlassControlCard(
+        notifier: notifier,
+        current: current,
+        showMetadata: false,
+        onDownload: current == null
+            ? null
+            : () => unawaited(_downloadCurrent(current)),
+        onLinkLyrics: current == null
+            ? null
+            : () => unawaited(_linkLyrics(current)),
+        onDesktopLyrics: () => unawaited(_toggleDesktopLyrics()),
+        onQuality: () => unawaited(_pickPlaybackQuality()),
+        onLyricFontSizePage: () => unawaited(_pickLyricFontSize()),
+        onPlayMv: current == null || !_mvButtonVisible(current)
+            ? null
+            : () => unawaited(_toggleMvOrVideo(current)),
+      ),
+    );
+
+    // 横屏按钮栏整体缩放（含播放键），适配半屏宽度。
+    Widget scaledLandscapeControls() => Transform.scale(
+      scale: .84,
+      alignment: Alignment.bottomCenter,
+      child: buildLandscapeControls(),
+    );
+
+    Widget buildLandscapeLyrics() {
+      if (current == null) {
+        return const Center(
+          child: Text('暂无歌词', style: TextStyle(color: Colors.white54)),
+        );
+      }
+      return _LyricsView(
+        key: ValueKey('lyrics:${current.path}'),
+        item: current,
+        offsetTenths: _lyricsOffsetTenths,
+        onLinkLyrics: () => unawaited(_linkLyrics(current)),
+      );
+    }
+
+    // 横屏右半屏：普通模式歌词 + 常驻控制栏；沉浸式仅歌词，点按弹出控制栏。
+    Widget buildLandscapeRightPane() {
+      final lyrics = buildLandscapeLyrics();
+      if (!landscapeImmersive) {
+        return Column(
+          children: [
+            Expanded(child: lyrics),
+            scaledLandscapeControls(),
+          ],
+        );
+      }
+      final barVisible = _landscapeControlsVisible;
+      return Stack(
+        children: [
+          Positioned.fill(
+            child: GestureDetector(
+              behavior: HitTestBehavior.opaque,
+              // 播放栏可见时，点歌词空白处收起；歌词行自身的点按 seek
+              // 在手势竞技场中先于外层胜出，不受影响。
+              onTap: barVisible
+                  ? () => setState(() => _landscapeControlsVisible = false)
+                  : null,
+              child: lyrics,
+            ),
+          ),
+          if (!barVisible)
+            // 播放栏隐藏时叠加透明点按层：任意单击（含歌词行）弹出播放栏。
+            // translucent 让点击继续传递给下层，歌词垂直滚动不受影响。
+            Positioned.fill(
+              child: GestureDetector(
+                behavior: HitTestBehavior.translucent,
+                onTap: () => setState(() => _landscapeControlsVisible = true),
+              ),
+            ),
+          Positioned(
+            left: 0,
+            right: 0,
+            bottom: 0,
+            child: IgnorePointer(
+              ignoring: !barVisible,
+              child: AnimatedOpacity(
+                duration: const Duration(milliseconds: 240),
+                curve: Curves.easeOutCubic,
+                opacity: barVisible ? 1 : 0,
+                child: DecoratedBox(
+                  decoration: const BoxDecoration(
+                    gradient: LinearGradient(
+                      begin: Alignment.bottomCenter,
+                      end: Alignment.topCenter,
+                      colors: [Color(0x8C000000), Color(0x2E000000)],
+                    ),
+                  ),
+                  child: scaledLandscapeControls(),
+                ),
+              ),
+            ),
+          ),
+        ],
+      );
+    }
 
     return Scaffold(
       backgroundColor: scheme.surface,
@@ -2172,14 +2374,27 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
                     children: [
                       detailHeader,
                       Expanded(
+                        // 横屏平分式排版（参考 MusicFree）：左半屏封面正中
+                        // 缩放、无迷你歌词；右半屏歌词 + 播放控制。
                         child: Row(
                           crossAxisAlignment: CrossAxisAlignment.stretch,
                           children: [
-                            Expanded(child: detailContent),
-                            SizedBox(
-                              width: math.min(360, viewport.width * .38),
-                              child: Center(child: detailControls),
+                            Expanded(
+                              child: _BigCover(
+                                key: ValueKey(
+                                  'coverLandscape:${current?.path ?? ''}',
+                                ),
+                                item: current,
+                                offsetTenths: _lyricsOffsetTenths,
+                                // 沉浸式在横屏分栏下退化为居中方形封面。
+                                style: coverStyle,
+                                landscape: true,
+                                onLongPress: current == null
+                                    ? null
+                                    : () => unawaited(_showMoreMenu(current)),
+                              ),
                             ),
+                            Expanded(child: buildLandscapeRightPane()),
                           ],
                         ),
                       ),
@@ -2811,11 +3026,15 @@ class _PlayerMoreMenuDialog extends ConsumerStatefulWidget {
   const _PlayerMoreMenuDialog({
     required this.initialOffsetTenths,
     required this.onApplyOffset,
+    this.showImmersiveLyricsToggle = false,
   });
   final int initialOffsetTenths;
 
   /// 偏移子面板每次变动的实时应用回调（由宿主页面静默保存）。
   final ValueChanged<int> onApplyOffset;
+
+  /// 横屏沉浸式歌词开关行（仅横屏传入 true）。
+  final bool showImmersiveLyricsToggle;
 
   @override
   ConsumerState<_PlayerMoreMenuDialog> createState() =>
@@ -2985,6 +3204,11 @@ class _PlayerMoreMenuDialogState extends ConsumerState<_PlayerMoreMenuDialog> {
           '添加到歌单',
         ),
         popRow(_PlayerMenuAction.linkLyrics, Icons.lyrics_outlined, '关联歌词'),
+        popRow(
+          _PlayerMenuAction.switchSource,
+          Icons.swap_horiz_rounded,
+          '换源',
+        ),
         _menuRow(
           context,
           icon: Icons.sync_alt_rounded,
@@ -2992,6 +3216,27 @@ class _PlayerMoreMenuDialogState extends ConsumerState<_PlayerMoreMenuDialog> {
           value: lyricsOffsetLabel(_offsetTenths),
           onTap: () => setState(() => _panel = _MoreMenuPanel.offset),
         ),
+        if (widget.showImmersiveLyricsToggle)
+          Builder(
+            builder: (context) {
+              final enabled =
+                  ref.watch(
+                    settingsProvider.select(
+                      (s) => s.valueOrNull?.landscapeImmersiveLyrics,
+                    ),
+                  ) ??
+                  false;
+              return _menuRow(
+                context,
+                icon: Icons.fullscreen_rounded,
+                title: '沉浸式歌词',
+                value: enabled ? '开' : '关',
+                onTap: () => ref
+                    .read(settingsProvider.notifier)
+                    .setLandscapeImmersiveLyrics(!enabled),
+              );
+            },
+          ),
         popRow(
           _PlayerMenuAction.sleepTimer,
           Icons.timer_outlined,
@@ -3859,12 +4104,12 @@ class _PlayerDetailBackground extends ConsumerWidget {
       PlayerDetailBackgroundMode.coverBlur => _coverBackdrop(current, size),
       PlayerDetailBackgroundMode.wallpaperBlur =>
         wallpaperPath.isEmpty
-            ? _flowingLightBackdrop()
+            ? _flowingLightBackdrop(current)
             : _wallpaperBackdrop(wallpaperPath, wallpaperBlur, blurred: true),
-      PlayerDetailBackgroundMode.flowingLight => _flowingLightBackdrop(),
+      PlayerDetailBackgroundMode.flowingLight => _flowingLightBackdrop(current),
       PlayerDetailBackgroundMode.customImage =>
         detailImagePath.isEmpty
-            ? _flowingLightBackdrop()
+            ? _flowingLightBackdrop(current)
             : _wallpaperBackdrop(
                 detailImagePath,
                 wallpaperBlur,
@@ -3872,22 +4117,30 @@ class _PlayerDetailBackground extends ConsumerWidget {
               ),
     };
 
+    // 流光模式本身即明亮氛围（颜色取自封面主色），叠加的暗色遮罩
+    // 显著减淡，避免把流光压回暗色；其余背景模式维持原有可读性遮罩。
+    final flowing = mode == PlayerDetailBackgroundMode.flowingLight ||
+        (mode == PlayerDetailBackgroundMode.wallpaperBlur &&
+            wallpaperPath.isEmpty) ||
+        (mode == PlayerDetailBackgroundMode.customImage &&
+            detailImagePath.isEmpty);
+
     return RepaintBoundary(
       child: Stack(
         fit: StackFit.expand,
         children: [
           Positioned.fill(child: backdrop),
-          ColoredBox(color: const Color(0xFF080A0F).withValues(alpha: .58)),
-          const DecoratedBox(
+          ColoredBox(
+            color: Color(0xFF080A0F).withValues(alpha: flowing ? .18 : .58),
+          ),
+          DecoratedBox(
             decoration: BoxDecoration(
               gradient: LinearGradient(
                 begin: Alignment.topCenter,
                 end: Alignment.bottomCenter,
-                colors: [
-                  Color(0x29000000),
-                  Color(0x12000000),
-                  Color(0xA6000000),
-                ],
+                colors: flowing
+                    ? [Color(0x00000000), Color(0x00000000), Color(0x33000000)]
+                    : [Color(0x29000000), Color(0x12000000), Color(0xA6000000)],
                 stops: [0, .48, 1],
               ),
             ),
@@ -3939,44 +4192,195 @@ class _PlayerDetailBackground extends ConsumerWidget {
     return image;
   }
 
-  Widget _flowingLightBackdrop() => const _FlowingLightBackground();
+  Widget _flowingLightBackdrop(QueueItem? item) =>
+      _FlowingLightBackground(item: item);
 }
 
-class _FlowingLightBackground extends StatefulWidget {
-  const _FlowingLightBackground();
+/// 流光背景取色未就绪或无封面时的回退色板。
+const _kFlowingFallbackColors = <Color>[
+  Color(0xFF4C6FFF),
+  Color(0xFF48C6EF),
+  Color(0xFFEC4141),
+];
+
+/// 解析 `hsl(220, 28%, 34%)` 格式的调色板字符串。
+Color? _parseHslColor(dynamic value) {
+  if (value is! String) return null;
+  final match = RegExp(
+    r'hsl\(\s*(\d+(?:\.\d+)?)\s*,\s*(\d+(?:\.\d+)?)%\s*,\s*(\d+(?:\.\d+)?)%\s*\)',
+  ).firstMatch(value);
+  if (match == null) return null;
+  final hue = double.tryParse(match.group(1)!) ?? 0;
+  final saturation = (double.tryParse(match.group(2)!) ?? 0) / 100;
+  final lightness = (double.tryParse(match.group(3)!) ?? 0) / 100;
+  return HSLColor.fromAHSL(1, hue, saturation, lightness).toColor();
+}
+
+class _FlowingLightBackground extends ConsumerStatefulWidget {
+  const _FlowingLightBackground({required this.item});
+
+  final QueueItem? item;
 
   @override
-  State<_FlowingLightBackground> createState() =>
+  ConsumerState<_FlowingLightBackground> createState() =>
       _FlowingLightBackgroundState();
 }
 
-class _FlowingLightBackgroundState extends State<_FlowingLightBackground>
-    with SingleTickerProviderStateMixin {
+class _FlowingLightBackgroundState extends ConsumerState<_FlowingLightBackground>
+    with TickerProviderStateMixin {
   late final AnimationController _controller = AnimationController(
     vsync: this,
     duration: const Duration(seconds: 9),
   )..repeat();
 
+  /// 封面切换时在旧色板与新色板之间平滑过渡。
+  late final AnimationController _colorController = AnimationController(
+    vsync: this,
+    duration: const Duration(milliseconds: 900),
+  );
+
+  List<Color> _from = _kFlowingFallbackColors;
+  List<Color> _to = _kFlowingFallbackColors;
+  int _paletteRequest = 0;
+
+  /// 已解析色板缓存（按取色源），避免同一封面反复解码。
+  static final Map<String, List<Color>> _paletteCache = {};
+
+  @override
+  void initState() {
+    super.initState();
+    _resolvePalette();
+  }
+
+  @override
+  void didUpdateWidget(covariant _FlowingLightBackground oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.item?.path != widget.item?.path ||
+        oldWidget.item?.coverUrl != widget.item?.coverUrl) {
+      _resolvePalette();
+    }
+  }
+
   @override
   void dispose() {
     _controller.dispose();
+    _colorController.dispose();
     super.dispose();
+  }
+
+  /// 解析取色源：优先网络封面（网易云 CDN 需经代理转 data URI），
+  /// 本地歌曲读取缩略图缓存文件路径；两者皆无时返回 null 走回退色板。
+  Future<String?> _coverPaletteSource(QueueItem? item) async {
+    if (item == null) return null;
+    final coverUrl = normalizeCoverImageUrl(item.coverUrl);
+    if (coverUrl.isNotEmpty) {
+      if (needsCoverImageProxy(coverUrl)) {
+        try {
+          final dataUrl = await proxyImage(
+            url: coverUrl,
+            referer: 'https://music.163.com/',
+          );
+          if (dataUrl.contains(',')) return dataUrl;
+        } catch (_) {
+          // 代理失败时退回直连地址。
+        }
+      }
+      return coverUrl;
+    }
+    try {
+      final dbPath = await ref.read(dbPathProvider.future);
+      final cacheRoot = await ref.read(appDataDirProvider.future);
+      final path = await getSongCoverThumbnail(
+        dbPath: dbPath,
+        cacheRoot: cacheRoot,
+        path: item.path,
+      );
+      return path.isEmpty ? null : path;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  Future<void> _resolvePalette() async {
+    final request = ++_paletteRequest;
+    final item = widget.item;
+    final source = await _coverPaletteSource(item);
+    if (!mounted || request != _paletteRequest) return;
+    if (source == null) {
+      _applyPalette(_kFlowingFallbackColors);
+      return;
+    }
+    final cached = _paletteCache[source];
+    if (cached != null) {
+      _applyPalette(cached);
+      return;
+    }
+    try {
+      // colorBoost 偏高、depth 偏低，让色板保持高饱和的亮色调，
+      // 与流光的发光氛围匹配。
+      final raw = await extractPalette(
+        source: source,
+        count: BigInt.from(4),
+        colorBoost: 78,
+        depth: 30,
+      );
+      if (!mounted || request != _paletteRequest) return;
+      final decoded = jsonDecode(raw);
+      final colors = decoded is List
+          ? decoded.map(_parseHslColor).whereType<Color>().toList()
+          : const <Color>[];
+      final palette = colors.length >= 3 ? colors : _kFlowingFallbackColors;
+      if (_paletteCache.length >= 24) {
+        _paletteCache.remove(_paletteCache.keys.first);
+      }
+      _paletteCache[source] = palette;
+      _applyPalette(palette);
+    } catch (_) {
+      if (mounted && request == _paletteRequest) {
+        _applyPalette(_kFlowingFallbackColors);
+      }
+    }
+  }
+
+  void _applyPalette(List<Color> palette) {
+    if (!mounted) return;
+    setState(() {
+      _from = _currentColors();
+      _to = palette;
+    });
+    _colorController.forward(from: 0);
+  }
+
+  List<Color> _currentColors() {
+    final t = Curves.easeOutCubic.transform(_colorController.value);
+    if (t >= 1 || _to.length != _from.length) {
+      return _to.length >= 3 ? _to : _kFlowingFallbackColors;
+    }
+    return List.generate(_to.length, (index) {
+      return Color.lerp(_from[index], _to[index], t) ?? _to[index];
+    }, growable: false);
   }
 
   @override
   Widget build(BuildContext context) => AnimatedBuilder(
-    animation: _controller,
+    animation: Listenable.merge([_controller, _colorController]),
     builder: (_, _) => CustomPaint(
-      painter: _FlowingLightPainter(_controller.value),
+      painter: _FlowingLightPainter(_controller.value, _currentColors()),
       child: const SizedBox.expand(),
     ),
   );
 }
 
 class _FlowingLightPainter extends CustomPainter {
-  const _FlowingLightPainter(this.progress);
+  const _FlowingLightPainter(this.progress, this.colors);
 
   final double progress;
+  final List<Color> colors;
+
+  Color _blobColor(int index, double alpha) {
+    final palette = colors.length >= 3 ? colors : _kFlowingFallbackColors;
+    return palette[index % palette.length].withValues(alpha: alpha);
+  }
 
   @override
   void paint(Canvas canvas, Size size) {
@@ -3985,34 +4389,45 @@ class _FlowingLightPainter extends CustomPainter {
     final points = [
       (
         Offset(size.width * (.18 + .18 * math.sin(phase)), size.height * .12),
-        const Color(0x88EC4141),
+        _blobColor(0, .72),
       ),
       (
         Offset(size.width * (.82 + .16 * math.cos(phase)), size.height * .62),
-        const Color(0x664C6FFF),
+        _blobColor(1, .58),
       ),
       (
         Offset(
           size.width * (.45 + .2 * math.sin(phase + 1)),
           size.height * .95,
         ),
-        const Color(0x5548C6EF),
+        _blobColor(2, .50),
       ),
+      if (colors.length > 3)
+        (
+          Offset(
+            size.width * (.32 + .22 * math.cos(phase + 2)),
+            size.height * (.38 + .18 * math.sin(phase + 3)),
+          ),
+          _blobColor(3, .42),
+        ),
     ];
+    // plus 混合让重叠区域亮度叠加，形成流光的通透感。
     for (final (center, color) in points) {
       final radius = math.max(size.width, size.height) * .78;
       final paint = Paint()
         ..shader = ui.Gradient.radial(center, radius, [
           color,
           color.withValues(alpha: 0),
-        ]);
+        ])
+        ..blendMode = BlendMode.plus;
       canvas.drawRect(Offset.zero & size, paint);
     }
   }
 
   @override
   bool shouldRepaint(_FlowingLightPainter oldDelegate) =>
-      oldDelegate.progress != progress;
+      oldDelegate.progress != progress ||
+      !listEquals(oldDelegate.colors, colors);
 }
 
 class _BilibiliVideoView extends StatefulWidget {
@@ -4386,6 +4801,7 @@ class _BigCover extends ConsumerWidget {
     this.style = PlayerCoverStyle.classic,
     this.onTap,
     this.onLongPress,
+    this.landscape = false,
   });
   final QueueItem? item;
   final int offsetTenths;
@@ -4395,26 +4811,42 @@ class _BigCover extends ConsumerWidget {
   /// 长按封面弹出播放页“更多”菜单（分享/收藏到歌单/关联歌词等）。
   final VoidCallback? onLongPress;
 
+  /// 横屏平分式布局：封面在左半屏正中缩放，不排迷你歌词与桌面反光。
+  final bool landscape;
+
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     // 圆形旋转 / 黑胶需要感知播放状态：播放时旋转、暂停时停在当前角度。
     final playing = ref.watch(playerProvider.select((s) => s.isPlaying));
     return LayoutBuilder(
       builder: (context, constraints) {
-        final normalSide = math.min(
-          390.0,
-          math.min(constraints.maxWidth * .72, constraints.maxHeight - 104),
-        );
-        final showCoverExtras = normalSide >= 150;
-        final side = showCoverExtras
-            ? normalSide
-            : math.max(
-                1.0,
-                math.min(
-                  390.0,
-                  math.min(constraints.maxWidth * .72, constraints.maxHeight),
-                ),
-              );
+        final double side;
+        final bool showCoverExtras;
+        if (landscape) {
+          side = math.max(
+            1.0,
+            math.min(
+              420.0,
+              math.min(constraints.maxWidth * .8, constraints.maxHeight * .8),
+            ),
+          );
+          showCoverExtras = false;
+        } else {
+          final normalSide = math.min(
+            390.0,
+            math.min(constraints.maxWidth * .72, constraints.maxHeight - 104),
+          );
+          showCoverExtras = normalSide >= 150;
+          side = showCoverExtras
+              ? normalSide
+              : math.max(
+                  1.0,
+                  math.min(
+                    390.0,
+                    math.min(constraints.maxWidth * .72, constraints.maxHeight),
+                  ),
+                );
+        }
         return Stack(
           fit: StackFit.expand,
           children: [

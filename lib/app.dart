@@ -10,6 +10,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'src/core/rust_init.dart';
 import 'src/deeplink/deep_link_handler.dart';
 import 'src/core/settings.dart';
+import 'src/navigation/animated_page_route.dart';
 import 'src/library/library_provider.dart';
 import 'src/navigation/routes.dart';
 import 'src/ui/xy_theme.dart';
@@ -197,6 +198,9 @@ class _XyMusicAppState extends ConsumerState<XyMusicApp> {
   Widget build(BuildContext context) {
     final init = ref.watch(rustInitProvider);
     final settings = ref.watch(settingsProvider).valueOrNull;
+    // 同步页面切换模式到路由层（transitionsBuilder 无法访问 ref）。
+    xyPageTransitionMode =
+        settings?.pageTransitionMode ?? PageTransitionMode.slide;
     final startup = widget.startupBackground;
     final backgroundPath =
         settings?.customBackgroundPath.trim() ?? startup?.path ?? '';

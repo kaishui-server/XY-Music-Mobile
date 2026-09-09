@@ -514,6 +514,36 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
           ),
           onTap: () => _pickAccentColor(context, ref, settings),
         ),
+        _tile(
+          context,
+          icon: Icons.animation,
+          title: '页面切换动画',
+          trailing: DropdownButtonHideUnderline(
+            child: DropdownButton<PageTransitionMode>(
+              value:
+                  settings?.pageTransitionMode ?? PageTransitionMode.slide,
+              isDense: true,
+              alignment: AlignmentDirectional.centerEnd,
+              items: PageTransitionMode.values
+                  .map(
+                    (mode) => DropdownMenuItem<PageTransitionMode>(
+                      value: mode,
+                      child: Text(_pageTransitionModeLabel(mode)),
+                    ),
+                  )
+                  .toList(),
+              onChanged: (mode) {
+                if (mode != null) {
+                  unawaited(
+                    ref
+                        .read(settingsProvider.notifier)
+                        .setPageTransitionMode(mode),
+                  );
+                }
+              },
+            ),
+          ),
+        ),
         _dynamicColorTile(
           context,
           settings: settings,
@@ -620,6 +650,35 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
             settings?.sidebarPosition == SidebarPosition.right ? '右上' : '左上',
           ),
           onTap: () => _pickSidebarPosition(context, ref, settings),
+        ),
+        Padding(
+          padding: const EdgeInsets.fromLTRB(16, 20, 16, 4),
+          child: Text(
+            '首页模块',
+            style: TextStyle(
+              fontSize: 13,
+              fontWeight: FontWeight.w700,
+              color: Theme.of(context).colorScheme.primary,
+            ),
+          ),
+        ),
+        _tile(
+          context,
+          icon: Icons.dashboard_customize_outlined,
+          title: '首页模块显示',
+          trailing: Text(
+            '${settings?.homeModules.length ?? kDefaultHomeModules.length}'
+            '/${kDefaultHomeModules.length}',
+            style: TextStyle(
+              fontSize: 13,
+              color: Theme.of(context).colorScheme.onSurfaceVariant,
+            ),
+          ),
+          onTap: () => showModalBottomSheet<void>(
+            context: context,
+            showDragHandle: true,
+            builder: (_) => const _HomeModulesSheet(),
+          ),
         ),
         Padding(
           padding: const EdgeInsets.fromLTRB(16, 20, 16, 4),
@@ -1361,6 +1420,12 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
     PlayerCoverStyle.circle => '圆形旋转',
     PlayerCoverStyle.immersive => '沉浸式',
     PlayerCoverStyle.vinyl => '黑胶唱片',
+  };
+
+  String _pageTransitionModeLabel(PageTransitionMode mode) => switch (mode) {
+    PageTransitionMode.slide => '平移',
+    PageTransitionMode.stack => '层叠',
+    PageTransitionMode.cube => '方块',
   };
 
   Future<void> _setPlayerDetailBackground(
@@ -2483,6 +2548,62 @@ class _ColorDot extends StatelessWidget {
       width: 24,
       height: 24,
       decoration: BoxDecoration(color: color, shape: BoxShape.circle),
+    );
+  }
+}
+
+/// 首页模块显隐面板：猜你想听固定展示，其余模块按开关动态显隐。
+class _HomeModulesSheet extends ConsumerWidget {
+  const _HomeModulesSheet();
+
+  static const _moduleMeta = <String, (IconData, String)>{
+    kHomeModuleNowPlaying: (Icons.play_circle_outline, '正在播放'),
+    kHomeModuleHotComment: (Icons.forum_outlined, '热评推荐'),
+    kHomeModuleStatistics: (Icons.insights_outlined, '听歌统计'),
+    kHomeModuleLeaderboard: (Icons.leaderboard_outlined, '听歌排行榜'),
+  };
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final settings = ref.watch(settingsProvider).valueOrNull;
+    final enabled = settings?.homeModules ?? kDefaultHomeModules;
+    final scheme = Theme.of(context).colorScheme;
+    return ListView(
+      shrinkWrap: true,
+      padding: const EdgeInsets.fromLTRB(8, 0, 8, 16),
+      children: [
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                '首页模块',
+                style: Theme.of(context).textTheme.titleMedium?.copyWith(
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
+              const SizedBox(height: 4),
+              Text(
+                '「猜你想听」固定展示；关闭的模块将从首页隐藏。',
+                style: TextStyle(
+                  fontSize: 12,
+                  color: scheme.onSurfaceVariant,
+                ),
+              ),
+            ],
+          ),
+        ),
+        for (final entry in _moduleMeta.entries)
+          SwitchListTile(
+            secondary: Icon(entry.value.$1),
+            title: Text(entry.value.$2),
+            value: enabled.contains(entry.key),
+            onChanged: (value) => ref
+                .read(settingsProvider.notifier)
+                .setHomeModuleEnabled(entry.key, value),
+          ),
+      ],
     );
   }
 }

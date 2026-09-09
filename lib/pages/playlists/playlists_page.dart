@@ -11,6 +11,7 @@ import 'package:permission_handler/permission_handler.dart';
 import '../../src/playlists/playlists_provider.dart';
 import '../../src/playlists/musicfree_backup_import.dart';
 import '../../src/library/library_provider.dart';
+import '../../src/plugins/lx_playlist_import.dart';
 import '../../src/plugins/plugin_runtime.dart';
 import '../../src/player/player_provider.dart';
 import '../../src/rust/api.dart';
@@ -152,7 +153,7 @@ class _PlaylistsPageState extends ConsumerState<PlaylistsPage> {
               ListTile(
                 leading: const Icon(Icons.insert_drive_file_rounded),
                 title: const Text('从本地文件导入'),
-                subtitle: const Text('支持 M3U / M3U8 歌单'),
+                subtitle: const Text('支持 M3U / M3U8 / 洛雪 JSON 歌单'),
                 onTap: () =>
                     Navigator.pop(sheetContext, _PlaylistImportMode.local),
               ),
@@ -303,11 +304,16 @@ class _PlaylistsPageState extends ConsumerState<PlaylistsPage> {
   Future<void> _importLocal(BuildContext context, WidgetRef ref) async {
     final result = await FilePicker.platform.pickFiles(
       type: FileType.custom,
-      allowedExtensions: const ['m3u', 'm3u8'],
+      allowedExtensions: const ['m3u', 'm3u8', 'json'],
     );
     final filePath = result?.files.single.path;
     if (filePath == null || !context.mounted) return;
     try {
+      // 洛雪歌单导出是 JSON 结构，按扩展名分流处理。
+      if (p.extension(filePath).toLowerCase() == '.json') {
+        await _importLxLocalFile(context, ref, filePath);
+        return;
+      }
       if (!await _ensureLocalAudioPermission()) {
         throw Exception('未授予本地音乐访问权限，无法读取歌单中的歌曲');
       }
@@ -350,6 +356,88 @@ class _PlaylistsPageState extends ConsumerState<PlaylistsPage> {
         type: XyNoticeType.error,
       );
     }
+  }
+
+  /// 导入洛雪歌单导出的 JSON 文件（单歌单或 my-list 全量备份）。
+  Future<void> _importLxLocalFile(
+    BuildContext context,
+    WidgetRef ref,
+    String filePath,
+  ) async {
+    final content = await File(filePath).readAsString();
+    final playlists = tryParseLxLocalPlaylists(content);
+    if (playlists.isEmpty) {
+      throw Exception('不是有效的洛雪歌单文件');
+    }
+    final plugins = await ref.read(enabledMusicPluginsProvider.future);
+    final lxPlugins = plugins.where((plugin) => plugin.isLx).toList();
+    if (lxPlugins.isEmpty) {
+      throw Exception('请先启用洛雪插件再导入洛雪歌单');
+    }
+    var playlistCount = 0;
+    var songCount = 0;
+    for (final playlist in playlists) {
+      final songs = <Song>[];
+      for (final raw in playlist.songs) {
+        // 歌曲关联到支持其平台的洛雪插件；播放失败时洛雪管线
+        // 会自动在其它洛雪插件与公共解析器之间回退。
+        final source = raw['lx'] is Map
+            ? (raw['lx'] as Map)['source']?.toString() ?? ''
+            : '';
+        final plugin = lxPlugins
+            .where((item) => item.lxSources.contains(source))
+            .firstOrNull ?? lxPlugins.first;
+        final title = raw['title']?.toString().trim() ?? '';
+        if (title.isEmpty) continue;
+        songs.add(
+          Song(
+            path: raw['_sourcePath']?.toString() ?? '',
+            title: title,
+            artist: raw['artist']?.toString() ?? '',
+            album: raw['album']?.toString() ?? '',
+            albumKey: raw['album']?.toString() ?? '',
+            duration: _rawDurationSeconds(raw),
+            format: '网络',
+            coverUrl: raw['artwork']?.toString(),
+            pluginId: plugin.id,
+            pluginData: raw,
+            lyricsRaw: _NetworkPlaylistImportDialogState._embeddedLyrics(raw),
+          ),
+        );
+      }
+      if (songs.isEmpty) continue;
+      final notifier = ref.read(playlistsProvider.notifier);
+      final existing = await notifier.findByName(playlist.name);
+      if (existing != null) {
+        if (!context.mounted) return;
+        final action = await _confirmDuplicatePlaylist(context, playlist.name);
+        if (!context.mounted || action == null) continue;
+        if (action == _DuplicatePlaylistAction.merge) {
+          await notifier.mergeImportedSongs(existing.id, songs);
+          playlistCount++;
+          songCount += songs.length;
+          continue;
+        }
+      }
+      final created = await notifier.create(playlist.name, songs: songs);
+      if (created != null) {
+        playlistCount++;
+        songCount += songs.length;
+      }
+    }
+    if (!context.mounted) return;
+    if (playlistCount == 0) throw Exception('歌单中没有可导入的歌曲');
+    XyNotice.show(
+      context,
+      message: '已从洛雪歌单导入 $playlistCount 个歌单、共 $songCount 首',
+      type: XyNoticeType.success,
+    );
+  }
+
+  static int _rawDurationSeconds(Map<String, dynamic> raw) {
+    final value = raw['duration'];
+    if (value is num) return value.toInt();
+    return int.tryParse(value?.toString() ?? '') ?? 0;
   }
 
   Future<bool> _ensureLocalAudioPermission() async {
@@ -705,7 +793,7 @@ class _NetworkPlaylistImportDialogState
   final _idController = TextEditingController();
   final _renameController = TextEditingController();
   // 歌单来源：仅支持已启用的插件（内置直连来源已移除，避免与
-  // 同平台插件在下拉里表现为重复项）。
+  // 同平台插件在下拉里表现为重复项）。洛雪插件按支持的平台拆分。
   String? _selectedSourceId;
   String? _error;
   bool _importing = false;
@@ -717,14 +805,38 @@ class _NetworkPlaylistImportDialogState
     super.dispose();
   }
 
-  /// 当前有效的来源 id：选中插件仍启用则用之，否则回退第一个插件。
-  /// 默认未手动选择时即第一个插件。
+  /// 洛雪平台来源 id：`lx:{pluginId}:{source}`。
+  static String _lxSourceId(String pluginId, String source) =>
+      'lx:$pluginId:$source';
+
+  /// 当前有效的来源 id：选中项仍有效则用之，否则回退第一个来源。
+  /// 默认未手动选择时即第一个来源。
   String? _effectiveSourceId(List<EnabledMusicPlugin> plugins) {
-    if (plugins.any((plugin) => 'plugin:${plugin.id}' == _selectedSourceId)) {
+    if (_selectedSourceId != null &&
+        _buildSourceIds(plugins).contains(_selectedSourceId)) {
       return _selectedSourceId;
     }
-    return plugins.isNotEmpty ? 'plugin:${plugins.first.id}' : null;
+    final ids = _buildSourceIds(plugins);
+    return ids.isNotEmpty ? ids.first : null;
   }
+
+  /// 下拉项的来源 id 列表：洛雪插件按平台拆分，其余插件逐项。
+  static List<String> _buildSourceIds(List<EnabledMusicPlugin> plugins) => [
+    for (final plugin in plugins)
+      if (plugin.isLx)
+        for (final source in _lxPluginSources(plugin))
+          _lxSourceId(plugin.id, source)
+      else
+        'plugin:${plugin.id}',
+  ];
+
+  /// 洛雪插件支持的平台：优先用检测结果，缺省为五个洛雪平台。
+  static List<String> _lxPluginSources(EnabledMusicPlugin plugin) =>
+      plugin.lxSources.isEmpty ? kLxSourceIds : plugin.lxSources;
+
+  /// 插件类型标记：Baka 系 / MusicFree。
+  static String _pluginTag(EnabledMusicPlugin plugin) =>
+      plugin.name.toLowerCase().contains('baka') ? 'Baka' : 'MusicFree';
 
   Future<void> _submit(List<EnabledMusicPlugin> plugins) async {
     final input = _idController.text.trim();
@@ -742,34 +854,52 @@ class _NetworkPlaylistImportDialogState
       late final String importedName;
       late final String importedCover;
       late final List<Song> songs;
-      final pluginId = sourceId.substring('plugin:'.length);
-      final plugin = plugins.firstWhere(
-        (item) => item.id == pluginId,
-        orElse: () => throw Exception('所选插件已停用或删除'),
-      );
-      final result = await ref
-          .read(pluginRuntimeProvider)
-          .importPlaylist(plugin, input);
-      importedName = result.name;
-      importedCover = result.coverUrl;
-      songs = result.songs
-          .where((item) => item.title.trim().isNotEmpty)
-          .map(
-            (item) => Song(
-              path: pluginSongPath(plugin, item),
-              title: item.title,
-              artist: item.artist,
-              album: item.album,
-              albumKey: item.album,
-              duration: (item.durationMs / 1000).round(),
-              format: '网络',
-              coverUrl: item.coverUrl,
-              pluginId: plugin.id,
-              pluginData: item.rawData,
-              lyricsRaw: _embeddedLyrics(item.rawData),
-            ),
-          )
-          .toList();
+      if (sourceId.startsWith('lx:')) {
+        // 洛雪插件来源：直连平台公开歌单接口（参考 lx-music-mobile），
+        // 不经插件运行时；歌曲携带 lx 元数据走现有洛雪播放管线。
+        final parts = sourceId.split(':');
+        if (parts.length != 3) throw Exception('无效的洛雪来源');
+        final plugin = plugins
+            .where((item) => item.isLx && item.id == parts[1])
+            .firstOrNull;
+        if (plugin == null) throw Exception('所选洛雪插件已停用或删除');
+        final result = await importLxPlaylist(source: parts[2], idOrUrl: input);
+        importedName = result.name;
+        importedCover = result.coverUrl;
+        songs = result.songs
+            .map((raw) => _rawToLxSong(raw, plugin))
+            .whereType<Song>()
+            .toList();
+      } else {
+        final pluginId = sourceId.substring('plugin:'.length);
+        final plugin = plugins.firstWhere(
+          (item) => item.id == pluginId,
+          orElse: () => throw Exception('所选插件已停用或删除'),
+        );
+        final result = await ref
+            .read(pluginRuntimeProvider)
+            .importPlaylist(plugin, input);
+        importedName = result.name;
+        importedCover = result.coverUrl;
+        songs = result.songs
+            .where((item) => item.title.trim().isNotEmpty)
+            .map(
+              (item) => Song(
+                path: pluginSongPath(plugin, item),
+                title: item.title,
+                artist: item.artist,
+                album: item.album,
+                albumKey: item.album,
+                duration: (item.durationMs / 1000).round(),
+                format: '网络',
+                coverUrl: item.coverUrl,
+                pluginId: plugin.id,
+                pluginData: item.rawData,
+                lyricsRaw: _embeddedLyrics(item.rawData),
+              ),
+            )
+            .toList();
+      }
       if (songs.isEmpty) throw Exception('歌单中没有可导入的歌曲');
       final rename = _renameController.text.trim();
       final name = rename.isEmpty ? importedName : rename;
@@ -841,6 +971,31 @@ class _NetworkPlaylistImportDialogState
     return null;
   }
 
+  /// 洛雪直连导入的 raw 歌曲 → Song。关联到所选洛雪插件，
+  /// path 用 `lx://` 虚拟路径，播放/歌词/音质解析走现有洛雪管线。
+  static Song? _rawToLxSong(
+    Map<String, dynamic> raw,
+    EnabledMusicPlugin plugin,
+  ) {
+    final title = raw['title']?.toString().trim() ?? '';
+    final path = raw['_sourcePath']?.toString() ?? '';
+    if (title.isEmpty || path.isEmpty) return null;
+    final duration = raw['duration'];
+    return Song(
+      path: path,
+      title: title,
+      artist: raw['artist']?.toString() ?? '',
+      album: raw['album']?.toString() ?? '',
+      albumKey: raw['album']?.toString() ?? '',
+      duration: duration is num ? duration.toInt() : 0,
+      format: '网络',
+      coverUrl: raw['artwork']?.toString(),
+      pluginId: plugin.id,
+      pluginData: raw,
+      lyricsRaw: _embeddedLyrics(raw),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final pluginsValue = ref.watch(enabledMusicPluginsProvider);
@@ -875,15 +1030,28 @@ class _NetworkPlaylistImportDialogState
                     prefixIcon: Icon(Icons.cloud_rounded),
                   ),
                   items: [
+                    // 洛雪插件按支持平台拆分并标记；其余插件按类型标记
+                    // （Baka / MusicFree），方便区分同名来源。
                     for (final plugin in plugins)
-                      DropdownMenuItem(
-                        value: 'plugin:${plugin.id}',
-                        child: Text(
-                          plugin.name,
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
+                      if (plugin.isLx)
+                        for (final source in _lxPluginSources(plugin))
+                          DropdownMenuItem(
+                            value: _lxSourceId(plugin.id, source),
+                            child: Text(
+                              '${plugin.name} · ${lxSourceLabel(source)}（洛雪）',
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                            ),
+                          )
+                      else
+                        DropdownMenuItem(
+                          value: 'plugin:${plugin.id}',
+                          child: Text(
+                            '${plugin.name}（${_pluginTag(plugin)}）',
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                          ),
                         ),
-                      ),
                   ],
                   onChanged: _importing
                       ? null

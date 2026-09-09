@@ -117,8 +117,18 @@ class _CloudSyncPageState extends ConsumerState<CloudSyncPage> {
         final suffix = result.pluginErrors.isEmpty
             ? ''
             : '；插件失败 ${result.pluginErrors.length} 个，请稍后重试';
+        // 首次同步空数据（或清空后同步）时 noChange 为 false 但所有
+        // 计数都是 0，同样按“没有变化”提示，避免展示一串无意义的 0。
+        final allCountsZero =
+            result.uploadedPlaylists == 0 &&
+            result.downloadedPlaylists == 0 &&
+            result.uploadedSongs == 0 &&
+            result.downloadedSongs == 0 &&
+            result.downloadedFavorites == 0 &&
+            result.uploadedPlugins == 0 &&
+            result.downloadedPlugins == 0;
         _notice(
-          result.noChange
+          result.noChange || allCountsZero
               ? '同步完成：歌单和插件没有变化，未重复上传$suffix'
               : '同步完成：插件下载 ${result.downloadedPlugins} 个、上传 ${result.uploadedPlugins} 个；歌单上传 ${result.uploadedPlaylists} 个、下载 ${result.downloadedPlaylists} 个$suffix',
         );

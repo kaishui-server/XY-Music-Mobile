@@ -38,7 +38,7 @@ Page<void> _instantPage(GoRouterState state, Widget child) =>
       key: state.pageKey,
       transitionDuration: xyPageTransitionDuration,
       reverseTransitionDuration: xyPageReverseTransitionDuration,
-      transitionsBuilder: xyHorizontalPageTransition,
+      transitionsBuilder: xyPageTransition,
       child: child,
     );
 

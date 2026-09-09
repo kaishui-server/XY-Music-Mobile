@@ -488,6 +488,30 @@ class PlaylistsNotifier extends StateNotifier<List<MobilePlaylist>> {
     ];
     await _save();
   }
+
+  /// 换源：把歌单中 [oldPath] 的歌曲原位替换为 [newSong]（来自其他插件）。
+  /// 歌单顺序与自定义排序保持不变，网络歌曲快照同步更新。
+  Future<void> replaceSong(String id, String oldPath, Song newSong) async {
+    state = [
+      for (final item in state)
+        if (item.id == id)
+          item.copyWith(
+            songPaths: [
+              for (final path in item.songPaths)
+                if (path == oldPath) newSong.path else path,
+            ],
+            songSnapshots: Map.of(item.songSnapshots)
+              ..remove(oldPath)
+              ..[newSong.path] = PlaylistSongSnapshot.fromSong(newSong),
+            customOrder: item.customOrder
+                ?.map((path) => path == oldPath ? newSong.path : path)
+                .toList(),
+          )
+        else
+          item,
+    ];
+    await _save();
+  }
 }
 
 final playlistsProvider =
