@@ -150,6 +150,47 @@ class AppShell extends ConsumerWidget {
     void navigate(String path) =>
         navigateFromSidebar(context, appScaffoldKey, path);
 
+    final viewport = MediaQuery.sizeOf(context);
+    // 宽松式横屏断点（宽 >= 高 × 1.05，含平板横持），与参考项目一致。
+    final isLandscape = viewport.width >= viewport.height * 1.05;
+
+    // 内容区：页面 + 悬浮底栏 + 迷你播放栏（横竖屏共用，横屏时位于
+    // 侧栏右侧的剩余宽度内）。
+    final content = Stack(
+      children: [
+        MediaQuery(
+          data: MediaQuery.of(context).copyWith(
+            padding: MediaQuery.of(context).padding.copyWith(
+              bottom: safeBottom + extraBottomPadding,
+            ),
+          ),
+          child: navigationShell,
+        ),
+        if (bottomBarVisible)
+          Positioned(
+            left: 12,
+            right: 12,
+            bottom: safeBottom + kBottomBarBottomGap,
+            child: XyBottomBar(
+              itemIds: bottomBarItemIds,
+              currentPath: currentPath,
+            ),
+          ),
+        if (showMiniPlayer)
+          AnimatedPositioned(
+            duration: const Duration(milliseconds: 220),
+            curve: Curves.easeOutCubic,
+            left: 12,
+            right: 12,
+            bottom: safeBottom +
+                (bottomBarVisible
+                    ? kBottomBarHeight + kBottomBarBottomGap * 2
+                    : 20),
+            child: const MiniPlayerBar(),
+          ),
+      ],
+    );
+
     return Scaffold(
       key: appScaffoldKey,
       extendBody: true,
@@ -160,7 +201,8 @@ class AppShell extends ConsumerWidget {
       // 底栏/迷你播放栏在键盘弹出时被系统键盘自然覆盖。
       resizeToAvoidBottomInset: false,
       drawerScrimColor: Colors.black.withValues(alpha: 0.58),
-      drawerEdgeDragWidth: MediaQuery.sizeOf(context).width * 0.16,
+      // 横屏已有常驻侧栏：禁用左缘拖出抽屉，避免与侧栏拖宽手势冲突。
+      drawerEdgeDragWidth: isLandscape ? 0 : viewport.width * 0.16,
       // 右侧抽屉禁用边缘拖拽：Android 手势导航的右缘返回滑动会被抽屉
       // 拖拽抢占，产生“返回时页面叠加/侧栏残影”的问题。
       endDrawerEnableOpenDragGesture: false,
@@ -170,40 +212,24 @@ class AppShell extends ConsumerWidget {
       endDrawer: sidebarOnRight
           ? XyMobileSidebar(currentPath: currentPath, onNavigate: navigate)
           : null,
-      body: Stack(
-        children: [
-          MediaQuery(
-            data: MediaQuery.of(context).copyWith(
-              padding: MediaQuery.of(context).padding.copyWith(
-                bottom: safeBottom + extraBottomPadding,
-              ),
-            ),
-            child: navigationShell,
-          ),
-          if (bottomBarVisible)
-            Positioned(
-              left: 12,
-              right: 12,
-              bottom: safeBottom + kBottomBarBottomGap,
-              child: XyBottomBar(
-                itemIds: bottomBarItemIds,
-                currentPath: currentPath,
-              ),
-            ),
-          if (showMiniPlayer)
-            AnimatedPositioned(
-              duration: const Duration(milliseconds: 220),
-              curve: Curves.easeOutCubic,
-              left: 12,
-              right: 12,
-              bottom: safeBottom +
-                  (bottomBarVisible
-                      ? kBottomBarHeight + kBottomBarBottomGap * 2
-                      : 20),
-              child: const MiniPlayerBar(),
-            ),
-        ],
-      ),
+      body: isLandscape
+          ? Row(
+              children: [
+                if (!sidebarOnRight)
+                  XyLandscapeSidebar(
+                    currentPath: currentPath,
+                    onNavigate: navigate,
+                  ),
+                Expanded(child: content),
+                if (sidebarOnRight)
+                  XyLandscapeSidebar(
+                    currentPath: currentPath,
+                    onNavigate: navigate,
+                    onRight: true,
+                  ),
+              ],
+            )
+          : content,
     );
   }
 }
@@ -690,6 +716,431 @@ class _SidebarTile extends StatelessWidget {
                   style: TextStyle(
                     fontSize: 14,
                     fontWeight: selected ? FontWeight.w700 : FontWeight.w500,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// 横屏常驻侧边栏（参考 XianYu-Music-Mobile）：内缘拖动可自由调整宽度，
+/// 缩窄到阈值以下仅显示图标；双击把手可在「仅图标 / 展开」两档间切换。
+/// 宽度持久化在设置里；拖动期间用本地 setState 保证跟手，松手才落盘。
+class XyLandscapeSidebar extends ConsumerStatefulWidget {
+  const XyLandscapeSidebar({
+    super.key,
+    required this.currentPath,
+    required this.onNavigate,
+    this.onRight = false,
+  });
+
+  final String currentPath;
+  final ValueChanged<String> onNavigate;
+  final bool onRight;
+
+  @override
+  ConsumerState<XyLandscapeSidebar> createState() =>
+      _XyLandscapeSidebarState();
+}
+
+class _XyLandscapeSidebarState extends ConsumerState<XyLandscapeSidebar> {
+  static const double _minWidth = 60;
+  static const double _maxWidth = 420;
+  static const double _iconOnlyBelow = 120;
+  static const double _handleWidth = 12;
+
+  double? _dragWidth;
+  bool _dragging = false;
+  bool _hoveringHandle = false;
+
+  bool _selected(String path) => _destinationSelected(widget.currentPath, path);
+
+  double _maxAllowed(Size viewport) =>
+      (viewport.width * 0.5).clamp(_minWidth, _maxWidth);
+
+  void _onDragUpdate(DragUpdateDetails details) {
+    final viewport = MediaQuery.sizeOf(context);
+    final base =
+        _dragWidth ??
+        ref
+            .read(settingsProvider)
+            .valueOrNull
+            ?.landscapeSidebarWidth ??
+        176.0;
+    // 右侧栏的把手在左缘：向左拖（dx < 0）才是加宽。
+    final delta = widget.onRight ? -details.delta.dx : details.delta.dx;
+    setState(() {
+      _dragWidth = (base + delta).clamp(_minWidth, _maxAllowed(viewport));
+    });
+  }
+
+  Future<void> _onDragEnd(DragEndDetails details) async {
+    final width = _dragWidth;
+    if (width == null) return;
+    await ref.read(settingsProvider.notifier).setLandscapeSidebarWidth(width);
+    // 保留 _dragWidth 作为后续拖动基准：设置是异步落盘的。
+  }
+
+  Future<void> _togglePinnedWidth() async {
+    const expanded = 176.0;
+    const collapsed = 84.0;
+    final base =
+        _dragWidth ??
+        ref
+            .read(settingsProvider)
+            .valueOrNull
+            ?.landscapeSidebarWidth ??
+        expanded;
+    final next = base >= _iconOnlyBelow ? collapsed : expanded;
+    setState(() => _dragWidth = next);
+    await ref.read(settingsProvider.notifier).setLandscapeSidebarWidth(next);
+  }
+
+  Widget _buildHeader(bool iconOnly) {
+    final icon = Container(
+      width: 32,
+      height: 32,
+      padding: const EdgeInsets.all(3),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(9),
+      ),
+      child: ClipRRect(
+        borderRadius: BorderRadius.circular(6),
+        child: Image.asset(
+          'assets/icon/app_icon.png',
+          fit: BoxFit.contain,
+          errorBuilder: (_, _, _) => const SizedBox.shrink(),
+        ),
+      ),
+    );
+    if (iconOnly) {
+      return SizedBox(height: 62, child: Center(child: icon));
+    }
+    return SizedBox(
+      height: 62,
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(10, 8, 10, 8),
+        child: Row(
+          children: [
+            icon,
+            const SizedBox(width: 7),
+            const Expanded(
+              child: Text(
+                'XY Music',
+                style: TextStyle(fontSize: 16, fontWeight: FontWeight.w900),
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildHandle(ThemeData theme, double width) {
+    final dark = theme.brightness == Brightness.dark;
+    final active = _dragging || _hoveringHandle;
+    return GestureDetector(
+      onHorizontalDragStart: (_) => setState(() => _dragging = true),
+      onHorizontalDragUpdate: _onDragUpdate,
+      onHorizontalDragEnd: _onDragEnd,
+      onHorizontalDragCancel: () => setState(() => _dragging = false),
+      onDoubleTap: _togglePinnedWidth,
+      behavior: HitTestBehavior.opaque,
+      child: MouseRegion(
+        cursor: SystemMouseCursors.resizeLeftRight,
+        onEnter: (_) => setState(() => _hoveringHandle = true),
+        onExit: (_) => setState(() => _hoveringHandle = false),
+        child: Stack(
+          clipBehavior: Clip.none,
+          children: [
+            Container(
+              width: _handleWidth,
+              color: active
+                  ? theme.colorScheme.primary.withValues(alpha: 0.16)
+                  : Colors.transparent,
+            ),
+            Center(
+              child: AnimatedContainer(
+                duration: const Duration(milliseconds: 120),
+                width: 4,
+                height: 38,
+                decoration: BoxDecoration(
+                  color: active
+                      ? theme.colorScheme.primary
+                      : (dark ? XyColors.darkBorder : XyColors.lightBorder),
+                  borderRadius: BorderRadius.circular(2),
+                ),
+              ),
+            ),
+            if (_dragging)
+              Positioned(
+                top: 12,
+                left: _handleWidth / 2 - 26,
+                child: IgnorePointer(
+                  child: Container(
+                    width: 52,
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 6,
+                      vertical: 3,
+                    ),
+                    decoration: BoxDecoration(
+                      color: theme.colorScheme.inverseSurface,
+                      borderRadius: BorderRadius.circular(8),
+                      boxShadow: [
+                        BoxShadow(
+                          color: Colors.black.withValues(alpha: 0.28),
+                          blurRadius: 10,
+                          offset: const Offset(0, 3),
+                        ),
+                      ],
+                    ),
+                    child: Text(
+                      '${width.round()}',
+                      textAlign: TextAlign.center,
+                      style: TextStyle(
+                        fontSize: 11,
+                        fontWeight: FontWeight.w700,
+                        color: theme.colorScheme.onInverseSurface,
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final dark = theme.brightness == Brightness.dark;
+    final viewport = MediaQuery.sizeOf(context);
+    final persisted = ref.watch(
+      settingsProvider.select(
+        (s) => s.valueOrNull?.landscapeSidebarWidth ?? 176.0,
+      ),
+    );
+    final width = (_dragWidth ?? persisted).clamp(
+      _minWidth,
+      _maxAllowed(viewport),
+    );
+    final iconOnly = width < _iconOnlyBelow;
+
+    final settings = ref.watch(settingsProvider).valueOrNull;
+    final hiddenItems =
+        settings?.sidebarHiddenItems.toSet() ?? const <String>{};
+    final showSettings = !hiddenItems.contains(kSidebarSettings);
+    final showDownloads = !hiddenItems.contains(kSidebarDownloads);
+    final primaryItems = normalizeSidebarItemOrder(
+          settings?.sidebarItemOrder ?? kDefaultSidebarItemOrder,
+        )
+        .where(
+          (id) =>
+              id != kSidebarSettings &&
+              id != kSidebarDownloads &&
+              !hiddenItems.contains(id),
+        )
+        .map((id) => _sidebarDestinations[id])
+        .whereType<_SidebarDestination>()
+        .toList();
+
+    final borderColor = dark ? XyColors.darkBorder : XyColors.lightBorder;
+    final sidebar = SizedBox(
+      width: width,
+      child: XyAppBackground(
+        imagePath: settings?.customBackgroundPath ?? '',
+        blur: settings?.customBackgroundBlur ?? 18,
+        child: DecoratedBox(
+          decoration: BoxDecoration(
+            color: theme.colorScheme.surface.withValues(
+              alpha: dark ? 0.9 : 0.97,
+            ),
+            border: Border(
+              left: widget.onRight
+                  ? BorderSide(color: borderColor)
+                  : BorderSide.none,
+              right: widget.onRight
+                  ? BorderSide.none
+                  : BorderSide(color: borderColor),
+            ),
+          ),
+          child: SafeArea(
+            left: !widget.onRight,
+            right: widget.onRight,
+            child: Column(
+              children: [
+                _buildHeader(iconOnly),
+                Divider(height: 1, color: borderColor),
+                Expanded(
+                  child: ListView(
+                    padding: EdgeInsets.fromLTRB(
+                      iconOnly ? 5 : 10,
+                      10,
+                      iconOnly ? 5 : 6,
+                      12,
+                    ),
+                    children: [
+                      for (final item in primaryItems)
+                        _LandscapeSidebarTile(
+                          destination: item,
+                          selected: _selected(item.path),
+                          onTap: () => widget.onNavigate(item.path),
+                          iconOnly: iconOnly,
+                        ),
+                    ],
+                  ),
+                ),
+                if (showSettings || showDownloads) ...[
+                  Divider(height: 1, color: borderColor),
+                  if (showDownloads)
+                    Padding(
+                      padding: EdgeInsets.fromLTRB(
+                        iconOnly ? 5 : 12,
+                        7,
+                        iconOnly ? 5 : 12,
+                        0,
+                      ),
+                      child: _LandscapeSidebarTile(
+                        destination: _sidebarDestinations[kSidebarDownloads]!,
+                        selected: _selected('/settings/downloads'),
+                        onTap: () => widget.onNavigate('/settings/downloads'),
+                        iconOnly: iconOnly,
+                      ),
+                    ),
+                  if (showSettings)
+                    Padding(
+                      padding: EdgeInsets.fromLTRB(
+                        iconOnly ? 5 : 12,
+                        7,
+                        iconOnly ? 5 : 12,
+                        9,
+                      ),
+                      child: _LandscapeSidebarTile(
+                        destination: _sidebarDestinations[kSidebarSettings]!,
+                        selected: _selected('/settings'),
+                        onTap: () => widget.onNavigate('/settings'),
+                        iconOnly: iconOnly,
+                      ),
+                    ),
+                ],
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+
+    final handle = _buildHandle(theme, width);
+
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        if (widget.onRight) handle,
+        sidebar,
+        if (!widget.onRight) handle,
+      ],
+    );
+  }
+}
+
+/// 横屏侧栏条目：宽档与抽屉条目同款（文字可截断），窄档仅居中图标。
+class _LandscapeSidebarTile extends StatelessWidget {
+  const _LandscapeSidebarTile({
+    required this.destination,
+    required this.selected,
+    required this.onTap,
+    required this.iconOnly,
+  });
+
+  final _SidebarDestination destination;
+  final bool selected;
+  final bool iconOnly;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    if (iconOnly) {
+      return Tooltip(
+        message: destination.label,
+        waitDuration: const Duration(milliseconds: 350),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(vertical: 2),
+          child: Material(
+            color: selected
+                ? theme.colorScheme.primary.withValues(alpha: 0.14)
+                : Colors.transparent,
+            borderRadius: BorderRadius.circular(XyRadii.medium),
+            child: InkWell(
+              onTap: onTap,
+              borderRadius: BorderRadius.circular(XyRadii.medium),
+              child: SizedBox(
+                height: 42,
+                child: Center(
+                  child: Icon(
+                    destination.icon,
+                    size: 20,
+                    color: selected
+                        ? theme.colorScheme.primary
+                        : theme.colorScheme.onSurfaceVariant,
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ),
+      );
+    }
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 1),
+      child: Material(
+        color: selected
+            ? theme.colorScheme.onSurface.withValues(alpha: 0.09)
+            : Colors.transparent,
+        borderRadius: BorderRadius.circular(XyRadii.small),
+        child: InkWell(
+          onTap: onTap,
+          borderRadius: BorderRadius.circular(XyRadii.small),
+          child: SizedBox(
+            height: 44,
+            child: Row(
+              children: [
+                AnimatedContainer(
+                  duration: const Duration(milliseconds: 160),
+                  width: 3,
+                  height: selected ? 22 : 0,
+                  decoration: BoxDecoration(
+                    color: theme.colorScheme.primary,
+                    borderRadius: BorderRadius.circular(3),
+                  ),
+                ),
+                const SizedBox(width: 11),
+                Icon(
+                  destination.icon,
+                  size: 19,
+                  color: selected
+                      ? theme.colorScheme.primary
+                      : theme.colorScheme.onSurfaceVariant,
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Text(
+                    destination.label,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                      fontSize: 14,
+                      fontWeight: selected ? FontWeight.w700 : FontWeight.w500,
+                    ),
                   ),
                 ),
               ],

@@ -12,6 +12,7 @@ import '../../src/navigation/animated_page_route.dart';
 import '../../src/navigation/sidebar_controller.dart';
 import '../../src/player/player_provider.dart';
 import '../../src/plugins/plugin_runtime.dart';
+import '../../src/ui/xy_surface.dart';
 import '../../src/widgets/frosted_search_field.dart';
 import '../../src/widgets/mini_player_bar.dart';
 import '../../src/widgets/song_list_view.dart';
@@ -867,142 +868,162 @@ class _SearchPageState extends ConsumerState<SearchPage>
         (value) => value.valueOrNull?.sidebarPosition == SidebarPosition.right,
       ),
     );
-    return DefaultTabController(
-      length: tabs.isEmpty ? 1 : tabs.length,
-      child: Scaffold(
-        appBar: AppBar(
-          automaticallyImplyLeading:
-              !widget.showSidebarButton && !widget.embeddedInShell,
-          leading: widget.showSidebarButton && !sidebarOnRight
-              ? const AppSidebarMenuButton()
-              : null,
-          title: FrostedSearchField(
-            controller: _controller,
-            focusNode: _searchFocusNode,
-            autofocus: widget.initialQuery.isEmpty,
-            hintText: '搜索网络歌曲、歌手、专辑、歌单',
-            onChanged: _onChanged,
-            onSubmitted: _onSubmitted,
-            // 空实现：覆盖框架默认的“收到键盘动作即失焦收起键盘”行为，
-            // 由 _onSubmitted 自行决定何时收起键盘。
-            onEditingComplete: () {},
-            showClearSuffix: true,
-            onCleared: _clear,
-            padding: EdgeInsets.zero,
-          ),
-          actions: [
-            if (widget.showSidebarButton && sidebarOnRight)
-              const AppSidebarMenuButton(),
-          ],
-          // TabBar 始终挂载（只要插件列表非空），不随输入文本有无变化。
-          // 否则输入第一个字符时 AppBar 底部从无到有挂载（高度突增 92px），
-          // 输入法组词期间发生布局重排会导致键盘被强制收起，输入被打断。
-          // body 仍按是否有文本在历史页/结果页之间切换。
-          bottom: tabs.isEmpty
-              ? null
-              : PreferredSize(
-                  preferredSize: const Size.fromHeight(92),
-                  child: Column(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      TabBar(
-                        isScrollable: true,
-                        tabAlignment: TabAlignment.start,
-                        onTap: (index) {
-                          setState(() => _selectedPluginIndex = index);
-                          _ensureCategorySearch(tabs, pluginIndex: index);
-                        },
-                        tabs: [for (final tab in tabs) _buildSourceTab(tab)],
-                      ),
-                      TabBar(
-                        controller: _categoryController,
-                        onTap: (index) {
-                          final category = _SearchCategory.values[index];
-                          setState(() {
-                            _selectedCategory = category;
-                          });
-                          // 分类搜索结果按来源 Tab 分别展示，切换分类时预取
-                          // 所有 Tab，这样用户左右切换一级 Tab 不会看到
-                          // 未加载的空页。
-                          for (
-                            var tabIndex = 0;
-                            tabIndex < tabs.length;
-                            tabIndex++
-                          ) {
-                            _ensureCategorySearch(
-                              tabs,
-                              pluginIndex: tabIndex,
-                              category: category,
-                            );
-                          }
-                        },
-                        tabs: [
-                          const Tab(text: '歌曲'),
-                          Tab(
-                            text:
-                                tabs.isNotEmpty &&
-                                    _selectedPluginIndex >= 0 &&
-                                    _selectedPluginIndex < tabs.length &&
-                                    isBilibiliPluginSource(
-                                      tabs[_selectedPluginIndex].plugin,
-                                    )
-                                ? 'UP主'
-                                : '歌手',
-                          ),
-                          const Tab(text: '专辑'),
-                          const Tab(text: '歌单'),
-                        ],
-                      ),
-                    ],
-                  ),
-                ),
-        ),
-        body: Stack(
-          children: [
-            Positioned.fill(
-              child: pluginsValue.when(
-                loading: () => const Center(child: CircularProgressIndicator()),
-                error: (error, _) => _MessageState(
-                  icon: Icons.error_outline,
-                  title: '插件列表加载失败',
-                  message: error.toString(),
-                  actionLabel: '重试',
-                  onAction: () => ref.invalidate(enabledMusicPluginsProvider),
-                ),
-                data: (loadedPlugins) {
-                  if (loadedPlugins.isEmpty) {
-                    return const _MessageState(
-                      icon: Icons.extension_off_outlined,
-                      title: '没有可搜索的插件',
-                      message: '请先在插件管理中安装并启用 MF 或 LX 插件',
-                    );
-                  }
-                  if (showingHistory) {
-                    return _historyBody(showMiniPlayer: showMiniPlayer);
-                  }
-                  return TabBarView(
-                    children: [
-                      for (final tab in tabs)
-                        _tabBody(
-                          tab,
-                          category: _selectedCategory,
-                          showMiniPlayer: showMiniPlayer,
-                        ),
-                    ],
-                  );
-                },
-              ),
-            ),
-            if (showMiniPlayer)
-              Positioned(
-                left: 12,
-                right: 12,
-                bottom: safeBottom + 20,
-                child: const MiniPlayerBar(),
-              ),
-          ],
+    final backgroundSettings = ref.watch(
+      settingsProvider.select(
+        (value) => (
+          path: value.valueOrNull?.customBackgroundPath ?? '',
+          blur: value.valueOrNull?.customBackgroundBlur ?? 18.0,
         ),
       ),
+    );
+    final scaffold = Scaffold(
+      appBar: AppBar(
+        automaticallyImplyLeading:
+            !widget.showSidebarButton && !widget.embeddedInShell,
+        leading: widget.showSidebarButton && !sidebarOnRight
+            ? const AppSidebarMenuButton()
+            : null,
+        title: FrostedSearchField(
+          controller: _controller,
+          focusNode: _searchFocusNode,
+          autofocus: widget.initialQuery.isEmpty,
+          hintText: '搜索网络歌曲、歌手、专辑、歌单',
+          onChanged: _onChanged,
+          onSubmitted: _onSubmitted,
+          // 空实现：覆盖框架默认的“收到键盘动作即失焦收起键盘”行为，
+          // 由 _onSubmitted 自行决定何时收起键盘。
+          onEditingComplete: () {},
+          showClearSuffix: true,
+          onCleared: _clear,
+          padding: EdgeInsets.zero,
+        ),
+        actions: [
+          if (widget.showSidebarButton && sidebarOnRight)
+            const AppSidebarMenuButton(),
+        ],
+        // TabBar 始终挂载（只要插件列表非空），不随输入文本有无变化。
+        // 否则输入第一个字符时 AppBar 底部从无到有挂载（高度突增 92px），
+        // 输入法组词期间发生布局重排会导致键盘被强制收起，输入被打断。
+        // body 仍按是否有文本在历史页/结果页之间切换。
+        bottom: tabs.isEmpty
+            ? null
+            : PreferredSize(
+                preferredSize: const Size.fromHeight(92),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    TabBar(
+                      isScrollable: true,
+                      tabAlignment: TabAlignment.start,
+                      onTap: (index) {
+                        setState(() => _selectedPluginIndex = index);
+                        _ensureCategorySearch(tabs, pluginIndex: index);
+                      },
+                      tabs: [for (final tab in tabs) _buildSourceTab(tab)],
+                    ),
+                    TabBar(
+                      controller: _categoryController,
+                      onTap: (index) {
+                        final category = _SearchCategory.values[index];
+                        setState(() {
+                          _selectedCategory = category;
+                        });
+                        // 分类搜索结果按来源 Tab 分别展示，切换分类时预取
+                        // 所有 Tab，这样用户左右切换一级 Tab 不会看到
+                        // 未加载的空页。
+                        for (
+                          var tabIndex = 0;
+                          tabIndex < tabs.length;
+                          tabIndex++
+                        ) {
+                          _ensureCategorySearch(
+                            tabs,
+                            pluginIndex: tabIndex,
+                            category: category,
+                          );
+                        }
+                      },
+                      tabs: [
+                        const Tab(text: '歌曲'),
+                        Tab(
+                          text:
+                              tabs.isNotEmpty &&
+                                  _selectedPluginIndex >= 0 &&
+                                  _selectedPluginIndex < tabs.length &&
+                                  isBilibiliPluginSource(
+                                    tabs[_selectedPluginIndex].plugin,
+                                  )
+                              ? 'UP主'
+                              : '歌手',
+                        ),
+                        const Tab(text: '专辑'),
+                        const Tab(text: '歌单'),
+                      ],
+                    ),
+                  ],
+                ),
+              ),
+      ),
+      body: Stack(
+        children: [
+          Positioned.fill(
+            child: pluginsValue.when(
+              loading: () => const Center(child: CircularProgressIndicator()),
+              error: (error, _) => _MessageState(
+                icon: Icons.error_outline,
+                title: '插件列表加载失败',
+                message: error.toString(),
+                actionLabel: '重试',
+                onAction: () => ref.invalidate(enabledMusicPluginsProvider),
+              ),
+              data: (loadedPlugins) {
+                if (loadedPlugins.isEmpty) {
+                  return const _MessageState(
+                    icon: Icons.extension_off_outlined,
+                    title: '没有可搜索的插件',
+                    message: '请先在插件管理中安装并启用 MF 或 LX 插件',
+                  );
+                }
+                if (showingHistory) {
+                  return _historyBody(showMiniPlayer: showMiniPlayer);
+                }
+                return TabBarView(
+                  children: [
+                    for (final tab in tabs)
+                      _tabBody(
+                        tab,
+                        category: _selectedCategory,
+                        showMiniPlayer: showMiniPlayer,
+                      ),
+                  ],
+                );
+              },
+            ),
+          ),
+          if (showMiniPlayer)
+            Positioned(
+              left: 12,
+              right: 12,
+              bottom: safeBottom + 20,
+              child: const MiniPlayerBar(),
+            ),
+        ],
+      ),
+    );
+    // /search 是根导航上的全屏覆盖路由，Scaffold 本身保持透明让壁纸
+    // 贯穿；但转场动画期间下层页面（探索页）仍在绘制，会透过透明的
+    // 搜索页形成“两页叠加”。这里为覆盖路由重绘一份不透明的应用
+    // 背景（与根背景共享同一张解码图，视觉完全一致），使入场页在
+    // 动画期间即可完全遮挡下层页面。
+    return DefaultTabController(
+      length: tabs.isEmpty ? 1 : tabs.length,
+      child: !widget.embeddedInShell
+          ? XyAppBackground(
+              imagePath: backgroundSettings.path,
+              blur: backgroundSettings.blur,
+              child: scaffold,
+            )
+          : scaffold,
     );
   }
 }

@@ -1,12 +1,12 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:video_player/video_player.dart';
 
-import '../explore/explore_page.dart';
 import '../../src/auth/auth_provider.dart';
 import '../../src/favorites/favorites_provider.dart';
 import '../../src/home/home_providers.dart';
@@ -21,6 +21,7 @@ import '../../src/core/settings.dart';
 import '../../src/ui/xy_surface.dart';
 import '../../src/ui/xy_theme.dart';
 import '../../src/update/app_update.dart';
+import '../../src/widgets/top_notice.dart';
 import '../../src/widgets/user_avatar_image.dart';
 
 Color _homeGlassPanelColor(BuildContext context) {
@@ -213,14 +214,23 @@ class _HomePageState extends ConsumerState<HomePage> {
 
   @override
   Widget build(BuildContext context) {
-    // 猜你想听固定展示；正在播放、热评推荐、听歌统计、听歌排行榜
-    // 按设置中的模块开关动态显隐。
+    // 「猜你想听」已移回探索页；正在播放、热评推荐、听歌统计、
+    // 听歌排行榜按设置中的模块开关动态显隐，默认仅保留听歌统计。
     final homeModules =
         ref.watch(
           settingsProvider.select((value) => value.valueOrNull?.homeModules),
         ) ??
         kDefaultHomeModules;
-    Widget moduleGap() => const SizedBox(height: 22);
+    final modules = <Widget>[
+      if (homeModules.contains(kHomeModuleNowPlaying))
+        const _NowPlayingModule(),
+      if (homeModules.contains(kHomeModuleHotComment))
+        const _HotCommentModule(),
+      if (homeModules.contains(kHomeModuleStatistics))
+        const _ListeningStatisticsModule(),
+      if (homeModules.contains(kHomeModuleLeaderboard))
+        const _LeaderboardModule(),
+    ];
     return Scaffold(
       body: XyPageBackground(
         child: SafeArea(
@@ -259,26 +269,10 @@ class _HomePageState extends ConsumerState<HomePage> {
                       MediaQuery.paddingOf(context).bottom + 16,
                     ),
                     children: [
-                      GuessYouLikePanel(
-                        onMore: () => context.push(
-                          '/home/explore/recommendations',
-                        ),
-                      ),
-                      if (homeModules.contains(kHomeModuleNowPlaying)) ...[
-                        moduleGap(),
-                        const _NowPlayingModule(),
-                      ],
-                      if (homeModules.contains(kHomeModuleHotComment)) ...[
-                        moduleGap(),
-                        const _HotCommentModule(),
-                      ],
-                      if (homeModules.contains(kHomeModuleStatistics)) ...[
-                        moduleGap(),
-                        const _ListeningStatisticsModule(),
-                      ],
-                      if (homeModules.contains(kHomeModuleLeaderboard)) ...[
-                        moduleGap(),
-                        const _LeaderboardModule(),
+                      // 模块之间统一用 22px 间距（首个模块不加，顶部已有 padding）。
+                      for (var i = 0; i < modules.length; i++) ...[
+                        if (i > 0) const SizedBox(height: 22),
+                        modules[i],
                       ],
                     ],
                   ),
@@ -739,6 +733,18 @@ class _HotCommentModule extends ConsumerWidget {
                   : () => context.push(
                       '/search?q=${Uri.encodeQueryComponent(item.songTitle!)}',
                     ),
+              onLongPress: () async {
+                await Clipboard.setData(
+                  ClipboardData(text: formatHotCommentForDisplay(item.comment)),
+                );
+                if (!context.mounted) return;
+                XyNotice.show(
+                  context,
+                  message: '已复制热评',
+                  type: XyNoticeType.success,
+                  compact: true,
+                );
+              },
               borderRadius: BorderRadius.circular(XyRadii.medium),
               child: Padding(
                 padding: const EdgeInsets.symmetric(vertical: 4),

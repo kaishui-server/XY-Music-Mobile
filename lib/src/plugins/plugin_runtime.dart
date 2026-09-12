@@ -784,8 +784,13 @@ class PluginRuntimeService {
         if (newItems.isEmpty) break;
         pages.addAll(newItems);
       }
-      final list = pages;
+      var list = pages;
       if (list.isNotEmpty) {
+        // 歌手作品接口与专辑接口同样可能缺封面（网易 hotSongs 的
+        // al.picUrl 缺失时只剩数值 picId），这里与搜索路径保持一致补全。
+        if (_isNeteaseMusicPlugin(plugin) || list.any(_looksLikeNeteaseTrack)) {
+          list = await _backfillNeteaseTrackMeta(list);
+        }
         // 常见的 B 站插件忽略 page 参数，getArtistWorks 只返回第一页
         // （约 30 条）。检测到翻页没有新增内容时，改由宿主直接调用
         // B 站空间投稿接口拉取 UP 主的全部投稿。
@@ -839,7 +844,14 @@ class PluginRuntimeService {
             ]);
       final list = _extractResultList(response);
       if (list.isNotEmpty) {
-        return list
+        // 部分接口（如网易 weapi/v1/album）对 OST 专辑不返回 al.picUrl，
+        // 只给超出 JS 安全整数的数值 picId，插件层无法还原封面；统一走
+        // song/detail 补全，与搜索路径行为一致。
+        var songs = list;
+        if (_isNeteaseMusicPlugin(plugin) || songs.any(_looksLikeNeteaseTrack)) {
+          songs = await _backfillNeteaseTrackMeta(songs);
+        }
+        return songs
             .map(
               (raw) => _toSearchSong(plugin.id, _resetMediaItem(plugin, raw)),
             )
@@ -1362,6 +1374,20 @@ class PluginRuntimeService {
   ) async {
     Object? lastError;
 
+    // 链接输入优先走插件原生 importMusicSheet：插件自己解析分享链接里的
+    // 歌单 ID（如 QQ 链接 ...?id=2784566436），能拿到真实歌单名、封面和
+    // 曲目。不能把整条链接当关键词传给 search——QQ 会返回一批以 URL
+    // 片段命名的垃圾歌单，_bestMatchingPlaylist 按 ID 匹配不上时取第一条，
+    // 最终导成完全无关的歌单（与前身 XianYu-Music-Mobile 相同的 bug）。
+    if (_isHttpUrl(input)) {
+      try {
+        final imported = await _importViaImportMusicSheet(plugin, input);
+        if (imported != null) return imported;
+      } catch (error) {
+        lastError = error;
+      }
+    }
+
     // 与电脑版一致：输入的是歌单名称、ID 或链接，先让 MusicFree 插件搜索，
     // 这样能保留真实歌单名称、封面和插件自己的媒体字段。
     for (final type in const ['sheet', 'playlist', 'album']) {
@@ -1393,19 +1419,8 @@ class PluginRuntimeService {
 
     // 收藏夹/纯 ID 导入兼容路径，B 站、酷狗等插件常只实现此接口。
     try {
-      final imported = await _callOnCurrentIsolate(plugin, 'importMusicSheet', [
-        input,
-      ]);
-      final songs = _extractResultList(
-        imported,
-      ).map((song) => _resetMediaItem(plugin, song)).toList();
-      if (songs.isNotEmpty) {
-        return {
-          'name': '${plugin.name}歌单',
-          'coverUrl': _extractCover(songs.first),
-          'songs': songs,
-        };
-      }
+      final imported = await _importViaImportMusicSheet(plugin, input);
+      if (imported != null) return imported;
     } catch (error) {
       lastError = error;
     }
@@ -1437,6 +1452,207 @@ class PluginRuntimeService {
     );
   }
 
+  /// 用插件的 importMusicSheet 整单导入（分享链接的优先路径、纯 ID 的兼容路径）。
+  ///
+  /// 插件返回歌单对象（含真实标题/封面/musicList）时按对象取信息；返回
+  /// 裸曲目列表时退回用插件名命名。返回 null 表示插件不支持或结果为空，
+  /// 调用方继续走搜索路径。QQ 歌单单次整单导入约 999 首封顶（插件固定
+  /// song_num=1000），大歌单用官方接口按 song_begin 偏移增量补齐。
+  Future<Map<String, dynamic>?> _importViaImportMusicSheet(
+    EnabledMusicPlugin plugin,
+    String input,
+  ) async {
+    final imported = await _callOnCurrentIsolate(plugin, 'importMusicSheet', [
+      input,
+    ]);
+    final songs = _extractResultList(imported)
+        .map((song) => _resetMediaItem(plugin, song))
+        .toList();
+    if (songs.isEmpty) return null;
+    if (imported is Map) {
+      final sheet = Map<String, dynamic>.from(imported);
+      if (_isQqMusicPlugin(plugin)) {
+        songs.addAll(await _topUpQqDissSongs(plugin, sheet, songs));
+      }
+      return {
+        'name': _playlistName(sheet, plugin.name),
+        'coverUrl': _extractCover(sheet),
+        'songs': songs,
+      };
+    }
+    return {
+      'name': '${plugin.name}歌单',
+      'coverUrl': _extractCover(songs.first),
+      'songs': songs,
+    };
+  }
+
+  /// QQ 歌单超出插件单次整单上限（约 999 首）时，直接调用官方
+  /// uniform_get_Dissinfo 接口按 song_begin 偏移补齐剩余曲目。
+  /// 补齐的歌曲按 baka 系 QQ 插件 formatMusicItem 的字段结构归一化，
+  /// 播放与音质解析继续走插件管线（getMediaSource 只依赖 songmid 与
+  /// qualities）。接口失败时静默返回已补齐的部分，不影响导入结果。
+  Future<List<Map<String, dynamic>>> _topUpQqDissSongs(
+    EnabledMusicPlugin plugin,
+    Map<String, dynamic> importedSheet,
+    List<Map<String, dynamic>> imported,
+  ) async {
+    final disstid = importedSheet['id']?.toString().trim() ?? '';
+    if (!RegExp(r'^\d+$').hasMatch(disstid)) return const [];
+    var total = 0;
+    for (final key in const ['worksNum', 'trackCount', 'count', 'total']) {
+      final value = importedSheet[key];
+      final parsed = value is num
+          ? value.toInt()
+          : int.tryParse(value?.toString() ?? '');
+      if (parsed != null && parsed > total) total = parsed;
+    }
+    if (total <= imported.length) return const [];
+    final seen = <String>{
+      for (final song in imported)
+        song['songmid']?.toString() ?? song['id']?.toString() ?? '',
+    }..remove('');
+    final extra = <Map<String, dynamic>>[];
+    var begin = imported.length;
+    // 安全上限：防止接口异常时无限翻页；正常会因空页/取满提前结束。
+    while (begin < total && begin < 10000) {
+      final page = await _fetchQqDissSonglist(disstid, begin);
+      if (page.isEmpty) break;
+      var added = 0;
+      for (final raw in page) {
+        final item = _normalizeQqDissSong(raw);
+        final key = item['songmid']?.toString() ?? '';
+        if (key.isEmpty || !seen.add(key)) continue;
+        extra.add(_resetMediaItem(plugin, item));
+        added++;
+      }
+      if (added == 0) break;
+      begin += page.length;
+    }
+    return extra;
+  }
+
+  /// 拉取 QQ 歌单详情的指定偏移页（uniform_get_Dissinfo）。
+  /// song_num 给 2000：接口对单次返回约 999 首封顶，一次取大一些
+  /// 可以减少大歌单的请求次数。
+  Future<List<Map<String, dynamic>>> _fetchQqDissSonglist(
+    String disstid,
+    int begin,
+  ) async {
+    final ownsClient = httpClient == null;
+    final client = httpClient ?? http.Client();
+    try {
+      final response = await client
+          .post(
+            Uri.https('u.y.qq.com', '/cgi-bin/musicu.fcg'),
+            headers: const {
+              'User-Agent':
+                  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                  'AppleWebKit/537.36 (KHTML, like Gecko) '
+                  'Chrome/120.0.0.0 Safari/537.36',
+              'Referer': 'https://y.qq.com/',
+              'Origin': 'https://y.qq.com',
+              'Content-Type': 'application/json;charset=UTF-8',
+            },
+            body: jsonEncode({
+              'comm': {'ct': 24, 'cv': 4747474, 'uin': 0},
+              'req': {
+                'module': 'music.srfDissInfo.aiDissInfo',
+                'method': 'uniform_get_Dissinfo',
+                'param': {
+                  'disstid': int.tryParse(disstid) ?? 0,
+                  'userinfo': 1,
+                  'tag': 1,
+                  'orderlist': 1,
+                  'song_begin': begin,
+                  'song_num': 2000,
+                  'onlysonglist': 0,
+                  'enc_host_uin': '',
+                },
+              },
+            }),
+          )
+          .timeout(const Duration(seconds: 20));
+      if (response.statusCode < 200 || response.statusCode >= 300) {
+        return const [];
+      }
+      final decoded = jsonDecode(_decodeResponseBody(response.bodyBytes));
+      if (decoded is! Map) return const [];
+      final req = decoded['req'];
+      final data = req is Map ? req['data'] : null;
+      final songlist = data is Map ? data['songlist'] : null;
+      if (songlist is! List) return const [];
+      return songlist.whereType<Map>().map(Map<String, dynamic>.from).toList();
+    } catch (_) {
+      return const [];
+    } finally {
+      if (ownsClient) client.close();
+    }
+  }
+
+  /// QQ uniform_get_Dissinfo 原始歌曲 → 插件媒体条目结构，
+  /// 字段对齐 baka 系 QQ 插件的 formatMusicItem / parseQualities。
+  static Map<String, dynamic> _normalizeQqDissSong(Map raw) {
+    final album = raw['album'] is Map
+        ? Map<String, dynamic>.from(raw['album'] as Map)
+        : const <String, dynamic>{};
+    final rawSingers = raw['singer'] is List ? raw['singer'] as List : const [];
+    final singers = [
+      for (final singer in rawSingers.whereType<Map>())
+        Map<String, dynamic>.from(singer),
+    ];
+    final artist = singers
+        .map((singer) => singer['name']?.toString() ?? '')
+        .where((name) => name.isNotEmpty)
+        .join(', ');
+    final file = raw['file'] is Map
+        ? Map<String, dynamic>.from(raw['file'] as Map)
+        : const <String, dynamic>{};
+    final qualities = <String, Map<String, int>>{};
+    void addQuality(String quality, dynamic size, int bitrate) {
+      final bytes = size is num ? size.toInt() : int.tryParse('$size') ?? 0;
+      if (bytes > 0) {
+        qualities[quality] = {'size': bytes, 'bitrate': bitrate};
+      }
+    }
+
+    addQuality('128k', file['size_128mp3'], 128000);
+    addQuality('320k', file['size_320mp3'], 320000);
+    addQuality('flac', file['size_flac'], 1411000);
+    addQuality('hires', file['size_hires'], 1536000);
+    addQuality('dolby', file['size_dolby'], 1411000);
+    final sizeNew = file['size_new'];
+    if (sizeNew is List) {
+      int sizeAt(int index) =>
+          index < sizeNew.length && sizeNew[index] is num
+          ? (sizeNew[index] as num).toInt()
+          : 0;
+      addQuality('master', sizeAt(0), 2304000);
+      addQuality('atmos', sizeAt(1), 1411000);
+      addQuality('atmos_plus', sizeAt(2), 1411000);
+      addQuality('vinyl', sizeAt(4), 2500000);
+    }
+    final albumMid = album['mid']?.toString() ?? '';
+    final albumPmid = album['pmid']?.toString() ?? '';
+    final coverMid = albumPmid.isNotEmpty ? albumPmid : albumMid;
+    return {
+      'id': raw['id'],
+      'songmid': raw['mid']?.toString() ?? '',
+      'title': raw['title'] ?? raw['name'] ?? '',
+      'artist': artist,
+      'singerList': singers,
+      'artwork': coverMid.isEmpty
+          ? ''
+          : 'https://y.gtimg.cn/music/photo_new/'
+                'T002R800x800M000$coverMid.jpg',
+      'album': album['title'] ?? album['name'] ?? '',
+      'duration': raw['interval'] ?? 0,
+      'albumid': album['id']?.toString() ?? '',
+      'albummid': albumMid,
+      'qualities': qualities,
+    };
+  }
+
   Future<List<Map<String, dynamic>>> _loadMusicFreePlaylistSongs(
     EnabledMusicPlugin plugin,
     Map<String, dynamic> sheet, {
@@ -1447,8 +1663,22 @@ class PluginRuntimeService {
       'top' => 'getTopListDetail',
       _ => 'getMusicSheetInfo',
     };
-    final songs = <Map<String, dynamic>>[];
+    var songs = <Map<String, dynamic>>[];
     final seen = <String>{};
+    // 分页拉取歌单全部曲目（对齐前身 XianYu-Music-mobile 的导入逻辑）。
+    // 只以插件返回的 isEnd / 空页 / 全重复 / 曲目数 / 短页判断结束，
+    // 不按固定数量猜页大小——QQ 等插件每页不足 30 首时，按 30 猜测会
+    // 提前截断导致歌单导入不完整。
+    var maxPageSize = 0;
+    var total = 0;
+    for (final key in const ['trackCount', 'count', 'total', 'worksNum']) {
+      final value = sheet[key];
+      if (value is num && value > total) total = value.toInt();
+      if (value is String) {
+        final parsed = int.tryParse(value.trim());
+        if (parsed != null && parsed > total) total = parsed;
+      }
+    }
     for (var page = 1; page <= 50; page++) {
       dynamic detail;
       try {
@@ -1497,9 +1727,20 @@ class PluginRuntimeService {
           added++;
         }
       }
+      // 全是重复曲目：插件忽略 page 参数每页返回同一批，视为结束。
+      if (added == 0) break;
       if (detail is Map && detail['isEnd'] == true) break;
-      // MusicFree 通常每页 30 首；不足一页即视为结束。
-      if (pageSongs.length < 30 || added == 0) break;
+      // 歌单曲目数已知且已取满，视为结束。
+      if (total > 0 && songs.length >= total) break;
+      if (pageSongs.length > maxPageSize) maxPageSize = pageSongs.length;
+      // 短页：比已见过的最大页短，即最后一页（允许插件自定义页大小）。
+      if (pageSongs.length < maxPageSize) break;
+    }
+    // 网易系歌单/专辑/榜单接口对部分 OST 专辑只返回数值 picId（超出
+    // JS 安全整数，插件无法生成封面地址），与搜索/导入路径一致补全。
+    if (songs.isNotEmpty &&
+        (_isNeteaseMusicPlugin(plugin) || songs.any(_looksLikeNeteaseTrack))) {
+      songs = await _backfillNeteaseTrackMeta(songs);
     }
     return songs;
   }
@@ -1743,6 +1984,27 @@ class PluginRuntimeService {
       }
       return patched;
     }).toList();
+  }
+
+  /// 播放时为缺少封面的网易系歌曲补拉专辑封面。历史会话/歌单里的
+  /// OST 歌曲可能带着空 artwork 持久化（接口当时只返回数值 picId），
+  /// 播放时通过 song/detail 现场补全。失败返回空串，不影响播放。
+  Future<String> fetchNeteaseTrackCover(
+    EnabledMusicPlugin plugin,
+    Map<String, dynamic> rawData,
+  ) async {
+    if (!_isNeteaseMusicPlugin(plugin) && !_looksLikeNeteaseTrack(rawData)) {
+      return '';
+    }
+    if (_extractCover(rawData).isNotEmpty) return '';
+    final id = _extractTrackId(rawData);
+    if (id.isEmpty || !RegExp(r'^\d+$').hasMatch(id)) return '';
+    final cached = _neteaseTrackMetaCache[id];
+    if (cached?.coverUrl.isNotEmpty == true) return cached!.coverUrl;
+    final patched = await _backfillNeteaseTrackMeta([
+      Map<String, dynamic>.from(rawData),
+    ]);
+    return patched.isEmpty ? '' : _extractCover(patched.first);
   }
 
   /// 后台 isolate 注入的 HTTP 客户端（_PluginBackgroundHttpClient）为
@@ -2385,7 +2647,7 @@ class PluginRuntimeService {
   }
 
   Future<String> _resolveLyricsResponse(dynamic response) async {
-    final lyrics = _extractLyrics(response);
+    final lyrics = _extractLyricsWithTranslation(response);
     if (lyrics.isNotEmpty) return lyrics;
     final url = _extractLyricsUrl(response);
     if (url.isEmpty) return '';
@@ -2397,7 +2659,7 @@ class PluginRuntimeService {
       final body = utf8.decode(httpResponse.bodyBytes, allowMalformed: true);
       try {
         final decoded = jsonDecode(body);
-        final nested = _extractLyrics(decoded);
+        final nested = _extractLyricsWithTranslation(decoded);
         if (nested.isNotEmpty) return nested;
       } catch (_) {
         // 纯 LRC 文本不是 JSON，直接返回正文。
@@ -2437,7 +2699,7 @@ class PluginRuntimeService {
       final decoded = jsonDecode(
         utf8.decode(response.bodyBytes, allowMalformed: true),
       );
-      return _extractLyrics(decoded);
+      return _extractLyricsWithTranslation(decoded);
     } catch (_) {
       return '';
     }
@@ -2476,7 +2738,7 @@ class PluginRuntimeService {
     return PluginMediaSource(
       url: _normalizeMediaUrl(url),
       headers: headers,
-      lyrics: _extractLyrics(value),
+      lyrics: _extractLyricsWithTranslation(value),
     );
   }
 
@@ -2996,6 +3258,69 @@ class PluginRuntimeService {
         RegExp(r'<tt[\s>]', caseSensitive: false).hasMatch(lyrics);
   }
 
+  /// 插件歌词响应还原为「主歌词 + 翻译 + 罗马音」的拼接文本，与
+  /// buildLxLyricsRaw 的输出格式一致：Rust 解析器按时间戳与文字脚本
+  /// 把翻译/罗马音行合并进 displayLine 的对应字段。此前只取主歌词，
+  /// MusicFree 插件（ILyricSource.rawLrc + translation，或 LX 风格的
+  /// lyric + tlyric）返回的翻译被整段丢弃，表现为插件歌曲无翻译。
+  static String _extractLyricsWithTranslation(dynamic value) {
+    final main = _extractLyrics(value);
+    if (main.isEmpty || value is! Map) return main;
+    final translation = _extractTranslation(value);
+    final romaji = _extractRomaji(value);
+    if (translation.isEmpty && romaji.isEmpty) return main;
+    return [main, translation, romaji]
+        .where((item) => item.isNotEmpty)
+        .join('\n');
+  }
+
+  static String _extractTranslation(dynamic value) {
+    if (value is! Map) return '';
+    for (final key in const [
+      'tlyric',
+      'tLyric',
+      'translation',
+      'translatedLyric',
+      'transLyric',
+    ]) {
+      final text = _plainLyricText(value[key]);
+      if (text.isNotEmpty) return text;
+    }
+    final data = value['data'];
+    return data is Map ? _extractTranslation(data) : '';
+  }
+
+  static String _extractRomaji(dynamic value) {
+    if (value is! Map) return '';
+    for (final key in const [
+      'rlyric',
+      'rLyric',
+      'roman',
+      'romalrc',
+      'romanization',
+    ]) {
+      final text = _plainLyricText(value[key]);
+      if (text.isNotEmpty) return text;
+    }
+    final data = value['data'];
+    return data is Map ? _extractRomaji(data) : '';
+  }
+
+  /// 歌词字段值可能是纯文本，也可能是网易风格的 `{ lyric: "..." }`
+  /// 嵌套结构。
+  static String _plainLyricText(dynamic value) {
+    if (value is String) return value.trim();
+    if (value is Map) {
+      for (final key in const ['lyric', 'lrc', 'text', 'content']) {
+        final nested = value[key];
+        if (nested is String && nested.trim().isNotEmpty) {
+          return nested.trim();
+        }
+      }
+    }
+    return '';
+  }
+
   static String _extractLyricsUrl(dynamic value) {
     if (value is String) {
       final url = value.trim();
@@ -3102,13 +3427,18 @@ class PluginRuntimeService {
     return normalized;
   }
 
+  /// 封面地址规范化：Android 禁止加载明文 HTTP 远程图片，而酷狗等音源
+  /// 仍返回 http:// 封面（imge.kugou.com 已支持 HTTPS），统一升级到
+  /// HTTPS；本机地址保留原协议。写入 rawData 的同时也会随收藏/歌单持久
+  /// 化，避免旧数据反复出现失效的明文地址。
   static String _normalizeImageUrl(String value) {
     var normalized = value.trim();
     if (normalized.startsWith('//')) normalized = 'https:$normalized';
     final uri = Uri.tryParse(normalized);
     final host = uri?.host.toLowerCase() ?? '';
-    if (normalized.startsWith('http://') &&
-        (host == 'music.126.net' || host.endsWith('.music.126.net'))) {
+    final isLocalHost =
+        host == 'localhost' || host == '127.0.0.1' || host == '[::1]';
+    if (normalized.startsWith('http://') && !isLocalHost) {
       normalized = 'https://${normalized.substring(7)}';
     }
     return _isHttpUrl(normalized) ? normalized : '';

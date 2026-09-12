@@ -552,6 +552,13 @@ class _AccountPageState extends ConsumerState<AccountPage>
         title: Text(auth.isLoggedIn ? '我的' : '账号'),
         centerTitle: true,
         actions: [
+          // 第三方音乐平台（QQ/网易/酷狗）登录与歌单导入，与 XY 账号无关，
+          // 未登录状态下也可使用。
+          IconButton(
+            tooltip: '第三方音乐平台',
+            onPressed: () => context.push('/account/music-platform'),
+            icon: const Icon(Icons.library_music_rounded),
+          ),
           if (widget.showSidebarButton && sidebarOnRight)
             const AppSidebarMenuButton(),
         ],

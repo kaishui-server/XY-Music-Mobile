@@ -227,6 +227,27 @@ class FavoritesNotifier extends StateNotifier<Set<String>> {
     return removed;
   }
 
+  /// 换源：把收藏中的旧路径原位替换为新歌曲（收藏页批量换源用）。
+  /// 保持收藏顺序与自定义排序位置不变；返回是否替换成功。
+  Future<bool> replacePath(String oldPath, FavoriteSongSnapshot newSong) async {
+    await _loaded;
+    if (!state.contains(oldPath) || oldPath == newSong.path) return false;
+    state = {
+      for (final path in state) path == oldPath ? newSong.path : path,
+    };
+    _songSnapshots.remove(oldPath);
+    if (_needsSnapshot(newSong.path, newSong.pluginId)) {
+      _songSnapshots[newSong.path] = newSong;
+    }
+    if (_customOrder != null && _customOrder!.contains(oldPath)) {
+      _customOrder = [
+        for (final path in _customOrder!) path == oldPath ? newSong.path : path,
+      ];
+    }
+    await _persist();
+    return true;
+  }
+
   /// 保存「自定义」排序结果（拖拽排序后的完整路径顺序）。
   Future<void> setCustomOrder(List<String> order) async {
     await _loaded;

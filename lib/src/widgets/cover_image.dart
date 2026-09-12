@@ -255,15 +255,18 @@ bool needsCoverImageProxy(String imageUrl) {
   return host == 'music.126.net' || host.endsWith('.music.126.net');
 }
 
-/// 兼容旧插件和旧播放会话保存的网易云 HTTP / 协议省略封面地址。
-/// Android 的网络安全配置只允许本机音频代理使用明文 HTTP，远程封面必须 HTTPS。
+/// 兼容旧插件和旧播放会话保存的 HTTP / 协议省略封面地址。
+/// Android 的网络安全配置只允许本机音频代理使用明文 HTTP，远程封面必须
+/// HTTPS；酷狗等音源仍返回 http:// 封面，主流音乐图床均已支持 HTTPS，
+/// 统一升级，否则这类封面在 Android 上一律显示占位图。
 String normalizeCoverImageUrl(String? imageUrl) {
   var normalized = imageUrl?.trim() ?? '';
   if (normalized.startsWith('//')) normalized = 'https:$normalized';
   final uri = Uri.tryParse(normalized);
   final host = uri?.host.toLowerCase() ?? '';
-  if (normalized.startsWith('http://') &&
-      (host == 'music.126.net' || host.endsWith('.music.126.net'))) {
+  final isLocalHost =
+      host == 'localhost' || host == '127.0.0.1' || host == '[::1]';
+  if (normalized.startsWith('http://') && !isLocalHost) {
     normalized = 'https://${normalized.substring(7)}';
   }
   return normalized;

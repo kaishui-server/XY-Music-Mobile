@@ -16,6 +16,9 @@ analyzer:
     - windows/**
     - macos/**
     - linux/**
+    # vendor 的第三方本地补丁（如 flutter_inappwebview_android），
+    # 保持上游原样，不做 lint。
+    - third_party/**
     # 旧版 codegen 遗留的子目录文件（当前 lib.dart 仅导出顶层 api.dart）
     - lib/src/rust/music/**
     - lib/src/rust/player/**

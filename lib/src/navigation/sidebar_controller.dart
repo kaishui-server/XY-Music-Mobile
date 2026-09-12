@@ -47,6 +47,11 @@ class AppSidebarMenuButton extends ConsumerWidget {
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
+    // 横屏已有常驻侧边栏，页面顶栏不再显示抽屉入口。
+    final viewport = MediaQuery.sizeOf(context);
+    if (viewport.width >= viewport.height * 1.05) {
+      return const SizedBox.shrink();
+    }
     final position = ref.watch(
       settingsProvider.select(
         (value) => value.valueOrNull?.sidebarPosition ?? SidebarPosition.left,

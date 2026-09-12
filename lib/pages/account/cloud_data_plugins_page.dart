@@ -111,6 +111,8 @@ class _CloudDataPluginsPageState extends ConsumerState<CloudDataPluginsPage> {
     final scheme = Theme.of(context).colorScheme;
     showModalBottomSheet(
       context: context,
+      // 根 Navigator：详情面板覆盖悬浮底栏，避免底部内容被底栏遮挡。
+      useRootNavigator: true,
       showDragHandle: true,
       isScrollControlled: true,
       builder: (ctx) => SafeArea(

@@ -200,7 +200,7 @@ class _XyMusicAppState extends ConsumerState<XyMusicApp> {
     final settings = ref.watch(settingsProvider).valueOrNull;
     // 同步页面切换模式到路由层（transitionsBuilder 无法访问 ref）。
     xyPageTransitionMode =
-        settings?.pageTransitionMode ?? PageTransitionMode.slide;
+        settings?.pageTransitionMode ?? PageTransitionMode.fade;
     final startup = widget.startupBackground;
     final backgroundPath =
         settings?.customBackgroundPath.trim() ?? startup?.path ?? '';

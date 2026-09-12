@@ -84,6 +84,16 @@ class _ExplorePageState extends ConsumerState<ExplorePage> {
                   onTap: () => context.push('/search'),
                 ),
               ),
+              // 「猜你想听」推荐面板移回探索页固定展示（首页不再挂载）。
+              SliverToBoxAdapter(
+                child: Padding(
+                  padding: const EdgeInsets.fromLTRB(16, 12, 16, 0),
+                  child: GuessYouLikePanel(
+                    onMore: () =>
+                        context.push('/home/explore/recommendations'),
+                  ),
+                ),
+              ),
               SliverToBoxAdapter(
                 child: _showHotCharts
                     ? const _ExploreHotChartsSection()
@@ -98,7 +108,7 @@ class _ExplorePageState extends ConsumerState<ExplorePage> {
 }
 
 /// 「猜你想听」推荐面板：根据本地偏好生成的歌曲/歌单推荐卡片。
-/// 原探索页卡片已迁移为首页固定模块，组件保留在此供首页复用。
+/// 探索页固定模块（从首页迁回）。
 class GuessYouLikePanel extends StatelessWidget {
   const GuessYouLikePanel({super.key, this.onMore});
 

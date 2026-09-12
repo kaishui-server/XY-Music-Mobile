@@ -381,6 +381,17 @@ Future<LxPlaylistImportResult> _importKg(http.Client client, String input) async
   if (RegExp(r'^\d+$').hasMatch(trimmed)) {
     return _kgByCode(client, trimmed);
   }
+  // 裸 global_collection_id 直接进 v5 歌单详情。
+  if (RegExp(r'^collection_\w+$').hasMatch(trimmed)) {
+    return _kgDetail2(client, trimmed);
+  }
+  // lx-music 的 id_ 前缀 specialid。
+  final idPrefixed = RegExp(r'^id_(\d+)$').firstMatch(trimmed);
+  if (idPrefixed != null) {
+    final converted = await _kgSpecialIdToGlobal(client, idPrefixed.group(1)!);
+    if (converted != null) return _kgDetail2(client, converted);
+    throw Exception('酷狗歌单不存在或已失效，请检查歌单 ID');
+  }
   return _kgByLink(client, trimmed);
 }
 
@@ -408,9 +419,16 @@ Future<LxPlaylistImportResult> _kgByCode(http.Client client, String id) async {
         body['error_code'] ?? body['errcode'] ?? body['err_code'],
         -1,
       );
-      if (errcode == 0 && body['info'] is Map) {
-        info = Map<String, dynamic>.from(body['info'] as Map);
-        rawList = body['list'];
+      if (errcode == 0) {
+        // command 响应形态：{status, err_code, data: {info, list}}。
+        final data = body['data'];
+        if (data is Map && data['info'] is Map) {
+          info = Map<String, dynamic>.from(data['info'] as Map);
+          rawList = data['list'];
+        } else if (body['info'] is Map) {
+          info = Map<String, dynamic>.from(body['info'] as Map);
+          rawList = body['list'];
+        }
       }
     }
   } catch (_) {
@@ -506,6 +524,8 @@ Future<LxPlaylistImportResult?> _kgResolveLink(
   if (gcidToken != null) {
     final decoded = await _kgDecodeGcid(client, 'gcid_${gcidToken.group(1)}');
     if (decoded != null) return _kgDetail2(client, decoded);
+    // 解码失败时把 gcid 串当 chain 再试（对齐 WalnutBai decodeGcid 兜底）。
+    return _kgByChain(client, gcidToken.group(1)!);
   }
 
   final chain = RegExp(r'[?&]chain=(\w+)').firstMatch(url);
@@ -546,8 +566,23 @@ Future<LxPlaylistImportResult?> _kgByShortLink(
       current = Uri.parse(current).resolve(location).toString();
       final gcid = RegExp(r'global_collection_id=(\w+)').firstMatch(current);
       if (gcid != null) return _kgDetail2(client, gcid.group(1)!);
+      final gcidToken = RegExp(r'gcid_(\w+)').firstMatch(current);
+      if (gcidToken != null) {
+        final decoded = await _kgDecodeGcid(
+          client,
+          'gcid_${gcidToken.group(1)}',
+        );
+        if (decoded != null) return _kgDetail2(client, decoded);
+      }
       final chain = RegExp(r'[?&]chain=(\w+)').firstMatch(current);
       if (chain != null) return _kgByChain(client, chain.group(1)!);
+      // xxx.html 分享页（song.html 除外）：文件名即 chain。
+      if (current.contains('.html') && !current.contains('song.html')) {
+        final page = RegExp(r'/(\w+)\.html').firstMatch(current);
+        if (page != null && page.group(1)!.length > 4) {
+          return _kgByChain(client, page.group(1)!);
+        }
+      }
       continue;
     }
     final page = await response.stream.bytesToString();
@@ -588,13 +623,76 @@ Future<LxPlaylistImportResult> _kgByChain(
       ? Map<String, dynamic>.from(body['info'] as Map)
       : const <String, dynamic>{};
   final hashes = _kgHashesFromList(body['list']);
-  if (hashes.isEmpty) throw Exception('酷狗歌单不存在或已失效');
+  if (hashes.isEmpty) {
+    // schain/transfer 无列表时回退 PC 分享页解析（对齐 WalnutBai
+    // getUserListDetail5：m 分享页取元信息 + www 分享页取歌曲）。
+    return _kgByPcShare(client, chain);
+  }
   return _kgSongsFromHashes(
     client,
     name: _text(info['name']),
     cover: _normalizeCover(_text(info['img'])),
     hashes: hashes,
   );
+}
+
+/// PC 分享页回退：m.kugou.com/share 内嵌 phpParam 提供歌单元信息，
+/// www.kugou.com/share/{chain}.html 内嵌 dataFromSmarty 提供歌曲列表。
+Future<LxPlaylistImportResult> _kgByPcShare(
+  http.Client client,
+  String chain,
+) async {
+  var name = '';
+  var cover = '';
+  try {
+    final page = await _kgGetPage(
+      client,
+      'https://m.kugou.com/share/?chain=$chain&id=$chain',
+    );
+    final match = RegExp(r'var\s+phpParam\s*=\s*(\{.+?\});').firstMatch(page);
+    if (match != null) {
+      final param = jsonDecode(match.group(1)!);
+      if (param is Map) {
+        name = _text(param['specialname']);
+        cover = _normalizeCover(
+          _text(param['imgurl']).replaceAll('{size}', '240'),
+        );
+      }
+    }
+  } catch (_) {
+    // 元信息解析失败不阻断歌曲列表获取。
+  }
+
+  final hashes = <String>[];
+  try {
+    final page = await _kgGetPage(
+      client,
+      'https://www.kugou.com/share/$chain.html',
+    );
+    final match = RegExp(
+      r'var\s+dataFromSmarty\s*=\s*(\[.+?\]);',
+    ).firstMatch(page);
+    if (match != null) {
+      final data = jsonDecode(match.group(1)!);
+      hashes.addAll(_kgHashesFromList(data));
+    }
+  } catch (_) {
+    // 歌曲列表解析失败走统一报错。
+  }
+  if (hashes.isEmpty) throw Exception('酷狗歌单不存在或已失效');
+  return _kgSongsFromHashes(
+    client,
+    name: name,
+    cover: cover,
+    hashes: hashes,
+  );
+}
+
+Future<String> _kgGetPage(http.Client client, String url) async {
+  final response = await client
+      .get(Uri.parse(url), headers: _browserHeaders)
+      .timeout(_timeout);
+  return utf8.decode(response.bodyBytes, allowMalformed: true);
 }
 
 /// gcid_ 分享标识 → global_collection_id。
@@ -622,7 +720,11 @@ Future<String?> _kgDecodeGcid(http.Client client, String gcid) async {
       'Referer': 'https://m.kugou.com/',
     },
   );
-  final list = result is Map ? result['list'] : null;
+  final data = result is Map ? result['data'] : null;
+  // 兼容 list 位于 data.list 或顶层 list 两种响应形态。
+  final list = data is Map
+      ? data['list']
+      : (result is Map ? result['list'] : null);
   if (list is List && list.isNotEmpty && list.first is Map) {
     final id = _text((list.first as Map)['global_collection_id']);
     if (id.isNotEmpty) return id;
@@ -735,14 +837,20 @@ List<String> _kgHashesFromList(dynamic list) {
   return hashes;
 }
 
-/// gateway 批量接口把 hash 补全为歌曲信息（对齐 lx-music createTask）。
+/// gateway 批量接口把 hash 补全为歌曲信息（对齐 lx-music createTask），
+/// 再经 get_res_privilege 批量补全音质详情（对齐 WalnutBai
+/// quality_detail.js 的 filterData/getBatchMusicQualityInfo，支持
+/// hires / master / atmos）。
 Future<LxPlaylistImportResult> _kgSongsFromHashes(
   http.Client client, {
   required String name,
   required String cover,
   required List<String> hashes,
 }) async {
-  final songs = <Map<String, dynamic>>[];
+  // 第一阶段：gateway 批量补全歌曲信息，按 audio_id 去重（同一首歌
+  // 不同音质 hash 只保留一份，对齐 WalnutBai filterData 的 removeDuplicates）。
+  final items = <Map<String, dynamic>>[];
+  final seenAudioIds = <String>{};
   for (var index = 0; index < hashes.length; index += 100) {
     final batch = hashes.skip(index).take(100).toList();
     final body = await _postJson(
@@ -780,39 +888,61 @@ Future<LxPlaylistImportResult> _kgSongsFromHashes(
     for (final value in (body['data'] as List).whereType<List>()) {
       if (value.isEmpty || value.first is! Map) continue;
       final item = Map<String, dynamic>.from(value.first as Map);
-      final audio = item['audio_info'] is Map
-          ? Map<String, dynamic>.from(item['audioInfo'] ?? item['audio_info'] as Map)
-          : const <String, dynamic>{};
-      final albumInfo = item['album_info'] is Map
-          ? Map<String, dynamic>.from(item['album_info'] as Map)
-          : const <String, dynamic>{};
+      final audio = _kgAudioInfo(item);
       final hash = _text(audio['hash']).toUpperCase();
-      final title = _decodeJsName(_text(item['songname']));
-      if (hash.isEmpty || title.isEmpty) continue;
-      final durationSec = (_toInt(audio['timelength']) / 1000).round();
-      final transParam = audio['trans_param'] is Map
-          ? Map<String, dynamic>.from(audio['trans_param'] as Map)
-          : const <String, dynamic>{};
-      final songCover = _normalizeCover(
+      if (hash.isEmpty) continue;
+      final audioId = _text(audio['audio_id']);
+      if (audioId.isNotEmpty && !seenAudioIds.add(audioId)) continue;
+      items.add(item);
+      if (items.length >= _maxImportSongs) break;
+    }
+    if (items.length >= _maxImportSongs) break;
+  }
+  if (items.isEmpty) throw Exception('酷狗歌单歌曲信息获取失败');
+
+  // 第二阶段：get_res_privilege 批量查询音质详情；失败时回退 gateway
+  // 自带的 hash_128/hash_320/hash_flac 音质。
+  final qualityInfo = await _kgQualityInfo(
+    client,
+    [for (final item in items) _text(_kgAudioInfo(item)['hash']).toUpperCase()],
+  );
+
+  final songs = <Map<String, dynamic>>[];
+  for (final item in items) {
+    final audio = _kgAudioInfo(item);
+    final albumInfo = item['album_info'] is Map
+        ? Map<String, dynamic>.from(item['album_info'] as Map)
+        : const <String, dynamic>{};
+    final hash = _text(audio['hash']).toUpperCase();
+    final title = _decodeJsName(_text(item['songname']));
+    if (hash.isEmpty || title.isEmpty) continue;
+    final durationSec = (_toInt(audio['timelength']) / 1000).round();
+    final transParam = audio['trans_param'] is Map
+        ? Map<String, dynamic>.from(audio['trans_param'] as Map)
+        : const <String, dynamic>{};
+    var songCover = _normalizeCover(
+      _text(albumInfo['sizable_cover']).replaceAll('{size}', '480'),
+    );
+    if (songCover.isEmpty) {
+      songCover = _normalizeCover(
         _text(transParam['union_cover']).replaceAll('{size}', '400'),
       );
-      songs.add(
-        _lxSong(
-          source: 'kg',
-          songmid: hash,
-          hash: hash,
-          name: title,
-          singer: _decodeJsName(_text(item['author_name'])),
-          album: _decodeJsName(_text(albumInfo['album_name'])),
-          albumId: _text(albumInfo['album_id']),
-          durationSec: durationSec,
-          img: songCover,
-          types: _kgTypes(audio),
-        ),
-      );
-      if (songs.length >= _maxImportSongs) break;
     }
-    if (songs.length >= _maxImportSongs) break;
+    final types = qualityInfo[hash] ?? _kgTypes(audio);
+    songs.add(
+      _lxSong(
+        source: 'kg',
+        songmid: hash,
+        hash: hash,
+        name: title,
+        singer: _decodeJsName(_text(item['author_name'])),
+        album: _decodeJsName(_text(albumInfo['album_name'])),
+        albumId: _text(albumInfo['album_id']),
+        durationSec: durationSec,
+        img: songCover,
+        types: types,
+      ),
+    );
   }
   if (songs.isEmpty) throw Exception('酷狗歌单歌曲信息获取失败');
   return LxPlaylistImportResult(
@@ -820,6 +950,99 @@ Future<LxPlaylistImportResult> _kgSongsFromHashes(
     coverUrl: cover,
     songs: songs,
   );
+}
+
+Map<String, dynamic> _kgAudioInfo(Map<String, dynamic> item) {
+  if (item['audio_info'] is Map) {
+    return Map<String, dynamic>.from(item['audio_info'] as Map);
+  }
+  if (item['audioInfo'] is Map) {
+    return Map<String, dynamic>.from(item['audioInfo'] as Map);
+  }
+  return const <String, dynamic>{};
+}
+
+/// get_res_privilege 批量查询音质详情（对齐 WalnutBai
+/// quality_detail.js 的 getBatchMusicQualityInfo）。
+/// 返回 hash → 音质档位（128k/320k/flac/hires/master/atmos/dolby 各含
+/// size 与对应 hash），查询失败时返回空表由调用方回退 gateway 音质。
+Future<Map<String, Map<String, dynamic>>> _kgQualityInfo(
+  http.Client client,
+  List<String> hashes,
+) async {
+  final result = <String, Map<String, dynamic>>{};
+  for (var index = 0; index < hashes.length; index += 100) {
+    final batch = hashes.skip(index).take(100).toList();
+    try {
+      final body = await _postJson(
+        client,
+        Uri.parse(
+          'https://gateway.kugou.com/goodsmstore/v1/get_res_privilege'
+          '?appid=1005&clientver=20049&clienttime='
+          '${DateTime.now().millisecondsSinceEpoch}&mid=NeZha',
+        ),
+        {
+          'behavior': 'play',
+          'clientver': '20049',
+          'resource': [
+            for (final hash in batch) {'id': 0, 'type': 'audio', 'hash': hash},
+          ],
+          'area_code': '1',
+          'quality': '128',
+          'qualities': const [
+            '128',
+            '320',
+            'flac',
+            'high',
+            'dolby',
+            'viper_atmos',
+            'viper_tape',
+            'viper_clear',
+          ],
+        },
+      );
+      if (body is! Map ||
+          _toInt(body['error_code'], -1) != 0 ||
+          body['data'] is! List) {
+        continue; // 单批失败不阻断导入。
+      }
+      for (final value in (body['data'] as List).whereType<Map>()) {
+        final item = Map<String, dynamic>.from(value);
+        final hash = _text(item['hash']).toUpperCase();
+        final goods = item['relate_goods'];
+        if (hash.isEmpty || goods is! List) continue;
+        final types = <String, dynamic>{};
+        for (final goodValue in goods.whereType<Map>()) {
+          final good = Map<String, dynamic>.from(goodValue);
+          final key = switch (_text(good['quality'])) {
+            '128' => '128k',
+            '320' => '320k',
+            'flac' => 'flac',
+            'high' => 'hires',
+            'viper_clear' => 'master',
+            'viper_atmos' => 'atmos',
+            'dolby' => 'dolby',
+            _ => null,
+          };
+          final goodHash = _text(good['hash']).toUpperCase();
+          if (key == null || goodHash.isEmpty) continue;
+          final info = good['info'] is Map
+              ? Map<String, dynamic>.from(good['info'] as Map)
+              : const <String, dynamic>{};
+          // 同档位重复出现时取最后一条（接口会在末尾附上请求的原始
+          // hash，作为播放兜底更可靠）。
+          types[key] = {
+            'size': _sizeFormate(info['filesize']),
+            'hash': goodHash,
+          };
+        }
+        if (types.isNotEmpty) result[hash] = types;
+      }
+    } catch (_) {
+      // 音质详情获取失败时回退 gateway 自带音质。
+    }
+  }
+  return result;
 }
 
 /// JS 字符串字面量中的 \\uXXXX 与 \x 转义解码。

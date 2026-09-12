@@ -521,7 +521,7 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
           trailing: DropdownButtonHideUnderline(
             child: DropdownButton<PageTransitionMode>(
               value:
-                  settings?.pageTransitionMode ?? PageTransitionMode.slide,
+                  settings?.pageTransitionMode ?? PageTransitionMode.fade,
               isDense: true,
               alignment: AlignmentDirectional.centerEnd,
               items: PageTransitionMode.values
@@ -668,7 +668,7 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
           title: '首页模块显示',
           trailing: Text(
             '${settings?.homeModules.length ?? kDefaultHomeModules.length}'
-            '/${kDefaultHomeModules.length}',
+            '/${kAllHomeModules.length}',
             style: TextStyle(
               fontSize: 13,
               color: Theme.of(context).colorScheme.onSurfaceVariant,
@@ -676,6 +676,8 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
           ),
           onTap: () => showModalBottomSheet<void>(
             context: context,
+            // 根 Navigator：模块面板覆盖悬浮底栏，避免底部开关被底栏遮挡。
+            useRootNavigator: true,
             showDragHandle: true,
             builder: (_) => const _HomeModulesSheet(),
           ),
@@ -735,7 +737,7 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
             child: DropdownButton<PlaybackFailureAction>(
               value:
                   settings?.playbackFailureAction ??
-                  PlaybackFailureAction.playNext,
+                  PlaybackFailureAction.pause,
               isDense: true,
               alignment: AlignmentDirectional.centerEnd,
               items: const [
@@ -859,7 +861,7 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
           icon: Icons.format_size_outlined,
           title: '歌词字号',
           trailing: Text(
-            (settings?.lyricFontSize ?? 18.0).toStringAsFixed(0),
+            (settings?.lyricFontSize ?? 22.0).toStringAsFixed(0),
             style: TextStyle(
               color: Theme.of(context).colorScheme.onSurfaceVariant,
             ),
@@ -951,7 +953,7 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
           icon: Icons.text_fields_rounded,
           title: '翻译字号',
           trailing: _desktopLyricsFontSizeControl(
-            value: settings?.desktopLyricsTranslationFontSize ?? 13,
+            value: settings?.desktopLyricsTranslationFontSize ?? 12,
             min: 10,
             max: 28,
             onChanged: notifier.setDesktopLyricsTranslationFontSize,
@@ -1397,7 +1399,7 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
       showDragHandle: true,
       isScrollControlled: true,
       builder: (_) => _SettingsLyricFontSizeSheet(
-        initial: ref.read(settingsProvider).valueOrNull?.lyricFontSize ?? 18.0,
+        initial: ref.read(settingsProvider).valueOrNull?.lyricFontSize ?? 22.0,
         onChanged: (value) {
           final notifier = ref.read(settingsProvider.notifier);
           notifier.setLyricFontSize(value);
@@ -1425,7 +1427,7 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
   String _pageTransitionModeLabel(PageTransitionMode mode) => switch (mode) {
     PageTransitionMode.slide => '平移',
     PageTransitionMode.stack => '层叠',
-    PageTransitionMode.cube => '方块',
+    PageTransitionMode.fade => '淡入淡出',
   };
 
   Future<void> _setPlayerDetailBackground(
@@ -1581,7 +1583,7 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
     ).withValues(alpha: settings?.desktopLyricsBackgroundOpacity ?? .85);
     final lyricFontSize = settings?.desktopLyricsLyricFontSize ?? 24;
     final translationFontSize =
-        settings?.desktopLyricsTranslationFontSize ?? 13;
+        settings?.desktopLyricsTranslationFontSize ?? 12;
     return Padding(
       padding: const EdgeInsets.fromLTRB(16, 12, 16, 16),
       child: Column(
@@ -1628,6 +1630,7 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
                     color: translationColor,
                     fontSize: translationFontSize,
                     height: 1.25,
+                    fontWeight: FontWeight.bold,
                   ),
                 ),
               ],
@@ -2424,22 +2427,25 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
     required String Function(dynamic) labelOf,
   }) {
     return SafeArea(
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          for (final c in choices)
-            ListTile(
-              title: Text(labelOf(c.value)),
-              trailing: c.value == cur
-                  ? Icon(
-                      Icons.check,
-                      color: Theme.of(context).colorScheme.primary,
-                    )
-                  : null,
-              selected: c.value == cur,
-              onTap: () => Navigator.pop(context, c),
-            ),
-        ],
+      // 选项较多（如 12 档音质）时支持滚动，避免底部档位被截断。
+      child: SingleChildScrollView(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            for (final c in choices)
+              ListTile(
+                title: Text(labelOf(c.value)),
+                trailing: c.value == cur
+                    ? Icon(
+                        Icons.check,
+                        color: Theme.of(context).colorScheme.primary,
+                      )
+                    : null,
+                selected: c.value == cur,
+                onTap: () => Navigator.pop(context, c),
+              ),
+          ],
+        ),
       ),
     );
   }
@@ -2567,31 +2573,24 @@ class _HomeModulesSheet extends ConsumerWidget {
   Widget build(BuildContext context, WidgetRef ref) {
     final settings = ref.watch(settingsProvider).valueOrNull;
     final enabled = settings?.homeModules ?? kDefaultHomeModules;
-    final scheme = Theme.of(context).colorScheme;
     return ListView(
       shrinkWrap: true,
-      padding: const EdgeInsets.fromLTRB(8, 0, 8, 16),
+      // 面板挂在根 Navigator 上覆盖整个屏幕（含悬浮底栏），
+      // 底部仅需让出系统安全区。
+      padding: EdgeInsets.fromLTRB(
+        8,
+        0,
+        8,
+        MediaQuery.paddingOf(context).bottom + 16,
+      ),
       children: [
         Padding(
           padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text(
-                '首页模块',
-                style: Theme.of(context).textTheme.titleMedium?.copyWith(
-                  fontWeight: FontWeight.w700,
-                ),
-              ),
-              const SizedBox(height: 4),
-              Text(
-                '「猜你想听」固定展示；关闭的模块将从首页隐藏。',
-                style: TextStyle(
-                  fontSize: 12,
-                  color: scheme.onSurfaceVariant,
-                ),
-              ),
-            ],
+          child: Text(
+            '首页模块',
+            style: Theme.of(context).textTheme.titleMedium?.copyWith(
+              fontWeight: FontWeight.w700,
+            ),
           ),
         ),
         for (final entry in _moduleMeta.entries)

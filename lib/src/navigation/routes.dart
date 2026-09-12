@@ -18,6 +18,8 @@ import '../../pages/account/cloud_data_playlists_page.dart';
 import '../../pages/account/cloud_data_favorites_page.dart';
 import '../../pages/account/cloud_data_plugins_page.dart';
 import '../../pages/account/cloud_data_user_page.dart';
+import '../../pages/music_platform/platform_account_page.dart';
+import '../../pages/music_platform/platform_playlists_page.dart';
 import '../../pages/statistics/statistics_page.dart';
 import '../../pages/settings/about_page.dart';
 import '../../pages/cloud/cloud_music_page.dart';
@@ -29,6 +31,7 @@ import '../../pages/settings/feedback_page.dart';
 import '../../pages/playlists/playlists_page.dart';
 import '../../pages/playlists/playlist_detail_page.dart';
 import '../../pages/recognize/recognize_page.dart';
+import '../../src/music_platform/platform_session.dart';
 import 'animated_branch_container.dart';
 import 'animated_page_route.dart';
 import 'shell.dart';
@@ -376,6 +379,28 @@ final appRouter = GoRouter(
                           ),
                         ),
                       ],
+                    ),
+                  ],
+                ),
+                // 第三方音乐平台（QQ/网易/酷狗）：登录后可导入在线歌单。
+                GoRoute(
+                  path: 'music-platform',
+                  pageBuilder: (context, state) => _instantPage(
+                    state,
+                    const PlatformAccountPage(),
+                  ),
+                  routes: [
+                    GoRoute(
+                      path: 'playlists/:platform',
+                      pageBuilder: (context, state) => _instantPage(
+                        state,
+                        PlatformPlaylistsPage(
+                          platform: MusicPlatformX.fromName(
+                                state.pathParameters['platform'],
+                              ) ??
+                              MusicPlatform.netease,
+                        ),
+                      ),
                     ),
                   ],
                 ),
