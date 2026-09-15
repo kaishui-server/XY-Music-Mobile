@@ -6,9 +6,16 @@ use regex::Regex;
 use serde::Serialize;
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
+use std::fmt::Write;
 use std::sync::OnceLock;
 
 const MAX_GROUP_TOLERANCE_MS: u32 = 50;
+
+/// 主歌词与翻译来自不同接口时，时间戳常有几百毫秒漂移（如网易
+/// tlyric 与 lyric 各自维护时间轴）。同语言行沿用 50ms 严格容差
+/// 防止吞并快节奏相邻行；跨语言行对（主词+翻译）放宽到 600ms，
+/// 否则翻译行永远无法与主词聚成一组，表现为翻译丢失、行序错乱。
+const CROSS_LANGUAGE_GROUP_TOLERANCE_MS: u32 = 600;
 
 // ==================== Regex caches (module-level, compiled once) ====================
 static XML_TAG_RE: OnceLock<Regex> = OnceLock::new();
@@ -21,6 +28,8 @@ static CONTRACTION_RE: OnceLock<Regex> = OnceLock::new();
 static ENGLISH_DIGRAPH_RE: OnceLock<Regex> = OnceLock::new();
 static ENGLISH_CONSONANT_RE: OnceLock<Regex> = OnceLock::new();
 static ROMANIZATION_RE: OnceLock<Regex> = OnceLock::new();
+static KRC_FULL_LINE_RE: OnceLock<Regex> = OnceLock::new();
+static KRC_TAG_RE: OnceLock<Regex> = OnceLock::new();
 const MAX_GROUP_SIZE: usize = 3;
 const ALIGNMENT_HIGH_WINDOW_MS: u32 = 300;
 const ALIGNMENT_MEDIUM_WINDOW_MS: u32 = 800;
@@ -538,6 +547,35 @@ fn get_line_script_profile(text: &str) -> LineScriptProfile {
 
 fn is_japanese_like(profile: &LineScriptProfile) -> bool {
     profile.kana_count > 0 && profile.hangul_count == 0
+}
+
+/// 比 DominantScript 更粗粒度的语言归类：日文假名的存在与否是区分
+/// 「日文主词 / 中文翻译」最可靠的信号（两者 DominantScript 都可能是
+/// Han 或 Mixed）。用于判断相邻两行是否属于跨语言的主词+翻译对。
+fn line_language_class(profile: &LineScriptProfile) -> u8 {
+    if is_japanese_like(profile) {
+        1 // Japanese-like
+    } else if profile.hangul_count > 0 {
+        2 // Hangul-like
+    } else if profile.han_count > 0 {
+        3 // Han (Chinese) like
+    } else if profile.latin_count > 0 {
+        4 // Latin-like
+    } else {
+        0 // Other
+    }
+}
+
+fn is_cross_language_pair(group: &[LyricTrackLine], candidate: &LyricTrackLine) -> bool {
+    let candidate_class = line_language_class(&candidate.script_profile);
+    if candidate_class == 0 {
+        return false;
+    }
+    group.iter().all(|line| {
+        line.explicit_role.is_none()
+            && candidate.explicit_role.is_none()
+            && line_language_class(&line.script_profile) != candidate_class
+    })
 }
 
 fn same_script_family(left: &DominantScript, right: &DominantScript) -> bool {
@@ -1160,11 +1198,52 @@ fn collect_candidate(
     });
 }
 
+/// KRC 词标签行 `[start,dur]<offset,dur,flag>文字` 转成 QRC
+/// `[start,dur]文字(start+offset,dur)`。
+///
+/// 汽水/BakaMusic 等插件的翻译轨道是 KRC 原文，而 QRC/YRC 解析器只认
+/// `word(start,dur)`，无词时间的行会被整行丢弃——英文主歌词配中文翻译
+/// 时表现为翻译全部消失。
+fn normalize_krc_word_tags(raw: &str) -> String {
+    let full_line_re = KRC_FULL_LINE_RE.get_or_init(|| {
+        Regex::new(r"^\[(\d+),(\d+)\]((?:<\d+,\d+,\d+>[^<]*)+)$").unwrap()
+    });
+    let tag_re = KRC_TAG_RE.get_or_init(|| Regex::new(r"<(\d+),(\d+),\d+>([^<]*)").unwrap());
+
+    raw.lines()
+        .map(|line| {
+            let Some(caps) = full_line_re.captures(line) else {
+                return line.to_string();
+            };
+            let start_ms: u64 = caps[1].parse().unwrap_or(0);
+            let line_duration = &caps[2];
+            let mut converted = String::new();
+            for tag in tag_re.captures_iter(&caps[3]) {
+                let offset_ms: u64 = tag[1].parse().unwrap_or(0);
+                let duration_ms: u64 = tag[2].parse().unwrap_or(0);
+                let text = tag[3].trim();
+                if text.is_empty() {
+                    continue;
+                }
+                converted.push_str(&text.replace('(', "（").replace(')', "）"));
+                let _ = write!(converted, "({},{})", start_ms + offset_ms, duration_ms);
+            }
+            if converted.is_empty() {
+                return line.to_string();
+            }
+            format!("[{start_ms},{line_duration}]{converted}")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn parse_raw_lyrics(raw: &str) -> Vec<ParsedLine> {
-    let normalized = raw
-        .replace('\u{FEFF}', "")
-        .replace("\r\n", "\n")
-        .replace('\r', "\n");
+    let normalized = normalize_krc_word_tags(
+        &raw
+            .replace('\u{FEFF}', "")
+            .replace("\r\n", "\n")
+            .replace('\r', "\n"),
+    );
 
     let mut candidates = Vec::new();
 
@@ -1510,9 +1589,18 @@ fn group_candidate_lines(lines: &[LyricTrackLine]) -> Vec<Vec<LyricTrackLine>> {
             find_context_start(lines, group_start_index, -1),
             find_context_start(lines, group_start_index, 1),
         );
-        let within_tolerance = line.start_ms.abs_diff(current_group[0].start_ms) <= tolerance;
+        let drift = line.start_ms.abs_diff(current_group[0].start_ms);
+        let cross_language = is_cross_language_pair(current_group, line);
+        let within_tolerance = if cross_language {
+            drift <= CROSS_LANGUAGE_GROUP_TOLERANCE_MS
+        } else {
+            drift <= tolerance
+        };
 
-        if within_tolerance && !should_keep_separate_for_script_similarity(current_group, line) {
+        if within_tolerance
+            && (cross_language
+                || !should_keep_separate_for_script_similarity(current_group, line))
+        {
             current_group.push(line.clone());
             continue;
         }
@@ -2981,6 +3069,16 @@ fn build_hard_role_semantic_line_from_cluster(
                     (*second_line, *first_line)
                 } else if is_han_latin_mixed_line(second_line) && is_latin_only_line(first_line) {
                     (*first_line, *second_line)
+                } else if is_japanese_like(&first_line.script_profile)
+                    && !is_japanese_like(&second_line.script_profile)
+                {
+                    // 日文主词 + 中文翻译（含时间戳漂移导致中文行排在前面时），
+                    // 假名的存在表明日文行是原词，中文行是翻译。
+                    (*first_line, *second_line)
+                } else if is_japanese_like(&second_line.script_profile)
+                    && !is_japanese_like(&first_line.script_profile)
+                {
+                    (*second_line, *first_line)
                 } else {
                     (*first_line, *second_line)
                 };
@@ -3765,6 +3863,220 @@ mod tests {
         assert!(
             score_romanized_latin_text(spaced_romaji)
                 > score_romanized_latin_text(compressed_latin)
+        );
+    }
+
+    #[test]
+    fn realistic_english_song_with_chinese_translation() {
+        let main = [
+            "[ti:Shape of You]",
+            "[ar:Ed Sheeran]",
+            "[al:Divide]",
+            "[00:00.00]The club isn't the best place to find a lover",
+            "[00:04.00]So the bar is where I go",
+            "[00:08.00]Me and my friends at the table doing shots",
+            "[00:12.00]Drinking fast and then we talk slow",
+            "[00:16.00]And you come over and start up a conversation with just me",
+            "[00:20.00]And trust me I'll give it a chance now",
+            "[00:24.00]Take my hand, stop, put Van the Man on the jukebox",
+            "[00:28.00]And then we start to dance, and now I'm singing like",
+            "[00:32.00]Girl, you know I want your love",
+            "[00:36.00]Your love was handmade for somebody like me",
+            "[00:40.00]Come on now, follow my lead",
+            "[00:44.00]I'm in love with the shape of you",
+        ];
+        let translation = [
+            "[00:00.00]俱乐部不是寻找爱人的最佳地点",
+            "[00:04.00]所以我去了酒吧",
+            "[00:08.00]我和朋友们坐在桌边喝酒",
+            "[00:12.00]喝得很快然后慢慢聊天",
+            "[00:16.00]你走了过来 开始和我搭话",
+            "[00:20.00]相信我 我会给你一个机会",
+            "[00:24.00]牵起我的手 点一首Van的歌",
+            "[00:28.00]然后我们开始跳舞 我唱着",
+            "[00:32.00]女孩 你知道我想要你的爱",
+            "[00:36.00]你的爱为我这样的人量身定做",
+            "[00:40.00]来吧 跟着我的节奏",
+            "[00:44.00]我爱上你的模样",
+        ];
+        let payload = build_structured_lyrics_payload(
+            [main.join("\n"), translation.join("\n")].join("\n"),
+        );
+
+        let with_translation = payload
+            .display_lines
+            .iter()
+            .filter(|line| !line.translation.is_empty())
+            .count();
+        assert!(
+            with_translation > 0,
+            "expected translations, got lines: {:?}",
+            payload
+                .display_lines
+                .iter()
+                .map(|line| (line.text.clone(), line.translation.clone()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn realistic_english_song_yrc_with_chinese_translation() {
+        let main = [
+            "[ti:Shape of You]",
+            "[ar:Ed Sheeran]",
+            "[00:00.00]<00:00.000>The <00:00.200>club <00:00.400>isn't <00:00.600>the <00:00.800>best <00:01.000>place <00:01.200>to <00:01.400>find <00:01.600>a <00:01.800>lover<00:02.000>",
+            "[00:04.00]<00:04.000>So <00:04.200>the <00:04.400>bar <00:04.600>is <00:04.800>where <00:05.000>I <00:05.200>go<00:05.400>",
+            "[00:08.00]<00:08.000>Me <00:08.200>and <00:08.400>my <00:08.600>friends <00:08.800>at <00:09.000>the <00:09.200>table <00:09.400>doing <00:09.600>shots<00:09.800>",
+            "[00:12.00]<00:12.000>Drinking <00:12.200>fast <00:12.400>and <00:12.600>then <00:12.800>we <00:13.000>talk <00:13.200>slow<00:13.400>",
+        ];
+        let translation = [
+            "[00:00.00]俱乐部不是寻找爱人的最佳地点",
+            "[00:04.00]所以我去了酒吧",
+            "[00:08.00]我和朋友们坐在桌边喝酒",
+            "[00:12.00]喝得很快然后慢慢聊天",
+        ];
+        let payload = build_structured_lyrics_payload(
+            [main.join("\n"), translation.join("\n")].join("\n"),
+        );
+
+        let with_translation = payload
+            .display_lines
+            .iter()
+            .filter(|line| !line.translation.is_empty())
+            .count();
+        assert!(
+            with_translation > 0,
+            "expected translations, got lines: {:?}",
+            payload
+                .display_lines
+                .iter()
+                .map(|line| (line.text.clone(), line.translation.clone()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn realistic_english_song_qrc_with_krc_chinese_translation() {
+        // 汽水/BakaMusic 插件 getLyric 返回：rawLrc 为 QRC
+        // `[start,dur]word(start,dur)`，translation 为 KRC
+        // `[start,dur]<offset,dur,0>文字`，Flutter 侧拼接后交给 Rust。
+        let main = [
+            "[3938,4988]The(3938,200) club(4138,300) isn't(4438,400) the(4838,200) best(5038,300) place(5338,400) to(5738,200) find(5938,300) a(6238,100) lover(6338,2500)",
+            "[8926,4100]So(8926,150) the(9076,200) bar(9276,300) is(9576,200) where(9776,400) I(10176,100) go(10276,2000)",
+            "[13026,5400]Me(13026,150) and(13176,250) my(13426,200) friends(13626,500) at(14126,200) the(14326,200) table(14526,600) doing(15126,500) shots(15626,900)",
+            "[18426,4600]Drinking(18426,600) fast(19026,300) and(19326,200) then(19526,300) we(19826,150) talk(19976,1200) slow(21176,800)",
+        ];
+        let translation = [
+            "[3938,4988]<0,4988,0>俱乐部不是寻找爱人的最佳地点",
+            "[8926,4100]<0,4100,0>所以我去了酒吧",
+            "[13026,5400]<0,5400,0>我和朋友们坐在桌边喝酒",
+            "[18426,4600]<0,4600,0>喝得很快然后慢慢聊天",
+        ];
+        let payload = build_structured_lyrics_payload(
+            [main.join("\n"), translation.join("\n")].join("\n"),
+        );
+
+        let with_translation = payload
+            .display_lines
+            .iter()
+            .filter(|line| !line.translation.is_empty())
+            .count();
+        assert!(
+            with_translation >= 3,
+            "expected translations on most lines, got {}/{}; lines: {:?}",
+            with_translation,
+            payload.display_lines.len(),
+            payload
+                .display_lines
+                .iter()
+                .map(|line| (line.text.clone(), line.translation.clone()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn realistic_japanese_ost_song_with_chinese_translation() {
+        // 网易 wy 插件日语歌曲：rawLrc 为日文，translation 为中文，
+        // 翻译仅覆盖人声行，且部分行时间戳与主歌词有轻微漂移。
+        let main = [
+            "[00:00.000]作詞 : Ayase",
+            "[00:00.000]作曲 : Ayase",
+            "[00:26.920]沈んだ目をした born loser",
+            "[00:31.260]夜に馳せる願いは",
+            "[00:35.600]誰にも言えないままで",
+            "[00:40.140]落ちていくのは",
+            "[00:44.980]悲しみだけ",
+            "[00:49.380]それでも君を抱きしめた",
+            "[00:54.120]離さないと誓った",
+            "[00:58.860]あの日のことを忘れない",
+        ];
+        let translation = [
+            "[00:26.920]眼神黯淡的 born loser",
+            "[00:31.260]向夜晚许下的愿望",
+            "[00:35.600]依然无法对任何人说起",
+            "[00:40.140]不断坠落的",
+            "[00:44.980]唯有悲伤",
+            "[00:49.380]即便如此我仍拥抱着你",
+            "[00:54.120]发誓绝不放手",
+            "[00:58.860]那一天的一切我不会忘记",
+        ];
+        let payload = build_structured_lyrics_payload(
+            [main.join("\n"), translation.join("\n")].join("\n"),
+        );
+
+        let with_translation = payload
+            .display_lines
+            .iter()
+            .filter(|line| !line.translation.is_empty())
+            .count();
+        assert!(
+            with_translation >= 6,
+            "expected translations on most lines, got {}/{}; lines: {:?}",
+            with_translation,
+            payload.display_lines.len(),
+            payload
+                .display_lines
+                .iter()
+                .map(|line| (line.text.clone(), line.translation.clone()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn realistic_japanese_song_translation_with_timestamp_drift() {
+        let main = [
+            "[00:26.920]沈んだ目をした born loser",
+            "[00:31.260]夜に馳せる願いは",
+            "[00:35.600]誰にも言えないままで",
+            "[00:40.140]落ちていくのは",
+            "[00:44.980]悲しみだけ",
+        ];
+        let translation = [
+            "[00:26.459]眼神黯淡的 born loser",
+            "[00:30.911]向夜晚许下的愿望",
+            "[00:35.376]依然无法对任何人说起",
+            "[00:39.842]不断坠落的",
+            "[00:44.307]唯有悲伤",
+        ];
+        let payload = build_structured_lyrics_payload(
+            [main.join("\n"), translation.join("\n")].join("\n"),
+        );
+
+        let with_translation = payload
+            .display_lines
+            .iter()
+            .filter(|line| !line.translation.is_empty())
+            .count();
+        assert!(
+            with_translation >= 4,
+            "expected translations despite drift, got {}/{}; lines: {:?}",
+            with_translation,
+            payload.display_lines.len(),
+            payload
+                .display_lines
+                .iter()
+                .map(|line| (line.text.clone(), line.translation.clone()))
+                .collect::<Vec<_>>()
         );
     }
 

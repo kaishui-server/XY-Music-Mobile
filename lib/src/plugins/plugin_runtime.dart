@@ -2648,7 +2648,7 @@ class PluginRuntimeService {
   }
 
   Future<String> _resolveLyricsResponse(dynamic response) async {
-    final lyrics = _extractLyrics(response);
+    final lyrics = _extractLyricsWithTranslation(response);
     if (lyrics.isNotEmpty) return lyrics;
     final url = _extractLyricsUrl(response);
     if (url.isEmpty) return '';
@@ -2660,7 +2660,7 @@ class PluginRuntimeService {
       final body = utf8.decode(httpResponse.bodyBytes, allowMalformed: true);
       try {
         final decoded = jsonDecode(body);
-        final nested = _extractLyrics(decoded);
+        final nested = _extractLyricsWithTranslation(decoded);
         if (nested.isNotEmpty) return nested;
       } catch (_) {
         // 纯 LRC 文本不是 JSON，直接返回正文。
@@ -2700,7 +2700,7 @@ class PluginRuntimeService {
       final decoded = jsonDecode(
         utf8.decode(response.bodyBytes, allowMalformed: true),
       );
-      return _extractLyrics(decoded);
+      return _extractLyricsWithTranslation(decoded);
     } catch (_) {
       return '';
     }
@@ -2739,7 +2739,7 @@ class PluginRuntimeService {
     return PluginMediaSource(
       url: _normalizeMediaUrl(url),
       headers: headers,
-      lyrics: _extractLyrics(value),
+      lyrics: _extractLyricsWithTranslation(value),
     );
   }
 
@@ -3257,6 +3257,69 @@ class PluginRuntimeService {
           multiLine: true,
         ).hasMatch(lyrics) ||
         RegExp(r'<tt[\s>]', caseSensitive: false).hasMatch(lyrics);
+  }
+
+  /// 插件歌词响应还原为「主歌词 + 翻译 + 罗马音」的拼接文本，与
+  /// buildLxLyricsRaw 的输出格式一致：Rust 解析器按时间戳与文字脚本
+  /// 把翻译/罗马音行合并进 displayLine 的对应字段。此前只取主歌词，
+  /// MusicFree 插件（ILyricSource.rawLrc + translation，或 LX 风格的
+  /// lyric + tlyric）返回的翻译被整段丢弃，表现为插件歌曲无翻译。
+  static String _extractLyricsWithTranslation(dynamic value) {
+    final main = _extractLyrics(value);
+    if (main.isEmpty || value is! Map) return main;
+    final translation = _extractTranslation(value);
+    final romaji = _extractRomaji(value);
+    if (translation.isEmpty && romaji.isEmpty) return main;
+    return [main, translation, romaji]
+        .where((item) => item.isNotEmpty)
+        .join('\n');
+  }
+
+  static String _extractTranslation(dynamic value) {
+    if (value is! Map) return '';
+    for (final key in const [
+      'tlyric',
+      'tLyric',
+      'translation',
+      'translatedLyric',
+      'transLyric',
+    ]) {
+      final text = _plainLyricText(value[key]);
+      if (text.isNotEmpty) return text;
+    }
+    final data = value['data'];
+    return data is Map ? _extractTranslation(data) : '';
+  }
+
+  static String _extractRomaji(dynamic value) {
+    if (value is! Map) return '';
+    for (final key in const [
+      'rlyric',
+      'rLyric',
+      'roman',
+      'romalrc',
+      'romanization',
+    ]) {
+      final text = _plainLyricText(value[key]);
+      if (text.isNotEmpty) return text;
+    }
+    final data = value['data'];
+    return data is Map ? _extractRomaji(data) : '';
+  }
+
+  /// 歌词字段值可能是纯文本，也可能是网易风格的 `{ lyric: "..." }`
+  /// 嵌套结构。
+  static String _plainLyricText(dynamic value) {
+    if (value is String) return value.trim();
+    if (value is Map) {
+      for (final key in const ['lyric', 'lrc', 'text', 'content']) {
+        final nested = value[key];
+        if (nested is String && nested.trim().isNotEmpty) {
+          return nested.trim();
+        }
+      }
+    }
+    return '';
   }
 
   static String _extractLyricsUrl(dynamic value) {
