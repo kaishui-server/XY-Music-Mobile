@@ -21,7 +21,7 @@ void main() {
     expect(
       snapshot.toSong().coverUrl,
       'https://p1.music.126.net/'
-      'yD9vbpuILH-tqNRIaP640g==/109951163038292176.jpg',
+      'yD9vbpuILH-tqNRIaP640g==/109951163038292176.jpg?param=800y800',
     );
   });
 

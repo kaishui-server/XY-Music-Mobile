@@ -72,3 +72,6 @@ package-lock.json
 
 # Local NDK toolchain shim (build workaround, machine-specific)
 .toolchain-shim/
+
+# 本地调试产物：一次调试会话的网易云接口加密参数（含会话信息）
+tool/netease_params.txt

@@ -13,7 +13,7 @@ void main() {
     expect(
       extractPluginCoverUrl(raw),
       'https://p1.music.126.net/'
-      'yD9vbpuILH-tqNRIaP640g==/109951163038292176.jpg',
+      'yD9vbpuILH-tqNRIaP640g==/109951163038292176.jpg?param=800y800',
     );
   });
 
@@ -26,7 +26,10 @@ void main() {
       },
     };
 
-    expect(extractPluginCoverUrl(raw), 'https://p3.music.126.net/key/song.jpg');
+    expect(
+      extractPluginCoverUrl(raw),
+      'https://p3.music.126.net/key/song.jpg?param=800y800',
+    );
   });
 
   test('拒绝用丢失精度的 JS 大整数生成错误封面', () {
@@ -42,7 +45,7 @@ void main() {
     expect(
       neteasePicIdToCoverUrl('109951163038292176'),
       'https://p1.music.126.net/'
-      'yD9vbpuILH-tqNRIaP640g==/109951163038292176.jpg',
+      'yD9vbpuILH-tqNRIaP640g==/109951163038292176.jpg?param=800y800',
     );
   });
 }

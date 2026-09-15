@@ -21,6 +21,7 @@ import '../plugins/plugin_runtime.dart';
 import '../recent/recent_store.dart';
 import '../rust/api.dart';
 import '../rust/music/types.dart';
+import '../widgets/cover_image.dart';
 import 'downloaded_song_store.dart';
 import 'desktop_lyrics.dart';
 import 'lx_lyrics_builder.dart';
@@ -52,6 +53,7 @@ class QueueItem {
   });
 
   QueueItem copyWith({
+    String? coverUrl,
     String? lyricsRaw,
     bool? lyricsAttempted,
     bool clearLyricsRaw = false,
@@ -63,7 +65,7 @@ class QueueItem {
     durationMs: durationMs,
     pluginId: pluginId,
     pluginData: pluginData,
-    coverUrl: coverUrl,
+    coverUrl: coverUrl ?? this.coverUrl,
     lyricsRaw: clearLyricsRaw ? null : lyricsRaw ?? this.lyricsRaw,
     lyricsAttempted: lyricsAttempted ?? this.lyricsAttempted,
   );
@@ -1561,6 +1563,11 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
               pluginData,
               preferredQuality: preferredQuality,
             );
+        // 历史队列里的网易系 OST 歌曲可能持久化了空封面（当时接口只返回
+        // 数值 picId），播放时现场补拉专辑封面，避免播放页一直无封面。
+        if (item.coverUrl?.trim().isNotEmpty != true) {
+          unawaited(_backfillPluginCover(queueIndex, item, plugin, pluginData));
+        }
         // 已存在用户记忆的歌词时，不要被插件返回的默认歌词覆盖。
         if (source.lyrics.isNotEmpty &&
             state.queue[queueIndex].lyricsRaw?.trim().isEmpty != false) {
@@ -1809,6 +1816,7 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
     await _saveAssociatedReplacement(
       proposal.originalPath,
       proposal.replacement,
+      original: currentAtIndex,
     );
     final queue = [...state.queue];
     queue[index] = proposal.replacement;
@@ -1833,7 +1841,11 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
   ) async {
     final index = state.queue.indexWhere((item) => item.path == originalPath);
     if (index < 0) return false;
-    await _saveAssociatedReplacement(originalPath, replacement);
+    await _saveAssociatedReplacement(
+      originalPath,
+      replacement,
+      original: state.queue[index],
+    );
     final queue = [...state.queue];
     queue[index] = replacement;
     state = state.copyWith(
@@ -1861,7 +1873,11 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
     if (queueIndex < 0 || queueIndex >= state.queue.length) return;
     if (state.queue[queueIndex].path != original.path) return;
 
-    await _saveAssociatedReplacement(original.path, replacement);
+    await _saveAssociatedReplacement(
+      original.path,
+      replacement,
+      original: original,
+    );
     final queue = [...state.queue];
     queue[queueIndex] = replacement;
     state = state.copyWith(
@@ -2191,8 +2207,9 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
 
   Future<void> _saveAssociatedReplacement(
     String originalPath,
-    QueueItem replacement,
-  ) async {
+    QueueItem replacement, {
+    QueueItem? original,
+  }) async {
     final preferences = await SharedPreferences.getInstance();
     final associations = <String, dynamic>{};
     try {
@@ -2202,11 +2219,93 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
         associations.addAll(Map<String, dynamic>.from(decoded));
       }
     } catch (_) {}
-    associations[originalPath] = _queueItemToAssociation(replacement);
+    final entry = _queueItemToAssociation(replacement);
+    // 记录换源前的原始音源，供「还原」功能恢复。
+    if (original != null) {
+      entry['original'] = _queueItemToAssociation(original);
+    }
+    associations[originalPath] = entry;
     await preferences.setString(
       _playbackSourceAssociationsKey,
       jsonEncode(associations, toEncodable: (value) => value.toString()),
     );
+  }
+
+  /// 在持久化关联中查找替代音源 path 为 [replacementPath] 的记录，
+  /// 返回（原始音源 path, 关联条目）。
+  Future<(String, Map<String, dynamic>)?> _findReplacementEntry(
+    String replacementPath,
+  ) async {
+    try {
+      final preferences = await SharedPreferences.getInstance();
+      final raw = preferences.getString(_playbackSourceAssociationsKey);
+      if (raw == null || raw.isEmpty) return null;
+      final decoded = jsonDecode(raw);
+      if (decoded is! Map) return null;
+      for (final entry in decoded.entries) {
+        final value = entry.value;
+        if (value is Map && value['path']?.toString() == replacementPath) {
+          return (entry.key.toString(), Map<String, dynamic>.from(value));
+        }
+      }
+    } catch (_) {}
+    return null;
+  }
+
+  Future<void> _removeAssociatedReplacement(String originalPath) async {
+    try {
+      final preferences = await SharedPreferences.getInstance();
+      final raw = preferences.getString(_playbackSourceAssociationsKey);
+      if (raw == null || raw.isEmpty) return;
+      final decoded = jsonDecode(raw);
+      if (decoded is! Map || decoded[originalPath] == null) return;
+      final associations = Map<String, dynamic>.from(decoded);
+      associations.remove(originalPath);
+      await preferences.setString(
+        _playbackSourceAssociationsKey,
+        jsonEncode(associations, toEncodable: (value) => value.toString()),
+      );
+    } catch (_) {}
+  }
+
+  /// 当前歌曲是否为换源后的替代音源且保存了可还原的原始音源，
+  /// 用于决定播放页更多菜单是否展示「还原」入口。
+  Future<bool> hasSwitchedSource(String currentPath) async {
+    final matched = await _findReplacementEntry(currentPath);
+    return matched?.$2['original'] is Map;
+  }
+
+  /// 还原换源：把队列中 path 为 [currentPath]（换源后的替代音源）的歌曲
+  /// 恢复为换源前的原始音源，并删除持久化关联（之后按原音源播放不再
+  /// 自动换回替代音源）。返回是否成功还原。
+  Future<bool> restoreSource(String currentPath) async {
+    final matched = await _findReplacementEntry(currentPath);
+    if (matched == null) return false;
+    final (originalPath, entry) = matched;
+    final originalJson = entry['original'];
+    if (originalJson is! Map) return false;
+    final original = _queueItemFromAssociation(
+      Map<String, dynamic>.from(originalJson),
+    );
+    if (original == null) return false;
+    await _removeAssociatedReplacement(originalPath);
+    final index = state.queue.indexWhere((item) => item.path == currentPath);
+    if (index >= 0) {
+      final queue = [...state.queue];
+      queue[index] = original;
+      state = state.copyWith(
+        queue: queue,
+        current: index == state.queueIndex ? original : state.current,
+        duration: index == state.queueIndex
+            ? original.durationMs / 1000.0
+            : state.duration,
+      );
+      unawaited(_persistSession());
+      if (index == state.queueIndex) {
+        await _playAt(index);
+      }
+    }
+    return true;
   }
 
   Future<String?> _loadRememberedLyrics(String path) async {
@@ -2855,12 +2954,10 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
   Future<({Uri? uri, Map<String, String>? headers})> _systemArtwork(
     QueueItem item,
   ) async {
-    var text = item.coverUrl?.trim() ?? '';
-    if (text.startsWith('//')) text = 'https:$text';
+    // 复用 normalizeCoverImageUrl：HTTPS 升级 + 网易云 CDN param 缩放
+    // （大原图会让系统媒体会话封面加载失败）。
+    final text = normalizeCoverImageUrl(item.coverUrl);
     var uri = Uri.tryParse(text);
-    if (uri != null && uri.scheme == 'http' && _coverHostSupportsHttps(uri)) {
-      uri = uri.replace(scheme: 'https');
-    }
     if (uri != null && const {'http', 'https'}.contains(uri.scheme)) {
       return (uri: uri, headers: _systemArtworkHeaders(uri));
     }
@@ -2891,16 +2988,6 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
       debugPrint('系统媒体封面提取失败：$error');
     }
     return (uri: null, headers: null);
-  }
-
-  bool _coverHostSupportsHttps(Uri uri) {
-    final host = uri.host.toLowerCase();
-    return host == 'music.126.net' ||
-        host.endsWith('.music.126.net') ||
-        host.endsWith('.qq.com') ||
-        host.endsWith('.kugou.com') ||
-        host.endsWith('.bilivideo.com') ||
-        host.endsWith('.hdslb.com');
   }
 
   Map<String, String>? _systemArtworkHeaders(Uri uri) {
@@ -3003,6 +3090,37 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
     _requestDesktopLyricsSync(immediate: true);
   }
 
+  /// 播放时为空封面的网易系插件歌曲补拉专辑封面（fire-and-forget）。
+  Future<void> _backfillPluginCover(
+    int index,
+    QueueItem item,
+    EnabledMusicPlugin plugin,
+    Map<String, dynamic> pluginData,
+  ) async {
+    try {
+      final cover = await _ref
+          .read(pluginRuntimeProvider)
+          .fetchNeteaseTrackCover(plugin, pluginData)
+          .timeout(const Duration(seconds: 15));
+      if (cover.trim().isEmpty) return;
+      if (index < 0 || index >= state.queue.length) return;
+      final current = state.queue[index];
+      if (current.path != item.path ||
+          current.coverUrl?.trim().isNotEmpty == true) {
+        return;
+      }
+      final queue = [...state.queue];
+      queue[index] = current.copyWith(coverUrl: cover);
+      state = state.copyWith(
+        queue: queue,
+        current: index == state.queueIndex ? queue[index] : state.current,
+      );
+      unawaited(_persistSession());
+    } catch (_) {
+      // 封面补全失败不影响播放。
+    }
+  }
+
   Future<void> _loadPluginLyrics(
     int index,
     EnabledMusicPlugin plugin,
@@ -3096,7 +3214,7 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
 
   /// 进入播放详情页时主动完成一次歌词探测，不依赖歌词页是否已经滑到。
   /// 网络歌曲、LX 音源和本地歌曲分别走各自的歌词来源；没有歌词时也会
-  /// 标记为已探测，交给详情页提示用户从右上角关联歌词。
+  /// 标记为已探测，交给详情页提示用户在歌词页关联歌词。
   Future<void> ensureCurrentLyricsChecked() async {
     final index = state.queueIndex;
     final item = state.current;
@@ -3230,7 +3348,7 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
     );
     final action =
         _ref.read(settingsProvider).valueOrNull?.playbackFailureAction ??
-        PlaybackFailureAction.playNext;
+        PlaybackFailureAction.pause;
     if (action != PlaybackFailureAction.playNext || state.queue.length <= 1) {
       return;
     }

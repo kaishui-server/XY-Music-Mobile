@@ -58,7 +58,6 @@ class _BatchDownloadOptionsDialogState
   late String _directoryValue;
   late String _quality;
   bool _dontAskAgain = false;
-  late bool _writeMetadata;
   String? _error;
   bool _choosing = false;
 
@@ -87,7 +86,6 @@ class _BatchDownloadOptionsDialogState
       text: AndroidStorage.displayPath(widget.initialDirectory),
     );
     _quality = _normalize(widget.initialQuality);
-    _writeMetadata = widget.initialWriteMetadata;
   }
 
   @override
@@ -126,7 +124,7 @@ class _BatchDownloadOptionsDialogState
         directory: directory,
         quality: _quality,
         dontAskAgain: _dontAskAgain,
-        writeMetadata: _writeMetadata,
+        writeMetadata: widget.initialWriteMetadata,
       ),
     );
   }
@@ -137,7 +135,7 @@ class _BatchDownloadOptionsDialogState
       title: Text(widget.title),
       content: SizedBox(
         width: 360,
-        height: 320,
+        height: 276,
         child: SingleChildScrollView(
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
@@ -217,24 +215,6 @@ class _BatchDownloadOptionsDialogState
                       onSelected: (_) => setState(() => _quality = quality),
                     ),
                 ],
-              ),
-              const SizedBox(height: 8),
-              CheckboxListTile(
-                value: _writeMetadata,
-                onChanged: (value) =>
-                    setState(() => _writeMetadata = value == true),
-                contentPadding: EdgeInsets.zero,
-                visualDensity: VisualDensity.compact,
-                materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
-                controlAffinity: ListTileControlAffinity.leading,
-                title: const Text(
-                  '写入元数据（封面、歌词等标签）',
-                  style: TextStyle(fontSize: 13),
-                ),
-                subtitle: const Text(
-                  '将标题/艺术家/专辑/歌词/封面写入音频文件',
-                  style: TextStyle(fontSize: 11),
-                ),
               ),
               CheckboxListTile(
                 value: _dontAskAgain,

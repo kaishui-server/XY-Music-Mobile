@@ -8,6 +8,7 @@ import 'package:go_router/go_router.dart';
 import '../../src/auth/auth_provider.dart';
 import '../../src/core/settings.dart';
 import '../../src/favorites/favorites_provider.dart';
+import '../../src/music_platform/platform_session.dart';
 import '../../src/navigation/sidebar_controller.dart';
 import '../../src/playlists/playlists_provider.dart';
 import '../../src/sync/account_cloud_sync.dart';
@@ -552,6 +553,8 @@ class _AccountPageState extends ConsumerState<AccountPage>
         title: Text(auth.isLoggedIn ? '我的' : '账号'),
         centerTitle: true,
         actions: [
+          // 第三方音乐平台（QQ/网易/酷狗）登录入口：仅登录后显示在
+          // 「账号云同步」之前；登录页不再展示。
           if (widget.showSidebarButton && sidebarOnRight)
             const AppSidebarMenuButton(),
         ],
@@ -646,9 +649,19 @@ class _AccountPageState extends ConsumerState<AccountPage>
           ),
         ),
         Expanded(
-          child: TabBarView(
-            controller: _tab,
-            children: [_loginForm(context, auth), _registerForm(context, auth)],
+          // 底部留白计入悬浮底栏与系统安全区（原第三方平台登录卡
+          // 移除后由这里承担避让）。
+          child: Padding(
+            padding: EdgeInsets.only(
+              bottom: MediaQuery.paddingOf(context).bottom,
+            ),
+            child: TabBarView(
+              controller: _tab,
+              children: [
+                _loginForm(context, auth),
+                _registerForm(context, auth),
+              ],
+            ),
           ),
         ),
       ],
@@ -884,7 +897,7 @@ class _AccountPageState extends ConsumerState<AccountPage>
 }
 
 /// 已登录资料视图。
-class _ProfileView extends StatelessWidget {
+class _ProfileView extends ConsumerWidget {
   const _ProfileView({
     required this.user,
     required this.onRefresh,
@@ -909,10 +922,20 @@ class _ProfileView extends StatelessWidget {
   final VoidCallback onLogout;
 
   @override
-  Widget build(BuildContext context) {
+  Widget build(BuildContext context, WidgetRef ref) {
     final scheme = Theme.of(context).colorScheme;
+    final platformAccounts =
+        ref.watch(musicPlatformSessionsProvider).valueOrNull?.accounts ??
+        const <MusicPlatform, MusicPlatformAccount>{};
+    // 底部留白计入悬浮底栏与系统安全区（Shell 已把二者注入
+    // MediaQuery.padding.bottom），避免退出登录按钮被底栏遮挡。
     return ListView(
-      padding: const EdgeInsets.fromLTRB(16, 32, 16, 24),
+      padding: EdgeInsets.fromLTRB(
+        16,
+        32,
+        16,
+        MediaQuery.paddingOf(context).bottom + 24,
+      ),
       children: [
         // 头像区：点击头像或右下角按钮即可提交新头像审核。
         Center(
@@ -1030,6 +1053,12 @@ class _ProfileView extends StatelessWidget {
               title: const Text('修改密码'),
               trailing: const Icon(Icons.chevron_right_rounded),
               onTap: onChangePassword,
+            ),
+            // 第三方音乐平台登录入口（单个选项）：点击进入登录与歌单
+            // 导入页，位于「账号云同步」之前。
+            _PlatformLoginTile(
+              accounts: platformAccounts,
+              onTap: () => context.push('/account/music-platform'),
             ),
             ListTile(
               leading: Icon(Icons.cloud_sync_outlined, color: scheme.primary),
@@ -1171,6 +1200,36 @@ class _InfoTile extends StatelessWidget {
       leading: Icon(icon, color: scheme.primary),
       title: Text(label),
       trailing: Text(value, style: TextStyle(color: scheme.onSurfaceVariant)),
+    );
+  }
+}
+
+/// 第三方音乐平台登录入口（单个选项行）：点击进入平台账号页，
+/// 可登录网易云/QQ/酷狗并导入在线歌单；副标题汇总已登录的平台。
+class _PlatformLoginTile extends StatelessWidget {
+  const _PlatformLoginTile({required this.accounts, this.onTap});
+
+  /// 各平台登录会话：用于在副标题汇总已登录的平台。
+  final Map<MusicPlatform, MusicPlatformAccount> accounts;
+  final VoidCallback? onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final loggedIn = MusicPlatform.values
+        .where((platform) => accounts[platform] != null)
+        .map((platform) => platform.label)
+        .join('、');
+    return ListTile(
+      onTap: onTap,
+      leading: Icon(Icons.library_music_rounded, color: scheme.primary),
+      title: const Text('第三方平台登录'),
+      subtitle: Text(
+        loggedIn.isEmpty ? '网易云音乐、QQ音乐、酷狗音乐' : '已登录：$loggedIn',
+        maxLines: 1,
+        overflow: TextOverflow.ellipsis,
+      ),
+      trailing: const Icon(Icons.chevron_right_rounded),
     );
   }
 }

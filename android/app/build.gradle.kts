@@ -25,8 +25,11 @@ android {
         targetSdk = flutter.targetSdkVersion
         versionCode = flutter.versionCode
         versionName = flutter.versionName
-        // ABI 过滤交给 --split-per-abi：每个分架构 APK 天然只含单 ABI 原生库
-        // （此前在此处加 ndk abiFilters 会与 splits 配置冲突，AGP 直接报错）。
+        // 只交付 arm64：过滤 jniLibs 与 AAR（quickjs 等）中的其他架构，
+        // 否则 armeabi-v7a/x86 的原生库会全部打入 APK 导致超体积。
+        ndk {
+            abiFilters.add("arm64-v8a")
+        }
     }
 
     signingConfigs {

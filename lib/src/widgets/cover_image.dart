@@ -255,18 +255,37 @@ bool needsCoverImageProxy(String imageUrl) {
   return host == 'music.126.net' || host.endsWith('.music.126.net');
 }
 
-/// 兼容旧插件和旧播放会话保存的网易云 HTTP / 协议省略封面地址。
-/// Android 的网络安全配置只允许本机音频代理使用明文 HTTP，远程封面必须 HTTPS。
+/// 兼容旧插件和旧播放会话保存的 HTTP / 协议省略封面地址。
+/// Android 的网络安全配置只允许本机音频代理使用明文 HTTP，远程封面必须
+/// HTTPS；酷狗等音源仍返回 http:// 封面，主流音乐图床均已支持 HTTPS，
+/// 统一升级，否则这类封面在 Android 上一律显示占位图。
 String normalizeCoverImageUrl(String? imageUrl) {
   var normalized = imageUrl?.trim() ?? '';
   if (normalized.startsWith('//')) normalized = 'https:$normalized';
   final uri = Uri.tryParse(normalized);
   final host = uri?.host.toLowerCase() ?? '';
-  if (normalized.startsWith('http://') &&
-      (host == 'music.126.net' || host.endsWith('.music.126.net'))) {
+  final isLocalHost =
+      host == 'localhost' || host == '127.0.0.1' || host == '[::1]';
+  if (normalized.startsWith('http://') && !isLocalHost) {
     normalized = 'https://${normalized.substring(7)}';
   }
-  return normalized;
+  return _applyNeteaseCoverScale(normalized);
+}
+
+/// 网易云 CDN 的 picUrl 指向原始尺寸图片，部分专辑（如「一生一世 影视
+/// 原声带」）原图高达 7MB+：直连加载缓慢，且 Rust 图片代理有 5MB 上限
+/// 会直接拒绝，表现为封面永远不显示。统一追加官方缩放参数。
+String _applyNeteaseCoverScale(String url) {
+  final uri = Uri.tryParse(url);
+  if (uri == null) return url;
+  final host = uri.host.toLowerCase();
+  if (host != 'music.126.net' && !host.endsWith('.music.126.net')) {
+    return url;
+  }
+  final query = uri.queryParameters;
+  if (query.containsKey('param')) return url;
+  final merged = <String, String>{...query, 'param': '800y800'};
+  return uri.replace(queryParameters: merged).toString();
 }
 
 Map<String, String>? _networkImageHeaders(String imageUrl) =>

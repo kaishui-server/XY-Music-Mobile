@@ -127,14 +127,14 @@ void main() {
     expect(needsCoverImageProxy('https://example.com/cover.jpg'), isFalse);
   });
 
-  test('网易云旧封面地址自动升级为 HTTPS', () {
+  test('网易云旧封面地址自动升级为 HTTPS 并追加缩放参数', () {
     expect(
       normalizeCoverImageUrl('http://p1.music.126.net/cover-key/song.jpg'),
-      'https://p1.music.126.net/cover-key/song.jpg',
+      'https://p1.music.126.net/cover-key/song.jpg?param=800y800',
     );
     expect(
       normalizeCoverImageUrl('//p2.music.126.net/cover-key/song.jpg'),
-      'https://p2.music.126.net/cover-key/song.jpg',
+      'https://p2.music.126.net/cover-key/song.jpg?param=800y800',
     );
     expect(
       normalizeCoverImageUrl('http://example.com/cover.jpg'),

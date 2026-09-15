@@ -1,5 +1,3 @@
-import 'dart:math' as math;
-
 import 'package:flutter/material.dart';
 
 import '../core/settings.dart';
@@ -11,7 +9,7 @@ const xyPageReverseTransitionDuration = Duration(milliseconds: 260);
 ///
 /// 路由的 transitionsBuilder 无法访问 WidgetRef，由根组件（app.dart）
 /// 在设置加载或变化时写入该值；每次新导航都会读取最新模式。
-PageTransitionMode xyPageTransitionMode = PageTransitionMode.slide;
+PageTransitionMode xyPageTransitionMode = PageTransitionMode.fade;
 
 CurvedAnimation _xyCurve(Animation<double> parent) => CurvedAnimation(
   parent: parent,
@@ -50,8 +48,8 @@ Widget xyPageTransition(
             secondaryAnimation: secondaryAnimation,
             child: child!,
           );
-        case PageTransitionMode.cube:
-          return _XyCubePageTransition(
+        case PageTransitionMode.fade:
+          return _XyFadePageTransition(
             animation: animation,
             secondaryAnimation: secondaryAnimation,
             child: child!,
@@ -178,10 +176,10 @@ class _XyStackPageTransition extends StatelessWidget {
   }
 }
 
-/// 方块：两页绕相邻边缘做带透视的 3D 旋转，像立方体翻面。
-/// 入场页绕右边缘从竖直转平（朝向观察者），被覆盖页绕左边缘折入屏幕。
-class _XyCubePageTransition extends StatelessWidget {
-  const _XyCubePageTransition({
+/// 淡入淡出：入场页渐显，被覆盖页渐隐，两页交叉淡化，
+/// 落定后下层页完全消失。
+class _XyFadePageTransition extends StatelessWidget {
+  const _XyFadePageTransition({
     required this.animation,
     required this.secondaryAnimation,
     required this.child,
@@ -191,46 +189,16 @@ class _XyCubePageTransition extends StatelessWidget {
   final Animation<double> secondaryAnimation;
   final Widget child;
 
-  static const double _perspective = .0016;
-
   @override
   Widget build(BuildContext context) {
     final incoming = _xyCurve(animation);
     final covered = _xyCurve(secondaryAnimation);
-    return LayoutBuilder(
-      builder: (context, constraints) {
-        final width = constraints.maxWidth;
-        return ClipRect(
-          child: AnimatedBuilder(
-            animation: Listenable.merge([incoming, covered]),
-            child: child,
-            builder: (context, child) {
-              final enterAngle = (1 - incoming.value) * math.pi / 2;
-              final coverAngle = covered.value * math.pi / 2;
-              final matrix = Matrix4.identity();
-              if (covered.value > 0) {
-                // 被覆盖页绕左边缘折入屏幕（右缘远去）。
-                matrix.multiply(
-                  Matrix4.identity()
-                    ..setEntry(3, 2, _perspective)
-                    ..rotateY(-coverAngle),
-                );
-              }
-              if (incoming.value < 1) {
-                // 入场页绕右边缘从屏幕后方转平。
-                matrix.multiply(
-                  Matrix4.identity()
-                    ..setEntry(3, 2, _perspective)
-                    ..translateByDouble(width.toDouble(), 0, 0, 1)
-                    ..rotateY(enterAngle)
-                    ..translateByDouble(-width.toDouble(), 0, 0, 1),
-                );
-              }
-              return Transform(transform: matrix, child: child);
-            },
-          ),
-        );
-      },
+    return FadeTransition(
+      opacity: incoming,
+      child: FadeTransition(
+        opacity: ReverseAnimation(covered),
+        child: child,
+      ),
     );
   }
 }

@@ -76,7 +76,19 @@ class DesktopLyricsService : Service() {
         }
         val translation = TextView(this).apply {
             setTextColor(Color.argb(190, 225, 225, 230))
-            textSize = 13f
+            textSize = 12f
+            typeface = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                android.graphics.Typeface.create(
+                    android.graphics.Typeface.DEFAULT,
+                    800,
+                    false,
+                )
+            } else {
+                android.graphics.Typeface.create(
+                    android.graphics.Typeface.DEFAULT,
+                    android.graphics.Typeface.BOLD,
+                )
+            }
             maxLines = 2
             ellipsize = android.text.TextUtils.TruncateAt.END
             gravity = Gravity.CENTER
@@ -198,7 +210,7 @@ class DesktopLyricsService : Service() {
         intent.getIntExtra("translationColor", Color.argb(190, 225, 225, 230)).let {
             translationView?.setTextColor(it)
         }
-        val translationFontSize = intent.getFloatExtra("translationFontSize", 13f).coerceIn(10f, 28f)
+        val translationFontSize = intent.getFloatExtra("translationFontSize", 12f).coerceIn(10f, 28f)
         if (kotlin.math.abs(
                 (translationView?.textSize ?: 0f) -
                     translationFontSize * resources.displayMetrics.scaledDensity,

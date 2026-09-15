@@ -326,7 +326,7 @@ void main() {
     expect(result, hasLength(1));
     expect(
       result.single.coverUrl,
-      'https://p2.music.126.net/cover-key/109951163038292176.jpg',
+      'https://p2.music.126.net/cover-key/109951163038292176.jpg?param=800y800',
     );
     expect(result.single.durationMs, 238698);
     expect(result.single.rawData['artwork'], result.single.coverUrl);
@@ -369,7 +369,7 @@ void main() {
     expect(result.single.id, '509781655');
     expect(
       result.single.coverUrl,
-      'https://p2.music.126.net/cover-key/song.jpg',
+      'https://p2.music.126.net/cover-key/song.jpg?param=800y800',
     );
     expect(result.single.rawData['artwork'], result.single.coverUrl);
   });
@@ -412,7 +412,7 @@ void main() {
     expect(
       result.single.coverUrl,
       'https://p1.music.126.net/'
-      'yD9vbpuILH-tqNRIaP640g==/109951163038292176.jpg',
+      'yD9vbpuILH-tqNRIaP640g==/109951163038292176.jpg?param=800y800',
     );
     expect(result.single.rawData['artwork'], result.single.coverUrl);
   });
@@ -454,7 +454,10 @@ void main() {
       '测试',
     );
 
-    expect(result.single.coverUrl, 'https://p3.music.126.net/key/song.jpg');
+    expect(
+      result.single.coverUrl,
+      'https://p3.music.126.net/key/song.jpg?param=800y800',
+    );
   });
 
   test('网易云旧详情接口没有封面时使用 v3 接口继续补全', () async {
@@ -505,7 +508,7 @@ void main() {
     expect(requests, 2);
     expect(
       result.single.coverUrl,
-      'https://p3.music.126.net/cover-key/song.jpg',
+      'https://p3.music.126.net/cover-key/song.jpg?param=800y800',
     );
     expect(result.single.durationMs, 238698);
   });

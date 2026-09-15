@@ -17,20 +17,23 @@ enum PlayerDetailBackgroundMode {
 enum PlayerCoverStyle { classic, circle, immersive, vinyl }
 
 /// 页面切换动画模式：平移（前后页同步推移）、层叠（前页滑入覆盖后页）、
-/// 方块（两页绕相邻边缘做 3D 翻面）。
-enum PageTransitionMode { slide, stack, cube }
+/// 淡入淡出（两页交叉淡化）。
+enum PageTransitionMode { slide, stack, fade }
 
 /// 首页顶栏侧边栏按钮的位置。
 enum SidebarPosition { left, right }
 
-/// 首页可自定义显隐的模块 id。探索页同款「猜你想听」推荐面板固定展示，
-/// 不参与自定义。
+/// 首页可自定义显隐的模块 id。「猜你想听」推荐面板在探索页固定展示，
+/// 不参与首页自定义；首页默认仅保留听歌统计。
 const kHomeModuleNowPlaying = 'nowPlaying';
 const kHomeModuleHotComment = 'hotComment';
 const kHomeModuleStatistics = 'statistics';
 const kHomeModuleLeaderboard = 'leaderboard';
 
-const kDefaultHomeModules = <String>[
+const kDefaultHomeModules = <String>[kHomeModuleStatistics];
+
+/// 全部合法的首页模块 id，按首页默认展示顺序排列。
+const kAllHomeModules = <String>[
   kHomeModuleNowPlaying,
   kHomeModuleHotComment,
   kHomeModuleStatistics,
@@ -42,7 +45,7 @@ const kDefaultHomeModules = <String>[
 List<String> normalizeHomeModules(Iterable<String> stored) {
   final normalized = <String>[];
   for (final id in stored) {
-    if (kDefaultHomeModules.contains(id) && !normalized.contains(id)) {
+    if (kAllHomeModules.contains(id) && !normalized.contains(id)) {
       normalized.add(id);
     }
   }
@@ -146,7 +149,7 @@ class AppSettings {
   const AppSettings({
     this.volume = 1.0,
     this.playMode = 0, // 0 顺序(列表循环) 1 单曲循环 2 随机
-    this.playbackFailureAction = PlaybackFailureAction.playNext,
+    this.playbackFailureAction = PlaybackFailureAction.pause,
     this.playOtherAudioWithoutInterruption = false,
     this.lastTab = 0,
     this.keepScreenOn = true,
@@ -156,6 +159,7 @@ class AppSettings {
     this.sidebarPosition = SidebarPosition.left,
     this.sidebarItemOrder = kDefaultSidebarItemOrder,
     this.sidebarHiddenItems = const <String>[],
+    this.landscapeSidebarWidth = 176.0,
     this.bottomBarEnabled = false,
     this.bottomBarItemIds = const <String>[],
     this.bottomBarShowLabels = true,
@@ -164,8 +168,9 @@ class AppSettings {
     this.playerDetailCustomImagePath = '',
     this.playerDetailBackgroundMode = PlayerDetailBackgroundMode.coverBlur,
     this.playerCoverStyle = PlayerCoverStyle.classic,
-    this.pageTransitionMode = PageTransitionMode.slide,
+    this.pageTransitionMode = PageTransitionMode.fade,
     this.landscapeImmersiveLyrics = false,
+    this.portraitImmersiveLyrics = false,
     this.homeModules = kDefaultHomeModules,
     this.showQualityBadges = true,
     this.onlineDefaultQuality = '320k',
@@ -173,7 +178,7 @@ class AppSettings {
     this.showLyricsTranslation = true,
     this.lyricWordEffectMode = LyricWordEffectMode.progressive,
     this.lyricDisplayAlignment = LyricDisplayAlignment.left,
-    this.lyricFontSize = 18.0,
+    this.lyricFontSize = 22.0,
     this.miniLyricFontSize = 14.0,
     this.desktopLyricsEnabled = false,
     this.desktopLyricsHideInApp = true,
@@ -210,6 +215,9 @@ class AppSettings {
   final List<String> sidebarItemOrder;
   final List<String> sidebarHiddenItems;
 
+  /// 横屏常驻侧栏宽度（px）：60 为仅图标态，低于 120 自动按仅图标渲染。
+  final double landscapeSidebarWidth;
+
   /// 自定义底栏开关：默认关闭，完成条目自定义（≥2 项）后自动开启。
   final bool bottomBarEnabled;
 
@@ -227,6 +235,10 @@ class AppSettings {
 
   /// 横屏播放页沉浸式歌词：开启后右侧仅显示歌词，点按弹出播放栏。
   final bool landscapeImmersiveLyrics;
+
+  /// 竖屏播放页沉浸式歌词：开启后歌词页铺满内容区，点击原播放栏
+  /// 位置弹出播放栏，5 秒无操作自动隐藏（与横屏一致）。
+  final bool portraitImmersiveLyrics;
 
   /// 首页已启用的模块 id（猜你想听固定展示，不在列表中即关闭）。
   final List<String> homeModules;
@@ -279,6 +291,7 @@ class AppSettings {
     SidebarPosition? sidebarPosition,
     List<String>? sidebarItemOrder,
     List<String>? sidebarHiddenItems,
+    double? landscapeSidebarWidth,
     bool? bottomBarEnabled,
     List<String>? bottomBarItemIds,
     bool? bottomBarShowLabels,
@@ -289,6 +302,7 @@ class AppSettings {
     PlayerCoverStyle? playerCoverStyle,
     PageTransitionMode? pageTransitionMode,
     bool? landscapeImmersiveLyrics,
+    bool? portraitImmersiveLyrics,
     List<String>? homeModules,
     bool? showQualityBadges,
     String? onlineDefaultQuality,
@@ -333,6 +347,8 @@ class AppSettings {
       sidebarPosition: sidebarPosition ?? this.sidebarPosition,
       sidebarItemOrder: sidebarItemOrder ?? this.sidebarItemOrder,
       sidebarHiddenItems: sidebarHiddenItems ?? this.sidebarHiddenItems,
+      landscapeSidebarWidth:
+          landscapeSidebarWidth ?? this.landscapeSidebarWidth,
       bottomBarEnabled: bottomBarEnabled ?? this.bottomBarEnabled,
       bottomBarItemIds: bottomBarItemIds ?? this.bottomBarItemIds,
       bottomBarShowLabels: bottomBarShowLabels ?? this.bottomBarShowLabels,
@@ -346,6 +362,8 @@ class AppSettings {
       pageTransitionMode: pageTransitionMode ?? this.pageTransitionMode,
       landscapeImmersiveLyrics:
           landscapeImmersiveLyrics ?? this.landscapeImmersiveLyrics,
+      portraitImmersiveLyrics:
+          portraitImmersiveLyrics ?? this.portraitImmersiveLyrics,
       homeModules: homeModules ?? this.homeModules,
       showQualityBadges: showQualityBadges ?? this.showQualityBadges,
       onlineDefaultQuality: onlineDefaultQuality ?? this.onlineDefaultQuality,
@@ -399,7 +417,8 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
       volume: prefs.getDouble('volume') ?? 1.0,
       playMode: normalizePlayMode(prefs.getInt('playMode') ?? 0),
       playbackFailureAction: _playbackFailureActionFromInt(
-        prefs.getInt('playbackFailureAction') ?? 0,
+        prefs.getInt('playbackFailureAction') ??
+            PlaybackFailureAction.pause.index,
       ),
       playOtherAudioWithoutInterruption:
           prefs.getBool('playOtherAudioWithoutInterruption') ?? false,
@@ -419,6 +438,8 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
               .where(kDefaultSidebarItemOrder.contains)
               .toSet()
               .toList(),
+      landscapeSidebarWidth: (prefs.getDouble('landscapeSidebarWidth') ?? 176)
+          .clamp(60, 420),
       bottomBarEnabled: prefs.getBool('bottomBarEnabled') ?? false,
       bottomBarItemIds: normalizeBottomBarItemIds(
         prefs.getStringList('bottomBarItemIds') ?? const [],
@@ -435,10 +456,12 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
         prefs.getInt('playerCoverStyle') ?? 0,
       ),
       pageTransitionMode: _pageTransitionModeFromInt(
-        prefs.getInt('pageTransitionMode') ?? 0,
+        prefs.getInt('pageTransitionMode') ?? PageTransitionMode.fade.index,
       ),
       landscapeImmersiveLyrics:
           prefs.getBool('landscapeImmersiveLyrics') ?? false,
+      portraitImmersiveLyrics:
+          prefs.getBool('portraitImmersiveLyrics') ?? false,
       homeModules: prefs.getStringList('homeModules') == null
           ? kDefaultHomeModules
           : normalizeHomeModules(prefs.getStringList('homeModules')!),
@@ -449,7 +472,7 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
       lyricWordEffectMode: _lyricWordEffectModeFromPrefs(prefs),
       lyricDisplayAlignment: _lyricDisplayAlignmentFromPrefs(prefs),
       lyricFontSize:
-          (prefs.getDouble('lyricFontSize') ?? 18.0)
+          (prefs.getDouble('lyricFontSize') ?? 22.0)
               .clamp(12.0, 32.0)
               .toDouble(),
       desktopLyricsEnabled: prefs.getBool('desktopLyricsEnabled') ?? false,
@@ -513,7 +536,7 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
     if (value >= 0 && value < PageTransitionMode.values.length) {
       return PageTransitionMode.values[value];
     }
-    return PageTransitionMode.slide;
+    return PageTransitionMode.fade;
   }
 
   PlayerDetailBackgroundMode _playerDetailBackgroundModeFromInt(int value) {
@@ -524,9 +547,9 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
   }
 
   PlaybackFailureAction _playbackFailureActionFromInt(int v) =>
-      v == PlaybackFailureAction.pause.index
-      ? PlaybackFailureAction.pause
-      : PlaybackFailureAction.playNext;
+      v == PlaybackFailureAction.playNext.index
+      ? PlaybackFailureAction.playNext
+      : PlaybackFailureAction.pause;
 
   LyricWordEffectMode _lyricWordEffectModeFromPrefs(SharedPreferences prefs) {
     final stored = prefs.getInt('lyricWordEffectMode');
@@ -579,6 +602,7 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
         normalizeSidebarItemOrder(next.sidebarItemOrder),
       ),
       prefs.setStringList('sidebarHiddenItems', next.sidebarHiddenItems),
+      prefs.setDouble('landscapeSidebarWidth', next.landscapeSidebarWidth),
       prefs.setBool('bottomBarEnabled', next.bottomBarEnabled),
       prefs.setStringList('bottomBarItemIds', next.bottomBarItemIds),
       prefs.setBool('bottomBarShowLabels', next.bottomBarShowLabels),
@@ -597,6 +621,10 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
       prefs.setBool(
         'landscapeImmersiveLyrics',
         next.landscapeImmersiveLyrics,
+      ),
+      prefs.setBool(
+        'portraitImmersiveLyrics',
+        next.portraitImmersiveLyrics,
       ),
       prefs.setStringList('homeModules', next.homeModules),
       prefs.setBool('showQualityBadges', next.showQualityBadges),
@@ -698,6 +726,13 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
     return _save(current.copyWith(sidebarHiddenItems: hidden.toList()));
   }
 
+  /// 横屏侧栏宽度：拖动分割线实时调用，持久化由防抖后的拖动结束统一完成。
+  Future<void> setLandscapeSidebarWidth(double value) => _save(
+    (state.valueOrNull ?? const AppSettings()).copyWith(
+      landscapeSidebarWidth: value.clamp(60, 420),
+    ),
+  );
+
   /// 手动开关底栏；条目不足 2 个时无法开启（保持关闭）。
   Future<void> setBottomBarEnabled(bool value) {
     final current = state.valueOrNull ?? const AppSettings();
@@ -768,6 +803,11 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
       landscapeImmersiveLyrics: value,
     ),
   );
+  Future<void> setPortraitImmersiveLyrics(bool value) => _save(
+    (state.valueOrNull ?? const AppSettings()).copyWith(
+      portraitImmersiveLyrics: value,
+    ),
+  );
 
   /// 首页模块显隐：开启时按默认顺序追加，关闭时移除。
   Future<void> setHomeModuleEnabled(String id, bool enabled) {
@@ -778,7 +818,7 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
     } else {
       modules.remove(id);
     }
-    final ordered = kDefaultHomeModules
+    final ordered = kAllHomeModules
         .where(modules.contains)
         .toList(growable: false);
     return _save(current.copyWith(homeModules: ordered));

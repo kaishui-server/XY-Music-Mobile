@@ -7,9 +7,11 @@ import '../../src/core/settings.dart';
 import '../../src/library/library_provider.dart';
 import '../../src/player/player_provider.dart';
 import '../../src/navigation/sidebar_controller.dart';
+import '../../src/plugins/plugin_runtime.dart';
 import '../../src/widgets/batch_download.dart';
 import '../../src/widgets/frosted_search_field.dart';
 import '../../src/widgets/song_list_view.dart';
+import '../../src/widgets/source_switch.dart';
 import '../../src/widgets/top_notice.dart';
 
 /// 收藏页：展示已收藏的歌曲，点击即播放整个收藏列表。
@@ -32,6 +34,10 @@ class _FavoritesPageState extends ConsumerState<FavoritesPage> {
   bool _selectionMode = false;
   bool _deleting = false;
   bool _downloading = false;
+  // 批量换源进度（对齐歌单页交互）。
+  bool _switchingSource = false;
+  int _switchingDone = 0;
+  int _switchingTotal = 0;
   // 播放器状态每秒更新一次。没有这个集合时，build 会反复安排同一批
   // SharedPreferences 写入，进入收藏页时容易出现连续卡顿。
   final Set<String> _snapshotSyncQueued = <String>{};
@@ -139,6 +145,108 @@ class _FavoritesPageState extends ConsumerState<FavoritesPage> {
     }
   }
 
+  /// 多选批量换源：选择目标插件后逐首搜索同名歌曲，原位替换收藏
+  ///（对齐歌单管理的换源交互）。
+  Future<void> _switchSourceSelected() async {
+    if (_selectedPaths.isEmpty || _switchingSource) return;
+    final selected = _sortedSongs
+        .where((song) => _selectedPaths.contains(song.path))
+        .toList();
+    if (selected.isEmpty) return;
+    final plugins = await ref.read(enabledMusicPluginsProvider.future);
+    if (!mounted) return;
+    if (plugins.isEmpty) {
+      XyNotice.show(
+        context,
+        message: '请先在 设置 → 插件 中启用插件',
+        type: XyNoticeType.warning,
+      );
+      return;
+    }
+    final plugin = await showSourcePluginPicker(context, plugins);
+    if (plugin == null || !mounted) return;
+    setState(() {
+      _switchingSource = true;
+      _switchingDone = 0;
+      _switchingTotal = selected.length;
+    });
+    var replaced = 0;
+    final missed = <String>[];
+    for (final song in selected) {
+      if (!mounted) return;
+      setState(() => _switchingDone++);
+      try {
+        final candidates = await searchReplacementCandidates(
+          ref,
+          plugin,
+          title: song.title,
+          artist: song.artist,
+          durationMs: song.duration * 1000,
+        );
+        if (candidates.isEmpty) {
+          missed.add(song.title);
+          continue;
+        }
+        await ref
+            .read(favoritesProvider.notifier)
+            .replacePath(
+              song.path,
+              FavoriteSongSnapshot.fromSong(
+                replacementToSong(plugin, candidates.first),
+              ),
+            );
+        replaced++;
+      } catch (_) {
+        missed.add(song.title);
+      }
+    }
+    if (!mounted) return;
+    setState(() => _switchingSource = false);
+    _exitSelection();
+    if (missed.isEmpty) {
+      XyNotice.show(
+        context,
+        message: '换源完成：$replaced 首已切换到 ${plugin.name}',
+        type: XyNoticeType.success,
+      );
+    } else {
+      await showDialog<void>(
+        context: context,
+        useRootNavigator: true,
+        builder: (dialogContext) => AlertDialog(
+          title: const Text('换源完成'),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text('成功换源 $replaced 首，${missed.length} 首未找到匹配结果：'),
+              const SizedBox(height: 10),
+              ConstrainedBox(
+                constraints: const BoxConstraints(maxHeight: 240),
+                child: SingleChildScrollView(
+                  child: Text(
+                    missed.take(50).join('\n') +
+                        (missed.length > 50 ? '\n…' : ''),
+                    style: TextStyle(
+                      fontSize: 13,
+                      color: Theme.of(dialogContext).colorScheme.onSurfaceVariant,
+                    ),
+                  ),
+                ),
+              ),
+            ],
+          ),
+          actions: [
+            FilledButton(
+              onPressed: () => Navigator.pop(dialogContext),
+              child: const Text('确定'),
+            ),
+          ],
+        ),
+      );
+    }
+  }
+
   List<Song> _sortedSongs = const <Song>[];
 
   @override
@@ -189,15 +297,35 @@ class _FavoritesPageState extends ConsumerState<FavoritesPage> {
         leading: sidebarOnRight ? null : const AppSidebarMenuButton(),
         title: _selectionMode
             ? Text(
-                _selectedPaths.isEmpty ? '选择要删除的收藏' : '已选 ${_selectedPaths.length} 首',
+                _switchingSource
+                    ? '换源中 $_switchingDone/$_switchingTotal'
+                    : (_selectedPaths.isEmpty
+                          ? '选择要删除的收藏'
+                          : '已选 ${_selectedPaths.length} 首'),
               )
             : const Text('我的收藏'),
         actions: [
           if (sidebarOnRight) const AppSidebarMenuButton(),
           if (_selectionMode) ...[
             IconButton(
+              tooltip: _switchingSource
+                  ? '换源中 $_switchingDone/$_switchingTotal'
+                  : '批量换源',
+              onPressed: _switchingSource || _downloading || _deleting ||
+                      _selectedPaths.isEmpty
+                  ? null
+                  : _switchSourceSelected,
+              icon: _switchingSource
+                  ? const SizedBox.square(
+                      dimension: 20,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    )
+                  : const Icon(Icons.swap_horiz_rounded),
+            ),
+            IconButton(
               tooltip: '批量下载',
-              onPressed: _downloading || _selectedPaths.isEmpty
+              onPressed: _downloading || _switchingSource || _deleting ||
+                      _selectedPaths.isEmpty
                   ? null
                   : _downloadSelected,
               icon: _downloading
@@ -209,7 +337,8 @@ class _FavoritesPageState extends ConsumerState<FavoritesPage> {
             ),
             IconButton(
               tooltip: '删除所选收藏',
-              onPressed: _deleting || _selectedPaths.isEmpty
+              onPressed: _deleting || _switchingSource || _downloading ||
+                      _selectedPaths.isEmpty
                   ? null
                   : _deleteSelected,
               icon: _deleting
@@ -221,7 +350,9 @@ class _FavoritesPageState extends ConsumerState<FavoritesPage> {
             ),
             IconButton(
               tooltip: '取消多选',
-              onPressed: _exitSelection,
+              onPressed: _switchingSource || _downloading || _deleting
+                  ? null
+                  : _exitSelection,
               icon: const Icon(Icons.close_rounded),
             ),
           ] else ...[
