@@ -9,6 +9,7 @@ import 'package:path/path.dart' as p;
 import 'package:permission_handler/permission_handler.dart';
 
 import '../../src/playlists/playlists_provider.dart';
+import '../../src/playlists/playlist_sync.dart';
 import '../../src/playlists/musicfree_backup_import.dart';
 import '../../src/library/library_provider.dart';
 import '../../src/plugins/lx_playlist_import.dart';
@@ -387,23 +388,8 @@ class _PlaylistsPageState extends ConsumerState<PlaylistsPage> {
         final plugin = lxPlugins
             .where((item) => item.lxSources.contains(source))
             .firstOrNull ?? lxPlugins.first;
-        final title = raw['title']?.toString().trim() ?? '';
-        if (title.isEmpty) continue;
-        songs.add(
-          Song(
-            path: raw['_sourcePath']?.toString() ?? '',
-            title: title,
-            artist: raw['artist']?.toString() ?? '',
-            album: raw['album']?.toString() ?? '',
-            albumKey: raw['album']?.toString() ?? '',
-            duration: _rawDurationSeconds(raw),
-            format: '网络',
-            coverUrl: raw['artwork']?.toString(),
-            pluginId: plugin.id,
-            pluginData: raw,
-            lyricsRaw: _NetworkPlaylistImportDialogState._embeddedLyrics(raw),
-          ),
-        );
+        final song = lxRawToPlaylistSong(plugin, raw);
+        if (song != null) songs.add(song);
       }
       if (songs.isEmpty) continue;
       final notifier = ref.read(playlistsProvider.notifier);
@@ -432,12 +418,6 @@ class _PlaylistsPageState extends ConsumerState<PlaylistsPage> {
       message: '已从洛雪歌单导入 $playlistCount 个歌单、共 $songCount 首',
       type: XyNoticeType.success,
     );
-  }
-
-  static int _rawDurationSeconds(Map<String, dynamic> raw) {
-    final value = raw['duration'];
-    if (value is num) return value.toInt();
-    return int.tryParse(value?.toString() ?? '') ?? 0;
   }
 
   Future<bool> _ensureLocalAudioPermission() async {
@@ -605,7 +585,15 @@ class _PlaylistsPageState extends ConsumerState<PlaylistsPage> {
                 children: [
                   ListView.separated(
                     controller: _playlistsController,
-                    padding: const EdgeInsets.fromLTRB(16, 8, 16, 98),
+                    // Shell 已把底栏+迷你播放栏的遮挡高度注入
+                    // MediaQuery.padding.bottom（含系统安全区），
+                    // 直接读取即可避免底部被悬浮元素遮挡。
+                    padding: EdgeInsets.fromLTRB(
+                      16,
+                      8,
+                      16,
+                      MediaQuery.paddingOf(context).bottom + 12,
+                    ),
                     itemCount: playlists.length,
                     separatorBuilder: (_, _) => const SizedBox(height: 10),
                     itemBuilder: (context, index) {
@@ -657,21 +645,41 @@ class _PlaylistsPageState extends ConsumerState<PlaylistsPage> {
                             overflow: TextOverflow.ellipsis,
                             style: const TextStyle(fontWeight: FontWeight.w700),
                           ),
-                          subtitle: Text('${playlist.songPaths.length} 首歌曲'),
+                          subtitle: Text(
+                            playlist.importSources.isEmpty
+                                ? '${playlist.songPaths.length} 首歌曲'
+                                : '${playlist.songPaths.length} 首歌曲'
+                                      ' · ${playlist.importSources.length} 个来源',
+                          ),
                           trailing: _selectionMode
                               ? null
                               : PopupMenuButton<String>(
                                   tooltip: '更多',
                                   onSelected: (action) {
                                     switch (action) {
+                                      case 'sync':
+                                        syncPlaylistWithNotice(
+                                          context,
+                                          ref,
+                                          playlist,
+                                        );
                                       case 'rename':
                                         _rename(context, ref, playlist);
                                       case 'delete':
                                         _delete(context, ref, playlist);
                                     }
                                   },
-                                  itemBuilder: (context) => const [
-                                    PopupMenuItem(
+                                  itemBuilder: (context) => [
+                                    if (playlist.importSources.isNotEmpty)
+                                      const PopupMenuItem(
+                                        value: 'sync',
+                                        child: ListTile(
+                                          contentPadding: EdgeInsets.zero,
+                                          leading: Icon(Icons.sync_rounded),
+                                          title: Text('同步来源'),
+                                        ),
+                                      ),
+                                    const PopupMenuItem(
                                       value: 'rename',
                                       child: ListTile(
                                         contentPadding: EdgeInsets.zero,
@@ -679,7 +687,7 @@ class _PlaylistsPageState extends ConsumerState<PlaylistsPage> {
                                         title: Text('重命名'),
                                       ),
                                     ),
-                                    PopupMenuItem(
+                                    const PopupMenuItem(
                                       value: 'delete',
                                       child: ListTile(
                                         contentPadding: EdgeInsets.zero,
@@ -854,6 +862,8 @@ class _NetworkPlaylistImportDialogState
       late final String importedName;
       late final String importedCover;
       late final List<Song> songs;
+      // 导入来源记录：供「同步来源」按原插件与输入重新拉取歌单。
+      late final PlaylistImportSource source;
       if (sourceId.startsWith('lx:')) {
         // 洛雪插件来源：直连平台公开歌单接口（参考 lx-music-mobile），
         // 不经插件运行时；歌曲携带 lx 元数据走现有洛雪播放管线。
@@ -867,9 +877,16 @@ class _NetworkPlaylistImportDialogState
         importedName = result.name;
         importedCover = result.coverUrl;
         songs = result.songs
-            .map((raw) => _rawToLxSong(raw, plugin))
+            .map((raw) => lxRawToPlaylistSong(plugin, raw))
             .whereType<Song>()
             .toList();
+        source = PlaylistImportSource(
+          kind: 'lx',
+          pluginId: plugin.id,
+          lxSource: parts[2],
+          input: input,
+          importedAt: DateTime.now().toIso8601String(),
+        );
       } else {
         final pluginId = sourceId.substring('plugin:'.length);
         final plugin = plugins.firstWhere(
@@ -882,23 +899,15 @@ class _NetworkPlaylistImportDialogState
         importedName = result.name;
         importedCover = result.coverUrl;
         songs = result.songs
-            .where((item) => item.title.trim().isNotEmpty)
-            .map(
-              (item) => Song(
-                path: pluginSongPath(plugin, item),
-                title: item.title,
-                artist: item.artist,
-                album: item.album,
-                albumKey: item.album,
-                duration: (item.durationMs / 1000).round(),
-                format: '网络',
-                coverUrl: item.coverUrl,
-                pluginId: plugin.id,
-                pluginData: item.rawData,
-                lyricsRaw: _embeddedLyrics(item.rawData),
-              ),
-            )
+            .map((item) => pluginSearchSongToPlaylistSong(plugin, item))
+            .whereType<Song>()
             .toList();
+        source = PlaylistImportSource(
+          kind: 'plugin',
+          pluginId: plugin.id,
+          input: input,
+          importedAt: DateTime.now().toIso8601String(),
+        );
       }
       if (songs.isEmpty) throw Exception('歌单中没有可导入的歌曲');
       final rename = _renameController.text.trim();
@@ -919,6 +928,7 @@ class _NetworkPlaylistImportDialogState
             existing.id,
             songs,
             coverUrl: importedCover,
+            sources: [source],
           );
         } else {
           await notifier.create(
@@ -927,15 +937,15 @@ class _NetworkPlaylistImportDialogState
                 ? songs.first.coverUrl
                 : importedCover,
             songs: songs,
+            sources: [source],
           );
         }
       } else {
         await notifier.create(
           name,
-          coverUrl: importedCover.isEmpty
-              ? songs.first.coverUrl
-              : importedCover,
+          coverUrl: importedCover.isEmpty ? songs.first.coverUrl : importedCover,
           songs: songs,
+          sources: [source],
         );
       }
       if (!mounted) return;
@@ -947,53 +957,6 @@ class _NetworkPlaylistImportDialogState
         _importing = false;
       });
     }
-  }
-
-  static String? _embeddedLyrics(Map<String, dynamic> raw) {
-    for (final key in const [
-      'yrc',
-      'qrc',
-      'eslrc',
-      'lxlyric',
-      'lyric',
-      'lyrics',
-      'lrc',
-    ]) {
-      final value = raw[key];
-      if (value is String && value.trim().isNotEmpty) return value;
-      if (value is Map) {
-        for (final nested in const ['lyric', 'lyrics', 'lrc', 'content']) {
-          final text = value[nested];
-          if (text is String && text.trim().isNotEmpty) return text;
-        }
-      }
-    }
-    return null;
-  }
-
-  /// 洛雪直连导入的 raw 歌曲 → Song。关联到所选洛雪插件，
-  /// path 用 `lx://` 虚拟路径，播放/歌词/音质解析走现有洛雪管线。
-  static Song? _rawToLxSong(
-    Map<String, dynamic> raw,
-    EnabledMusicPlugin plugin,
-  ) {
-    final title = raw['title']?.toString().trim() ?? '';
-    final path = raw['_sourcePath']?.toString() ?? '';
-    if (title.isEmpty || path.isEmpty) return null;
-    final duration = raw['duration'];
-    return Song(
-      path: path,
-      title: title,
-      artist: raw['artist']?.toString() ?? '',
-      album: raw['album']?.toString() ?? '',
-      albumKey: raw['album']?.toString() ?? '',
-      duration: duration is num ? duration.toInt() : 0,
-      format: '网络',
-      coverUrl: raw['artwork']?.toString(),
-      pluginId: plugin.id,
-      pluginData: raw,
-      lyricsRaw: _embeddedLyrics(raw),
-    );
   }
 
   @override

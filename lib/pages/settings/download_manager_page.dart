@@ -12,6 +12,7 @@ import '../../src/player/download_quality.dart';
 import '../../src/player/downloaded_song_store.dart';
 import '../../src/player/player_provider.dart';
 import '../../src/rust/api.dart';
+import '../../src/widgets/batch_download.dart';
 import '../../src/widgets/frosted_search_field.dart';
 import '../../src/widgets/top_notice.dart';
 
@@ -34,6 +35,22 @@ class _DownloadManagerPageState extends ConsumerState<DownloadManagerPage> {
   String _query = '';
   int _page = 0;
   bool _redownloading = false;
+
+  /// 悬浮头部（搜索框）的测量 Key 与实测高度：搜索框悬浮于列表上方，
+  /// 列表内容滚动时从毛玻璃下方穿过被模糊（与列表浮动按钮组同款
+  /// 观感），列表顶部让出头部高度。
+  final GlobalKey _floatingHeaderKey = GlobalKey();
+  double _floatingHeaderExtent = 58;
+
+  /// 布局完成后用真实高度修正悬浮头部占位，字体缩放等场景自动适配。
+  void _measureFloatingHeader() {
+    if (!mounted) return;
+    final size = _floatingHeaderKey.currentContext?.size;
+    if (size == null || size.height <= 0) return;
+    if ((size.height - _floatingHeaderExtent).abs() > 0.5) {
+      setState(() => _floatingHeaderExtent = size.height);
+    }
+  }
 
   /// 多选删除模式：长按列表项进入。
   bool _selectionMode = false;
@@ -201,7 +218,23 @@ class _DownloadManagerPageState extends ConsumerState<DownloadManagerPage> {
     setState(() => _redownloading = true);
     try {
       final settings = ref.read(settingsProvider).valueOrNull;
-      final directory = await resolveMusicDownloadDirectory(settings);
+      var directory = await resolveMusicDownloadDirectory(settings);
+      if (!mounted) return;
+      // SAF 目录授权校验：重装应用或恢复备份后持久化授权会丢失，直接
+      // 写入会被系统以 MANAGE_DOCUMENTS 权限拒绝；失效时引导重新选择。
+      directory =
+          await ensureSafDirectoryAccess(context, ref, directory) ?? '';
+      if (directory.isEmpty) {
+        historyNotifier.fail(historyId, '已取消：下载目录未授权');
+        if (mounted) {
+          XyNotice.show(
+            context,
+            message: '已取消下载：下载目录未授权',
+            type: XyNoticeType.warning,
+          );
+        }
+        return;
+      }
       final usesSafDirectory = AndroidStorage.isTreeUri(directory);
       final workDirectory = usesSafDirectory
           ? await resolveDownloadStagingDirectory()
@@ -461,6 +494,10 @@ class _DownloadManagerPageState extends ConsumerState<DownloadManagerPage> {
         .take(_pageSize)
         .toList();
 
+    // 布局完成后修正悬浮头部占位高度。
+    WidgetsBinding.instance.addPostFrameCallback(
+      (_) => _measureFloatingHeader(),
+    );
     return Scaffold(
       appBar: AppBar(
         title: Text(_selectionMode ? '已选择 ${_selectedIds.length} 项' : '下载管理'),
@@ -498,10 +535,115 @@ class _DownloadManagerPageState extends ConsumerState<DownloadManagerPage> {
                 ),
               ]
             : null,
-        bottom: _selectionMode
-            ? null
-            : PreferredSize(
-                preferredSize: const Size.fromHeight(58),
+      ),
+      // 搜索框悬浮于列表上方：列表内容滚动时从毛玻璃下方穿过被模糊，
+      // 与列表浮动按钮组观感一致。
+      body: Stack(
+        children: [
+          Positioned.fill(
+            child: Padding(
+              padding: EdgeInsets.only(
+                top: _selectionMode || entries.isEmpty
+                    ? 0
+                    : _floatingHeaderExtent,
+              ),
+              child: entries.isEmpty
+                  ? Center(
+                      child: Text(
+                        _query.isEmpty ? '暂无下载记录' : '未找到匹配的下载记录',
+                        style: TextStyle(color: theme.colorScheme.onSurfaceVariant),
+                      ),
+                    )
+                  : Column(
+                      children: [
+                        Expanded(
+                          child: ListView.builder(
+                            padding: const EdgeInsets.only(bottom: 12),
+                            itemCount: pageEntries.length,
+                            itemBuilder: (context, index) =>
+                                _buildTile(theme, pageEntries[index]),
+                          ),
+                        ),
+                        if (_selectionMode)
+                          SafeArea(
+                            top: false,
+                            child: Padding(
+                              padding: const EdgeInsets.fromLTRB(16, 4, 16, 10),
+                              child: Row(
+                                children: [
+                                  Text(
+                                    '已选 ${_selectedIds.length} 项',
+                                    style: TextStyle(
+                                      color: theme.colorScheme.onSurfaceVariant,
+                                    ),
+                                  ),
+                                  const Spacer(),
+                                  FilledButton.icon(
+                                    style: FilledButton.styleFrom(
+                                      backgroundColor: theme.colorScheme.error,
+                                    ),
+                                    onPressed: _selectedIds.isEmpty
+                                        ? null
+                                        : () => _confirmDelete(
+                                            entries
+                                                .where(
+                                                  (entry) => _selectedIds
+                                                      .contains(entry.id),
+                                                )
+                                                .toList(),
+                                          ),
+                                    icon: const Icon(
+                                      Icons.delete_sweep_outlined,
+                                      size: 20,
+                                    ),
+                                    label: const Text('批量删除'),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          )
+                        else if (totalPages > 1)
+                          SafeArea(
+                            top: false,
+                            child: Padding(
+                              padding: const EdgeInsets.fromLTRB(16, 4, 16, 10),
+                              child: Row(
+                                mainAxisAlignment: MainAxisAlignment.center,
+                                children: [
+                                  IconButton(
+                                    tooltip: '上一页',
+                                    onPressed: safePage <= 0
+                                        ? null
+                                        : () => setState(
+                                            () => _page = safePage - 1,
+                                          ),
+                                    icon: const Icon(Icons.chevron_left_rounded),
+                                  ),
+                                  Text('${safePage + 1} / $totalPages'),
+                                  IconButton(
+                                    tooltip: '下一页',
+                                    onPressed: safePage >= totalPages - 1
+                                        ? null
+                                        : () => setState(
+                                            () => _page = safePage + 1,
+                                          ),
+                                    icon: const Icon(Icons.chevron_right_rounded),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ),
+                      ],
+                    ),
+            ),
+          ),
+          if (!_selectionMode)
+            Positioned(
+              top: 0,
+              left: 0,
+              right: 0,
+              child: KeyedSubtree(
+                key: _floatingHeaderKey,
                 child: Padding(
                   padding: const EdgeInsets.fromLTRB(16, 0, 16, 10),
                   child: FrostedSearchField(
@@ -512,91 +654,9 @@ class _DownloadManagerPageState extends ConsumerState<DownloadManagerPage> {
                   ),
                 ),
               ),
-      ),
-      body: entries.isEmpty
-          ? Center(
-              child: Text(
-                _query.isEmpty ? '暂无下载记录' : '未找到匹配的下载记录',
-                style: TextStyle(color: theme.colorScheme.onSurfaceVariant),
-              ),
-            )
-          : Column(
-              children: [
-                Expanded(
-                  child: ListView.builder(
-                    padding: const EdgeInsets.only(bottom: 12),
-                    itemCount: pageEntries.length,
-                    itemBuilder: (context, index) =>
-                        _buildTile(theme, pageEntries[index]),
-                  ),
-                ),
-                if (_selectionMode)
-                  SafeArea(
-                    top: false,
-                    child: Padding(
-                      padding: const EdgeInsets.fromLTRB(16, 4, 16, 10),
-                      child: Row(
-                        children: [
-                          Text(
-                            '已选 ${_selectedIds.length} 项',
-                            style: TextStyle(
-                              color: theme.colorScheme.onSurfaceVariant,
-                            ),
-                          ),
-                          const Spacer(),
-                          FilledButton.icon(
-                            style: FilledButton.styleFrom(
-                              backgroundColor: theme.colorScheme.error,
-                            ),
-                            onPressed: _selectedIds.isEmpty
-                                ? null
-                                : () => _confirmDelete(
-                                    entries
-                                        .where(
-                                          (entry) =>
-                                              _selectedIds.contains(entry.id),
-                                        )
-                                        .toList(),
-                                  ),
-                            icon: const Icon(
-                              Icons.delete_sweep_outlined,
-                              size: 20,
-                            ),
-                            label: const Text('批量删除'),
-                          ),
-                        ],
-                      ),
-                    ),
-                  )
-                else if (totalPages > 1)
-                  SafeArea(
-                    top: false,
-                    child: Padding(
-                      padding: const EdgeInsets.fromLTRB(16, 4, 16, 10),
-                      child: Row(
-                        mainAxisAlignment: MainAxisAlignment.center,
-                        children: [
-                          IconButton(
-                            tooltip: '上一页',
-                            onPressed: safePage <= 0
-                                ? null
-                                : () => setState(() => _page = safePage - 1),
-                            icon: const Icon(Icons.chevron_left_rounded),
-                          ),
-                          Text('${safePage + 1} / $totalPages'),
-                          IconButton(
-                            tooltip: '下一页',
-                            onPressed: safePage >= totalPages - 1
-                                ? null
-                                : () => setState(() => _page = safePage + 1),
-                            icon: const Icon(Icons.chevron_right_rounded),
-                          ),
-                        ],
-                      ),
-                    ),
-                  ),
-              ],
             ),
+        ],
+      ),
     );
   }
 

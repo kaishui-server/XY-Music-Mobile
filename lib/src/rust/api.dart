@@ -689,6 +689,20 @@ Future<String> getLibrarySongsByPaths({
   paths: paths,
 );
 
+/// 导出曲库用户数据表（songs/library_folders/artists 等），供本地备份内嵌。
+/// 返回 {"表名": {"columns": [...], "rows": [[...]]}} JSON。
+Future<String> exportLibraryTables({required String dbPath}) =>
+    RustLib.instance.api.crateApiExportLibraryTables(dbPath: dbPath);
+
+/// 把备份导出的曲库表 JSON 整体写回数据库（覆盖语义，供本地备份导入）。
+Future<void> importLibraryTables({
+  required String dbPath,
+  required String payload,
+}) => RustLib.instance.api.crateApiImportLibraryTables(
+  dbPath: dbPath,
+  payload: payload,
+);
+
 /// 搜索本地音乐库（返回 `LibrarySong[]` JSON）。
 Future<String> searchLibrarySongs({
   required String dbPath,

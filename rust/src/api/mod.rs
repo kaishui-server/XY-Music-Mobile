@@ -1144,6 +1144,19 @@ pub fn get_library_songs_by_paths(db_path: String, paths: Vec<String>) -> Result
     serde_json::to_string(&songs).map_err(|e| e.to_string())
 }
 
+/// 导出曲库用户数据表（songs/library_folders/artists 等），供本地备份内嵌。
+/// 返回 {"表名": {"columns": [...], "rows": [[...]]}} JSON。
+pub fn export_library_tables(db_path: String) -> Result<String, String> {
+    let conn = open_scan_conn(&db_path)?;
+    crate::music::library::export_library_tables(&conn)
+}
+
+/// 把备份导出的曲库表 JSON 整体写回数据库（覆盖语义，供本地备份导入）。
+pub fn import_library_tables(db_path: String, payload: String) -> Result<(), String> {
+    let mut conn = open_scan_conn(&db_path)?;
+    crate::music::library::import_library_tables(&mut conn, &payload)
+}
+
 /// 搜索本地音乐库（返回 `LibrarySong[]` JSON）。
 pub fn search_library_songs(
     db_path: String,

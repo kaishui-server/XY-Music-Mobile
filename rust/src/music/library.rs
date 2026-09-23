@@ -914,10 +914,276 @@ pub fn parse_folder_song_sort_mode(s: &str) -> Result<FolderSongSortMode, String
     }
 }
 
+// =========================================================================
+// 本地备份：曲库表导出/导入
+// =========================================================================
+
+/// 随本地备份迁移的曲库用户数据表。
+/// 不包含：播放会话/播放历史/统计（会话类数据不迁移）、
+/// remote_sources/remote_files（远程音源配置含凭据）、song_loudness（可重新扫描生成）。
+const BACKUP_TABLES: &[&str] = &[
+    "songs",
+    "library_folders",
+    "artists",
+    "song_artists",
+    "song_backgrounds",
+    "sidebar_folders",
+];
+
+/// 把单列值转成 JSON 值（BLOB 不参与备份，转 null）。
+fn column_value_to_json(value: rusqlite::types::ValueRef<'_>) -> serde_json::Value {
+    use rusqlite::types::ValueRef;
+    match value {
+        ValueRef::Null => serde_json::Value::Null,
+        ValueRef::Integer(i) => serde_json::Value::from(i),
+        ValueRef::Real(f) => serde_json::Value::from(f),
+        ValueRef::Text(t) => serde_json::Value::String(String::from_utf8_lossy(t).into_owned()),
+        ValueRef::Blob(_) => serde_json::Value::Null,
+    }
+}
+
+/// 导出曲库用户数据表，返回 JSON：
+/// {"表名": {"columns": ["列", ...], "rows": [[值, ...], ...]}}。
+/// 按实际表结构动态读列，未来新增列自动进入备份。
+pub fn export_library_tables(conn: &Connection) -> Result<String, String> {
+    let mut tables = serde_json::Map::new();
+    for table in BACKUP_TABLES {
+        let mut stmt = conn
+            .prepare(&format!("SELECT * FROM {table}"))
+            .map_err(|e| e.to_string())?;
+        let columns: Vec<String> = stmt
+            .column_names()
+            .iter()
+            .map(|name| name.to_string())
+            .collect();
+        let column_count = stmt.column_count();
+        let rows = stmt
+            .query_map([], |row| {
+                let mut values = Vec::with_capacity(column_count);
+                for index in 0..column_count {
+                    values.push(column_value_to_json(row.get_ref(index)?));
+                }
+                Ok(values)
+            })
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<Vec<serde_json::Value>>, _>>()
+            .map_err(|e| e.to_string())?;
+        let mut entry = serde_json::Map::new();
+        entry.insert(
+            "columns".to_string(),
+            serde_json::Value::Array(
+                columns
+                    .iter()
+                    .map(|column| serde_json::Value::String(column.clone()))
+                    .collect(),
+            ),
+        );
+        entry.insert(
+            "rows".to_string(),
+            serde_json::Value::Array(
+                rows.into_iter()
+                    .map(|row| serde_json::Value::Array(row))
+                    .collect(),
+            ),
+        );
+        tables.insert(table.to_string(), serde_json::Value::Object(entry));
+    }
+    serde_json::to_string(&serde_json::Value::Object(tables)).map_err(|e| e.to_string())
+}
+
+/// 备份里的单表数据（列名 + 行数组）。
+#[derive(Deserialize)]
+struct TableBackup {
+    #[serde(default)]
+    columns: Vec<String>,
+    #[serde(default)]
+    rows: Vec<Vec<serde_json::Value>>,
+}
+
+/// 把 JSON 值转回 SQLite 参数值。
+fn json_to_sql_value(value: serde_json::Value) -> rusqlite::types::Value {
+    use rusqlite::types::Value;
+    match value {
+        serde_json::Value::Null => Value::Null,
+        serde_json::Value::Bool(flag) => Value::Integer(if flag { 1 } else { 0 }),
+        serde_json::Value::Number(number) => {
+            if let Some(int) = number.as_i64() {
+                Value::Integer(int)
+            } else if let Some(float) = number.as_f64() {
+                Value::Real(float)
+            } else {
+                Value::Null
+            }
+        }
+        serde_json::Value::String(text) => Value::Text(text),
+        _ => Value::Null,
+    }
+}
+
+/// 读取表当前列名（按建表顺序）。
+fn table_columns(conn: &Connection, table: &str) -> Result<Vec<String>, String> {
+    let mut stmt = conn
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .map_err(|e| e.to_string())?;
+    let columns = stmt
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|e| e.to_string())?
+        .filter_map(Result::ok)
+        .collect::<Vec<_>>();
+    Ok(columns)
+}
+
+/// 把备份 JSON 整体写回曲库（覆盖语义：先清空再插入）。
+/// 只使用当前表结构中实际存在的列，备份缺失的列写 NULL——
+/// 新旧版本之间增删字段自动兼容；备份中的未知列被忽略。
+pub fn import_library_tables(conn: &mut Connection, payload: &str) -> Result<(), String> {
+    let parsed: std::collections::HashMap<String, TableBackup> =
+        serde_json::from_str(payload).map_err(|_| "曲库备份数据格式无效".to_string())?;
+    let tx = conn.transaction().map_err(|e| e.to_string())?;
+    // 覆盖语义：先清空全部目标表（子表先清，满足外键约束；
+    // song_loudness 依赖 songs 的 ON DELETE CASCADE 级联清理，无需单独处理）。
+    for table in [
+        "song_artists",
+        "song_backgrounds",
+        "songs",
+        "artists",
+        "library_folders",
+        "sidebar_folders",
+    ] {
+        tx.execute(&format!("DELETE FROM {table}"), [])
+            .map_err(|e| e.to_string())?;
+    }
+    // 插入（父表先插，保证外键可解析）。
+    for table in [
+        "songs",
+        "artists",
+        "song_artists",
+        "song_backgrounds",
+        "library_folders",
+        "sidebar_folders",
+    ] {
+        let Some(backup) = parsed.get(table) else {
+            continue;
+        };
+        if backup.columns.is_empty() || backup.rows.is_empty() {
+            continue;
+        }
+        let existing = table_columns(&tx, table)?;
+        // 备份列与当前表列取交集，并按当前表列序排列。
+        let used: Vec<&String> = existing
+            .iter()
+            .filter(|column| backup.columns.contains(column))
+            .collect();
+        if used.is_empty() {
+            continue;
+        }
+        let column_list = used
+            .iter()
+            .map(|column| format!("\"{}\"", column.replace('"', "\"\"")))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let placeholders = used
+            .iter()
+            .map(|_| "?".to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!("INSERT INTO {table} ({column_list}) VALUES ({placeholders})");
+        let column_indexes: Vec<usize> = used
+            .iter()
+            .map(|column| {
+                backup
+                    .columns
+                    .iter()
+                    .position(|name| name == *column)
+                    .unwrap_or(0)
+            })
+            .collect();
+        let mut insert_stmt = tx.prepare(&sql).map_err(|e| e.to_string())?;
+        for row in &backup.rows {
+            let mut params = Vec::with_capacity(column_indexes.len());
+            for &index in &column_indexes {
+                let value = row
+                    .get(index)
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                params.push(json_to_sql_value(value));
+            }
+            insert_stmt
+                .execute(rusqlite::params_from_iter(params))
+                .map_err(|e| e.to_string())?;
+        }
+    }
+    tx.commit().map_err(|e| e.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use rusqlite::Connection;
+
+    /// 曲库表导出 → 空库导入 → 数据一致；且导入为覆盖语义（清掉目标库已有行）。
+    #[test]
+    fn library_tables_export_import_roundtrip() {
+        let mut source = Connection::open_in_memory().expect("open source");
+        crate::database::schema::ensure_base_schema(&source).expect("source schema");
+        source
+            .execute(
+                "INSERT INTO songs (path, title, artist, album, duration) VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params!["/music/a.mp3", "A", "Artist A", "Album", 123],
+            )
+            .expect("insert song");
+        source
+            .execute(
+                "INSERT INTO library_folders (path, added_at) VALUES (?1, 1)",
+                rusqlite::params!["/music"],
+            )
+            .expect("insert folder");
+        source
+            .execute("INSERT INTO artists (name) VALUES (?1)", rusqlite::params!["Artist A"])
+            .expect("insert artist");
+        source
+            .execute(
+                "INSERT INTO song_artists (song_id, artist_id, sort_order)
+                 SELECT songs.id, artists.id, 0 FROM songs, artists
+                 WHERE songs.path = '/music/a.mp3' AND artists.name = 'Artist A'",
+                [],
+            )
+            .expect("insert song_artists");
+        let payload = export_library_tables(&source).expect("export");
+
+        // 目标库：先有一条额外歌曲，导入后应被覆盖清除。
+        let mut target = Connection::open_in_memory().expect("open target");
+        crate::database::schema::ensure_base_schema(&target).expect("target schema");
+        target
+            .execute(
+                "INSERT INTO songs (path, title) VALUES (?1, ?2)",
+                rusqlite::params!["/old/b.mp3", "B"],
+            )
+            .expect("insert stale song");
+        import_library_tables(&mut target, &payload).expect("import");
+
+        let song_count: i64 = target
+            .query_row("SELECT COUNT(*) FROM songs", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(song_count, 1);
+        let (title, duration): (String, Option<i64>) = target
+            .query_row(
+                "SELECT title, duration FROM songs WHERE path = '/music/a.mp3'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(title, "A");
+        assert_eq!(duration, Some(123));
+        let folder_count: i64 = target
+            .query_row("SELECT COUNT(*) FROM library_folders", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(folder_count, 1);
+        let link_count: i64 = target
+            .query_row("SELECT COUNT(*) FROM song_artists", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(link_count, 1);
+    }
 
     fn create_minimal_schema(conn: &Connection) {
         conn.execute(

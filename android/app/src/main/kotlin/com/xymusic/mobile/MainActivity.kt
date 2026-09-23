@@ -5,11 +5,13 @@ import android.content.ContentValues
 import android.content.Intent
 import android.media.projection.MediaProjectionManager
 import android.net.Uri
+import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.Environment
 import android.provider.MediaStore
 import android.provider.DocumentsContract
 import android.provider.Settings
+import android.view.KeyEvent
 import android.view.WindowManager
 import android.media.MediaScannerConnection
 import java.io.File
@@ -29,9 +31,12 @@ class MainActivity : AudioServiceActivity() {
         private const val APP_UPDATE_CHANNEL = "com.xymusic.mobile/app_update"
         private const val DESKTOP_LYRICS_CHANNEL = "com.xymusic.mobile/desktop_lyrics"
         private const val SCREEN_AWAKE_CHANNEL = "com.xymusic.mobile/screen_awake"
+        private const val DNS_LOOKUP_CHANNEL = "com.xymusic.mobile/dns_lookup"
         private const val GALLERY_CHANNEL = "com.xymusic.mobile/gallery"
         private const val STORAGE_CHANNEL = "com.xymusic.mobile/storage"
         private const val DEEPLINK_CHANNEL = "com.xymusic.mobile/deeplink"
+        private const val MEDIA_BUTTON_CHANNEL = "com.xymusic.mobile/media_buttons"
+        private const val VOLUME_KEY_CHANNEL = "com.xymusic.mobile/volume_keys"
         private const val CAPTURE_REQUEST = 4217
         private const val DIRECTORY_REQUEST = 4218
     }
@@ -40,6 +45,19 @@ class MainActivity : AudioServiceActivity() {
     private var pendingDirectoryResult: MethodChannel.Result? = null
     private var deepLinkChannel: MethodChannel? = null
     private var pendingDeepLink: String? = null
+    private var mediaButtonChannel: MethodChannel? = null
+
+    /// 音量键拦截开关（Flutter 侧按设置推送）：开启时应用前台的
+    /// 音量键只调本应用播放音量，不动系统媒体音量。
+    private var volumeKeyCaptureEnabled = false
+    private var volumeKeyChannel: MethodChannel? = null
+
+    /// 全局 Wi-Fi 高性能锁：阻止系统在播放/加载期间让 Wi-Fi 进入省电
+    /// 模式拖慢网络。实测 HyperOS（小米）等 ROM 的省电策略会限制网络
+    /// 吞吐，表现为歌曲加载极慢（CDN 连接 8 秒以上），开启系统录屏后
+    /// 因系统持有性能锁而恢复正常。App 主动持锁等价于常驻该状态。
+    @Suppress("DEPRECATION")
+    private var wifiLock: WifiManager.WifiLock? = null
 
     override fun onCreate(savedInstanceState: android.os.Bundle?) {
         super.onCreate(savedInstanceState)
@@ -47,6 +65,36 @@ class MainActivity : AudioServiceActivity() {
         CrashHandler.install(this)
         // 冷启动深链暂存：Flutter 引擎就绪后由 getInitialDeepLink 取走。
         pendingDeepLink = extractDeepLink(intent)
+        acquirePlaybackWifiLock()
+    }
+
+    override fun onDestroy() {
+        try {
+            wifiLock?.release()
+        } catch (_: Exception) {
+        }
+        wifiLock = null
+        super.onDestroy()
+    }
+
+    /// 播放期 Wi-Fi 锁使用 WIFI_MODE_FULL_HIGH_PERF：禁用 Wi-Fi 省电，
+    /// 保持天线高性能收发。API 34 起该模式被标记废弃（系统认为默认
+    /// 已足够），但在厂商省电激进的 ROM 上仍然有效。
+    @Suppress("DEPRECATION")
+    private fun acquirePlaybackWifiLock() {
+        if (wifiLock != null) return
+        try {
+            val manager = applicationContext.getSystemService(WIFI_SERVICE) as WifiManager
+            wifiLock = manager.createWifiLock(
+                WifiManager.WIFI_MODE_FULL_HIGH_PERF,
+                "xymusic_playback",
+            ).apply {
+                setReferenceCounted(false)
+                acquire()
+            }
+        } catch (_: Exception) {
+            // 持锁失败不影响正常功能，仅回退到系统默认调度。
+        }
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -69,6 +117,23 @@ class MainActivity : AudioServiceActivity() {
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
         StoragePermissionBridge.register(this, flutterEngine)
+        mediaButtonChannel = MethodChannel(
+            flutterEngine.dartExecutor.binaryMessenger,
+            MEDIA_BUTTON_CHANNEL,
+        )
+        volumeKeyChannel = MethodChannel(
+            flutterEngine.dartExecutor.binaryMessenger,
+            VOLUME_KEY_CHANNEL,
+        ).also { channel ->
+            channel.setMethodCallHandler { call, result ->
+                if (call.method == "setCaptureEnabled") {
+                    volumeKeyCaptureEnabled = call.argument<Boolean>("enabled") == true
+                    result.success(true)
+                } else {
+                    result.notImplemented()
+                }
+            }
+        }
         deepLinkChannel = MethodChannel(
             flutterEngine.dartExecutor.binaryMessenger,
             DEEPLINK_CHANNEL,
@@ -98,6 +163,44 @@ class MainActivity : AudioServiceActivity() {
                     }
                     result.success(true)
                 }
+            }
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, DNS_LOOKUP_CHANNEL)
+            .setMethodCallHandler { call, result ->
+                if (call.method != "lookup") {
+                    result.notImplemented()
+                    return@setMethodCallHandler
+                }
+                val host = call.argument<String>("host")?.trim().orEmpty()
+                if (host.isEmpty()) {
+                    result.error("invalid_host", "host is empty", null)
+                    return@setMethodCallHandler
+                }
+                // Java 层 DNS 解析走系统 netd 缓存，与 ExoPlayer 共享：
+                // 播放前预解析可填充缓存，setUrl 的连接阶段直接命中。
+                // 解析结果同时回传（地址与耗时），用于诊断慢连接根因。
+                Thread {
+                    val started = System.currentTimeMillis()
+                    try {
+                        val addresses = java.net.InetAddress.getAllByName(host)
+                        val elapsed = System.currentTimeMillis() - started
+                        val list = addresses.map { it.hostAddress ?: "" }
+                            .filter { it.isNotEmpty() }
+                        result.success(
+                            mapOf(
+                                "elapsedMs" to elapsed,
+                                "addresses" to list,
+                            )
+                        )
+                    } catch (error: Exception) {
+                        val elapsed = System.currentTimeMillis() - started
+                        result.success(
+                            mapOf(
+                                "elapsedMs" to elapsed,
+                                "error" to (error.message ?: error.toString()),
+                            )
+                        )
+                    }
+                }.start()
             }
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, GALLERY_CHANNEL)
             .setMethodCallHandler { call, result ->
@@ -175,6 +278,38 @@ class MainActivity : AudioServiceActivity() {
                     startActivityForResult(intent, DIRECTORY_REQUEST)
                     return@setMethodCallHandler
                 }
+                if (call.method == "hasDirectoryGrant") {
+                    val directoryUri = call.argument<String>("directoryUri")?.trim().orEmpty()
+                    if (!directoryUri.startsWith("content://")) {
+                        result.success(false)
+                        return@setMethodCallHandler
+                    }
+                    try {
+                        val treeUri = Uri.parse(directoryUri)
+                        if (!DocumentsContract.isTreeUri(treeUri)) {
+                            result.success(false)
+                            return@setMethodCallHandler
+                        }
+                        // 授权可能因重装应用、恢复备份或系统回收而丢失；
+                        // 写入前先确认本进程仍持有该目录的持久化写授权。
+                        val treeId = DocumentsContract.getTreeDocumentId(treeUri)
+                        val granted = contentResolver.persistedUriPermissions.any { perm ->
+                            if (!perm.isWritePermission) return@any false
+                            if (perm.uri == treeUri) return@any true
+                            try {
+                                DocumentsContract.isTreeUri(perm.uri) &&
+                                    perm.uri.authority == treeUri.authority &&
+                                    DocumentsContract.getTreeDocumentId(perm.uri) == treeId
+                            } catch (_: Exception) {
+                                false
+                            }
+                        }
+                        result.success(granted)
+                    } catch (_: Exception) {
+                        result.success(false)
+                    }
+                    return@setMethodCallHandler
+                }
                 if (call.method == "deleteFile") {
                     val target = call.argument<String>("uri")?.trim().orEmpty()
                     if (!target.startsWith("content://")) {
@@ -245,10 +380,18 @@ class MainActivity : AudioServiceActivity() {
                         }
                         runOnUiThread { result.success(targetUri.toString()) }
                     } catch (error: Exception) {
+                        val message = error.message ?: ""
+                        val permissionDenied = error is SecurityException ||
+                            message.contains("Permission Denial") ||
+                            message.contains("MANAGE_DOCUMENTS") ||
+                            message.contains("grantUriPermission")
                         runOnUiThread {
                             result.error(
-                                "STORAGE_WRITE_FAILED",
-                                error.message ?: "写入目标文件失败",
+                                if (permissionDenied) "STORAGE_PERMISSION_DENIED" else "STORAGE_WRITE_FAILED",
+                                if (permissionDenied)
+                                    "下载目录的访问授权已失效（可能因重装应用或恢复备份丢失），请重新选择下载目录"
+                                else
+                                    message.ifEmpty { "写入目标文件失败" },
                                 null,
                             )
                         }
@@ -400,6 +543,56 @@ class MainActivity : AudioServiceActivity() {
                     SystemAudioCaptureBridge.eventSink = null
                 }
             })
+    }
+
+    /// 车机/方向盘按键兜底：部分车机 ROM 不把媒体按键交给 MediaSession，
+    /// 而是直接注入前台 Activity。这里拦截媒体键并转发给 Flutter 侧，
+    /// 保证在绕过媒体会话的设备上也能切歌/暂停。
+    /// 标准 Android 上媒体键优先派发给活跃 MediaSession（audio_service 已
+    /// 处理 click/skipToNext/skipToPrevious），不会到达这里，因此不会重复触发。
+    /// 仅在 ACTION_DOWN 且非重复按（repeatCount==0）时转发一次，
+    /// 避免 AVRCP 长按连发导致连续切歌；对应的 ACTION_UP 直接吞掉。
+    override fun dispatchKeyEvent(event: KeyEvent?): Boolean {
+        if (event != null) {
+            // 音量键拦截（设置开启时）：应用前台按音量键只调本应用
+            // 播放音量，不弹系统音量面板、不动系统媒体音量（车机上
+            // 不影响导航等其他声音）。ACTION_DOWN 转发（含长按连发，
+            // 由 Flutter 侧节流），ACTION_UP 直接吞掉。
+            if (volumeKeyCaptureEnabled &&
+                (event.keyCode == KeyEvent.KEYCODE_VOLUME_UP ||
+                    event.keyCode == KeyEvent.KEYCODE_VOLUME_DOWN)
+            ) {
+                if (event.action == KeyEvent.ACTION_DOWN) {
+                    volumeKeyChannel?.invokeMethod(
+                        "onVolumeKey",
+                        if (event.keyCode == KeyEvent.KEYCODE_VOLUME_UP) "up" else "down",
+                    )
+                }
+                return true
+            }
+            val action = mediaButtonAction(event.keyCode)
+            if (action != null) {
+                if (event.action == KeyEvent.ACTION_DOWN && event.repeatCount == 0) {
+                    mediaButtonChannel?.invokeMethod("onMediaButton", action)
+                }
+                return true
+            }
+        }
+        return super.dispatchKeyEvent(event)
+    }
+
+    private fun mediaButtonAction(keyCode: Int): String? = when (keyCode) {
+        KeyEvent.KEYCODE_MEDIA_NEXT -> "next"
+        KeyEvent.KEYCODE_MEDIA_PREVIOUS -> "previous"
+        KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE,
+        KeyEvent.KEYCODE_HEADSETHOOK,
+        -> "playPause"
+        KeyEvent.KEYCODE_MEDIA_PLAY -> "play"
+        KeyEvent.KEYCODE_MEDIA_PAUSE -> "pause"
+        KeyEvent.KEYCODE_MEDIA_STOP -> "stop"
+        KeyEvent.KEYCODE_MEDIA_FAST_FORWARD -> "fastForward"
+        KeyEvent.KEYCODE_MEDIA_REWIND -> "rewind"
+        else -> null
     }
 
     private fun requestSystemAudioCapture(result: MethodChannel.Result) {

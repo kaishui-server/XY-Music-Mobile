@@ -1,4 +1,4 @@
-// lyric_fetcher.rs - 四音源歌词抓取与解密
+// lyric_fetcher.rs - 五音源歌词抓取与解密
 //
 // 将前端 lxLyricFetcher.ts 中的请求构造+解密逻辑迁移到 Rust。
 // 支持的音源：
@@ -6,6 +6,7 @@
 // - kw (酷我): XOR 加密请求 → zlib 解压 → 逐字歌词解析
 // - tx (QQ音乐): QRC 3DES 解密 → 逐字歌词解析
 // - wy (网易云): eapi AES-ECB 加密 → yrc/krc 逐字歌词
+// - mg (咪咕): MRC 64 位 XXTEA 变体解密 → 逐字歌词解析
 
 use base64::Engine;
 use serde::{Deserialize, Serialize};
@@ -37,6 +38,8 @@ static WY_YRC_CHECK_RE: OnceLock<Regex> = OnceLock::new();
 static WY_FIX_TIME_RE: OnceLock<Regex> = OnceLock::new();
 static WY_FIX_ROMA_TIME_RE: OnceLock<Regex> = OnceLock::new();
 static WY_FIX_ROMA_TRAIL_RE: OnceLock<Regex> = OnceLock::new();
+static MG_LINE_TIME_RE: OnceLock<Regex> = OnceLock::new();
+static MG_WORD_TIME_RE: OnceLock<Regex> = OnceLock::new();
 
 // ==================== Types ====================
 
@@ -444,8 +447,11 @@ fn des_key_schedule(key: &[u8], mode: u32) -> [[u8; 6]; 16] {
 
     for i in 0..16 {
         let shift = key_rnd_shift[i];
-        c = ((c << shift) | (c >> (28 - shift))) & 0x0fffffff;
-        d = ((d << shift) | (d >> (28 - shift))) & 0x0fffffff;
+        // 28 位半密钥存储在 bit 31..4（见上方 bitnum(..., 31 - i) 布局），
+        // 循环左移后必须用 0xfffffff0 保留高 28 位；原先的 0x0fffffff 会
+        // 把最高 4 位清零并引入低位杂散比特，导致 QRC 解密输出乱码。
+        c = ((c << shift) | (c >> (28 - shift))) & 0xfffffff0;
+        d = ((d << shift) | (d >> (28 - shift))) & 0xfffffff0;
         let togen = if mode == 0 { 15 - i } else { i };
         for j in 0..6 {
             schedule[togen][j] = 0;
@@ -511,21 +517,26 @@ fn qrc_decrypt(encrypted_hex: &str) -> Result<String, String> {
         i += 8;
     }
 
-    decompress_deflate_to_string(&decrypted_bytes)
+    // QQ 的 QRC 密文解密后是 zlib 流（0x78 0x9C 头），不是 raw deflate；
+    // 解压结果可能带 UTF-8 BOM，需一并去除。
+    decompress_zlib_to_string(&decrypted_bytes)
+}
+
+fn decompress_zlib_to_string(bytes: &[u8]) -> Result<String, String> {
+    use flate2::read::ZlibDecoder;
+    use std::io::Read;
+    let mut decoder = ZlibDecoder::new(bytes);
+    let mut result = Vec::new();
+    decoder
+        .read_to_end(&mut result)
+        .map_err(|e| e.to_string())?;
+    if result.len() >= 3 && result[0] == 0xEF && result[1] == 0xBB && result[2] == 0xBF {
+        result.drain(0..3);
+    }
+    String::from_utf8(result).map_err(|e| e.to_string())
 }
 
 // ==================== Deflate/Zlib Decompression ====================
-
-fn decompress_deflate_to_string(bytes: &[u8]) -> Result<String, String> {
-    use flate2::read::DeflateDecoder;
-    use std::io::Read;
-    let mut decoder = DeflateDecoder::new(bytes);
-    let mut result = String::new();
-    decoder
-        .read_to_string(&mut result)
-        .map_err(|e| e.to_string())?;
-    Ok(result)
-}
 
 fn decompress_deflate_to_bytes(bytes: &[u8]) -> Result<Vec<u8>, String> {
     use flate2::read::DeflateDecoder;
@@ -1277,11 +1288,14 @@ fn tx_parse_lyric(lrc: &str) -> (String, String) {
 
     let line_time_re = TX_LINE_TIME_RE.get_or_init(|| Regex::new(r"^\[(\d+),\d+]").unwrap());
     let line_time2_re = TX_LINE_TIME2_RE.get_or_init(|| Regex::new(r"^\[([\d:.]+)]").unwrap());
+    // QQ 的 QRC 词级标记有两种形态：旧两段式 (offset,dur) 与新三段式
+    // (offset,dur,0)（与网易 YRC 同构）。只认两段式时三段式歌曲的正文行
+    // 全部解析不出词级时间，表现为“只有标题/元数据行逐字”。
     let word_time_all_re =
-        TX_WORD_TIME_GROUP_RE.get_or_init(|| Regex::new(r"(\(\d+,\d+\))").unwrap());
-    let word_time_re = TX_WORD_TIME_RE.get_or_init(|| Regex::new(r"\(\d+,\d+\)").unwrap());
+        TX_WORD_TIME_GROUP_RE.get_or_init(|| Regex::new(r"(\(\d+,\d+(?:,\d+)?\))").unwrap());
+    let word_time_re = TX_WORD_TIME_RE.get_or_init(|| Regex::new(r"\(\d+,\d+(?:,\d+)?\)").unwrap());
     let word_extract_re =
-        TX_WORD_EXTRACT_RE.get_or_init(|| Regex::new(r"\((\d+),(\d+)\)").unwrap());
+        TX_WORD_EXTRACT_RE.get_or_init(|| Regex::new(r"\((\d+),(\d+)(?:,\d+)?\)").unwrap());
 
     let mut lxlrc_lines: Vec<String> = Vec::new();
     let mut lrc_lines: Vec<String> = Vec::new();
@@ -1613,8 +1627,11 @@ async fn fetch_tx_lyric(song_info: &LyricSongInfo) -> Result<Option<LyricResult>
 
 fn parse_yrc(yrc_text: &str) -> String {
     let line_time_re = WY_YRC_LINE_TIME_RE.get_or_init(|| Regex::new(r"^\[(\d+),(\d+)]").unwrap());
+    // 网易 YRC 词级标记常规是三段式 (start,dur,0)，但部分歌曲行内是
+    // 两段式 (start,dur)（与 QQ QRC 同构）。两种形态都要能识别，否则
+    // 对应行直接被跳过、丢失逐字数据。
     let word_tag_re =
-        WY_YRC_WORD_TAG_RE.get_or_init(|| Regex::new(r"\((\d+),(\d+),\d+\)").unwrap());
+        WY_YRC_WORD_TAG_RE.get_or_init(|| Regex::new(r"\((\d+),(\d+)(?:,\d+)?\)").unwrap());
     let mut result: Vec<String> = Vec::new();
 
     for raw_line in yrc_text.split('\n') {
@@ -1909,9 +1926,32 @@ async fn wy_eapi_post(
     data: serde_json::Value,
     extra_headers: &[(&str, &str)],
 ) -> Result<Option<serde_json::Value>, String> {
-    let data_str = serde_json::to_string(&data).unwrap_or_default();
+    // eapi 必须在参数 JSON 里附带 PC 客户端 header，否则服务端返回 wrong params。
+    let mut payload = data;
+    if let serde_json::Value::Object(ref mut map) = payload {
+        map.insert(
+            "header".to_string(),
+            serde_json::json!({
+                "os": "pc",
+                "appver": "8.9.75",
+                "versioncode": "140",
+                "buildver": "0.0.1",
+                "resolution": "1920x1080",
+                "osver": "",
+                "deviceId": "",
+                "mobilename": "",
+                "channel": "",
+            }),
+        );
+    }
+    let data_str = serde_json::to_string(&payload).unwrap_or_default();
     let params = wy_eapi_encrypt(eapi_path, &data_str)?;
-    let api_url = format!("https://interface3.music.163.com{}", eapi_path);
+    // eapi 端点规则：加密用 path 为 /api/...，实际请求 URL 需将前缀换成 /eapi/...
+    let eapi_url = if let Some(rest) = eapi_path.strip_prefix("/api") {
+        format!("https://interface3.music.163.com/eapi{}", rest)
+    } else {
+        format!("https://interface3.music.163.com/eapi{}", eapi_path)
+    };
     let body = format!("params={}", params);
 
     let mut headers: Vec<(&str, &str)> = vec![
@@ -1921,7 +1961,7 @@ async fn wy_eapi_post(
     ];
     headers.extend_from_slice(extra_headers);
 
-    let resp = http_fetch_text(&api_url, "POST", &headers, Some(&body)).await?;
+    let resp = http_fetch_text(&eapi_url, "POST", &headers, Some(&body)).await?;
     if resp.status != 200 {
         return Ok(None);
     }
@@ -1957,37 +1997,18 @@ async fn wyy_get_karaoke(song_id: &str) -> String {
     let data2 = serde_json::json!({
         "cp": -1, "id": id_num, "kv": 1, "lv": -1, "rv": 0, "tv": -1, "yt": false, "yv": 0,
     });
-    // Override User-Agent for this request
-    let data_str = serde_json::to_string(&data2).unwrap_or_default();
-    let params = match wy_eapi_encrypt("/api/song/lyric/v1", &data_str) {
-        Ok(p) => p,
-        Err(_) => return String::new(),
-    };
-    let api_url = "https://interface3.music.163.com/api/song/lyric/v1";
-    let body = format!("params={}", params);
-    let resp = http_fetch_text(
-        &api_url,
-        "POST",
-        &[
-            ("User-Agent", "Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Safari/537.36 Chrome/91.0.4472.164 NeteaseMusicDesktop/2.10.2.200154"),
-            ("Cookie", "os=pc; appver=8.9.75; osver=; deviceId=pyncm!"),
-            ("Content-Type", "application/x-www-form-urlencoded"),
-        ],
-        Some(&body),
-    ).await;
-
-    if let Ok(resp) = resp {
-        if resp.status == 200 {
-            if let Ok(body) = serde_json::from_str::<serde_json::Value>(&resp.body) {
-                let yrc = try_extract_yrc(&body);
-                if !yrc.is_empty() {
-                    return yrc;
-                }
-                let krc = try_extract_krc(&body);
-                if !krc.is_empty() {
-                    return krc;
-                }
-            }
+    if let Ok(Some(body)) = wy_eapi_post(
+        "/api/song/lyric/v1",
+        data2,
+        &[("Cookie", "os=pc; appver=8.9.75; osver=; deviceId=pyncm!")],
+    ).await {
+        let yrc = try_extract_yrc(&body);
+        if !yrc.is_empty() {
+            return yrc;
+        }
+        let krc = try_extract_krc(&body);
+        if !krc.is_empty() {
+            return krc;
         }
     }
 
@@ -2085,7 +2106,24 @@ async fn fetch_wy_lyric_by_id(song_id: &str) -> Result<Option<LyricResult>, Stri
     let data = serde_json::json!({
         "id": song_id_value, "cp": false, "tv": 0, "lv": 0, "rv": 0, "kv": 0, "yv": 0, "ytv": 0, "yrv": 0,
     });
-    let body = match wy_eapi_post("/api/song/lyric/v1", data, &[]).await? {
+    // 对齐 lx-lxwalnut-music-mobile 的 getLyricWithRetry：真机弱网下
+    // eapi 偶发超时/限流，最多重试 3 次、间隔 200ms；全部失败再走 legacy。
+    let mut body: Option<serde_json::Value> = None;
+    for attempt in 0..3usize {
+        match wy_eapi_post("/api/song/lyric/v1", data.clone(), &[]).await {
+            Ok(Some(b)) => {
+                body = Some(b);
+                break;
+            }
+            Ok(None) => break,
+            Err(_) => {
+                if attempt + 1 < 3 {
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                }
+            }
+        }
+    }
+    let body = match body {
         Some(b) => b,
         None => return fetch_wy_legacy_lyric(song_id).await,
     };
@@ -2170,6 +2208,249 @@ async fn fetch_wy_lyric(song_info: &LyricSongInfo) -> Result<Option<LyricResult>
     Ok(None)
 }
 
+// ==================== MG (Migu) Lyric Fetching ====================
+
+/// MRC 逐字歌词解密的 9 个 64 位密钥（与 LX Music 官方 mg/utils/mrc.js 一致）。
+const MG_MRC_DELTA: i64 = 2654435769;
+const MG_MRC_KEYS: [i64; 9] = [
+    27303562373562475,
+    18014862372307051,
+    22799692160172081,
+    34058940340699235,
+    30962724186095721,
+    27303523720101991,
+    27303523720101998,
+    31244139033526382,
+    28992395054481524,
+];
+
+/// 64 位 XXTEA 变体解密（对应 mrc.js teaDecrypt）。所有运算按带符号
+/// 64 位回绕，与 JS BigInt + toLong 归一化行为等价。
+fn mg_mrc_tea_decrypt(mut data: Vec<i64>) -> Vec<i64> {
+    if data.is_empty() {
+        return data;
+    }
+    let length = data.len() as i64;
+    let mut j2 = data[0];
+    let mut j3 = 6i64.wrapping_add(52 / length).wrapping_mul(MG_MRC_DELTA);
+    while j3 != 0 {
+        let j4 = j3;
+        let j5 = (j4 >> 2) & 3;
+        let mut j6 = length;
+        loop {
+            j6 -= 1;
+            if !(j6 > 0) {
+                break;
+            }
+            let j7 = data[(j6 - 1) as usize];
+            let i = j6 as usize;
+            j2 = data[i].wrapping_sub(
+                (j2 ^ j4)
+                    .wrapping_add(j7 ^ MG_MRC_KEYS[((3 & j6) ^ j5) as usize])
+                    ^ ((j7 >> 5) ^ (j2 << 2))
+                        .wrapping_add((j2 >> 3) ^ (j7 << 4)),
+            );
+            data[i] = j2;
+        }
+        let j8 = data[(length - 1) as usize];
+        j2 = data[0].wrapping_sub(
+            (MG_MRC_KEYS[((j6 & 3) ^ j5) as usize] ^ j8)
+                .wrapping_add(j2 ^ j4)
+                ^ ((j8 >> 5) ^ (j2 << 2))
+                    .wrapping_add((j2 >> 3) ^ (j8 << 4)),
+        );
+        data[0] = j2;
+        j3 = j4.wrapping_sub(MG_MRC_DELTA);
+    }
+    data
+}
+
+/// 解密 MRC 逐字歌词：hex 密文 → 64 位字数组 → XXTEA → 小端字节 →
+/// UTF-16LE 文本。长度不足 32（不足 2 个字）视为未加密数据原样返回。
+fn mg_mrc_decrypt(hex: &str) -> Option<String> {
+    let hex: String = hex.chars().filter(|c| c.is_ascii_hexdigit()).collect();
+    if hex.len() < 32 {
+        return None;
+    }
+    let word_count = hex.len() / 16;
+    let mut words = Vec::with_capacity(word_count);
+    for i in 0..word_count {
+        let chunk = &hex[i * 16..(i + 1) * 16];
+        let value = u64::from_str_radix(chunk, 16).ok()?;
+        words.push(value as i64);
+    }
+    let mut units = Vec::with_capacity(words.len() * 4);
+    for word in mg_mrc_tea_decrypt(words) {
+        let bytes = word.to_le_bytes();
+        for pair in bytes.chunks_exact(2) {
+            units.push(u16::from_le_bytes([pair[0], pair[1]]));
+        }
+    }
+    Some(String::from_utf16_lossy(&units))
+}
+
+/// 解析 MRC 明文：`[行开始,行时长]词(词开始,词时长)词(词开始,词时长)...`
+/// 输出与 wy/kg/tx 相同的约定 —— lxlyric 用行内相对偏移 `<offset,dur>`，
+/// Dart 侧（lx_lyrics_builder）会加上行起始时间还原绝对时间。
+fn mg_parse_mrc(text: &str) -> (String, String) {
+    let line_time_re = MG_LINE_TIME_RE
+        .get_or_init(|| Regex::new(r"^\s*\[(\d+),\d+\]").unwrap());
+    let word_time_re =
+        MG_WORD_TIME_RE.get_or_init(|| Regex::new(r"\((\d+),(\d+)\)").unwrap());
+    let mut lyric_lines = Vec::new();
+    let mut lxlyric_lines = Vec::new();
+
+    for line in text.split(|c| c == '\r' || c == '\n') {
+        if line.len() < 6 {
+            continue;
+        }
+        let Some(caps) = line_time_re.captures(line) else {
+            continue;
+        };
+        let start_ms: u64 = caps[1].parse().unwrap_or(0);
+        let words = line_time_re.replace(line, "").to_string();
+
+        // 普通行：去掉词级时间标签。
+        let plain = word_time_re.replace_all(&words, "").to_string();
+        lyric_lines.push(format!("{}{}", ms_format(start_ms), plain));
+
+        // 逐字行：词标签转为相对行首的偏移。
+        let mut pairs: Vec<(u64, u64)> = Vec::new();
+        for word_caps in word_time_re.captures_iter(&words) {
+            pairs.push((
+                word_caps[1].parse().unwrap_or(0),
+                word_caps[2].parse().unwrap_or(0),
+            ));
+        }
+        if pairs.is_empty() {
+            continue;
+        }
+        let chunks: Vec<&str> = word_time_re.split(&words).collect();
+        let mut builder = String::new();
+        for (index, (word_start, word_duration)) in pairs.iter().enumerate() {
+            let word = chunks.get(index).copied().unwrap_or("");
+            builder.push_str(&format!(
+                "<{},{}>{}",
+                word_start.saturating_sub(start_ms),
+                word_duration,
+                word
+            ));
+        }
+        lxlyric_lines.push(format!("{}{}", ms_format(start_ms), builder));
+    }
+    (lyric_lines.join("\n"), lxlyric_lines.join("\n"))
+}
+
+async fn fetch_mg_lyric(song_info: &LyricSongInfo) -> Result<Option<LyricResult>, String> {
+    // resourceinfo.do 用歌曲 songId（contentId）查询，copyrightId 查不到
+    // 歌词资源（实测返回空 resource 列表）。
+    let song_id = if song_info.songmid.is_empty() {
+        song_info.copyright_id.clone().unwrap_or_default()
+    } else {
+        song_info.songmid.clone()
+    };
+    if song_id.is_empty() {
+        return Ok(None);
+    }
+
+    let form_body = format!("resourceId={}", song_id);
+    let resp = http_fetch_text(
+        "https://c.musicapp.migu.cn/MIGUM2.0/v1.0/content/resourceinfo.do?resourceType=2",
+        "POST",
+        &[
+            ("Content-Type", "application/x-www-form-urlencoded"),
+            ("Referer", "https://app.c.nf.migu.cn/"),
+            ("channel", "0146921"),
+            ("User-Agent", "Mozilla/5.0 (Linux; Android 5.1.1; Nexus 6 Build/LYZ28E) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/59.0.3071.115 Mobile Safari/537.36"),
+        ],
+        Some(&form_body),
+    )
+    .await?;
+
+    let mut mrc_url = String::new();
+    let mut lrc_url = String::new();
+    let mut trc_url = String::new();
+    if resp.status == 200 {
+        if let Ok(body) = serde_json::from_str::<serde_json::Value>(&resp.body) {
+            if body.get("code").and_then(|v| v.as_str()) == Some("000000") {
+                if let Some(item) = body
+                    .get("resource")
+                    .and_then(|v| v.as_array())
+                    .and_then(|list| list.first())
+                {
+                    mrc_url = item
+                        .get("mrcUrl")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    lrc_url = item
+                        .get("lrcUrl")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    trc_url = item
+                        .get("trcUrl")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                }
+            }
+        }
+    }
+
+    let lyric_headers = [
+        ("Referer", "https://app.c.nf.migu.cn/"),
+        ("channel", "0146921"),
+        ("User-Agent", "Mozilla/5.0 (Linux; Android 5.1.1; Nexus 6 Build/LYZ28E) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/59.0.3071.115 Mobile Safari/537.36"),
+    ];
+
+    let mut lyric = String::new();
+    let mut lxlyric = String::new();
+
+    // 优先 MRC 逐字歌词。
+    if !mrc_url.is_empty() {
+        if let Ok(mrc_resp) = http_fetch_text(&mrc_url, "GET", &lyric_headers, None).await {
+            if mrc_resp.status == 200 && !mrc_resp.body.trim().is_empty() {
+                if let Some(decrypted) = mg_mrc_decrypt(mrc_resp.body.trim()) {
+                    let (plain, word_by_word) = mg_parse_mrc(&decrypted);
+                    lyric = plain;
+                    lxlyric = word_by_word;
+                }
+            }
+        }
+    }
+
+    // 回退普通 LRC。
+    if lyric.is_empty() && lxlyric.is_empty() && !lrc_url.is_empty() {
+        if let Ok(lrc_resp) = http_fetch_text(&lrc_url, "GET", &lyric_headers, None).await {
+            if lrc_resp.status == 200 && !lrc_resp.body.trim().is_empty() {
+                lyric = lrc_resp.body.trim().to_string();
+            }
+        }
+    }
+
+    if lyric.is_empty() && lxlyric.is_empty() {
+        return Ok(None);
+    }
+
+    // 翻译歌词（多数歌曲没有 trcUrl，失败不影响主歌词）。
+    let mut tlyric = String::new();
+    if !trc_url.is_empty() {
+        if let Ok(trc_resp) = http_fetch_text(&trc_url, "GET", &lyric_headers, None).await {
+            if trc_resp.status == 200 && !trc_resp.body.trim().is_empty() {
+                tlyric = trc_resp.body.trim().to_string();
+            }
+        }
+    }
+
+    Ok(Some(LyricResult {
+        lyric,
+        tlyric,
+        rlyric: String::new(),
+        lxlyric,
+    }))
+}
+
 // ==================== 对外入口 ====================
 
 pub async fn fetch_lyric_from_source(
@@ -2181,7 +2462,883 @@ pub async fn fetch_lyric_from_source(
         "kw" => fetch_kw_lyric(&song_info).await?,
         "tx" => fetch_tx_lyric(&song_info).await?,
         "wy" => fetch_wy_lyric(&song_info).await?,
+        "mg" => fetch_mg_lyric(&song_info).await?,
         _ => return Ok(None),
     };
     Ok(result)
+}
+
+#[cfg(test)]
+mod mg_tests {
+    use super::*;
+
+    #[test]
+    fn mg_parse_mrc_formats_word_by_word_lines() {
+        let mrc = "[12801,3791]感(12801,199)受(13000,299)停(13300,99)\r\n[16900,2000]下一行(16900,500)\r\n[ti:无效行]";
+        let (lyric, lxlyric) = mg_parse_mrc(mrc);
+
+        assert_eq!(lyric, "[00:12.801]感受停\n[00:16.900]下一行");
+        // 词级偏移相对行首：12801-12801=0、13000-12801=199、13300-12801=499。
+        assert_eq!(
+            lxlyric,
+            "[00:12.801]<0,199>感<199,299>受<499,99>停\n[00:16.900]<0,500>下一行"
+        );
+    }
+
+    /// 依赖网络的集成测试：咪咕真实歌曲「光年之外」（songId=1104716107）
+    /// 的 MRC 逐字歌词全链路。运行：`cargo test -- --ignored mg_`
+    #[tokio::test]
+    #[ignore = "依赖网络与咪咕接口可用性"]
+    async fn mg_lyric_full_chain_real_song() {
+        let song_info = LyricSongInfo {
+            songmid: "1104716107".to_string(),
+            hash: None,
+            name: "光年之外".to_string(),
+            singer: "邓紫棋".to_string(),
+            album_name: None,
+            interval: None,
+            interval_ms: None,
+            song_id: None,
+            str_media_mid: None,
+            album_mid: None,
+            album_id: None,
+            copyright_id: None,
+            source: Some("mg".to_string()),
+        };
+        let result = fetch_mg_lyric(&song_info)
+            .await
+            .expect("mg lyric fetch failed");
+        let result = result.expect("expected a lyric result");
+        assert!(!result.lxlyric.is_empty(), "逐字歌词不应为空");
+        assert!(
+            result.lxlyric.contains("<0,"),
+            "首词偏移应为 0：{}",
+            &result.lxlyric[..result.lxlyric.len().min(120)]
+        );
+        assert!(result.lyric.contains("[00:"));
+        println!("---- lyric ----\n{}", &result.lyric[..result.lyric.len().min(400)]);
+        println!("---- lxlyric ----\n{}", &result.lxlyric[..result.lxlyric.len().min(400)]);
+    }
+}
+
+/// 全链路集成测试：复现 App 真实调用路径——
+/// lx_search → Dart _normalizeLxSearchSong 等价 JSON → fetch_lyric_from_source。
+/// 结果落盘 target/lx_samples/{source}.json，供 Dart 转换与 Rust 解析环节继续测试。
+/// 运行：`cargo test -- --ignored --nocapture lx_chain`
+#[cfg(test)]
+mod lx_chain_tests {
+    use super::*;
+
+    /// 订阅源端到端测试：模拟应用完整播放流程——内置 lx_search 搜索 →
+    /// 订阅源（聆澜）API 取播放地址（等价于 LX 插件 musicUrl 动作）→
+    /// 内置 Rust 链路取逐字歌词（等价于 Dart _getLxLyrics/_loadLxLyrics）。
+    /// 订阅源脚本只声明 musicUrl 动作，歌词全部由内置链路负责。
+    #[tokio::test]
+    #[ignore = "依赖网络与订阅源服务可用性"]
+    async fn lx_subscription_source_end_to_end() {
+        const SUB_API_KEY: &str =
+            "CERU_KEY-QaLw7gh1KEpKzEwq7qYE7NweM0rKMRBe8U5aRE8KHQDMsdRc";
+        let cases: &[(&str, &str, &str)] = &[
+            ("kw", "晴天 周杰伦", "周杰伦"),
+            ("kg", "晴天 周杰伦", "周杰伦"),
+            ("tx", "晴天 周杰伦", "周杰伦"),
+            // 晴天在网易没有逐字歌词，wy 用确认有 YRC 的孤勇者验证。
+            ("wy", "孤勇者 陈奕迅", "陈奕迅"),
+            ("mg", "光年之外 邓紫棋", "邓紫棋"),
+        ];
+        for (source, keyword, origin_singer) in cases {
+            let limit = if *source == "wy" { 30 } else { 3 };
+            let items = crate::music::lx_search::lx_search(source, keyword, limit)
+                .await
+                .unwrap_or_else(|e| panic!("{source} 搜索失败: {e}"));
+            assert!(!items.is_empty(), "{source} 搜索无结果");
+            let item = items
+                .iter()
+                .find(|it| it.singer.contains(origin_singer))
+                .unwrap_or(&items[0]);
+            // 与 Dart _normalizeLxSearchSong 生成的 lx map 字段一一对应。
+            let lx = serde_json::json!({
+                "songmid": item.songmid,
+                "source": item.source,
+                "hash": item.hash,
+                "name": item.name,
+                "singer": item.singer,
+                "albumName": item.album_name,
+                "albumId": item.album_id,
+                "strMediaMid": item.str_media_mid,
+                "songId": item.song_id,
+                "albumMid": item.album_mid,
+                "copyrightId": item.copyright_id,
+                "interval": item.interval,
+                "_interval": null,
+                "_types": null,
+            });
+            let song_info: LyricSongInfo = serde_json::from_value(lx)
+                .unwrap_or_else(|e| panic!("{source} LyricSongInfo 反序列化失败: {e}"));
+
+            // 订阅源 musicUrl：脚本按 hash ?? songmid ?? id 取 songId。
+            let api_song_id = song_info
+                .hash
+                .as_deref()
+                .filter(|h| !h.trim().is_empty())
+                .unwrap_or(&item.songmid);
+            let url = format!(
+                "https://source.shiqianjiang.cn/api/music/url?source={}&songId={}&quality=128k",
+                urlencoding::encode(source),
+                urlencoding::encode(api_song_id),
+            );
+            let api_headers: Vec<(&str, &str)> = vec![
+                ("X-API-Key", SUB_API_KEY),
+                ("Content-Type", "application/json"),
+                (
+                    "User-Agent",
+                    "lx-music-request/2.0.0",
+                ),
+            ];
+            let media_url = match http_fetch_text(&url, "GET", &api_headers, None).await {
+                Ok(resp) if resp.status == 200 => {
+                    match serde_json::from_str::<serde_json::Value>(&resp.body) {
+                        Ok(body) => {
+                            body.get("url").and_then(|v| v.as_str()).unwrap_or("").to_string()
+                        }
+                        Err(_) => String::new(),
+                    }
+                }
+                _ => String::new(),
+            };
+
+            // 内置 Rust 歌词链路（订阅源歌曲的歌词入口）。
+            let result = fetch_lyric_from_source(source.to_string(), song_info)
+                .await
+                .unwrap_or_else(|e| panic!("{source} 歌词抓取失败: {e}"));
+            let (lrc_len, lx_len) = match &result {
+                Some(r) => (r.lyric.len(), r.lxlyric.len()),
+                None => (0, 0),
+            };
+            println!(
+                "== {source} == {} - {} | 订阅musicUrl {} | lyric {lrc_len}B lxlyric {lx_len}B",
+                item.singer,
+                item.name,
+                if media_url.is_empty() { "FAIL" } else { "OK" },
+            );
+            assert!(!media_url.is_empty(), "{source} 订阅源未返回播放地址");
+            assert!(lx_len > 0, "{source} 内置链路应有逐字歌词");
+        }
+    }
+
+    /// 调试用：网易 song_id=1901371647（陈奕迅 - 孤勇者，确认有 YRC）直测逐字链路。
+    /// 注意：晴天(186016) 在网易本身没有逐字歌词，不能用作逐字测试。
+    #[tokio::test]
+    #[ignore = "依赖网络"]
+    async fn wy_debug_real_song_186016() {
+        let song_info = LyricSongInfo {
+            songmid: "1901371647".to_string(),
+            hash: None,
+            name: "孤勇者".to_string(),
+            singer: "陈奕迅".to_string(),
+            album_name: None,
+            interval: None,
+            interval_ms: None,
+            song_id: None,
+            str_media_mid: None,
+            album_mid: None,
+            album_id: None,
+            copyright_id: None,
+            source: Some("wy".to_string()),
+        };
+        let result = fetch_wy_lyric(&song_info)
+            .await
+            .expect("wy lyric fetch failed");
+        let result = result.expect("expected a lyric result");
+        println!(
+            "wy 孤勇者: lyric {}B lxlyric {}B",
+            result.lyric.len(),
+            result.lxlyric.len()
+        );
+        if !result.lxlyric.is_empty() {
+            println!("---- lxlyric head ----\n{}", &result.lxlyric[..result.lxlyric.len().min(300)]);
+        }
+        assert!(!result.lxlyric.is_empty(), "孤勇者 wy 应有逐字歌词");
+    }
+
+    /// 离线回归：QQ QRC 词级标记两段式 (offset,dur) 与三段式 (offset,dur,0)
+    /// 必须都能解析。修复前只认两段式，三段式歌曲正文整行被跳过，
+    /// 真机表现为“只有标题/元数据行逐字”。
+    #[test]
+    fn tx_parse_lyric_word_tag_variants() {
+        let qrc = "[offset:0]\n\
+                   [0,2000]晴(0,200)天(200,200)\n\
+                   [5000,3000]故(5000,500,0)事(5500,500,0)的(6000,500,0)小(6500,500,0)黄(7000,500,0)花(7500,500,0)\n";
+        let (lrc, lxlyric) = tx_parse_lyric(qrc);
+        assert!(
+            lxlyric.contains("[00:00.000]<0,200>晴<200,200>天"),
+            "两段式行解析异常: {lxlyric}"
+        );
+        assert!(
+            lxlyric.contains("[00:05.000]<0,500>故<500,500>事<1000,500>的"),
+            "三段式行未解析出逐字: {lxlyric}"
+        );
+        assert!(!lrc.contains('('), "行级歌词残留词级标记: {lrc}");
+    }
+
+    /// 离线回归：网易 YRC 两段式词标记（部分歌曲行内形态）也要能解析，
+    /// 修复前只认三段式 (start,dur,0)。注意 YRC 行内是“标记在前、词在后”。
+    #[test]
+    fn wy_parse_yrc_two_segment_word_tags() {
+        let yrc = "[3000,2000](3000,400)故(3400,400)事(3800,400)的(4200,400)小(4600,400)花";
+        let lxlyric = parse_yrc(yrc);
+        assert!(
+            lxlyric.contains("[00:03.000]<0,400>故<400,400>事<800,400>的<1200,400>小<1600,400>花"),
+            "两段式 YRC 行未解析出逐字: {lxlyric}"
+        );
+    }
+
+    /// 诊断：多首 QQ 歌曲直接拉 QRC 原文，统计词级标记两段式/三段式形态，
+    /// 验证“部分歌曲 QRC 为三段式导致正文丢失逐字”的根因假设。
+    #[tokio::test]
+    #[ignore = "依赖网络与 QQ 接口可用性"]
+    async fn tx_qrc_word_tag_probe() {
+        let cases: &[(&str, &str, &str)] = &[
+            ("孤勇者", "陈奕迅", "003UkWuI0E8U0l"),
+            ("晴天", "周杰伦", "0039MnYb0qxYhV"),
+            ("起风了", "买辣椒也用券", ""),
+            ("告白气球", "周杰伦", ""),
+            ("三生三世", "张杰", ""),
+            ("西楼儿女", "海来阿木", ""),
+            ("青花瓷", "周杰伦", ""),
+        ];
+        let two_seg = Regex::new(r"\((\d+),(\d+)\)").unwrap();
+        let three_seg = Regex::new(r"\((\d+),(\d+),\d+\)").unwrap();
+        for (name, singer, fixed_mid) in cases {
+            let songmid = if fixed_mid.is_empty() {
+                let items = crate::music::lx_search::lx_search("tx", &format!("{name} {singer}"), 5)
+                    .await
+                    .unwrap_or_default();
+                match items.iter().find(|it| it.singer.contains(singer)) {
+                    Some(it) => it.songmid.clone(),
+                    None => {
+                        println!("== tx == {name}-{singer}: 搜索无匹配，跳过");
+                        continue;
+                    }
+                }
+            } else {
+                fixed_mid.to_string()
+            };
+            let req_body = serde_json::json!({
+                "comm": { "uin": "0", "format": "json", "ct": "19", "cv": "1859" },
+                "req": {
+                    "module": "music.musichallSong.PlayLyricInfo",
+                    "method": "GetPlayLyricInfo",
+                    "param": { "songMID": songmid, "songID": 0, "songType": 0, "qrc": 1, "qrc_t": 1 },
+                },
+            });
+            let resp = http_fetch_text(
+                "https://u.y.qq.com/cgi-bin/musicu.fcg",
+                "POST",
+                &[
+                    ("referer", "https://y.qq.com"),
+                    ("user-agent", "Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/86.0.4240.198 Safari/537.36"),
+                    ("Content-Type", "application/json"),
+                ],
+                Some(&req_body.to_string()),
+            )
+            .await;
+            let resp = match resp {
+                Ok(r) => r,
+                Err(e) => {
+                    println!("== tx == {name}: 请求失败 {e}");
+                    continue;
+                }
+            };
+            let hex = serde_json::from_str::<serde_json::Value>(&resp.body)
+                .ok()
+                .and_then(|b| {
+                    b.get("req")?.get("data")?.get("lyric")?.as_str().map(String::from)
+                })
+                .unwrap_or_default();
+            if hex.is_empty() {
+                println!("== tx == {name}: 无 QRC 数据");
+                continue;
+            }
+            let decrypted = match qrc_decrypt(&hex) {
+                Ok(d) => d,
+                Err(e) => {
+                    println!("== tx == {name}: QRC 解密失败 {e}");
+                    continue;
+                }
+            };
+            let two = two_seg.captures_iter(&decrypted).count();
+            let three = three_seg.captures_iter(&decrypted).count();
+            // 三段式正则会同时命中两段式前缀，真正三段数 = three - two
+            let pure_three = three.saturating_sub(two);
+            println!(
+                "== tx == {name} ({songmid}): 两段式 {two} 个，三段式 {pure_three} 个，总 {} 字节",
+                decrypted.len()
+            );
+        }
+    }
+
+
+    /// 解析层验证：把 lx_chain_search_then_fetch_lyrics 落盘的各源 lxlyric
+    /// 按 Dart convertLxLyricToEnhancedLrc 等价规则转成 Enhanced LRC，
+    /// 再走 parse_lyrics（设备端 embeddedLyricsProvider 同一入口），
+    /// 确认 displayLines 携带逐字 words——即 UI 逐字动效可用。
+    #[test]
+    fn lx_samples_parse_to_word_timings() {
+        for source in ["kw", "kg", "tx", "wy", "mg"] {
+            let path = format!("target/lx_samples/{source}.json");
+            let raw = match std::fs::read_to_string(&path) {
+                Ok(s) => s,
+                Err(_) => {
+                    println!("{source}: 样本不存在（先跑 lx_chain_search_then_fetch_lyrics），跳过");
+                    continue;
+                }
+            };
+            let payload: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            let lxlyric = payload["lxlyric"].as_str().unwrap_or("");
+            assert!(!lxlyric.is_empty(), "{source} 样本 lxlyric 为空");
+
+            // 等价 Dart 转换：<offset,dur> → <绝对时间>；行首 [mm:ss.mmm] 保留。
+            let marker_re = regex::Regex::new(r"<(-?\d+),(-?\d+)(?:,-?\d+)?>").unwrap();
+            let line_re = regex::Regex::new(r"^\[(\d+):(\d{2})\.(\d{1,3})\]").unwrap();
+            let mut converted_lines: Vec<String> = Vec::new();
+            for line in lxlyric.lines() {
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                let line_start_ms = line_re.captures(line).and_then(|c| {
+                    let m: u64 = c[1].parse().ok()?;
+                    let s: u64 = c[2].parse().ok()?;
+                    let frac = c[3].to_string();
+                    let ms: u64 = frac
+                        .parse::<u64>()
+                        .map(|v| v * 10u64.pow(3 - frac.len() as u32))
+                        .unwrap_or(0);
+                    Some(m * 60000 + s * 1000 + ms)
+                });
+                // (markerStart, markerEnd, 绝对开始时间)；词文本 = 本标记末尾到下一标记开头。
+                let markers: Vec<(usize, usize, u64)> = marker_re
+                    .captures_iter(line)
+                    .filter_map(|m| {
+                        let s: i64 = m[1].parse().ok()?;
+                        let abs = (line_start_ms.unwrap_or(0) as i64 + s).max(0) as u64;
+                        Some((m.get(0)?.start(), m.get(0)?.end(), abs))
+                    })
+                    .collect();
+                if markers.is_empty() {
+                    continue;
+                }
+                let mut with_text = String::new();
+                for (i, (_, mend, abs)) in markers.iter().enumerate() {
+                    let text_end = if i + 1 < markers.len() { markers[i + 1].0 } else { line.len() };
+                    with_text.push_str(&format!("<{}>{}", fmt_ms(*abs), &line[*mend..text_end]));
+                }
+                if let Some(caps) = line_re.captures(line) {
+                    converted_lines.push(format!("[{}:{}.{}]{}", &caps[1], &caps[2], &caps[3], with_text));
+                } else {
+                    converted_lines.push(with_text);
+                }
+            }
+            let enhanced = converted_lines.join("\n");
+            assert!(!enhanced.is_empty(), "{source} Enhanced LRC 转换为空");
+
+            let parsed_json = crate::api::parse_lyrics(enhanced);
+            let parsed: serde_json::Value = serde_json::from_str(&parsed_json).unwrap();
+            let display_lines = parsed["displayLines"].as_array().cloned().unwrap_or_default();
+            let with_words = display_lines
+                .iter()
+                .filter(|l| {
+                    l.get("words")
+                        .and_then(|w| w.as_array())
+                        .map(|w| !w.is_empty())
+                        .unwrap_or(false)
+                })
+                .count();
+            println!("{source}: displayLines {} 行，含 words {with_words} 行", display_lines.len());
+            assert!(with_words > 0, "{source} 解析结果没有逐字 words");
+
+            // 数值诊断：输出首行与首个正文行的行时间与词级时间轴（秒），
+            // 复现真机“只有标题逐字、正文不逐字”时对比时间轴是否错位。
+            if source == "tx" {
+                for (tag, idx) in [("首行", 0usize), ("正文行", 16usize)] {
+                    if let Some(line) = display_lines.get(idx) {
+                        let time = line["time"].as_f64().unwrap_or(-1.0);
+                        let end_time = line["end_time"].as_f64().unwrap_or(-1.0);
+                        let text = line["text"].as_str().unwrap_or("").chars().take(12).collect::<String>();
+                        let words = line["words"].as_array().cloned().unwrap_or_default();
+                        let timeline: Vec<String> = words
+                            .iter()
+                            .take(4)
+                            .map(|w| {
+                                format!(
+                                    "[{}~{}]",
+                                    w["start"].as_f64().unwrap_or(-1.0),
+                                    w["end"].as_f64().unwrap_or(-1.0)
+                                )
+                            })
+                            .collect();
+                        println!("  tx {tag} time={time:.3} end={end_time:.3} “{text}” words={} 前词={:?}",
+                            words.len(), timeline);
+                    }
+                }
+            }
+        }
+    }
+
+    fn fmt_ms(ms: u64) -> String {
+        format!("{:02}:{:02}.{:03}", ms / 60000, (ms % 60000) / 1000, ms % 1000)
+    }
+
+    #[tokio::test]
+    #[ignore = "依赖网络与各平台接口可用性"]
+    async fn lx_chain_search_then_fetch_lyrics() {
+        let cases: &[(&str, &str)] = &[
+            ("kw", "晴天 周杰伦"),
+            ("kg", "晴天 周杰伦"),
+            ("tx", "晴天 周杰伦"),
+            // 晴天在网易没有逐字歌词，wy 用确认有 YRC 的孤勇者验证。
+            ("wy", "孤勇者 陈奕迅"),
+            ("mg", "光年之外 邓紫棋"),
+        ];
+        std::fs::create_dir_all("target/lx_samples").ok();
+        for (source, keyword) in cases {
+            let limit = if *source == "wy" { 30 } else { 3 };
+            let items = crate::music::lx_search::lx_search(source, keyword, limit)
+                .await
+                .unwrap_or_else(|e| panic!("{source} 搜索失败: {e}"));
+            assert!(!items.is_empty(), "{source} 搜索无结果");
+            // 优先取原唱（搜索结果常把翻唱版排在前面）。
+            let origin_singer: &str = if *source == "wy" { "陈奕迅" } else { "周杰伦" };
+            let item = items
+                .iter()
+                .find(|it| it.singer.contains(origin_singer))
+                .unwrap_or(&items[0]);
+            println!("== {source} == {} - {} (songmid={})", item.singer, item.name, item.songmid);
+            // 与 Dart _normalizeLxSearchSong 生成的 lx map 字段一一对应。
+            let lx = serde_json::json!({
+                "songmid": item.songmid,
+                "source": item.source,
+                "hash": item.hash,
+                "name": item.name,
+                "singer": item.singer,
+                "albumName": item.album_name,
+                "albumId": item.album_id,
+                "strMediaMid": item.str_media_mid,
+                "songId": item.song_id,
+                "albumMid": item.album_mid,
+                "copyrightId": item.copyright_id,
+                "interval": item.interval,
+                "_interval": null,
+                "_types": null,
+            });
+            let song_info: LyricSongInfo = serde_json::from_value(lx)
+                .unwrap_or_else(|e| panic!("{source} LyricSongInfo 反序列化失败: {e}"));
+            let result = fetch_lyric_from_source(source.to_string(), song_info)
+                .await
+                .unwrap_or_else(|e| panic!("{source} 歌词抓取失败: {e}"));
+            match result {
+                Some(r) => {
+                    println!(
+                        "== {source} == lyric {}B lxlyric {}B tlyric {}B rlyric {}B",
+                        r.lyric.len(),
+                        r.lxlyric.len(),
+                        r.tlyric.len(),
+                        r.rlyric.len()
+                    );
+                    std::fs::write(
+                        format!("target/lx_samples/{source}.json"),
+                        serde_json::to_string(&r).unwrap(),
+                    )
+                    .unwrap();
+                }
+                None => println!("== {source} == 返回 None（无歌词）"),
+            }
+        }
+    }
+
+    /// 多歌曲实证诊断：模拟真机完整流程（lx_search → Dart _normalizeLxSearchSong
+    /// 等价 JSON → fetch_lyric_from_source → Dart 转换 → parse_lyrics），
+    /// 输出每首歌逐字数据可用性。用于排查真机"部分行有逐字/无逐字"问题。
+    /// 运行：`cargo test -- --ignored --nocapture lx_device_flow_multi_song`
+    #[tokio::test]
+    #[ignore = "依赖网络与各平台接口可用性"]
+    async fn lx_device_flow_multi_song() {
+        let cases: &[(&str, &str, &str)] = &[
+            ("tx", "晴天 周杰伦", "周杰伦"),
+            ("tx", "孤勇者 陈奕迅", "陈奕迅"),
+            ("tx", "泡沫 邓紫棋", "邓紫棋"),
+            ("wy", "孤勇者 陈奕迅", "陈奕迅"),
+            ("wy", "晴天 周杰伦", "周杰伦"),
+            ("wy", "大鱼 周深", "周深"),
+        ];
+        for (source, keyword, origin_singer) in cases {
+            let items = crate::music::lx_search::lx_search(source, keyword, 10)
+                .await
+                .unwrap_or_else(|e| panic!("{source} 搜索失败: {e}"));
+            let item = items
+                .iter()
+                .find(|it| it.singer.contains(origin_singer))
+                .unwrap_or(&items[0]);
+            println!(
+                "\n== {source} == {} - {} (songmid={}, songId={:?})",
+                item.singer,
+                item.name,
+                item.songmid,
+                item.song_id
+            );
+            let lx = serde_json::json!({
+                "songmid": item.songmid,
+                "source": item.source,
+                "hash": item.hash,
+                "name": item.name,
+                "singer": item.singer,
+                "albumName": item.album_name,
+                "albumId": item.album_id,
+                "strMediaMid": item.str_media_mid,
+                "songId": item.song_id,
+                "albumMid": item.album_mid,
+                "copyrightId": item.copyright_id,
+                "interval": item.interval,
+                "_interval": null,
+                "_types": null,
+            });
+            let song_info: LyricSongInfo = serde_json::from_value(lx)
+                .unwrap_or_else(|e| panic!("{source} LyricSongInfo 反序列化失败: {e}"));
+            let result = fetch_lyric_from_source(source.to_string(), song_info)
+                .await
+                .unwrap_or_else(|e| panic!("{source} 歌词抓取失败: {e}"));
+            let r = match result {
+                Some(r) => r,
+                None => {
+                    println!("   结果: None（无任何歌词）");
+                    continue;
+                }
+            };
+            let lx_lines: Vec<&str> = r.lxlyric.lines().filter(|l| !l.trim().is_empty()).collect();
+            let marker_lines = lx_lines
+                .iter()
+                .filter(|l| l.contains('<') && l.contains('>'))
+                .count();
+            println!(
+                "   结果: lyric {}B lxlyric {}B（{} 行，含词级标记 {} 行）",
+                r.lyric.len(),
+                r.lxlyric.len(),
+                lx_lines.len(),
+                marker_lines
+            );
+            if !lx_lines.is_empty() {
+                println!("   lxlyric 首行: {}", &lx_lines[0][..lx_lines[0].len().min(150)]);
+                if lx_lines.len() > 1 {
+                    println!("   lxlyric 次行: {}", &lx_lines[1][..lx_lines[1].len().min(150)]);
+                }
+            }
+        }
+    }
+
+    /// 用户报告曲目实证：wy 国风堂《吹灭小山河》(songId=1412559986)、
+    /// tx《绘笔江南》(songId=227857536, mid=003JK9Ry3DVRhg)。
+    /// 两个 id 均为用户从各自平台确认的目标歌曲，直接走
+    /// fetch_lyric_from_source，断言逐字歌词非空且正文行有词级标记。
+    /// 运行：`cargo test -- --ignored --nocapture lx_user_reported_songs`
+    #[tokio::test]
+    #[ignore = "依赖网络与各平台接口可用性"]
+    async fn lx_user_reported_songs() {
+        // (source, 歌名, songmid, 固定数字 songId 或空串)
+        let cases: &[(&str, &str, &str, &str)] = &[
+            ("wy", "吹灭小山河", "1412559986", ""),
+            ("tx", "绘笔江南", "003JK9Ry3DVRhg", "227857536"),
+        ];
+        for (source, name, songmid, fixed_song_id) in cases {
+            let song_id: Option<serde_json::Value> = if fixed_song_id.is_empty() {
+                None
+            } else {
+                Some(serde_json::json!(fixed_song_id.parse::<u64>().unwrap_or(0)))
+            };
+            let singer = if *source == "wy" { "国风堂、司南" } else { "未知歌手" };
+            let lx = serde_json::json!({
+                "songmid": songmid,
+                "source": source,
+                "hash": null,
+                "name": name,
+                "singer": singer,
+                "albumName": null,
+                "albumId": null,
+                "strMediaMid": null,
+                "songId": song_id,
+                "albumMid": null,
+                "copyrightId": null,
+                "interval": null,
+                "_interval": null,
+                "_types": null,
+            });
+            let song_info: LyricSongInfo = serde_json::from_value(lx)
+                .unwrap_or_else(|e| panic!("{source} LyricSongInfo 反序列化失败: {e}"));
+            let result = fetch_lyric_from_source(source.to_string(), song_info)
+                .await
+                .unwrap_or_else(|e| panic!("{source} 歌词抓取失败: {e}"))
+                .unwrap_or_else(|| panic!("{source} 《{}》未返回任何歌词", name));
+            println!("\n== {source} == 《{}》songmid={}", name, songmid);
+            let lx_lines: Vec<&str> = result
+                .lxlyric
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .collect();
+            let marker_lines = lx_lines
+                .iter()
+                .filter(|l| l.contains('<') && l.contains('>'))
+                .count();
+            println!(
+                "   结果: lyric {}B lxlyric {}B（{} 行，含词级标记 {} 行）",
+                result.lyric.len(),
+                result.lxlyric.len(),
+                lx_lines.len(),
+                marker_lines
+            );
+            if !lx_lines.is_empty() {
+                println!("   lxlyric 首行: {}", &lx_lines[0][..lx_lines[0].len().min(150)]);
+                if lx_lines.len() > 1 {
+                    println!("   lxlyric 次行: {}", &lx_lines[1][..lx_lines[1].len().min(150)]);
+                }
+            }
+            assert!(
+                !result.lxlyric.is_empty(),
+                "{source} 《{}》应有逐字歌词",
+                name
+            );
+            assert!(
+                marker_lines >= lx_lines.len().saturating_sub(3),
+                "{source} 《{}》逐字歌词正文行缺少词级标记（{} 行中仅 {} 行有标记）",
+                name,
+                lx_lines.len(),
+                marker_lines
+            );
+        }
+    }
+
+    /// 诊断：用户报告《泡沫》(songId=1530858, mid=001X0PDf0W4lBq) 在 QQ 源
+    /// 无逐字。直接拉 QRC 解密原文打印前几行，确认其词级标记形态，
+    /// 并跑 fetch_tx_lyric 全链路看 lxlyric 是否为空。
+    /// 运行：`cargo test -- --ignored --nocapture tx_paomo_probe`
+    #[tokio::test]
+    #[ignore = "依赖网络与 QQ 接口可用性"]
+    async fn tx_paomo_probe() {
+        let songmid = "001X0PDf0W4lBq";
+        let song_id = 1530858u64;
+        let req_body = serde_json::json!({
+            "comm": { "uin": "0", "format": "json", "ct": "19", "cv": "1859" },
+            "req": {
+                "module": "music.musichallSong.PlayLyricInfo",
+                "method": "GetPlayLyricInfo",
+                "param": { "songMID": songmid, "songID": song_id, "songType": 0, "qrc": 1, "qrc_t": 1 },
+            },
+        });
+        let resp = http_fetch_text(
+            "https://u.y.qq.com/cgi-bin/musicu.fcg",
+            "POST",
+            &[
+                ("referer", "https://y.qq.com"),
+                ("user-agent", "Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/86.0.4240.198 Safari/537.36"),
+                ("Content-Type", "application/json"),
+            ],
+            Some(&req_body.to_string()),
+        )
+        .await
+        .expect("请求失败");
+        println!("HTTP {}", resp.status);
+        let body: serde_json::Value = serde_json::from_str(&resp.body).expect("JSON 解析失败");
+        let data = body.get("req").and_then(|v| v.get("data"));
+        if data.is_none() {
+            println!("无 req.data，响应: {}", &resp.body[..resp.body.len().min(300)]);
+            return;
+        }
+        let data = data.unwrap();
+        for key in ["lyric", "trans", "roma"] {
+            println!("字段 {key}: {}", data.get(key).map(|v| v.as_str().map(|s| s.len()).unwrap_or(0)).unwrap_or(0));
+        }
+        let hex = data.get("lyric").and_then(|v| v.as_str()).unwrap_or("");
+        if hex.is_empty() {
+            println!("无 QRC lyric 数据");
+            return;
+        }
+        let decrypted = qrc_decrypt(hex).expect("QRC 解密失败");
+        println!("\n--- QRC 原文（前 1200 字节）---\n{}", &decrypted[..decrypted.len().min(1200)]);
+        println!("--- QRC 原文（中段 1200-2400）---\n{}", if decrypted.len() > 1200 { &decrypted[1200..decrypted.len().min(2400)] } else { "" });
+
+        // 全链路
+        let lx = serde_json::json!({
+            "songmid": songmid, "source": "tx", "hash": null,
+            "name": "泡沫", "singer": "邓紫棋", "albumName": null, "albumId": null,
+            "strMediaMid": null, "songId": serde_json::json!(song_id), "albumMid": null,
+            "copyrightId": null, "interval": null, "_interval": null, "_types": null,
+        });
+        let song_info: LyricSongInfo = serde_json::from_value(lx).unwrap();
+        let result = fetch_tx_lyric(&song_info).await.expect("fetch_tx_lyric 失败");
+        if let Some(r) = result {
+            let lines: Vec<&str> = r.lxlyric.lines().filter(|l| !l.trim().is_empty()).collect();
+            let marker = lines.iter().filter(|l| l.contains('<') && l.contains('>')).count();
+            println!("\n全链路: lxlyric {}B（{} 行，词级标记 {} 行）", r.lxlyric.len(), lines.len(), marker);
+            for (i, line) in lines.iter().take(8).enumerate() {
+                println!("lxlyric[{i}]: {}", &line[..line.len().min(160)]);
+            }
+            // 落盘供 Dart 端 lx_convert_check.dart 继续诊断转换链路。
+            let payload = serde_json::json!({
+                "lyric": r.lyric, "tlyric": r.tlyric, "rlyric": r.rlyric, "lxlyric": r.lxlyric,
+            });
+            let dir = std::path::Path::new("target/lx_samples");
+            std::fs::create_dir_all(dir).ok();
+            std::fs::write(
+                dir.join("tx_paomo.json"),
+                serde_json::to_string_pretty(&payload).unwrap(),
+            )
+            .ok();
+            println!("已落盘 target/lx_samples/tx_paomo.json");
+        }
+    }
+
+    /// 用户真实场景复现：app 内“QQ音乐[L1]”播放《泡沫》时 songInfo 来自
+    /// lx_search 搜索结果（songId 字段可能为 null，与用户手填的
+    /// id=1530858 不同）。搜索→取第一条→抓歌词→统计词级行数。
+    /// 运行：`cargo test -- --ignored --nocapture tx_paomo_search_flow`
+    #[tokio::test]
+    #[ignore = "依赖网络与 QQ 接口可用性"]
+    async fn tx_paomo_search_flow() {
+        let items = crate::music::lx_search::lx_search("tx", "泡沫 邓紫棋", 5)
+            .await
+            .expect("搜索失败");
+        assert!(!items.is_empty(), "搜索无结果");
+        let item = items
+            .iter()
+            .find(|it| it.singer.contains("邓紫棋"))
+            .unwrap_or(&items[0]);
+        println!(
+            "搜索命中: {} - {} | songmid={} song_id={:?} strMediaMid={:?}",
+            item.singer, item.name, item.songmid, item.song_id, item.str_media_mid
+        );
+        let lx = serde_json::json!({
+            "songmid": item.songmid, "source": item.source, "hash": item.hash,
+            "name": item.name, "singer": item.singer, "albumName": item.album_name,
+            "albumId": item.album_id, "strMediaMid": item.str_media_mid,
+            "songId": item.song_id, "albumMid": item.album_mid,
+            "copyrightId": item.copyright_id, "interval": item.interval,
+            "_interval": null, "_types": null,
+        });
+        let song_info: LyricSongInfo = serde_json::from_value(lx).unwrap();
+        let result = fetch_lyric_from_source("tx".to_string(), song_info)
+            .await
+            .expect("歌词抓取失败")
+            .expect("未返回歌词");
+        let lines: Vec<&str> = result.lxlyric.lines().filter(|l| !l.trim().is_empty()).collect();
+        let marker = lines.iter().filter(|l| l.contains('<') && l.contains('>')).count();
+        for (i, line) in lines.iter().take(4).enumerate() {
+            println!("lxlyric[{i}]: {}", &line[..line.len().min(130)]);
+        }
+        println!("lxlyric {}B（{} 行，词级标记 {} 行）", result.lxlyric.len(), lines.len(), marker);
+        assert!(marker >= lines.len().saturating_sub(3), "词级行数不足: {marker}/{}", lines.len());
+    }
+
+    /// 诊断：用户报告酷我源“只有歌名逐字”。搜索真实歌曲走
+    /// fetch_lyric_from_source 全链路，打印 lxlyric（含 [kuwo:] 标签与
+    /// <a,b> 加密词标记的原始文本）并落盘，供 Dart 端酷我公式转换验证。
+    /// 运行：`cargo test -- --ignored --nocapture kw_word_probe`
+    #[tokio::test]
+    #[ignore = "依赖网络与酷我接口可用性"]
+    async fn kw_word_probe() {
+        let items = crate::music::lx_search::lx_search("kw", "晴天 周杰伦", 5)
+            .await
+            .expect("搜索失败");
+        assert!(!items.is_empty(), "搜索无结果");
+        let item = &items[0];
+        println!(
+            "搜索命中: {} - {} | songmid={}",
+            item.singer, item.name, item.songmid
+        );
+        let lx = serde_json::json!({
+            "songmid": item.songmid, "source": item.source, "hash": item.hash,
+            "name": item.name, "singer": item.singer, "albumName": item.album_name,
+            "albumId": item.album_id, "strMediaMid": item.str_media_mid,
+            "songId": item.song_id, "albumMid": item.album_mid,
+            "copyrightId": item.copyright_id, "interval": item.interval,
+            "_interval": null, "_types": null,
+        });
+        let song_info: LyricSongInfo = serde_json::from_value(lx).unwrap();
+        let result = fetch_lyric_from_source("kw".to_string(), song_info)
+            .await
+            .expect("歌词抓取失败")
+            .expect("未返回歌词");
+        println!(
+            "\nkw 结果: lyric {}B tlyric {}B lxlyric {}B",
+            result.lyric.len(),
+            result.tlyric.len(),
+            result.lxlyric.len()
+        );
+        println!("\n--- lxlyric（前 900 字节）---\n{}", &result.lxlyric[..result.lxlyric.len().min(900)]);
+        let payload = serde_json::json!({
+            "lyric": result.lyric, "tlyric": result.tlyric,
+            "rlyric": result.rlyric, "lxlyric": result.lxlyric,
+        });
+        let dir = std::path::Path::new("target/lx_samples");
+        std::fs::create_dir_all(dir).ok();
+        std::fs::write(
+            dir.join("kw_qingtian.json"),
+            serde_json::to_string_pretty(&payload).unwrap(),
+        )
+        .ok();
+        println!("已落盘 target/lx_samples/kw_qingtian.json");
+    }
+
+    /// 诊断：用户报告咪咕源“没有逐字”。搜索真实歌曲走
+    /// fetch_lyric_from_source 全链路（MRC 解密 → mg_parse_mrc），
+    /// 统计词级行数并落盘。
+    /// 运行：`cargo test -- --ignored --nocapture mg_word_probe`
+    #[tokio::test]
+    #[ignore = "依赖网络与咪咕接口可用性"]
+    async fn mg_word_probe() {
+        let items = crate::music::lx_search::lx_search("mg", "泡沫 邓紫棋", 5)
+            .await
+            .expect("搜索失败");
+        assert!(!items.is_empty(), "搜索无结果");
+        let item = &items[0];
+        println!(
+            "搜索命中: {} - {} | songmid={}",
+            item.singer, item.name, item.songmid
+        );
+        let lx = serde_json::json!({
+            "songmid": item.songmid, "source": item.source, "hash": item.hash,
+            "name": item.name, "singer": item.singer, "albumName": item.album_name,
+            "albumId": item.album_id, "strMediaMid": item.str_media_mid,
+            "songId": item.song_id, "albumMid": item.album_mid,
+            "copyrightId": item.copyright_id, "interval": item.interval,
+            "_interval": null, "_types": null,
+        });
+        let song_info: LyricSongInfo = serde_json::from_value(lx).unwrap();
+        let result = fetch_lyric_from_source("mg".to_string(), song_info)
+            .await
+            .expect("歌词抓取失败")
+            .expect("未返回歌词");
+        println!(
+            "\nmg 结果: lyric {}B tlyric {}B lxlyric {}B",
+            result.lyric.len(),
+            result.tlyric.len(),
+            result.lxlyric.len()
+        );
+        let lines: Vec<&str> = result.lxlyric.lines().filter(|l| !l.trim().is_empty()).collect();
+        let marker = lines.iter().filter(|l| l.contains('<') && l.contains('>')).count();
+        println!("lxlyric {}B（{} 行，词级标记 {} 行）", result.lxlyric.len(), lines.len(), marker);
+        for (i, line) in lines.iter().take(6).enumerate() {
+            println!("lxlyric[{i}]: {}", &line[..line.len().min(150)]);
+        }
+        let payload = serde_json::json!({
+            "lyric": result.lyric, "tlyric": result.tlyric,
+            "rlyric": result.rlyric, "lxlyric": result.lxlyric,
+        });
+        let dir = std::path::Path::new("target/lx_samples");
+        std::fs::create_dir_all(dir).ok();
+        std::fs::write(
+            dir.join("mg_paomo.json"),
+            serde_json::to_string_pretty(&payload).unwrap(),
+        )
+        .ok();
+        println!("已落盘 target/lx_samples/mg_paomo.json");
+    }
 }

@@ -6,6 +6,7 @@ import 'package:lpinyin/lpinyin.dart';
 import '../../src/favorites/favorites_provider.dart';
 import '../../src/library/library_provider.dart';
 import '../../src/playlists/playlists_provider.dart';
+import '../../src/playlists/playlist_sync.dart' show syncPlaylistWithNotice;
 import '../../src/plugins/plugin_runtime.dart';
 import '../../src/widgets/batch_download.dart';
 import '../../src/widgets/cover_image.dart';
@@ -41,6 +42,26 @@ class _PlaylistDetailPageState extends ConsumerState<PlaylistDetailPage> {
   bool _searchMode = false;
   String _query = '';
   SongSort _sort = const SongSort(SongSortKey.custom);
+
+  /// 悬浮头部（搜索框 + 歌单信息卡 + 歌曲数行）的测量 Key 与实测高度：
+  /// 头部悬浮于列表上方，列表内容滚动时从毛玻璃下方穿过被模糊（与
+  /// 列表浮动按钮组同款观感），列表顶部让出头部高度。
+  final GlobalKey _floatingHeaderKey = GlobalKey();
+  double _floatingHeaderExtent = 190;
+
+  /// 布局完成后用真实高度修正悬浮头部占位，字体缩放等场景自动适配。
+  void _measureFloatingHeader() {
+    if (!mounted) return;
+    final size = _floatingHeaderKey.currentContext?.size;
+    if (size == null || size.height <= 0) return;
+    if ((size.height - _floatingHeaderExtent).abs() > 0.5) {
+      setState(() => _floatingHeaderExtent = size.height);
+    }
+  }
+
+  /// 自定义排序的拖拽编辑模式：已是自定义排序时再次点击“自定义”
+  /// 进入，列表行首显示拖拽手柄；点击“完成”退出，手柄消失。
+  bool _dragEditMode = false;
 
   /// 歌曲列表加载缓存：future 只跟随歌单内容指纹创建一次，
   /// 勾选/搜索等 setState 不会重复触发数据库查询和全屏转圈。
@@ -274,25 +295,13 @@ class _PlaylistDetailPageState extends ConsumerState<PlaylistDetailPage> {
 
     return Scaffold(
       appBar: AppBar(
-        title: _searchMode
-            ? FrostedSearchField(
-                controller: _searchController,
-                focusNode: _searchFocus,
-                autofocus: true,
-                hintText: '搜索歌单中的歌曲',
-                onChanged: (value) =>
-                    setState(() => _query = value.trim().toLowerCase()),
-                // 清除按钮与操作栏「取消」按钮分工：前者清文本，后者退出搜索。
-                showClearSuffix: true,
-                padding: EdgeInsets.zero,
-              )
-            : Text(
-                _switchingSource
-                    ? '换源中 $_switchingDone/$_switchingTotal'
-                    : _selectionMode && _selectedPaths.isNotEmpty
-                    ? '已选 ${_selectedPaths.length} 首'
-                    : playlist.name,
-              ),
+        title: Text(
+          _switchingSource
+              ? '换源中 $_switchingDone/$_switchingTotal'
+              : _selectionMode && _selectedPaths.isNotEmpty
+              ? '已选 ${_selectedPaths.length} 首'
+              : playlist.name,
+        ),
         actions: [
           if (_searchMode)
             TextButton(onPressed: _exitSearch, child: const Text('取消'))
@@ -308,13 +317,36 @@ class _PlaylistDetailPageState extends ConsumerState<PlaylistDetailPage> {
             if (!_selectionMode)
               IconButton(
                 tooltip: '多选',
-                onPressed: () => setState(() => _selectionMode = true),
+                onPressed: () => setState(() {
+                  _selectionMode = true;
+                  // 多选与拖拽编辑互斥，进入多选时收起拖拽手柄。
+                  _dragEditMode = false;
+                }),
                 icon: const Icon(Icons.library_add_check_rounded),
               ),
-            SongSortMenuButton(
-              sort: _sort,
-              onSortChanged: (sort) => setState(() => _sort = sort),
-            ),
+            if (_dragEditMode)
+              // 拖拽编辑模式：点击“完成”收起拖拽手柄。
+              TextButton(
+                onPressed: () => setState(() => _dragEditMode = false),
+                child: const Text('完成'),
+              )
+            else
+              SongSortMenuButton(
+                sort: _sort,
+                onSortChanged: (sort) {
+                  setState(() {
+                    // 已处于自定义排序时再次点击“自定义”：
+                    // 进入/退出拖拽编辑模式（手柄随之显隐）。
+                    if (sort.key == SongSortKey.custom &&
+                        _sort.key == SongSortKey.custom) {
+                      _dragEditMode = !_dragEditMode;
+                    } else {
+                      _sort = sort;
+                      _dragEditMode = false;
+                    }
+                  });
+                },
+              ),
             IconButton(
               tooltip: '搜索',
               onPressed: _enterSearch,
@@ -347,92 +379,166 @@ class _PlaylistDetailPageState extends ConsumerState<PlaylistDetailPage> {
             playlist!,
           );
           _visibleSongs = visibleSongs;
+          // 布局完成后修正悬浮头部占位高度。
+          WidgetsBinding.instance.addPostFrameCallback(
+            (_) => _measureFloatingHeader(),
+          );
+          // 搜索框（搜索时）+ 歌单信息卡 + 歌曲数行悬浮于列表上方：列表
+          // 内容滚动时从毛玻璃下方穿过被模糊，与列表浮动按钮组观感一致。
           return Column(
             children: [
-              _PlaylistHeroHeader(
-                playlist: playlist,
-                songs: songs,
-                onPlayAll: songs.isEmpty
-                    ? null
-                    : () => ref
-                          .read(libraryProvider.notifier)
-                          .playAll(_applySort(songs, playlist!)),
-              ),
-              if (songs.isEmpty)
-                Expanded(
-                  child: Center(
-                    child: Padding(
-                      padding: const EdgeInsets.only(bottom: 110),
-                      child: Text(
-                        '歌单中暂无可用歌曲',
-                        style: TextStyle(
-                          color: Theme.of(context).colorScheme.onSurfaceVariant,
+              Expanded(
+                child: Stack(
+                  children: [
+                    Positioned.fill(
+                      child: Padding(
+                        padding: EdgeInsets.only(
+                          top: songs.isEmpty || visibleSongs.isEmpty
+                              ? 0
+                              : _floatingHeaderExtent,
                         ),
+                        child: songs.isEmpty
+                            ? Center(
+                                child: Padding(
+                                  padding: const EdgeInsets.only(bottom: 110),
+                                  child: Text(
+                                    '歌单中暂无可用歌曲',
+                                    style: TextStyle(
+                                      color: Theme.of(
+                                        context,
+                                      ).colorScheme.onSurfaceVariant,
+                                    ),
+                                  ),
+                                ),
+                              )
+                            : visibleSongs.isEmpty
+                            ? Center(
+                                child: Padding(
+                                  padding: const EdgeInsets.only(bottom: 110),
+                                  child: Text(
+                                    '未找到匹配的歌曲',
+                                    style: TextStyle(
+                                      color: Theme.of(
+                                        context,
+                                      ).colorScheme.onSurfaceVariant,
+                                    ),
+                                  ),
+                                ),
+                              )
+                            : SongsListView(
+                                songs: visibleSongs,
+                                // 悬浮元素遮挡高度已注入 MediaQuery.padding；
+                                // 多选时底部横排菜单自带安全区 padding，列表留 12 即可。
+                                padding: EdgeInsets.fromLTRB(
+                                  10,
+                                  0,
+                                  10,
+                                  _selectionMode
+                                      ? 12
+                                      : MediaQuery.paddingOf(context).bottom +
+                                            12,
+                                ),
+                                selectionMode: _selectionMode,
+                                isSelected: (song) =>
+                                    _selectedPaths.contains(song.path),
+                                onToggleSelection: _toggleSelection,
+                                // 搜索过滤时下标与歌单全量不一致，禁止拖拽；
+                                // 拖拽手柄仅在自定义排序的编辑模式中显示。
+                                onReorder:
+                                    _sort.key == SongSortKey.custom &&
+                                        _dragEditMode &&
+                                        query.isEmpty
+                                    ? _onReorder
+                                    : null,
+                                onPlay: (list, index) => ref
+                                    .read(libraryProvider.notifier)
+                                    .playList(list, index),
+                                // 更多菜单中的单曲移出（与多选移出一致，不删文件）。
+                                onRemoveAction: (song) async {
+                                  await ref
+                                      .read(playlistsProvider.notifier)
+                                      .removeSongs(widget.playlistId, [
+                                        song.path,
+                                      ]);
+                                  if (context.mounted) {
+                                    XyNotice.show(
+                                      context,
+                                      message: '已移出歌单',
+                                      type: XyNoticeType.success,
+                                    );
+                                  }
+                                },
+                                removeActionLabel: '移出歌单',
+                              ),
                       ),
                     ),
-                  ),
-                )
-              else if (visibleSongs.isEmpty)
-                Expanded(
-                  child: Center(
-                    child: Padding(
-                      padding: const EdgeInsets.only(bottom: 110),
-                      child: Text(
-                        '未找到匹配的歌曲',
-                        style: TextStyle(
-                          color: Theme.of(context).colorScheme.onSurfaceVariant,
-                        ),
-                      ),
-                    ),
-                  ),
-                )
-              else
-                Expanded(
-                  child: Column(
-                    children: [
-                      Padding(
-                        padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
-                        child: Row(
+                    Positioned(
+                      top: 0,
+                      left: 0,
+                      right: 0,
+                      child: KeyedSubtree(
+                        key: _floatingHeaderKey,
+                        child: Column(
                           children: [
-                            Text(
-                              query.isEmpty
-                                  ? '${songs.length} 首歌曲'
-                                  : '${visibleSongs.length} / ${songs.length} 首歌曲',
+                            if (_searchMode)
+                              Padding(
+                                padding: const EdgeInsets.fromLTRB(16, 4, 16, 4),
+                                child: FrostedSearchField(
+                                  controller: _searchController,
+                                  focusNode: _searchFocus,
+                                  autofocus: true,
+                                  hintText: '搜索歌单中的歌曲',
+                                  onChanged: (value) => setState(
+                                    () => _query = value.trim().toLowerCase(),
+                                  ),
+                                  // 清除按钮与操作栏「取消」按钮分工：前者清
+                                  // 文本，后者退出搜索。
+                                  showClearSuffix: true,
+                                  padding: EdgeInsets.zero,
+                                ),
+                              ),
+                            _PlaylistHeroHeader(
+                              playlist: playlist,
+                              songs: songs,
+                              onPlayAll: songs.isEmpty
+                                  ? null
+                                  : () => ref
+                                        .read(libraryProvider.notifier)
+                                        .playAll(_applySort(songs, playlist!)),
+                              onSyncSource: playlist.importSources.isEmpty
+                                  ? null
+                                  : () => syncPlaylistWithNotice(
+                                      context,
+                                      ref,
+                                      playlist!,
+                                    ),
                             ),
-                            const Spacer(),
+                            if (songs.isNotEmpty && visibleSongs.isNotEmpty)
+                              Padding(
+                                padding: const EdgeInsets.fromLTRB(
+                                  16,
+                                  0,
+                                  16,
+                                  8,
+                                ),
+                                child: Row(
+                                  children: [
+                                    Text(
+                                      query.isEmpty
+                                          ? '${songs.length} 首歌曲'
+                                          : '${visibleSongs.length} / ${songs.length} 首歌曲',
+                                    ),
+                                    const Spacer(),
+                                  ],
+                                ),
+                              ),
                           ],
                         ),
                       ),
-                      Expanded(
-                        child: SongsListView(
-                          songs: visibleSongs,
-                          // 悬浮元素遮挡高度已注入 MediaQuery.padding；
-                          // 多选时底部横排菜单自带安全区 padding，列表留 12 即可。
-                          padding: EdgeInsets.fromLTRB(
-                            10,
-                            0,
-                            10,
-                            _selectionMode
-                                ? 12
-                                : MediaQuery.paddingOf(context).bottom + 12,
-                          ),
-                          selectionMode: _selectionMode,
-                          isSelected: (song) =>
-                              _selectedPaths.contains(song.path),
-                          onToggleSelection: _toggleSelection,
-                          // 搜索过滤时下标与歌单全量不一致，禁止拖拽。
-                          onReorder:
-                              _sort.key == SongSortKey.custom && query.isEmpty
-                              ? _onReorder
-                              : null,
-                          onPlay: (list, index) => ref
-                              .read(libraryProvider.notifier)
-                              .playList(list, index),
-                        ),
-                      ),
-                    ],
-                  ),
+                    ),
+                  ],
                 ),
+              ),
               // 多选底部横排菜单（参考闲鱼音乐）：全选/收藏/下载/换源/移出。
               // 底部 padding 取注入后的 MediaQuery（系统安全区+自定义底栏
               // 与迷你播放栏的遮挡高度），保证不被悬浮元素盖住。
@@ -600,11 +706,15 @@ class _PlaylistHeroHeader extends StatelessWidget {
     required this.playlist,
     required this.songs,
     required this.onPlayAll,
+    this.onSyncSource,
   });
 
   final MobilePlaylist playlist;
   final List<Song> songs;
   final VoidCallback? onPlayAll;
+
+  /// 存在导入来源时的「同步来源」回调（拉取来源最新内容）。
+  final VoidCallback? onSyncSource;
 
   @override
   Widget build(BuildContext context) {
@@ -642,7 +752,10 @@ class _PlaylistHeroHeader extends StatelessWidget {
                 ),
                 const SizedBox(height: 8),
                 Text(
-                  '本地歌单 · ${songs.length} 首歌曲',
+                  playlist.importSources.isEmpty
+                      ? '本地歌单 · ${songs.length} 首歌曲'
+                      : '本地歌单 · ${songs.length} 首歌曲'
+                        ' · ${playlist.importSources.length} 个来源',
                   style: TextStyle(
                     color: theme.colorScheme.onSurfaceVariant,
                     fontSize: 13,
@@ -658,6 +771,12 @@ class _PlaylistHeroHeader extends StatelessWidget {
                       icon: const Icon(Icons.play_arrow_rounded),
                       label: const Text('播放全部'),
                     ),
+                    if (onSyncSource != null)
+                      OutlinedButton.icon(
+                        onPressed: onSyncSource,
+                        icon: const Icon(Icons.sync_rounded),
+                        label: const Text('同步来源'),
+                      ),
                   ],
                 ),
               ],

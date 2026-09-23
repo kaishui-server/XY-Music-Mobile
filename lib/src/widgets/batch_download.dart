@@ -267,6 +267,48 @@ class _BatchDownloadOptionsDialogState
       qualityDisplayLabel(quality);
 }
 
+/// 确保 SAF 下载目录仍可写：授权失效（重装应用/恢复备份/系统回收后
+/// 持久化授权丢失）时引导用户重新选择目录，并同步更新下载路径设置。
+///
+/// 返回可用于本次下载的目录（授权正常时原样返回 [directory]，重新选择
+/// 后返回新目录）；用户取消或选择失败时返回 null，调用方应中止下载。
+Future<String?> ensureSafDirectoryAccess(
+  BuildContext context,
+  WidgetRef ref,
+  String directory,
+) async {
+  if (!AndroidStorage.isTreeUri(directory)) return directory;
+  if (await AndroidStorage.hasDirectoryGrant(directory)) return directory;
+  if (!context.mounted) return null;
+  final ok = await showDialog<bool>(
+    context: context,
+    useRootNavigator: true,
+    builder: (dialogContext) => AlertDialog(
+      title: const Text('下载目录授权失效'),
+      content: const Text(
+        '当前下载目录（SAF 文件夹）的访问授权已丢失，通常发生在重装应用或'
+        '恢复备份之后。\n\n请重新选择下载目录，选择同一文件夹即可保留原目录。',
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(dialogContext, false),
+          child: const Text('取消'),
+        ),
+        FilledButton(
+          onPressed: () => Navigator.pop(dialogContext, true),
+          child: const Text('重新选择'),
+        ),
+      ],
+    ),
+  );
+  if (ok != true || !context.mounted) return null;
+  final picked = await AndroidStorage.pickDirectory();
+  final trimmed = picked?.trim() ?? '';
+  if (trimmed.isEmpty) return null;
+  await ref.read(settingsProvider.notifier).setDownloadPath(trimmed);
+  return trimmed;
+}
+
 /// 批量下载选中的歌曲（收藏页与歌单详情页共用）。
 ///
 /// 逐首解析音源并下载，写入下载历史（下载管理页可见进度），
@@ -303,6 +345,23 @@ Future<void> runBatchDownload(
     await settingsNotifier.setAskDownloadDetails(false);
   }
   if (!context.mounted) return;
+  // SAF 目录授权校验：重装应用或恢复备份后持久化授权会丢失，直接写入
+  // 会被系统以 MANAGE_DOCUMENTS 权限拒绝；失效时引导重新选择目录。
+  final downloadDirectory = await ensureSafDirectoryAccess(
+    context,
+    ref,
+    options.directory.trim(),
+  );
+  if (downloadDirectory == null) {
+    if (context.mounted) {
+      XyNotice.show(
+        context,
+        message: '已取消下载：下载目录未授权',
+        type: XyNoticeType.warning,
+      );
+    }
+    return;
+  }
   var success = 0;
   var skipped = 0;
   var failed = 0;
@@ -311,10 +370,10 @@ Future<void> runBatchDownload(
   final downgraded = <String>[];
   final failureReasons = <String>[];
   try {
-    final usesSafDirectory = AndroidStorage.isTreeUri(options.directory);
+    final usesSafDirectory = AndroidStorage.isTreeUri(downloadDirectory);
     final workDirectory = usesSafDirectory
         ? await resolveDownloadStagingDirectory()
-        : options.directory;
+        : downloadDirectory;
     await Directory(workDirectory).create(recursive: true);
     final notifier = ref.read(playerProvider.notifier);
     final historyNotifier = ref.read(downloadHistoryProvider.notifier);
@@ -402,7 +461,7 @@ Future<void> runBatchDownload(
         var finalPath = verified.path;
         if (usesSafDirectory) {
           finalPath = await AndroidStorage.copyFileToDirectory(
-            directoryUri: options.directory,
+            directoryUri: downloadDirectory,
             sourcePath: verified.path,
             fileName: p.basename(verified.path),
             mimeType: 'audio/*',
@@ -410,7 +469,7 @@ Future<void> runBatchDownload(
           final lrcPath = p.setExtension(verified.path, '.lrc');
           if (await File(lrcPath).exists()) {
             await AndroidStorage.copyFileToDirectory(
-              directoryUri: options.directory,
+              directoryUri: downloadDirectory,
               sourcePath: lrcPath,
               fileName: p.basename(lrcPath),
               mimeType: 'text/plain',

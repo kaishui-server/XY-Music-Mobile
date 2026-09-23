@@ -3646,6 +3646,56 @@ mod tests {
         ParsedLineSourceFormat,
     };
 
+    /// 端到端：泡沫（QQ QRC）样本经 Dart convertLxLyricToEnhancedLrc 落盘的
+    /// 增强 LRC，喂给 build_structured_lyrics_payload（App 真实解析路径），
+    /// 断言所有展示行都带词级时间（用户反馈“正文只有第一行逐字”）。
+    /// 样本由 test/lx_convert_check.dart（LX_SAMPLE=tx_paomo.json）生成；
+    /// 不存在时跳过。
+    #[test]
+    fn parses_paomo_enhanced_lrc_all_lines_word_timed() {
+        assert_enhanced_lrc_all_lines_word_timed("target/lx_samples/tx_paomo_enhanced.lrc");
+    }
+
+    /// 端到端：酷我《晴天》kly 样本（修复酷我公式漏加行首时间后）经
+    /// Dart 转换落盘的增强 LRC。样本由 lx_convert_check.dart
+    /// （LX_SAMPLE=kw_qingtian.json）生成；不存在时跳过。
+    #[test]
+    fn parses_kw_qingtian_enhanced_lrc_all_lines_word_timed() {
+        assert_enhanced_lrc_all_lines_word_timed("target/lx_samples/kw_qingtian_enhanced.lrc");
+    }
+
+    /// 端到端：咪咕《泡沫》MRC 样本经 Dart 转换落盘的增强 LRC。
+    /// 样本由 lx_convert_check.dart（LX_SAMPLE=mg_paomo.json）生成；
+    /// 不存在时跳过。
+    #[test]
+    fn parses_mg_paomo_enhanced_lrc_all_lines_word_timed() {
+        assert_enhanced_lrc_all_lines_word_timed("target/lx_samples/mg_paomo_enhanced.lrc");
+    }
+
+    fn assert_enhanced_lrc_all_lines_word_timed(path: &str) {
+        let Ok(raw) = std::fs::read_to_string(path) else {
+            println!("{path} 样本不存在，跳过");
+            return;
+        };
+        let payload = build_structured_lyrics_payload(raw);
+        let total = payload.display_lines.len();
+        let word_timed = payload
+            .display_lines
+            .iter()
+            .filter(|l| l.words.as_ref().is_some_and(|w| !w.is_empty()))
+            .count();
+        for (i, line) in payload.display_lines.iter().take(4).enumerate() {
+            let word_count = line.words.as_ref().map(|w| w.len()).unwrap_or(0);
+            println!("[{i}] {} 词级={word_count} {}", line.time, line.text);
+        }
+        println!("display_lines: {total}, word_timed: {word_timed}");
+        assert!(total > 5, "行数过少: {total}");
+        assert_eq!(
+            word_timed, total,
+            "应所有行都有词级时间，实际 {word_timed}/{total}"
+        );
+    }
+
     #[test]
     fn parses_inline_timestamp_lrc_into_word_timed_lines() {
         let parsed = parse_raw_lyrics(

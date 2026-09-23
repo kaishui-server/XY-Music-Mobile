@@ -10,7 +10,10 @@ import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:go_router/go_router.dart';
 import 'package:http/http.dart' as http;
+import 'package:just_audio/just_audio.dart';
+import 'package:just_audio_background/just_audio_background.dart';
 import 'package:path/path.dart' as p;
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:video_player/video_player.dart';
@@ -18,6 +21,7 @@ import 'package:video_player/video_player.dart';
 import '../../src/core/db_path.dart';
 import '../../src/core/settings.dart';
 import '../../src/auth/auth_provider.dart';
+import '../../src/effects/effects_provider.dart';
 import '../../src/favorites/favorites_provider.dart';
 import '../../src/lyrics/lyrics_models.dart';
 import '../../src/player/player_provider.dart';
@@ -28,10 +32,13 @@ import '../../src/player/android_storage.dart';
 import '../../src/player/download_quality.dart';
 import '../../src/player/video_playback_session.dart';
 import '../../src/playlists/playlists_provider.dart';
+import '../../src/playlists/playlist_picker_sheet.dart';
 import '../../src/plugins/plugin_runtime.dart';
 import '../../src/rust/api.dart';
 import '../../src/rust/music/types.dart';
 import '../../src/share/share_sheet.dart';
+import 'vinyl_tonearm.dart';
+import '../../src/widgets/batch_download.dart';
 import '../../src/widgets/cover_image.dart';
 import '../../src/widgets/queue_sheet.dart';
 import '../../src/widgets/source_switch.dart';
@@ -88,17 +95,6 @@ String _displayLinesToLrc(dynamic payload) {
     }
   }
   return output.join('\n');
-}
-
-enum _PlayerMenuAction {
-  share,
-  playlist,
-  coverStyle,
-  switchSource,
-  restoreSource,
-  sleepTimer,
-  playbackSpeed,
-  comments,
 }
 
 enum _LyricsSourceAction { plugin, local, cancel }
@@ -189,11 +185,6 @@ String _sleepTimerLabel(DateTime? endsAt) {
       : '剩余 ${_formatSleepDuration(Duration(seconds: seconds))}';
 }
 
-/// 倍速展示标签：整数省略小数位（1x），小数保留一位（1.25x）。
-String _formatPlaybackSpeed(double speed) => speed == speed.roundToDouble()
-    ? speed.toStringAsFixed(0)
-    : speed.toStringAsFixed(1);
-
 bool _isBilibiliQueueItem(QueueItem item) {
   final raw = item.pluginData;
   final values = <String>[
@@ -270,6 +261,27 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
   bool _resumeAudioAfterVideo = false;
   /// MV 横屏播放开关：开启后锁定横向屏幕方向，关闭或退出视频时恢复。
   bool _videoLandscape = false;
+  /// 当前视频分辨率（B 站/插件解析时的画质档位，如 1080P），顶部副标题
+  /// 与画质切换入口使用。MV 默认请求最高档（2160P），插件按可用档位
+  /// 回落并返回实际选中画质；B 站视频歌曲初始请求 1080P。
+  String _videoQuality = '1080P';
+  /// 插件返回的当前 MV 可用画质 key 列表（如 ["360p","720p","1080p"]），
+  /// 画质选择入口动态展示；插件未提供时回退到内置档位。
+  List<String> _videoAvailableQualities = const [];
+
+  /// 视频画质展示文案：插件回传了实际档位（含回落结果）时显示该档位；
+  /// 插件未回传时把「最高档」请求哨兵值显示为「自动」，避免误导。
+  String get _displayVideoQuality {
+    if (_videoQuality == '2160P' && _videoAvailableQualities.isEmpty) {
+      return '自动';
+    }
+    return _videoQuality.toUpperCase();
+  }
+  /// 视频静音开关（控制栏音量按钮）。
+  bool _videoMuted = false;
+  /// 当前视频是否为插件 MV（画质切换时决定走 resolveMvSource 还是
+  /// resolveVideoSource，后者需要传 path）。
+  bool _videoIsMv = false;
   String? _videoError;
   VoidCallback? _videoControllerListener;
   // 后台久置自动关闭视频的守护已上移到应用级 PlayerNotifier
@@ -570,6 +582,7 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
       _videoSongPath = item.path;
       _videoLoading = true;
       _videoClosing = false;
+      _videoIsMv = isMv;
       _resumeAudioAfterVideo = resumeAudio;
       _videoError = null;
     });
@@ -581,20 +594,34 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
     VideoPlaybackSession.error = null;
     VideoPlaybackSession.changed();
     try {
+      // MV 请求「最高档」哨兵值 2160P：baka 系插件按可用档位自动回落
+      // 并在返回值里给出实际画质；B 站视频歌曲请求 1080P（匿名最高档）。
+      final initialQuality = isMv ? '2160P' : '1080P';
+      _videoQuality = initialQuality;
+      _videoAvailableQualities = const [];
+      _videoMuted = false;
       final source = isMv
           ? await ref
                 .read(pluginRuntimeProvider)
-                .resolveMvSource(plugin, pluginData)
+                .resolveMvSource(plugin, pluginData,
+                    videoQuality: initialQuality)
                 .timeout(const Duration(seconds: 25))
           : await ref
                 .read(pluginRuntimeProvider)
                 .resolveVideoSource(
                   plugin,
                   pluginData,
-                  videoQuality: '720P',
+                  videoQuality: initialQuality,
                   path: item.path,
                 )
                 .timeout(const Duration(seconds: 25));
+      // 插件实际选中的画质优先于请求值（回落后的真实档位）。
+      if (source.selectedQuality?.trim().isNotEmpty == true) {
+        _videoQuality = source.selectedQuality!.trim();
+      }
+      if (source.availableQualities.isNotEmpty) {
+        _videoAvailableQualities = source.availableQualities;
+      }
       if (!mounted || _videoSongPath != item.path) return;
       VideoPlayerController? controller;
       Object? lastVideoError;
@@ -677,6 +704,386 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
     }
   }
 
+  /// 控制栏「画质」入口：优先展示插件返回的可用档位，未提供时回退
+  /// 到内置档位；按需切换。
+  Future<void> _pickVideoQuality() async {
+    final qualities = _videoAvailableQualities.isNotEmpty
+        ? _videoAvailableQualities
+        : const ['1080P', '720P', '480P'];
+    bool isSameQuality(String left, String right) =>
+        left.toLowerCase() == right.toLowerCase();
+    final picked = await showModalBottomSheet<String>(
+      context: context,
+      backgroundColor: Theme.of(context).colorScheme.surface,
+      builder: (sheetContext) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Padding(
+              padding: EdgeInsets.fromLTRB(20, 16, 20, 8),
+              child: Align(
+                alignment: Alignment.centerLeft,
+                child: Text('画质选择'),
+              ),
+            ),
+            for (final quality in qualities)
+              ListTile(
+                dense: true,
+                title: Text(
+                  isSameQuality(quality, _videoQuality)
+                      ? '${quality.toUpperCase()}（当前）'
+                      : quality.toUpperCase(),
+                ),
+                trailing: isSameQuality(quality, _videoQuality)
+                    ? const Icon(Icons.check_rounded, size: 18)
+                    : null,
+                onTap: () => Navigator.of(sheetContext).pop(quality),
+              ),
+            const SizedBox(height: 8),
+          ],
+        ),
+      ),
+    );
+    if (picked == null || isSameQuality(picked, _videoQuality)) return;
+    await _switchVideoQuality(picked);
+  }
+
+  /// 切换视频画质：重新解析目标档位的播放地址，无缝替换控制器
+  /// （保持播放进度与播放/暂停状态）；解析或起播失败时提示并保留原画质。
+  Future<void> _switchVideoQuality(String quality) async {
+    final item = ref.read(playerProvider).current;
+    if (item == null || _videoSongPath != item.path || _videoLoading) return;
+    final pluginData = item.pluginData;
+    if (pluginData == null || pluginData.isEmpty) return;
+    EnabledMusicPlugin? plugin;
+    try {
+      final plugins = await ref.read(enabledMusicPluginsProvider.future);
+      plugin = plugins.where((value) => value.id == item.pluginId).firstOrNull;
+    } catch (_) {
+      plugin = null;
+    }
+    if (plugin == null) {
+      if (mounted) {
+        XyNotice.show(
+          context,
+          message: '歌曲所属插件已停用或删除',
+          type: XyNoticeType.error,
+        );
+      }
+      return;
+    }
+    final oldController = _videoController;
+    final resumePosition = oldController?.value.position ?? Duration.zero;
+    final wasPlaying = oldController?.value.isPlaying ?? true;
+    final previousSpeed = oldController?.value.playbackSpeed ?? 1.0;
+    setState(() => _videoLoading = true);
+    try {
+      final runtime = ref.read(pluginRuntimeProvider);
+      final source = _videoIsMv
+          ? await runtime
+                .resolveMvSource(plugin, pluginData, videoQuality: quality)
+                .timeout(const Duration(seconds: 25))
+          : await runtime
+                .resolveVideoSource(
+                  plugin,
+                  pluginData,
+                  videoQuality: quality,
+                  path: item.path,
+                )
+                .timeout(const Duration(seconds: 25));
+      if (!mounted || _videoSongPath != item.path) return;
+      VideoPlayerController? nextController;
+      Object? lastError;
+      for (final url in <String>[source.url, ...source.backupUrls]) {
+        VideoPlayerController? candidate;
+        try {
+          candidate = VideoPlayerController.networkUrl(
+            Uri.parse(url),
+            httpHeaders: source.headers,
+            videoPlayerOptions: VideoPlayerOptions(
+              allowBackgroundPlayback: true,
+              mixWithOthers: true,
+            ),
+          );
+          await candidate.initialize();
+          nextController = candidate;
+          break;
+        } catch (error) {
+          lastError = error;
+          try {
+            await candidate?.dispose();
+          } catch (_) {}
+        }
+      }
+      if (nextController == null) {
+        throw lastError ?? Exception('该画质暂不可用');
+      }
+      if (!mounted || _videoSongPath != item.path) {
+        await nextController.dispose();
+        return;
+      }
+      // 新控制器承接旧状态：进度、播放状态、倍速、静音，切换无感。
+      await nextController.setPlaybackSpeed(previousSpeed);
+      if (_videoMuted) {
+        await nextController.setVolume(0);
+      }
+      if (resumePosition > Duration.zero) {
+        await nextController.seekTo(resumePosition);
+      }
+      _bindVideoController(nextController);
+      _videoController = nextController;
+      VideoPlaybackSession.controller = nextController;
+      VideoPlaybackSession.loading = false;
+      VideoPlaybackSession.changed();
+      VideoPlaybackSession.progressChanged();
+      // 实际选中画质优先（插件可能对请求档位回落），并刷新可用档位。
+      final appliedQuality =
+          source.selectedQuality?.trim().isNotEmpty == true
+          ? source.selectedQuality!.trim()
+          : quality;
+      if (source.availableQualities.isNotEmpty) {
+        _videoAvailableQualities = source.availableQualities;
+      }
+      setState(() {
+        _videoQuality = appliedQuality;
+        _videoLoading = false;
+      });
+      if (wasPlaying) {
+        await nextController.play();
+      } else {
+        await nextController.pause();
+      }
+      // 旧控制器已解绑，直接释放其原生纹理。
+      _unbindVideoController(oldController);
+      if (oldController != null &&
+          VideoPlaybackSession.controller != oldController) {
+        await oldController.dispose();
+      }
+    } catch (error) {
+      if (!mounted || _videoSongPath != item.path) return;
+      setState(() => _videoLoading = false);
+      XyNotice.show(
+        context,
+        message: '切换 $quality 失败：${_errorText(error)}',
+        type: XyNoticeType.error,
+      );
+    }
+  }
+
+  /// 控制栏「倍速」入口：弹出速度选择（仅作用于当前视频）。
+  Future<void> _pickVideoSpeed() async {
+    final controller = _videoController;
+    if (controller == null) return;
+    const speeds = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0];
+    final current = controller.value.playbackSpeed;
+    final picked = await showModalBottomSheet<double>(
+      context: context,
+      backgroundColor: Theme.of(context).colorScheme.surface,
+      builder: (sheetContext) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Padding(
+              padding: EdgeInsets.fromLTRB(20, 16, 20, 8),
+              child: Align(
+                alignment: Alignment.centerLeft,
+                child: Text('倍速选择'),
+              ),
+            ),
+            for (final speed in speeds)
+              ListTile(
+                dense: true,
+                title: Text(
+                  speed == 1.0
+                      ? '1x（正常）'
+                      : '${speed == speed.truncateToDouble() ? speed.truncate() : speed}x',
+                ),
+                trailing: (speed - current).abs() < 0.01
+                    ? const Icon(Icons.check_rounded, size: 18)
+                    : null,
+                onTap: () => Navigator.of(sheetContext).pop(speed),
+              ),
+            const SizedBox(height: 8),
+          ],
+        ),
+      ),
+    );
+    if (picked == null) return;
+    await controller.setPlaybackSpeed(picked);
+  }
+
+  /// 控制栏音量按钮：静音/恢复切换（视频音量归一为 0 或 1）。
+  Future<void> _toggleVideoMute() async {
+    final controller = _videoController;
+    if (controller == null) return;
+    setState(() => _videoMuted = !_videoMuted);
+    await controller.setVolume(_videoMuted ? 0 : 1);
+  }
+
+  /// 控制栏「下载」入口：下载当前画质的视频到音乐下载目录。
+  /// 复用歌曲下载链路（下载历史进度 + SAF 目录授权 + staging 中转），
+  /// 但不写音频元数据、不进入「已下载歌曲」库。
+  Future<void> _downloadCurrentVideo() async {
+    final item = ref.read(playerProvider).current;
+    if (item == null || _videoSongPath != item.path) return;
+    final pluginData = item.pluginData;
+    if (pluginData == null || pluginData.isEmpty) {
+      XyNotice.show(
+        context,
+        message: '该视频不支持下载',
+        type: XyNoticeType.warning,
+      );
+      return;
+    }
+    // 视频下载在历史记录中以「#video」后缀与音频下载区分。
+    final videoSourcePath = '${item.path}#video';
+    final historyNotifier = ref.read(downloadHistoryProvider.notifier);
+    if (historyNotifier.hasActiveDownload(videoSourcePath)) {
+      XyNotice.show(
+        context,
+        message: '该 MV 正在下载中，可在“下载管理”查看进度',
+      );
+      return;
+    }
+    final settings = ref.read(settingsProvider).valueOrNull;
+    final initialDirectory = await resolveMusicDownloadDirectory(settings);
+    if (!mounted) return;
+    final downloadDirectory = await ensureSafDirectoryAccess(
+      context,
+      ref,
+      initialDirectory,
+    );
+    if (!mounted) return;
+    if (downloadDirectory == null) {
+      XyNotice.show(
+        context,
+        message: '已取消下载：下载目录未授权',
+        type: XyNoticeType.warning,
+      );
+      return;
+    }
+    EnabledMusicPlugin? plugin;
+    try {
+      final plugins = await ref.read(enabledMusicPluginsProvider.future);
+      plugin = plugins.where((value) => value.id == item.pluginId).firstOrNull;
+    } catch (_) {
+      plugin = null;
+    }
+    if (plugin == null) {
+      if (mounted) {
+        XyNotice.show(
+          context,
+          message: '歌曲所属插件已停用或删除',
+          type: XyNoticeType.error,
+        );
+      }
+      return;
+    }
+    final videoDuration =
+        _videoController?.value.duration ??
+        Duration(milliseconds: item.durationMs);
+    final historyId = historyNotifier.begin(
+      title: '${item.title}（MV）',
+      artist: item.artist,
+      album: item.album,
+      quality: _displayVideoQuality,
+      durationMs: videoDuration.inMilliseconds,
+      sourcePath: videoSourcePath,
+      pluginId: item.pluginId,
+      pluginData: item.pluginData,
+      coverUrl: item.coverUrl,
+    );
+    try {
+      final runtime = ref.read(pluginRuntimeProvider);
+      // 重新解析当前画质拿最新地址：播放中的 URL 可能已接近过期。
+      final source = _videoIsMv
+          ? await runtime
+                .resolveMvSource(plugin, pluginData,
+                    videoQuality: _videoQuality)
+                .timeout(const Duration(seconds: 25))
+          : await runtime
+                .resolveVideoSource(
+                  plugin,
+                  pluginData,
+                  videoQuality: _videoQuality,
+                  path: item.path,
+                )
+                .timeout(const Duration(seconds: 25));
+      if (ref.read(playerProvider).current?.path != item.path) {
+        throw Exception('歌曲已切换，请重新选择下载');
+      }
+      final usesSafDirectory = AndroidStorage.isTreeUri(downloadDirectory);
+      final workDirectory = usesSafDirectory
+          ? await resolveDownloadStagingDirectory()
+          : downloadDirectory;
+      await Directory(workDirectory).create(recursive: true);
+      final basename = await buildDownloadBasename(
+        title: item.title,
+        artist: item.artist,
+        album: item.album,
+        fileNameStyle: 'artist-title',
+      );
+      final fileName = '$basename [$_displayVideoQuality].mp4';
+      final destination = await resolveDownloadPath(
+        directory: workDirectory,
+        fileName: fileName,
+        overwriteExisting: false,
+      );
+      final savedPath = await trackDownloadProgress(
+        history: historyNotifier,
+        entryId: historyId,
+        url: source.url,
+        headers: source.headers,
+        destPath: destination,
+        download: () => downloadOnlineSong(
+          url: source.url,
+          destPath: destination,
+          headersJson: jsonEncode(source.headers),
+        ),
+      );
+      var finalPath = savedPath;
+      if (usesSafDirectory) {
+        finalPath = await AndroidStorage.copyFileToDirectory(
+          directoryUri: downloadDirectory,
+          sourcePath: savedPath,
+          fileName: p.basename(savedPath),
+          mimeType: 'video/*',
+        );
+        try {
+          await File(savedPath).delete();
+        } catch (_) {}
+      }
+      historyNotifier.complete(
+        historyId,
+        savedPath: finalPath,
+        actualQuality: _displayVideoQuality,
+      );
+      if (mounted) {
+        XyNotice.show(
+          context,
+          message: '下载完成：${p.basename(finalPath)}',
+          type: XyNoticeType.success,
+          duration: const Duration(milliseconds: 2600),
+        );
+      }
+    } catch (error) {
+      if (error is DownloadPausedSignal) {
+        if (mounted) {
+          XyNotice.show(context, message: '已暂停：${item.title}（MV）');
+        }
+      } else {
+        historyNotifier.fail(historyId, _errorText(error));
+        if (mounted) {
+          XyNotice.show(
+            context,
+            message: '下载失败：${_errorText(error)}',
+            type: XyNoticeType.error,
+          );
+        }
+      }
+    }
+  }
+
   Future<void> _closeBilibiliVideo() async {
     if (_videoClosing) return;
     _videoClosing = true;
@@ -742,55 +1149,79 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
     }
   }
 
-  /// 更多菜单：居中弹窗（参考弦予音乐歌词调节弹窗的单弹窗多面板设计）。
-  /// 主菜单 + 歌词偏移子面板在同一弹窗内经 setState 切换，避免「先 pop 再
-  /// push」的路由叠换白屏；其余条目 pop 后走原有流程。
-  /// 下载/音质/字号/桌面歌词/MV 等播放页已有专属按钮的功能不在此重复。
+  /// 更多菜单：底部弹层（截图样式）。顶部为 5 个圆形快捷按钮
+  /// （下载/加到歌单/换源+还原/音质/歌词字号），下方为 9 行设置列表。
+  /// 开关行与封面样式切换在弹层内直接生效；其余条目收起弹层后
+  /// 由本页面拉起对应面板。
   Future<void> _showMoreMenu(QueueItem item) async {
-    // 沉浸式歌词开关横竖屏都展示：横屏控制右半屏“仅歌词”形态，
-    // 竖屏控制歌词页播放栏的弹出/隐藏（各自的设置互不影响）。
-    // 换源行右侧的「还原」入口只在当前歌曲换过源（保存了原始音源）时展示。
-    final restorable = await ref
-        .read(playerProvider.notifier)
-        .hasSwitchedSource(item.path);
+    final notifier = ref.read(playerProvider.notifier);
+    final restorable = await notifier.hasSwitchedSource(item.path);
+    if (!mounted) return;
+    final associated = await notifier.rememberedLyricsAssociation(item.path);
     if (!mounted) return;
     final viewport = MediaQuery.sizeOf(context);
-    final action = await showDialog<_PlayerMenuAction>(
+    await showModalBottomSheet<void>(
       context: context,
       useRootNavigator: true,
-      builder: (dialogContext) => _PlayerMoreMenuDialog(
+      showDragHandle: true,
+      isScrollControlled: true,
+      builder: (sheetContext) => _PlayerMoreSheet(
+        item: item,
         initialOffsetTenths: _lyricsOffsetTenths,
-        onApplyOffset: (tenths) =>
-            unawaited(_applyLyricsOffset(item, tenths)),
-        showImmersiveLyricsToggle: true,
         isLandscape: viewport.width > viewport.height,
-        showRestoreSource: restorable,
+        restorableSource: restorable,
+        hasLyricsAssociation: associated != null,
+        onDownload: () => unawaited(_downloadCurrent(item)),
+        onAddToPlaylist: () => unawaited(_addToPlaylist(item)),
+        onSwitchSource: () => unawaited(_switchSource(item)),
+        onRestoreSource: () => unawaited(_restoreSource(item)),
+        onPickQuality: () => unawaited(_pickPlaybackQuality()),
+        onPickLyricFontSize: () => unawaited(_pickLyricFontSize()),
+        onShare: () => unawaited(_showShareSheet(item)),
+        onToggleDesktopLyrics: () => unawaited(_toggleDesktopLyrics()),
+        onShowEffects: () => unawaited(_showEffectsSheet()),
+        onLinkLyrics: () => unawaited(_linkLyrics(item)),
+        onUnlinkLyrics: () => unawaited(_unlinkLyrics(item)),
+        onShowLyricsOffset: () => unawaited(_showLyricsOffsetSheet(item)),
+        onCycleCoverStyle: _cycleCoverStyle,
+        onShowComments: () => unawaited(
+          showModalBottomSheet<void>(
+            context: context,
+            useRootNavigator: true,
+            isScrollControlled: true,
+            builder: (_) => CommentSheet(song: item),
+          ),
+        ),
+        onPickSleepTimer: () => unawaited(_pickSleepTimer()),
       ),
     );
-    if (!mounted || action == null) return;
-    switch (action) {
-      case _PlayerMenuAction.share:
-        await _showShareSheet(item);
-      case _PlayerMenuAction.playlist:
-        await _addToPlaylist(item);
-      case _PlayerMenuAction.coverStyle:
-        _cycleCoverStyle();
-      case _PlayerMenuAction.switchSource:
-        await _switchSource(item);
-      case _PlayerMenuAction.restoreSource:
-        await _restoreSource(item);
-      case _PlayerMenuAction.sleepTimer:
-        await _pickSleepTimer();
-      case _PlayerMenuAction.playbackSpeed:
-        await _pickPlaybackSpeed();
-      case _PlayerMenuAction.comments:
-        await showModalBottomSheet<void>(
-          context: context,
-          useRootNavigator: true,
-          isScrollControlled: true,
-          builder: (_) => CommentSheet(song: item),
-        );
-    }
+  }
+
+  /// 歌词偏移子面板：滑杆 + 细调按钮 + 重置，实时生效并保存。
+  Future<void> _showLyricsOffsetSheet(QueueItem item) async {
+    await showModalBottomSheet<void>(
+      context: context,
+      useRootNavigator: true,
+      showDragHandle: true,
+      isScrollControlled: true,
+      builder: (sheetContext) => _LyricsOffsetSheet(
+        initialTenths: _lyricsOffsetTenths,
+        onApply: (tenths) => unawaited(_applyLyricsOffset(item, tenths)),
+      ),
+    );
+  }
+
+  /// 解除当前歌曲的歌词关联（更多菜单「关联歌词」行的尾部按钮）。
+  Future<void> _unlinkLyrics(QueueItem item) async {
+    if (ref.read(playerProvider).current?.path != item.path) return;
+    await ref.read(playerProvider.notifier).clearCurrentLyricsAssociation();
+    if (!mounted) return;
+    XyNotice.show(context, message: '已解除歌词关联', type: XyNoticeType.success);
+  }
+
+  /// 音效页面：跳转到完整音效设置页（均衡器/变速变调/混响/空间音效/高级音效）。
+  Future<void> _showEffectsSheet() async {
+    context.push('/effects-page');
   }
 
   /// 换源：选择目标插件搜索同名歌曲，替换当前播放并保存关联。
@@ -805,20 +1236,23 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
       );
       return;
     }
-    final plugin = await showSourcePluginPicker(
-      context,
-      plugins,
-      excludePluginId: item.pluginId,
-    );
-    if (plugin == null || !mounted) return;
-    final replacement = await showReplacementPicker(
+    final picked = await showSourceSwitchSheet(
       context,
       ref,
-      plugin,
       title: item.title,
       artist: item.artist,
+      durationMs: item.durationMs,
+      excludePluginId: item.pluginId,
     );
-    if (replacement == null || !mounted) return;
+    if (picked == null || !mounted) return;
+    final (plugin, replacement) = picked;
+    // 收藏与歌单里的同一首歌同步原位换源，保持列表数据一致。
+    await syncReplacementToCollections(
+      ref,
+      originalPath: item.path,
+      plugin: plugin,
+      replacement: replacement,
+    );
     final applied = await ref
         .read(playerProvider.notifier)
         .switchSource(item.path, replacementToQueueItem(plugin, replacement));
@@ -1175,42 +1609,8 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
     );
   }
 
-  Future<void> _pickPlaybackSpeed() async {
-    final current = ref.read(playerProvider).playbackSpeed;
-    const speeds = [0.5, 0.8, 1.0, 1.5, 2.0];
-    final selected = await showModalBottomSheet<double>(
-      context: context,
-      useRootNavigator: true,
-      showDragHandle: true,
-      builder: (sheetContext) => SafeArea(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            const ListTile(
-              leading: Icon(Icons.speed_rounded),
-              title: Text('播放倍速'),
-            ),
-            for (final speed in speeds)
-              ListTile(
-                title: Text('${_formatPlaybackSpeed(speed)}x'),
-                trailing: (speed - current).abs() < 0.001
-                    ? Icon(
-                        Icons.check,
-                        color: Theme.of(sheetContext).colorScheme.primary,
-                      )
-                    : null,
-                onTap: () => Navigator.pop(sheetContext, speed),
-              ),
-          ],
-        ),
-      ),
-    );
-    if (selected == null) return;
-    await ref.read(playerProvider.notifier).setPlaybackSpeed(selected);
-  }
-
-  /// 歌词字号调整弹窗：滑杆实时调整，下方用示例歌词预览效果，
-  /// 确认后写入设置。歌词与迷你歌词共用同一字号，调节时同步生效。
+  /// 歌词字号调整弹窗：双滑杆实时调整（主歌词 + 迷你歌词各自独立），
+  /// 下方用示例歌词预览效果，拖动即写入设置。
   /// 设置页“播放详情页歌词-歌词字号”共用同一份数据。
   Future<void> _pickLyricFontSize() async {
     await showModalBottomSheet<void>(
@@ -1220,11 +1620,12 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
       isScrollControlled: true,
       builder: (sheetContext) => _LyricFontSizeSheet(
         initial: ref.read(settingsProvider).valueOrNull?.lyricFontSize ?? 18.0,
-        onChanged: (value) {
-          final notifier = ref.read(settingsProvider.notifier);
-          notifier.setLyricFontSize(value);
-          notifier.setMiniLyricFontSize(value);
-        },
+        initialMini:
+            ref.read(settingsProvider).valueOrNull?.miniLyricFontSize ?? 14.0,
+        onChanged: (value) =>
+            ref.read(settingsProvider.notifier).setLyricFontSize(value),
+        onMiniChanged: (value) =>
+            ref.read(settingsProvider.notifier).setMiniLyricFontSize(value),
       ),
     );
   }
@@ -1274,13 +1675,7 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
   }
 
   Future<void> _addToPlaylist(QueueItem item) async {
-    final result = await showModalBottomSheet<_PlaylistPickResult>(
-      context: context,
-      useRootNavigator: true,
-      isScrollControlled: true,
-      showDragHandle: true,
-      builder: (_) => _PlaylistPickerSheet(item: item),
-    );
+    final result = await showPlaylistPicker(context, items: [item]);
     if (!mounted || result == null) return;
     final playlist = ref
         .read(playlistsProvider)
@@ -1289,16 +1684,14 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
     final name = playlist?.name;
     XyNotice.show(
       context,
-      message: switch (result.kind) {
-        // 歌曲已在该歌单中，未重复添加。
-        _PlaylistPickKind.alreadyExists => name == null
-            ? '该歌曲已在歌单中'
-            : '该歌曲已在歌单“$name”中',
-        _PlaylistPickKind.added => name == null
-            ? '已添加到歌单'
-            : '已添加到歌单“$name”',
-      },
-      type: result.kind == _PlaylistPickKind.alreadyExists
+      message: result.existsCount > 0
+          ? (name == null
+                ? '该歌曲已在歌单中'
+                : '该歌曲已在歌单“$name”中')
+          : (name == null
+                ? '已添加到歌单'
+                : '已添加到歌单“$name”'),
+      type: result.existsCount > 0
           ? XyNoticeType.warning
           : XyNoticeType.success,
     );
@@ -1829,7 +2222,23 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
       await settingsNotifier.setAskDownloadDetails(false);
     }
     if (!mounted) return;
-    final usesSafDirectory = AndroidStorage.isTreeUri(directory);
+    // SAF 目录授权校验：重装应用或恢复备份后持久化授权会丢失，直接写入
+    // 会被系统以 MANAGE_DOCUMENTS 权限拒绝；失效时引导重新选择目录。
+    final downloadDirectory = await ensureSafDirectoryAccess(
+      context,
+      ref,
+      directory,
+    );
+    if (!mounted) return;
+    if (downloadDirectory == null) {
+      XyNotice.show(
+        context,
+        message: '已取消下载：下载目录未授权',
+        type: XyNoticeType.warning,
+      );
+      return;
+    }
+    final usesSafDirectory = AndroidStorage.isTreeUri(downloadDirectory);
     XyNotice.show(
       context,
       message: '下载已开始 ${item.title}',
@@ -1850,7 +2259,7 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
     try {
       final workDirectory = usesSafDirectory
           ? await resolveDownloadStagingDirectory()
-          : directory;
+          : downloadDirectory;
       await Directory(workDirectory).create(recursive: true);
       final source = await ref
           .read(playerProvider.notifier)
@@ -1915,7 +2324,7 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
       var finalPath = verified.path;
       if (usesSafDirectory) {
         finalPath = await AndroidStorage.copyFileToDirectory(
-          directoryUri: directory,
+          directoryUri: downloadDirectory,
           sourcePath: verified.path,
           fileName: p.basename(verified.path),
           mimeType: 'audio/*',
@@ -1923,7 +2332,7 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
         final lrcPath = p.setExtension(verified.path, '.lrc');
         if (await File(lrcPath).exists()) {
           await AndroidStorage.copyFileToDirectory(
-            directoryUri: directory,
+            directoryUri: downloadDirectory,
             sourcePath: lrcPath,
             fileName: p.basename(lrcPath),
             mimeType: 'text/plain',
@@ -2008,12 +2417,18 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
   String _errorText(Object error) =>
       error.toString().replaceFirst('Exception: ', '').trim();
 
-  /// 收起竖屏沉浸式的弹出播放栏（翻页时调用，取消隐藏定时器，
-  /// 随后的 setState 由调用方负责）。
-  void _dismissPortraitImmersiveBar() {
+  /// 竖屏沉浸式播放栏可见时重置 5 秒隐藏倒计时（封面页 ↔ 歌词页
+  /// 翻页时调用）：封面页与歌词页共用同一弹出播放栏，翻页不打断
+  /// 播放栏显示（旧版翻页会收起播放栏，切到歌词页后播放栏消失，
+  /// 需要再点一次才能唤出）。
+  void _keepPortraitImmersiveBar() {
+    if (!_portraitControlsVisible) return;
     _immersiveBarTimer?.cancel();
-    _immersiveBarTimer = null;
-    _portraitControlsVisible = false;
+    _immersiveBarTimer = Timer(const Duration(seconds: 5), () {
+      if (mounted && _portraitControlsVisible) {
+        setState(() => _portraitControlsVisible = false);
+      }
+    });
   }
 
   /// 布局完成后测量沉浸式播放栏的自然高度（播放栏常驻布局、仅视觉
@@ -2046,10 +2461,8 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
 
   void _showDetailPage(bool showLyrics) {
     if (_showLyrics != showLyrics) {
-      // 竖屏沉浸式翻页时收起弹出播放栏并取消隐藏定时器。
-      if (_portraitControlsVisible) {
-        _dismissPortraitImmersiveBar();
-      }
+      // 竖屏沉浸式翻页时保持弹出播放栏显示，仅重置 5 秒隐藏倒计时。
+      _keepPortraitImmersiveBar();
       setState(() => _showLyrics = showLyrics);
     }
     final page = showLyrics ? 1 : 0;
@@ -2151,6 +2564,11 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
     final videoActive =
         _videoSongPath != null && _videoSongPath == current?.path;
     if (videoActive) {
+      // 顶部标题栏副标题：歌手 · 画质（QQ 音乐 MV 播放页排版）。
+      final videoSubtitle = [
+        if (current?.artist.isNotEmpty == true) current!.artist,
+        _displayVideoQuality,
+      ].join(' · ');
       return Scaffold(
         backgroundColor: Colors.black,
         body: _BilibiliVideoView(
@@ -2160,6 +2578,12 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
           landscape: _videoLandscape,
           onToggleOrientation: () => unawaited(_toggleVideoOrientation()),
           onClose: () => unawaited(_closeBilibiliVideo()),
+          title: current?.title ?? '',
+          subtitle: videoSubtitle,
+          onPickSpeed: () => unawaited(_pickVideoSpeed()),
+          onPickQuality: () => unawaited(_pickVideoQuality()),
+          onToggleMute: () => unawaited(_toggleVideoMute()),
+          onDownload: () => unawaited(_downloadCurrentVideo()),
         ),
       );
     }
@@ -2239,10 +2663,9 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
           onPageChanged: (page) {
             final showLyrics = page == 1;
             if (_showLyrics != showLyrics) {
-              // 竖屏沉浸式翻页时收起弹出播放栏并取消隐藏定时器。
-              if (_portraitControlsVisible) {
-                _dismissPortraitImmersiveBar();
-              }
+              // 竖屏沉浸式翻页时保持弹出播放栏显示，仅重置 5 秒隐藏
+              // 倒计时：封面页与歌词页共用同一播放栏，翻页不应收起。
+              _keepPortraitImmersiveBar();
               setState(() => _showLyrics = showLyrics);
             }
           },
@@ -2475,8 +2898,8 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
 
     // 竖屏沉浸式内容（封面页与歌词页通用）：内容铺满整个区域
     //（封面 + 迷你歌词 / 纯歌词），播放栏隐藏，单击原播放栏位置
-    // 弹出（上浮动画），弹出期间内容区收缩恢复沉浸式开启前的排版
-    //（播放栏位置的歌词隐藏），5 秒无操作自动隐藏（与横屏逻辑一致）。
+    // 弹出（上浮动画），弹出期间左右翻页（封面页 ↔ 歌词页）播放栏
+    // 保持显示，5 秒无操作自动隐藏（与横屏逻辑一致）。
     Widget buildPortraitImmersiveContent() {
       // 布局后测量播放栏自然高度（隐藏状态也可测：常驻布局仅视觉隐藏）。
       _measureImmersiveBars();
@@ -2486,16 +2909,6 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
         setState(() => _portraitControlsVisible = true);
         _immersiveBarTimer = Timer(const Duration(seconds: 5), () {
           if (mounted) setState(() => _portraitControlsVisible = false);
-        });
-      }
-      // 重置倒计时（控制栏内任何交互都触发）。
-      void keepBar() {
-        if (!_portraitControlsVisible) return;
-        _immersiveBarTimer?.cancel();
-        _immersiveBarTimer = Timer(const Duration(seconds: 5), () {
-          if (mounted && _portraitControlsVisible) {
-            setState(() => _portraitControlsVisible = false);
-          }
         });
       }
 
@@ -2537,7 +2950,7 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
                       // 倒计时，避免用户正在操作时栏突然消失。
                       child: Listener(
                         behavior: HitTestBehavior.opaque,
-                        onPointerDown: (_) => keepBar(),
+                        onPointerDown: (_) => _keepPortraitImmersiveBar(),
                         // 沉浸式歌词的弹出播放栏不带背景，直接浮在歌词上。
                         child: detailControls,
                       ),
@@ -2563,7 +2976,9 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
     // 单击原播放栏位置弹出，5 秒无操作自动隐藏。
     final portraitImmersiveActive = portraitImmersive && current != null;
 
-    return Scaffold(
+    return PopScope(
+      canPop: true,
+      child: Scaffold(
       backgroundColor: scheme.surface,
       body: Stack(
         fit: StackFit.expand,
@@ -2630,194 +3045,11 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
           ),
         ],
       ),
-    );
-  }
-}
-
-/// 播放详情页中的歌单选择器。创建歌单后会自动将当前歌曲加入新歌单。
-enum _PlaylistPickKind { added, alreadyExists }
-
-class _PlaylistPickResult {
-  const _PlaylistPickResult(this.playlistId, this.kind);
-
-  final String playlistId;
-  final _PlaylistPickKind kind;
-}
-
-class _PlaylistPickerSheet extends ConsumerStatefulWidget {
-  const _PlaylistPickerSheet({required this.item});
-
-  final QueueItem item;
-
-  @override
-  ConsumerState<_PlaylistPickerSheet> createState() =>
-      _PlaylistPickerSheetState();
-}
-
-class _PlaylistPickerSheetState extends ConsumerState<_PlaylistPickerSheet> {
-  bool _busy = false;
-
-  Future<void> _addTo(String playlistId) async {
-    if (_busy) return;
-    setState(() => _busy = true);
-    try {
-      final added = await ref
-          .read(playlistsProvider.notifier)
-          .addQueueItem(playlistId, widget.item);
-      if (mounted) {
-        Navigator.pop(
-          context,
-          _PlaylistPickResult(
-            playlistId,
-            added ? _PlaylistPickKind.added : _PlaylistPickKind.alreadyExists,
-          ),
-        );
-      }
-    } finally {
-      if (mounted) setState(() => _busy = false);
-    }
-  }
-
-  Future<void> _createAndAdd() async {
-    if (_busy) return;
-    final controller = TextEditingController();
-    final name = await showDialog<String>(
-      context: context,
-      builder: (dialogContext) => AlertDialog(
-        title: const Text('新建歌单'),
-        content: TextField(
-          controller: controller,
-          autofocus: true,
-          maxLength: 30,
-          decoration: const InputDecoration(hintText: '请输入歌单名称'),
-          onSubmitted: (value) => Navigator.pop(dialogContext, value.trim()),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(dialogContext),
-            child: const Text('取消'),
-          ),
-          FilledButton(
-            onPressed: () =>
-                Navigator.pop(dialogContext, controller.text.trim()),
-            child: const Text('创建并添加'),
-          ),
-        ],
-      ),
-    );
-    controller.dispose();
-    if (!mounted || name == null || name.trim().isEmpty) return;
-    setState(() => _busy = true);
-    try {
-      final playlist = await ref.read(playlistsProvider.notifier).create(name);
-      if (playlist == null) return;
-      await ref
-          .read(playlistsProvider.notifier)
-          .addQueueItem(playlist.id, widget.item);
-      if (mounted) {
-        // 新建歌单中不可能存在重复歌曲，结果恒为“已添加”。
-        Navigator.pop(
-          context,
-          _PlaylistPickResult(playlist.id, _PlaylistPickKind.added),
-        );
-      }
-    } finally {
-      if (mounted) setState(() => _busy = false);
-    }
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final playlists = ref.watch(playlistsProvider);
-    final colorScheme = Theme.of(context).colorScheme;
-    return SafeArea(
-      child: SizedBox(
-        height: MediaQuery.sizeOf(context).height * .62,
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            const Padding(
-              padding: EdgeInsets.fromLTRB(20, 0, 20, 4),
-              child: Text(
-                '添加到歌单',
-                style: TextStyle(fontSize: 20, fontWeight: FontWeight.w800),
-              ),
-            ),
-            Padding(
-              padding: const EdgeInsets.fromLTRB(20, 0, 20, 12),
-              child: Text(
-                widget.item.title,
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-                style: TextStyle(color: colorScheme.onSurfaceVariant),
-              ),
-            ),
-            const Divider(height: 1),
-            ListTile(
-              leading: CircleAvatar(
-                backgroundColor: colorScheme.primaryContainer,
-                child: Icon(Icons.add_rounded, color: colorScheme.primary),
-              ),
-              title: const Text('新建歌单'),
-              subtitle: const Text('创建后自动添加当前歌曲'),
-              trailing: const Icon(Icons.chevron_right_rounded),
-              enabled: !_busy,
-              onTap: _createAndAdd,
-            ),
-            const Divider(height: 1),
-            Expanded(
-              child: playlists.isEmpty
-                  ? Center(
-                      child: Text(
-                        '还没有歌单，先新建一个吧',
-                        style: TextStyle(color: colorScheme.onSurfaceVariant),
-                      ),
-                    )
-                  : ListView.builder(
-                      padding: const EdgeInsets.only(bottom: 12),
-                      itemCount: playlists.length,
-                      itemBuilder: (context, index) {
-                        final playlist = playlists[index];
-                        final firstPath = playlist.songPaths.isEmpty
-                            ? playlist.id
-                            : playlist.songPaths.first;
-                        return ListTile(
-                          leading: playlist.songPaths.isEmpty
-                              ? CircleAvatar(
-                                  backgroundColor:
-                                      colorScheme.surfaceContainerHighest,
-                                  child: Icon(
-                                    Icons.queue_music_rounded,
-                                    color: colorScheme.onSurfaceVariant,
-                                  ),
-                                )
-                              : CoverImage(
-                                  songPath: firstPath,
-                                  imageUrl: playlist.effectiveCoverUrl,
-                                  width: 40,
-                                  height: 40,
-                                  radius: 20,
-                                  icon: Icons.queue_music_rounded,
-                                ),
-                          title: Text(
-                            playlist.name,
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                          ),
-                          subtitle: Text('${playlist.songPaths.length} 首歌曲'),
-                          trailing: const Icon(Icons.chevron_right_rounded),
-                          enabled: !_busy,
-                          onTap: () => _addTo(playlist.id),
-                        );
-                      },
-                    ),
-            ),
-          ],
-        ),
       ),
     );
   }
 }
+
 
 class _DownloadOptionsDialog extends StatefulWidget {
   const _DownloadOptionsDialog({
@@ -3215,136 +3447,163 @@ class _QualitySelectorState extends State<_QualitySelector> {
   }
 }
 
-/// 更多菜单弹窗的子面板：main 主菜单，offset 为内嵌子面板。
-enum _MoreMenuPanel { main, offset }
-
-/// 播放页更多菜单弹窗：参考弦予音乐歌词调节弹窗的单弹窗多面板设计。
-/// 主菜单与歌词偏移子面板在同一弹窗内经 setState 切换（子面板左上角
-/// 返回箭头回主菜单），避免「先 pop 再 push 新弹窗」造成切换瞬间的
-/// 白屏盖屏。偏移调节实时生效，无需确认按钮。
-class _PlayerMoreMenuDialog extends ConsumerStatefulWidget {
-  const _PlayerMoreMenuDialog({
+/// 播放页更多菜单底部弹层：顶部 5 个圆形快捷按钮（下载/加到歌单/换源+
+/// 还原/音质/歌词字号）+ 下方 9 行设置列表。开关行与封面样式切换在弹层
+/// 内直接生效（watch 设置即时刷新）；其余条目收起弹层后由宿主页面
+/// 拉起对应面板。
+class _PlayerMoreSheet extends ConsumerStatefulWidget {
+  const _PlayerMoreSheet({
+    required this.item,
     required this.initialOffsetTenths,
-    required this.onApplyOffset,
-    this.showImmersiveLyricsToggle = false,
-    this.isLandscape = false,
-    this.showRestoreSource = false,
+    required this.isLandscape,
+    required this.restorableSource,
+    required this.hasLyricsAssociation,
+    required this.onDownload,
+    required this.onAddToPlaylist,
+    required this.onSwitchSource,
+    required this.onRestoreSource,
+    required this.onPickQuality,
+    required this.onPickLyricFontSize,
+    required this.onShare,
+    required this.onToggleDesktopLyrics,
+    required this.onShowEffects,
+    required this.onLinkLyrics,
+    required this.onUnlinkLyrics,
+    required this.onShowLyricsOffset,
+    required this.onCycleCoverStyle,
+    required this.onShowComments,
+    required this.onPickSleepTimer,
   });
+
+  final QueueItem item;
+
+  /// 打开菜单时的歌词偏移快照（子面板实时应用后本弹层已收起）。
   final int initialOffsetTenths;
 
-  /// 偏移子面板每次变动的实时应用回调（由宿主页面静默保存）。
-  final ValueChanged<int> onApplyOffset;
-
-  /// 沉浸式歌词开关行（横竖屏均展示，按 [isLandscape] 读写对应设置）。
-  final bool showImmersiveLyricsToggle;
-
-  /// 打开菜单时的屏幕方向：决定开关读写横屏还是竖屏的沉浸式设置。
+  /// 打开菜单时的屏幕方向：决定沉浸式歌词开关读写哪个设置。
   final bool isLandscape;
 
-  /// 换源行右侧「还原」入口：仅当前歌曲换过源（保存了原始音源）时展示。
-  final bool showRestoreSource;
+  /// 当前歌曲换过源时展示「还原」小按钮。
+  final bool restorableSource;
+
+  /// 当前歌曲存在歌词关联时展示「解除关联」入口。
+  final bool hasLyricsAssociation;
+
+  final VoidCallback onDownload;
+  final VoidCallback onAddToPlaylist;
+  final VoidCallback onSwitchSource;
+  final VoidCallback onRestoreSource;
+  final VoidCallback onPickQuality;
+  final VoidCallback onPickLyricFontSize;
+  final VoidCallback onShare;
+  final VoidCallback onToggleDesktopLyrics;
+  final VoidCallback onShowEffects;
+  final VoidCallback onLinkLyrics;
+  final VoidCallback onUnlinkLyrics;
+  final VoidCallback onShowLyricsOffset;
+  final VoidCallback onCycleCoverStyle;
+  final VoidCallback onShowComments;
+  final VoidCallback onPickSleepTimer;
 
   @override
-  ConsumerState<_PlayerMoreMenuDialog> createState() =>
-      _PlayerMoreMenuDialogState();
+  ConsumerState<_PlayerMoreSheet> createState() => _PlayerMoreSheetState();
 }
 
-class _PlayerMoreMenuDialogState extends ConsumerState<_PlayerMoreMenuDialog> {
-  _MoreMenuPanel _panel = _MoreMenuPanel.main;
-  late int _offsetTenths = clampLyricsOffsetTenths(widget.initialOffsetTenths);
+class _PlayerMoreSheetState extends ConsumerState<_PlayerMoreSheet> {
+  /// 解除关联后行内即时移除入口（弹层不收起）。
+  late bool _hasLyricsAssociation = widget.hasLyricsAssociation;
 
-  void _changeOffset(int delta) {
-    final next = clampLyricsOffsetTenths(_offsetTenths + delta);
-    if (next == _offsetTenths) return;
-    setState(() => _offsetTenths = next);
-    widget.onApplyOffset(next);
+  /// 收起弹层后执行宿主动作（子面板由宿主页面拉起）。
+  void _popThen(VoidCallback action) {
+    Navigator.pop(context);
+    action();
   }
 
-  @override
-  Widget build(BuildContext context) {
-    return Dialog(
-      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(22)),
-      // 菜单条目已精简（重复功能砍去），放宽最大宽度并放大字号，
-      // 小屏机型仍无需滚动即可读完整部菜单。
-      child: ConstrainedBox(
-        constraints: const BoxConstraints(maxWidth: 340),
-        child: SingleChildScrollView(
-          padding: const EdgeInsets.fromLTRB(14, 12, 14, 10),
-          child: switch (_panel) {
-            _MoreMenuPanel.main => _buildMain(context),
-            _MoreMenuPanel.offset => _buildOffset(context),
-          },
+  /// 圆形快捷按钮：圆形底 + 图标 + 下方文字标签（可选附加小按钮）。
+  Widget _quickButton(
+    BuildContext context, {
+    required IconData icon,
+    required String label,
+    required VoidCallback onTap,
+    Widget? extra,
+  }) {
+    final scheme = Theme.of(context).colorScheme;
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Material(
+          color: scheme.surfaceContainerHighest,
+          shape: const CircleBorder(),
+          clipBehavior: Clip.antiAlias,
+          child: InkWell(
+            onTap: onTap,
+            child: SizedBox(
+              width: 52,
+              height: 52,
+              child: Icon(icon, size: 23, color: scheme.onSurface),
+            ),
+          ),
+        ),
+        const SizedBox(height: 7),
+        Text(
+          label,
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+          style: TextStyle(fontSize: 11, color: scheme.onSurfaceVariant),
+        ),
+        ?extra,
+      ],
+    );
+  }
+
+  /// 换源按钮下方的「还原」小按钮：恢复换源前的原始音源。
+  Widget _restorePill(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return Padding(
+      padding: const EdgeInsets.only(top: 5),
+      child: GestureDetector(
+        behavior: HitTestBehavior.opaque,
+        onTap: () => _popThen(widget.onRestoreSource),
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 2),
+          decoration: BoxDecoration(
+            border: Border.all(color: scheme.outlineVariant),
+            borderRadius: BorderRadius.circular(999),
+          ),
+          child: Text(
+            '还原',
+            style: TextStyle(fontSize: 10, color: scheme.onSurfaceVariant),
+          ),
         ),
       ),
     );
   }
 
-  /// 子面板标题行：返回箭头 + 标题（偏移面板右侧附「重置」）。
-  /// 固定高度的标题行 + 定宽返回按钮，保证箭头与标题垂直居中对齐。
-  Widget _panelHeader(
-    BuildContext context,
-    String title, {
-    Widget? trailing,
-  }) {
-    final scheme = Theme.of(context).colorScheme;
-    return SizedBox(
-      height: 32,
-      child: Row(
-        children: [
-          SizedBox(
-            width: 32,
-            height: 32,
-            child: IconButton(
-              visualDensity: VisualDensity.compact,
-              padding: EdgeInsets.zero,
-              constraints: const BoxConstraints(),
-              icon: const Icon(
-                Icons.arrow_back_ios_new_rounded,
-                size: 15,
-              ),
-              color: scheme.onSurfaceVariant,
-              onPressed: () => setState(() => _panel = _MoreMenuPanel.main),
-            ),
-          ),
-          const SizedBox(width: 2),
-          Text(
-            title,
-            style: TextStyle(
-              fontSize: 16,
-              fontWeight: FontWeight.w600,
-              color: scheme.onSurface,
-            ),
-          ),
-          if (trailing != null) ...[const Spacer(), trailing],
-        ],
-      ),
-    );
-  }
-
-  /// 主菜单条目行：图标 + 标题 + 当前值（弦予菜单行样式，无右箭头）。
-  /// 条目精简后放大字号与行距，保证小屏机型一屏读完。
-  Widget _menuRow(
+  /// 设置行：图标 + 标题 + 当前值 + 尾部控件（开关/解除关联/箭头）。
+  /// 统一最小行高并垂直居中，保证开关行、纯文字行、带小按钮的行
+  /// 行高完全一致。
+  Widget _settingRow(
     BuildContext context, {
     required IconData icon,
     required String title,
     String? value,
-    VoidCallback? onTap,
     Widget? trailing,
+    VoidCallback? onTap,
   }) {
     final scheme = Theme.of(context).colorScheme;
     return InkWell(
       onTap: onTap,
       borderRadius: BorderRadius.circular(10),
-      child: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 9),
+      child: Container(
+        constraints: const BoxConstraints(minHeight: 52),
+        alignment: Alignment.centerLeft,
+        padding: const EdgeInsets.symmetric(horizontal: 6),
         child: Row(
           children: [
             Icon(icon, size: 20, color: scheme.onSurfaceVariant),
             const SizedBox(width: 11),
-            // 标题用 Expanded 占满剩余宽度：若用 Flexible，标题会与
-            // Spacer 平分剩余空间，短标题行的当前值无法顶到右缘，
-            // 各行右缘参差不齐。Expanded 保证当前值小字（含「还原」
-            // 入口）始终紧贴行右缘，完全对齐。
+            // 标题用 Expanded 占满剩余宽度，保证当前值小字与尾部控件
+            // 始终紧贴行右缘，各行右缘完全对齐。
             Expanded(
               child: Text(
                 title,
@@ -3361,10 +3620,7 @@ class _PlayerMoreMenuDialogState extends ConsumerState<_PlayerMoreMenuDialog> {
               const SizedBox(width: 8),
               Text(
                 value!,
-                style: TextStyle(
-                  fontSize: 12,
-                  color: scheme.onSurfaceVariant,
-                ),
+                style: TextStyle(fontSize: 12, color: scheme.onSurfaceVariant),
               ),
             ],
             ?trailing,
@@ -3374,242 +3630,435 @@ class _PlayerMoreMenuDialogState extends ConsumerState<_PlayerMoreMenuDialog> {
     );
   }
 
-  /// 换源行右侧的「还原」入口：恢复换源前的原始音源。
-  /// 与其他行的当前值小字（如「无偏移」「关」）同款样式，
-  /// 右缘与各行当前值完全对齐。
-  Widget _restoreSourceChip(BuildContext context) {
+  /// 打开子面板的行：当前值 + 右箭头，收起弹层后由宿主拉起面板。
+  Widget _panelRow(
+    BuildContext context, {
+    required IconData icon,
+    required String title,
+    String? value,
+    required VoidCallback onOpen,
+  }) {
+    final scheme = Theme.of(context).colorScheme;
+    return _settingRow(
+      context,
+      icon: icon,
+      title: title,
+      value: value,
+      trailing: Icon(
+        Icons.chevron_right_rounded,
+        size: 20,
+        color: scheme.outline,
+      ),
+      onTap: () => _popThen(onOpen),
+    );
+  }
+
+  /// 开关行：整行可点，开关自身也响应（Switch 消费自身点击不冒泡）。
+  /// Switch 收缩点击区避免撑高行，与其他行保持一致行高。
+  Widget _switchRow(
+    BuildContext context, {
+    required IconData icon,
+    required String title,
+    required bool value,
+    required ValueChanged<bool> onChanged,
+  }) {
+    return _settingRow(
+      context,
+      icon: icon,
+      title: title,
+      trailing: SwitchTheme(
+        data: SwitchThemeData(
+          materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+        ),
+        child: Switch(value: value, onChanged: onChanged),
+      ),
+      onTap: () => onChanged(!value),
+    );
+  }
+
+  /// 关联歌词行的「解除关联」小按钮：解除后行内移除入口，弹层不收起。
+  Widget _unlinkButton(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
     return Padding(
       padding: const EdgeInsets.only(left: 8),
       child: GestureDetector(
         behavior: HitTestBehavior.opaque,
-        onTap: () =>
-            Navigator.pop(context, _PlayerMenuAction.restoreSource),
-        child: Padding(
-          padding: const EdgeInsets.symmetric(vertical: 4),
+        onTap: () {
+          setState(() => _hasLyricsAssociation = false);
+          widget.onUnlinkLyrics();
+        },
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 3),
+          decoration: BoxDecoration(
+            border: Border.all(color: scheme.outlineVariant),
+            borderRadius: BorderRadius.circular(999),
+          ),
           child: Text(
-            '还原',
-            style: TextStyle(fontSize: 12, color: scheme.onSurfaceVariant),
+            '解除关联',
+            style: TextStyle(fontSize: 10, color: scheme.onSurfaceVariant),
           ),
         ),
       ),
     );
   }
 
-  Widget _buildMain(BuildContext context) {
+  @override
+  Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
+    final settings = ref.watch(settingsProvider).valueOrNull;
+    final desktopLyricsEnabled = settings?.desktopLyricsEnabled ?? false;
+    final immersiveEnabled = widget.isLandscape
+        ? (settings?.landscapeImmersiveLyrics ?? false)
+        : (settings?.portraitImmersiveLyrics ?? false);
+    final coverStyle = settings?.playerCoverStyle ?? PlayerCoverStyle.classic;
+    // 音效开/关指示以完整音效系统（均衡器/变速变调/混响/空间/高级）
+    // 是否有任一启用为准；旧的 settings.equalizerEnabled 已不再参与。
+    final effectsActive = ref.watch(
+      effectsProvider.select(
+        (value) => value.valueOrNull?.hasActiveEffects ?? false,
+      ),
+    );
+    final lyricFontSize = settings?.lyricFontSize ?? 22.0;
     final sleepTimerEndsAt = ref.watch(
       playerProvider.select((state) => state.sleepTimerEndsAt),
     );
-    final playbackSpeed = ref.watch(
-      playerProvider.select((state) => state.playbackSpeed),
-    );
 
-    Widget popRow(_PlayerMenuAction action, IconData icon, String title,
-            {String? value}) =>
-        _menuRow(
-          context,
-          icon: icon,
-          title: title,
-          value: value,
-          onTap: () => Navigator.pop(context, action),
-        );
-
-    return Column(
-      mainAxisSize: MainAxisSize.min,
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        Padding(
-          padding: const EdgeInsets.only(left: 6),
-          child: Text(
-            '更多操作',
-            style: TextStyle(
-              fontSize: 16,
-              fontWeight: FontWeight.w600,
-              color: scheme.onSurface,
-            ),
-          ),
+    // 弹层总高不超过屏幕 60%：信息条与 5 个快捷按钮固定可见，
+    // 下方设置列表独立滚动。
+    return SafeArea(
+      child: ConstrainedBox(
+        constraints: BoxConstraints(
+          maxHeight: MediaQuery.sizeOf(context).height * .60,
         ),
-        const SizedBox(height: 6),
-        popRow(_PlayerMenuAction.share, Icons.share_outlined, '分享'),
-        popRow(
-          _PlayerMenuAction.playlist,
-          Icons.playlist_add_rounded,
-          '添加到歌单',
-        ),
-        Builder(
-          builder: (context) {
-            final coverStyle =
-                ref.watch(
-                  settingsProvider.select(
-                    (s) => s.valueOrNull?.playerCoverStyle,
-                  ),
-                ) ??
-                PlayerCoverStyle.classic;
-            return popRow(
-              _PlayerMenuAction.coverStyle,
-              coverStyleIcon(coverStyle),
-              '切换封面样式',
-              value: coverStyleLabel(coverStyle),
-            );
-          },
-        ),
-        _menuRow(
-          context,
-          icon: Icons.swap_horiz_rounded,
-          title: '换源',
-          onTap: () => Navigator.pop(context, _PlayerMenuAction.switchSource),
-          trailing: widget.showRestoreSource
-              ? _restoreSourceChip(context)
-              : null,
-        ),
-        _menuRow(
-          context,
-          icon: Icons.sync_alt_rounded,
-          title: '歌词偏移',
-          value: lyricsOffsetLabel(_offsetTenths),
-          onTap: () => setState(() => _panel = _MoreMenuPanel.offset),
-        ),
-        if (widget.showImmersiveLyricsToggle)
-          Builder(
-            builder: (context) {
-              final enabled =
-                  ref.watch(
-                    settingsProvider.select(
-                      (s) => widget.isLandscape
-                          ? s.valueOrNull?.landscapeImmersiveLyrics
-                          : s.valueOrNull?.portraitImmersiveLyrics,
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(16, 0, 16, 14),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              // 顶部当前歌曲信息条：封面缩略图 + 歌名/副标题，
+              // 右侧空白处放分享入口（参考 BakaMusic 弹层排版）。
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 6),
+                child: Row(
+                  children: [
+                    CoverImage(
+                      songPath: widget.item.path,
+                      imageUrl: widget.item.coverUrl,
+                      width: 48,
+                      height: 48,
+                      radius: 10,
+                      icon: Icons.music_note_rounded,
                     ),
-                  ) ??
-                  false;
-              return _menuRow(
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            widget.item.title,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: TextStyle(
+                              fontSize: 16,
+                              fontWeight: FontWeight.w700,
+                              color: scheme.onSurface,
+                            ),
+                          ),
+                          const SizedBox(height: 3),
+                          Text(
+                            widget.item.album.trim().isEmpty
+                                ? widget.item.artist
+                                : '${widget.item.artist} · '
+                                    '${widget.item.album.trim()}',
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: TextStyle(
+                              fontSize: 12,
+                              color: scheme.onSurfaceVariant,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                    IconButton(
+                      tooltip: '分享',
+                      visualDensity: VisualDensity.compact,
+                      icon: Icon(
+                        Icons.share_outlined,
+                        size: 20,
+                        color: scheme.onSurfaceVariant,
+                      ),
+                      onPressed: () => _popThen(widget.onShare),
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(height: 14),
+              // 5 个圆形快捷按钮。
+              Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Expanded(
+                    child: _quickButton(
+                      context,
+                      icon: Icons.download_rounded,
+                      label: '下载',
+                      onTap: () => _popThen(widget.onDownload),
+                    ),
+                  ),
+                  Expanded(
+                    child: _quickButton(
+                      context,
+                      icon: Icons.playlist_add_rounded,
+                      label: '加到歌单',
+                      onTap: () => _popThen(widget.onAddToPlaylist),
+                    ),
+                  ),
+                  Expanded(
+                    child: _quickButton(
+                      context,
+                      icon: Icons.swap_horiz_rounded,
+                      label: '换源',
+                      onTap: () => _popThen(widget.onSwitchSource),
+                      extra: widget.restorableSource
+                          ? _restorePill(context)
+                          : null,
+                    ),
+                  ),
+                  Expanded(
+                    child: _quickButton(
+                      context,
+                      icon: Icons.high_quality_outlined,
+                      label: '音质',
+                      onTap: () => _popThen(widget.onPickQuality),
+                    ),
+                  ),
+                  Expanded(
+                    child: _quickButton(
+                      context,
+                      icon: Icons.lyrics_outlined,
+                      label: '关联歌词',
+                      onTap: () => _popThen(widget.onLinkLyrics),
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 14),
+              // 9 行设置列表：超出剩余高度时仅在区域内滚动。
+              Flexible(
+                child: SingleChildScrollView(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+              _switchRow(
+                context,
+                icon: Icons.subtitles_outlined,
+                title: '桌面歌词',
+                value: desktopLyricsEnabled,
+                onChanged: (_) => widget.onToggleDesktopLyrics(),
+              ),
+              _settingRow(
+                context,
+                icon: Icons.format_size_rounded,
+                title: '歌词字号',
+                value: '${lyricFontSize.toInt()}号',
+                trailing: Icon(
+                  Icons.chevron_right_rounded,
+                  size: 20,
+                  color: scheme.outline,
+                ),
+                onTap: () => _popThen(widget.onPickLyricFontSize),
+              ),
+              _switchRow(
                 context,
                 icon: Icons.fullscreen_rounded,
                 title: '沉浸式歌词',
-                value: enabled ? '开' : '关',
-                onTap: () => widget.isLandscape
-                    ? ref
-                          .read(settingsProvider.notifier)
-                          .setLandscapeImmersiveLyrics(!enabled)
-                    : ref
-                          .read(settingsProvider.notifier)
-                          .setPortraitImmersiveLyrics(!enabled),
-              );
-            },
-          ),
-        popRow(
-          _PlayerMenuAction.sleepTimer,
-          Icons.timer_outlined,
-          '定时关闭',
-          value: _sleepTimerLabel(sleepTimerEndsAt),
-        ),
-        popRow(
-          _PlayerMenuAction.playbackSpeed,
-          Icons.speed_rounded,
-          '倍速',
-          value: '${_formatPlaybackSpeed(playbackSpeed)}x',
-        ),
-        popRow(
-          _PlayerMenuAction.comments,
-          Icons.mode_comment_outlined,
-          '查看评论',
-        ),
-      ],
-    );
-  }
-
-  /// 歌词偏移子面板：当前值 + 滑杆 + 细调按钮 + 重置，实时生效。
-  Widget _buildOffset(BuildContext context) {
-    final scheme = Theme.of(context).colorScheme;
-    return Column(
-      mainAxisSize: MainAxisSize.min,
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        _panelHeader(
-          context,
-          '歌词偏移',
-          trailing: TextButton(
-            onPressed: _offsetTenths == 0
-                ? null
-                : () => _changeOffset(-_offsetTenths),
-            style: TextButton.styleFrom(
-              visualDensity: VisualDensity.compact,
-              minimumSize: const Size(0, 32),
-              padding: const EdgeInsets.symmetric(horizontal: 10),
-            ),
-            child: const Text('重置', style: TextStyle(fontSize: 12)),
-          ),
-        ),
-        const SizedBox(height: 4),
-        Container(
-          width: double.infinity,
-          padding: const EdgeInsets.symmetric(vertical: 9),
-          decoration: BoxDecoration(
-            color: scheme.surfaceContainerHighest.withValues(alpha: .5),
-            borderRadius: BorderRadius.circular(12),
-          ),
-          child: Text(
-            lyricsOffsetLabel(_offsetTenths),
-            textAlign: TextAlign.center,
-            style: TextStyle(
-              fontSize: 14,
-              fontWeight: FontWeight.w700,
-              color: scheme.onSurface,
-            ),
-          ),
-        ),
-        Slider(
-          value: _offsetTenths.toDouble(),
-          min: -100,
-          max: 100,
-          divisions: 200,
-          label: lyricsOffsetLabel(_offsetTenths),
-          onChanged: (next) {
-            final tenths = next.round();
-            if (tenths == _offsetTenths) return;
-            setState(() => _offsetTenths = tenths);
-            widget.onApplyOffset(tenths);
-          },
-        ),
-        const Padding(
-          padding: EdgeInsets.symmetric(horizontal: 8),
-          child: Row(
-            mainAxisAlignment: MainAxisAlignment.spaceBetween,
-            children: [
-              Text('延后 10 秒', style: TextStyle(fontSize: 10)),
-              Text('同步', style: TextStyle(fontSize: 10)),
-              Text('提前 10 秒', style: TextStyle(fontSize: 10)),
+                value: immersiveEnabled,
+                onChanged: (next) {
+                  // 横屏控制右半屏“仅歌词”形态，竖屏控制歌词页播放栏的
+                  // 弹出/隐藏（各自的设置互不影响）。
+                  widget.isLandscape
+                      ? ref
+                            .read(settingsProvider.notifier)
+                            .setLandscapeImmersiveLyrics(next)
+                      : ref
+                            .read(settingsProvider.notifier)
+                            .setPortraitImmersiveLyrics(next);
+                },
+              ),
+              _panelRow(
+                context,
+                icon: Icons.sync_alt_rounded,
+                title: '歌词偏移',
+                value: lyricsOffsetLabel(widget.initialOffsetTenths),
+                onOpen: widget.onShowLyricsOffset,
+              ),
+              _panelRow(
+                context,
+                icon: Icons.equalizer_rounded,
+                title: '音效',
+                value: effectsActive ? '开' : '关',
+                onOpen: widget.onShowEffects,
+              ),
+              _settingRow(
+                context,
+                icon: coverStyleIcon(coverStyle),
+                title: '封面样式',
+                value: coverStyleLabel(coverStyle),
+                onTap: widget.onCycleCoverStyle,
+              ),
+              _panelRow(
+                context,
+                icon: Icons.mode_comment_outlined,
+                title: '查看评论',
+                onOpen: widget.onShowComments,
+              ),
+              _panelRow(
+                context,
+                icon: Icons.timer_outlined,
+                title: '定时关闭',
+                value: _sleepTimerLabel(sleepTimerEndsAt),
+                onOpen: widget.onPickSleepTimer,
+              ),
+                    ],
+                  ),
+                ),
+              ),
             ],
           ),
         ),
-        const SizedBox(height: 8),
-        Wrap(
-          alignment: WrapAlignment.center,
-          spacing: 7,
-          runSpacing: 7,
-          children: [
-            for (final (label, delta) in [
-              ('-1秒', -10),
-              ('-0.5秒', -5),
-              ('-0.1秒', -1),
-              ('+0.1秒', 1),
-              ('+0.5秒', 5),
-              ('+1秒', 10),
-            ])
-              ActionChip(
-                label: Text(label, style: const TextStyle(fontSize: 11)),
-                visualDensity: VisualDensity.compact,
-                onPressed: () => _changeOffset(delta),
+      ),
+    );
+  }
+}
+
+/// 歌词偏移子面板：当前值 + 滑杆 + 细调按钮 + 重置，实时生效并保存。
+class _LyricsOffsetSheet extends StatefulWidget {
+  const _LyricsOffsetSheet({required this.initialTenths, required this.onApply});
+
+  final int initialTenths;
+
+  /// 每次变动的实时应用回调（由宿主页面静默保存）。
+  final ValueChanged<int> onApply;
+
+  @override
+  State<_LyricsOffsetSheet> createState() => _LyricsOffsetSheetState();
+}
+
+class _LyricsOffsetSheetState extends State<_LyricsOffsetSheet> {
+  late int _offsetTenths = clampLyricsOffsetTenths(widget.initialTenths);
+
+  void _changeOffset(int delta) {
+    final next = clampLyricsOffsetTenths(_offsetTenths + delta);
+    if (next == _offsetTenths) return;
+    setState(() => _offsetTenths = next);
+    widget.onApply(next);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return Padding(
+      padding: EdgeInsets.only(
+        left: 20,
+        right: 20,
+        bottom: 20 + MediaQuery.viewInsetsOf(context).bottom,
+      ),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Row(
+            children: [
+              Icon(Icons.sync_alt_rounded, color: scheme.primary),
+              const SizedBox(width: 12),
+              const Text('歌词偏移', style: TextStyle(fontSize: 16)),
+              const Spacer(),
+              TextButton(
+                onPressed: _offsetTenths == 0
+                    ? null
+                    : () => _changeOffset(-_offsetTenths),
+                style: TextButton.styleFrom(
+                  visualDensity: VisualDensity.compact,
+                  minimumSize: const Size(0, 32),
+                  padding: const EdgeInsets.symmetric(horizontal: 10),
+                ),
+                child: const Text('重置', style: TextStyle(fontSize: 12)),
               ),
-          ],
-        ),
-        const SizedBox(height: 6),
-        Text(
-          '偏移实时保存，仅对当前歌曲生效并记忆。',
-          textAlign: TextAlign.center,
-          style: TextStyle(fontSize: 10, color: scheme.outline),
-        ),
-      ],
+            ],
+          ),
+          const SizedBox(height: 4),
+          Container(
+            width: double.infinity,
+            padding: const EdgeInsets.symmetric(vertical: 9),
+            decoration: BoxDecoration(
+              color: scheme.surfaceContainerHighest.withValues(alpha: .5),
+              borderRadius: BorderRadius.circular(12),
+            ),
+            child: Text(
+              lyricsOffsetLabel(_offsetTenths),
+              textAlign: TextAlign.center,
+              style: TextStyle(
+                fontSize: 14,
+                fontWeight: FontWeight.w700,
+                color: scheme.onSurface,
+              ),
+            ),
+          ),
+          Slider(
+            value: _offsetTenths.toDouble(),
+            min: -100,
+            max: 100,
+            divisions: 200,
+            label: lyricsOffsetLabel(_offsetTenths),
+            onChanged: (next) {
+              final tenths = next.round();
+              if (tenths == _offsetTenths) return;
+              setState(() => _offsetTenths = tenths);
+              widget.onApply(tenths);
+            },
+          ),
+          const Padding(
+            padding: EdgeInsets.symmetric(horizontal: 8),
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                Text('延后 10 秒', style: TextStyle(fontSize: 10)),
+                Text('同步', style: TextStyle(fontSize: 10)),
+                Text('提前 10 秒', style: TextStyle(fontSize: 10)),
+              ],
+            ),
+          ),
+          const SizedBox(height: 8),
+          Wrap(
+            alignment: WrapAlignment.center,
+            spacing: 7,
+            runSpacing: 7,
+            children: [
+              for (final (label, delta) in [
+                ('-1秒', -10),
+                ('-0.5秒', -5),
+                ('-0.1秒', -1),
+                ('+0.1秒', 1),
+                ('+0.5秒', 5),
+                ('+1秒', 10),
+              ])
+                ActionChip(
+                  label: Text(label, style: const TextStyle(fontSize: 11)),
+                  visualDensity: VisualDensity.compact,
+                  onPressed: () => _changeOffset(delta),
+                ),
+            ],
+          ),
+          const SizedBox(height: 6),
+          Text(
+            '偏移实时保存，仅对当前歌曲生效并记忆。',
+            textAlign: TextAlign.center,
+            style: TextStyle(fontSize: 10, color: scheme.outline),
+          ),
+        ],
+      ),
     );
   }
 }
@@ -4317,17 +4766,17 @@ class _PlayerDetailBackground extends ConsumerWidget {
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
-    final size = MediaQuery.sizeOf(context);
     final settings = ref.watch(settingsProvider).valueOrNull;
     final mode =
         settings?.playerDetailBackgroundMode ??
-        PlayerDetailBackgroundMode.coverBlur;
+        PlayerDetailBackgroundMode.flowingLight;
     final wallpaperPath = settings?.customBackgroundPath.trim() ?? '';
     final detailImagePath = settings?.playerDetailCustomImagePath.trim() ?? '';
     final wallpaperBlur = settings?.customBackgroundBlur ?? 18.0;
 
     final backdrop = switch (mode) {
-      PlayerDetailBackgroundMode.coverBlur => _coverBackdrop(current, size),
+      // 封面模糊背景已移除：统一回退为流光背景。
+      PlayerDetailBackgroundMode.coverBlur => _flowingLightBackdrop(current),
       PlayerDetailBackgroundMode.wallpaperBlur =>
         wallpaperPath.isEmpty
             ? _flowingLightBackdrop(current)
@@ -4348,6 +4797,7 @@ class _PlayerDetailBackground extends ConsumerWidget {
     // 深色渐变对齐参考应用的暗色氛围，但较 beta10 略微调亮（.30 → .24）。其余
     // 背景模式维持原有可读性遮罩。
     final flowing = mode == PlayerDetailBackgroundMode.flowingLight ||
+        mode == PlayerDetailBackgroundMode.coverBlur ||
         (mode == PlayerDetailBackgroundMode.wallpaperBlur &&
             wallpaperPath.isEmpty) ||
         (mode == PlayerDetailBackgroundMode.customImage &&
@@ -4378,27 +4828,6 @@ class _PlayerDetailBackground extends ConsumerWidget {
             ),
           ),
         ],
-      ),
-    );
-  }
-
-  Widget _coverBackdrop(QueueItem? item, Size size) {
-    if (item == null) return const ColoredBox(color: Color(0xFF0B0D12));
-    // 封面模式保持原有氛围背景样式，不额外施加模糊滤镜。
-    return Transform.scale(
-      scale: 1.24,
-      child: Opacity(
-        opacity: .46,
-        child: CoverImage(
-          key: ValueKey('background:${item.path}'),
-          songPath: item.path,
-          imageUrl: item.coverUrl,
-          width: size.width,
-          height: size.height,
-          radius: 0,
-          cacheWidth: 256,
-          icon: Icons.music_note_rounded,
-        ),
       ),
     );
   }
@@ -4463,7 +4892,7 @@ class _FlowingLightBackgroundState extends ConsumerState<_FlowingLightBackground
   late final AnimationController _controller = AnimationController(
     vsync: this,
     duration: const Duration(seconds: 9),
-  )..repeat();
+  );
 
   /// 封面切换时在旧色板与新色板之间平滑过渡。
   late final AnimationController _colorController = AnimationController(
@@ -4482,6 +4911,18 @@ class _FlowingLightBackgroundState extends ConsumerState<_FlowingLightBackground
   void initState() {
     super.initState();
     _resolvePalette();
+    // 流光仅随播放运行：暂停时冻结动画，页面静止不再每帧重绘，
+    // 降低 GPU 占用与耗电（卡顿优化）。
+    if (ref.read(playerProvider.select((s) => s.isPlaying))) {
+      _controller.repeat();
+    }
+    ref.listenManual(playerProvider.select((s) => s.isPlaying), (_, playing) {
+      if (playing) {
+        if (!_controller.isAnimating) _controller.repeat();
+      } else if (_controller.isAnimating) {
+        _controller.stop();
+      }
+    });
   }
 
   @override
@@ -4717,6 +5158,12 @@ class _BilibiliVideoView extends StatefulWidget {
     this.landscape = false,
     this.onToggleOrientation,
     this.onClose,
+    this.title = '',
+    this.subtitle = '',
+    this.onPickSpeed,
+    this.onPickQuality,
+    this.onToggleMute,
+    this.onDownload,
   });
 
   final VideoPlayerController? controller;
@@ -4725,16 +5172,22 @@ class _BilibiliVideoView extends StatefulWidget {
   final bool landscape;
   final VoidCallback? onToggleOrientation;
   final VoidCallback? onClose;
+  final String title;
+  final String subtitle;
+  final VoidCallback? onPickSpeed;
+  final VoidCallback? onPickQuality;
+  final VoidCallback? onToggleMute;
+  final VoidCallback? onDownload;
 
   @override
   State<_BilibiliVideoView> createState() => _BilibiliVideoViewState();
 }
 
-/// MV/视频全屏覆盖播放层（参考 MusicFree 短视频横竖屏效果）：
+/// MV/视频全屏覆盖播放层（排版参考 QQ 音乐 MV 播放页）：
 /// - 整屏纯黑背景，视频画面按原始比例居中
 /// - 点击画面切换控制层显隐（播放中 3 秒无操作自动隐藏）
-/// - 右上角常驻关闭按钮；底部控制栏：播放/暂停 + 进度条 + 时间 +
-///   横竖屏切换（横屏时由宿主进入沉浸式全屏）
+/// - 控制层：顶部标题/副标题（歌手 · 画质），右上角常驻关闭按钮；
+///   底部一行式控制栏：进度条 + 播放/音量/时间/倍速/画质/横竖屏切换
 class _BilibiliVideoViewState extends State<_BilibiliVideoView> {
   bool _showControls = true;
   bool _dragging = false;
@@ -4832,24 +5285,33 @@ class _BilibiliVideoViewState extends State<_BilibiliVideoView> {
                 child: VideoPlayer(player),
               ),
             ),
-          // 点击整屏切换控制层显隐。
+          // 单击切换控制层显隐；双击播放/暂停（QQ 音乐 MV 播放页手势）。
           Positioned.fill(
             child: GestureDetector(
               behavior: HitTestBehavior.opaque,
               onTap: _toggleControls,
+              onDoubleTap: initialized ? () => _togglePlay(player!) : null,
             ),
           ),
-          // 暂停时中央展示大播放按钮（点击画面即可恢复播放）。
+          // 暂停时中央展示描边圆环 + 实心三角的大播放按钮。
           if (initialized && !player!.value.isPlaying)
             Center(
-              child: IconButton(
-                tooltip: '播放',
-                iconSize: 44,
-                icon: const Icon(
-                  Icons.play_circle_fill_rounded,
-                  color: Colors.white70,
+              child: GestureDetector(
+                onTap: () => _togglePlay(player),
+                child: Container(
+                  width: 72,
+                  height: 72,
+                  decoration: BoxDecoration(
+                    shape: BoxShape.circle,
+                    color: Colors.black.withValues(alpha: .35),
+                    border: Border.all(color: Colors.white, width: 2.5),
+                  ),
+                  child: const Icon(
+                    Icons.play_arrow_rounded,
+                    color: Colors.white,
+                    size: 44,
+                  ),
                 ),
-                onPressed: () => _togglePlay(player),
               ),
             ),
           // 右上角常驻关闭按钮：控制层隐藏时也能退出视频。
@@ -4865,7 +5327,66 @@ class _BilibiliVideoViewState extends State<_BilibiliVideoView> {
                 ),
               ),
             ),
-          // 底部控制栏：播放/暂停 + 进度条 + 时间 + 横竖屏切换。
+          // 顶部标题栏（随控制层显隐）：歌名 + 「歌手 · 画质」。
+          // 右侧留出常驻关闭按钮的宽度，标题不会被遮挡。
+          if (_showControls && (widget.title.isNotEmpty || widget.subtitle.isNotEmpty))
+            Positioned(
+              top: 0,
+              left: 0,
+              right: 0,
+              child: IgnorePointer(
+                child: DecoratedBox(
+                  decoration: BoxDecoration(
+                    gradient: LinearGradient(
+                      begin: Alignment.topCenter,
+                      end: Alignment.bottomCenter,
+                      colors: [
+                        Colors.black.withValues(alpha: .6),
+                        Colors.transparent,
+                      ],
+                    ),
+                  ),
+                  child: SafeArea(
+                    bottom: false,
+                    child: Padding(
+                      padding: const EdgeInsets.fromLTRB(16, 8, 56, 20),
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          if (widget.title.isNotEmpty)
+                            Text(
+                              widget.title,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: const TextStyle(
+                                color: Colors.white,
+                                fontSize: 16,
+                                fontWeight: FontWeight.w600,
+                                height: 1.2,
+                              ),
+                            ),
+                          if (widget.subtitle.isNotEmpty) ...[
+                            const SizedBox(height: 2),
+                            Text(
+                              widget.subtitle,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: const TextStyle(
+                                color: Colors.white70,
+                                fontSize: 12,
+                                height: 1.2,
+                              ),
+                            ),
+                          ],
+                        ],
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          // 底部控制栏（QQ 音乐式）：进度条 + 播放/音量/时间/倍速/画质/全屏。
           if (_showControls && initialized)
             Positioned(
               left: 0,
@@ -4899,7 +5420,8 @@ class _BilibiliVideoViewState extends State<_BilibiliVideoView> {
     );
   }
 
-  /// 底部控制栏：半透明渐变底 + 播放/暂停 + 进度条 + 时间 + 横竖屏切换。
+  /// 底部控制栏（QQ 音乐式两行布局）：
+  /// 第一行全宽进度条；第二行播放/音量 +「当前 / 总时长」+ 倍速/画质/全屏。
   Widget _buildControlBar(VideoPlayerController player) {
     return ValueListenableBuilder<VideoPlayerValue>(
       valueListenable: player,
@@ -4911,6 +5433,8 @@ class _BilibiliVideoViewState extends State<_BilibiliVideoView> {
             ? _dragValue * durationMs
             : positionMs.clamp(0, durationMs <= 0 ? 0 : durationMs)
                 .toDouble();
+        final muted = value.volume == 0;
+        final speedText = _speedLabel(value.playbackSpeed);
         return DecoratedBox(
           decoration: BoxDecoration(
             gradient: LinearGradient(
@@ -4923,103 +5447,187 @@ class _BilibiliVideoViewState extends State<_BilibiliVideoView> {
             ),
           ),
           child: Padding(
-            padding: const EdgeInsets.fromLTRB(4, 24, 4, 2),
-            child: Row(
+            padding: const EdgeInsets.fromLTRB(12, 28, 12, 4),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
               children: [
-                IconButton(
-                  tooltip: value.isPlaying ? '暂停' : '播放',
-                  iconSize: 22,
-                  padding: const EdgeInsets.all(8),
-                  constraints: const BoxConstraints.tightFor(
-                    width: 38,
-                    height: 38,
+                // 第一行：全宽进度条。
+                SliderTheme(
+                  data: SliderTheme.of(context).copyWith(
+                    trackHeight: 2.5,
+                    thumbShape: const RoundSliderThumbShape(
+                      enabledThumbRadius: 6,
+                    ),
+                    overlayShape: const RoundSliderOverlayShape(
+                      overlayRadius: 12,
+                    ),
+                    trackShape: const _VideoProgressTrackShape(),
                   ),
-                  icon: Icon(
-                    value.isPlaying
-                        ? Icons.pause_circle_filled_rounded
-                        : Icons.play_circle_fill_rounded,
-                    color: Colors.white,
+                  child: Slider(
+                    value: max <= 0 ? 0 : (current / max).clamp(0.0, 1.0),
+                    onChanged: durationMs <= 0
+                        ? null
+                        : (ratio) {
+                            setState(() {
+                              _dragging = true;
+                              _dragValue = ratio;
+                            });
+                            _hideTimer?.cancel();
+                          },
+                    onChangeEnd: durationMs <= 0
+                        ? null
+                        : (ratio) {
+                            _dragging = false;
+                            final target = Duration(
+                              milliseconds: (ratio * durationMs).round(),
+                            );
+                            unawaited(player.seekTo(target));
+                            _scheduleHide();
+                          },
                   ),
-                  onPressed: () => _togglePlay(player),
                 ),
-                Text(
-                  _fmtDuration(
-                    Duration(milliseconds: current.round()),
-                  ),
-                  style: const TextStyle(
-                    color: Colors.white,
-                    fontSize: 11,
-                    fontFeatures: [ui.FontFeature.tabularFigures()],
-                  ),
-                ),
-                Expanded(
-                  child: SliderTheme(
-                    data: SliderTheme.of(context).copyWith(
-                      trackHeight: 2.5,
-                      thumbShape: const RoundSliderThumbShape(
-                        enabledThumbRadius: 6,
+                const SizedBox(height: 2),
+                // 第二行：功能按钮（统一 40x40 触摸区 + 22 图标基准对齐）。
+                Row(
+                  children: [
+                    IconButton(
+                      tooltip: value.isPlaying ? '暂停' : '播放',
+                      iconSize: 26,
+                      padding: const EdgeInsets.all(8),
+                      constraints: const BoxConstraints.tightFor(
+                        width: 40,
+                        height: 40,
                       ),
-                      overlayShape: const RoundSliderOverlayShape(
-                        overlayRadius: 12,
+                      icon: Icon(
+                        value.isPlaying
+                            ? Icons.pause_rounded
+                            : Icons.play_arrow_rounded,
+                        color: Colors.white,
                       ),
-                      trackShape: const _VideoProgressTrackShape(),
+                      onPressed: () => _togglePlay(player),
                     ),
-                    child: Slider(
-                      value: max <= 0 ? 0 : (current / max).clamp(0.0, 1.0),
-                      onChanged: durationMs <= 0
-                          ? null
-                          : (ratio) {
-                              setState(() {
-                                _dragging = true;
-                                _dragValue = ratio;
-                              });
-                              _hideTimer?.cancel();
-                            },
-                      onChangeEnd: durationMs <= 0
-                          ? null
-                          : (ratio) {
-                              _dragging = false;
-                              final target = Duration(
-                                milliseconds:
-                                    (ratio * durationMs).round(),
-                              );
-                              unawaited(player.seekTo(target));
-                              _scheduleHide();
-                            },
+                    if (widget.onToggleMute != null)
+                      IconButton(
+                        tooltip: muted ? '取消静音' : '静音',
+                        iconSize: 22,
+                        padding: const EdgeInsets.all(8),
+                        constraints: const BoxConstraints.tightFor(
+                          width: 40,
+                          height: 40,
+                        ),
+                        icon: Icon(
+                          muted
+                              ? Icons.volume_off_rounded
+                              : Icons.volume_up_rounded,
+                          color: Colors.white,
+                        ),
+                        onPressed: widget.onToggleMute,
+                      ),
+                    const SizedBox(width: 4),
+                    Text(
+                      '${_fmtDuration(Duration(milliseconds: current.round()))}'
+                      ' / ${_fmtDuration(value.duration)}',
+                      style: const TextStyle(
+                        color: Colors.white,
+                        fontSize: 12,
+                        fontFeatures: [ui.FontFeature.tabularFigures()],
+                      ),
                     ),
-                  ),
+                    const Spacer(),
+                    if (widget.onPickSpeed != null)
+                      Padding(
+                        padding: const EdgeInsets.symmetric(horizontal: 4),
+                        child: GestureDetector(
+                          onTap: widget.onPickSpeed,
+                          behavior: HitTestBehavior.opaque,
+                          child: Padding(
+                            padding: const EdgeInsets.symmetric(
+                              vertical: 8,
+                              horizontal: 6,
+                            ),
+                            child: Text(
+                              speedText,
+                              style: const TextStyle(
+                                color: Colors.white,
+                                fontSize: 13,
+                                fontFeatures: [
+                                  ui.FontFeature.tabularFigures(),
+                                ],
+                              ),
+                            ),
+                          ),
+                        ),
+                      ),
+                    if (widget.onDownload != null)
+                      IconButton(
+                        tooltip: '下载视频',
+                        iconSize: 22,
+                        padding: const EdgeInsets.all(8),
+                        constraints: const BoxConstraints.tightFor(
+                          width: 40,
+                          height: 40,
+                        ),
+                        icon: const Icon(
+                          Icons.file_download_outlined,
+                          color: Colors.white,
+                        ),
+                        onPressed: widget.onDownload,
+                      ),
+                    if (widget.onPickQuality != null)
+                      Padding(
+                        padding: const EdgeInsets.symmetric(horizontal: 4),
+                        child: GestureDetector(
+                          onTap: widget.onPickQuality,
+                          behavior: HitTestBehavior.opaque,
+                          child: const Padding(
+                            padding: EdgeInsets.symmetric(
+                              vertical: 8,
+                              horizontal: 6,
+                            ),
+                            child: Text(
+                              '画质',
+                              style: TextStyle(
+                                color: Colors.white,
+                                fontSize: 13,
+                              ),
+                            ),
+                          ),
+                        ),
+                      ),
+                    if (widget.onToggleOrientation != null)
+                      IconButton(
+                        tooltip: widget.landscape ? '切换竖屏' : '全屏',
+                        iconSize: 22,
+                        padding: const EdgeInsets.all(8),
+                        constraints: const BoxConstraints.tightFor(
+                          width: 40,
+                          height: 40,
+                        ),
+                        icon: Icon(
+                          widget.landscape
+                              ? Icons.fullscreen_exit_rounded
+                              : Icons.fullscreen_rounded,
+                          color: Colors.white,
+                        ),
+                        onPressed: widget.onToggleOrientation,
+                      ),
+                  ],
                 ),
-                Text(
-                  _fmtDuration(value.duration),
-                  style: const TextStyle(
-                    color: Colors.white,
-                    fontSize: 11,
-                    fontFeatures: [ui.FontFeature.tabularFigures()],
-                  ),
-                ),
-                if (widget.onToggleOrientation != null)
-                  IconButton(
-                    tooltip: widget.landscape ? '切换竖屏' : '切换横屏',
-                    iconSize: 20,
-                    padding: const EdgeInsets.all(8),
-                    constraints: const BoxConstraints.tightFor(
-                      width: 38,
-                      height: 38,
-                    ),
-                    icon: Icon(
-                      widget.landscape
-                          ? Icons.stay_current_portrait_rounded
-                          : Icons.stay_current_landscape_rounded,
-                      color: Colors.white,
-                    ),
-                    onPressed: widget.onToggleOrientation,
-                  ),
               ],
             ),
           ),
         );
       },
     );
+  }
+
+  /// 倍速显示文案：1.0 → 「1x」、1.25 → 「1.25x」。
+  static String _speedLabel(double speed) {
+    final v = speed == 0 ? 1.0 : speed;
+    final text = v == v.truncateToDouble()
+        ? v.truncate().toString()
+        : v.toStringAsFixed(2);
+    return '$text${'x'}';
   }
 }
 
@@ -5097,6 +5705,10 @@ class _BigCover extends ConsumerWidget {
   Widget build(BuildContext context, WidgetRef ref) {
     // 圆形旋转 / 黑胶需要感知播放状态：播放时旋转、暂停时停在当前角度。
     final playing = ref.watch(playerProvider.select((s) => s.isPlaying));
+    // 黑胶唱针开关（设置 → 播放）。
+    final showTonearm = ref.watch(
+      settingsProvider.select((s) => s.valueOrNull?.vinylTonearm ?? true),
+    );
     return LayoutBuilder(
       builder: (context, constraints) {
         final double side;
@@ -5168,6 +5780,7 @@ class _BigCover extends ConsumerWidget {
                             item: item,
                             playing: playing,
                             size: side,
+                            showTonearm: showTonearm,
                             onTap: onTap,
                             onLongPress: onLongPress,
                           ),
@@ -5560,13 +6173,14 @@ class _ImmersiveTopCover extends StatelessWidget {
   }
 }
 
-/// 黑胶唱片封面（参考 BakaMusic）：旋转唱片（盘面纹理 + 61.8% 标签 +
-/// 4.6% 中心孔）。
+/// 黑胶唱片封面（参考 BakaMusic）：旋转唱片（盘面纹理 + 61.8% 标签，
+/// 对齐网易手机版无中心孔）。
 class _VinylCover extends StatelessWidget {
   const _VinylCover({
     this.item,
     required this.playing,
     required this.size,
+    this.showTonearm = true,
     this.onTap,
     this.onLongPress,
   });
@@ -5574,6 +6188,7 @@ class _VinylCover extends StatelessWidget {
   final QueueItem? item;
   final bool playing;
   final double size;
+  final bool showTonearm;
   final VoidCallback? onTap;
   final VoidCallback? onLongPress;
 
@@ -5619,6 +6234,12 @@ class _VinylCover extends StatelessWidget {
                 child: CustomPaint(painter: _VinylSheenPainter()),
               ),
             ),
+            // 唱针（复刻 BakaMusic 经典款）：播放 -12 度搭在盘缘内侧，
+            // 暂停 -20 度悬在盘缘外，720ms 回弹过渡；不拦截点击。
+            if (showTonearm)
+              Positioned.fill(
+                child: IgnorePointer(child: VinylTonearm(playing: playing)),
+              ),
             // 手势层盖在最上，避免旋转层干扰点击。
             Positioned.fill(
               child: InkWell(
@@ -5633,7 +6254,8 @@ class _VinylCover extends StatelessWidget {
   }
 }
 
-/// 黑胶标签区：61.8% 直径的深色圆底 + 92% 封面 + 中心孔。
+/// 黑胶标签区：61.8% 直径的深色圆底 + 92% 封面（对齐网易手机版，
+/// 无中心孔）。
 class _VinylLabel extends StatelessWidget {
   const _VinylLabel({required this.item, required this.size});
 
@@ -5650,20 +6272,11 @@ class _VinylLabel extends StatelessWidget {
       child: Stack(
         alignment: Alignment.center,
         children: [
-          // 标签圆底（径向深灰）。
+          // 标签圆底（移除深色环，消除封面外圈黑边）。
           DecoratedBox(
             decoration: const BoxDecoration(
               shape: BoxShape.circle,
-              gradient: RadialGradient(
-                colors: [Color(0xF52C2C30), Color(0xFA111114)],
-              ),
-              boxShadow: [
-                BoxShadow(
-                  color: Color(0x59000000),
-                  blurRadius: 18,
-                  spreadRadius: -6,
-                ),
-              ],
+              color: Color(0xFF1A1A1E),
             ),
           ),
           // 封面（92%）叠一层轻微压暗/提饱和，模拟唱片印刷质感。
@@ -5699,24 +6312,6 @@ class _VinylLabel extends StatelessWidget {
                       ),
                     ),
                   ),
-          ),
-          // 中心孔（4.6%）：深色内芯 + 白色微光描边。
-          Container(
-            width: size * .046,
-            height: size * .046,
-            decoration: const BoxDecoration(
-              shape: BoxShape.circle,
-              gradient: RadialGradient(
-                colors: [Color(0xFF060608), Color(0xFF121216)],
-              ),
-              boxShadow: [
-                BoxShadow(
-                  color: Color(0x12FFFFFF),
-                  blurRadius: 6,
-                  spreadRadius: 1,
-                ),
-              ],
-            ),
           ),
         ],
       ),
@@ -5760,7 +6355,7 @@ class _VinylDiscPainter extends CustomPainter {
     // 在唱片上呈现为固定的扇形亮区（见 _VinylSheenPainter），随盘面
     // 一起旋转的线性高光会显得“反光跟着唱片转”，不自然。
 
-    // 边缘 1px 白描边 + 内侧压暗。
+    // 边缘 1px 白描边（移除内侧压暗环，消除内圈黑边）。
     canvas.drawCircle(
       center,
       radius - .5,
@@ -5768,14 +6363,6 @@ class _VinylDiscPainter extends CustomPainter {
         ..style = PaintingStyle.stroke
         ..strokeWidth = 1
         ..color = const Color(0x14FFFFFF),
-    );
-    canvas.drawCircle(
-      center,
-      radius - 6,
-      Paint()
-        ..style = PaintingStyle.stroke
-        ..strokeWidth = 12
-        ..color = const Color(0x5C000000),
     );
   }
 
@@ -5877,62 +6464,82 @@ class _MiniLyrics extends ConsumerWidget {
         if (active < 0) active = 0;
         final current = lines[active];
         final translation = current.translation.trim();
-        final showSecondary = fontSize <= _singleLineThreshold;
-        final secondary = showSecondary
-            ? (translation.isNotEmpty
-                  ? translation
-                  : active + 1 < lines.length
-                  ? lines[active + 1].text
-                  : '')
-            : '';
+        final mainStyle = TextStyle(
+          color: Colors.white,
+          fontSize: fontSize,
+          fontWeight: FontWeight.w700,
+        );
         return _surface(
-          AnimatedSwitcher(
-            duration: const Duration(milliseconds: 280),
-            switchInCurve: Curves.easeOutCubic,
-            switchOutCurve: Curves.easeInCubic,
-            transitionBuilder: (child, animation) {
-              return FadeTransition(
-                opacity: animation,
-                child: SlideTransition(
-                  position: Tween<Offset>(
-                    begin: const Offset(0, .22),
-                    end: Offset.zero,
-                  ).animate(animation),
-                  child: child,
+          // LayoutBuilder + TextPainter 预测主行是否换行：换行时隐藏副行，
+          // 避免主行两行 + 副行超出 56dp 展示区。
+          LayoutBuilder(
+            builder: (context, constraints) {
+              final maxWidth = constraints.maxWidth;
+              final textPainter = TextPainter(
+                text: TextSpan(text: current.text, style: mainStyle),
+                textDirection: TextDirection.ltr,
+              )..layout(maxWidth: maxWidth);
+              final mainWrapped =
+                  textPainter.computeLineMetrics().length > 1;
+              final secondary = !mainWrapped &&
+                      fontSize <= _singleLineThreshold
+                  ? (translation.isNotEmpty
+                        ? translation
+                        : active + 1 < lines.length
+                        ? lines[active + 1].text
+                        : '')
+                  : '';
+              return AnimatedSwitcher(
+                duration: const Duration(milliseconds: 280),
+                switchInCurve: Curves.easeOutCubic,
+                switchOutCurve: Curves.easeInCubic,
+                transitionBuilder: (child, animation) {
+                  return FadeTransition(
+                    opacity: animation,
+                    child: SlideTransition(
+                      position: Tween<Offset>(
+                        begin: const Offset(0, .22),
+                        end: Offset.zero,
+                      ).animate(animation),
+                      child: child,
+                    ),
+                  );
+                },
+                child: Column(
+                  key: ValueKey('${item.path}:${current.time}'),
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Text(
+                      current.text,
+                      // 主行超出宽度时软换行（最多两行）且不做省略号
+                      // 截断，保证歌词完整可读。
+                      maxLines: 2,
+                      softWrap: true,
+                      overflow: TextOverflow.clip,
+                      textAlign: TextAlign.center,
+                      style: mainStyle.copyWith(
+                        shadows: [
+                          Shadow(color: Colors.black54, blurRadius: 10),
+                        ],
+                      ),
+                    ),
+                    if (secondary.trim().isNotEmpty) ...[
+                      const SizedBox(height: 3),
+                      Text(
+                        secondary,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        textAlign: TextAlign.center,
+                        style: TextStyle(
+                          color: Colors.white.withValues(alpha: .5),
+                          fontSize: fontSize * .82,
+                        ),
+                      ),
+                    ],
+                  ],
                 ),
               );
             },
-            child: Column(
-              key: ValueKey('${item.path}:${current.time}'),
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Text(
-                  current.text,
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  textAlign: TextAlign.center,
-                  style: TextStyle(
-                    color: Colors.white,
-                    fontSize: fontSize,
-                    fontWeight: FontWeight.w700,
-                    shadows: [Shadow(color: Colors.black54, blurRadius: 10)],
-                  ),
-                ),
-                if (secondary.trim().isNotEmpty) ...[
-                  const SizedBox(height: 3),
-                  Text(
-                    secondary,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    textAlign: TextAlign.center,
-                    style: TextStyle(
-                      color: Colors.white.withValues(alpha: .5),
-                      fontSize: fontSize * .82,
-                    ),
-                  ),
-                ],
-              ],
-            ),
           ),
         );
       },
@@ -6395,16 +7002,21 @@ class _LyricsViewState extends ConsumerState<_LyricsView>
   );
 }
 
-/// 歌词字号调整弹窗：滑杆 + 实时预览。拖动即写入设置（实时生效），
-/// 播放详情页歌词会立即使用新字号重新渲染。
+/// 歌词字号调整弹窗：双滑杆（主歌词 + 迷你歌词）+ 实时预览。拖动即写入
+/// 设置（实时生效），播放详情页歌词会立即使用新字号重新渲染；两类字号
+/// 彼此独立。
 class _LyricFontSizeSheet extends StatefulWidget {
   const _LyricFontSizeSheet({
     required this.initial,
+    required this.initialMini,
     required this.onChanged,
+    required this.onMiniChanged,
   });
 
   final double initial;
+  final double initialMini;
   final ValueChanged<double> onChanged;
+  final ValueChanged<double> onMiniChanged;
 
   @override
   State<_LyricFontSizeSheet> createState() => _LyricFontSizeSheetState();
@@ -6412,11 +7024,13 @@ class _LyricFontSizeSheet extends StatefulWidget {
 
 class _LyricFontSizeSheetState extends State<_LyricFontSizeSheet> {
   late double _value;
+  late double _miniValue;
 
   @override
   void initState() {
     super.initState();
     _value = widget.initial;
+    _miniValue = widget.initialMini;
   }
 
   @override
@@ -6436,7 +7050,7 @@ class _LyricFontSizeSheetState extends State<_LyricFontSizeSheet> {
             children: [
               Icon(Icons.format_size_rounded, color: scheme.primary),
               const SizedBox(width: 12),
-              const Text('歌词与迷你歌词字号', style: TextStyle(fontSize: 16)),
+              const Text('歌词字号', style: TextStyle(fontSize: 16)),
               const Spacer(),
               Text(
                 _value.toStringAsFixed(0),
@@ -6457,6 +7071,34 @@ class _LyricFontSizeSheetState extends State<_LyricFontSizeSheet> {
             onChanged: (value) {
               setState(() => _value = value);
               widget.onChanged(value);
+            },
+          ),
+          const SizedBox(height: 8),
+          Row(
+            children: [
+              Icon(Icons.subtitles_outlined, color: scheme.primary),
+              const SizedBox(width: 12),
+              const Text('迷你歌词字号', style: TextStyle(fontSize: 16)),
+              const Spacer(),
+              Text(
+                _miniValue.toStringAsFixed(0),
+                style: TextStyle(
+                  fontSize: 15,
+                  fontWeight: FontWeight.w700,
+                  color: scheme.primary,
+                ),
+              ),
+            ],
+          ),
+          Slider(
+            value: _miniValue,
+            min: 10,
+            max: 24,
+            divisions: 14,
+            label: _miniValue.toStringAsFixed(0),
+            onChanged: (value) {
+              setState(() => _miniValue = value);
+              widget.onMiniChanged(value);
             },
           ),
           const SizedBox(height: 6),
@@ -6504,7 +7146,7 @@ class _LyricFontSizeSheetState extends State<_LyricFontSizeSheet> {
           ),
           const SizedBox(height: 8),
           // 迷你歌词预览：与封面下方的迷你歌词展示区等高，
-          // 直观展示字号同时作用于迷你歌词的效果。
+          // 直观展示迷你歌词字号的效果。
           Container(
             height: 56,
             alignment: Alignment.center,
@@ -6521,12 +7163,12 @@ class _LyricFontSizeSheetState extends State<_LyricFontSizeSheet> {
                   overflow: TextOverflow.ellipsis,
                   textAlign: TextAlign.center,
                   style: TextStyle(
-                    fontSize: math.min(24, _value),
+                    fontSize: _miniValue,
                     fontWeight: FontWeight.w700,
                     color: scheme.onSurface,
                   ),
                 ),
-                if (_value <= 20) ...[
+                if (_miniValue <= 20) ...[
                   const SizedBox(height: 3),
                   Text(
                     '迷你歌词副行',
@@ -6534,7 +7176,7 @@ class _LyricFontSizeSheetState extends State<_LyricFontSizeSheet> {
                     overflow: TextOverflow.ellipsis,
                     textAlign: TextAlign.center,
                     style: TextStyle(
-                      fontSize: math.min(24, _value) * .82,
+                      fontSize: _miniValue * .82,
                       color: scheme.onSurface.withValues(alpha: .5),
                     ),
                   ),
@@ -6544,7 +7186,7 @@ class _LyricFontSizeSheetState extends State<_LyricFontSizeSheet> {
           ),
           const SizedBox(height: 8),
           Text(
-            '歌词与迷你歌词同时使用该字号（迷你歌词超过 20 只显示单行）',
+            '迷你歌词超过 20 只显示单行；两类字号独立保存，重启后保留',
             textAlign: TextAlign.center,
             style: TextStyle(
               fontSize: 12,
@@ -6578,14 +7220,12 @@ class _TimedLyricText extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    // 当前播放行不再叠加阴影，逐字/逐词高亮也不再发光，保持纯色渲染。
     final baseStyle = TextStyle(
       color: Colors.white,
       fontSize: baseFontSize,
       height: 1.3,
       fontWeight: FontWeight.w600,
-      shadows: selected
-          ? const [Shadow(color: Colors.black54, blurRadius: 12)]
-          : null,
     );
     if (!selected ||
         line.words.isEmpty ||
@@ -6601,7 +7241,9 @@ class _TimedLyricText extends StatelessWidget {
   }
 
   Widget _buildWordByWordText(TextStyle baseStyle) {
-    final dimColor = Colors.white.withValues(alpha: .28);
+    // 与未播放行（白字 + 整行 55% 透明度）保持同一灰度，避免当前行
+    // 未播区呈现更深的灰。
+    final dimColor = Colors.white.withValues(alpha: .55);
     return Text.rich(
       TextSpan(
         children: [
@@ -6610,12 +7252,6 @@ class _TimedLyricText extends StatelessWidget {
               text: word.text,
               style: baseStyle.copyWith(
                 color: Color.lerp(dimColor, Colors.white, _wordProgress(word)),
-                shadows: position >= word.start && position < word.end
-                    ? const [
-                        Shadow(color: Colors.white54, blurRadius: 10),
-                        Shadow(color: Colors.black54, blurRadius: 12),
-                      ]
-                    : baseStyle.shadows,
               ),
             ),
         ],
@@ -6667,27 +7303,68 @@ class _ProgressiveLyricWord extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final value = progress.clamp(0.0, 1.0);
-    // ShaderMask 在进度为 0 时仍会绘制渐变的首个白色采样点，
-    // 每个 WidgetSpan 的左边因此出现一条白边。边界状态直接绘制纯色，
-    // 只有真正播放到当前词时才使用渐变过渡。
-    final dim = Colors.white.withValues(alpha: .28);
+    // 前景画笔方案：child（暗色整词）走普通 Text 渲染路径，与未扫光
+    // 的词完全一致；白色字形由 TextPainter 按相同 style 绘制并水平裁剪。
+    // 不引入 saveLayer/混合模式，WidgetSpan 内字形底部（下降部）不会
+    // 再被图层擦除裁掉。进度采样 80ms 一次，硬边裁剪在视觉上足够平滑。
+    // 暗色与未播放行（55% 透明度）灰度一致。
+    //
+    // WidgetSpan 内的 Text 会与 DefaultTextStyle 合并（字体族等来自
+    // 主题）；画笔必须用同一份合并后的样式布局，否则 child 与画笔
+    // 用两套字体渲染出大小不一的重影。
+    final resolved = DefaultTextStyle.of(context).style.merge(style);
+    final dim = Colors.white.withValues(alpha: .55);
     if (value <= 0) {
-      return Text(text, style: style.copyWith(color: dim));
+      return Text(text, style: resolved.copyWith(color: dim));
     }
     if (value >= 1) {
-      return Text(text, style: style.copyWith(color: Colors.white));
+      return Text(text, style: resolved.copyWith(color: Colors.white));
     }
-    final edgeStart = (value - .08).clamp(0.0, 1.0);
-    final edgeEnd = (value + .08).clamp(0.0, 1.0);
-    return ShaderMask(
-      blendMode: BlendMode.srcIn,
-      shaderCallback: (bounds) => LinearGradient(
-        colors: [Colors.white, Colors.white, dim, dim],
-        stops: [0, edgeStart, edgeEnd, 1],
-      ).createShader(bounds),
-      child: Text(text, style: style.copyWith(color: Colors.white)),
+    return CustomPaint(
+      foregroundPainter: _SweepWordPainter(
+        text: text,
+        style: resolved,
+        progress: value,
+        textScaler: MediaQuery.textScalerOf(context),
+      ),
+      child: Text(text, style: resolved.copyWith(color: dim)),
     );
   }
+}
+
+/// 逐字扫光前景画笔：在暗色整词之上，按进度水平裁剪绘制白色字形。
+class _SweepWordPainter extends CustomPainter {
+  _SweepWordPainter({
+    required this.text,
+    required this.style,
+    required this.progress,
+    required this.textScaler,
+  });
+
+  final String text;
+  final TextStyle style;
+  final double progress;
+  final TextScaler textScaler;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    if (progress <= 0) return;
+    final tp = TextPainter(
+      text: TextSpan(text: text, style: style.copyWith(color: Colors.white)),
+      textDirection: TextDirection.ltr,
+      textScaler: textScaler,
+    )..layout();
+    final clipWidth = tp.width * progress.clamp(0.0, 1.0);
+    if (clipWidth <= 0) return;
+    canvas.save();
+    canvas.clipRect(Rect.fromLTWH(0, 0, clipWidth, size.height));
+    tp.paint(canvas, Offset.zero);
+    canvas.restore();
+  }
+
+  @override
+  bool shouldRepaint(_SweepWordPainter old) =>
+      old.progress != progress || old.text != text;
 }
 
 /// 毛玻璃控制卡：标题 + 进度 + 播放控制。
@@ -6776,20 +7453,23 @@ class _GlassControlCard extends ConsumerWidget {
       );
       return;
     }
-    final plugin = await showSourcePluginPicker(
-      context,
-      plugins,
-      excludePluginId: item.pluginId,
-    );
-    if (plugin == null || !context.mounted) return;
-    final song = await showReplacementPicker(
+    final picked = await showSourceSwitchSheet(
       context,
       ref,
-      plugin,
       title: item.title,
       artist: item.artist,
+      durationMs: item.durationMs,
+      excludePluginId: item.pluginId,
     );
-    if (song == null || !context.mounted) return;
+    if (picked == null || !context.mounted) return;
+    final (plugin, song) = picked;
+    // 收藏与歌单里的同一首歌同步原位换源，保持列表数据一致。
+    await syncReplacementToCollections(
+      ref,
+      originalPath: item.path,
+      plugin: plugin,
+      replacement: song,
+    );
     final replaced = await ref
         .read(playerProvider.notifier)
         .switchSource(item.path, replacementToQueueItem(plugin, song));
@@ -7021,9 +7701,20 @@ class _TitleRow extends ConsumerWidget {
   }
 }
 
-class _ProgressBar extends ConsumerWidget {
+class _ProgressBar extends ConsumerStatefulWidget {
   const _ProgressBar({required this.notifier});
   final PlayerNotifier notifier;
+
+  @override
+  ConsumerState<_ProgressBar> createState() => _ProgressBarState();
+}
+
+class _ProgressBarState extends ConsumerState<_ProgressBar> {
+  // 拖动中的本地预览位置：拖动期间滑块只跟随手指，暂时隔离进度流
+  // 的更新；松手（onChangeEnd）才真正 seek。旧实现把 onChanged 直接
+  // 接到原生 seek，每个拖动 tick 都执行一次 seek，既造成音频卡顿，
+  // 又让滑块在手指位置与流式位置之间来回打架（表现为拖拽失误）。
+  double? _dragValue;
 
   String _fmt(double s) {
     if (!s.isFinite || s < 0) s = 0;
@@ -7033,7 +7724,7 @@ class _ProgressBar extends ConsumerWidget {
   }
 
   @override
-  Widget build(BuildContext context, WidgetRef ref) {
+  Widget build(BuildContext context) {
     final progress = ref.watch(
       playerProvider.select(
         (state) => (position: state.position, duration: state.duration),
@@ -7041,9 +7732,13 @@ class _ProgressBar extends ConsumerWidget {
     );
     return _buildProgress(
       context,
-      progress.position,
+      _dragValue ?? progress.position,
       progress.duration,
-      onChanged: notifier.seek,
+      onChanged: (value) => setState(() => _dragValue = value),
+      onChangeEnd: (value) {
+        setState(() => _dragValue = null);
+        widget.notifier.seek(value);
+      },
     );
   }
 
@@ -7052,10 +7747,17 @@ class _ProgressBar extends ConsumerWidget {
     double rawPosition,
     double rawDuration, {
     required ValueChanged<double>? onChanged,
+    ValueChanged<double>? onChangeEnd,
   }) {
     final scheme = Theme.of(context).colorScheme;
-    final dur = rawDuration.isFinite && rawDuration > 0 ? rawDuration : 1.0;
-    final position = rawPosition.isFinite ? rawPosition.clamp(0.0, dur) : 0.0;
+    // 时长未知（恢复会话/插件歌曲元数据缺时长）时进度归零：若仍按
+    // max=1.0 钳制，恢复的 position 会让滑块先停在尾端，时长事件到达
+    // 后再跳回真实进度。
+    final hasDuration = rawDuration.isFinite && rawDuration > 0;
+    final dur = hasDuration ? rawDuration : 1.0;
+    final position = hasDuration && rawPosition.isFinite
+        ? rawPosition.clamp(0.0, dur)
+        : 0.0;
     return Column(
       children: [
         SliderTheme(
@@ -7068,7 +7770,12 @@ class _ProgressBar extends ConsumerWidget {
             thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 5),
             overlayShape: const RoundSliderOverlayShape(overlayRadius: 14),
           ),
-          child: Slider(value: position, max: dur, onChanged: onChanged),
+          child: Slider(
+            value: position,
+            max: dur,
+            onChanged: onChanged,
+            onChangeEnd: onChangeEnd,
+          ),
         ),
         Padding(
           padding: const EdgeInsets.symmetric(horizontal: 10),

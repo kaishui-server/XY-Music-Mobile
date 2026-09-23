@@ -1,5 +1,4 @@
 import 'dart:async';
-import 'dart:ui';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -8,8 +7,13 @@ import '../favorites/favorites_provider.dart';
 import '../library/library_provider.dart';
 import '../navigation/shell.dart';
 import '../player/player_provider.dart';
+import '../playlists/playlist_picker_sheet.dart';
+import '../playlists/playlists_provider.dart';
 import '../plugins/plugin_runtime.dart';
+import '../ui/xy_surface.dart';
+import 'batch_download.dart';
 import 'cover_image.dart';
+import 'source_switch.dart';
 import 'top_notice.dart';
 
 /// 通用歌曲列表：手机端以 56dp 以上触控行展示，点击播放、长按或右侧
@@ -278,12 +282,13 @@ class _SongsListViewState extends ConsumerState<SongsListView> {
                         visualDensity: VisualDensity.compact,
                       ),
                     )
-                  else if (dragIndex >= 0)
+                  else if (dragIndex >= 0) ...[
                     // 与插件管理列表一致的拖拽手柄：只有手柄区域可发起排序。
+                    // 手柄与封面之间留出空隙，降低点封面时误触拖拽的概率。
                     ReorderableDragStartListener(
                       index: dragIndex,
                       child: SizedBox(
-                        width: 34,
+                        width: 30,
                         height: 44,
                         child: Icon(
                           Icons.drag_indicator_rounded,
@@ -292,6 +297,8 @@ class _SongsListViewState extends ConsumerState<SongsListView> {
                         ),
                       ),
                     ),
+                    const SizedBox(width: 8),
+                  ],
                   SongCover(song: s),
                   const SizedBox(width: 11),
                   Expanded(
@@ -329,10 +336,8 @@ class _SongsListViewState extends ConsumerState<SongsListView> {
                                   // 正在播放的歌曲副标题（歌手-专辑）
                                   // 同步主题色，仅降低不透明度保持层级。
                                   color: isPlaying
-                                      ? Theme.of(context)
-                                          .colorScheme
-                                          .primary
-                                          .withValues(alpha: .85)
+                                      ? Theme.of(context).colorScheme.primary
+                                            .withValues(alpha: .85)
                                       : Theme.of(
                                           context,
                                         ).colorScheme.onSurfaceVariant,
@@ -390,9 +395,10 @@ class _SongsListViewState extends ConsumerState<SongsListView> {
   }
 
   String _subtitle(Song song) {
-    final parts = [song.artist, song.album]
-        .where((part) => part.trim().isNotEmpty)
-        .toList();
+    final parts = [
+      song.artist,
+      song.album,
+    ].where((part) => part.trim().isNotEmpty).toList();
     return parts.isEmpty ? '未知艺术家' : parts.join(' · ');
   }
 
@@ -415,11 +421,12 @@ class _SongsListViewState extends ConsumerState<SongsListView> {
     var pluginNames = const <String, String>{};
     try {
       final plugins = await ref.read(enabledMusicPluginsProvider.future);
-      pluginNames = {
-        for (final plugin in plugins) plugin.id: plugin.name,
-      };
+      pluginNames = {for (final plugin in plugins) plugin.id: plugin.name};
     } catch (_) {}
     final sourceTag = _sourceTagLabel(song, pluginNames);
+    // 网络歌曲才提供下载与换源；本地文件没有插件音源可切换，
+    // 批量下载流程本身也会跳过本地文件。
+    final isNetworkSong = song.pluginId?.trim().isNotEmpty == true;
     if (!context.mounted) return;
     final action = await showModalBottomSheet<_SongAction>(
       context: context,
@@ -492,11 +499,31 @@ class _SongsListViewState extends ConsumerState<SongsListView> {
               ),
               _actionTile(
                 context,
+                _SongAction.addToPlaylist,
+                Icons.playlist_add_check,
+                '添加到歌单',
+              ),
+              _actionTile(
+                context,
                 _SongAction.favorite,
                 isFavorite ? Icons.favorite : Icons.favorite_border,
                 isFavorite ? '取消收藏' : '收藏',
                 color: isFavorite ? const Color(0xFFEC4141) : null,
               ),
+              if (isNetworkSong) ...[
+                _actionTile(
+                  context,
+                  _SongAction.download,
+                  Icons.download_outlined,
+                  '下载',
+                ),
+                _actionTile(
+                  context,
+                  _SongAction.switchSource,
+                  Icons.swap_horiz_rounded,
+                  '换源',
+                ),
+              ],
               _actionTile(
                 context,
                 _SongAction.info,
@@ -528,8 +555,21 @@ class _SongsListViewState extends ConsumerState<SongsListView> {
         await ref.read(playerProvider.notifier).addToQueue(song.toQueueItem());
         if (context.mounted) _toast(context, '已添加到播放队列');
         return;
+      case _SongAction.addToPlaylist:
+        if (context.mounted) await _addSongToPlaylist(context, ref, song);
+        return;
       case _SongAction.favorite:
         await _toggleFavorite(context, ref, song);
+        return;
+      case _SongAction.download:
+        if (context.mounted) {
+          await runBatchDownload(context, ref, songs: [song]);
+        }
+        return;
+      case _SongAction.switchSource:
+        if (context.mounted) {
+          await _switchSongSource(context, ref, song);
+        }
         return;
       case _SongAction.info:
         if (context.mounted) await _showSongInfo(context, song);
@@ -549,6 +589,90 @@ class _SongsListViewState extends ConsumerState<SongsListView> {
         .read(favoritesProvider.notifier)
         .toggle(song.path, song: FavoriteSongSnapshot.fromSong(song));
     if (context.mounted) _toast(context, added ? '已收藏' : '已取消收藏');
+  }
+
+  /// 单曲“添加到歌单”：弹出歌单选择面板（含新建入口），完成后提示。
+  Future<void> _addSongToPlaylist(
+    BuildContext context,
+    WidgetRef ref,
+    Song song,
+  ) async {
+    final result = await showPlaylistPicker(
+      context,
+      items: [song.toQueueItem()],
+    );
+    if (!context.mounted || result == null) return;
+    final name = ref
+        .read(playlistsProvider)
+        .where((value) => value.id == result.playlistId)
+        .firstOrNull
+        ?.name;
+    if (result.existsCount > 0) {
+      XyNotice.show(
+        context,
+        message: name == null ? '该歌曲已在歌单中' : '该歌曲已在歌单“$name”中',
+        type: XyNoticeType.warning,
+      );
+    } else {
+      XyNotice.show(
+        context,
+        message: name == null ? '已添加到歌单' : '已添加到歌单“$name”',
+        type: XyNoticeType.success,
+      );
+    }
+  }
+
+  /// 单曲换源：选目标插件 → 挑候选歌曲 → 原位替换播放队列并重播；
+  /// 收藏列表里的同一首也同步换源，保持列表数据一致。
+  Future<void> _switchSongSource(
+    BuildContext context,
+    WidgetRef ref,
+    Song song,
+  ) async {
+    final plugins = await ref.read(enabledMusicPluginsProvider.future);
+    if (!context.mounted) return;
+    if (plugins.isEmpty) {
+      XyNotice.show(
+        context,
+        message: '请先在 设置 → 插件 中启用插件',
+        type: XyNoticeType.warning,
+      );
+      return;
+    }
+    final picked = await showSourceSwitchSheet(
+      context,
+      ref,
+      title: song.title,
+      artist: song.artist,
+      durationMs: song.duration * 1000,
+      excludePluginId: song.pluginId,
+    );
+    if (picked == null || !context.mounted) return;
+    final (plugin, replacement) = picked;
+    // 收藏与歌单里的同一首歌同步原位换源，避免列表仍显示旧音源。
+    await syncReplacementToCollections(
+      ref,
+      originalPath: song.path,
+      plugin: plugin,
+      replacement: replacement,
+    );
+    final replaced = await ref
+        .read(playerProvider.notifier)
+        .switchSource(song.path, replacementToQueueItem(plugin, replacement));
+    if (!context.mounted) return;
+    if (replaced) {
+      XyNotice.show(
+        context,
+        message: '已切换到 ${plugin.name} 音源',
+        type: XyNoticeType.success,
+      );
+    } else {
+      XyNotice.show(
+        context,
+        message: '已切换音源，原歌曲不在播放队列中',
+        type: XyNoticeType.warning,
+      );
+    }
   }
 
   ListTile _actionTile(
@@ -749,21 +873,20 @@ class _ScrollToTopButtonState extends State<ScrollToTopButton> {
           MediaQuery.paddingOf(context).bottom +
           (widget.hasMiniPlayer ? 104 : 24),
       child: ClipOval(
-        child: BackdropFilter(
-          filter: ImageFilter.blur(sigmaX: 5, sigmaY: 5),
-          child: Material(
-            color: scheme.surfaceContainerHighest.withValues(alpha: .45),
-            shape: const CircleBorder(),
-            clipBehavior: Clip.antiAlias,
-            child: InkWell(
-              onTap: _scrollToTop,
-              child: const Tooltip(
-                message: '回到顶部',
-                child: SizedBox(
-                  width: 42,
-                  height: 42,
-                  child: Icon(Icons.keyboard_arrow_up_rounded),
-                ),
+        // 浮动按钮不再使用 BackdropFilter：滚动时下方内容每帧变化，
+        // 模糊随帧重采样是列表掉帧来源之一；高不透明度纯色观感一致。
+        child: Material(
+          color: scheme.surfaceContainerHighest.withValues(alpha: .78),
+          shape: const CircleBorder(),
+          clipBehavior: Clip.antiAlias,
+          child: InkWell(
+            onTap: _scrollToTop,
+            child: const Tooltip(
+              message: '回到顶部',
+              child: SizedBox(
+                width: 42,
+                height: 42,
+                child: Icon(Icons.keyboard_arrow_up_rounded),
               ),
             ),
           ),
@@ -890,9 +1013,9 @@ class _FloatingListButtonsState extends State<_FloatingListButtons> {
           MediaQuery.paddingOf(context).bottom +
           (widget.hasMiniPlayer
               ? (widget.ownMiniPlayerBar
-                      ? kMiniPlayerBottomGap + kMiniPlayerHeight
-                      : 0) +
-                  8
+                        ? kMiniPlayerBottomGap + kMiniPlayerHeight
+                        : 0) +
+                    8
               : 12),
       // 毛玻璃按钮：单个圆形独立排列（无边框组合容器、无描边），
       // 5px 高斯模糊 + 半透明蒙层，与搜索框观感统一。
@@ -937,22 +1060,23 @@ class _FloatingListButtonsState extends State<_FloatingListButtons> {
   }) {
     return Padding(
       padding: const EdgeInsets.only(top: 10),
-      child: ClipOval(
-        child: BackdropFilter(
-          filter: ImageFilter.blur(sigmaX: 5, sigmaY: 5),
-          child: Material(
-            color: scheme.surfaceContainerHighest.withValues(alpha: .45),
-            shape: const CircleBorder(),
-            clipBehavior: Clip.antiAlias,
-            child: InkWell(
-              onTap: onPressed,
-              child: Tooltip(
-                message: tooltip,
-                child: SizedBox(
-                  width: 42,
-                  height: 42,
-                  child: Icon(icon, size: iconSize),
-                ),
+      // 常驻毛玻璃：5px 高斯模糊 + 半透明蒙层，与搜索框观感统一。
+      child: XyBackdropGlass(
+        sigma: 5,
+        borderRadius: BorderRadius.circular(21),
+        glassColor: scheme.surfaceContainerHighest.withValues(alpha: .35),
+        child: Material(
+          color: Colors.transparent,
+          shape: const CircleBorder(),
+          clipBehavior: Clip.antiAlias,
+          child: InkWell(
+            onTap: onPressed,
+            child: Tooltip(
+              message: tooltip,
+              child: SizedBox(
+                width: 42,
+                height: 42,
+                child: Icon(icon, size: iconSize),
               ),
             ),
           ),
@@ -966,7 +1090,10 @@ enum _SongAction {
   play,
   playNext,
   addToQueue,
+  addToPlaylist,
   favorite,
+  download,
+  switchSource,
   info,
   removeFromRecent,
 }

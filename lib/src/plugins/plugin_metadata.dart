@@ -44,6 +44,7 @@ class PluginMetadata {
     final header = _parseHeader(script);
     final exported = _parseExportedObject(script, constants);
     final json = _parseJsonObject(script);
+    final constMeta = _parseConstMeta(script);
 
     return PluginMetadata(
       id: _clean(header['id'] ?? exported['id'] ?? json['id']),
@@ -53,12 +54,19 @@ class PluginMetadata {
             exported['platform'] ??
             exported['name'] ??
             json['platform'] ??
-            json['name'],
+            json['name'] ??
+            constMeta['name'],
       ),
       version: _clean(
-        header['version'] ?? exported['version'] ?? json['version'],
+        header['version'] ??
+            exported['version'] ??
+            json['version'] ??
+            constMeta['version'],
       ),
-      author: _clean(header['author'] ?? exported['author'] ?? json['author']),
+      author: _clean(
+        header['author'] ?? exported['author'] ?? json['author'] ??
+            constMeta['author'],
+      ),
       remark: _clean(
         header['description'] ??
             header['desc'] ??
@@ -181,6 +189,27 @@ class PluginMetadata {
       result.putIfAbsent(key, () => value);
     }
     return result;
+  }
+
+  /// animemusic/1 等新格式插件把元信息放在 `const META = { ... }` 单行
+  /// JSON 常量里，且 module.exports 导出的是变量而非对象字面量，前面
+  /// 的静态解析都取不到名称；这里单独截取该常量做一次 JSON 解析兜底。
+  static Map<String, String> _parseConstMeta(String script) {
+    final match = RegExp(
+      r'const\s+META\s*=\s*(\{[^\n;]+\})\s*;',
+    ).firstMatch(script);
+    if (match == null) return const {};
+    try {
+      final value = jsonDecode(match.group(1)!);
+      if (value is! Map) return const {};
+      return {
+        for (final key in const ['id', 'name', 'version', 'author', 'platform'])
+          if (value[key] != null && value[key].toString().trim().isNotEmpty)
+            key: value[key].toString(),
+      };
+    } catch (_) {
+      return const {};
+    }
   }
 
   static Map<String, String> _parseStringConstants(String script) {

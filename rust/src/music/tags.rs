@@ -959,7 +959,52 @@ fn item_text(item: &TagItem) -> Option<String> {
 
 fn clean_text(value: &str) -> Option<String> {
     let trimmed = value.trim_matches('\0').trim();
-    (!trimmed.is_empty()).then(|| trimmed.to_string())
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(
+        repair_latin1_gbk_mojibake(trimmed).unwrap_or_else(|| trimmed.to_string()),
+    )
+}
+
+/// 尝试修复被按 Latin-1 误解码的 GBK 文本。
+///
+/// 早期中文打标签工具常把 GBK 字节写入 ID3 的 Latin-1（encoding=0）字段，
+/// 读取端按 ISO-8859-1 解码后得到 U+0080..=U+00FF 区间的乱码（例如
+/// “ºi»¨Óê”）。这里把只含 ASCII / Latin-1 区间字符的可疑文本还原成字节后
+/// 用 GBK 重新解码：
+/// - 任一字符超出 U+00FF（本身已是正常多字节文本）→ 不处理；
+/// - 全为 ASCII → 不处理；
+/// - GBK 解码出现替换字符或不含 CJK 汉字 → 保留原文，
+///   避免“Beyoncé”这类合法 Latin-1 文本被误转。
+fn repair_latin1_gbk_mojibake(text: &str) -> Option<String> {
+    let mut has_high_byte = false;
+    for ch in text.chars() {
+        let code = ch as u32;
+        if code <= 0x7f {
+            continue;
+        }
+        if code > 0xff {
+            return None;
+        }
+        has_high_byte = true;
+    }
+    if !has_high_byte {
+        return None;
+    }
+
+    let bytes: Vec<u8> = text.chars().map(|ch| ch as u8).collect();
+    let (decoded, _, had_errors) = encoding_rs::GBK.decode(&bytes);
+    if had_errors || decoded.contains('\u{fffd}') {
+        return None;
+    }
+    let has_cjk = decoded
+        .chars()
+        .any(|ch| matches!(ch as u32, 0x3400..=0x4dbf | 0x4e00..=0x9fff));
+    if !has_cjk {
+        return None;
+    }
+    Some(decoded.into_owned())
 }
 
 fn looks_like_lyrics_key(raw_key: &str) -> bool {
@@ -1421,5 +1466,107 @@ mod tests {
         assert!(find_embedded_picture(&scan_tagged_file).is_none());
 
         let _ = fs::remove_file(temp_path);
+    }
+
+    fn gbk_bytes(text: &str) -> Vec<u8> {
+        encoding_rs::GBK.encode(text).0.into_owned()
+    }
+
+    fn id3v23_frame(id: &str, payload: &[u8]) -> Vec<u8> {
+        let mut frame = Vec::new();
+        frame.extend_from_slice(id.as_bytes());
+        frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        frame.extend_from_slice(&[0x00, 0x00]); // frame flags
+        frame.extend_from_slice(payload);
+        frame
+    }
+
+    fn latin1_mojibake(gbk_text: &str) -> String {
+        gbk_bytes(gbk_text)
+            .iter()
+            .map(|byte| char::from(*byte))
+            .collect()
+    }
+
+    /// 构造一个 ID3v2.3 文本帧声明为 Latin-1（encoding=0）但实际写入
+    /// GBK 字节的 MP3 —— 老旧中文打标签工具的常见产物。
+    fn create_mp3_with_gbk_latin1_id3v2_bytes() -> Vec<u8> {
+        let mut frames = Vec::new();
+        for (frame_id, text) in [
+            ("TIT2", "红花雨"),
+            ("TPE1", "[高品质]刘紫玲"),
+            ("TALB", "民歌精选"),
+        ] {
+            let mut payload = vec![0x00]; // encoding = Latin-1
+            payload.extend(gbk_bytes(text));
+            frames.extend(id3v23_frame(frame_id, &payload));
+        }
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"ID3");
+        bytes.extend_from_slice(&[0x03, 0x00, 0x00]); // v2.3 revision 0, flags 0
+        let size = frames.len();
+        bytes.extend_from_slice(&[
+            ((size >> 21) & 0x7F) as u8,
+            ((size >> 14) & 0x7F) as u8,
+            ((size >> 7) & 0x7F) as u8,
+            (size & 0x7F) as u8,
+        ]);
+        bytes.extend_from_slice(&frames);
+        bytes.extend_from_slice(&[0xFF, 0xFB, 0x90, 0x64]);
+        bytes.extend(std::iter::repeat(0).take(413));
+        bytes
+    }
+
+    #[test]
+    fn repairs_gbk_mojibake_in_latin1_id3v2_frames() {
+        let temp_name = format!(
+            "xymusic_gbk_latin1_{}.mp3",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        );
+        let temp_path = std::env::temp_dir().join(temp_name);
+
+        fs::write(&temp_path, create_mp3_with_gbk_latin1_id3v2_bytes())
+            .expect("temp mp3 should be written");
+
+        let tagged_file =
+            read_tagged_file_from_path_for_scan(&temp_path).expect("mp3 tags should be read");
+        let metadata = extract_text_metadata(&tagged_file);
+
+        assert_eq!(metadata.title.as_deref(), Some("红花雨"));
+        assert_eq!(metadata.artist.as_deref(), Some("[高品质]刘紫玲"));
+        assert_eq!(metadata.album.as_deref(), Some("民歌精选"));
+
+        let _ = fs::remove_file(temp_path);
+    }
+
+    #[test]
+    fn repair_latin1_gbk_mojibake_keeps_normal_text() {
+        // 正常中文（已是 Unicode）不处理。
+        assert_eq!(
+            super::repair_latin1_gbk_mojibake("正常文本"),
+            None,
+            "已经是正确解码的中文不应被改写"
+        );
+        // 纯 ASCII 不处理。
+        assert_eq!(super::repair_latin1_gbk_mojibake("Plain Title"), None);
+        // 合法 Latin-1 文本：é 结尾无法构成 GBK 双字节，保持原样。
+        assert_eq!(super::repair_latin1_gbk_mojibake("Beyoncé"), None);
+    }
+
+    #[test]
+    fn repair_latin1_gbk_mojibake_restores_gbk_text() {
+        assert_eq!(
+            super::repair_latin1_gbk_mojibake(&latin1_mojibake("红花雨")),
+            Some("红花雨".to_string())
+        );
+        // 混合 ASCII 与 GBK 的文本也能修复。
+        assert_eq!(
+            super::repair_latin1_gbk_mojibake(&latin1_mojibake("[HQ]刘紫玲")),
+            Some("[HQ]刘紫玲".to_string())
+        );
     }
 }

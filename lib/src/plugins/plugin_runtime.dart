@@ -25,6 +25,10 @@ class EnabledMusicPlugin {
     required this.path,
     this.isLx = false,
     this.lxSources = const [],
+    this.isAnimemusic = false,
+    this.animemusicApi = '',
+    this.animemusicPlatform = 'wy',
+    this.animemusicQualities = const ['128k', '192k', '320k', 'flac'],
     this.userVariables = const {},
   });
 
@@ -33,6 +37,19 @@ class EnabledMusicPlugin {
   final String path;
   final bool isLx;
   final List<String> lxSources;
+
+  /// animemusic/1 自有格式插件：CommonJS Node 模块，QuickJS 无法直接
+  /// 执行（没有 http/https/zlib 内置模块），宿主按其 REST 契约直连。
+  final bool isAnimemusic;
+
+  /// 从插件 META 提取的后端接口地址（可被用户变量 api 覆盖）。
+  final String animemusicApi;
+
+  /// 后端音源平台（wy/kg/…）。
+  final String animemusicPlatform;
+
+  /// META.qualities 声明的音质档位。
+  final List<String> animemusicQualities;
 
   /// 用户在插件管理中填写的用户变量值，加载插件时注入 env。
   final Map<String, String> userVariables;
@@ -105,6 +122,15 @@ class PluginMediaSource {
   final String lyrics;
 }
 
+/// 播放源缓存的条目：inFlight 非空表示解析正在进行（并发调用直接
+/// 复用同一 Future）；source 非空表示解析完成（TTL 内直接返回）。
+class _MediaSourceCacheEntry {
+  _MediaSourceCacheEntry(this.cachedAt);
+  DateTime cachedAt;
+  Future<PluginMediaSource>? inFlight;
+  PluginMediaSource? source;
+}
+
 /// Bilibili 视频流地址。DASH 视频通常需要 Referer 才能在 Android 播放器中
 /// 正常打开，因此地址和请求头一起返回给详情页。
 class PluginVideoSource {
@@ -113,12 +139,22 @@ class PluginVideoSource {
     this.backupUrls = const [],
     this.headers = const {},
     this.mimeType = 'video/mp4',
+    this.selectedQuality,
+    this.availableQualities = const [],
   });
 
   final String url;
   final List<String> backupUrls;
   final Map<String, String> headers;
   final String mimeType;
+
+  /// 插件实际选中的画质 key（如 baka 系返回的 "1080p"）。
+  /// 请求「最高档」时插件会回落到可用档位，此字段即回落后的真实档位。
+  final String? selectedQuality;
+
+  /// 插件返回的可用画质 key 列表（如 ["360p","720p","1080p"]），
+  /// 供 MV 播放页的画质选择入口动态展示；插件未提供时为空。
+  final List<String> availableQualities;
 }
 
 String pluginSongPath(EnabledMusicPlugin plugin, PluginSearchSong song) {
@@ -315,14 +351,57 @@ List<String> _qualityTokensFromRaw(dynamic value) {
   return result.toList();
 }
 
+/// 读取插件管理页记录的插件下载源 URL（id → 安装时的下载地址）。
+Map<String, String> _readPluginSourceUrls(
+  SharedPreferences prefs,
+  String key,
+) {
+  final raw = prefs.getString(key);
+  if (raw == null || raw.isEmpty) return const {};
+  try {
+    final decoded = jsonDecode(raw);
+    if (decoded is! Map) return const {};
+    return {
+      for (final entry in decoded.entries)
+        if (entry.key is String && entry.value is String)
+          entry.key as String: entry.value as String,
+    };
+  } catch (_) {
+    return const {};
+  }
+}
+
+/// animemusic 分发端点生成的插件 META.api 与脚本下载地址同主机但指向
+/// 默认端口（80），而后端实际运行在订阅源端口上（如 animemusic 的
+/// 19844）。对照插件的下载源 URL：同主机、api 未带显式端口、源 URL
+/// 带端口时，把 api 端口改写成源端口。
+String _rewriteAnimemusicApiPort(String api, String sourceUrl) {
+  if (api.isEmpty || sourceUrl.isEmpty) return api;
+  final apiUri = Uri.tryParse(api);
+  final sourceUri = Uri.tryParse(sourceUrl);
+  if (apiUri == null || sourceUri == null) return api;
+  if (!apiUri.hasScheme ||
+      apiUri.host.isEmpty ||
+      apiUri.host != sourceUri.host) {
+    return api;
+  }
+  final apiDefaultPort = !apiUri.hasPort || apiUri.port == 80;
+  if (!apiDefaultPort || !sourceUri.hasPort || sourceUri.port == 80) {
+    return api;
+  }
+  return apiUri.replace(port: sourceUri.port).toString();
+}
+
 Future<List<EnabledMusicPlugin>> loadEnabledMusicPlugins(Ref ref) async {
   const enabledKey = 'mobileEnabledPlugins';
+  const sourceUrlsKey = 'mobilePluginSourceUrlsV1';
   final dataDir = await ref.read(appDataDirProvider.future);
   final directory = Directory(p.join(dataDir, 'plugins'));
   if (!directory.existsSync()) return const [];
   final prefs = await SharedPreferences.getInstance();
   final enabled = (prefs.getStringList(enabledKey) ?? const []).toSet();
   final savedVariables = readPluginUserVariables(prefs);
+  final sourceUrls = _readPluginSourceUrls(prefs, sourceUrlsKey);
   final plugins = <EnabledMusicPlugin>[];
   for (final file in directory.listSync().whereType<File>()) {
     if (p.extension(file.path).toLowerCase() != '.js') continue;
@@ -330,14 +409,42 @@ Future<List<EnabledMusicPlugin>> loadEnabledMusicPlugins(Ref ref) async {
     if (!enabled.contains(id)) continue;
     final source = await file.readAsString();
     final isLx = _looksLikeLxPlugin(source);
+    final isAnimemusic = !isLx && _looksLikeAnimemusicPlugin(source);
+    final animemusicMeta =
+        isAnimemusic ? _extractAnimemusicMeta(source) : const <String, String>{};
     final metadata = PluginMetadata.parse(source);
+    // animemusic 的 module.exports 导出的是变量而非对象字面量，
+    // PluginMetadata 取不到名称时回退 META.name。
+    var pluginName = metadata.name ?? id;
+    final metaName = animemusicMeta['name']?.trim() ?? '';
+    if (isAnimemusic && metaName.isNotEmpty) pluginName = metaName;
     plugins.add(
       EnabledMusicPlugin(
         id: id,
-        name: metadata.name ?? id,
+        name: pluginName,
         path: file.path,
         isLx: isLx,
         lxSources: isLx ? _detectLxSources(source) : const [],
+        isAnimemusic: isAnimemusic,
+        animemusicApi:
+            (savedVariables[id]?['api']?.trim().isNotEmpty == true
+                ? savedVariables[id]!['api']!.trim()
+                : _rewriteAnimemusicApiPort(
+                    animemusicMeta['api']?.trim() ?? '',
+                    sourceUrls[id] ?? '',
+                  )),
+        animemusicPlatform:
+            animemusicMeta['platform']?.trim().isNotEmpty == true
+            ? animemusicMeta['platform']!.trim()
+            : 'wy',
+        animemusicQualities:
+            animemusicMeta['qualities']?.trim().isNotEmpty == true
+            ? (animemusicMeta['qualities']!
+                  .split(',')
+                  .map((item) => item.trim())
+                  .where((item) => item.isNotEmpty)
+                  .toList())
+            : const ['128k', '192k', '320k', 'flac'],
         userVariables: savedVariables[id] ?? const {},
       ),
     );
@@ -429,6 +536,39 @@ List<String> _detectLxSources(String source) {
   return found.isEmpty ? supported : found;
 }
 
+/// animemusic/1 插件识别：脚本内 META.format 声明自有格式，本体是
+/// CommonJS Node 模块（require http/https/zlib），无法在 QuickJS 中执行。
+bool _looksLikeAnimemusicPlugin(String source) =>
+    RegExp(
+      r'''["']format["']\s*:\s*["']animemusic/1["']''',
+    ).hasMatch(source) ||
+    RegExp(r'''module\.exports\s*=\s*\w+''').hasMatch(source) &&
+        source.contains('animemusic/1');
+
+/// 提取 animemusic/1 插件 `const META = { ... }` 中的关键字段。
+/// META 由分发端点实时生成、保证是单行合法 JSON，这里按行截取后解码；
+/// 解码失败时退回逐字段正则，尽量拿到 api/platform/qualities。
+Map<String, String> _extractAnimemusicMeta(String source) {
+  final match = RegExp(
+    r'const\s+META\s*=\s*(\{[^\n;]+\})\s*;',
+  ).firstMatch(source);
+  if (match == null) return const {};
+  try {
+    final decoded = jsonDecode(match.group(1)!) as Map;
+    return {
+      for (final key in const ['name', 'platform', 'version', 'author', 'api'])
+        if (decoded[key] != null && decoded[key].toString().trim().isNotEmpty)
+          key: decoded[key].toString(),
+      if (decoded['qualities'] is List)
+        'qualities': (decoded['qualities'] as List)
+            .map((item) => item.toString())
+            .join(','),
+    };
+  } catch (_) {
+    return const {};
+  }
+}
+
 final enabledMusicPluginsProvider = FutureProvider<List<EnabledMusicPlugin>>(
   loadEnabledMusicPlugins,
 );
@@ -452,6 +592,12 @@ class PluginRuntimeService {
   final String? runtimeLxBootstrap;
   final Map<String, String> pluginSources;
   JavascriptRuntime? _runtime;
+  // 常驻插件工作 isolate：QuickJS 运行时与已加载插件全程复用，
+  // 消除每次操作都要冷启动 JS 引擎并重新 eval 插件源码的开销
+  // （该开销是纯 CPU 负载，省电调度下会被放大数秒，表现为部分
+  // 机型播放加载特别慢）。
+  _PluginWorker? _pluginWorker;
+  Future<_PluginWorker>? _pluginWorkerTask;
   Future<void>? _initializing;
   int _activeRuntimeOperations = 0;
   bool _disposeRequested = false;
@@ -462,6 +608,13 @@ class PluginRuntimeService {
   final Map<String, Future<String>> _pluginSourceTasks = {};
   final Map<String, _NeteaseTrackMeta> _neteaseTrackMetaCache = {};
   final Map<String, Future<List<String>>> _qualityDiscoveryCache = {};
+
+  /// 已解析播放源的短时缓存：同一首歌曲短时间内重复播放（切歌回切、
+  /// 下一首预取）时直接复用 URL，跳过插件网络解析。音源返回的 CDN
+  /// 地址普遍只有几分钟时效，TTL 取保守的 5 分钟，并限制条目数量。
+  static const Duration _mediaSourceCacheTtl = Duration(minutes: 5);
+  static const int _mediaSourceCacheMaxEntries = 12;
+  final Map<String, _MediaSourceCacheEntry> _mediaSourceCache = {};
 
   bool get _runsPluginsInBackground =>
       httpClient == null && runtimeBootstrap == null;
@@ -628,13 +781,47 @@ class PluginRuntimeService {
     String operation,
     dynamic payload,
   ) async {
+    final pluginSource = await _loadPluginSource(plugin);
+    Object? reply;
+    try {
+      final worker = await _ensurePluginWorker();
+      reply = await worker.run(<String, Object?>{
+        'operation': operation,
+        'pluginId': plugin.id,
+        'pluginName': plugin.name,
+        'pluginPath': plugin.path,
+        'pluginSource': pluginSource,
+        'userVariables': jsonEncode(plugin.userVariables),
+        'payload': jsonEncode(payload),
+      });
+    } on Exception {
+      // 常驻工作 isolate 拉起失败或中途崩溃/卡死：回退到一次性
+      // 冷启动 isolate，保证插件功能依然可用。
+      return _runPluginOperationCold(plugin, operation, payload, pluginSource);
+    }
+    if (reply is! Map || reply['ok'] != true) {
+      throw Exception(
+        _friendlyError(
+          (reply is Map ? reply['error'] : null)?.toString() ?? '后台插件调用失败',
+        ),
+      );
+    }
+    return reply['data'];
+  }
+
+  /// 一次性冷启动执行（常驻工作 isolate 不可用时的回退路径）。
+  Future<dynamic> _runPluginOperationCold(
+    EnabledMusicPlugin plugin,
+    String operation,
+    dynamic payload,
+    String pluginSource,
+  ) async {
     final bootstrap = await (_runtimeBootstrapTask ??= rootBundle.loadString(
       'assets/plugin_runtime.js',
     ));
     final lxBootstrap = await rootBundle.loadString(
       'assets/lx_plugin_runtime.js',
     );
-    final pluginSource = await _loadPluginSource(plugin);
     final request = <String, String>{
       'operation': operation,
       'pluginId': plugin.id,
@@ -660,6 +847,25 @@ class PluginRuntimeService {
     return response['data'];
   }
 
+  /// 惰性拉起常驻插件工作 isolate；已存在时直接复用。
+  Future<_PluginWorker> _ensurePluginWorker() {
+    final worker = _pluginWorker;
+    if (worker != null) return Future.value(worker);
+    return _pluginWorkerTask ??= _PluginWorker.spawn().then((spawned) {
+      spawned.onDead = () {
+        if (_pluginWorker == spawned) {
+          _pluginWorker = null;
+          _pluginWorkerTask = null;
+        }
+      };
+      _pluginWorker = spawned;
+      return spawned;
+    }).catchError((Object error) {
+      _pluginWorkerTask = null;
+      throw error;
+    });
+  }
+
   Future<List<PluginSearchSong>> search(
     EnabledMusicPlugin plugin,
     String keyword, {
@@ -667,6 +873,9 @@ class PluginRuntimeService {
   }) async {
     if (plugin.isLx) {
       return _searchLxPlugin(plugin, keyword, onlySource: lxSource);
+    }
+    if (plugin.isAnimemusic) {
+      return _searchAnimemusic(plugin, keyword);
     }
     dynamic response;
     Object? pluginError;
@@ -715,6 +924,9 @@ class PluginRuntimeService {
   }) async {
     if (plugin.isLx) {
       return _searchLxPlugin(plugin, artist.title, onlySource: lxSource);
+    }
+    if (plugin.isAnimemusic) {
+      return _searchAnimemusic(plugin, artist.title);
     }
     try {
       Future<List<Map<String, dynamic>>> fetchPage(int page) async {
@@ -833,6 +1045,9 @@ class PluginRuntimeService {
     if (plugin.isLx) {
       return _searchLxPlugin(plugin, album.title, onlySource: lxSource);
     }
+    if (plugin.isAnimemusic) {
+      return _searchAnimemusic(plugin, album.title);
+    }
     try {
       final response = _runsPluginsInBackground
           ? await _runPluginOperation(plugin, 'getAlbumInfo', {
@@ -890,6 +1105,7 @@ class PluginRuntimeService {
         artist: true,
       );
     }
+    if (plugin.isAnimemusic) return const [];
     // Bilibili 的“歌手”实际上是 UP 主。部分插件把用户搜索暴露为
     // user 类型，另一些插件仍使用 artist 类型；优先尝试 user，并且
     // 只接受带有 mid/uid/uname 等用户字段的结果，避免把视频搜索结果
@@ -996,6 +1212,7 @@ class PluginRuntimeService {
         artist: false,
       );
     }
+    if (plugin.isAnimemusic) return const [];
     final list = await _searchMusicFreeType(plugin, keyword, 'album');
     return list
         .map(
@@ -1018,6 +1235,7 @@ class PluginRuntimeService {
     bool includeAlbums = true,
   }) async {
     if (plugin.isLx) return const [];
+    if (plugin.isAnimemusic) return const [];
     List<Map<String, dynamic>> list = const [];
     final types = includeAlbums
         ? const ['sheet', 'playlist', 'album']
@@ -1048,6 +1266,7 @@ class PluginRuntimeService {
     EnabledMusicPlugin plugin,
   ) async {
     if (plugin.isLx) return const [];
+    if (plugin.isAnimemusic) return const [];
     final response = _runsPluginsInBackground
         ? await _runPluginOperation(plugin, 'getTopLists', null)
         : await _callOnCurrentIsolate(plugin, 'getTopLists', []);
@@ -1071,6 +1290,7 @@ class PluginRuntimeService {
     int limit = 40,
   }) async {
     if (plugin.isLx) return const [];
+    if (plugin.isAnimemusic) return const [];
     final songs = await _loadMusicFreePlaylistSongs(
       plugin,
       Map<String, dynamic>.from(chart.rawData),
@@ -1838,6 +2058,9 @@ class PluginRuntimeService {
   /// 直接扫描插件源码，供菜单展示前快速判断（与用户变量声明扫描同一思路）。
   Future<bool> pluginSupportsMvSource(EnabledMusicPlugin plugin) async {
     if (plugin.isLx) return false;
+    // animemusic 插件由宿主直连 REST（music/mv/search、music/mv/url），
+    // META.capabilities 恒含 mvSearch/mvUrl，无需扫描源码。
+    if (plugin.animemusicApi.trim().isNotEmpty) return true;
     final cached = _mvSupportCache[plugin.id];
     if (cached != null) return cached;
     bool supported = false;
@@ -2166,7 +2389,21 @@ class PluginRuntimeService {
     EnabledMusicPlugin plugin,
     Map<String, dynamic> rawData, {
     String? preferredQuality,
+    bool bypassCache = false,
   }) async {
+    final cacheKey = _mediaSourceCacheKey(plugin, rawData, preferredQuality);
+    if (!bypassCache) {
+      final entry = _mediaSourceCache[cacheKey];
+      if (entry != null) {
+        if (entry.source != null &&
+            DateTime.now().difference(entry.cachedAt) < _mediaSourceCacheTtl) {
+          return entry.source!;
+        }
+        // 解析正在进行：并发调用（预取 + 用户点播）合并为同一请求。
+        final inFlight = entry.inFlight;
+        if (inFlight != null) return inFlight;
+      }
+    }
     Future<PluginMediaSource> resolve(String? quality) async {
       if (plugin.isLx) {
         return _resolveLxMediaSource(
@@ -2174,6 +2411,9 @@ class PluginRuntimeService {
           rawData,
           preferredQuality: quality,
         );
+      }
+      if (plugin.isAnimemusic) {
+        return _resolveAnimemusicMediaSource(plugin, rawData, quality);
       }
       if (_runsPluginsInBackground) {
         final response = await _runPluginOperation(
@@ -2192,9 +2432,26 @@ class PluginRuntimeService {
       );
     }
 
+    final future = resolve(preferredQuality);
+    final entry = _mediaSourceCache.putIfAbsent(
+      cacheKey,
+      () => _MediaSourceCacheEntry(DateTime.now()),
+    );
+    entry.inFlight = future;
+    _trimMediaSourceCache(cacheKey);
     try {
-      return await resolve(preferredQuality);
+      final source = await future;
+      entry
+        ..source = source
+        ..cachedAt = DateTime.now()
+        ..inFlight = null;
+      return source;
     } catch (error) {
+      entry.inFlight = null;
+      // 解析失败不留缓存（含 in-flight 占位），下次调用重新走插件。
+      if (identical(_mediaSourceCache[cacheKey], entry)) {
+        _mediaSourceCache.remove(cacheKey);
+      }
       // 音质偏好是跨歌曲保存的，但插件支持的档位是逐首歌曲变化的。
       // 某些插件遇到不支持的 super/母带档位会直接抛错，导致原本可播
       // 的歌曲也被判定为播放失败；失败时用最兼容的 320k 再解析一次。
@@ -2205,6 +2462,64 @@ class PluginRuntimeService {
       } catch (_) {
         rethrow;
       }
+    }
+  }
+
+  /// 播放地址 setUrl 失败时使缓存条目失效（地址可能已过 CDN 时效），
+  /// 强制下一次解析重新请求插件。
+  void invalidateMediaSourceCache(
+    EnabledMusicPlugin plugin,
+    Map<String, dynamic> rawData, {
+    String? quality,
+  }) {
+    _mediaSourceCache.remove(_mediaSourceCacheKey(plugin, rawData, quality));
+  }
+
+  String _mediaSourceCacheKey(
+    EnabledMusicPlugin plugin,
+    Map<String, dynamic> rawData,
+    String? quality,
+  ) {
+    // 洛雪音源歌曲的歌曲 id 位于 pluginData['lx'] 内层（外层是识曲
+    // 快照）；不从内层提取会让同一插件的所有 lx 歌曲共享空 id 键。
+    final Map raw = rawData['lx'] is Map
+        ? Map<String, dynamic>.from(rawData['lx'] as Map)
+        : rawData;
+    final songId =
+        (raw['id'] ??
+                raw['songId'] ??
+                raw['songmid'] ??
+                raw['mid'] ??
+                raw['hash'] ??
+                raw['url'] ??
+                rawData['url'] ??
+                '')
+            .toString();
+    if (songId.isEmpty) {
+      // 兜底：无法提取稳定歌曲 id 时退回整份 rawData 的内容散列，
+      // 避免不同歌曲错误共享同一条缓存。
+      return '${plugin.id}\u0000${rawData.hashCode}\u0000${quality?.trim() ?? ''}';
+    }
+    // lx 歌曲的播放解析与平台（kw/kg/tx/wy/mg）绑定，不同平台可能
+    // 出现相同歌曲 id，source 也要参与键。
+    final source = raw['source']?.toString() ?? '';
+    return '${plugin.id}\u0000$source\u0000$songId\u0000${quality?.trim() ?? ''}';
+  }
+
+  /// 控制缓存规模：超出上限时按写入时间淘汰最旧条目。
+  void _trimMediaSourceCache(String protectedKey) {
+    while (_mediaSourceCache.length > _mediaSourceCacheMaxEntries) {
+      String? oldestKey;
+      DateTime? oldestAt;
+      for (final e in _mediaSourceCache.entries) {
+        if (e.key == protectedKey) continue;
+        if (oldestAt == null || e.value.cachedAt.isBefore(oldestAt)) {
+          oldestAt = e.value.cachedAt;
+          oldestKey = e.key;
+        }
+      }
+      if (oldestKey == null) break;
+      _mediaSourceCache.remove(oldestKey);
     }
   }
 
@@ -2275,6 +2590,24 @@ class PluginRuntimeService {
     Map<String, dynamic> rawData,
   ) async {
     final declared = _qualityTokensFromRaw(rawData);
+    if (plugin.isAnimemusic) {
+      // REST 后端逐档实测：music/url 返回有效地址才展示给用户。
+      final supported = <String>[];
+      for (final quality in plugin.animemusicQualities) {
+        try {
+          final source = await _resolveAnimemusicMediaSource(
+            plugin,
+            rawData,
+            quality,
+          ).timeout(const Duration(seconds: 6));
+          if (source.url.isNotEmpty) supported.add(quality);
+        } catch (_) {
+          // 单一音质探测失败不应阻断整个选择器。
+        }
+      }
+      if (supported.isNotEmpty) return supported;
+      return plugin.animemusicQualities;
+    }
     final candidates = <String>{
       ...declared,
       if (declared.isEmpty) ..._qualityDiscoveryFallback,
@@ -2412,13 +2745,21 @@ class PluginRuntimeService {
 
   /// 获取非 B 站插件歌曲的 MV 播放源。参考 BakaMusic 的
   /// getMvSource 实现：直接调用 MusicFree 插件的 `getMvSource` 扩展，
-  /// 不附加 B 站 Referer 请求头。
+  /// 不附加 B 站 Referer 请求头。animemusic/1 插件是 CommonJS Node
+  /// 模块，QuickJS 无法执行，宿主按插件契约直连后端 REST。
   Future<PluginVideoSource> resolveMvSource(
     EnabledMusicPlugin plugin,
     Map<String, dynamic> rawData, {
     String? videoQuality,
   }) async {
     if (plugin.isLx) throw Exception('LX 插件不支持 MV 播放');
+    if (plugin.animemusicApi.trim().isNotEmpty) {
+      return _resolveAnimemusicMvSource(
+        plugin,
+        rawData,
+        videoQuality: videoQuality,
+      );
+    }
     final response = _runsPluginsInBackground
         ? await _runPluginOperation(plugin, 'resolveMvSource', {
             'rawData': rawData,
@@ -2541,6 +2882,7 @@ class PluginRuntimeService {
     Map<String, dynamic> rawData,
   ) async {
     if (plugin.isLx) return _getLxLyrics(rawData);
+    if (plugin.isAnimemusic) return _getAnimemusicLyrics(plugin, rawData);
     if (_runsPluginsInBackground) {
       final response = await _runPluginOperation(plugin, 'getLyrics', rawData);
       return response?.toString() ?? '';
@@ -2565,6 +2907,293 @@ class PluginRuntimeService {
       musicItem,
       page,
     ]);
+  }
+
+  // ==================== animemusic/1 REST 直连 ====================
+  // 插件本体是 CommonJS Node 模块，QuickJS 没有其依赖的 http/https/zlib
+  // 内置模块；但插件契约只是对后端 REST 的薄封装（{api}/music/search
+  // 等，含 PATH_INFO / ?route= 两种路由风格自适应），宿主直接实现等价
+  // 调用，插件文件仍保留在磁盘上以便后续更新与配置管理。
+
+  /// 每个插件已确认可用的路由风格：false = PATH_INFO，true = ?route=。
+  final Map<String, bool> _animemusicQueryRoute = {};
+
+  String _animemusicApiBase(EnabledMusicPlugin plugin) => plugin.animemusicApi
+      .trim()
+      .replaceFirst(RegExp(r'/index\.php(\?.*)?$', caseSensitive: false), '')
+      .replaceFirst(RegExp(r'/+$'), '');
+
+  Uri _animemusicUri(
+    EnabledMusicPlugin plugin,
+    String path,
+    Map<String, String> params, {
+    required bool queryRoute,
+  }) {
+    final base = _animemusicApiBase(plugin);
+    if (queryRoute) {
+      return Uri.parse('$base/index.php').replace(
+        queryParameters: {'route': path, ...params},
+      );
+    }
+    return Uri.parse('$base/$path').replace(queryParameters: params);
+  }
+
+  /// 调用 animemusic 后端：自动探测并记忆路由风格，404 时换另一种重试。
+  Future<Map<String, dynamic>> _callAnimemusicApi(
+    EnabledMusicPlugin plugin,
+    String path,
+    Map<String, String> params,
+  ) async {
+    if (plugin.animemusicApi.trim().isEmpty) {
+      throw Exception('插件缺少后端接口地址');
+    }
+    final confirmed = _animemusicQueryRoute[plugin.id];
+    final attempts =
+        confirmed == null ? [false, true] : [confirmed, !confirmed];
+    Object? lastError;
+    for (final useQuery in attempts) {
+      final uri = _animemusicUri(
+        plugin,
+        path,
+        params,
+        queryRoute: useQuery,
+      );
+      try {
+        final response = await _rawGet(uri, headers: const {
+          'Accept': 'application/json, text/plain, */*',
+          'User-Agent': 'animemusic-plugin/1.0.0',
+        });
+        if (response.statusCode == 404) {
+          // 路由风格不匹配，换另一种再试（与插件 apiCall 一致）。
+          lastError = Exception('接口返回 404');
+          continue;
+        }
+        if (response.statusCode < 200 || response.statusCode >= 300) {
+          throw Exception('接口返回 HTTP ${response.statusCode}');
+        }
+        final decoded = jsonDecode(
+          utf8.decode(response.bodyBytes, allowMalformed: true),
+        );
+        if (decoded is! Map) throw Exception('接口返回异常');
+        final code = (decoded['code'] as num?)?.toInt() ?? 0;
+        if (code == 404) {
+          lastError = Exception(decoded['message']?.toString() ?? '接口 404');
+          continue;
+        }
+        if (code != 200) {
+          final message = decoded['message']?.toString().trim() ?? '';
+          throw Exception(
+            message.isNotEmpty ? message : '接口返回失败（$code）',
+          );
+        }
+        _animemusicQueryRoute[plugin.id] = useQuery;
+        return Map<String, dynamic>.from(decoded);
+      } catch (error) {
+        lastError = error;
+        // 已确认过路由风格后，业务错误不再换风格重试。
+        if (confirmed != null) rethrow;
+      }
+    }
+    throw lastError ?? Exception('接口调用失败');
+  }
+
+  /// 歌词响应中的平台与歌曲 id。搜索结果的 mapSong 已带 platform 字段。
+  static (String, String) _animemusicSongRef(
+    EnabledMusicPlugin plugin,
+    Map<String, dynamic> rawData,
+  ) {
+    dynamic idValue =
+        rawData['id'] ?? rawData['songId'] ?? rawData['musicId'];
+    if (idValue == null && rawData['extra'] is Map) {
+      idValue = (rawData['extra'] as Map)['songId'];
+    }
+    final id = idValue?.toString().trim() ?? '';
+    final platform = (rawData['platform']?.toString().trim().isNotEmpty == true
+        ? rawData['platform'].toString().trim()
+        : plugin.animemusicPlatform);
+    return (platform, id);
+  }
+
+  Future<List<PluginSearchSong>> _searchAnimemusic(
+    EnabledMusicPlugin plugin,
+    String keyword, {
+    int page = 1,
+  }) async {
+    final trimmed = keyword.trim();
+    if (trimmed.isEmpty) return const [];
+    final body = await _callAnimemusicApi(plugin, 'music/search', {
+      'platform': plugin.animemusicPlatform,
+      'keyword': trimmed,
+      'page': '$page',
+      'limit': '30',
+    });
+    final data = body['data'];
+    if (data is! List) return const [];
+    return [
+      for (final item in data)
+        if (item is Map)
+          _toSearchSong(plugin.id, {
+            // rawData 保留 platform 字段（wy），musicUrl 以它为 source。
+            ...Map<String, dynamic>.from(item),
+            // animemusic 全平台支持 mvSearch/mvUrl（META.capabilities），
+            // 注入 mv 标识让播放页显示 MV 按钮（hasMvIdentifier）。
+            'mv': true,
+          }),
+    ];
+  }
+
+  String _normalizeAnimemusicQuality(String? quality) {
+    final value = quality?.trim().toLowerCase() ?? '';
+    if (value.isEmpty) return '320k';
+    switch (value) {
+      case 'hires':
+      case 'hi-res':
+      case 'master':
+      case 'atmos':
+      case 'dolby':
+      case 'hifi':
+      case '24bit':
+        return 'flac24bit';
+      case 'flac24bit':
+      case 'flac':
+      case 'lossless':
+      case 'sq':
+      case 'ape':
+      case 'wav':
+        return value == 'flac24bit' ? value : 'flac';
+      case '128k':
+      case '192k':
+      case '320k':
+        return value;
+      default:
+        return '320k';
+    }
+  }
+
+  Future<PluginMediaSource> _resolveAnimemusicMediaSource(
+    EnabledMusicPlugin plugin,
+    Map<String, dynamic> rawData,
+    String? quality,
+  ) async {
+    final (platform, id) = _animemusicSongRef(plugin, rawData);
+    if (id.isEmpty) throw Exception('歌曲缺少 id');
+    final body = await _callAnimemusicApi(plugin, 'music/url', {
+      'source': platform,
+      'musicId': id,
+      'quality': _normalizeAnimemusicQuality(quality),
+    });
+    final url = body['url']?.toString().trim() ?? '';
+    if (url.isEmpty) throw Exception('插件没有返回可播放地址');
+    return PluginMediaSource(url: _normalizeMediaUrl(url));
+  }
+
+  /// animemusic 歌词：优先逐字（lrc-a2，即 Enhanced LRC，直接兼容
+  /// Rust 解析器），失败回退逐行；主歌词、翻译、罗马音按与
+  /// buildLxLyricsRaw 相同的顺序拼接。
+  Future<String> _getAnimemusicLyrics(
+    EnabledMusicPlugin plugin,
+    Map<String, dynamic> rawData,
+  ) async {
+    final (platform, id) = _animemusicSongRef(plugin, rawData);
+    if (id.isEmpty) return '';
+    final params = <String, String>{
+      'platform': platform,
+      'musicId': id,
+      'interval': '200',
+      if (rawData['title']?.toString().trim().isNotEmpty == true)
+        'name': rawData['title'].toString().trim(),
+    };
+    String joinLyrics(Map<String, dynamic> body) => [
+      body['lyric']?.toString() ?? '',
+      body['tlyric']?.toString() ?? '',
+      body['rlyric']?.toString() ?? '',
+    ]
+        .map((item) => item.trim())
+        .where((item) => item.isNotEmpty)
+        .join('\n');
+
+    try {
+      final word = await _callAnimemusicApi(
+        plugin,
+        'music/lyric/word',
+        params,
+      );
+      final joined = joinLyrics(word);
+      if (joined.isNotEmpty) return joined;
+    } catch (_) {
+      // 逐字失败自动回退逐行（与插件 lyricFallback 默认行为一致）。
+    }
+    final line = await _callAnimemusicApi(plugin, 'music/lyric', params);
+    return joinLyrics(line);
+  }
+
+  /// animemusic 各平台 MV 画质映射（与插件 MV_QUALITY 一致）：平台不支持
+  /// 的画质映射为空串，后端自选可用画质。
+  static const Map<String, Map<String, String>> _animemusicMvQuality = {
+    'kg': {},
+    'kw': {
+      '1080p': 'MP4BD',
+      '720p': 'MP4UL',
+      '480p': 'MP4HV',
+      '360p': 'MV700',
+      '240p': 'MP4L',
+    },
+    'wy': {'1080p': '1080', '720p': '720', '480p': '480', '240p': '240'},
+    'tx': {'1080p': '1080', '720p': '720', '480p': '480'},
+    'mg': {},
+    'bilibili': {
+      '1080p': '80',
+      '720p': '64',
+      '480p': '32',
+      '360p': '16',
+      '240p': '16',
+    },
+  };
+
+  /// animemusic MV 解析：按标题（+艺术家）搜索 MV（music/mv/search），
+  /// 优先取标题完全一致的一条，再解析直链（music/mv/url）。
+  Future<PluginVideoSource> _resolveAnimemusicMvSource(
+    EnabledMusicPlugin plugin,
+    Map<String, dynamic> rawData, {
+    String? videoQuality,
+  }) async {
+    final platform = plugin.animemusicPlatform;
+    final title = rawData['title']?.toString().trim() ?? '';
+    final artist = rawData['artist']?.toString().trim() ?? '';
+    if (title.isEmpty) throw Exception('缺少歌曲标题，无法搜索 MV');
+    final keyword = artist.isEmpty ? title : '$title $artist';
+    final body = await _callAnimemusicApi(plugin, 'music/mv/search', {
+      'platform': platform,
+      'keyword': keyword,
+      'page': '1',
+      'limit': '10',
+    });
+    final data = body['data'];
+    final candidates = [
+      if (data is List)
+        for (final item in data)
+          if (item is Map) Map<String, dynamic>.from(item),
+    ];
+    if (candidates.isEmpty) throw Exception('没有找到这首歌的 MV');
+    var best = candidates.first;
+    for (final candidate in candidates) {
+      if (candidate['title']?.toString().trim() == title) {
+        best = candidate;
+        break;
+      }
+    }
+    final mvId = best['id']?.toString().trim() ?? '';
+    if (mvId.isEmpty) throw Exception('MV 结果缺少 id');
+    final want = (videoQuality ?? '1080p').trim().toLowerCase();
+    final upstream = _animemusicMvQuality[platform]?[want] ?? '';
+    final urlBody = await _callAnimemusicApi(plugin, 'music/mv/url', {
+      'platform': platform,
+      'id': mvId,
+      'quality': upstream,
+    });
+    final url = urlBody['url']?.toString().trim() ?? '';
+    if (url.isEmpty) throw Exception('插件没有返回可播放的 MV 地址');
+    return PluginVideoSource(url: _normalizeMediaUrl(url));
   }
 
   Future<String> _getLxLyrics(Map<String, dynamic> rawData) async {
@@ -2839,6 +3468,39 @@ class PluginRuntimeService {
         backups.add(raw.trim());
       }
     }
+    // 画质信息（baka 系插件）：videoQuality 为实际选中档位，
+    // availableVideoQualities 为可用档位列表（兼容 qualities 别名）。
+    final selectedQuality =
+        value['videoQuality']?.toString().trim() ?? '';
+    final availableQualities = <String>[];
+    for (final key in const [
+      'availableVideoQualities',
+      'available_video_qualities',
+      'videoQualities',
+    ]) {
+      final raw = value[key];
+      if (raw is Iterable) {
+        for (final entry in raw) {
+          final qualityKey = entry is Map
+              ? (entry['key'] ?? entry['label'] ?? entry['quality'])
+                  ?.toString()
+                  .trim() ?? ''
+              : entry?.toString().trim() ?? '';
+          if (qualityKey.isNotEmpty &&
+              !availableQualities.contains(qualityKey)) {
+            availableQualities.add(qualityKey);
+          }
+        }
+      }
+    }
+    for (final entry in value['qualities'] ?? const <dynamic>[]) {
+      final qualityKey = entry is Map
+          ? (entry['key'] ?? entry['label'] ?? entry['quality'])?.toString().trim() ?? ''
+          : entry?.toString().trim() ?? '';
+      if (qualityKey.isNotEmpty && !availableQualities.contains(qualityKey)) {
+        availableQualities.add(qualityKey);
+      }
+    }
     return PluginVideoSource(
       url: url,
       backupUrls: backups,
@@ -2846,6 +3508,8 @@ class PluginRuntimeService {
       mimeType: value['mimeType']?.toString().trim().isNotEmpty == true
           ? value['mimeType'].toString().trim()
           : 'video/mp4',
+      selectedQuality: selectedQuality.isEmpty ? null : selectedQuality,
+      availableQualities: availableQualities,
     );
   }
 
@@ -3117,6 +3781,41 @@ class PluginRuntimeService {
             .where((item) => _isHttpUrl(item)),
       );
     }
+    // B 站画质 ID → 档位标签，供实际选中画质与可用档位列表展示。
+    String? qualityLabel(Object? rawId) {
+      final id = (rawId as num?)?.toInt();
+      if (id == null) return null;
+      const labels = <int, String>{
+        16: '360P',
+        32: '480P',
+        64: '720P',
+        74: '720P',
+        80: '1080P',
+        112: '1080P',
+        116: '1080P',
+        120: '4K',
+        125: '4K',
+        126: '4K',
+        127: '4K',
+      };
+      return labels[id];
+    }
+
+    final selectedQuality = qualityLabel(selected?['id']);
+    final availableQualities = <String>[];
+    final acceptQuality = data['accept_quality'];
+    if (acceptQuality is Iterable) {
+      for (final rawId in acceptQuality) {
+        final label = qualityLabel(rawId);
+        if (label != null && !availableQualities.contains(label)) {
+          availableQualities.add(label);
+        }
+      }
+    }
+    if (selectedQuality != null &&
+        !availableQualities.contains(selectedQuality)) {
+      availableQualities.insert(0, selectedQuality);
+    }
     return PluginVideoSource(
       url: direct,
       backupUrls: backups,
@@ -3124,6 +3823,8 @@ class PluginRuntimeService {
       mimeType: selected?['mimeType']?.toString().trim().isNotEmpty == true
           ? selected!['mimeType'].toString().trim()
           : 'video/mp4',
+      selectedQuality: selectedQuality,
+      availableQualities: availableQualities,
     );
   }
 
@@ -3154,7 +3855,18 @@ class PluginRuntimeService {
     final parsed = int.tryParse(match?.group(0) ?? '');
     if (parsed == null) return 64;
     const allowed = {6, 16, 32, 64, 74, 80, 112, 116, 120, 125, 126, 127};
-    return allowed.contains(parsed) ? parsed : 64;
+    if (allowed.contains(parsed)) return parsed;
+    // 高度值归一：2160→4K(120)、1080→80、720→64、480→32、360→16。
+    const heightToId = {
+      240: 6,
+      360: 16,
+      480: 32,
+      720: 64,
+      1080: 80,
+      1440: 112,
+      2160: 120,
+    };
+    return heightToId[parsed] ?? 64;
   }
 
   static ({String bvid, String aid, String cid}) _extractBilibiliIdentity(
@@ -3747,79 +4459,16 @@ class PluginRuntimeService {
         .trim();
   }
 
-  void dispose() {
-    _disposeRequested = true;
-    if (_activeRuntimeOperations > 0) return;
-    _disposeNow();
-  }
-
-  void _disposeNow() {
-    _runtime?.dispose();
-    _runtime = null;
-    _initializing = null;
-    _disposeRequested = false;
-    _loaded.clear();
-    _loadedLx.clear();
-    _pluginSourceTasks.clear();
-    _neteaseTrackMetaCache.clear();
-    _qualityDiscoveryCache.clear();
-  }
-}
-
-/// 判断一个已启用插件是否为哔哩哔哩音源，供搜索页按平台显示“UP主”分类。
-bool isBilibiliPluginSource(EnabledMusicPlugin plugin) =>
-    PluginRuntimeService._isBilibiliPlugin(plugin);
-
-class _NeteaseTrackMeta {
-  const _NeteaseTrackMeta({required this.coverUrl, required this.durationMs});
-
-  final String coverUrl;
-  final int durationMs;
-}
-
-/// 供封面渲染、数据迁移和单元测试复用的插件封面归一化入口。
-String extractPluginCoverUrl(Map<String, dynamic> raw) =>
-    PluginRuntimeService._extractCover(raw);
-
-/// 由可靠的网易云 picId 生成官方 CDN 封面地址。
-String neteasePicIdToCoverUrl(String picId) =>
-    PluginRuntimeService._neteasePicIdToUrl(picId);
-
-Map<String, String> _decodeUserVariables(String? raw) {
-  if (raw == null || raw.isEmpty) return const {};
-  try {
-    final decoded = jsonDecode(raw);
-    if (decoded is! Map) return const {};
-    return {
-      for (final entry in decoded.entries)
-        if (entry.value is String)
-          entry.key.toString(): entry.value as String,
-    };
-  } catch (_) {
-    return const {};
-  }
-}
-
-Future<String> _executePluginOperationInBackground(
-  Map<String, String> request,
-) async {
-  final client = _PluginBackgroundHttpClient();
-  final service = PluginRuntimeService(
-    httpClient: client,
-    runtimeBootstrap: request['bootstrap'],
-    runtimeLxBootstrap: request['lxBootstrap'],
-    pluginSources: {request['pluginId'] ?? '': request['pluginSource'] ?? ''},
-  );
-  try {
-    final plugin = EnabledMusicPlugin(
-      id: request['pluginId'] ?? '',
-      name: request['pluginName'] ?? '',
-      path: request['pluginPath'] ?? '',
-      userVariables: _decodeUserVariables(request['userVariables']),
-    );
-    final payload = jsonDecode(request['payload'] ?? 'null');
+  /// 在给定服务实例上执行一次插件操作：一次性冷启动执行器与常驻
+  /// 工作 isolate 共用这段分发逻辑。
+  static Future<dynamic> _executePluginOperation(
+    PluginRuntimeService service,
+    EnabledMusicPlugin plugin,
+    String operation,
+    dynamic payload,
+  ) async {
     dynamic data;
-    switch (request['operation']) {
+    switch (operation) {
       case 'search':
         {
           final searchPayload = payload is Map
@@ -3941,6 +4590,9 @@ Future<String> _executePluginOperationInBackground(
           'backupUrls': source.backupUrls,
           'headers': source.headers,
           'mimeType': source.mimeType,
+          if (source.selectedQuality != null)
+            'videoQuality': source.selectedQuality,
+          'availableVideoQualities': source.availableQualities,
         };
         break;
       case 'resolveMvSource':
@@ -3960,6 +4612,9 @@ Future<String> _executePluginOperationInBackground(
           'backupUrls': source.backupUrls,
           'headers': source.headers,
           'mimeType': source.mimeType,
+          if (source.selectedQuality != null)
+            'videoQuality': source.selectedQuality,
+          'availableVideoQualities': source.availableQualities,
         };
         break;
       case 'getLyrics':
@@ -3992,8 +4647,89 @@ Future<String> _executePluginOperationInBackground(
         );
         break;
       default:
-        throw Exception('不支持的插件后台操作：${request['operation']}');
+        throw Exception('不支持的插件后台操作：$operation');
     }
+    return data;
+  }
+
+  void dispose() {
+    _disposeRequested = true;
+    _pluginWorker?.kill();
+    if (_activeRuntimeOperations > 0) return;
+    _disposeNow();
+  }
+
+  void _disposeNow() {
+    _runtime?.dispose();
+    _runtime = null;
+    _initializing = null;
+    _disposeRequested = false;
+    _loaded.clear();
+    _loadedLx.clear();
+    _pluginSourceTasks.clear();
+    _neteaseTrackMetaCache.clear();
+    _qualityDiscoveryCache.clear();
+  }
+}
+
+/// 判断一个已启用插件是否为哔哩哔哩音源，供搜索页按平台显示“UP主”分类。
+bool isBilibiliPluginSource(EnabledMusicPlugin plugin) =>
+    PluginRuntimeService._isBilibiliPlugin(plugin);
+
+class _NeteaseTrackMeta {
+  const _NeteaseTrackMeta({required this.coverUrl, required this.durationMs});
+
+  final String coverUrl;
+  final int durationMs;
+}
+
+/// 供封面渲染、数据迁移和单元测试复用的插件封面归一化入口。
+String extractPluginCoverUrl(Map<String, dynamic> raw) =>
+    PluginRuntimeService._extractCover(raw);
+
+/// 由可靠的网易云 picId 生成官方 CDN 封面地址。
+String neteasePicIdToCoverUrl(String picId) =>
+    PluginRuntimeService._neteasePicIdToUrl(picId);
+
+Map<String, String> _decodeUserVariables(String? raw) {
+  if (raw == null || raw.isEmpty) return const {};
+  try {
+    final decoded = jsonDecode(raw);
+    if (decoded is! Map) return const {};
+    return {
+      for (final entry in decoded.entries)
+        if (entry.value is String)
+          entry.key.toString(): entry.value as String,
+    };
+  } catch (_) {
+    return const {};
+  }
+}
+
+Future<String> _executePluginOperationInBackground(
+  Map<String, String> request,
+) async {
+  final client = _PluginBackgroundHttpClient();
+  final service = PluginRuntimeService(
+    httpClient: client,
+    runtimeBootstrap: request['bootstrap'],
+    runtimeLxBootstrap: request['lxBootstrap'],
+    pluginSources: {request['pluginId'] ?? '': request['pluginSource'] ?? ''},
+  );
+  try {
+    final plugin = EnabledMusicPlugin(
+      id: request['pluginId'] ?? '',
+      name: request['pluginName'] ?? '',
+      path: request['pluginPath'] ?? '',
+      userVariables: _decodeUserVariables(request['userVariables']),
+    );
+    final payload = jsonDecode(request['payload'] ?? 'null');
+    final data = await PluginRuntimeService._executePluginOperation(
+      service,
+      plugin,
+      request['operation'] ?? '',
+      payload,
+    );
     return jsonEncode({'ok': true, 'data': data});
   } catch (error, stackTrace) {
     return jsonEncode({
@@ -4005,6 +4741,150 @@ Future<String> _executePluginOperationInBackground(
     service.dispose();
     client.close();
   }
+}
+
+/// 常驻插件工作 isolate：QuickJS 运行时与各插件只加载一次，之后
+/// 所有操作复用热运行时。此前每次播放/搜索都要在全新 isolate 里
+/// 冷启动 JS 引擎并重新 eval 插件源码，纯 CPU 负载在省电调度下
+/// 会被显著拖慢（表现为部分机型播放加载特别慢，录屏等高性能
+/// 状态下又恢复正常）。
+class _PluginWorker {
+  _PluginWorker._(this._isolate, this._sendPort, this._responses);
+
+  final Isolate _isolate;
+  final SendPort _sendPort;
+  final ReceivePort _responses;
+  final Map<int, Completer<Object?>> _pending = {};
+  int _nextRequestId = 0;
+
+  /// isolate 意外退出或被终止时通知服务清空引用，下次调用重新拉起。
+  void Function()? onDead;
+
+  /// 单请求兜底超时：防止插件 JS 死循环或异常把常驻 isolate 永久
+  /// 挂死，超时后终止 isolate，下一次调用时自动重启。
+  static const _requestTimeout = Duration(seconds: 120);
+
+  static Future<_PluginWorker> spawn() async {
+    final bootstrap = await rootBundle.loadString(
+      'assets/plugin_runtime.js',
+    );
+    final lxBootstrap = await rootBundle.loadString(
+      'assets/lx_plugin_runtime.js',
+    );
+    final ready = ReceivePort();
+    final isolate = await Isolate.spawn(
+      _pluginWorkerEntry,
+      <String, Object?>{
+        'bootstrap': bootstrap,
+        'lxBootstrap': lxBootstrap,
+        'ready': ready.sendPort,
+      },
+      debugName: 'music-plugin-worker',
+    );
+    final sendPort = await ready.first as SendPort;
+    final responses = ReceivePort();
+    final worker = _PluginWorker._(isolate, sendPort, responses);
+    responses.listen(
+      worker._handleMessage,
+      onDone: worker._handleWorkerGone,
+    );
+    return worker;
+  }
+
+  void _handleMessage(Object? message) {
+    if (message is! Map) return;
+    final id = message['requestId'];
+    if (id is! int) return;
+    final completer = _pending.remove(id);
+    if (completer == null || completer.isCompleted) return;
+    completer.complete(message);
+  }
+
+  void _handleWorkerGone() {
+    final pending = List<Completer<Object?>>.of(_pending.values);
+    _pending.clear();
+    for (final completer in pending) {
+      completer.completeError(Exception('插件运行时已退出'));
+    }
+    onDead?.call();
+  }
+
+  /// 提交一次操作并等待回复。回复始终以 Map 返回（含 ok 字段），
+  /// 只有 isolate 基础设施故障（崩溃/超时）才会让 Future 出错。
+  Future<Object?> run(Map<String, Object?> request) {
+    final id = ++_nextRequestId;
+    final completer = Completer<Object?>();
+    _pending[id] = completer;
+    _sendPort.send({
+      ...request,
+      'requestId': id,
+      'replyTo': _responses.sendPort,
+    });
+    return completer.future.timeout(_requestTimeout, onTimeout: () {
+      kill();
+      throw Exception('插件后台调用超时');
+    });
+  }
+
+  void kill() {
+    _handleWorkerGone();
+    _responses.close();
+    _isolate.kill(priority: Isolate.immediate);
+  }
+}
+
+/// 常驻工作 isolate 入口：创建一个持久化的插件服务实例（QuickJS
+/// 运行时与已加载插件全程存活），循环处理主 isolate 的操作请求。
+void _pluginWorkerEntry(Map<String, Object?> init) {
+  final service = PluginRuntimeService(
+    httpClient: _PluginBackgroundHttpClient(),
+    runtimeBootstrap: init['bootstrap'] as String?,
+    runtimeLxBootstrap: init['lxBootstrap'] as String?,
+    pluginSources: <String, String>{},
+  );
+  final requests = ReceivePort();
+  (init['ready'] as SendPort).send(requests.sendPort);
+  requests.listen((message) {
+    if (message is! Map) return;
+    final replyTo = message['replyTo'];
+    if (replyTo is! SendPort) return;
+    final requestId = message['requestId'];
+    _runPluginWorkerRequest(service, message).then(
+      (data) =>
+          replyTo.send({'requestId': requestId, 'ok': true, 'data': data}),
+      onError: (Object error) => replyTo.send({
+        'requestId': requestId,
+        'ok': false,
+        'error': error.toString(),
+      }),
+    );
+  });
+}
+
+Future<dynamic> _runPluginWorkerRequest(
+  PluginRuntimeService service,
+  Map<Object?, Object?> message,
+) async {
+  final pluginId = message['pluginId']?.toString() ?? '';
+  final pluginSource = message['pluginSource'];
+  if (pluginSource is String && pluginSource.isNotEmpty) {
+    // 主 isolate 解析好的插件源码（含内置插件覆盖），注入后由
+    // 服务按插件 id 缓存，后续请求直接复用。
+    service.pluginSources[pluginId] = pluginSource;
+  }
+  final plugin = EnabledMusicPlugin(
+    id: pluginId,
+    name: message['pluginName']?.toString() ?? '',
+    path: message['pluginPath']?.toString() ?? '',
+    userVariables: _decodeUserVariables(message['userVariables']?.toString()),
+  );
+  final payload = jsonDecode(message['payload']?.toString() ?? 'null');
+  return PluginRuntimeService._executePluginOperation(
+    service,
+    plugin,
+    message['operation']?.toString() ?? '',
+    payload,
+  );
 }
 
 /// 后台 isolate 不能复用主 isolate 中已经初始化的 Rust 桥，因此直接使用

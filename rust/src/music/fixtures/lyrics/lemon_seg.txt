@@ -1,0 +1,132 @@
+[00:00.000]作词: 米津玄師
+[00:00.212]作曲: 米津玄師
+[00:00.424]编曲: 米津玄師/室屋光一郎
+[00:00.636]制作人: 米津玄師
+[00:00.851]夢ならばどれほどよかったでしょう
+[00:06.650]未だにあなたのことを夢にみる
+[00:12.340]忘れた物を取りに帰るように
+[00:17.660]古びた思い出の埃を払う
+[00:25.820]戻らない幸せがあることを
+[00:31.580]最後にあなたが教えてくれた
+[00:36.980]言えずに隠してた昏い過去も
+[00:42.550]あなたがいなきゃ永遠に昏いまま
+[00:48.230]きっともうこれ以上 傷つくことなど
+[00:53.750]ありはしないとわかっている
+[00:58.660]あの日の悲しみさえ
+[01:01.410]あの日の苦しみさえ
+[01:04.150]そのすべてを愛してた あなたとともに
+[01:09.800]胸に残り離れない
+[01:12.730]苦いレモンの匂い
+[01:15.730]雨が降り止むまでは帰れない
+[01:21.240]今でもあなたはわたしの光
+[01:37.600]暗闇であなたの背をなぞった
+[01:42.980]その輪郭を鮮明に覚えている
+[01:48.800]受け止めきれないものと出会うたび
+[01:54.400]溢れてやまないのは涙だけ
+[01:59.990]何をしていたの
+[02:02.760]何を見ていたの
+[02:05.580]わたしの知らない横顔で
+[02:10.390]どこかであなたが今
+[02:13.380]わたしと同じ様な
+[02:15.950]涙にくれ 淋しさの中にいるなら
+[02:21.470]わたしのことなどどうか 忘れてください
+[02:27.490]そんなことを心から願うほどに
+[02:32.910]今でもあなたはわたしの光
+[02:41.600]自分が思うより 恋をしていたあなたに
+[02:52.410]あれから思うように 息ができない
+[03:03.360]あんなに側にいたのにまるで嘘みたい
+[03:14.140]とても忘れられないそれだけが確か
+[03:30.430]あの日の悲しみさえ
+[03:33.200]あの日の苦しみさえ
+[03:35.910]その全てを愛してたあなたと共に
+[03:41.320]胸に残り離れない
+[03:44.280]苦いレモンの匂い
+[03:47.730]雨が降り止むまでは帰れない
+[03:52.840]切り分けた果実の片方の様に
+[03:58.590]今でもあなたはわたしの光
+<!--xym:track:translation-->
+[00:00.851]如果这一切都是梦境该有多好
+[00:06.650]至今仍能与你在梦中相遇
+[00:12.340]如同取回遗忘之物一般
+[00:17.660]细细拂去将回忆覆盖的尘埃
+[00:25.820]有着无法挽回的幸福
+[00:31.580]最终是你告诉我
+[00:36.980]那些未对他人提及过的黑暗往事
+[00:42.550]如果不曾有你的话 它们将永远沉睡在黑暗中
+[00:48.230]我知道这世上一定没有
+[00:53.750]比这更令人难过的事情了
+[00:58.660]那日的悲伤
+[01:01.410]与那日的痛苦
+[01:04.150]连同深爱着这一切的你
+[01:09.800]化作了深深烙印在我心中的
+[01:12.730]苦涩柠檬的香气
+[01:15.730]在雨过天晴前都无法归去
+[01:21.240]时至今日 你仍是我的光芒
+[01:37.600]在黑暗中追寻着你的身影
+[01:42.980]那轮廓至今仍鲜明地刻印于心
+[01:48.800]每当遇到无法承受的苦痛时
+[01:54.400]总是不禁泪如泉涌
+[01:59.990]你都经历过什么呢
+[02:02.760]又目睹过什么呢
+[02:05.580]脸上浮现着我不曾见过的神情
+[02:10.390]如今你正在什么地方
+[02:13.380]与我一样
+[02:15.950]终日过着以泪洗面的寂寞生活的话
+[02:21.470]就请你将我的一切全部遗忘吧
+[02:27.490]这是我发自内心深处唯一的祈愿
+[02:32.910]时至今日 你仍是我的光芒
+[02:41.600]我深深地恋慕着你 甚至超出了我自己的想象
+[02:52.410]自此每当想起你 都如同窒息般痛苦
+[03:03.360]你曾亲密伴我身旁 如今却如烟云般消散
+[03:14.140]唯一能确定的是 我永远都不会将你遗忘
+[03:30.430]那日的悲伤
+[03:33.200]与那日的痛苦
+[03:35.910]连同深爱着这一切的你
+[03:41.320]化作了深深烙印在我心中的
+[03:44.280]苦涩柠檬的香气
+[03:47.730]在雨过天晴前都无法归去
+[03:52.840]如同被切开的半个柠檬一般
+[03:58.590]时至今日 你仍是我的光芒
+<!--xym:track:romanization-->
+[00:00.851]yu me na ra ba do re ho do yo ka tta de syo u
+[00:06.650]i ma da ni a na ta no ko to wo yu me ni mi ru
+[00:12.340]wa su re ta mo no wo to ri ni ka e ru yo u ni
+[00:17.660]fu ru bi ta o mo i de no ho ko ri wo ha ra u
+[00:25.820]mo do ra na i shi a wa se ga a ru ko to wo
+[00:31.580]sa i go ni a na ta ga o shi e te ku re ta
+[00:36.980]i e zu ni ka ku shi te ta ku ra i ka ko mo
+[00:42.550]a na ta ga i na kya e i e n ni ku ra i ma ma
+[00:48.230]ki tto mo u ko re i jyo u ki zu tsu ku ko to na do
+[00:53.750]a ri wa shi na i to wa ka tte i ru
+[00:58.660]a no hi no ka na shi mi sa e
+[01:01.410]a no hi no ku ru shi mi sa e
+[01:04.150]so no su be te wo a i shi te ta a na ta to to mo ni
+[01:09.800]mu ne ni no ko ri ha na re na i
+[01:12.730]ni ga i re mo n no ni o i
+[01:15.730]a me ga fu ri ya mu ma de wa ka e re na i
+[01:21.240]i ma de mo a na ta wa wa ta shi no hi ka ri
+[01:37.600]ku ra ya mi de a na ta no se wo na zo tta
+[01:42.980]so no ri n ka ku wo se n me i ni o bo e te i ru
+[01:48.800]u ke to me ki re na i mo no to de a u ta bi
+[01:54.400]a fu re te ya ma na i no wa na mi da da ke
+[01:59.990]na ni wo shi te i ta no
+[02:02.760]na ni wo mi te i ta no
+[02:05.580]wa ta shi no shi ra na i yo ko ga o de
+[02:10.390]do ko ka de a na ta ga i ma
+[02:13.380]wa ta shi to o na ji yo u na
+[02:15.950]na mi da ni ku re sa bi shi sa no na ka ni i ru na ra
+[02:21.470]wa ta shi no ko to na do do u ka wa su re te ku da sa i
+[02:27.490]so n na ko to wo ko ko ro ka ra ne ga u ho do ni
+[02:32.910]i ma de mo a na ta wa wa ta shi no hi ka ri
+[02:41.600]ji bu n ga o mo u yo ri ko i wo shi te i ta a na ta ni
+[02:52.410]a re ka ra o mo u yo u ni i ki ga de ki na i
+[03:03.360]a n na ni so ba ni i ta no ni ma ru de u so mi ta i
+[03:14.140]to te mo wa su re ra re na i so re da ke ga ta shi ka
+[03:30.430]a no hi no ka na shi mi sa e
+[03:33.200]a no hi no ku ru shi mi sa e
+[03:35.910]so no su be te wo a i shi te ta a na ta to to mo ni
+[03:41.320]mu ne ni no ko ri ha na re na i
+[03:44.280]ni ga i re mo n no ni o i
+[03:47.730]a me ga hu ri ya mu ma de wa ka e re na i
+[03:52.840]ki ri wa ke ta ka ji tsu no ka ta ho u no yo u ni
+[03:58.590]i ma de mo a na ta wa wa ta shi no hi ka ri

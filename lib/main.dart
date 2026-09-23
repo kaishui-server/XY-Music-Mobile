@@ -9,6 +9,7 @@ import 'package:flutter/services.dart';
 import 'package:just_audio_background/just_audio_background.dart';
 
 import 'app.dart';
+import 'src/core/custom_font.dart';
 import 'src/logging/app_log_store.dart';
 
 Future<void> main() async {
@@ -58,36 +59,54 @@ Future<void> _bootstrapApp() async {
       debugPrint('系统状态栏初始化失败：$error');
     }
   }
-  if (!kIsWeb &&
-      (defaultTargetPlatform == TargetPlatform.android ||
-          defaultTargetPlatform == TargetPlatform.iOS ||
-          defaultTargetPlatform == TargetPlatform.macOS)) {
-    try {
-      await JustAudioBackground.init(
-        androidNotificationChannelId: 'com.xymusic.mobile.playback',
-        androidNotificationChannelName: 'XY Music 音乐播放',
-        androidNotificationChannelDescription: '显示正在播放的歌曲和播放控制',
-        androidNotificationIcon: 'drawable/ic_stat_xy_music',
-        androidNotificationOngoing: true,
-        androidStopForegroundOnPause: false,
-        // MediaSession 会经 Binder 传递封面位图。512x512 的 ARGB 位图
-        // 已接近 1MB 事务上限，部分 ROM 会连同整张媒体卡片一起丢弃。
-        // 256x256 足够通知栏/锁屏展示，同时保留充足的事务余量。
-        artDownscaleWidth: 256,
-        artDownscaleHeight: 256,
-      );
-      final audioSession = await AudioSession.instance;
-      await audioSession.configure(const AudioSessionConfiguration.music());
-    } catch (error, stackTrace) {
-      // 个别 ROM 的媒体服务初始化失败时仍允许应用进入前台，播放时由播放器自行处理。
-      debugPrint('后台音频初始化失败：$error');
-      debugPrintStack(stackTrace: stackTrace);
-    }
-  }
+  // 启动卡顿修复：音频服务绑定（Binder IPC，慢 ROM 上可达秒级）、自定义
+  // 背景读取解码、自定义字体注册原先串行 await，耗时全部累加在首帧之前。
+  // 三者互不依赖，改为并行执行，首帧只需等待最慢的一个完成。
+  final audioInit = _initBackgroundAudio();
+  final backgroundFuture = loadXyStartupBackground();
+  final fontFuture = restoreCustomFontAtStartup();
   // 自定义背景必须在第一帧之前加载。否则设置 Provider 完成异步读取前，
   // 页面会短暂使用默认底色，表现为每次恢复或切页时闪一下。
-  final startupBackground = await loadXyStartupBackground();
+  final startupBackground = await backgroundFuture;
+  // 自定义字体同理：必须在第一帧之前注册，避免首屏闪回系统默认字体。
+  await fontFuture;
+  // PlayerProvider 构造时即创建 just_audio_background 的 AudioPlayer，
+  // 其初始化必须先完成；失败已在上层捕获，不会阻断启动。
+  await audioInit;
   runApp(
     ProviderScope(child: XyMusicApp(startupBackground: startupBackground)),
   );
+}
+
+/// 绑定后台音频服务并配置音频会话。
+///
+/// 个别 ROM 的媒体服务初始化失败时仍允许应用进入前台，播放时由播放器
+/// 自行处理。
+Future<void> _initBackgroundAudio() async {
+  if (kIsWeb ||
+      !(defaultTargetPlatform == TargetPlatform.android ||
+          defaultTargetPlatform == TargetPlatform.iOS ||
+          defaultTargetPlatform == TargetPlatform.macOS)) {
+    return;
+  }
+  try {
+    await JustAudioBackground.init(
+      androidNotificationChannelId: 'com.xymusic.mobile.playback',
+      androidNotificationChannelName: 'XY Music 音乐播放',
+      androidNotificationChannelDescription: '显示正在播放的歌曲和播放控制',
+      androidNotificationIcon: 'drawable/ic_stat_xy_music',
+      androidNotificationOngoing: true,
+      androidStopForegroundOnPause: false,
+      // MediaSession 会经 Binder 传递封面位图。512x512 的 ARGB 位图
+      // 已接近 1MB 事务上限，部分 ROM 会连同整张媒体卡片一起丢弃。
+      // 256x256 足够通知栏/锁屏展示，同时保留充足的事务余量。
+      artDownscaleWidth: 256,
+      artDownscaleHeight: 256,
+    );
+    final audioSession = await AudioSession.instance;
+    await audioSession.configure(const AudioSessionConfiguration.music());
+  } catch (error, stackTrace) {
+    debugPrint('后台音频初始化失败：$error');
+    debugPrintStack(stackTrace: stackTrace);
+  }
 }

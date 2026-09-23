@@ -12,9 +12,11 @@ import 'src/deeplink/deep_link_handler.dart';
 import 'src/core/settings.dart';
 import 'src/navigation/animated_page_route.dart';
 import 'src/library/library_provider.dart';
+import 'src/player/player_provider.dart';
 import 'src/navigation/routes.dart';
 import 'src/ui/xy_theme.dart';
 import 'src/ui/xy_surface.dart';
+import 'src/widgets/top_notice.dart';
 
 /// 在 Flutter 第一帧之前读取并解码自定义背景。
 ///
@@ -64,6 +66,7 @@ class XyMusicApp extends ConsumerStatefulWidget {
 
 class _XyMusicAppState extends ConsumerState<XyMusicApp> {
   int? _cachedAccent;
+  String? _cachedFontFamily;
   int? _cachedLightDynamicHash;
   int? _cachedDarkDynamicHash;
   ThemeData? _lightTheme;
@@ -107,26 +110,33 @@ class _XyMusicAppState extends ConsumerState<XyMusicApp> {
     int accent, {
     ColorScheme? lightDynamic,
     ColorScheme? darkDynamic,
+    String fontFamily = '',
   }) {
     if (_cachedAccent == accent &&
+        _cachedFontFamily == fontFamily &&
         _cachedLightDynamicHash == lightDynamic?.hashCode &&
         _cachedDarkDynamicHash == darkDynamic?.hashCode &&
         _lightTheme != null) {
       return;
     }
     _cachedAccent = accent;
+    _cachedFontFamily = fontFamily;
     _cachedLightDynamicHash = lightDynamic?.hashCode;
     _cachedDarkDynamicHash = darkDynamic?.hashCode;
     final seed = Color(accent);
+    // 空字符串表示系统默认字体。
+    final family = fontFamily.isEmpty ? null : fontFamily;
     _lightTheme = buildXyTheme(
       brightness: Brightness.light,
       accent: seed,
       dynamicColorScheme: lightDynamic,
+      fontFamily: family,
     );
     _darkTheme = buildXyTheme(
       brightness: Brightness.dark,
       accent: seed,
       dynamicColorScheme: darkDynamic,
+      fontFamily: family,
     );
   }
 
@@ -135,6 +145,16 @@ class _XyMusicAppState extends ConsumerState<XyMusicApp> {
       value: xySystemUiOverlayStyle(Theme.of(context).brightness),
       child: child ?? const SizedBox.shrink(),
     );
+  }
+
+  /// 把“音量键调节应用内音量”开关推送给原生层（MainActivity 持有，
+  /// dispatchKeyEvent 里同步判断是否拦截音量键）。设置加载完成与
+  /// 用户切换时都会触发；失败静默（原生层保持默认不拦截）。
+  void _syncVolumeKeyCapture(bool enabled) {
+    if (!Platform.isAndroid) return;
+    MethodChannel('com.xymusic.mobile/volume_keys')
+        .invokeMethod('setCaptureEnabled', {'enabled': enabled})
+        .catchError((_) => null);
   }
 
   void _precacheBackground(String path) {
@@ -198,6 +218,24 @@ class _XyMusicAppState extends ConsumerState<XyMusicApp> {
   Widget build(BuildContext context) {
     final init = ref.watch(rustInitProvider);
     final settings = ref.watch(settingsProvider).valueOrNull;
+    // 音量键拦截开关同步到原生层（含设置加载完成后的首次同步）。
+    ref.listen<bool>(
+      settingsProvider.select(
+        (s) => s.valueOrNull?.volumeKeyControlsAppVolume ?? true,
+      ),
+      (_, enabled) => _syncVolumeKeyCapture(enabled),
+    );
+    // 音量键调节应用内音量的 OSD 反馈：音量键被拦截时系统音量面板
+    // 不会出现，由根节点提示当前应用音量。
+    ref.listen<double?>(volumeKeyOscProvider, (_, next) {
+      if (next == null || !mounted) return;
+      XyNotice.show(
+        this.context,
+        message: '应用音量 ${(next * 100).round()}%',
+        compact: true,
+        duration: const Duration(milliseconds: 1100),
+      );
+    });
     // 同步页面切换模式到路由层（transitionsBuilder 无法访问 ref）。
     xyPageTransitionMode =
         settings?.pageTransitionMode ?? PageTransitionMode.fade;
@@ -208,6 +246,7 @@ class _XyMusicAppState extends ConsumerState<XyMusicApp> {
         settings?.customBackgroundBlur ?? startup?.blur ?? 18.0;
     _precacheBackground(backgroundPath);
     final accent = settings?.accentColor ?? 0xFFEC4141;
+    final fontFamily = settings?.fontFamily ?? '';
     final themeMode = switch (settings?.themeMode ??
         ThemeModePreference.system) {
       ThemeModePreference.light => ThemeMode.light,
@@ -221,6 +260,7 @@ class _XyMusicAppState extends ConsumerState<XyMusicApp> {
           accent,
           lightDynamic: dynamicEnabled ? lightDynamic : null,
           darkDynamic: dynamicEnabled ? darkDynamic : null,
+          fontFamily: fontFamily,
         );
         final theme = _lightTheme!;
         final darkTheme = _darkTheme!;

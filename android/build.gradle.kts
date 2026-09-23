@@ -3,6 +3,25 @@ allprojects {
         google()
         mavenCentral()
     }
+    configurations.all {
+        resolutionStrategy {
+            // Xiaomi Civi 4 Pro 等机型上 ExoPlayer 间歇性起播卡死：
+            // just_audio 0.10.6 底层捆绑的 media3 1.4.1 偏旧，统一强制
+            // 到最新 1.11.1（media3 对 ExoPlayer 2.x 的继任实现，持续
+            // 修复各 OEM ROM 的解码/AudioTrack 兼容问题）。
+            // force 仅替换已解析依赖的版本，未被引用的组件不受影响。
+            force("androidx.media3:media3-common:1.11.1")
+            force("androidx.media3:media3-exoplayer:1.11.1")
+            force("androidx.media3:media3-exoplayer-hls:1.11.1")
+            force("androidx.media3:media3-exoplayer-dash:1.11.1")
+            force("androidx.media3:media3-exoplayer-smoothstreaming:1.11.1")
+            force("androidx.media3:media3-extractor:1.11.1")
+            force("androidx.media3:media3-datasource:1.11.1")
+            force("androidx.media3:media3-database:1.11.1")
+            force("androidx.media3:media3-decoder:1.11.1")
+            force("androidx.media3:media3-ui:1.11.1")
+        }
+    }
 }
 
 val newBuildDir: Directory =

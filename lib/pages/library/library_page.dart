@@ -302,6 +302,22 @@ class _AllSongsTabState extends ConsumerState<_AllSongsTab> {
   bool _deleting = false;
   final Set<String> _selectedPaths = <String>{};
 
+  /// 悬浮头部（搜索框）的测量 Key 与实测高度：搜索框悬浮于列表上方，
+  /// 列表内容滚动时从毛玻璃下方穿过被模糊（与列表浮动按钮组同款
+  /// 观感），列表顶部让出头部高度。
+  final GlobalKey _floatingHeaderKey = GlobalKey();
+  double _floatingHeaderExtent = 60;
+
+  /// 布局完成后用真实高度修正悬浮头部占位，字体缩放等场景自动适配。
+  void _measureFloatingHeader() {
+    if (!mounted) return;
+    final size = _floatingHeaderKey.currentContext?.size;
+    if (size == null || size.height <= 0) return;
+    if ((size.height - _floatingHeaderExtent).abs() > 0.5) {
+      setState(() => _floatingHeaderExtent = size.height);
+    }
+  }
+
   void _toggleSelection(Song song) {
     setState(() {
       if (!_selectedPaths.add(song.path)) _selectedPaths.remove(song.path);
@@ -440,16 +456,37 @@ class _AllSongsTabState extends ConsumerState<_AllSongsTab> {
                     s.album.toLowerCase().contains(_query),
               )
               .toList();
-    return Column(
+    // 布局完成后修正悬浮头部占位高度。
+    WidgetsBinding.instance.addPostFrameCallback(
+      (_) => _measureFloatingHeader(),
+    );
+    // 搜索框悬浮于列表上方：列表内容滚动时从毛玻璃下方穿过被模糊，
+    // 与列表浮动按钮组观感一致。
+    return Stack(
       children: [
-        if (!selectionMode)
-          FrostedSearchField(
-            controller: _controller,
-            onChanged: (v) => setState(() => _query = v.trim().toLowerCase()),
-            showClearSuffix: true,
-            padding: const EdgeInsets.fromLTRB(12, 8, 12, 4),
-          )
-        else
+        Positioned.fill(
+          child: Padding(
+            padding: EdgeInsets.only(
+              top: selectionMode || songs.isEmpty ? 0 : _floatingHeaderExtent,
+            ),
+            child: songs.isEmpty
+                ? const Center(child: Text('没有匹配的歌曲'))
+                : SongsListView(
+                    songs: songs,
+                    // 悬浮元素遮挡高度已由外层 body 统一注入 MediaQuery，
+                    // 这里只需少量呼吸空间。
+                    padding: const EdgeInsets.only(bottom: 12),
+                    onPlay: (list, i) =>
+                        ref.read(libraryProvider.notifier).playList(list, i),
+                    selectionMode: selectionMode,
+                    isSelected: (song) => _selectedPaths.contains(song.path),
+                    onToggleSelection: _toggleSelection,
+                    onRemoveAction: (song) => _deleteSongs([song]),
+                    removeActionLabel: '删除',
+                  ),
+          ),
+        ),
+        if (selectionMode)
           Padding(
             padding: const EdgeInsets.fromLTRB(12, 8, 12, 4),
             child: Row(
@@ -497,24 +534,22 @@ class _AllSongsTabState extends ConsumerState<_AllSongsTab> {
                 ),
               ],
             ),
+          )
+        else
+          Positioned(
+            top: 0,
+            left: 0,
+            right: 0,
+            child: KeyedSubtree(
+              key: _floatingHeaderKey,
+              child: FrostedSearchField(
+                controller: _controller,
+                onChanged: (v) => setState(() => _query = v.trim().toLowerCase()),
+                showClearSuffix: true,
+                padding: const EdgeInsets.fromLTRB(12, 8, 12, 4),
+              ),
+            ),
           ),
-        Expanded(
-          child: songs.isEmpty
-              ? const Center(child: Text('没有匹配的歌曲'))
-              : SongsListView(
-                  songs: songs,
-                  // 悬浮元素遮挡高度已由外层 body 统一注入 MediaQuery，
-                  // 这里只需少量呼吸空间。
-                  padding: const EdgeInsets.only(bottom: 12),
-                  onPlay: (list, i) =>
-                      ref.read(libraryProvider.notifier).playList(list, i),
-                  selectionMode: selectionMode,
-                  isSelected: (song) => _selectedPaths.contains(song.path),
-                  onToggleSelection: _toggleSelection,
-                  onRemoveAction: (song) => _deleteSongs([song]),
-                  removeActionLabel: '删除',
-                ),
-        ),
       ],
     );
   }

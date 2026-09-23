@@ -5,6 +5,9 @@ import 'package:shared_preferences/shared_preferences.dart';
 enum ThemeModePreference { system, light, dark }
 
 /// 播放详情页背景样式。
+///
+/// [coverBlur] 已从设置中移除（v2.2.0-beta2 起不再提供“封面模糊”选项），
+/// 枚举值仅为兼容旧持久化索引保留，读取时会被归一化为 [flowingLight]。
 enum PlayerDetailBackgroundMode {
   coverBlur,
   wallpaperBlur,
@@ -24,13 +27,18 @@ enum PageTransitionMode { slide, stack, fade }
 enum SidebarPosition { left, right }
 
 /// 首页可自定义显隐的模块 id。「猜你想听」推荐面板在探索页固定展示，
-/// 不参与首页自定义；首页默认仅保留听歌统计。
+/// 不参与首页自定义；首页默认全部开启，可手动关闭。
 const kHomeModuleNowPlaying = 'nowPlaying';
 const kHomeModuleHotComment = 'hotComment';
 const kHomeModuleStatistics = 'statistics';
 const kHomeModuleLeaderboard = 'leaderboard';
 
-const kDefaultHomeModules = <String>[kHomeModuleStatistics];
+const kDefaultHomeModules = <String>[
+  kHomeModuleNowPlaying,
+  kHomeModuleHotComment,
+  kHomeModuleStatistics,
+  kHomeModuleLeaderboard,
+];
 
 /// 全部合法的首页模块 id，按首页默认展示顺序排列。
 const kAllHomeModules = <String>[
@@ -153,9 +161,12 @@ class AppSettings {
     this.playOtherAudioWithoutInterruption = false,
     this.lastTab = 0,
     this.keepScreenOn = true,
+    // 音量键调节应用内音量（不动系统媒体音量，车机上不影响导航等）。
+    this.volumeKeyControlsAppVolume = true,
     this.themeMode = ThemeModePreference.system,
     this.accentColor = 0xFFEC4141,
     this.dynamicColor = false,
+    this.fontFamily = '',
     this.sidebarPosition = SidebarPosition.left,
     this.sidebarItemOrder = kDefaultSidebarItemOrder,
     this.sidebarHiddenItems = const <String>[],
@@ -166,11 +177,12 @@ class AppSettings {
     this.customBackgroundPath = '',
     this.customBackgroundBlur = 18.0,
     this.playerDetailCustomImagePath = '',
-    this.playerDetailBackgroundMode = PlayerDetailBackgroundMode.coverBlur,
+    this.playerDetailBackgroundMode = PlayerDetailBackgroundMode.flowingLight,
     this.playerCoverStyle = PlayerCoverStyle.classic,
+    this.vinylTonearm = true,
     this.pageTransitionMode = PageTransitionMode.fade,
     this.landscapeImmersiveLyrics = false,
-    this.portraitImmersiveLyrics = false,
+    this.portraitImmersiveLyrics = true,
     this.homeModules = kDefaultHomeModules,
     this.showQualityBadges = true,
     this.onlineDefaultQuality = '320k',
@@ -198,6 +210,8 @@ class AppSettings {
     this.downloadWriteMetadata = true,
     this.organizeRule = '{Artist}/{Album}/{Title}',
     this.scanFormats = kSupportedScanFormats,
+    this.equalizerEnabled = false,
+    this.equalizerGains = const [],
   });
 
   final double volume;
@@ -206,11 +220,19 @@ class AppSettings {
   final bool playOtherAudioWithoutInterruption;
   final int lastTab;
   final bool keepScreenOn;
+
+  /// 音量键调节应用内音量：应用前台时拦截音量键，只调本应用播放音量，
+  /// 不动系统媒体音量（车机上不影响导航等其他声音）。
+  final bool volumeKeyControlsAppVolume;
   final ThemeModePreference themeMode;
   final int accentColor;
 
   /// 使用 Android 12+ 系统 Material You 动态取色。
   final bool dynamicColor;
+
+  /// 全局自定义字体的 family 名（'' = 系统默认）。字体文件由设置页
+  /// 选择后复制到应用文档目录，启动时通过 FontLoader 注册。
+  final String fontFamily;
   final SidebarPosition sidebarPosition;
   final List<String> sidebarItemOrder;
   final List<String> sidebarHiddenItems;
@@ -231,13 +253,17 @@ class AppSettings {
   final String playerDetailCustomImagePath;
   final PlayerDetailBackgroundMode playerDetailBackgroundMode;
   final PlayerCoverStyle playerCoverStyle;
+
+  /// 黑胶唱片封面是否显示唱针（复刻 BakaMusic 经典款唱针）。
+  final bool vinylTonearm;
   final PageTransitionMode pageTransitionMode;
 
   /// 横屏播放页沉浸式歌词：开启后右侧仅显示歌词，点按弹出播放栏。
   final bool landscapeImmersiveLyrics;
 
-  /// 竖屏播放页沉浸式歌词：开启后歌词页铺满内容区，点击原播放栏
-  /// 位置弹出播放栏，5 秒无操作自动隐藏（与横屏一致）。
+  /// 竖屏播放页沉浸式歌词（默认开启）：开启后封面页/歌词页铺满
+  /// 内容区，点击原播放栏位置弹出播放栏，左右翻页时播放栏保持
+  /// 显示，5 秒无操作自动隐藏（与横屏一致）。
   final bool portraitImmersiveLyrics;
 
   /// 首页已启用的模块 id（猜你想听固定展示，不在列表中即关闭）。
@@ -278,6 +304,13 @@ class AppSettings {
   final String organizeRule;
   final List<String> scanFormats;
 
+  /// 均衡器（音效）总开关：关闭时直通原始音频。
+  final bool equalizerEnabled;
+
+  /// 均衡器各频段增益（dB）。频段数量随设备而异（常见 5 段），
+  /// 应用时按下标对齐，超出设备频段数的部分忽略。
+  final List<double> equalizerGains;
+
   AppSettings copyWith({
     double? volume,
     int? playMode,
@@ -285,9 +318,11 @@ class AppSettings {
     bool? playOtherAudioWithoutInterruption,
     int? lastTab,
     bool? keepScreenOn,
+    bool? volumeKeyControlsAppVolume,
     ThemeModePreference? themeMode,
     int? accentColor,
     bool? dynamicColor,
+    String? fontFamily,
     SidebarPosition? sidebarPosition,
     List<String>? sidebarItemOrder,
     List<String>? sidebarHiddenItems,
@@ -300,6 +335,7 @@ class AppSettings {
     String? playerDetailCustomImagePath,
     PlayerDetailBackgroundMode? playerDetailBackgroundMode,
     PlayerCoverStyle? playerCoverStyle,
+    bool? vinylTonearm,
     PageTransitionMode? pageTransitionMode,
     bool? landscapeImmersiveLyrics,
     bool? portraitImmersiveLyrics,
@@ -330,6 +366,8 @@ class AppSettings {
     bool? downloadWriteMetadata,
     String? organizeRule,
     List<String>? scanFormats,
+    bool? equalizerEnabled,
+    List<double>? equalizerGains,
   }) {
     return AppSettings(
       volume: volume ?? this.volume,
@@ -341,9 +379,12 @@ class AppSettings {
           this.playOtherAudioWithoutInterruption,
       lastTab: lastTab ?? this.lastTab,
       keepScreenOn: keepScreenOn ?? this.keepScreenOn,
+      volumeKeyControlsAppVolume:
+          volumeKeyControlsAppVolume ?? this.volumeKeyControlsAppVolume,
       themeMode: themeMode ?? this.themeMode,
       accentColor: accentColor ?? this.accentColor,
       dynamicColor: dynamicColor ?? this.dynamicColor,
+      fontFamily: fontFamily ?? this.fontFamily,
       sidebarPosition: sidebarPosition ?? this.sidebarPosition,
       sidebarItemOrder: sidebarItemOrder ?? this.sidebarItemOrder,
       sidebarHiddenItems: sidebarHiddenItems ?? this.sidebarHiddenItems,
@@ -359,7 +400,8 @@ class AppSettings {
       playerDetailBackgroundMode:
           playerDetailBackgroundMode ?? this.playerDetailBackgroundMode,
       playerCoverStyle: playerCoverStyle ?? this.playerCoverStyle,
-      pageTransitionMode: pageTransitionMode ?? this.pageTransitionMode,
+    vinylTonearm: vinylTonearm ?? this.vinylTonearm,
+    pageTransitionMode: pageTransitionMode ?? this.pageTransitionMode,
       landscapeImmersiveLyrics:
           landscapeImmersiveLyrics ?? this.landscapeImmersiveLyrics,
       portraitImmersiveLyrics:
@@ -405,6 +447,8 @@ class AppSettings {
           downloadWriteMetadata ?? this.downloadWriteMetadata,
       organizeRule: organizeRule ?? this.organizeRule,
       scanFormats: scanFormats ?? this.scanFormats,
+      equalizerEnabled: equalizerEnabled ?? this.equalizerEnabled,
+      equalizerGains: equalizerGains ?? this.equalizerGains,
     );
   }
 }
@@ -424,9 +468,12 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
           prefs.getBool('playOtherAudioWithoutInterruption') ?? false,
       lastTab: prefs.getInt('lastTab') ?? 0,
       keepScreenOn: prefs.getBool('keepScreenOn') ?? true,
+      volumeKeyControlsAppVolume:
+          prefs.getBool('volumeKeyControlsAppVolume') ?? true,
       themeMode: _themeFromInt(prefs.getInt('themeMode') ?? 0),
       accentColor: prefs.getInt('accentColor') ?? 0xFFEC4141,
       dynamicColor: prefs.getBool('dynamicColor') ?? false,
+      fontFamily: prefs.getString('fontFamily') ?? '',
       sidebarPosition: _sidebarPositionFromInt(
         prefs.getInt('sidebarPosition') ?? 0,
       ),
@@ -455,13 +502,14 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
       playerCoverStyle: _playerCoverStyleFromInt(
         prefs.getInt('playerCoverStyle') ?? 0,
       ),
+      vinylTonearm: prefs.getBool('vinylTonearm') ?? true,
       pageTransitionMode: _pageTransitionModeFromInt(
         prefs.getInt('pageTransitionMode') ?? PageTransitionMode.fade.index,
       ),
       landscapeImmersiveLyrics:
           prefs.getBool('landscapeImmersiveLyrics') ?? false,
       portraitImmersiveLyrics:
-          prefs.getBool('portraitImmersiveLyrics') ?? false,
+          prefs.getBool('portraitImmersiveLyrics') ?? true,
       homeModules: prefs.getStringList('homeModules') == null
           ? kDefaultHomeModules
           : normalizeHomeModules(prefs.getStringList('homeModules')!),
@@ -474,6 +522,10 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
       lyricFontSize:
           (prefs.getDouble('lyricFontSize') ?? 22.0)
               .clamp(12.0, 32.0)
+              .toDouble(),
+      miniLyricFontSize:
+          (prefs.getDouble('miniLyricFontSize') ?? 14.0)
+              .clamp(10.0, 24.0)
               .toDouble(),
       desktopLyricsEnabled: prefs.getBool('desktopLyricsEnabled') ?? false,
       desktopLyricsHideInApp: prefs.getBool('desktopLyricsHideInApp') ?? true,
@@ -506,6 +558,11 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
       organizeRule:
           prefs.getString('organizeRule') ?? '{Artist}/{Album}/{Title}',
       scanFormats: prefs.getStringList('scanFormats') ?? kSupportedScanFormats,
+      equalizerEnabled: prefs.getBool('equalizerEnabled') ?? false,
+      equalizerGains: (prefs.getStringList('equalizerGains') ?? const [])
+          .map(double.tryParse)
+          .whereType<double>()
+          .toList(),
     );
   }
 
@@ -540,10 +597,14 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
   }
 
   PlayerDetailBackgroundMode _playerDetailBackgroundModeFromInt(int value) {
+    // coverBlur（旧索引 0）已移除：统一迁移为流光背景。
+    if (value == PlayerDetailBackgroundMode.coverBlur.index) {
+      return PlayerDetailBackgroundMode.flowingLight;
+    }
     if (value >= 0 && value < PlayerDetailBackgroundMode.values.length) {
       return PlayerDetailBackgroundMode.values[value];
     }
-    return PlayerDetailBackgroundMode.coverBlur;
+    return PlayerDetailBackgroundMode.flowingLight;
   }
 
   PlaybackFailureAction _playbackFailureActionFromInt(int v) =>
@@ -593,9 +654,14 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
       ),
       prefs.setInt('lastTab', next.lastTab),
       prefs.setBool('keepScreenOn', next.keepScreenOn),
+      prefs.setBool(
+        'volumeKeyControlsAppVolume',
+        next.volumeKeyControlsAppVolume,
+      ),
       prefs.setInt('themeMode', next.themeMode.index),
       prefs.setInt('accentColor', next.accentColor),
       prefs.setBool('dynamicColor', next.dynamicColor),
+      prefs.setString('fontFamily', next.fontFamily),
       prefs.setInt('sidebarPosition', next.sidebarPosition.index),
       prefs.setStringList(
         'sidebarItemOrder',
@@ -617,6 +683,7 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
         next.playerDetailBackgroundMode.index,
       ),
       prefs.setInt('playerCoverStyle', next.playerCoverStyle.index),
+      prefs.setBool('vinylTonearm', next.vinylTonearm),
       prefs.setInt('pageTransitionMode', next.pageTransitionMode.index),
       prefs.setBool(
         'landscapeImmersiveLyrics',
@@ -674,6 +741,11 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
       prefs.setBool('downloadWriteMetadata', next.downloadWriteMetadata),
       prefs.setString('organizeRule', next.organizeRule),
       prefs.setStringList('scanFormats', next.scanFormats),
+      prefs.setBool('equalizerEnabled', next.equalizerEnabled),
+      prefs.setStringList(
+        'equalizerGains',
+        next.equalizerGains.map((value) => value.toString()).toList(),
+      ),
     ]);
   }
 
@@ -698,6 +770,11 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
       _save((state.valueOrNull ?? const AppSettings()).copyWith(lastTab: t));
   Future<void> setKeepScreenOn(bool v) => _save(
     (state.valueOrNull ?? const AppSettings()).copyWith(keepScreenOn: v),
+  );
+  Future<void> setVolumeKeyControlsAppVolume(bool value) => _save(
+    (state.valueOrNull ?? const AppSettings()).copyWith(
+      volumeKeyControlsAppVolume: value,
+    ),
   );
   Future<void> setThemeMode(ThemeModePreference m) =>
       _save((state.valueOrNull ?? const AppSettings()).copyWith(themeMode: m));
@@ -793,6 +870,11 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
       playerCoverStyle: style,
     ),
   );
+  Future<void> setVinylTonearm(bool value) => _save(
+    (state.valueOrNull ?? const AppSettings()).copyWith(
+      vinylTonearm: value,
+    ),
+  );
   Future<void> setPageTransitionMode(PageTransitionMode mode) => _save(
     (state.valueOrNull ?? const AppSettings()).copyWith(
       pageTransitionMode: mode,
@@ -867,9 +949,28 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
       miniLyricFontSize: value.clamp(10.0, 24.0).toDouble(),
     ),
   );
+
+  /// 全局自定义字体 family；传空字符串恢复系统默认。
+  Future<void> setFontFamily(String value) =>
+      _save((state.valueOrNull ?? const AppSettings()).copyWith(fontFamily: value));
   Future<void> setDesktopLyricsEnabled(bool value) => _save(
     (state.valueOrNull ?? const AppSettings()).copyWith(
       desktopLyricsEnabled: value,
+    ),
+  );
+
+  /// 均衡器开关与频段增益。增益值按设备频段数截断，写入后由播放器
+  /// 侧的应用方法实时生效。
+  Future<void> setEqualizerEnabled(bool value) => _save(
+    (state.valueOrNull ?? const AppSettings()).copyWith(
+      equalizerEnabled: value,
+    ),
+  );
+  Future<void> setEqualizerGains(List<double> gains) => _save(
+    (state.valueOrNull ?? const AppSettings()).copyWith(
+      equalizerGains: List<double>.unmodifiable(
+        gains.map((value) => value.clamp(-15.0, 15.0).toDouble()),
+      ),
     ),
   );
   Future<void> setDesktopLyricsHideInApp(bool value) => _save(

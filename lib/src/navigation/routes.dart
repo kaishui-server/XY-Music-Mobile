@@ -22,6 +22,7 @@ import '../../pages/music_platform/platform_account_page.dart';
 import '../../pages/music_platform/platform_playlists_page.dart';
 import '../../pages/statistics/statistics_page.dart';
 import '../../pages/settings/about_page.dart';
+import '../../pages/settings/storage_page.dart';
 import '../../pages/cloud/cloud_music_page.dart';
 import '../../pages/cloud/cloud_browser_page.dart';
 import '../../pages/settings/plugins_page.dart';
@@ -265,6 +266,13 @@ final appRouter = GoRouter(
                   ),
                 ),
                 GoRoute(
+                  path: 'backup',
+                  pageBuilder: (context, state) => _instantPage(
+                    state,
+                    const SettingsPage(section: SettingsSection.backup),
+                  ),
+                ),
+                GoRoute(
                   path: 'logs-debug',
                   pageBuilder: (context, state) => _instantPage(
                     state,
@@ -289,6 +297,11 @@ final appRouter = GoRouter(
                   path: 'statistics',
                   pageBuilder: (context, state) =>
                       _instantPage(state, const StatisticsPage()),
+                ),
+                GoRoute(
+                  path: 'storage',
+                  pageBuilder: (context, state) =>
+                      _instantPage(state, const StoragePage()),
                 ),
                 GoRoute(
                   path: 'about',
@@ -414,6 +427,13 @@ final appRouter = GoRouter(
     GoRoute(
       path: '/player',
       pageBuilder: (context, state) => _instantPage(state, const PlayerPage()),
+    ),
+    // 完整音效页全屏覆盖：从播放页（shell 外路由）push shell 内 branch
+    // 会导致空白页，这里注册独立全屏路由供播放页跳转，返回即回播放页。
+    GoRoute(
+      path: '/effects-page',
+      pageBuilder: (context, state) =>
+          _instantPage(state, const EffectsPage(showBackButton: true)),
     ),
     // 搜索页同为全屏覆盖。
     GoRoute(

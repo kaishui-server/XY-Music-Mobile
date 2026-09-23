@@ -22,7 +22,11 @@ int? _activeRelinkProposalId;
 /// 侧边栏与自定义底栏共用的目的地映射（id → 名称/图标/路由）。
 const _sidebarDestinations = <String, _SidebarDestination>{
   kSidebarHome: _SidebarDestination('首页', Icons.home_outlined, '/home'),
-  kSidebarExplore: _SidebarDestination('探索', Icons.explore_outlined, '/home/explore'),
+  kSidebarExplore: _SidebarDestination(
+    '探索',
+    Icons.explore_outlined,
+    '/home/explore',
+  ),
   kSidebarLocalMusic: _SidebarDestination(
     '本地音乐',
     Icons.music_note_outlined,
@@ -68,14 +72,30 @@ const _sidebarDestinations = <String, _SidebarDestination>{
     Icons.download_rounded,
     '/settings/downloads',
   ),
-  kSidebarSettings: _SidebarDestination('设置', Icons.settings_outlined, '/settings'),
+  kSidebarSettings: _SidebarDestination(
+    '设置',
+    Icons.settings_outlined,
+    '/settings',
+  ),
 };
 
 /// 目的地是否对应当前路由（忽略查询参数，支持子路由高亮）。
 bool _destinationSelected(String currentPath, String path) {
   final normalized = path.split('?').first;
   if (normalized == '/home') return currentPath == '/home';
-  return currentPath == normalized || currentPath.startsWith('$normalized/');
+  if (!(currentPath == normalized || currentPath.startsWith('$normalized/'))) {
+    return false;
+  }
+  // 子路由有独立入口时（如 /settings/downloads 相对 /settings）只高亮
+  // 更长前缀的那个入口，避免“下载管理”与“设置”同时点亮。
+  for (final destination in _sidebarDestinations.values) {
+    final other = destination.path.split('?').first;
+    if (other.length > normalized.length &&
+        (currentPath == other || currentPath.startsWith('$other/'))) {
+      return false;
+    }
+  }
+  return true;
 }
 
 /// 自定义底栏的高度与悬浮间距（迷你播放栏据此让位）。
@@ -133,7 +153,8 @@ class AppShell extends ConsumerWidget {
         ref.watch(settingsProvider).valueOrNull?.sidebarPosition ==
         SidebarPosition.right;
     final shellSettings = ref.watch(settingsProvider).valueOrNull;
-    final bottomBarItemIds = shellSettings?.bottomBarItemIds ?? const <String>[];
+    final bottomBarItemIds =
+        shellSettings?.bottomBarItemIds ?? const <String>[];
     final bottomBarVisible =
         (shellSettings?.bottomBarEnabled ?? false) &&
         bottomBarItemIds.length >= 2;
@@ -160,9 +181,9 @@ class AppShell extends ConsumerWidget {
       children: [
         MediaQuery(
           data: MediaQuery.of(context).copyWith(
-            padding: MediaQuery.of(context).padding.copyWith(
-              bottom: safeBottom + extraBottomPadding,
-            ),
+            padding: MediaQuery.of(
+              context,
+            ).padding.copyWith(bottom: safeBottom + extraBottomPadding),
           ),
           child: navigationShell,
         ),
@@ -182,7 +203,8 @@ class AppShell extends ConsumerWidget {
             curve: Curves.easeOutCubic,
             left: 12,
             right: 12,
-            bottom: safeBottom +
+            bottom:
+                safeBottom +
                 (bottomBarVisible
                     ? kBottomBarHeight + kBottomBarBottomGap * 2
                     : 20),
@@ -251,12 +273,11 @@ class XyBottomBar extends ConsumerWidget {
   Widget build(BuildContext context, WidgetRef ref) {
     final theme = Theme.of(context);
     final dark = theme.brightness == Brightness.dark;
-    final showLabels =
-        ref.watch(
-          settingsProvider.select(
-            (value) => value.valueOrNull?.bottomBarShowLabels ?? true,
-          ),
-        );
+    final showLabels = ref.watch(
+      settingsProvider.select(
+        (value) => value.valueOrNull?.bottomBarShowLabels ?? true,
+      ),
+    );
     final items = itemIds
         .map((id) => _sidebarDestinations[id])
         .whereType<_SidebarDestination>()
@@ -743,8 +764,7 @@ class XyLandscapeSidebar extends ConsumerStatefulWidget {
   final bool onRight;
 
   @override
-  ConsumerState<XyLandscapeSidebar> createState() =>
-      _XyLandscapeSidebarState();
+  ConsumerState<XyLandscapeSidebar> createState() => _XyLandscapeSidebarState();
 }
 
 class _XyLandscapeSidebarState extends ConsumerState<XyLandscapeSidebar> {
@@ -766,10 +786,7 @@ class _XyLandscapeSidebarState extends ConsumerState<XyLandscapeSidebar> {
     final viewport = MediaQuery.sizeOf(context);
     final base =
         _dragWidth ??
-        ref
-            .read(settingsProvider)
-            .valueOrNull
-            ?.landscapeSidebarWidth ??
+        ref.read(settingsProvider).valueOrNull?.landscapeSidebarWidth ??
         176.0;
     // 右侧栏的把手在左缘：向左拖（dx < 0）才是加宽。
     final delta = widget.onRight ? -details.delta.dx : details.delta.dx;
@@ -790,10 +807,7 @@ class _XyLandscapeSidebarState extends ConsumerState<XyLandscapeSidebar> {
     const collapsed = 84.0;
     final base =
         _dragWidth ??
-        ref
-            .read(settingsProvider)
-            .valueOrNull
-            ?.landscapeSidebarWidth ??
+        ref.read(settingsProvider).valueOrNull?.landscapeSidebarWidth ??
         expanded;
     final next = base >= _iconOnlyBelow ? collapsed : expanded;
     setState(() => _dragWidth = next);
@@ -940,18 +954,19 @@ class _XyLandscapeSidebarState extends ConsumerState<XyLandscapeSidebar> {
         settings?.sidebarHiddenItems.toSet() ?? const <String>{};
     final showSettings = !hiddenItems.contains(kSidebarSettings);
     final showDownloads = !hiddenItems.contains(kSidebarDownloads);
-    final primaryItems = normalizeSidebarItemOrder(
-          settings?.sidebarItemOrder ?? kDefaultSidebarItemOrder,
-        )
-        .where(
-          (id) =>
-              id != kSidebarSettings &&
-              id != kSidebarDownloads &&
-              !hiddenItems.contains(id),
-        )
-        .map((id) => _sidebarDestinations[id])
-        .whereType<_SidebarDestination>()
-        .toList();
+    final primaryItems =
+        normalizeSidebarItemOrder(
+              settings?.sidebarItemOrder ?? kDefaultSidebarItemOrder,
+            )
+            .where(
+              (id) =>
+                  id != kSidebarSettings &&
+                  id != kSidebarDownloads &&
+                  !hiddenItems.contains(id),
+            )
+            .map((id) => _sidebarDestinations[id])
+            .whereType<_SidebarDestination>()
+            .toList();
 
     final borderColor = dark ? XyColors.darkBorder : XyColors.lightBorder;
     final sidebar = SizedBox(

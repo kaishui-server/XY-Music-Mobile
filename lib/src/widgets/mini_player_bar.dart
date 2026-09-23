@@ -6,6 +6,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 import 'package:video_player/video_player.dart';
 
+import '../core/settings.dart';
 import '../lyrics/lyrics_models.dart';
 import '../player/player_provider.dart';
 import '../player/video_playback_session.dart';
@@ -77,7 +78,8 @@ class MiniPlayerBar extends ConsumerWidget {
       String? errorMessage,
       double position,
       double duration,
-    }) player,
+    })
+    player,
     QueueItem current, {
     VideoPlayerController? video,
     VideoPlayerValue? videoValue,
@@ -142,92 +144,98 @@ class MiniPlayerBar extends ConsumerWidget {
                       ),
                     ),
                     const SizedBox(width: 6),
-                    Expanded(
-                      child: Column(
-                        mainAxisAlignment: MainAxisAlignment.center,
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
+                  Expanded(
+                    child: Column(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          // 歌手名拼进标题行，保证副行滚动歌词时歌手名仍可见。
+                          current.artist.isEmpty
+                              ? current.title
+                              : '${current.title} - ${current.artist}',
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(
+                            fontSize: 14,
+                            fontWeight: FontWeight.w700,
+                          ),
+                        ),
+                        const SizedBox(height: 3),
+                        if (player.errorMessage != null)
                           Text(
-                            // 歌手名拼进标题行，保证副行滚动歌词时歌手名仍可见。
-                            current.artist.isEmpty
-                                ? current.title
-                                : '${current.title} - ${current.artist}',
+                            player.errorMessage!,
                             maxLines: 1,
                             overflow: TextOverflow.ellipsis,
-                            style: const TextStyle(
-                              fontSize: 14,
-                              fontWeight: FontWeight.w700,
+                            style: TextStyle(
+                              fontSize: 11,
+                              color: theme.colorScheme.error,
                             ),
+                          )
+                        else
+                          RepaintBoundary(
+                            child: _MiniBarLyrics(item: current),
                           ),
-                          const SizedBox(height: 3),
-                          if (player.errorMessage != null)
-                            Text(
-                              player.errorMessage!,
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis,
-                              style: TextStyle(
-                                fontSize: 11,
-                                color: theme.colorScheme.error,
-                              ),
-                            )
-                          else
-                            _MiniBarLyrics(item: current),
-                        ],
-                      ),
+                      ],
                     ),
-                    _PlayerButton(
-                      primary: true,
-                      icon: isLoading
-                          ? Icons.hourglass_top_rounded
-                          : isPlaying
-                          ? Icons.pause_rounded
-                          : Icons.play_arrow_rounded,
-                      label: isLoading
-                          ? '加载中'
-                          : isPlaying
-                          ? '暂停'
-                          : '播放',
-                      onTap: isLoading
-                          ? () {}
-                          : video != null
-                          ? () {
-                              if (video.value.isPlaying) {
-                                unawaited(video.pause());
-                              } else {
-                                unawaited(video.play());
-                              }
+                  ),
+                  _PlayerButton(
+                    primary: true,
+                    icon: isLoading
+                        ? Icons.hourglass_top_rounded
+                        : isPlaying
+                        ? Icons.pause_rounded
+                        : Icons.play_arrow_rounded,
+                    label: isLoading
+                        ? '加载中'
+                        : isPlaying
+                        ? '暂停'
+                        : '播放',
+                    onTap: isLoading
+                        ? () {}
+                        : video != null
+                        ? () {
+                            if (video.value.isPlaying) {
+                              unawaited(video.pause());
+                            } else {
+                              unawaited(video.play());
                             }
-                          : () => ref.read(playerProvider.notifier).toggle(),
-                    ),
-                    _PlayerButton(
-                      icon: Icons.skip_next_rounded,
-                      label: '下一首',
-                      onTap: () {
-                        if (video != null) {
-                          unawaited(VideoPlaybackSession.stopForTrackAction());
-                        }
-                        unawaited(ref.read(playerProvider.notifier).next());
-                      },
-                    ),
-                    _PlayerButton(
-                      icon: Icons.queue_music_rounded,
-                      label: '播放队列',
-                      onTap: () => showQueueSheet(context, ref),
-                    ),
-                    const SizedBox(width: 3),
-                  ],
-                ),
-                Align(
-                  alignment: Alignment.bottomLeft,
+                          }
+                        : () => ref.read(playerProvider.notifier).toggle(),
+                  ),
+                  _PlayerButton(
+                    icon: Icons.skip_next_rounded,
+                    label: '下一首',
+                    onTap: () {
+                      if (video != null) {
+                        unawaited(VideoPlaybackSession.stopForTrackAction());
+                      }
+                      unawaited(ref.read(playerProvider.notifier).next());
+                    },
+                  ),
+                  _PlayerButton(
+                    icon: Icons.queue_music_rounded,
+                    label: '播放队列',
+                    onTap: () => showQueueSheet(context, ref),
+                  ),
+                  const SizedBox(width: 3),
+                ],
+              ),
+              Align(
+                alignment: Alignment.bottomLeft,
+                // 进度条随 position 流（80~120ms）重绘：RepaintBoundary
+                // 把重绘伤害局限在本层，避免连带玻璃层每 tick 重新采样。
+                child: RepaintBoundary(
                   child: _MiniPlayerProgress(
                     position: position,
                     duration: duration,
                   ),
                 ),
-              ],
-            ),
+              ),
+            ],
           ),
         ),
+      ),
       ),
     );
   }
@@ -303,8 +311,9 @@ class _PlayerButton extends StatelessWidget {
 }
 
 /// 底栏迷你歌词：随播放进度滚动显示当前歌词行。
-/// 歌手名已并入标题行（歌曲名 - 歌手名）始终显示；本行固定字号单行，
-/// 无歌词（含插件歌曲未内嵌歌词）时显示「暂无歌词」占位。
+/// 歌手名已并入标题行（歌曲名 - 歌手名）始终显示；本行跟随迷你歌词
+/// 字号设置，单行显示、超出省略号截断，无歌词（含插件歌曲未内嵌歌词）
+/// 时显示「暂无歌词」占位。
 class _MiniBarLyrics extends ConsumerWidget {
   const _MiniBarLyrics({required this.item});
 
@@ -315,6 +324,16 @@ class _MiniBarLyrics extends ConsumerWidget {
     final position = ref.watch(
       playerProvider.select((state) => state.position),
     );
+    // 跟随迷你歌词字号设置；底栏高度有限（64dp，标题行外仅余约 29dp），
+    // 上限收紧到 15 防止撑破布局。
+    final fontSize =
+        (ref.watch(
+                  settingsProvider.select(
+                    (s) => s.valueOrNull?.miniLyricFontSize,
+                  ),
+                ) ??
+                11.0)
+            .clamp(10.0, 15.0);
     final embedded = item.lyricsRaw?.trim() ?? '';
     final AsyncValue<List<LyricLine>> lyrics;
     if (embedded.isNotEmpty) {
@@ -344,10 +363,12 @@ class _MiniBarLyrics extends ConsumerWidget {
       child: Text(
         text,
         key: ValueKey('bar:${item.path}:$lineTime'),
+        // 单行显示，超出部分省略号截断，保证底栏高度稳定。
         maxLines: 1,
+        softWrap: false,
         overflow: TextOverflow.ellipsis,
         style: TextStyle(
-          fontSize: 11,
+          fontSize: fontSize,
           color: Theme.of(context).colorScheme.onSurfaceVariant,
         ),
       ),

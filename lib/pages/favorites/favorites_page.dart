@@ -6,6 +6,8 @@ import '../../src/favorites/favorites_provider.dart';
 import '../../src/core/settings.dart';
 import '../../src/library/library_provider.dart';
 import '../../src/player/player_provider.dart';
+import '../../src/playlists/playlist_picker_sheet.dart';
+import '../../src/playlists/playlists_provider.dart';
 import '../../src/navigation/sidebar_controller.dart';
 import '../../src/plugins/plugin_runtime.dart';
 import '../../src/widgets/batch_download.dart';
@@ -27,6 +29,26 @@ class _FavoritesPageState extends ConsumerState<FavoritesPage> {
   // 搜索框控制器：供一键清除按钮清空输入。
   final TextEditingController _searchController = TextEditingController();
   SongSort _sort = const SongSort(SongSortKey.custom);
+
+  /// 悬浮头部（搜索框 + 歌曲数行）的测量 Key 与实测高度：头部悬浮于
+  /// 列表上方，列表内容滚动时从毛玻璃下方穿过被模糊（与列表浮动
+  /// 按钮组同款观感），列表顶部让出头部高度。
+  final GlobalKey _floatingHeaderKey = GlobalKey();
+  double _floatingHeaderExtent = 104;
+
+  /// 布局完成后用真实高度修正悬浮头部占位，字体缩放等场景自动适配。
+  void _measureFloatingHeader() {
+    if (!mounted) return;
+    final size = _floatingHeaderKey.currentContext?.size;
+    if (size == null || size.height <= 0) return;
+    if ((size.height - _floatingHeaderExtent).abs() > 0.5) {
+      setState(() => _floatingHeaderExtent = size.height);
+    }
+  }
+
+  /// 自定义排序的拖拽编辑模式：已是自定义排序时再次点击“自定义”
+  /// 进入，列表行首显示拖拽手柄；点击“完成”退出，手柄消失。
+  bool _dragEditMode = false;
   Future<List<Song>>? _songsFuture;
   int? _songsFutureKey;
   // 多选删除：勾选的收藏路径集合。
@@ -143,6 +165,36 @@ class _FavoritesPageState extends ConsumerState<FavoritesPage> {
     } finally {
       if (mounted) setState(() => _downloading = false);
     }
+  }
+
+  /// 多选批量添加到歌单：选中歌曲加入已有歌单或新建歌单。
+  Future<void> _addSelectedToPlaylist() async {
+    if (_selectedPaths.isEmpty) return;
+    final selected = _sortedSongs
+        .where((song) => _selectedPaths.contains(song.path))
+        .toList();
+    if (selected.isEmpty) return;
+    final result = await showPlaylistPicker(
+      context,
+      items: [for (final song in selected) song.toQueueItem()],
+    );
+    if (!mounted || result == null) return;
+    _exitSelection();
+    final name = ref
+        .read(playlistsProvider)
+        .where((value) => value.id == result.playlistId)
+        .firstOrNull
+        ?.name;
+    final parts = <String>[
+      if (result.addedCount > 0)
+        '已添加 ${result.addedCount} 首到歌单“$name”',
+      if (result.existsCount > 0) '${result.existsCount} 首已在歌单中',
+    ];
+    XyNotice.show(
+      context,
+      message: parts.isEmpty ? '所选歌曲均已在歌单中' : parts.join('，'),
+      type: result.addedCount > 0 ? XyNoticeType.success : XyNoticeType.warning,
+    );
   }
 
   /// 多选批量换源：选择目标插件后逐首搜索同名歌曲，原位替换收藏
@@ -308,6 +360,14 @@ class _FavoritesPageState extends ConsumerState<FavoritesPage> {
           if (sidebarOnRight) const AppSidebarMenuButton(),
           if (_selectionMode) ...[
             IconButton(
+              tooltip: '添加到歌单',
+              onPressed: _switchingSource || _downloading || _deleting ||
+                      _selectedPaths.isEmpty
+                  ? null
+                  : _addSelectedToPlaylist,
+              icon: const Icon(Icons.playlist_add_check_rounded),
+            ),
+            IconButton(
               tooltip: _switchingSource
                   ? '换源中 $_switchingDone/$_switchingTotal'
                   : '批量换源',
@@ -362,16 +422,37 @@ class _FavoritesPageState extends ConsumerState<FavoritesPage> {
                   ? null
                   : () => setState(() {
                         _selectionMode = true;
+                        // 多选与拖拽编辑互斥，进入多选时收起拖拽手柄。
+                        _dragEditMode = false;
                         // 进入多选时清掉搜索过滤，保证全选覆盖整个收藏。
                         _query = '';
                         _searchController.clear();
                       }),
               icon: const Icon(Icons.library_add_check_rounded),
             ),
-            SongSortMenuButton(
-              sort: _sort,
-              onSortChanged: (sort) => setState(() => _sort = sort),
-            ),
+            if (_dragEditMode)
+              // 拖拽编辑模式：点击“完成”收起拖拽手柄。
+              TextButton(
+                onPressed: () => setState(() => _dragEditMode = false),
+                child: const Text('完成'),
+              )
+            else
+              SongSortMenuButton(
+                sort: _sort,
+                onSortChanged: (sort) {
+                  setState(() {
+                    // 已处于自定义排序时再次点击“自定义”：
+                    // 进入/退出拖拽编辑模式（手柄随之显隐）。
+                    if (sort.key == SongSortKey.custom &&
+                        _sort.key == SongSortKey.custom) {
+                      _dragEditMode = !_dragEditMode;
+                    } else {
+                      _sort = sort;
+                      _dragEditMode = false;
+                    }
+                  });
+                },
+              ),
           ],
         ],
       ),
@@ -466,8 +547,59 @@ class _FavoritesPageState extends ConsumerState<FavoritesPage> {
                             .toList();
                   // 供拖拽回调读取当前展示顺序。
                   _sortedSongs = filteredSongs;
-                  return Column(
+                  // 布局完成后修正悬浮头部占位高度。
+                  WidgetsBinding.instance.addPostFrameCallback(
+                    (_) => _measureFloatingHeader(),
+                  );
+                  // 搜索框与歌曲数行悬浮于列表上方：列表内容滚动时从
+                  // 毛玻璃下方穿过被模糊，与列表浮动按钮组观感一致。
+                  return Stack(
                     children: [
+                      Positioned.fill(
+                        child: Padding(
+                          padding: EdgeInsets.only(
+                            top: _selectionMode || filteredSongs.isEmpty
+                                ? 0
+                                : _floatingHeaderExtent,
+                          ),
+                          child: filteredSongs.isEmpty
+                              ? Center(
+                                  child: Text(
+                                    '没有找到匹配的收藏歌曲',
+                                    style: TextStyle(
+                                      color: Theme.of(
+                                        context,
+                                      ).colorScheme.onSurfaceVariant,
+                                    ),
+                                  ),
+                                )
+                              : SongsListView(
+                                  songs: filteredSongs,
+                                  // 悬浮元素遮挡高度已注入 MediaQuery.padding。
+                                  padding: EdgeInsets.fromLTRB(
+                                    10,
+                                    0,
+                                    10,
+                                    MediaQuery.paddingOf(context).bottom + 12,
+                                  ),
+                                  selectionMode: _selectionMode,
+                                  isSelected: (song) =>
+                                      _selectedPaths.contains(song.path),
+                                  onToggleSelection: _toggleSelection,
+                                  // 搜索过滤时下标与全量收藏不一致，禁止拖拽；
+                                  // 拖拽手柄仅在自定义排序的编辑模式中显示。
+                                  onReorder:
+                                      _sort.key == SongSortKey.custom &&
+                                          _dragEditMode &&
+                                          query.isEmpty
+                                      ? _onReorder
+                                      : null,
+                                  onPlay: (list, i) => ref
+                                        .read(libraryProvider.notifier)
+                                        .playList(list, i),
+                                ),
+                        ),
+                      ),
                       if (_selectionMode)
                         Padding(
                           padding: const EdgeInsets.fromLTRB(16, 4, 16, 8),
@@ -512,76 +644,66 @@ class _FavoritesPageState extends ConsumerState<FavoritesPage> {
                           ),
                         )
                       else
-                        FrostedSearchField(
-                          controller: _searchController,
-                          hintText: '搜索歌曲、歌手或专辑',
-                          onChanged: (value) =>
-                              setState(() => _query = value),
-                          showClearSuffix: true,
-                          padding: const EdgeInsets.fromLTRB(16, 4, 16, 4),
-                        ),
-                      if (!_selectionMode)
-                        Padding(
-                          padding: const EdgeInsets.fromLTRB(16, 4, 16, 8),
-                          child: Row(
-                            children: [
-                              Text(
-                                '${filteredSongs.length} 首歌曲',
-                                style: TextStyle(
-                                  color: Theme.of(
-                                    context,
-                                  ).colorScheme.onSurfaceVariant,
-                                ),
-                              ),
-                              const Spacer(),
-                              FilledButton.tonalIcon(
-                                onPressed: filteredSongs.isEmpty
-                                    ? null
-                                    : () => ref
-                                          .read(libraryProvider.notifier)
-                                          .playAll(filteredSongs),
-                                icon: const Icon(Icons.play_arrow, size: 20),
-                                label: const Text('播放全部'),
-                              ),
-                            ],
-                          ),
-                        ),
-                      Expanded(
-                        child: filteredSongs.isEmpty
-                            ? Center(
-                                child: Text(
-                                  '没有找到匹配的收藏歌曲',
-                                  style: TextStyle(
-                                    color: Theme.of(
-                                      context,
-                                    ).colorScheme.onSurfaceVariant,
+                        Positioned(
+                          top: 0,
+                          left: 0,
+                          right: 0,
+                          child: KeyedSubtree(
+                            key: _floatingHeaderKey,
+                            child: Column(
+                              children: [
+                                FrostedSearchField(
+                                  controller: _searchController,
+                                  hintText: '搜索歌曲、歌手或专辑',
+                                  onChanged: (value) =>
+                                      setState(() => _query = value),
+                                  showClearSuffix: true,
+                                  padding: const EdgeInsets.fromLTRB(
+                                    16,
+                                    4,
+                                    16,
+                                    4,
                                   ),
                                 ),
-                              )
-                            : SongsListView(
-                                songs: filteredSongs,
-                                // 悬浮元素遮挡高度已注入 MediaQuery.padding。
-                                padding: EdgeInsets.fromLTRB(
-                                  10,
-                                  0,
-                                  10,
-                                  MediaQuery.paddingOf(context).bottom + 12,
+                                Padding(
+                                  padding: const EdgeInsets.fromLTRB(
+                                    16,
+                                    4,
+                                    16,
+                                    8,
+                                  ),
+                                  child: Row(
+                                    children: [
+                                      Text(
+                                        '${filteredSongs.length} 首歌曲',
+                                        style: TextStyle(
+                                          color: Theme.of(
+                                            context,
+                                          ).colorScheme.onSurfaceVariant,
+                                        ),
+                                      ),
+                                      const Spacer(),
+                                      FilledButton.tonalIcon(
+                                        onPressed: filteredSongs.isEmpty
+                                            ? null
+                                            : () => ref
+                                                  .read(
+                                                    libraryProvider.notifier,
+                                                  )
+                                                  .playAll(filteredSongs),
+                                        icon: const Icon(
+                                          Icons.play_arrow,
+                                          size: 20,
+                                        ),
+                                        label: const Text('播放全部'),
+                                      ),
+                                    ],
+                                  ),
                                 ),
-                                selectionMode: _selectionMode,
-                                isSelected: (song) =>
-                                    _selectedPaths.contains(song.path),
-                                onToggleSelection: _toggleSelection,
-                                // 搜索过滤时下标与全量收藏不一致，禁止拖拽。
-                                onReorder:
-                                    _sort.key == SongSortKey.custom &&
-                                        query.isEmpty
-                                    ? _onReorder
-                                    : null,
-                                onPlay: (list, i) => ref
-                                    .read(libraryProvider.notifier)
-                                    .playList(list, i),
-                              ),
-                      ),
+                              ],
+                            ),
+                          ),
+                        ),
                     ],
                   );
                 },

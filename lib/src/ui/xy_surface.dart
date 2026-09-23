@@ -247,3 +247,49 @@ class XyPanel extends StatelessWidget {
     );
   }
 }
+
+/// 玻璃容器：BackdropFilter 高斯模糊 + 半透明底色。
+///
+/// 常驻玻璃效果，不做滚动降级（切换会造成闪屏）。使用时确保外层
+/// 有局部裁剪（ClipRRect/ClipOval），否则滤镜区域会外溢。
+class XyBackdropGlass extends StatelessWidget {
+  const XyBackdropGlass({
+    super.key,
+    required this.child,
+    required this.glassColor,
+    this.sigma = 16,
+    this.borderRadius,
+  });
+
+  /// 玻璃底色（较低不透明度，配合模糊透出后方内容）。
+  final Color glassColor;
+
+  /// 高斯模糊半径。
+  final double sigma;
+
+  /// 圆角裁剪；外层已裁剪时传 null 避免重复 ClipRRect。
+  final BorderRadius? borderRadius;
+
+  final Widget child;
+
+  @override
+  Widget build(BuildContext context) {
+    Widget content = ColoredBox(color: glassColor, child: child);
+    if (sigma > 0) {
+      // .grouped 构造挂到 app 根部的 BackdropGroup（app.dart）共享
+      // 背景图层：普通 BackdropFilter 只能采样“同图层中绘制在自己
+      // 之前”的内容，而 XyAppBackground 为性能被 RepaintBoundary
+      // 隔离在独立图层，普通构造永远读不到背景（玻璃模糊全部失效）。
+      // grouped 从共享图层采样，多个玻璃元素也只重采样一次。
+      content = BackdropFilter.grouped(
+        filter: ui.ImageFilter.blur(sigmaX: sigma, sigmaY: sigma),
+        child: content,
+      );
+    }
+    final radius = borderRadius;
+    if (radius != null) {
+      content = ClipRRect(borderRadius: radius, child: content);
+    }
+    return content;
+  }
+}

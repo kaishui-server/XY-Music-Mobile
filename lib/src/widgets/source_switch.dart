@@ -1,21 +1,30 @@
+import 'dart:async';
+import 'dart:math' as math;
+
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../library/library_provider.dart';
 import '../player/player_provider.dart';
 import '../plugins/plugin_runtime.dart';
+import '../favorites/favorites_provider.dart';
+import '../playlists/playlists_provider.dart';
 
 /// 换源：把歌曲切换到其他已启用插件的同名音源。
 ///
 /// 参考闲鱼音乐的换源交互：先选择目标音源（插件列表标记类型），
 /// 搜索「歌名 歌手」后按 `recognizedSongMatchScore` 打分取最佳匹配；
-/// 单曲换源时弹出候选列表供用户挑选，批量换源自动取最高分。
+/// 单曲换源弹出一体化底部面板（搜索框 + 音源 tab + 候选列表，
+/// 排版与关联歌词面板一致），批量换源自动取最高分。
 
-/// 插件类型标记：Baka 系 / MusicFree / 洛雪（与歌单网络导入对话框一致）。
-String sourcePluginTag(EnabledMusicPlugin plugin) =>
-    plugin.isLx ? '洛雪' : (plugin.name.toLowerCase().contains('baka') ? 'Baka' : 'MusicFree');
+/// 插件类型标记：Baka 系 / MusicFree / 洛雪 / animemusic（与歌单网络导入对话框一致）。
+String sourcePluginTag(EnabledMusicPlugin plugin) => plugin.isLx
+    ? '洛雪'
+    : plugin.isAnimemusic
+    ? 'animemusic'
+    : (plugin.name.toLowerCase().contains('baka') ? 'Baka' : 'MusicFree');
 
-/// 选择换源目标插件的对话框；取消返回 null。
+/// 选择换源目标插件的底部菜单（批量换源用）；取消返回 null。
 Future<EnabledMusicPlugin?> showSourcePluginPicker(
   BuildContext context,
   List<EnabledMusicPlugin> plugins, {
@@ -25,40 +34,65 @@ Future<EnabledMusicPlugin?> showSourcePluginPicker(
     for (final plugin in plugins)
       if (plugin.id != excludePluginId) plugin,
   ];
-  return showDialog<EnabledMusicPlugin>(
+  return showModalBottomSheet<EnabledMusicPlugin>(
     context: context,
     useRootNavigator: true,
-    builder: (dialogContext) => SimpleDialog(
-      title: const Text('选择目标音源'),
-      children: [
-        if (candidates.isEmpty)
-          const Padding(
-            padding: EdgeInsets.symmetric(horizontal: 24, vertical: 12),
-            child: Text('没有其他可用的插件，请先在 设置 → 插件 中启用'),
-          )
-        else
-          for (final plugin in candidates)
-            SimpleDialogOption(
-              onPressed: () => Navigator.pop(dialogContext, plugin),
-              child: Row(
-                children: [
-                  Icon(
-                    Icons.extension_rounded,
-                    size: 20,
-                    color: Theme.of(dialogContext).colorScheme.onSurfaceVariant,
-                  ),
-                  const SizedBox(width: 12),
-                  Expanded(
-                    child: Text(
-                      '${plugin.name}（${sourcePluginTag(plugin)}）',
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                    ),
-                  ),
-                ],
+    showDragHandle: true,
+    builder: (sheetContext) => SafeArea(
+      child: Padding(
+        padding: const EdgeInsets.only(bottom: 8),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Padding(
+              padding: const EdgeInsets.fromLTRB(20, 0, 20, 10),
+              child: Text(
+                '选择目标音源',
+                style: TextStyle(
+                  fontSize: 16,
+                  fontWeight: FontWeight.w700,
+                  color: Theme.of(sheetContext).colorScheme.onSurface,
+                ),
               ),
             ),
-      ],
+            if (candidates.isEmpty)
+              Padding(
+                padding: const EdgeInsets.fromLTRB(20, 0, 20, 14),
+                child: Text(
+                  '没有其他可用的插件，请先在 设置 → 插件 中启用',
+                  style: TextStyle(
+                    color: Theme.of(sheetContext).colorScheme.onSurfaceVariant,
+                  ),
+                ),
+              )
+            else
+              for (final plugin in candidates)
+                ListTile(
+                  dense: true,
+                  leading: Icon(
+                    Icons.extension_rounded,
+                    size: 22,
+                    color: Theme.of(sheetContext).colorScheme.onSurfaceVariant,
+                  ),
+                  title: Text(
+                    plugin.name,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(fontWeight: FontWeight.w600),
+                  ),
+                  trailing: Text(
+                    sourcePluginTag(plugin),
+                    style: TextStyle(
+                      fontSize: 12,
+                      color: Theme.of(sheetContext).colorScheme.primary,
+                    ),
+                  ),
+                  onTap: () => Navigator.pop(sheetContext, plugin),
+                ),
+          ],
+        ),
+      ),
     ),
   );
 }
@@ -70,14 +104,35 @@ Future<List<PluginSearchSong>> searchReplacementCandidates(
   required String title,
   required String artist,
   int durationMs = 0,
+}) =>
+    searchReplacementCandidatesWithKeyword(
+      ref,
+      plugin,
+      keyword: artist.trim().isEmpty
+          ? title.trim()
+          : '${title.trim()} ${artist.trim()}',
+      title: title,
+      artist: artist,
+      durationMs: durationMs,
+    );
+
+/// 按关键词在目标插件上搜索替换候选。默认关键词（歌名 + 歌手）时按
+/// `recognizedSongMatchScore` 过滤并排序；自定义关键词时保留插件原始
+/// 排序（最多 50 条），方便手动搜索翻唱、Live 等其他版本。
+Future<List<PluginSearchSong>> searchReplacementCandidatesWithKeyword(
+  WidgetRef ref,
+  EnabledMusicPlugin plugin, {
+  required String keyword,
+  required String title,
+  required String artist,
+  int durationMs = 0,
+  bool scoreFilter = true,
 }) async {
-  final keyword = artist.trim().isEmpty
-      ? title.trim()
-      : '${title.trim()} ${artist.trim()}';
   final results = await ref
       .read(pluginRuntimeProvider)
       .search(plugin, keyword)
       .timeout(const Duration(seconds: 20), onTimeout: () => const []);
+  if (!scoreFilter) return results.take(50).toList();
   final scored = <(int, PluginSearchSong)>[];
   for (final song in results) {
     final score = recognizedSongMatchScore(
@@ -124,129 +179,392 @@ Song replacementToSong(EnabledMusicPlugin plugin, PluginSearchSong song) =>
       pluginData: song.rawData,
     );
 
-/// 单曲换源的候选列表（最多展示前 8 个），取消返回 null。
-Future<PluginSearchSong?> showReplacementPicker(
+/// 换源后同步「我的收藏」与所有包含该歌的歌单：旧音源条目原位替换
+/// 为新插件歌曲（保持顺序、快照与来源归属），无需用户再手动把新歌
+/// 重新加回列表。同步失败只忽略，不影响播放队列的换源结果。
+Future<void> syncReplacementToCollections(
+  WidgetRef ref, {
+  required String originalPath,
+  required EnabledMusicPlugin plugin,
+  required PluginSearchSong replacement,
+}) async {
+  final song = replacementToSong(plugin, replacement);
+  try {
+    if (ref.read(favoritesProvider).contains(originalPath)) {
+      await ref
+          .read(favoritesProvider.notifier)
+          .replacePath(originalPath, FavoriteSongSnapshot.fromSong(song));
+    }
+  } catch (_) {}
+  try {
+    for (final playlist in ref.read(playlistsProvider)) {
+      if (playlist.songPaths.contains(originalPath)) {
+        await ref
+            .read(playlistsProvider.notifier)
+            .replaceSong(playlist.id, originalPath, song);
+      }
+    }
+  } catch (_) {}
+}
+
+/// 单曲换源的一体化底部面板：顶部搜索框 + 音源 tab + 候选列表，
+/// 排版与「选择插件歌词」面板一致。打开即自动搜索，各音源结果独立
+/// 分组展示；点选候选返回 (插件, 歌曲)，取消返回 null。
+Future<(EnabledMusicPlugin, PluginSearchSong)?> showSourceSwitchSheet(
   BuildContext context,
-  WidgetRef ref,
-  EnabledMusicPlugin plugin, {
+  WidgetRef ref, {
   required String title,
   required String artist,
+  int durationMs = 0,
+  String? excludePluginId,
 }) {
-  return showDialog<PluginSearchSong>(
+  return showModalBottomSheet<(EnabledMusicPlugin, PluginSearchSong)>(
     context: context,
     useRootNavigator: true,
-    builder: (dialogContext) => _ReplacementPickerDialog(
-      plugin: plugin,
+    showDragHandle: true,
+    isScrollControlled: true,
+    builder: (_) => _SourceSwitchSheet(
       title: title,
       artist: artist,
+      durationMs: durationMs,
+      excludePluginId: excludePluginId,
     ),
   );
 }
 
-class _ReplacementPickerDialog extends ConsumerStatefulWidget {
-  const _ReplacementPickerDialog({
-    required this.plugin,
+class _SourceSwitchSheet extends ConsumerStatefulWidget {
+  const _SourceSwitchSheet({
     required this.title,
     required this.artist,
+    required this.durationMs,
+    this.excludePluginId,
   });
 
-  final EnabledMusicPlugin plugin;
   final String title;
   final String artist;
+  final int durationMs;
+  final String? excludePluginId;
 
   @override
-  ConsumerState<_ReplacementPickerDialog> createState() =>
-      _ReplacementPickerDialogState();
+  ConsumerState<_SourceSwitchSheet> createState() => _SourceSwitchSheetState();
 }
 
-class _ReplacementPickerDialogState
-    extends ConsumerState<_ReplacementPickerDialog> {
-  late Future<List<PluginSearchSong>> _future;
+class _SourceSwitchSheetState extends ConsumerState<_SourceSwitchSheet> {
+  late final TextEditingController _controller;
+  late final String _defaultQuery;
+  List<EnabledMusicPlugin> _plugins = const [];
+  final Map<String, List<PluginSearchSong>> _results = {};
+  final Set<String> _completed = {};
+  bool _loadingPlugins = true;
+  bool _searching = false;
+  bool _searched = false;
+  // 搜索防污染：新一轮搜索开始时递增，旧请求的结果直接丢弃。
+  int _requestId = 0;
 
   @override
   void initState() {
     super.initState();
-    _future = searchReplacementCandidates(
-      ref,
-      widget.plugin,
-      title: widget.title,
-      artist: widget.artist,
-    );
+    _defaultQuery = widget.artist.trim().isEmpty
+        ? widget.title.trim()
+        : '${widget.title.trim()} ${widget.artist.trim()}';
+    _controller = TextEditingController(text: _defaultQuery)
+      ..selection = TextSelection.collapsed(offset: _defaultQuery.length);
+    WidgetsBinding.instance.addPostFrameCallback((_) => _initialize());
+  }
+
+  @override
+  void dispose() {
+    _requestId++;
+    _controller.dispose();
+    super.dispose();
+  }
+
+  Future<void> _initialize() async {
+    try {
+      final plugins = await ref.read(enabledMusicPluginsProvider.future);
+      if (!mounted) return;
+      setState(() {
+        _plugins = [
+          for (final plugin in plugins)
+            if (plugin.id != widget.excludePluginId) plugin,
+        ];
+        _loadingPlugins = false;
+      });
+    } catch (_) {
+      if (!mounted) return;
+      setState(() => _loadingPlugins = false);
+    }
+    await _search();
+  }
+
+  Future<void> _search() async {
+    final query = _controller.text.trim();
+    if (query.isEmpty || _searching) return;
+    final requestId = ++_requestId;
+    setState(() {
+      _searching = true;
+      _searched = true;
+      _results.clear();
+      _completed.clear();
+    });
+    final plugins = _plugins;
+    if (plugins.isEmpty) {
+      if (mounted) setState(() => _searching = false);
+      return;
+    }
+    // 各音源并行搜索，逐个完成后立即展示，无需等全部结束。
+    await Future.wait([
+      for (final plugin in plugins) _searchPlugin(requestId, plugin, query),
+    ]);
+    if (mounted && requestId == _requestId) {
+      setState(() => _searching = false);
+    }
+  }
+
+  Future<void> _searchPlugin(
+    int requestId,
+    EnabledMusicPlugin plugin,
+    String query,
+  ) async {
+    List<PluginSearchSong> songs = const [];
+    try {
+      songs = await searchReplacementCandidatesWithKeyword(
+        ref,
+        plugin,
+        keyword: query,
+        title: widget.title,
+        artist: widget.artist,
+        durationMs: widget.durationMs,
+        // 自定义关键词时不按原曲信息过滤，保留插件原始排序。
+        scoreFilter: query == _defaultQuery,
+      );
+    } catch (_) {
+      songs = const [];
+    }
+    if (!mounted || requestId != _requestId) return;
+    setState(() {
+      _results[plugin.id] = songs;
+      _completed.add(plugin.id);
+    });
+  }
+
+  String _formatDuration(int durationMs) {
+    if (durationMs <= 0) return '';
+    final seconds = durationMs ~/ 1000;
+    return '${seconds ~/ 60}:${(seconds % 60).toString().padLeft(2, '0')}';
   }
 
   @override
   Widget build(BuildContext context) {
-    return AlertDialog(
-      title: Text('换源：${widget.title}'),
-      content: SizedBox(
-        width: 400,
-        child: FutureBuilder<List<PluginSearchSong>>(
-          future: _future,
-          builder: (context, snapshot) {
-            if (snapshot.connectionState != ConnectionState.done) {
-              return const SizedBox(
-                height: 160,
-                child: Center(child: CircularProgressIndicator()),
-              );
-            }
-            if (snapshot.hasError) {
-              return SizedBox(
-                height: 120,
-                child: Center(
-                  child: Text(
-                    '搜索失败：${snapshot.error.toString().replaceFirst('Exception: ', '')}',
-                    textAlign: TextAlign.center,
-                  ),
-                ),
-              );
-            }
-            final songs = (snapshot.data ?? const <PluginSearchSong>[])
-                .take(8)
-                .toList();
-            if (songs.isEmpty) {
-              return const SizedBox(
-                height: 120,
-                child: Center(child: Text('没有找到匹配的歌曲')),
-              );
-            }
-            return SingleChildScrollView(
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  for (final song in songs)
-                    ListTile(
-                      dense: true,
-                      contentPadding: EdgeInsets.zero,
-                      title: Text(
-                        song.title,
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
+    final viewInsets = MediaQuery.viewInsetsOf(context);
+    final availableHeight =
+        MediaQuery.sizeOf(context).height - viewInsets.bottom;
+    return AnimatedPadding(
+      duration: const Duration(milliseconds: 180),
+      curve: Curves.easeOutCubic,
+      padding: EdgeInsets.only(bottom: viewInsets.bottom),
+      child: SafeArea(
+        top: false,
+        child: SizedBox(
+          height: math.min(availableHeight * .82, 720),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Padding(
+                padding: const EdgeInsets.fromLTRB(20, 0, 20, 12),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Text(
+                      '歌曲换源',
+                      style: TextStyle(
+                        fontSize: 18,
+                        fontWeight: FontWeight.w700,
                       ),
-                      subtitle: Text(
-                        song.artist,
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                      ),
-                      trailing: Text(
-                        song.durationMs > 0
-                            ? '${(song.durationMs / 1000).round() ~/ 60}:'
-                                '${((song.durationMs / 1000).round() % 60).toString().padLeft(2, '0')}'
-                            : '',
-                      ),
-                      onTap: () => Navigator.pop(context, song),
                     ),
-                ],
+                    const SizedBox(height: 4),
+                    Text(
+                      '${widget.title} · ${widget.artist}',
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        fontSize: 12,
+                        color: Theme.of(context).colorScheme.onSurfaceVariant,
+                      ),
+                    ),
+                  ],
+                ),
               ),
-            );
-          },
+              Padding(
+                padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+                child: Row(
+                  children: [
+                    Expanded(
+                      child: TextField(
+                        controller: _controller,
+                        enabled: !_searching,
+                        textInputAction: TextInputAction.search,
+                        onSubmitted: (_) => _search(),
+                        decoration: const InputDecoration(
+                          hintText: '输入歌名、歌手或其他搜索内容',
+                          prefixIcon: Icon(Icons.search_rounded),
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 10),
+                    FilledButton(
+                      onPressed:
+                          _searching || _controller.text.trim().isEmpty
+                          ? null
+                          : _search,
+                      child: _searching
+                          ? const SizedBox.square(
+                              dimension: 18,
+                              child: CircularProgressIndicator(strokeWidth: 2),
+                            )
+                          : const Text('搜索'),
+                    ),
+                  ],
+                ),
+              ),
+              Padding(
+                padding: const EdgeInsets.fromLTRB(20, 0, 20, 10),
+                child: Row(
+                  children: [
+                    Expanded(
+                      child: Text(
+                        '各音源结果独立展示，点击候选歌曲即可换源。',
+                        style: TextStyle(
+                          fontSize: 11,
+                          color: Theme.of(context).colorScheme.onSurfaceVariant,
+                        ),
+                      ),
+                    ),
+                    if (_searching && _plugins.isNotEmpty)
+                      Text(
+                        '${_completed.length}/${_plugins.length} 个音源',
+                        style: TextStyle(
+                          fontSize: 11,
+                          color: Theme.of(context).colorScheme.primary,
+                        ),
+                      )
+                    else if (_searched && _plugins.isNotEmpty)
+                      Text(
+                        '共 ${_results.values.fold<int>(0, (sum, list) => sum + list.length)} 个候选',
+                        style: TextStyle(
+                          fontSize: 11,
+                          color: Theme.of(context).colorScheme.onSurfaceVariant,
+                        ),
+                      ),
+                  ],
+                ),
+              ),
+              const Divider(height: 1),
+              Expanded(child: _buildResults(context)),
+            ],
+          ),
         ),
       ),
-      actions: [
-        TextButton(
-          onPressed: () => Navigator.pop(context),
-          child: const Text('取消'),
+    );
+  }
+
+  Widget _buildResults(BuildContext context) {
+    if (_loadingPlugins) {
+      return const Center(child: CircularProgressIndicator());
+    }
+    if (_plugins.isEmpty) {
+      return const Center(child: Text('没有其他可用的插件，请先在 设置 → 插件 中启用'));
+    }
+    return Column(
+      children: [
+        if (_searching)
+          LinearProgressIndicator(
+            minHeight: 2,
+            value: _completed.length / _plugins.length,
+          ),
+        Expanded(
+          child: DefaultTabController(
+            length: _plugins.length,
+            child: Column(
+              children: [
+                Material(
+                  color: Colors.transparent,
+                  child: TabBar(
+                    isScrollable: true,
+                    tabAlignment: TabAlignment.start,
+                    tabs: [
+                      for (final plugin in _plugins)
+                        Tab(
+                          text: _completed.contains(plugin.id)
+                              ? '${plugin.name} (${_results[plugin.id]!.length})'
+                              : plugin.name,
+                        ),
+                    ],
+                  ),
+                ),
+                Expanded(
+                  child: TabBarView(
+                    children: [
+                      for (final plugin in _plugins) _pluginList(context, plugin),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+          ),
         ),
       ],
+    );
+  }
+
+  Widget _pluginList(BuildContext context, EnabledMusicPlugin plugin) {
+    if (!_completed.contains(plugin.id)) {
+      return Center(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const CircularProgressIndicator(),
+            const SizedBox(height: 14),
+            Text('正在搜索 ${plugin.name}…'),
+          ],
+        ),
+      );
+    }
+    final songs = _results[plugin.id] ?? const <PluginSearchSong>[];
+    if (songs.isEmpty) {
+      return const Center(child: Text('该音源没有匹配的歌曲'));
+    }
+    return ListView.separated(
+      padding: const EdgeInsets.symmetric(vertical: 6),
+      itemCount: songs.length,
+      separatorBuilder: (_, _) => const Divider(height: 1, indent: 16),
+      itemBuilder: (context, index) {
+        final song = songs[index];
+        final artist = song.artist.trim().isEmpty ? '未知歌手' : song.artist;
+        final album = song.album.trim();
+        final duration = _formatDuration(song.durationMs);
+        return ListTile(
+          minTileHeight: 64,
+          title: Text(
+            song.title,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+          ),
+          subtitle: Text(
+            album.isEmpty ? artist : '$artist · $album',
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+          ),
+          trailing: Text(
+            duration.isEmpty ? '--:--' : duration,
+            style: TextStyle(
+              fontSize: 12,
+              color: Theme.of(context).colorScheme.onSurfaceVariant,
+            ),
+          ),
+          onTap: () => Navigator.pop(context, (plugin, song)),
+        );
+      },
     );
   }
 }

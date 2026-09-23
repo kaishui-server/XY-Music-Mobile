@@ -56,6 +56,7 @@ ThemeData buildXyTheme({
   required Brightness brightness,
   required Color accent,
   ColorScheme? dynamicColorScheme,
+  String? fontFamily,
 }) {
   final dark = brightness == Brightness.dark;
   final fallbackBackground = dark
@@ -112,6 +113,9 @@ ThemeData buildXyTheme({
   final base = ThemeData(
     brightness: brightness,
     colorScheme: scheme,
+    // 全局自定义字体：ThemeData 会把 family 应用到整个 textTheme，
+    // null 时保持系统默认。
+    fontFamily: fontFamily,
     // 由应用级 XyAppBackground 绘制纯色或用户自定义背景，页面 Scaffold
     // 保持透明后才能让背景图贯穿所有移动端页面。
     scaffoldBackgroundColor: Colors.transparent,

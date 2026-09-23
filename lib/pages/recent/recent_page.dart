@@ -23,6 +23,60 @@ class _RecentPageState extends ConsumerState<RecentPage> {
   final TextEditingController _searchController = TextEditingController();
   String _query = '';
 
+  /// 悬浮头部（搜索框 / 分段选择 + 歌曲数行）的测量 Key 与实测高度：
+  /// 头部悬浮于列表上方，列表内容滚动时从毛玻璃下方穿过被模糊（与
+  /// 列表浮动按钮组同款观感），列表顶部让出头部高度。
+  final GlobalKey _floatingHeaderKey = GlobalKey();
+  double _floatingHeaderExtent = 104;
+
+  /// 布局完成后用真实高度修正悬浮头部占位，字体缩放等场景自动适配。
+  void _measureFloatingHeader() {
+    if (!mounted) return;
+    final size = _floatingHeaderKey.currentContext?.size;
+    if (size == null || size.height <= 0) return;
+    if ((size.height - _floatingHeaderExtent).abs() > 0.5) {
+      setState(() => _floatingHeaderExtent = size.height);
+    }
+  }
+
+  /// 显示顺序冻结快照（歌曲 path 顺序）。每次切歌都会刷新播放时间，
+  /// 当前歌曲会跳到列表首位，导致显示顺序与播放队列（点歌时的快照）
+  /// 错位——连播的“下一首”看起来不按列表顺序。冻结本页停留期间的
+  /// 显示顺序，让连播顺序始终与列表一致；页面重新进入时重建快照。
+  List<String>? _frozenOrder;
+
+  /// 按冻结快照重排最近播放列表：快照中的歌保持原位，之后新播放的
+  /// 歌（不在快照中）插到最前，保持“最近在前”的语义。
+  List<RecentSongEntry> _stabilize(List<RecentSongEntry> entries) {
+    if (entries.isEmpty) return entries;
+    final frozen = _frozenOrder;
+    if (frozen == null) {
+      _frozenOrder = [for (final entry in entries) entry.song.path];
+      return entries;
+    }
+    final rank = <String, int>{
+      for (var i = 0; i < frozen.length; i++) frozen[i]: i,
+    };
+    final known = <RecentSongEntry>[];
+    final fresh = <RecentSongEntry>[];
+    for (final entry in entries) {
+      if (rank.containsKey(entry.song.path)) {
+        known.add(entry);
+      } else {
+        fresh.add(entry);
+      }
+    }
+    if (known.isEmpty) {
+      // 快照全部失效（如清空后重新积累），以最新顺序重建快照。
+      _frozenOrder = [for (final entry in entries) entry.song.path];
+      return entries;
+    }
+    known.sort(
+      (a, b) => rank[a.song.path]!.compareTo(rank[b.song.path]!),
+    );
+    return [...fresh, ...known];
+  }
+
   @override
   void dispose() {
     _searchController.dispose();
@@ -59,7 +113,8 @@ class _RecentPageState extends ConsumerState<RecentPage> {
       ),
     );
     final keyword = _query.toLowerCase();
-    final entries = recent.valueOrNull ?? const <RecentSongEntry>[];
+    // 冻结显示顺序，保证连播顺序与列表一致（见 _stabilize 注释）。
+    final entries = _stabilize(recent.valueOrNull ?? const <RecentSongEntry>[]);
     final filteredEntries = keyword.isEmpty
         ? entries
         : entries
@@ -70,20 +125,18 @@ class _RecentPageState extends ConsumerState<RecentPage> {
                     entry.song.album.toLowerCase().contains(keyword),
               )
               .toList();
+    // 布局完成后修正悬浮头部占位高度。
+    WidgetsBinding.instance.addPostFrameCallback(
+      (_) => _measureFloatingHeader(),
+    );
+    // 显示内容为列表时（非空态/加载态），列表顶部让出悬浮头部高度。
+    final listShown =
+        entries.isNotEmpty && !(_searching && filteredEntries.isEmpty);
     return Scaffold(
       appBar: AppBar(
         automaticallyImplyLeading: !sidebarOnRight,
         leading: sidebarOnRight ? null : const AppSidebarMenuButton(),
-        title: _searching
-            ? FrostedSearchField(
-                controller: _searchController,
-                autofocus: true,
-                hintText: '搜索最近播放',
-                onChanged: (value) => setState(() => _query = value.trim()),
-                showClearSuffix: true,
-                padding: EdgeInsets.zero,
-              )
-            : const Text('最近播放'),
+        title: const Text('最近播放'),
         actions: [
           if (sidebarOnRight) const AppSidebarMenuButton(),
           IconButton(
@@ -106,47 +159,107 @@ class _RecentPageState extends ConsumerState<RecentPage> {
           ),
         ],
       ),
-      body: Column(
+      // 搜索框（或分段选择 + 歌曲数行）悬浮于列表上方：列表内容滚动时
+      // 从毛玻璃下方穿过被模糊，与列表浮动按钮组观感一致。
+      body: Stack(
         children: [
-          if (!_searching)
-            Padding(
-              padding: const EdgeInsets.fromLTRB(16, 4, 16, 12),
-              child: SizedBox(
-                width: double.infinity,
-                child: SegmentedButton<int>(
-                  segments: const [
-                    ButtonSegment(
-                      value: 0,
-                      icon: Icon(Icons.music_note, size: 18),
-                      label: Text('歌曲'),
-                    ),
-                    ButtonSegment(
-                      value: 1,
-                      icon: Icon(Icons.album_outlined, size: 18),
-                      label: Text('专辑'),
-                    ),
-                  ],
-                  selected: {_segment},
-                  onSelectionChanged: (value) =>
-                      setState(() => _segment = value.first),
-                  showSelectedIcon: false,
+          Positioned.fill(
+            child: Padding(
+              padding: EdgeInsets.only(top: listShown ? _floatingHeaderExtent : 0),
+              child: recent.when(
+                // 切歌会写入播放历史并刷新本 provider；reload 期间保留
+                // 旧列表继续显示（只隐藏 loading），避免每次切歌列表
+                // 整块闪成加载态再恢复（车机上表现为整屏暗一下再亮）。
+                skipLoadingOnReload: true,
+                loading: () => const Center(child: CircularProgressIndicator()),
+                error: (error, _) => _RecentError(
+                  error: '$error',
+                  onRetry: () => ref.invalidate(recentSongsProvider),
                 ),
+                data: (allEntries) => allEntries.isEmpty
+                    ? const _RecentEmpty()
+                    : _searching && filteredEntries.isEmpty
+                    ? const _RecentSearchEmpty()
+                    : _segment == 0
+                    ? _RecentSongs(entries: filteredEntries)
+                    : _RecentAlbums(entries: filteredEntries),
               ),
             ),
-          Expanded(
-            child: recent.when(
-              loading: () => const Center(child: CircularProgressIndicator()),
-              error: (error, _) => _RecentError(
-                error: '$error',
-                onRetry: () => ref.invalidate(recentSongsProvider),
+          ),
+          Positioned(
+            top: 0,
+            left: 0,
+            right: 0,
+            child: KeyedSubtree(
+              key: _floatingHeaderKey,
+              child: Column(
+                children: [
+                  if (_searching)
+                    Padding(
+                      padding: const EdgeInsets.fromLTRB(16, 4, 16, 4),
+                      child: FrostedSearchField(
+                        controller: _searchController,
+                        autofocus: true,
+                        hintText: '搜索最近播放',
+                        onChanged: (value) =>
+                            setState(() => _query = value.trim()),
+                        showClearSuffix: true,
+                        padding: EdgeInsets.zero,
+                      ),
+                    )
+                  else
+                    Padding(
+                      padding: const EdgeInsets.fromLTRB(16, 4, 16, 12),
+                      child: SizedBox(
+                        width: double.infinity,
+                        child: SegmentedButton<int>(
+                          segments: const [
+                            ButtonSegment(
+                              value: 0,
+                              icon: Icon(Icons.music_note, size: 18),
+                              label: Text('歌曲'),
+                            ),
+                            ButtonSegment(
+                              value: 1,
+                              icon: Icon(Icons.album_outlined, size: 18),
+                              label: Text('专辑'),
+                            ),
+                          ],
+                          selected: {_segment},
+                          onSelectionChanged: (value) =>
+                              setState(() => _segment = value.first),
+                          showSelectedIcon: false,
+                        ),
+                      ),
+                    ),
+                  if (_segment == 0 && listShown)
+                    Padding(
+                      padding: const EdgeInsets.fromLTRB(16, 0, 16, 6),
+                      child: Row(
+                        children: [
+                          Text(
+                            '${filteredEntries.length} 首',
+                            style: TextStyle(
+                              color: Theme.of(
+                                context,
+                              ).colorScheme.onSurfaceVariant,
+                            ),
+                          ),
+                          const Spacer(),
+                          FilledButton.tonalIcon(
+                            onPressed: () => ref
+                                .read(libraryProvider.notifier)
+                                .playAll(
+                                  [for (final e in filteredEntries) e.song],
+                                ),
+                            icon: const Icon(Icons.play_arrow, size: 20),
+                            label: const Text('播放全部'),
+                          ),
+                        ],
+                      ),
+                    ),
+                ],
               ),
-              data: (allEntries) => allEntries.isEmpty
-                  ? const _RecentEmpty()
-                  : _searching && filteredEntries.isEmpty
-                  ? const _RecentSearchEmpty()
-                  : _segment == 0
-                  ? _RecentSongs(entries: filteredEntries)
-                  : _RecentAlbums(entries: filteredEntries),
             ),
           ),
         ],
@@ -163,56 +276,30 @@ class _RecentSongs extends ConsumerWidget {
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final songs = entries.map((entry) => entry.song).toList();
-    return Column(
-      children: [
-        Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 16),
-          child: Row(
-            children: [
-              Text(
-                '${songs.length} 首',
-                style: TextStyle(
-                  color: Theme.of(context).colorScheme.onSurfaceVariant,
-                ),
-              ),
-              const Spacer(),
-              FilledButton.tonalIcon(
-                onPressed: () =>
-                    ref.read(libraryProvider.notifier).playAll(songs),
-                icon: const Icon(Icons.play_arrow, size: 20),
-                label: const Text('播放全部'),
-              ),
-            ],
-          ),
-        ),
-        const SizedBox(height: 6),
-        Expanded(
-          child: SongsListView(
-            songs: songs,
-            // 悬浮元素遮挡高度已注入 MediaQuery.padding。
-            padding: EdgeInsets.fromLTRB(
-              10,
-              0,
-              10,
-              MediaQuery.paddingOf(context).bottom + 12,
-            ),
-            onPlay: (list, index) =>
-                ref.read(libraryProvider.notifier).playList(list, index),
-            removeActionLabel: '从最近播放删除',
-            onRemoveAction: (song) async {
-              await removeRecentSong(ref, song);
-              if (context.mounted) {
-                XyNotice.show(
-                  context,
-                  message: '已从最近播放删除',
-                  type: XyNoticeType.success,
-                  duration: const Duration(seconds: 1),
-                );
-              }
-            },
-          ),
-        ),
-      ],
+    // 歌曲数行已上移为页面悬浮头部的一部分，列表自身顶部 padding 为 0。
+    return SongsListView(
+      songs: songs,
+      // 悬浮元素遮挡高度已注入 MediaQuery.padding。
+      padding: EdgeInsets.fromLTRB(
+        10,
+        0,
+        10,
+        MediaQuery.paddingOf(context).bottom + 12,
+      ),
+      onPlay: (list, index) =>
+          ref.read(libraryProvider.notifier).playList(list, index),
+      removeActionLabel: '从最近播放删除',
+      onRemoveAction: (song) async {
+        await removeRecentSong(ref, song);
+        if (context.mounted) {
+          XyNotice.show(
+            context,
+            message: '已从最近播放删除',
+            type: XyNoticeType.success,
+            duration: const Duration(seconds: 1),
+          );
+        }
+      },
     );
   }
 }
@@ -232,7 +319,14 @@ class _RecentAlbums extends ConsumerWidget {
       groups.putIfAbsent(key, () => []).add(entry.song);
     }
     return GridView.builder(
-      padding: const EdgeInsets.fromLTRB(16, 4, 16, 90),
+      // Shell 注入的遮挡高度（底栏+迷你播放栏+安全区）动态读取，
+      // 避免固定 90 在底栏+播放栏同时显示时仍被遮挡。
+      padding: EdgeInsets.fromLTRB(
+        16,
+        4,
+        16,
+        MediaQuery.paddingOf(context).bottom + 12,
+      ),
       gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
         crossAxisCount: 2,
         mainAxisSpacing: 18,

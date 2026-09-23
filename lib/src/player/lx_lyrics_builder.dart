@@ -12,7 +12,7 @@ final _enhancedMarker = RegExp(r'<\d+:\d{2}(?:\.\d+)?>');
 final _kuwoTag = RegExp(r'^\[kuwo:\s*(\S+)\s*\]', caseSensitive: false);
 
 class _WordEntry {
-  const _WordEntry({
+  _WordEntry({
     required this.index,
     required this.endIndex,
     required this.startMs,
@@ -21,8 +21,11 @@ class _WordEntry {
 
   final int index;
   final int endIndex;
-  final int startMs;
-  final int endMs;
+
+  /// 逐字时间轴按 LX 官方 lrcTools 的 prevWord 规则允许向后收缩：
+  /// 当前词提前开始时缩短前词的结束时间。
+  int startMs;
+  int endMs;
 }
 
 int? _timestampMs(String value) {
@@ -59,7 +62,6 @@ List<_WordEntry> _entriesForLine({
   required int kuwoOffset2,
 }) {
   if (markers.isEmpty) return const [];
-  var previousStart = 0;
   final entries = <_WordEntry>[];
   for (final marker in markers) {
     final first = int.tryParse(marker.group(1) ?? '');
@@ -68,14 +70,30 @@ List<_WordEntry> _entriesForLine({
     int start;
     int end;
     if (kuwo && kuwoOffset > 0 && kuwoOffset2 > 0) {
-      start = ((first + second) / (kuwoOffset * 2)).floor().abs();
-      end = start + ((first - second) / (kuwoOffset2 * 2)).floor().abs();
+      // 与 LX 官方 kw/util.js lrcTools.getWordInfo 完全对齐：
+      // 词开始 = |a + b| / (tagValue/10 * 2)，时长 = |a - b| / (tagValue%10 * 2)。
+      // 绝对值要先于取整取，负数先 floor 再 abs 会得到方向相反的偏移。
+      // 实测（晴天等曲目）解出的时间是相对行首的偏移：每行首词 a=-b
+      // 解码为 0，各行词时长恰好衔接到下一行行首。之前漏加行首时间，
+      // 导致除首行（行时间为 0）外所有词都叠在歌曲开头——表现为
+      // “只有歌名逐字”。
+      start =
+          (lineStartMs ?? 0) + ((first + second).abs() / (kuwoOffset * 2)).floor();
+      end = start + ((first - second).abs() / (kuwoOffset2 * 2)).floor();
     } else {
       start = (lineStartMs ?? 0) + first;
       end = start + second;
     }
-    start = start < 0 ? 0 : start;
-    if (start < previousStart) start = previousStart;
+    if (start < 0) start = 0;
+    // 官方 prevWord 规则：当前词比前词结束更早开始时缩短前词，
+    // 而不是推迟当前词——推迟会把整行词的时间越推越晚。
+    if (entries.isNotEmpty && start < entries.last.endMs) {
+      final previous = entries.last;
+      previous.endMs = start;
+      if (previous.startMs > previous.endMs) {
+        previous.startMs = previous.endMs;
+      }
+    }
     end = end < start ? start : end;
     entries.add(
       _WordEntry(
@@ -85,7 +103,6 @@ List<_WordEntry> _entriesForLine({
         endMs: end,
       ),
     );
-    previousStart = start;
   }
   return entries;
 }

@@ -117,12 +117,13 @@ class GuessYouLikePanel extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final dark = theme.brightness == Brightness.dark;
     return XyPanel(
       padding: const EdgeInsets.fromLTRB(14, 8, 14, 16),
+      // 滚动感知玻璃：静止时模糊透出页面背景，滚动中自动降级纯色。
       blurSigma: 14,
-      color: Theme.of(context).colorScheme.surface.withValues(
-        alpha: Theme.of(context).brightness == Brightness.dark ? .30 : .42,
-      ),
+      color: theme.colorScheme.surface.withValues(alpha: dark ? .30 : .42),
       child: Column(
         children: [
           Row(
@@ -153,6 +154,8 @@ class _ExploreHotChartsSection extends ConsumerWidget {
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
+    final theme = Theme.of(context);
+    final dark = theme.brightness == Brightness.dark;
     return Padding(
       // 探索页最后一个区块：底部读取注入的悬浮元素遮挡高度。
       padding: EdgeInsets.fromLTRB(
@@ -164,9 +167,7 @@ class _ExploreHotChartsSection extends ConsumerWidget {
       child: XyPanel(
         padding: const EdgeInsets.fromLTRB(14, 8, 14, 14),
         blurSigma: 14,
-        color: Theme.of(context).colorScheme.surface.withValues(
-          alpha: Theme.of(context).brightness == Brightness.dark ? .30 : .42,
-        ),
+        color: theme.colorScheme.surface.withValues(alpha: dark ? .30 : .42),
         child: Column(
           children: [
             Row(

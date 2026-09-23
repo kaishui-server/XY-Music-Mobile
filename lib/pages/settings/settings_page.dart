@@ -8,13 +8,19 @@ import 'package:go_router/go_router.dart';
 import 'package:path/path.dart' as p;
 
 import '../../src/core/settings.dart';
+import '../../src/library/library_provider.dart';
 import '../../src/player/android_storage.dart';
 import '../../src/core/platform_capabilities.dart';
 import '../../src/core/db_path.dart';
+import '../../src/core/custom_font.dart';
 import '../../src/auth/auth_provider.dart';
+import '../../src/backup/backup_service.dart';
+import '../../src/favorites/favorites_provider.dart';
 import '../../src/navigation/sidebar_controller.dart';
 import '../../src/player/desktop_lyrics.dart';
+import '../../src/playlists/playlists_provider.dart';
 import '../../src/plugins/plugin_runtime.dart';
+import '../../src/recent/recent_provider.dart';
 import '../../src/ui/xy_surface.dart';
 import '../../src/widgets/color_picker_sheet.dart';
 import '../../src/widgets/frosted_search_field.dart';
@@ -31,6 +37,7 @@ enum SettingsSection {
   desktopLyrics,
   library,
   download,
+  backup,
   other,
   logsDebug,
   feedback,
@@ -67,7 +74,7 @@ const settingsSearchEntries = <SettingsSearchEntry>[
     path: ['外观'],
     route: '/settings/appearance',
     icon: Icons.palette_outlined,
-    keywords: '主题 模式 颜色 深色 浅色 背景 图片 模糊',
+    keywords: '主题 模式 颜色 深色 浅色 背景 图片 模糊 字体',
   ),
   SettingsSearchEntry(
     title: '播放',
@@ -126,11 +133,25 @@ const settingsSearchEntries = <SettingsSearchEntry>[
     keywords: '询问 不询问 下载弹窗',
   ),
   SettingsSearchEntry(
+    title: '备份与恢复',
+    path: ['备份与恢复'],
+    route: '/settings/backup',
+    icon: Icons.backup_outlined,
+    keywords: '备份 恢复 导出 导入 迁移 换机 歌单 收藏',
+  ),
+  SettingsSearchEntry(
     title: '其他',
     path: ['其他'],
     route: '/settings/other',
     icon: Icons.tune_rounded,
     keywords: '统计 关于 版本',
+  ),
+  SettingsSearchEntry(
+    title: '存储与缓存',
+    path: ['存储与缓存'],
+    route: '/settings/storage',
+    icon: Icons.cleaning_services_outlined,
+    keywords: '缓存 清理 空间 占用 封面 临时文件',
   ),
   SettingsSearchEntry(
     title: '账号与安全',
@@ -168,6 +189,13 @@ const settingsSearchEntries = <SettingsSearchEntry>[
     keywords: 'Material You 安卓12 系统颜色 壁纸取色',
   ),
   SettingsSearchEntry(
+    title: '自定义字体',
+    path: ['外观', '自定义字体'],
+    route: '/settings/appearance',
+    icon: Icons.font_download_outlined,
+    keywords: '字体 ttf otf 全局 文字 更换',
+  ),
+  SettingsSearchEntry(
     title: '播放详情页背景',
     path: ['外观', '播放详情页背景'],
     route: '/settings/appearance',
@@ -180,6 +208,13 @@ const settingsSearchEntries = <SettingsSearchEntry>[
     route: '/settings/appearance',
     icon: Icons.album_outlined,
     keywords: '经典方形 圆形旋转 沉浸式 黑胶唱片 封面',
+  ),
+  SettingsSearchEntry(
+    title: '黑胶唱针',
+    path: ['外观', '播放页封面样式', '黑胶唱针'],
+    route: '/settings/appearance',
+    icon: Icons.graphic_eq_outlined,
+    keywords: '唱针 唱臂 黑胶唱片 开关',
   ),
   SettingsSearchEntry(
     title: '侧边栏位置',
@@ -400,6 +435,24 @@ class SettingsPage extends ConsumerStatefulWidget {
 class _SettingsPageState extends ConsumerState<SettingsPage> {
   final TextEditingController _searchController = TextEditingController();
   String _query = '';
+  bool _exportingBackup = false;
+  bool _importingBackup = false;
+
+  /// 悬浮头部（搜索框）的测量 Key 与实测高度：搜索框悬浮于设置列表
+  /// 上方，列表内容滚动时从毛玻璃下方穿过被模糊（与列表浮动按钮组
+  /// 同款观感），列表顶部让出头部高度。
+  final GlobalKey _floatingHeaderKey = GlobalKey();
+  double _floatingHeaderExtent = 70;
+
+  /// 布局完成后用真实高度修正悬浮头部占位，字体缩放等场景自动适配。
+  void _measureFloatingHeader() {
+    if (!mounted) return;
+    final size = _floatingHeaderKey.currentContext?.size;
+    if (size == null || size.height <= 0) return;
+    if ((size.height - _floatingHeaderExtent).abs() > 0.5) {
+      setState(() => _floatingHeaderExtent = size.height);
+    }
+  }
 
   SettingsSection get section => widget.section;
 
@@ -407,6 +460,134 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
   void dispose() {
     _searchController.dispose();
     super.dispose();
+  }
+
+  /// 导出全部本地数据（歌单、收藏、插件与用户变量、主题、设置）到
+  /// 用户选择的 JSON 文件。
+  Future<void> _exportBackup() async {
+    if (_exportingBackup) return;
+    setState(() => _exportingBackup = true);
+    try {
+      final path = await const BackupService().exportBackup();
+      if (!mounted || path == null) return;
+      XyNotice.show(context, message: '备份已导出');
+    } catch (error) {
+      if (mounted) {
+        XyNotice.show(
+          context,
+          message: '导出备份失败：$error',
+          type: XyNoticeType.error,
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _exportingBackup = false);
+    }
+  }
+
+  /// 选择备份文件 → 校验 → 用户确认 → 写入 prefs 与插件脚本。
+  Future<void> _importBackup() async {
+    if (_importingBackup) return;
+    final picked = await FilePicker.platform.pickFiles(
+      type: FileType.custom,
+      allowedExtensions: const ['json'],
+    );
+    if (!mounted || picked == null || picked.files.isEmpty) return;
+    final filePath = picked.files.single.path;
+    if (filePath == null) {
+      XyNotice.show(context, message: '无法读取所选文件', type: XyNoticeType.error);
+      return;
+    }
+    setState(() => _importingBackup = true);
+    try {
+      final service = const BackupService();
+      final data = await service.readBackup(filePath);
+      if (!mounted) return;
+      final exportedAt = data.exportedAt.isNotEmpty
+          ? data.exportedAt.replaceFirst('T', ' ').split('.').first
+          : '未知时间';
+      final libraryInfo = data.librarySongCount > 0
+          ? '与 ${data.librarySongCount} 首本地曲库'
+          : '';
+      final appearanceInfo = data.appearance.isEmpty
+          ? ''
+          : '、外观自定义文件（壁纸/字体）';
+      final confirmed = await showDialog<bool>(
+        context: context,
+        builder: (dialogContext) => AlertDialog(
+          title: const Text('导入备份？'),
+          content: Text(
+            '备份导出于 $exportedAt，包含 '
+            '${data.prefCount} 项数据、${data.pluginCount} 个插件'
+            '$libraryInfo$appearanceInfo。\n\n'
+            '导入将覆盖当前同名的歌单、收藏、插件、本地曲库与设置，'
+            '建议先停止播放后继续。',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(dialogContext, false),
+              child: const Text('取消'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(dialogContext, true),
+              child: const Text('导入'),
+            ),
+          ],
+        ),
+      );
+      if (!mounted || confirmed != true) return;
+      await service.applyBackup(data);
+      // 备份可能带回自定义字体文件（v3 起）：立即注册让字体无需重启
+      // 即可生效（文件缺失或损坏时 loadCustomFont 静默返回 false）。
+      if (data.appearance.font != null) {
+        await loadCustomFont(await customFontFilePath());
+      }
+      // 设置/主题在 provider 重建后立即生效；曲库表已整体写回 SQLite，
+      // invalidate 后曲库页即时刷新；歌单、收藏、最近播放与插件列表原先
+      // 由各 provider 在内存中持有快照且仅在启动时加载一次，导入后必须
+      // 一并 invalidate 重建，否则「我的收藏」等页面会继续显示旧的
+      // （空的）内存状态。
+      ref.invalidate(settingsProvider);
+      ref.invalidate(favoritesProvider);
+      ref.invalidate(playlistsProvider);
+      ref.invalidate(recentSongsProvider);
+      ref.invalidate(enabledMusicPluginsProvider);
+      if (data.librarySongCount > 0) ref.invalidate(libraryProvider);
+      if (!mounted) return;
+      await showDialog<void>(
+        context: context,
+        builder: (dialogContext) => AlertDialog(
+          title: const Text('导入完成'),
+          content: const Text(
+            '设置与主题已生效；本地曲库已恢复；'
+            '歌单与收藏已恢复。',
+          ),
+          actions: [
+            FilledButton(
+              onPressed: () => Navigator.pop(dialogContext),
+              child: const Text('知道了'),
+            ),
+          ],
+        ),
+      );
+    } on BackupException catch (error) {
+      if (mounted) {
+        XyNotice.show(
+          context,
+          message: error.message,
+          type: XyNoticeType.error,
+        );
+      }
+    } catch (error) {
+      if (mounted) {
+        XyNotice.show(
+          context,
+          message: '导入备份失败：$error',
+          type: XyNoticeType.error,
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _importingBackup = false);
+    }
   }
 
   @override
@@ -466,6 +647,20 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
           title: '下载',
           subtitle: '保存位置、音质与歌词',
           route: '/settings/download',
+        ),
+        _categoryTile(
+          context,
+          icon: Icons.backup_outlined,
+          title: '备份与恢复',
+          subtitle: '导出或导入歌单、收藏、本地曲库、插件与设置',
+          route: '/settings/backup',
+        ),
+        _categoryTile(
+          context,
+          icon: Icons.cleaning_services_outlined,
+          title: '存储与缓存',
+          subtitle: '查看并清理封面、播放缓存与临时文件',
+          route: '/settings/storage',
         ),
         _categoryTile(
           context,
@@ -553,6 +748,15 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
         ),
         _tile(
           context,
+          icon: Icons.font_download_outlined,
+          title: '自定义字体',
+          trailing: Text(
+            settings?.fontFamily.trim().isNotEmpty == true ? '已启用' : '默认',
+          ),
+          onTap: () => _editCustomFont(context, ref),
+        ),
+        _tile(
+          context,
           icon: Icons.wallpaper_outlined,
           title: '自定义壁纸',
           trailing: Text(
@@ -570,10 +774,14 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
             child: DropdownButton<PlayerDetailBackgroundMode>(
               value:
                   settings?.playerDetailBackgroundMode ??
-                  PlayerDetailBackgroundMode.coverBlur,
+                  PlayerDetailBackgroundMode.flowingLight,
               isDense: true,
               alignment: AlignmentDirectional.centerEnd,
+              // 封面模糊选项已移除，仅展示其余背景模式。
               items: PlayerDetailBackgroundMode.values
+                  .where(
+                    (mode) => mode != PlayerDetailBackgroundMode.coverBlur,
+                  )
                   .map(
                     (mode) => DropdownMenuItem<PlayerDetailBackgroundMode>(
                       value: mode,
@@ -629,6 +837,17 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
             ),
           ),
         ),
+        if (settings?.playerCoverStyle == PlayerCoverStyle.vinyl)
+          _switchTile(
+            context,
+            icon: Icons.graphic_eq_outlined,
+            title: '黑胶唱针',
+            subtitle: '在黑胶唱片封面右上角显示经典款唱针',
+            value: settings?.vinylTonearm ?? true,
+            onChanged: (value) => unawaited(
+              ref.read(settingsProvider.notifier).setVinylTonearm(value),
+            ),
+          ),
       ],
       SettingsSection.layout => [
         Padding(
@@ -719,6 +938,14 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
           icon: Icons.volume_up,
           title: '音量',
           trailing: _volumeSlider(settings, notifier),
+        ),
+        _switchTile(
+          context,
+          icon: Icons.volume_up_rounded,
+          title: '音量键调节应用内音量',
+          subtitle: '应用前台时音量键只调本应用音量，不影响系统媒体音量',
+          value: settings?.volumeKeyControlsAppVolume ?? true,
+          onChanged: (v) => notifier.setVolumeKeyControlsAppVolume(v),
         ),
         _tile(
           context,
@@ -1080,6 +1307,30 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
           onChanged: (v) => notifier.setDownloadWriteMetadata(v),
         ),
       ],
+      SettingsSection.backup => [
+        ListTile(
+          leading: const Icon(Icons.info_outline_rounded),
+          title: const Text('备份内容'),
+          subtitle: const Text(
+            '歌单、收藏、本地曲库（扫描文件夹与歌曲信息）、'
+            '插件与用户变量、主题、全部设置与歌词关联',
+          ),
+        ),
+        _tile(
+          context,
+          icon: Icons.file_upload_outlined,
+          title: _exportingBackup ? '正在导出…' : '导出备份',
+          trailing: const Text(''),
+          onTap: _exportingBackup ? null : _exportBackup,
+        ),
+        _tile(
+          context,
+          icon: Icons.file_download_outlined,
+          title: _importingBackup ? '正在导入…' : '导入备份',
+          trailing: const Text(''),
+          onTap: _importingBackup ? null : _importBackup,
+        ),
+      ],
       SettingsSection.other => [
         _tile(
           context,
@@ -1092,7 +1343,11 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
           context,
           icon: Icons.info_outline,
           title: '关于 XY Music',
-          trailing: const Text('1.3.1'),
+          // 原生通道读取实际版本（构建时来自 pubspec.yaml），避免
+          // 硬编码版本号随版本升级过期。
+          trailing: Text(
+            ref.watch(appVersionProvider).valueOrNull ?? '',
+          ),
           onTap: () => context.push('/settings/about'),
         ),
         _categoryTile(
@@ -1122,6 +1377,10 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
       SettingsSection.feedback => const [],
     };
 
+    // 布局完成后修正悬浮头部占位高度。
+    WidgetsBinding.instance.addPostFrameCallback(
+      (_) => _measureFloatingHeader(),
+    );
     return Scaffold(
       appBar: AppBar(
         automaticallyImplyLeading:
@@ -1139,32 +1398,56 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
             const AppSidebarMenuButton(),
         ],
       ),
-      body: ListView(
-        padding: EdgeInsets.only(
-          top: section == SettingsSection.root ? 8 : 4,
-          // 消费 Shell 注入的悬浮底栏/播放栏高度（padding.bottom），
-          // 否则布局页等底部的设置项会被自定义底栏盖住。
-          bottom: 24 + MediaQuery.paddingOf(context).bottom,
-        ),
+      // 搜索框悬浮于设置列表上方：列表内容滚动时从毛玻璃下方穿过被
+      // 模糊，与列表浮动按钮组观感一致。
+      body: Stack(
         children: [
-          if (section == SettingsSection.root) ...[
-            Padding(
-              padding: const EdgeInsets.fromLTRB(16, 0, 16, 10),
-              child: FrostedSearchField(
-                controller: _searchController,
-                hintText: '搜索设置',
-                onChanged: (value) => setState(() => _query = value.trim()),
-                showClearSuffix: true,
-                onCleared: () {
-                  _searchController.clear();
-                  setState(() => _query = '');
-                },
-                padding: EdgeInsets.zero,
+          Positioned.fill(
+            child: Padding(
+              padding: EdgeInsets.only(
+                top: section == SettingsSection.root
+                    ? _floatingHeaderExtent
+                    : 0,
+              ),
+              child: ListView(
+                padding: EdgeInsets.only(
+                  // 消费 Shell 注入的悬浮底栏/播放栏高度（padding.bottom），
+                  // 否则布局页等底部的设置项会被自定义底栏盖住。
+                  bottom: 24 + MediaQuery.paddingOf(context).bottom,
+                ),
+                children: [
+                  if (section == SettingsSection.root &&
+                      _query.isNotEmpty)
+                    ..._searchResultTiles(context),
+                  if (section != SettingsSection.root || _query.isEmpty)
+                    ...children,
+                ],
               ),
             ),
-            if (_query.isNotEmpty) ..._searchResultTiles(context),
-          ],
-          if (section != SettingsSection.root || _query.isEmpty) ...children,
+          ),
+          if (section == SettingsSection.root)
+            Positioned(
+              top: 0,
+              left: 0,
+              right: 0,
+              child: KeyedSubtree(
+                key: _floatingHeaderKey,
+                child: Padding(
+                  padding: const EdgeInsets.fromLTRB(16, 8, 16, 10),
+                  child: FrostedSearchField(
+                    controller: _searchController,
+                    hintText: '搜索设置',
+                    onChanged: (value) => setState(() => _query = value.trim()),
+                    showClearSuffix: true,
+                    onCleared: () {
+                      _searchController.clear();
+                      setState(() => _query = '');
+                    },
+                    padding: EdgeInsets.zero,
+                  ),
+                ),
+              ),
+            ),
         ],
       ),
     );
@@ -1254,6 +1537,7 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
     SettingsSection.desktopLyrics => '桌面歌词',
     SettingsSection.library => '音乐库',
     SettingsSection.download => '下载',
+    SettingsSection.backup => '备份与恢复',
     SettingsSection.other => '其他',
     SettingsSection.logsDebug => '日志与调试',
     SettingsSection.feedback => '问题反馈',
@@ -1388,8 +1672,8 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
         LyricDisplayAlignment.right => '靠右',
       };
 
-  /// 歌词字号调整弹窗：滑杆 + 歌词预览，与播放详情页更多菜单中的
-  /// “歌词字号”共用同一份设置，实时生效；歌词与迷你歌词同步调整。
+  /// 歌词字号调整弹窗：双滑杆 + 歌词预览，与播放详情页更多菜单中的
+  /// “歌词字号”共用同一份设置，实时生效；主歌词与迷你歌词字号独立调整。
   Future<void> _showLyricFontSizeSheet(BuildContext context, WidgetRef ref) {
     return showModalBottomSheet<void>(
       context: context,
@@ -1400,11 +1684,12 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
       isScrollControlled: true,
       builder: (_) => _SettingsLyricFontSizeSheet(
         initial: ref.read(settingsProvider).valueOrNull?.lyricFontSize ?? 22.0,
-        onChanged: (value) {
-          final notifier = ref.read(settingsProvider.notifier);
-          notifier.setLyricFontSize(value);
-          notifier.setMiniLyricFontSize(value);
-        },
+        initialMini:
+            ref.read(settingsProvider).valueOrNull?.miniLyricFontSize ?? 14.0,
+        onChanged: (value) =>
+            ref.read(settingsProvider.notifier).setLyricFontSize(value),
+        onMiniChanged: (value) =>
+            ref.read(settingsProvider.notifier).setMiniLyricFontSize(value),
       ),
     );
   }
@@ -2161,6 +2446,167 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
     await notifier.setCustomBackgroundBlur(result.blur);
   }
 
+  /// 自定义字体面板：选择 .ttf/.otf 立即应用到全局，或恢复系统默认。
+  Future<void> _editCustomFont(BuildContext context, WidgetRef ref) async {
+    var enabled =
+        ref.read(settingsProvider).valueOrNull?.fontFamily.trim().isNotEmpty ==
+        true;
+    await showModalBottomSheet<void>(
+      context: context,
+      useRootNavigator: true,
+      showDragHandle: true,
+      builder: (sheetContext) => StatefulBuilder(
+        builder: (context, setSheetState) {
+          Future<void> pickFont() async {
+            final picked = await FilePicker.platform.pickFiles(
+              type: FileType.custom,
+              allowedExtensions: const ['ttf', 'otf'],
+              withData: true,
+              // 字体文件不能被压缩/转码，禁用插件压缩避免拿到损坏数据。
+              compressionQuality: 0,
+            );
+            if (picked == null || picked.files.isEmpty) return;
+            final file = picked.files.single;
+            final sourcePath = file.path;
+            final bytes = file.bytes;
+            final extension = p
+                .extension(sourcePath ?? file.name)
+                .toLowerCase();
+            if (!const ['.ttf', '.otf'].contains(extension)) {
+              if (context.mounted) {
+                ScaffoldMessenger.of(context).showSnackBar(
+                  const SnackBar(content: Text('仅支持 .ttf / .otf 字体文件')),
+                );
+              }
+              return;
+            }
+            if ((bytes == null || bytes.isEmpty) && sourcePath == null) {
+              if (context.mounted) {
+                ScaffoldMessenger.of(
+                  context,
+                ).showSnackBar(const SnackBar(content: Text('无法读取字体文件，请重新选择')));
+              }
+              return;
+            }
+            if ((bytes?.length ?? 0) > 100 * 1024 * 1024) {
+              if (context.mounted) {
+                ScaffoldMessenger.of(
+                  context,
+                ).showSnackBar(const SnackBar(content: Text('字体文件不能超过 100 MB')));
+              }
+              return;
+            }
+            try {
+              final target = File(await customFontFilePath());
+              await target.parent.create(recursive: true);
+              if (bytes != null && bytes.isNotEmpty) {
+                await target.writeAsBytes(bytes, flush: true);
+              } else {
+                await File(sourcePath!).copy(target.path);
+              }
+              final loaded = await loadCustomFont(target.path);
+              if (!loaded) {
+                try {
+                  await target.delete();
+                } catch (_) {}
+                if (context.mounted) {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(content: Text('字体文件解析失败，请换一个文件')),
+                  );
+                }
+                return;
+              }
+              await ref
+                  .read(settingsProvider.notifier)
+                  .setFontFamily(kCustomFontFamily);
+              if (context.mounted) {
+                setSheetState(() => enabled = true);
+                ScaffoldMessenger.of(
+                  context,
+                ).showSnackBar(const SnackBar(content: Text('已应用自定义字体')));
+              }
+            } catch (error) {
+              if (context.mounted) {
+                ScaffoldMessenger.of(
+                  context,
+                ).showSnackBar(SnackBar(content: Text('保存字体失败：$error')));
+              }
+            }
+          }
+
+          Future<void> resetFont() async {
+            await ref.read(settingsProvider.notifier).setFontFamily('');
+            try {
+              final target = File(await customFontFilePath());
+              if (await target.exists()) await target.delete();
+            } catch (_) {}
+            if (context.mounted) {
+              setSheetState(() => enabled = false);
+            }
+          }
+
+          return SafeArea(
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(16, 0, 16, 20),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text(
+                    '自定义字体',
+                    style: TextStyle(fontSize: 19, fontWeight: FontWeight.w700),
+                  ),
+                  const SizedBox(height: 6),
+                  Text(
+                    '字体仅保存在本机，不会上传到服务器。支持 .ttf / .otf，'
+                    '应用后全局界面文字都会切换。',
+                    style: TextStyle(
+                      color: Theme.of(context).colorScheme.onSurfaceVariant,
+                      fontSize: 12,
+                    ),
+                  ),
+                  const SizedBox(height: 14),
+                  Container(
+                    width: double.infinity,
+                    padding: const EdgeInsets.all(16),
+                    decoration: BoxDecoration(
+                      color: Theme.of(context).colorScheme.surfaceContainerHigh,
+                      borderRadius: BorderRadius.circular(16),
+                    ),
+                    child: Text(
+                      '预览：晴天 阴天 傍晚 车窗外\nABC abc 0123 哆来咪\n正在播放 · 自定义字体',
+                      style: TextStyle(
+                        fontFamily: enabled ? kCustomFontFamily : null,
+                        fontSize: 16,
+                        height: 1.6,
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 14),
+                  Row(
+                    children: [
+                      OutlinedButton.icon(
+                        onPressed: pickFont,
+                        icon: const Icon(Icons.upload_file_outlined),
+                        label: const Text('选择字体'),
+                      ),
+                      const Spacer(),
+                      if (enabled)
+                        TextButton(
+                          onPressed: resetFont,
+                          child: const Text('恢复默认'),
+                        ),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+          );
+        },
+      ),
+    );
+  }
+
   Future<void> _pickQuality(
     BuildContext context,
     WidgetRef ref,
@@ -2852,16 +3298,20 @@ class _Choice {
   const _Choice(this.label, this.value);
 }
 
-/// 歌词字号调整弹窗：滑杆 + 歌词预览。拖动即写入设置，
-/// 播放详情页歌词实时使用新字号渲染。
+/// 歌词字号调整弹窗：双滑杆（主歌词 + 迷你歌词）+ 歌词预览。拖动即写入
+/// 设置，播放详情页歌词实时使用新字号渲染；两类字号彼此独立。
 class _SettingsLyricFontSizeSheet extends StatefulWidget {
   const _SettingsLyricFontSizeSheet({
     required this.initial,
+    required this.initialMini,
     required this.onChanged,
+    required this.onMiniChanged,
   });
 
   final double initial;
+  final double initialMini;
   final ValueChanged<double> onChanged;
+  final ValueChanged<double> onMiniChanged;
 
   @override
   State<_SettingsLyricFontSizeSheet> createState() =>
@@ -2871,11 +3321,13 @@ class _SettingsLyricFontSizeSheet extends StatefulWidget {
 class _SettingsLyricFontSizeSheetState
     extends State<_SettingsLyricFontSizeSheet> {
   late double _value;
+  late double _miniValue;
 
   @override
   void initState() {
     super.initState();
     _value = widget.initial;
+    _miniValue = widget.initialMini;
   }
 
   @override
@@ -2912,6 +3364,34 @@ class _SettingsLyricFontSizeSheetState
             onChanged: (value) {
               setState(() => _value = value);
               widget.onChanged(value);
+            },
+          ),
+          const SizedBox(height: 8),
+          Row(
+            children: [
+              Icon(Icons.subtitles_outlined, color: scheme.primary),
+              const SizedBox(width: 12),
+              const Text('迷你歌词字号', style: TextStyle(fontSize: 16)),
+              const Spacer(),
+              Text(
+                _miniValue.toStringAsFixed(0),
+                style: TextStyle(
+                  fontSize: 15,
+                  fontWeight: FontWeight.w700,
+                  color: scheme.primary,
+                ),
+              ),
+            ],
+          ),
+          Slider(
+            value: _miniValue,
+            min: 10,
+            max: 24,
+            divisions: 14,
+            label: _miniValue.toStringAsFixed(0),
+            onChanged: (value) {
+              setState(() => _miniValue = value);
+              widget.onMiniChanged(value);
             },
           ),
           const SizedBox(height: 6),
@@ -2952,6 +3432,15 @@ class _SettingsLyricFontSizeSheetState
                   style: TextStyle(
                     fontSize: (_value - 5).clamp(10.0, 26.0),
                     color: scheme.onSurface.withValues(alpha: .4),
+                  ),
+                ),
+                const SizedBox(height: 5),
+                Text(
+                  '迷你歌词行',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(
+                    fontSize: _miniValue,
+                    color: scheme.onSurface.withValues(alpha: .5),
                   ),
                 ),
               ],

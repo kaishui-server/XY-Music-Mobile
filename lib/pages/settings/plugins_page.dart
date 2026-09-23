@@ -231,6 +231,35 @@ class _PluginsNotifier extends AsyncNotifier<List<_PluginInfo>> {
     return body;
   }
 
+  /// 订阅源索引单条插件下载：URL 与订阅源同主机但未带显式端口
+  /// （即默认 80）且下载失败时，改用订阅源端口重试一次。animemusic
+  /// 这类订阅源的 JSON 里插件 URL 指向 80 端口，服务实际运行在订阅
+  /// 源端口（如 19844）。返回脚本内容与最终生效的 URL（用于记录
+  /// 插件来源，保证后续更新可用）。
+  Future<(String, String)> _downloadIndexPlugin(
+    String pluginUrl,
+    Uri base,
+  ) async {
+    try {
+      return (await _downloadText(pluginUrl), pluginUrl);
+    } catch (firstError) {
+      final uri = Uri.tryParse(pluginUrl);
+      final sameHost =
+          uri != null && uri.host.isNotEmpty && uri.host == base.host;
+      final defaultPort =
+          uri == null || !uri.hasPort || uri.port == 80;
+      if (!sameHost || !defaultPort || !base.hasPort || base.port == 80) {
+        throw firstError;
+      }
+      final rewritten = uri.replace(port: base.port).toString();
+      try {
+        return (await _downloadText(rewritten), rewritten);
+      } catch (_) {
+        throw firstError;
+      }
+    }
+  }
+
   Future<bool> _persistScript(
     String script,
     String origin,
@@ -296,10 +325,13 @@ class _PluginsNotifier extends AsyncNotifier<List<_PluginInfo>> {
             if (rawUrl.isEmpty) continue;
             final pluginUrl = base.resolve(rawUrl).toString();
             try {
-              final script = await _downloadText(pluginUrl);
+              final (script, effectiveUrl) = await _downloadIndexPlugin(
+                pluginUrl,
+                base,
+              );
               await _persistScript(
                 script,
-                pluginUrl,
+                effectiveUrl,
                 summary,
                 displayName: item['name']?.toString(),
                 displayVersion: item['version']?.toString(),
@@ -333,12 +365,33 @@ class _PluginsNotifier extends AsyncNotifier<List<_PluginInfo>> {
     final result = await FilePicker.platform.pickFiles(
       type: FileType.custom,
       allowedExtensions: const ['js'],
+      // 支持一次选多个插件脚本批量导入。
+      allowMultiple: true,
       // Android 的 Storage Access Framework 对外部文件有时不会返回可直接
       // 读取的 path，只返回文件内容；同时请求 bytes 兼容这类文件选择结果。
       withData: true,
     );
-    final file = result?.files.single;
-    if (file == null) {
+    final files = result?.files ?? const <PlatformFile>[];
+    final summary = _MutableInstallSummary();
+    for (final file in files) {
+      try {
+        final path = file.path;
+        final script = file.bytes != null
+            ? utf8.decode(file.bytes!, allowMalformed: true)
+            : path != null
+            ? await File(path).readAsString()
+            : '';
+        if (script.isEmpty) {
+          throw Exception('无法读取所选插件文件，请重新选择');
+        }
+        // path 为空时使用文件名作为来源，保证插件 ID 仍能稳定生成。
+        await _persistScript(script, path ?? file.name, summary);
+      } catch (error) {
+        summary.failed++;
+        summary.errors.add('${file.name}：$error');
+      }
+    }
+    if (files.isEmpty) {
       return const _InstallSummary(
         installed: 0,
         skipped: 0,
@@ -346,23 +399,6 @@ class _PluginsNotifier extends AsyncNotifier<List<_PluginInfo>> {
         names: [],
         errors: [],
       );
-    }
-    final summary = _MutableInstallSummary();
-    try {
-      final path = file.path;
-      final script = file.bytes != null
-          ? utf8.decode(file.bytes!, allowMalformed: true)
-          : path != null
-          ? await File(path).readAsString()
-          : '';
-      if (script.isEmpty) {
-        throw Exception('无法读取所选插件文件，请重新选择');
-      }
-      // path 为空时使用文件名作为来源，保证插件 ID 仍能稳定生成。
-      await _persistScript(script, path ?? file.name, summary);
-    } catch (error) {
-      summary.failed++;
-      summary.errors.add(error.toString());
     }
     state = AsyncData(await _load());
     ref.invalidate(enabledMusicPluginsProvider);

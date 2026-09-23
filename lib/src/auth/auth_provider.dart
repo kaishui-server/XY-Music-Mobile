@@ -316,7 +316,7 @@ class AuthNotifier extends StateNotifier<AuthState> {
             ? model
             : '$manufacturer $model'.trim();
         return _ClientMetadata(
-          appVersion: info?['appVersion']?.toString().trim() ?? '1.3.1',
+          appVersion: info?['appVersion']?.toString().trim() ?? '2.2.0-beta5',
           osVersion: 'Android ${info?['osVersion'] ?? ''}'.trim(),
           deviceModel: deviceModel.isEmpty ? 'Android 手机' : deviceModel,
         );
@@ -325,7 +325,7 @@ class AuthNotifier extends StateNotifier<AuthState> {
       }
     }
     return _ClientMetadata(
-      appVersion: '1.3.1',
+      appVersion: '2.2.0-beta5',
       osVersion: defaultTargetPlatform.name,
       deviceModel: '${defaultTargetPlatform.name} 设备',
     );
@@ -858,4 +858,11 @@ class AuthNotifier extends StateNotifier<AuthState> {
 
 final authProvider = StateNotifierProvider<AuthNotifier, AuthState>(
   (ref) => AuthNotifier(ref),
+);
+
+/// 当前应用版本号（原生通道读取 BuildConfig.VERSION_NAME，构建时自动
+/// 来自 pubspec.yaml；通道不可用时回退内置常量）。设置页“关于”行与
+/// 关于页共用，避免硬编码版本号与实际版本不一致。
+final appVersionProvider = FutureProvider<String>(
+  (ref) => ref.read(authProvider.notifier).currentAppVersion(),
 );

@@ -43,6 +43,21 @@ class AndroidStorage {
     return _channel.invokeMethod<String>('pickDirectory');
   }
 
+  /// 检查本进程是否仍持有该 SAF 目录的持久化写授权。
+  /// 重装应用、恢复备份或系统回收都会让授权丢失，此时继续写入会触发
+  /// `MANAGE_DOCUMENTS` 权限拒绝，调用方应引导用户重新选择目录。
+  static Future<bool> hasDirectoryGrant(String directoryUri) async {
+    if (!Platform.isAndroid) return false;
+    try {
+      return await _channel.invokeMethod<bool>('hasDirectoryGrant', {
+            'directoryUri': directoryUri,
+          }) ==
+          true;
+    } catch (_) {
+      return false;
+    }
+  }
+
   static Future<String> copyFileToDirectory({
     required String directoryUri,
     required String sourcePath,

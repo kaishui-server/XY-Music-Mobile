@@ -6,6 +6,7 @@ import 'dart:math';
 import 'package:audio_service/audio_service.dart' as audio_service;
 import 'package:audio_session/audio_session.dart';
 import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter/widgets.dart';
 import 'package:just_audio/just_audio.dart';
@@ -143,6 +144,14 @@ const _playbackSourceAssociationsKey = 'playbackSourceAssociationsV1';
 const _rememberedLyricsKey = 'rememberedLyricsV1';
 const _rememberedLyricsAssociationKey = 'rememberedLyricsAssociationV1';
 const _rememberedLyricsOriginalKey = 'rememberedLyricsOriginalV1';
+
+/// 会话歌词格式版本：网络歌词的词级时间转换逻辑变更时递增。
+/// 恢复会话时若版本不匹配则丢弃旧版本缓存的网络歌词（lyricsRaw），
+/// 重新抓取——否则旧版本转换出的错位逐字时间会被永久复用
+/// （如 QQ QRC 绝对时间戳被当相对偏移，只有行时间为 0 的标题行逐字）。
+/// 用户手动关联的歌词按路径存在独立的记忆存储中，播放时会重新套用，
+/// 不受作废影响；本地文件歌词存的是原文，展示时每次都重新解析。
+const _sessionLyricsFormatVersion = 1;
 
 /// 识曲结果只有歌名、歌手等文本信息，回退到插件搜索时必须先做严格匹配，
 /// 避免仅因标题里有几个相同字符就播放成另一首歌。
@@ -583,6 +592,31 @@ class _MediaSessionBridge extends audio_service.CompositeAudioHandler {
   ValueStream<audio_service.PlaybackState> get playbackState =>
       _patchedPlaybackState;
 
+  /// 车机方向盘/蓝牙耳机的上一首/下一首按键走系统 KeyEvent → onClick
+  /// 路径（区别于通知栏按钮直接调 skipToNext）。默认实现最终在下游的
+  /// _PlayerAudioHandler 上就地解析虚方法 skipToNext，因单 URL 播放
+  /// 模型 hasNext 恒为 false 而变成 no-op，所以必须在桥接层显式拦截
+  /// 并路由到注入的切歌回调。
+  @override
+  Future<void> click([
+    audio_service.MediaButton button = audio_service.MediaButton.media,
+  ]) async {
+    if (button == audio_service.MediaButton.next) {
+      final callback = onSkipToNext;
+      if (callback != null) {
+        await callback();
+        return;
+      }
+    } else if (button == audio_service.MediaButton.previous) {
+      final callback = onSkipToPrevious;
+      if (callback != null) {
+        await callback();
+        return;
+      }
+    }
+    await super.click(button);
+  }
+
   @override
   // ignore: must_call_super
   Future<void> skipToNext() async {
@@ -625,8 +659,28 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
       // 否则“软件内不显示桌面歌词”时浮窗会一直停留在“暂无歌词”。
       _desktopLyricsHiddenSent = false;
       _requestDesktopLyricsSync(immediate: true);
+      // 均衡器（音效）：设置里开关/增益变化时实时应用到播放器。
+      // 记住上次已应用的值，避免无关设置项变化触发重复赋值。
+      final eqEnabled = next.valueOrNull?.equalizerEnabled ?? false;
+      final eqGains = next.valueOrNull?.equalizerGains ?? const <double>[];
+      final lastGains = _lastAppliedEqGains ?? const <double>[];
+      final gainsChanged =
+          eqGains.length != lastGains.length ||
+          () {
+            for (var i = 0; i < eqGains.length; i++) {
+              if ((eqGains[i] - lastGains[i]).abs() > 0.01) return true;
+            }
+            return false;
+          }();
+      if (eqEnabled != _lastAppliedEqEnabled || gainsChanged) {
+        _lastAppliedEqEnabled = eqEnabled;
+        _lastAppliedEqGains = eqGains;
+        unawaited(_applyEqualizer(eqEnabled, eqGains));
+      }
     });
     _init();
+    _installCarMediaButtonChannel();
+    _installVolumeKeyChannel();
     // just_audio_background 的内部 handler 要等首个 AudioPlayer 完成平台
     // 初始化才会挂到 SwitchAudioHandler 上，延迟安装 + 播放时兜底重试。
     Future<void>.delayed(const Duration(seconds: 1)).then((_) {
@@ -668,10 +722,125 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
     }
   }
 
+  /// 上一次车机/方向盘按键的触发时间（节流用）。
+  DateTime? _lastCarMediaButtonAt;
+
+  /// 车机/方向盘媒体按键兜底通道（见 MainActivity.dispatchKeyEvent）：
+  /// 部分车机 ROM 不把媒体键交给 MediaSession，而是直接注入前台
+  /// Activity。原生层拦截后经此通道转发到 Flutter，路由到播放控制。
+  /// 标准 Android 上活跃媒体会话优先消费这些按键（走上面的桥接），
+  /// 不会走到这里，因此不会重复触发。
+  void _installCarMediaButtonChannel() {
+    if (kIsWeb || defaultTargetPlatform != TargetPlatform.android) return;
+    const channel = MethodChannel('com.xymusic.mobile/media_buttons');
+    channel.setMethodCallHandler((call) async {
+      if (call.method != 'onMediaButton') return;
+      final action = call.arguments as String?;
+      if (action == null) return;
+      final now = DateTime.now();
+      final last = _lastCarMediaButtonAt;
+      // 200ms 节流：避免按键在 Activity 与媒体会话两条链路上重复触发，
+      // 或车机按键连发导致连续切歌。
+      if (last != null &&
+          now.difference(last) < const Duration(milliseconds: 200)) {
+        return;
+      }
+      _lastCarMediaButtonAt = now;
+      switch (action) {
+        case 'next':
+          await next();
+          break;
+        case 'previous':
+          await previous();
+          break;
+        case 'playPause':
+          await toggle();
+          break;
+        case 'play':
+          if (!state.isPlaying) await toggle();
+          break;
+        case 'pause':
+        case 'stop':
+          if (state.isPlaying) await toggle();
+          break;
+        case 'fastForward':
+          await seek(state.position + 10);
+          break;
+        case 'rewind':
+          await seek(max(0, state.position - 10));
+          break;
+      }
+    });
+  }
+
+  /// 上一次音量键事件的触发时间（长按连发节流用）。
+  DateTime? _lastVolumeKeyAt;
+
+  /// 音量键应用内音量通道（见 MainActivity.dispatchKeyEvent）：设置
+  /// “音量键调节应用内音量”开启时，原生层把前台的音量键转发到这里，
+  /// 只调本应用播放音量（0–1），不动系统媒体音量。长按音量键会连发
+  /// ACTION_DOWN，节流避免音量跳变过快。
+  void _installVolumeKeyChannel() {
+    if (kIsWeb || defaultTargetPlatform != TargetPlatform.android) return;
+    const channel = MethodChannel('com.xymusic.mobile/volume_keys');
+    channel.setMethodCallHandler((call) async {
+      if (call.method != 'onVolumeKey') return;
+      final direction = call.arguments as String?;
+      if (direction != 'up' && direction != 'down') return;
+      final now = DateTime.now();
+      final last = _lastVolumeKeyAt;
+      if (last != null &&
+          now.difference(last) < const Duration(milliseconds: 120)) {
+        return;
+      }
+      _lastVolumeKeyAt = now;
+      final current = _ref.read(volumeProvider);
+      final target =
+          (direction == 'up' ? current + .05 : current - .05).clamp(0.0, 1.0);
+      if ((target - current).abs() < .001) return;
+      await setAppVolume(target);
+      // 供应用根节点显示“应用音量 xx%”的 OSD 反馈。
+      _ref.read(volumeKeyOscProvider.notifier).state = target;
+    });
+  }
+
+  /// 设置应用内音量（音量键通道使用）：写设置并立即应用到播放器。
+  /// MV 视频桥接期间播放器音量为 0（画面自带伴音），此时只保存设置，
+  /// 桥接结束恢复音量时会应用新值。
+  Future<void> setAppVolume(double v) async {
+    final clamped = v.clamp(0.0, 1.0);
+    await _ref.read(settingsProvider.notifier).setVolume(clamped);
+    if (!_videoMediaBridgeActive) {
+      await _player.setVolume(clamped);
+    }
+  }
+
   final Ref _ref;
+
+  /// 暴露给音效面板的均衡器门面：面板读取频段参数（中心频率、
+  /// dB 范围、各频段当前增益）并直接调用 setBandGain/setEnabled，
+  /// 持久化走设置 provider，本类经设置监听自动同步。
+  XyAndroidEqualizer get androidEqualizer => xyAndroidEqualizer;
+
+  /// 把设置中的均衡器开关与频段增益应用到播放器。原生均衡器挂在
+  /// 真实平台播放器上（fork 注入），首次 load 前不可用——门面缓存
+  /// 状态并在每次 load 后自动重放，此处无需关心就绪时机。
+  Future<void> _applyEqualizer(bool enabled, List<double> gains) async {
+    if (kIsWeb || defaultTargetPlatform != TargetPlatform.android) return;
+    try {
+      await xyAndroidEqualizer.apply(enabled: enabled, gains: gains);
+    } catch (error) {
+      debugPrint('均衡器应用失败：$error');
+    }
+  }
+
   // 音频中断由本类按设置处理：开启“不中断”时忽略其他应用的音频焦点
   // 中断，避免 just_audio 默认行为直接暂停当前歌曲。
-  final AudioPlayer _player = AudioPlayer(handleInterruptions: false);
+  // 均衡器音效经 xyAndroidEqualizer 门面驱动真实平台播放器上的原生
+  // 均衡器（fork 注入）；不能挂入本播放器管线：经 just_audio_background
+  // 代理的激活发生在首次 load 前，Java 侧均衡器尚未随 audio session
+  // 创建，空指针会中断 setPlatform 使播放卡死。
+  late final AudioPlayer _player = AudioPlayer(handleInterruptions: false);
   final Random _rand = Random();
   StreamSubscription<Duration?>? _posSub;
   StreamSubscription<Duration?>? _durSub;
@@ -701,17 +870,36 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
   String? _lastVideoPath;
   bool _videoMediaBridgeActive = false;
   bool _syncingVideoMediaBridge = false;
+
+  /// MV 播放前歌曲自身的进度/时长（见 [enableVideoMediaBridge]）。
+  /// 桥接期间静音音频被 seek 到视频时间线，关闭视频时用这里记录的值
+  /// 把歌曲进度恢复到开启 MV 之前，MV 的播放进度不污染歌曲进度。
+  Duration? _songPositionBeforeVideo;
+  String? _songPositionBeforeVideoPath;
+  int? _songDurationBeforeVideoMs;
   bool _desktopLyricsSyncInFlight = false;
   bool _desktopLyricsSyncPending = false;
   bool _desktopLyricsHiddenSent = false;
   DateTime _lastDesktopLyricsSync = DateTime.fromMillisecondsSinceEpoch(0);
   bool? _expectedAudioPlayingFromVideo;
   DateTime _lastVideoMediaSeek = DateTime.fromMillisecondsSinceEpoch(0);
+  // 脏回跳过滤的解卡状态：连续被过滤事件的上一值与计数。
+  int _staleStreakPrevMs = -1;
+  int _staleStreakCount = 0;
+  // 已应用到均衡器的上次值：用于设置监听去重。
+  bool? _lastAppliedEqEnabled;
+  List<double>? _lastAppliedEqGains;
   // 听歌统计按会话增量刷写，避免定时刷写把累计 position 重复计算。
   String? _statsSessionPath;
   int _statsRecordedPositionMs = 0;
   bool _statsPlayEventRecorded = false;
   Future<void> _statsWriteChain = Future<void>.value();
+  // 统计墙钟（单调时钟，不受系统时间跳变影响）：估算“自上次刷写以来
+  // 最多可能真实听了多久”。脏回跳/错误时长元数据（如在线源返回数小时
+  // 的 durationMs）会让单次结算产生数小时的 listenedMs，用墙钟上限
+  // 把每次结算钳制在物理可能的范围内。
+  final Stopwatch _statsWallClock = Stopwatch()..start();
+  int _statsLastFlushElapsedMs = 0;
 
   Future<void> _init() async {
     final allowOtherAudio =
@@ -732,6 +920,13 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
         unawaited(_player.pause());
       });
     }
+    _attachPlayerStreams();
+    await _restoreSession();
+  }
+
+  /// 挂接 just_audio 的 position / duration / playerState 订阅。
+  /// 重建 AudioPlayer 实例（起播卡死自愈）后必须重新挂接。
+  void _attachPlayerStreams() {
     // 逐字歌词需要比默认 200ms 更细的进度采样，但 40ms 会让全局播放状态
     // 在手机上以 25fps 重建，首页、底栏和歌词页会同时承受不必要的开销。
     // 80~120ms 足够逐词/渐进效果使用，也能明显降低主 isolate 的负担。
@@ -749,7 +944,54 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
               VideoPlaybackSession.isFor(state.current?.path)) {
             return;
           }
-          state = state.copyWith(position: p.inMilliseconds / 1000.0);
+          final positionMs = p.inMilliseconds;
+          // 大幅回跳过滤（纯过滤，不做 seek 修复——旧方案的修复 seek 会
+          // 重写原生基准引发新问题，已移除）：
+          // - 单曲循环的自然回绕（上次可信进度已逼近末尾、新进度回到
+          //   开头）必须放行，否则歌曲会在开头几秒无限循环；
+          // - 其余远离当前进度的回跳（熄屏/系统控件暂停恢复时原生可能
+          //   上报滞后或被重置为 0 的基准事件）视为脏数据：忽略并记
+          //   日志，等待原生以正确基准重新上报。参考的 XianYu 架构下
+          //   原生基准不会被播放器重建/媒体会话交接污染，故无需此层；
+          //   本应用存在重建与桥接路径，需要这层最小防护。
+          // 以 state.position（本回调是播放期唯一写者）为参照基准。
+          final lastMs = (state.position * 1000).round();
+          final durationMs = state.duration * 1000;
+          final isNaturalWrap = state.isPlaying &&
+              positionMs < 5000 &&
+              durationMs > 10000 &&
+              lastMs >= durationMs - 5000;
+          if (positionMs + 3000 < lastMs && !isNaturalWrap) {
+            // 解卡判定（beta15 实测：恢复播放后先有一条滞后的前进事件
+            // 污染基准，随后真实进度流全部被当作回跳过滤，界面卡死）：
+            // 被滤事件若持续严格递增，说明原生确实在从更低基准实时前进，
+            // 连续 8 次（约 0.7s）后重新接受并重同步基准；杂乱脏数据
+            // （如 0 风暴）不满足递增，继续过滤。
+            if (_staleStreakPrevMs >= 0 && positionMs > _staleStreakPrevMs) {
+              _staleStreakCount++;
+            } else {
+              _staleStreakPrevMs = positionMs;
+              _staleStreakCount = 1;
+            }
+            if (_staleStreakCount >= 8) {
+              debugPrint(
+                '[播放链路] 连续递增的被滤事件判定为真实进度流，'
+                '重同步基准 ${lastMs}ms → ${positionMs}ms',
+              );
+              _staleStreakPrevMs = -1;
+              _staleStreakCount = 0;
+            } else {
+              debugPrint(
+                '[播放链路] 忽略脏回跳进度事件 ${positionMs}ms'
+                '（最近可信 ${lastMs}ms，播放态 ${state.isPlaying}）',
+              );
+              return;
+            }
+          } else {
+            _staleStreakPrevMs = -1;
+            _staleStreakCount = 0;
+          }
+          state = state.copyWith(position: positionMs / 1000.0);
           _persistPositionDebounced();
           _requestDesktopLyricsSync();
         });
@@ -758,9 +1000,12 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
           VideoPlaybackSession.isFor(state.current?.path)) {
         return;
       }
-      state = state.copyWith(
-        duration: (d ?? Duration.zero).inMilliseconds / 1000.0,
-      );
+      final dur = (d ?? Duration.zero).inMilliseconds / 1000.0;
+      // 参考 XianYu-Music-Mobile：恢复/重挂期间原生可能上报 null 或 0
+      // 时长。已经拿到正时长时忽略 0，防止进度条 max 被冲掉、
+      // position 被按 max=1.0 错误钳制。
+      if (dur <= 0 && state.duration > 0) return;
+      state = state.copyWith(duration: dur);
     });
     _stateSub = _player.playerStateStream.listen((ps) {
       final playing = ps.playing;
@@ -768,6 +1013,12 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
       if (completed ||
           playing != state.isPlaying ||
           (playing && state.isLoading)) {
+        if (playing) {
+          // 恢复播放时重新起算统计墙钟窗口：暂停期间不产生新的收听
+          // 时长，若不重置，长时间暂停后的首次结算上限会包含暂停
+          // 时长，脏回跳产生的错误尾部就能穿透钳制。
+          _statsLastFlushElapsedMs = _statsWallClock.elapsedMilliseconds;
+        }
         state = state.copyWith(
           isPlaying: completed ? false : playing,
           // just_audio 的 play() 要等暂停或播放结束才完成。播放器已经进入
@@ -798,7 +1049,6 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
       }
       _requestDesktopLyricsSync(immediate: true);
     });
-    await _restoreSession();
   }
 
   @override
@@ -1009,6 +1259,13 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
     }
     _videoMediaBridgeActive = true;
     _lastVideoMediaSeek = DateTime.fromMillisecondsSinceEpoch(0);
+    // 歌曲进度与 MV 进度分离：桥接会把静音音频 seek 到视频时间线驱动
+    // 系统媒体会话，这里先记下歌曲自身的进度/时长（此时音频仍是
+    // pauseForVideo 暂停时的位置），关闭视频时恢复，MV 的播放进度
+    // 不会影响歌曲播放进度。
+    _songPositionBeforeVideo = _player.position;
+    _songPositionBeforeVideoPath = path;
+    _songDurationBeforeVideoMs = _player.duration?.inMilliseconds;
     // 必须在进入 await 前登记预期播放态：setVolume/seek 期间视频进度
     // 监听会触发镜像同步并提前起播音频，若此刻才写标记，起播序列中
     // 的 seek 事件（playing=false）会与标记不匹配而被当作暂停命令。
@@ -1040,6 +1297,41 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
       await _player.pause();
     }
     await _player.setVolume(_ref.read(volumeProvider));
+    await _restoreSongProgressAfterVideo();
+  }
+
+  /// 关闭 MV/视频后把歌曲进度恢复到开启前（见 [enableVideoMediaBridge]）。
+  /// MV 关闭即终止播放：视频进度条不再残留，播放页回到歌曲自身进度。
+  /// 切歌等场景下当前歌曲已变化时跳过恢复（新歌曲自行加载），仅清空记录。
+  Future<void> _restoreSongProgressAfterVideo() async {
+    final savedPath = _songPositionBeforeVideoPath;
+    final savedPosition = _songPositionBeforeVideo;
+    final savedDurationMs = _songDurationBeforeVideoMs;
+    _songPositionBeforeVideoPath = null;
+    _songPositionBeforeVideo = null;
+    _songDurationBeforeVideoMs = null;
+    if (savedPath == null || savedPosition == null) return;
+    if (state.current?.path != savedPath) return;
+    try {
+      await _player.seek(savedPosition);
+      // seek 期间可能已经切歌（异步关闭视频的路径），恢复前再校验一次，
+      // 避免旧歌曲的进度覆盖新歌曲的状态。
+      if (state.current?.path != savedPath) return;
+      var restored = state.copyWith(
+        position: savedPosition.inMilliseconds / 1000.0,
+      );
+      if (savedDurationMs != null && savedDurationMs > 0) {
+        restored = restored.copyWith(duration: savedDurationMs / 1000.0);
+      }
+      state = restored;
+      if (_statsSessionPath == state.current?.path) {
+        _statsRecordedPositionMs = savedPosition.inMilliseconds;
+      }
+      _persistPositionDebounced();
+      _requestDesktopLyricsSync(immediate: true);
+    } catch (error) {
+      debugPrint('关闭视频后恢复歌曲进度失败：$error');
+    }
   }
 
   Future<void> _mirrorVideoStateToSystemMedia() async {
@@ -1173,7 +1465,15 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
       }
     } else if (shouldPause && _wasInterrupted) {
       _wasInterrupted = false;
-      unawaited(_player.play());
+      // 与手动恢复播放一致走 _startPlayback：中断期间（通话/熄屏）
+      // 原生同样可能上报错误基准，恢复前先按暂停锚点校正。
+      final path = state.current?.path;
+      if (path != null && _preparedSourceRequestId == _playRequestId) {
+        _manualPause = false;
+        unawaited(_startPlayback(_playRequestId, path));
+      } else {
+        unawaited(_player.play());
+      }
     }
   }
 
@@ -1188,6 +1488,11 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
       final queueMeta = j['queueSongMeta'] is Map
           ? Map<String, dynamic>.from(j['queueSongMeta'] as Map)
           : const <String, dynamic>{};
+      // 旧会话没有版本号（默认 0）：网络歌词的词级时间转换逻辑已变更，
+      // 旧缓存的逐字时间整体错位（表现为只有标题行逐字），必须作废重抓。
+      final savedLyricsVersion =
+          (j['lyricsFormatVersion'] as num?)?.toInt() ?? 0;
+      final keepSessionLyrics = savedLyricsVersion >= _sessionLyricsFormatVersion;
       final items = paths.map((p) {
         final raw = queueMeta[p];
         final meta = raw is Map
@@ -1200,6 +1505,7 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
         final recoveredCover = pluginData == null
             ? ''
             : extractPluginCoverUrl(pluginData);
+        final savedLyricsRaw = meta['lyricsRaw']?.toString();
         return QueueItem(
           path: p,
           title: meta['title']?.toString() ?? _titleFromPath(p),
@@ -1213,9 +1519,11 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
           coverUrl: savedCover.isNotEmpty
               ? savedCover
               : (recoveredCover.isEmpty ? null : recoveredCover),
-          lyricsRaw: meta['lyricsRaw']?.toString(),
-          lyricsAttempted:
-              meta['lyricsAttempted'] == true || meta['lyricsRaw'] != null,
+          lyricsRaw: keepSessionLyrics ? savedLyricsRaw : null,
+          // 作废旧歌词时 lyricsAttempted 必须一并复位，否则播放链和
+          // ensureCurrentLyricsChecked 都会因“已探测”跳过重新抓取。
+          lyricsAttempted: keepSessionLyrics &&
+              (meta['lyricsAttempted'] == true || savedLyricsRaw != null),
         );
       }).toList();
       final currentPath = j['currentSongPath'] as String?;
@@ -1229,49 +1537,56 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
           : (_ref.read(settingsProvider).valueOrNull?.onlineDefaultQuality ??
                 '320k');
 
+      // 快速恢复队列与歌曲信息，不设 isLoading：插件音源解析可能需要
+      // 数秒甚至超时，阻塞在 loading 态会让用户以为起播卡死。
       state = state.copyWith(
         queue: items,
         queueIndex: idx,
         current: items[idx],
         playMode: mode,
         position: pos,
+        // 进度条 max 立即用队列元数据时长占位：不设的话进入播放页时
+        // 恢复的 position 会被按 max=1.0 钳到尾端，起播后才跳回真实
+        // 进度（表现为进度条先满格再回跳）。真实时长仍由引擎事件更正。
+        duration: items[idx].durationMs / 1000.0,
         isPlaying: false,
-        isLoading: true,
+        isLoading: false,
         errorMessage: null,
         currentQuality: restoredQuality,
       );
       _beginStatsSession(items[idx], initialPositionMs: (pos * 1000).round());
       await _ref.read(settingsProvider.notifier).setPlayMode(mode);
-      try {
-        await _player.setLoopMode(audioLoopModeForPlayMode(mode));
-        final plugin = await _prepareAudioSource(
-          items[idx],
-          queueIndex: idx,
-          preferredQualityOverride: restoredQuality,
-        );
-        _preparedSourceRequestId = _playRequestId;
-        await _player.setVolume(_ref.read(volumeProvider));
-        await seek(pos);
-        // 进程重新启动时只恢复队列、歌曲和进度，不自动恢复“正在播放”。
-        // 自动播放会在首页首帧同时启动媒体服务、网络音源和高频 UI 更新，
-        // 部分旧设备可能因此被系统终止；用户点击播放后再正常继续。
-        _manualPause = true;
-        state = state.copyWith(isLoading: false, errorMessage: null);
-        if (plugin != null && !(state.current?.lyricsAttempted ?? false)) {
-          unawaited(
-            _loadPluginLyrics(idx, plugin, state.current ?? items[idx]),
+      // 后台异步预加载音源：成功则用户点播放即可直接起播；失败也不
+      // 污染 UI 状态，toggle() 检测到音源未就绪会自动重走切歌链。
+      unawaited(() async {
+        try {
+          await _player.setLoopMode(audioLoopModeForPlayMode(mode));
+          final plugin = await _prepareAudioSource(
+            items[idx],
+            queueIndex: idx,
+            preferredQualityOverride: restoredQuality,
           );
+          if (idx != state.queueIndex) return; // 期间已切歌，放弃
+          _preparedSourceRequestId = _playRequestId;
+          await _player.setVolume(_ref.read(volumeProvider));
+          await seek(pos);
+          // 进程重新启动时只恢复队列、歌曲和进度，不自动恢复“正在播放”。
+          // 自动播放会在首页首帧同时启动媒体服务、网络音源和高频 UI 更新，
+          // 部分旧设备可能因此被系统终止；用户点击播放后再正常继续。
+          _manualPause = true;
+          if (plugin != null && !(state.current?.lyricsAttempted ?? false)) {
+            unawaited(
+              _loadPluginLyrics(idx, plugin, state.current ?? items[idx]),
+            );
+          }
+          unawaited(_persistSession());
+        } catch (error, stackTrace) {
+          debugPrint('播放会话预加载失败：$error');
+          debugPrintStack(stackTrace: stackTrace);
+          // 预加载失败不设置 errorMessage / isLoading：
+          // 静默等待用户点击播放时由 toggle() 触发重试。
         }
-        unawaited(_persistSession());
-      } catch (error, stackTrace) {
-        debugPrint('播放会话恢复失败：$error');
-        debugPrintStack(stackTrace: stackTrace);
-        state = state.copyWith(
-          isPlaying: false,
-          isLoading: false,
-          errorMessage: _friendlyPlaybackError(error),
-        );
-      }
+      }());
     } catch (_) {
       // 无有效会话，忽略。
     }
@@ -1450,6 +1765,8 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
       if (requestId != _playRequestId) return;
       // play() 已成功发起。不要 await：它只会在暂停、停止或播放结束后完成。
       state = state.copyWith(isLoading: false, errorMessage: null);
+      // 空闲预解析下一首的播放地址，切歌时直接命中运行时缓存。
+      unawaited(_prefetchNextSource());
       if (plugin != null && !(state.current?.lyricsAttempted ?? false)) {
         unawaited(_loadPluginLyrics(index, plugin, item));
       } else if (plugin == null &&
@@ -1479,6 +1796,43 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
       );
     }
     unawaited(_persistSession());
+  }
+
+  /// 起播成功后预解析队列中下一首歌曲的播放地址（写入运行时短时
+  /// 缓存）。插件 getMusicUrl 网络解析是切歌加载的大头，HyperOS 等
+  /// 系统的省电策略可能拖慢网络线程；播放期间的空闲预取让切歌时
+  /// 直接命中缓存，仅需 setUrl 连接 CDN。
+  Future<void> _prefetchNextSource() async {
+    final queue = state.queue;
+    final nextIndex = state.queueIndex + 1;
+    if (nextIndex < 0 || nextIndex >= queue.length) return;
+    final item = queue[nextIndex];
+    final type = playbackSourceTypeFor(item);
+    if (type != PlaybackSourceType.plugin && type != PlaybackSourceType.lx) {
+      return;
+    }
+    final pluginData = item.pluginData;
+    final pluginId = item.pluginId?.trim() ?? '';
+    if (pluginData == null || pluginData.isEmpty || pluginId.isEmpty) return;
+    try {
+      final plugins = await _ref.read(enabledMusicPluginsProvider.future);
+      final plugin = plugins
+          .where((candidate) => candidate.id == pluginId)
+          .firstOrNull;
+      if (plugin == null) return;
+      final preferredQuality =
+          _ref.read(settingsProvider).valueOrNull?.onlineDefaultQuality ??
+          '320k';
+      await _ref
+          .read(pluginRuntimeProvider)
+          .resolveMediaSource(
+            plugin,
+            pluginData,
+            preferredQuality: preferredQuality,
+          );
+    } catch (_) {
+      // 预取失败静默：切歌时会按原路径重新解析。
+    }
   }
 
   Future<EnabledMusicPlugin?> _prepareAudioSource(
@@ -1514,6 +1868,9 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
           );
         }
         final runtime = _ref.read(pluginRuntimeProvider);
+        // 各阶段计时日志：真机上排查“加载慢”时通过 logcat 观察是插件
+        // 解析（getMusicUrl 网络请求）慢还是 setUrl（CDN 连接）慢。
+        final resolveStopwatch = Stopwatch()..start();
         late PluginMediaSource source;
         try {
           source = await runtime.resolveMediaSource(
@@ -1540,8 +1897,12 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
               .read(settingsProvider.notifier)
               .setOnlineDefaultQuality('320k');
         }
-        await _setPlayerUrl(
-          source.url,
+        debugPrint(
+          '[播放链路] ${item.path} 音源解析 ${resolveStopwatch.elapsedMilliseconds}ms',
+        );
+        final setUrlStopwatch = Stopwatch()..start();
+        Future<void> submitUrl(PluginMediaSource resolved) => _setPlayerUrl(
+          resolved.url,
           // just_audio treats even an empty map as an instruction to route
           // the request through its local Dart proxy.  LX plugins (including
           // 长青) normally return no headers; that proxy performs the TLS
@@ -1550,9 +1911,31 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
           // Leave headers null when none are required so ExoPlayer opens the
           // URL natively.  Keep the proxy for plugins that really need
           // custom headers (for example Bilibili DASH streams).
-          headers: source.headers.isEmpty ? null : source.headers,
+          headers: resolved.headers.isEmpty ? null : resolved.headers,
           tag: mediaItem,
           requestId: requestId,
+        );
+        try {
+          await submitUrl(source);
+        } catch (error) {
+          if (requestId != null && requestId != _playRequestId) rethrow;
+          // 短时缓存（预取/切歌回切）的地址可能已过 CDN 时效：失效缓存
+          // 并绕过缓存强制重新解析一次，避免把地址过期误判为不可播。
+          runtime.invalidateMediaSourceCache(
+            plugin,
+            pluginData,
+            quality: preferredQuality,
+          );
+          source = await runtime.resolveMediaSource(
+            plugin,
+            pluginData,
+            preferredQuality: preferredQuality,
+            bypassCache: true,
+          );
+          await submitUrl(source);
+        }
+        debugPrint(
+          '[播放链路] ${item.path} setUrl ${setUrlStopwatch.elapsedMilliseconds}ms',
         );
         // 歌曲开始准备播放后立即后台探测当前插件支持的音质，结果由运行时
         // 缓存；播放和下载菜单重复打开时直接读取缓存，不再现场等待网络。
@@ -1581,18 +1964,43 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
         }
         final plugins = await _ref.read(enabledMusicPluginsProvider.future);
         // 洛雪插件自有歌曲只走洛雪命名空间（见 _resolveOwnedLxSource）。
-        final owned = await _resolveOwnedLxSource(
+        final resolveStopwatch = Stopwatch()..start();
+        var owned = await _resolveOwnedLxSource(
           item,
           Map<String, dynamic>.from(rawLx),
           plugins,
           preferredQuality: preferredQuality,
         );
+        debugPrint(
+          '[播放链路] ${item.path} lx 音源解析 ${resolveStopwatch.elapsedMilliseconds}ms',
+        );
         if (owned != null) {
-          await _setPlayerUrl(
-            owned.url,
-            headers: owned.headers.isEmpty ? null : owned.headers,
-            tag: mediaItem,
-            requestId: requestId,
+          final setUrlStopwatch = Stopwatch()..start();
+          Future<void> submitOwnedUrl(_RecognizedAudioSource resolved) =>
+              _setPlayerUrl(
+                resolved.url,
+                headers: resolved.headers.isEmpty ? null : resolved.headers,
+                tag: mediaItem,
+                requestId: requestId,
+              );
+          try {
+            await submitOwnedUrl(owned);
+          } catch (error) {
+            if (requestId != null && requestId != _playRequestId) rethrow;
+            // 短时缓存的地址可能已过 CDN 时效：绕过缓存重新解析一次。
+            final fresh = await _resolveOwnedLxSource(
+              item,
+              Map<String, dynamic>.from(rawLx),
+              plugins,
+              preferredQuality: preferredQuality,
+              bypassCache: true,
+            );
+            if (fresh == null) rethrow;
+            owned = fresh;
+            await submitOwnedUrl(owned);
+          }
+          debugPrint(
+            '[播放链路] ${item.path} setUrl ${setUrlStopwatch.elapsedMilliseconds}ms',
           );
           if (!(state.current?.lyricsAttempted ?? false)) {
             unawaited(
@@ -1700,6 +2108,31 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
     return result;
   }
 
+  /// 播放地址 Java 层 DNS 预热：解析结果写入系统 netd 缓存（与
+  /// ExoPlayer 共享同一缓存）。实测部分厂商 ROM 上 CDN 域名冷解析
+  /// 可达数秒（如 tx 音源 isure 节点 setUrl 8 秒），预热后 setUrl 的
+  /// 连接阶段直接命中缓存。回传的耗时与地址同时写入日志，用于诊断
+  /// 慢连接根因（DNS 慢 / 连接慢 / 代理慢）。
+  Future<void> _warmUpPlaybackDns(String url) async {
+    if (!Platform.isAndroid) return;
+    final uri = Uri.tryParse(url);
+    final host = uri?.host ?? '';
+    if (uri == null || !uri.hasScheme || host.isEmpty) return;
+    try {
+      final result = await const MethodChannel(
+        'com.xymusic.mobile/dns_lookup',
+      ).invokeMethod<Map<dynamic, dynamic>>('lookup', {
+        'host': host,
+      }).timeout(const Duration(seconds: 4));
+      debugPrint(
+        '[播放链路] DNS预热 $host ${result?['elapsedMs']}ms '
+        '${result?['error'] ?? result?['addresses']}',
+      );
+    } catch (_) {
+      // 预热失败（超时/无服务）不阻塞播放链路。
+    }
+  }
+
   Future<void> _setPlayerUrl(
     String url, {
     Map<String, String>? headers,
@@ -1708,7 +2141,28 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
   }) async {
     await _enqueueSourceOperation(() async {
       if (requestId != null && requestId != _playRequestId) return;
-      await _player.setUrl(url, headers: headers, tag: tag);
+      if (url.startsWith('http')) {
+        // 预解析域名填充系统 DNS 缓存；headers 走向也记入日志，
+        // 下份日志可据此区分「本地代理慢」与「DNS/网络慢」。
+        await _warmUpPlaybackDns(url);
+        if (requestId != null && requestId != _playRequestId) return;
+        final host = Uri.tryParse(url)?.host ?? '';
+        debugPrint(
+          '[播放链路] setUrl 开始 $host '
+          '(${headers == null ? '直连' : '本地代理 ${headers.length} 头'})',
+        );
+      }
+      // setUrl 加超时保护：部分机型上 ExoPlayer 加载特定 URL 可能卡死
+      // （既不抛错也不完成），导致 isLoading 永久为 true。超过 15 秒
+      // 主动放弃并抛出超时，交由上层错误处理链路统一兜底。
+      try {
+        await _player
+            .setUrl(url, headers: headers, tag: tag)
+            .timeout(const Duration(seconds: 15));
+      } on TimeoutException {
+        debugPrint('[播放链路] setUrl 超时 15s，主动中断并上报错误');
+        rethrow;
+      }
     });
   }
 
@@ -2638,6 +3092,7 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
     Map<String, dynamic> rawLx,
     List<EnabledMusicPlugin> plugins, {
     String? preferredQuality,
+    bool bypassCache = false,
   }) async {
     final lxPluginId = item.pluginId?.trim() ?? '';
     if (lxPluginId.isEmpty) return null;
@@ -2653,6 +3108,7 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
             lxPlugin,
             item.pluginData ?? const <String, dynamic>{},
             preferredQuality: preferredQuality,
+            bypassCache: bypassCache,
           )
           .timeout(const Duration(seconds: 30));
       if (media.url.trim().isNotEmpty) {
@@ -3031,8 +3487,50 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
         _preparedSourceRequestId != requestId) {
       return;
     }
+    // 参考 XianYu-Music-Mobile：恢复播放就是纯粹的 play()。此前这里的
+    // “先 seek 回锚点重写原生基准 + 起播后漂移校验再 seek”会在部分系统
+    // （如 ColorOS 系统控件暂停→熄屏→恢复）上触发原生基准重置，反而
+    // 造成 UI 进度从 0 开始走。原生 positionStream 会持续上报真实进度。
+    final expectedMs = (state.position * 1000).round();
+    // 起播进入加载态：play() 发起到引擎真正出声（playing 事件）之间，
+    // 迷你播放栏/播放页按钮显示“加载中”而非滞留播放图标；出声后由
+    // playerStateStream 监听统一清除。兜底：引擎极端挂死不上报 playing
+    // 时 3 秒后强制结束，避免按钮永久停在“加载中”且不可点。
+    state = state.copyWith(isLoading: true);
+    _clearLoadingWhenStalled(
+      requestId: requestId,
+      itemPath: itemPath,
+    );
     final playback = _player.play();
     unawaited(_watchPlayback(playback, requestId, itemPath));
+    // 诊断日志：恢复播放完成后核对预期与实际进度。若出现“音频在正确
+    // 位置但界面从 0 开始”的复现，此日志可直接区分是原生基准被重置
+    // （实际≈0）还是事件流被污染（实际正常但事件脏）。
+    unawaited(
+      playback.then(
+        (_) => debugPrint(
+          '[播放链路] 恢复播放完成：预期 $expectedMs ms，'
+          '实际 ${_player.position.inMilliseconds} ms',
+        ),
+      ),
+    );
+  }
+
+  /// 起播加载态兜底：3 秒内 playing 事件仍未到来（引擎挂死等极端情况）
+  /// 时强制结束 loading，避免按钮永久停在“加载中”且不可点。出声正常
+  /// 时 playing 事件已先行清除，此处不做任何事。
+  void _clearLoadingWhenStalled({
+    required int requestId,
+    required String itemPath,
+  }) {
+    Timer(const Duration(seconds: 3), () {
+      if (requestId != _playRequestId || state.current?.path != itemPath) {
+        return;
+      }
+      if (state.isLoading) {
+        state = state.copyWith(isLoading: false);
+      }
+    });
   }
 
   Future<void> _ensureMediaNotificationPermission() async {
@@ -3395,6 +3893,8 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
     // 恰好约 35.8 分钟，长时间播放/恢复时会造成排行榜时长停止累计。
     _statsRecordedPositionMs = initialPositionMs < 0 ? 0 : initialPositionMs;
     _statsPlayEventRecorded = false;
+    // 新会话重新起算墙钟窗口。
+    _statsLastFlushElapsedMs = _statsWallClock.elapsedMilliseconds;
   }
 
   int _statsPositionMs(PlaybackState snapshot) {
@@ -3457,6 +3957,12 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
   void _flushPlaybackStats(PlaybackState snapshot) {
     final item = snapshot.current;
     if (item == null) return;
+    // 先结算墙钟窗口：无论本次走哪个分支（含早退），下一次结算的
+    // 上限都从现在重新起算。上限按最高 3 倍速 + 15s 容差估算——
+    // 定时刷写周期为 15s，正常增量远小于上限，不会被误伤。
+    final nowElapsedMs = _statsWallClock.elapsedMilliseconds;
+    final wallCapMs = (nowElapsedMs - _statsLastFlushElapsedMs) * 3 + 15000;
+    _statsLastFlushElapsedMs = nowElapsedMs;
     // 已暂停且没有正在播放的原生音频时，不会产生新的听歌时长。过滤这类
     // 调用可避免暂停期间残留的 position 被重复结算。
     if (!snapshot.isPlaying && !_player.playing) return;
@@ -3473,7 +3979,12 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
       final durationMs = item.durationMs > 0
           ? item.durationMs
           : (snapshot.duration * 1000).round();
-      final tailMs = max(0, durationMs - _statsRecordedPositionMs);
+      // 尾部时长同样受墙钟钳制：时长元数据错误（在线源可能返回数小时）
+      // 或脏回跳（熄屏恢复进度归零）时，避免一次结算记出数小时。
+      final tailMs = min(
+        max(0, durationMs - _statsRecordedPositionMs),
+        wallCapMs,
+      );
       if (tailMs > 0) {
         _enqueueStatsChunk(item, snapshot, tailMs, !_statsPlayEventRecorded);
       }
@@ -3482,7 +3993,7 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
       return;
     }
 
-    final deltaMs = positionMs - _statsRecordedPositionMs;
+    final deltaMs = min(positionMs - _statsRecordedPositionMs, wallCapMs);
     if (deltaMs <= 0) return;
 
     _statsRecordedPositionMs = positionMs;
@@ -3851,6 +4362,13 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
         _flushCurrentPlaybackStats();
         await _player.pause();
       } else {
+        // 音源未就绪（恢复会话失败、上首播放失败等）时不能直接
+        // _startPlayback：_preparedSourceRequestId 校验不通过会静默返回，
+        // 用户看到「点播放没反应」，形同卡死。此时重新走完整切歌链。
+        if (_preparedSourceRequestId != _playRequestId) {
+          await _playAt(state.queueIndex);
+          return;
+        }
         _manualPause = false;
         _startPlayback(_playRequestId, state.current!.path);
       }
@@ -4103,6 +4621,8 @@ Map<String, dynamic> buildPlaybackSessionPayload({
     'isPlaying': state.isPlaying,
     'sessionQualityOverride': state.currentQuality,
     'queueSongMeta': queueMeta,
+    // 记录写入时的歌词转换版本，恢复时版本不一致则作废旧歌词缓存。
+    'lyricsFormatVersion': _sessionLyricsFormatVersion,
     'updatedAt': updatedAt,
   };
 }
@@ -4112,6 +4632,11 @@ final volumeProvider = Provider<double>((ref) {
   return ref.watch(settingsProvider.select((s) => s.valueOrNull?.volume)) ??
       1.0;
 });
+
+/// 音量键调节应用内音量后的最新值（仅音量键通道写入）。应用根节点
+/// 监听它显示“应用音量 xx%”的 OSD 反馈——音量键被拦截时系统音量
+/// 面板不会出现，需要自己提示当前音量。
+final volumeKeyOscProvider = StateProvider<double?>((ref) => null);
 
 /// 最近播放写入成功后的修订号，让已打开的最近播放页在异步落库完成后刷新。
 final recentHistoryRevisionProvider = StateProvider<int>((ref) => 0);

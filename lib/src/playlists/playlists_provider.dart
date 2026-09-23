@@ -94,6 +94,53 @@ class PlaylistSongSnapshot {
   );
 }
 
+/// 歌单的网络导入来源记录（参考 BakaMusic 的 importSources）：
+/// 记录导入时使用的插件与用户输入，供「同步来源」重新拉取歌单快照。
+class PlaylistImportSource {
+  const PlaylistImportSource({
+    required this.kind,
+    required this.pluginId,
+    required this.input,
+    this.lxSource,
+    this.importedAt,
+  });
+
+  /// 来源类型：'plugin' = 插件运行时导入；'lx' = 洛雪直连导入。
+  final String kind;
+
+  /// 导入所用插件 id（洛雪来源为洛雪插件 id）。
+  final String pluginId;
+
+  /// 洛雪来源的平台 id（kw/kg/tx/wy/mg），仅 kind == 'lx' 时有意义。
+  final String? lxSource;
+
+  /// 用户导入时输入的歌单 ID 或分享链接（同步时原样回传）。
+  final String input;
+
+  /// 首次导入时间（ISO 8601，仅展示用）。
+  final String? importedAt;
+
+  /// 来源身份键：同插件同输入视为同一来源（重复导入按此去重）。
+  String get key => '$kind\u0000$pluginId\u0000${lxSource ?? ''}\u0000$input';
+
+  Map<String, dynamic> toJson() => {
+    'kind': kind,
+    'pluginId': pluginId,
+    'lxSource': lxSource,
+    'input': input,
+    'importedAt': importedAt,
+  };
+
+  factory PlaylistImportSource.fromJson(Map<String, dynamic> json) =>
+      PlaylistImportSource(
+        kind: json['kind'] as String? ?? 'plugin',
+        pluginId: json['pluginId'] as String? ?? '',
+        lxSource: json['lxSource'] as String?,
+        input: json['input'] as String? ?? '',
+        importedAt: json['importedAt'] as String?,
+      );
+}
+
 class MobilePlaylist {
   const MobilePlaylist({
     required this.id,
@@ -103,6 +150,8 @@ class MobilePlaylist {
     this.coverUrl,
     this.songSnapshots = const {},
     this.customOrder,
+    this.importSources = const [],
+    this.songSources = const {},
   });
 
   final String id;
@@ -115,6 +164,13 @@ class MobilePlaylist {
   /// 用户手动拖拽后的自定义顺序（完整歌曲路径列表）。null 表示从未
   /// 自定义过，「自定义」排序回退为 songPaths 的原始顺序。
   final List<String>? customOrder;
+
+  /// 歌单的网络导入来源（为空表示非导入歌单或未记录来源）。
+  final List<PlaylistImportSource> importSources;
+
+  /// 歌曲归属：path → 来源身份键列表。不在表中的歌曲视为手动添加
+  /// （同步时永不移除）；同步时来源不再包含的来源歌曲会被移出歌单。
+  final Map<String, List<String>> songSources;
 
   /// 歌单没有单独设置封面时，默认使用第一首歌的封面。
   String? get effectiveCoverUrl {
@@ -130,6 +186,8 @@ class MobilePlaylist {
     String? coverUrl,
     Map<String, PlaylistSongSnapshot>? songSnapshots,
     List<String>? customOrder,
+    List<PlaylistImportSource>? importSources,
+    Map<String, List<String>>? songSources,
   }) {
     return MobilePlaylist(
       id: id,
@@ -139,6 +197,8 @@ class MobilePlaylist {
       coverUrl: coverUrl ?? this.coverUrl,
       songSnapshots: songSnapshots ?? this.songSnapshots,
       customOrder: customOrder ?? this.customOrder,
+      importSources: importSources ?? this.importSources,
+      songSources: songSources ?? this.songSources,
     );
   }
 
@@ -152,6 +212,10 @@ class MobilePlaylist {
       (path, snapshot) => MapEntry(path, snapshot.toJson()),
     ),
     if (customOrder != null) 'customOrder': customOrder,
+    'importSources': [
+      for (final source in importSources) source.toJson(),
+    ],
+    'songSources': songSources.map((path, keys) => MapEntry(path, keys)),
   };
 
   factory MobilePlaylist.fromJson(Map<String, dynamic> json) {
@@ -172,6 +236,22 @@ class MobilePlaylist {
             })
           : const {},
       customOrder: (json['customOrder'] as List?)?.cast<String>(),
+      importSources: [
+        if (json['importSources'] is List)
+          for (final item in json['importSources'] as List)
+            if (item is Map)
+              PlaylistImportSource.fromJson(
+                Map<String, dynamic>.from(item),
+              ),
+      ],
+      songSources: json['songSources'] is Map
+          ? (json['songSources'] as Map).map((key, value) {
+              final keys = value is List
+                  ? value.map((e) => e.toString()).toList()
+                  : const <String>[];
+              return MapEntry(key.toString(), keys);
+            })
+          : const {},
     );
   }
 }
@@ -229,10 +309,12 @@ class PlaylistsNotifier extends StateNotifier<List<MobilePlaylist>> {
     List<String> paths = const [],
     String? coverUrl,
     List<Song> songs = const [],
+    List<PlaylistImportSource> sources = const [],
   }) async {
     final trimmed = name.trim();
     if (trimmed.isEmpty) return null;
     final firstSongCover = songs.isEmpty ? null : songs.first.coverUrl;
+    final sourceKeys = [for (final source in sources) source.key];
     final item = MobilePlaylist(
       id: DateTime.now().microsecondsSinceEpoch.toString(),
       name: trimmed,
@@ -244,6 +326,13 @@ class PlaylistsNotifier extends StateNotifier<List<MobilePlaylist>> {
       songSnapshots: {
         for (final song in songs)
           song.path: PlaylistSongSnapshot.fromSong(song),
+      },
+      importSources: sources,
+      // 导入歌曲全部归属到传入来源；本地路径（paths）不记录归属，
+      // 视为手动添加，同步时不会被移除。
+      songSources: {
+        if (sourceKeys.isNotEmpty)
+          for (final song in songs) song.path: List.of(sourceKeys),
       },
     );
     state = [...state, item];
@@ -355,10 +444,13 @@ class PlaylistsNotifier extends StateNotifier<List<MobilePlaylist>> {
 
   /// 将导入歌单的歌曲合并到已有歌单，同时保存网络歌曲的完整快照。
   /// 相同路径只保留一份，已有歌曲的顺序保持不变，新歌曲追加到末尾。
+  /// 传入 [sources] 时记录导入来源（同来源重复导入按 key 去重），并
+  /// 为本次导入的歌曲累加来源归属（原手动添加的歌曲转为来源歌曲）。
   Future<void> mergeImportedSongs(
     String id,
     Iterable<Song> songs, {
     String? coverUrl,
+    List<PlaylistImportSource> sources = const [],
   }) async {
     await _loaded;
     final incoming = songs.toList(growable: false);
@@ -370,10 +462,28 @@ class PlaylistsNotifier extends StateNotifier<List<MobilePlaylist>> {
     final snapshots = Map<String, PlaylistSongSnapshot>.of(
       current.songSnapshots,
     );
+    final importSources = [...current.importSources];
+    for (final source in sources) {
+      if (!importSources.any((item) => item.key == source.key)) {
+        importSources.add(source);
+      }
+    }
+    final sourceKeys = [for (final source in sources) source.key];
+    final songSources = Map<String, List<String>>.of(current.songSources);
     for (final song in incoming) {
       if (song.path.trim().isEmpty) continue;
       if (!paths.contains(song.path)) paths.add(song.path);
       snapshots[song.path] = PlaylistSongSnapshot.fromSong(song);
+      final existing = songSources[song.path];
+      if (existing == null) {
+        if (sourceKeys.isNotEmpty) {
+          songSources[song.path] = List.of(sourceKeys);
+        }
+      } else {
+        for (final key in sourceKeys) {
+          if (!existing.contains(key)) existing.add(key);
+        }
+      }
     }
     final fallbackCover = incoming
         .map((song) => song.coverUrl?.trim() ?? '')
@@ -382,6 +492,8 @@ class PlaylistsNotifier extends StateNotifier<List<MobilePlaylist>> {
     next[index] = current.copyWith(
       songPaths: paths,
       songSnapshots: snapshots,
+      importSources: importSources,
+      songSources: songSources,
       coverUrl:
           current.coverUrl ??
           (coverUrl?.trim().isNotEmpty == true
@@ -440,6 +552,55 @@ class PlaylistsNotifier extends StateNotifier<List<MobilePlaylist>> {
     return true;
   }
 
+  /// 批量将歌曲加入歌单（收藏多选等场景）：合并为一次状态更新与一次
+  /// 持久化写入。已存在的歌曲自动跳过，返回 (新添加数量, 已存在数量)。
+  Future<(int, int)> addQueueItems(String id, List<QueueItem> items) async {
+    final existingPlaylist = state.where((playlist) => playlist.id == id).firstOrNull;
+    if (existingPlaylist == null) return (0, 0);
+    final existingPaths = existingPlaylist.songPaths.toSet();
+    final fresh = <QueueItem>[
+      for (final item in items)
+        if (!existingPaths.contains(item.path)) item,
+    ];
+    if (fresh.isEmpty) return (0, items.length);
+    final newPaths = [for (final item in fresh) item.path];
+    state = [
+      for (final playlist in state)
+        if (playlist.id == id)
+          playlist.copyWith(
+            songPaths: _prependNewPaths(playlist.songPaths, newPaths),
+            customOrder: playlist.customOrder == null
+                ? null
+                : _prependNewPaths(playlist.customOrder!, newPaths),
+            coverUrl:
+                (playlist.coverUrl?.trim().isNotEmpty ?? false) ||
+                    playlist.songPaths.isNotEmpty
+                ? playlist.coverUrl
+                : fresh.first.coverUrl,
+            songSnapshots: Map.of(playlist.songSnapshots)
+              ..addAll({
+                for (final item in fresh)
+                  item.path: PlaylistSongSnapshot(
+                    path: item.path,
+                    title: item.title,
+                    artist: item.artist,
+                    album: item.album,
+                    duration: (item.durationMs / 1000).round(),
+                    format: item.pluginId == null ? '本地' : '网络',
+                    coverUrl: item.coverUrl,
+                    pluginId: item.pluginId,
+                    pluginData: item.pluginData,
+                    lyricsRaw: item.lyricsRaw,
+                  ),
+              }),
+          )
+        else
+          playlist,
+    ];
+    await _save();
+    return (fresh.length, items.length - fresh.length);
+  }
+
   Future<void> removeSong(String id, String path) async {
     state = [
       for (final item in state)
@@ -447,6 +608,9 @@ class PlaylistsNotifier extends StateNotifier<List<MobilePlaylist>> {
           item.copyWith(
             songPaths: item.songPaths.where((value) => value != path).toList(),
             songSnapshots: Map.of(item.songSnapshots)..remove(path),
+            // 同步清除归属：来源歌单下次同步仍包含这首歌时会重新加回
+            //（与 BakaMusic 的「显式本地删除可被来源恢复」语义一致）。
+            songSources: Map.of(item.songSources)..remove(path),
             customOrder: item.customOrder
                 ?.where((value) => value != path)
                 .toList(),
@@ -470,6 +634,8 @@ class PlaylistsNotifier extends StateNotifier<List<MobilePlaylist>> {
                 item.songPaths.where((value) => !removing.contains(value)).toList(),
             songSnapshots: Map.of(item.songSnapshots)
               ..removeWhere((value, _) => removing.contains(value)),
+            songSources: Map.of(item.songSources)
+              ..removeWhere((value, _) => removing.contains(value)),
             customOrder: item.customOrder
                 ?.where((value) => !removing.contains(value))
                 .toList(),
@@ -490,7 +656,8 @@ class PlaylistsNotifier extends StateNotifier<List<MobilePlaylist>> {
   }
 
   /// 换源：把歌单中 [oldPath] 的歌曲原位替换为 [newSong]（来自其他插件）。
-  /// 歌单顺序与自定义排序保持不变，网络歌曲快照同步更新。
+  /// 歌单顺序与自定义排序保持不变，网络歌曲快照同步更新；原歌曲的
+  /// 来源归属转移到新路径（换源后下次同步以来源为准恢复原曲）。
   Future<void> replaceSong(String id, String oldPath, Song newSong) async {
     state = [
       for (final item in state)
@@ -503,6 +670,11 @@ class PlaylistsNotifier extends StateNotifier<List<MobilePlaylist>> {
             songSnapshots: Map.of(item.songSnapshots)
               ..remove(oldPath)
               ..[newSong.path] = PlaylistSongSnapshot.fromSong(newSong),
+            songSources: _transferSongSource(
+              item.songSources,
+              oldPath,
+              newSong.path,
+            ),
             customOrder: item.customOrder
                 ?.map((path) => path == oldPath ? newSong.path : path)
                 .toList(),
@@ -510,6 +682,42 @@ class PlaylistsNotifier extends StateNotifier<List<MobilePlaylist>> {
         else
           item,
     ];
+    await _save();
+  }
+
+  /// 迁移歌曲归属：旧路径的来源键转移到新路径；无归属（手动添加）
+  /// 时新路径同样不记录归属。
+  static Map<String, List<String>> _transferSongSource(
+    Map<String, List<String>> sources,
+    String oldPath,
+    String newPath,
+  ) {
+    final keys = sources[oldPath];
+    if (keys == null || keys.isEmpty) return sources;
+    return Map.of(sources)..remove(oldPath)..[newPath] = List.of(keys);
+  }
+
+  /// 应用「同步来源」的计算结果：一次性写回歌曲顺序、归属、快照与
+  /// 自定义排序（差分合并的最终提交点）。调用前应已确认结果有变化。
+  Future<void> applySync(
+    String id, {
+    required List<String> songPaths,
+    required Map<String, List<String>> songSources,
+    required Map<String, PlaylistSongSnapshot> songSnapshots,
+    List<String>? customOrder,
+  }) async {
+    await _loaded;
+    final index = state.indexWhere((item) => item.id == id);
+    if (index < 0) return;
+    final current = state[index];
+    final next = [...state];
+    next[index] = current.copyWith(
+      songPaths: songPaths,
+      songSources: songSources,
+      songSnapshots: songSnapshots,
+      customOrder: customOrder,
+    );
+    state = next;
     await _save();
   }
 }

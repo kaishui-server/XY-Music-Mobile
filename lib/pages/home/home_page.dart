@@ -27,6 +27,8 @@ import '../../src/widgets/user_avatar_image.dart';
 Color _homeGlassPanelColor(BuildContext context) {
   final theme = Theme.of(context);
   final dark = theme.brightness == Brightness.dark;
+  // 半透明色 + XyPanel 的滚动感知玻璃：静止时模糊透出页面背景，
+  // 滚动中自动退回高不透明纯色（无重采样），玻璃质感与流畅兼得。
   return theme.colorScheme.surface.withValues(alpha: dark ? .34 : .48);
 }
 
@@ -215,7 +217,7 @@ class _HomePageState extends ConsumerState<HomePage> {
   @override
   Widget build(BuildContext context) {
     // 「猜你想听」已移回探索页；正在播放、热评推荐、听歌统计、
-    // 听歌排行榜按设置中的模块开关动态显隐，默认仅保留听歌统计。
+    // 听歌排行榜按设置中的模块开关动态显隐，默认全部开启。
     final homeModules =
         ref.watch(
           settingsProvider.select((value) => value.valueOrNull?.homeModules),
@@ -820,8 +822,6 @@ class _ListeningStatisticsModule extends ConsumerWidget {
         statistics.when(
           loading: () => XyPanel(
             color: _homeGlassPanelColor(context),
-            // 低端手机上大半径 BackdropFilter 会在滚动时反复重采样整块背景。
-            // 10px 仍保留玻璃质感，但显著降低合成开销。
             blurSigma: 10,
             child: const _ModuleLoading(height: 190),
           ),
