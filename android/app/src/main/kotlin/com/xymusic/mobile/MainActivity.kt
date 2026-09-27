@@ -492,26 +492,58 @@ class MainActivity : AudioServiceActivity() {
                         }
                     }
                     "update" -> {
+                        val params = DesktopLyricsUpdateParams(
+                            lyric = call.argument<String>("lyric") ?: "",
+                            translation = call.argument<String>("translation") ?: "",
+                            wordsJson = call.argument<String>("wordsJson") ?: "[]",
+                            position = call.argument<Number>("position")?.toDouble() ?: 0.0,
+                            isPlaying = call.argument<Boolean>("isPlaying") == true,
+                            effectMode = call.argument<Number>("wordEffectMode")?.toInt() ?: 2,
+                            locked = call.argument<Boolean>("locked") == true,
+                            noBackground = call.argument<Boolean>("noBackground") != false,
+                            lyricColor = call.argument<Number>("lyricColor")?.toInt()
+                                ?: 0xFFFFFFFF.toInt(),
+                            translationColor = call.argument<Number>("translationColor")?.toInt()
+                                ?: 0xFFE1E1E6.toInt(),
+                            lyricFontSize = call.argument<Number>("lyricFontSize")?.toFloat() ?: 24f,
+                            translationFontSize = call.argument<Number>("translationFontSize")
+                                ?.toFloat() ?: 13f,
+                            backgroundColor = call.argument<Number>("backgroundColor")?.toInt()
+                                ?: 0xFF18181C.toInt(),
+                            backgroundOpacity = call.argument<Number>("backgroundOpacity")
+                                ?.toFloat() ?: .85f,
+                        )
+                        // 服务已在运行时直连分发，省去每次进度刷新的
+                        // startService binder 往返；未运行（被系统回收）时
+                        // 走 startService 拉起并携带完整状态恢复浮窗。
+                        val running = DesktopLyricsService.instance
+                        if (running != null) {
+                            try {
+                                running.applyUpdate(params)
+                                result.success(true)
+                            } catch (_: Exception) {
+                                result.success(false)
+                            }
+                            return@setMethodCallHandler
+                        }
                         try {
                             startService(
                                 Intent(this, DesktopLyricsService::class.java).apply {
                                     action = DesktopLyricsService.ACTION_UPDATE
-                                    putExtra("title", call.argument<String>("title") ?: "")
-                                    putExtra("artist", call.argument<String>("artist") ?: "")
-                                    putExtra("lyric", call.argument<String>("lyric") ?: "")
-                                    putExtra("translation", call.argument<String>("translation") ?: "")
-                                    putExtra("wordsJson", call.argument<String>("wordsJson") ?: "[]")
-                                    putExtra("position", call.argument<Number>("position")?.toDouble() ?: 0.0)
-                                    putExtra("isPlaying", call.argument<Boolean>("isPlaying") == true)
-                                    putExtra("wordEffectMode", call.argument<Number>("wordEffectMode")?.toInt() ?: 2)
-                                    putExtra("locked", call.argument<Boolean>("locked") == true)
-                                    putExtra("noBackground", call.argument<Boolean>("noBackground") != false)
-                                    putExtra("lyricColor", call.argument<Number>("lyricColor")?.toInt() ?: 0xFFFFFFFF.toInt())
-                                    putExtra("translationColor", call.argument<Number>("translationColor")?.toInt() ?: 0xFFE1E1E6.toInt())
-                                    putExtra("lyricFontSize", call.argument<Number>("lyricFontSize")?.toFloat() ?: 24f)
-                                    putExtra("translationFontSize", call.argument<Number>("translationFontSize")?.toFloat() ?: 13f)
-                                    putExtra("backgroundColor", call.argument<Number>("backgroundColor")?.toInt() ?: 0xFF18181C.toInt())
-                                    putExtra("backgroundOpacity", (call.argument<Number>("backgroundOpacity")?.toFloat() ?: .85f))
+                                    putExtra("lyric", params.lyric)
+                                    putExtra("translation", params.translation)
+                                    putExtra("wordsJson", params.wordsJson)
+                                    putExtra("position", params.position)
+                                    putExtra("isPlaying", params.isPlaying)
+                                    putExtra("wordEffectMode", params.effectMode)
+                                    putExtra("locked", params.locked)
+                                    putExtra("noBackground", params.noBackground)
+                                    putExtra("lyricColor", params.lyricColor)
+                                    putExtra("translationColor", params.translationColor)
+                                    putExtra("lyricFontSize", params.lyricFontSize)
+                                    putExtra("translationFontSize", params.translationFontSize)
+                                    putExtra("backgroundColor", params.backgroundColor)
+                                    putExtra("backgroundOpacity", params.backgroundOpacity)
                                 },
                             )
                             result.success(true)

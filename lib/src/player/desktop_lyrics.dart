@@ -12,10 +12,20 @@ class DesktopLyricsBridge {
 
   static const _channel = MethodChannel('com.xymusic.mobile/desktop_lyrics');
   static bool? _lastEnabled;
-  static String? _lastPayload;
+  static String? _lastContentSignature;
+  static bool? _lastIsPlayingSent;
+  static double _lastSentPosition = -1e9;
+  static DateTime _lastSendTime = DateTime.fromMillisecondsSinceEpoch(0);
   static String? _lyricsCacheKey;
   static Future<List<_DesktopLyricLine>>? _lyricsCacheFuture;
   static int _syncGeneration = 0;
+
+  static void _resetSendState() {
+    _lastContentSignature = null;
+    _lastIsPlayingSent = null;
+    _lastSentPosition = -1e9;
+    _lastSendTime = DateTime.fromMillisecondsSinceEpoch(0);
+  }
 
   static Future<bool> setEnabled(bool enabled) async {
     if (!Platform.isAndroid) return false;
@@ -27,7 +37,7 @@ class DesktopLyricsBridge {
       final accepted = result == true;
       if (accepted) {
         _lastEnabled = enabled;
-        if (!enabled) _lastPayload = null;
+        if (!enabled) _resetSendState();
       }
       return accepted;
     } on PlatformException {
@@ -37,9 +47,11 @@ class DesktopLyricsBridge {
     }
   }
 
-  /// 只在歌曲、当前歌词或样式真正变化时向原生浮窗发送文本，避免每个进度
-  /// 采样都跨一次 MethodChannel。歌词解析结果会缓存，支持播放详情页同款
-  /// displayLines/words 逐字数据。
+  /// 原生侧用 Choreographer 按墙钟时间前推播放位置并逐帧渲染渐进填充，
+  /// 因此 Dart 只需在「内容变化」（歌词行/翻译/样式/逐字数据/锁定）时
+  /// 立即推送，播放位置本身低频（500ms）校正一次漂移即可；暂停/恢复与
+  /// 大幅跳转（>0.35s，如 seek）立即推送。此前每 100~250ms 全量推送是
+  /// 桌面歌词卡顿的主因之一（每次都触发原生全量重建 + 基准回跳）。
   static Future<void> sync({
     required bool enabled,
     required bool locked,
@@ -63,7 +75,10 @@ class DesktopLyricsBridge {
       final accepted = await setEnabled(enabled);
       if (generation != _syncGeneration || !accepted || !enabled) return;
     }
-    if (!enabled) return;
+    if (!enabled) {
+      _resetSendState();
+      return;
+    }
     final current = await _resolveCurrentLyric(lyrics, position);
     // 解析歌词和 MethodChannel 都是异步的。高频进度更新时，较旧任务可能
     // 晚于新任务完成；必须丢弃它，否则刚切到下一句又会被上一句覆盖。
@@ -76,14 +91,37 @@ class DesktopLyricsBridge {
           )
           .toList(),
     );
-    final payload =
-        '$title\n$artist\n$lyric\n${current.translation}\n$wordsJson\n'
-        '$noBackground\n$lyricColor\n$translationColor\n'
-        '$lyricFontSize\n$translationFontSize\n'
-        '$backgroundColor\n$backgroundOpacity\n$position\n$isPlaying\n'
-        '$wordEffectMode\n$locked';
-    if (_lastPayload == payload) return;
-    _lastPayload = payload;
+    // 内容签名：除播放位置与播放态外的全部字段。签名不变说明只是进度
+    // 漂移，走低频校正；变化（换行/换样式/换锁定）立即推送。
+    final contentSignature = <Object?>[
+      title,
+      artist,
+      lyric,
+      current.translation,
+      wordsJson,
+      noBackground,
+      lyricColor,
+      translationColor,
+      lyricFontSize,
+      translationFontSize,
+      backgroundColor,
+      backgroundOpacity,
+      wordEffectMode,
+      locked,
+    ].join('\u0000');
+    final now = DateTime.now();
+    final positionDelta = (position - _lastSentPosition).abs();
+    final shouldSend =
+        contentSignature != _lastContentSignature ||
+        isPlaying != _lastIsPlayingSent ||
+        positionDelta > 0.35 ||
+        (now.difference(_lastSendTime) >= const Duration(milliseconds: 500) &&
+            positionDelta > 0.01);
+    if (!shouldSend) return;
+    _lastContentSignature = contentSignature;
+    _lastIsPlayingSent = isPlaying;
+    _lastSentPosition = position;
+    _lastSendTime = now;
     try {
       await _channel.invokeMethod<void>('update', <String, dynamic>{
         'title': title,

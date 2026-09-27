@@ -62,6 +62,7 @@ if (-not (Test-Path $androidSdk)) {
 $javaHome = "D:\Software\Java\jdk-25.0.4.1+1"
 if (-not (Test-Path $javaHome)) {
     foreach ($p in @(
+        "C:\Program Files\Zulu\zulu-17",
         "C:\Program Files\Eclipse Adoptium\jdk-17.0.20.8-hotspot",
         "C:\Program Files\Microsoft\jdk-21.0.9.10-hotspot"
     )) {

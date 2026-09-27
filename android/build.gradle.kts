@@ -1,5 +1,15 @@
 allprojects {
     repositories {
+        // Kotlin 2.2.20+ 起 kotlin-compiler-embeddable 的 jar 在 Maven Central
+        // 上被 301 重定向到 GitHub Releases；GitHub 不可达的网络环境下跟随
+        // 重定向会以连接错误终止整个解析（不会回退到后续仓库）。将 JetBrains
+        // Space 官方仓库置于最前（仅解析 org.jetbrains.kotlin 组），让元数据
+        // 与 jar 均直接命中，绕开重定向。
+        maven("https://maven.pkg.jetbrains.space/kotlin/p/kotlin/dev") {
+            content {
+                includeGroup("org.jetbrains.kotlin")
+            }
+        }
         google()
         mavenCentral()
     }
