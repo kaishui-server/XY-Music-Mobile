@@ -60,7 +60,9 @@ class EffectsPage extends ConsumerWidget {
               _AdvancedSection(settings: settings, notifier: notifier),
               const SizedBox(height: 16),
               Text(
-                '音效由 Rust DSP 引擎实时处理；变速变调即时生效，其余效果在播放时同步到引擎。',
+                '均衡器、前级与变速变调实时生效（系统原生音频引擎）；'
+                '混响、空间音效及高级音效由 Rust DSP 引擎处理，'
+                '在独占音频输出下播放时生效。',
                 style: TextStyle(
                   fontSize: 12,
                   color: Theme.of(context).colorScheme.outline,

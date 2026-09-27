@@ -685,4 +685,95 @@ void main() {
 
     expect(lyrics, '[1000,1200](1000,400,0)网(1400,400,0)易(1800,400,0)云');
   });
+
+  // 复现 cwo baka 订阅源 QQ 平台「沧浪歌」无歌词 bug：插件 getLyric
+  // 拿到 crypt:1 的十六进制密文后不解密直接透传。修复后宿主应拒绝
+  // 密文并走 QQ 平台直连兜底（c.y.qq.com 老接口，按 songmid 查询）。
+  test('QQ 音乐插件返回密文时拒绝并走老接口兜底（沧浪歌）', () async {
+    final directory = await Directory.systemTemp.createTemp(
+      'xy-music-qq-lyrics-',
+    );
+    final pluginFile = File(
+      '${directory.path}${Platform.pathSeparator}qq-lyrics.js',
+    );
+    await pluginFile.writeAsString(r'''
+      module.exports = {
+        platform: 'QQ音乐[L1]',
+        search: async () => ({ data: [] }),
+        getLyric: async () =>
+          '8e1f2a3b4c5d6e7f8e1f2a3b4c5d6e7f8e1f2a3b4c5d6e7f8e1f2a3b4c5d6e7f' +
+          '8e1f2a3b4c5d6e7f8e1f2a3b4c5d6e7f8e1f2a3b4c5d6e7f8e1f2a3b4c5d6e7f',
+      };
+    ''');
+    // 沧浪歌（songmid=003RbupC0mrIj3）老接口的真实响应。
+    const canglangLegacyResponse =
+        '{"retcode":0,"code":0,"subcode":0,"lyric":"WzAwOjAxLjcxXeS9nOivje+8mumdnuasogpbMDA6MDIuOTZd5L2c5puy77ya54aZ5pyI5pyI5aKo6L6eL+iRo+WtkOm+mQpbMDA6MDMuOTZd57yW5puy77ya5aKo6L6eL+iRo+WtkOm+mS/pub/ngq/pnJYKWzAwOjA1LjQ3XeWSjOWjsOe8luW9le+8muWwj+mbquS6ui/nhpnmnIjmnIgv57ud5q2MClswMDowNi43Ml3nrJvlrZDlrp7lvZXvvJrlsZXlrofvvIjlvJXllYblnYrvvIkKWzAwOjA3Ljk4XeW8puS5kOWunuW9le+8muWbvemZhemmluW4reeIseS5kOS5kOWbogpbMDA6MDkuMjRd5ZCJ5LuW5a6e5b2V77ya6JGj5a2Q6b6ZClswMDoxMC4yNF3liIbovajmt7fpn7PluIjvvJrmoqjphaMKWzAwOjExLjc0XeavjeW4pu+8muaiqOmFowpbMDA6MTIuNzVd57uf562577ya5aKo6L6eL+mYv+iIn05sZwpbMDA6MTQuMDBd55uR5Yi277ya5q+b5LiN5q2qL+WtkOasogpbMDA6MTUuNTFd5bWV5b2X5LiO5pe25LqG77ya5q2l6IyE5a+G5pepL1pUTiBTdHVkaW8KWzAwOjE2LjUxXemfs+S5kOaOqOW5v++8muWGrOaggC/lvZLkuIAv5pe25a6JClswMDoxNy43N13liLbkvZzlhazlj7jvvJrlrZDlpoLliJ3pn7PkuZDlt6XkvZzlrqQKWzAwOjE5LjAzXea1t+aKpeiuvuiuoe+8muiUk+S6iC/mna3lt57ku5/kur/kvKDlqpLmnInpmZDlhazlj7gKClswMDoyNS41NV3lpJrlsJHmg4Xku4fmganmgKgg5ZCM6LW06Z+25YWJClswMDozMS4zM13lh6DluqbnlJ/mrbvova7lm54g5pyA5piv5peg5bi4ClswMDozNy4xMF3mmK/kuI7pnZ4g5Lu75a6D5aSp5LiL5Y676K6yClswMDo0Mi42M13or7Tku5nlppYg5pyA5pyJ5Yir5peg5aaoCgpbMDA6NDguNDBd5oiR5bCG5rWu55Sf5Y6G5bC9IOeVmeS4gOi6q+S8pApbMDA6NTQuNDJd5Lu75oiR6L2s5LiW6YeN5p2lIOS+neaXp+mavuW/mApbMDA6NTkuOTRd562J5pyI5Y2OIOmTuuWcqOS9oOaIkei6q+S4igpbMDE6MDQuNDZd5Lmf566X5pivIOmZquS9oOS4gOS4lumVvwoKWzAxOjEwLjIzXeiAjOaIkei6q+S4lua1ruayiSDml6DnlY/pqofmtaog5aSp5Zyw5Lu75oiR6ZevClswMToxNS41MF3ljbTlnKjnrYnkvaAg5ouo5byA5Lq65rW35p2l5Yiw5oiR6Lqr5peBClswMToyMS41M13nrYnov4fpm6jpm6rpo47pnJwg5pel5aSN5pelIOaVheS6uuS4jeaVouW/mApbMDE6MjcuMzBd5pyJ5bm45LiO5ZCb55u46YCiIOWIu+WcqOW/g+S4igoKWzAxOjU3LjA4XeaIkeWwhua1rueUn+WOhuWwveeVmeS4gOi6q+S8pApbMDI6MDIuNjFd5Lu75oiR6L2s5LiW6YeN5p2l5L6d5pen6Zq+5b+YClswMjowOC4zOF3nrYnmnIjljY7pk7rlnKjkvaDmiJHouqvkuIoKWzAyOjEzLjE1XeS5n+eul+aYr+mZquS9oOS4gOS4lumVvwoKWzAyOjE4LjkyXeiAjOaIkei6q+S4lua1ruayiSDml6DnlY/pqofmtaog5aSp5Zyw5Lu75oiR6ZevClswMjoyNC4xOV3ljbTlnKjnrYnkvaAg5ouo5byA5Lq65rW35p2l5Yiw5oiR6Lqr5peBClswMjozMC4yMl3nrYnov4fpm6jpm6rpo47pnJwg5pel5aSN5pelIOaVheS6uuS4jeaVouW/mApbMDI6MzUuOTld5pyJ5bm45ZCb55u46YCiIOWIu+WcqOW/g+S4igoKWzAyOjQyLjAyXeWlveWcqOS9oOS7jeaYr+S9oCDmiJHkuqbmmK/miJEg5oCO6aG75LuW5Lq66K6yClswMjo0Ny41N13ml6DkurrkvZzmopcg5pC65omL5Lq66Ze05q2k55Sf5bqU5LiN5p6JClswMjo1My4xMF3lkIzljoblr5LmnaXmmpHlvoAg5bm05aSN5bm0IOa3sea4iuWPiOS9leWmqApbMDI6NTguNjJd57uI5b2S5pyJ5L2g5LiO5oiRIOi4j+egtOayp+a1qgoKWzAzOjA1LjM5XeeJueWIq+m4o+iwou+8mgpbMDM6MDYuNDBd6aOT6aOO5bel5L2c5a6kClswMzowNy42NV3mqLHmoYPmtL7lr7lNQ04KWzAzOjA4LjkxXeadreW3nuS7n+S6v+S8oOWqkuaciemZkOWFrOWPuApbMDM6MDkuOTFd5bm/6KW/6IKG6IKG5aO56Zu26Zu25paH5YyW56eR5oqA5pyJ6ZmQ5YWs5Y+4ClswMzoyMi4wMF0=","trans":""}';
+    final client = MockClient((request) async {
+      if (request.url.host == 'c.y.qq.com') {
+        expect(request.url.path, '/lyric/fcgi-bin/fcg_query_lyric_new.fcg');
+        expect(request.url.queryParameters['songmid'], '003RbupC0mrIj3');
+        return http.Response(
+          canglangLegacyResponse,
+          200,
+          headers: {'content-type': 'application/json; charset=utf-8'},
+        );
+      }
+      return http.Response('{}', 200);
+    });
+    final service = PluginRuntimeService(httpClient: client);
+    addTearDown(() async {
+      service.dispose();
+      client.close();
+      await directory.delete(recursive: true);
+    });
+
+    final lyrics = await service.getLyrics(
+      EnabledMusicPlugin(id: 'qq', name: 'QQ音乐[L1]', path: pluginFile.path),
+      const {
+        'platform': 'QQ音乐[L1]',
+        'name': '沧浪歌',
+        'id': '374735399',
+        'mid': '003RbupC0mrIj3',
+      },
+    );
+
+    // 密文被拒绝，兜底返回沧浪歌真实歌词（首行与正文）。
+    expect(lyrics, contains('[00:01.71]作词：非欢'));
+    expect(lyrics, contains('[02:58.62]终归有你与我 踏破沧浪'));
+    expect(lyrics, isNot(contains('8e1f2a3b')));
+  });
+
+  test('插件歌词为密文且无兜底来源时返回空串而非乱码', () async {
+    final directory = await Directory.systemTemp.createTemp(
+      'xy-music-encrypted-lyrics-',
+    );
+    final pluginFile = File(
+      '${directory.path}${Platform.pathSeparator}encrypted.js',
+    );
+    await pluginFile.writeAsString(r'''
+      module.exports = {
+        platform: '聚合测试',
+        search: async () => ({ data: [] }),
+        getLyric: async () =>
+          'deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef' +
+          'deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef',
+      };
+    ''');
+    final client = MockClient(
+      (_) async => http.Response('{}', 200),
+    );
+    final service = PluginRuntimeService(httpClient: client);
+    addTearDown(() async {
+      service.dispose();
+      client.close();
+      await directory.delete(recursive: true);
+    });
+
+    final lyrics = await service.getLyrics(
+      EnabledMusicPlugin(id: 'mixed', name: '聚合测试', path: pluginFile.path),
+      const {'name': '测试歌曲'},
+    );
+
+    expect(lyrics, '');
+  });
 }

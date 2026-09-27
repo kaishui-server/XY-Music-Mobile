@@ -19,6 +19,281 @@ late JustAudioPlatform _platform;
 /// 未初始化（JustAudioBackground.init 尚未调用）时抛出 LateInitializationError。
 SwitchAudioHandler get xySwitchAudioHandler => _audioHandler;
 
+/// XY Music 本地补丁：跨代理链的均衡器门面。
+///
+/// 真实平台播放器在 [_initPlayer] 时被注入原生 AndroidEqualizer（默认
+/// 停用），本门面在其首次 load（audio session attach、原生均衡器创建）
+/// 之后按需读写。未就绪时缓存开关与增益，load 完成后自动重放；audio
+/// session 变化重建均衡器也会触发重放。宿主应用直接读写本门面，外层
+/// just_audio 播放器不再挂任何音频效果。
+final XyAndroidEqualizer xyAndroidEqualizer = XyAndroidEqualizer();
+
+/// XY Music 本地补丁：响度增益（LoudnessEnhancer）门面。
+///
+/// 与 [xyAndroidEqualizer] 同机制：真实平台播放器在 [_initPlayer] 时被
+/// 注入原生 AndroidLoudnessEnhancer（默认停用），供宿主实现均衡器前级
+/// （preamp）、音量增强等整体 dB 增益。未就绪时缓存，load 后重放。
+final XyAndroidLoudnessEnhancer xyLoudnessEnhancer =
+    XyAndroidLoudnessEnhancer();
+
+/// 均衡器单个频段的可读信息。
+class XyEqualizerBandInfo {
+  const XyEqualizerBandInfo({
+    required this.index,
+    required this.centerFrequency,
+    required this.gain,
+  });
+
+  /// 频段下标（从 0 开始）。
+  final int index;
+
+  /// 中心频率（Hz）。
+  final double centerFrequency;
+
+  /// 当前增益（dB）。
+  final double gain;
+}
+
+/// 均衡器整体的可读信息。
+class XyEqualizerInfo {
+  const XyEqualizerInfo({
+    required this.minDecibels,
+    required this.maxDecibels,
+    required this.bands,
+  });
+
+  final double minDecibels;
+  final double maxDecibels;
+  final List<XyEqualizerBandInfo> bands;
+}
+
+class XyAndroidEqualizer {
+  AudioPlayerPlatform? _platform;
+
+  /// 是否已完成过至少一次 load（原生均衡器已随 audio session 创建）。
+  bool _sourceLoaded = false;
+
+  /// 缓存的开关状态与各频段增益（dB），load 后重放。
+  bool _enabled = false;
+  final Map<int, double> _bandGains = {};
+
+  /// 最近一次 [applyMapped] 的入参缓存：load 后重放时按（可能更新的）
+  /// 原生频段重新插值映射。
+  List<double>? _mappedSourceGains;
+  List<double>? _mappedSourceFreqs;
+
+  /// 原生均衡器真实频段的中心频率缓存（Hz，按下标对应）。
+  /// 首次成功读取后缓存，播放器重建（_bind）时清空。
+  List<double>? _nativeBandFreqs;
+
+  void _bind(AudioPlayerPlatform platform) {
+    _platform = platform;
+    _sourceLoaded = false;
+    _nativeBandFreqs = null;
+  }
+
+  Future<void> _onSourceLoaded() async {
+    _sourceLoaded = true;
+    await _refreshNativeBands();
+    await _reapply();
+  }
+
+  /// 读取原生均衡器真实频段参数并缓存中心频率。失败（均衡器尚未就绪
+  /// 或平台不支持）时保持缓存为空，重放退化为按下标直写。
+  Future<void> _refreshNativeBands() async {
+    final platform = _platform;
+    if (platform == null || !_sourceLoaded) return;
+    if (_nativeBandFreqs != null) return;
+    try {
+      final response = await platform
+          .androidEqualizerGetParameters(AndroidEqualizerGetParametersRequest());
+      final freqs = [
+        for (final band in response.parameters.bands) band.centerFrequency,
+      ];
+      if (freqs.isNotEmpty) _nativeBandFreqs = freqs;
+    } catch (_) {
+      // 原生均衡器暂不可用：保持缓存为空，下次 load 后重试。
+    }
+  }
+
+  /// 把缓存的开关与增益写入真实平台播放器上的原生均衡器。
+  /// 均衡器尚未创建（切换音源瞬间）时静默失败，下次 load 后重放。
+  Future<void> _reapply() async {
+    final platform = _platform;
+    if (platform == null || !_sourceLoaded) return;
+    try {
+      await platform.audioEffectSetEnabled(AudioEffectSetEnabledRequest(
+        type: 'AndroidEqualizer',
+        enabled: _enabled,
+      ));
+      for (final entry in _bandGains.entries) {
+        await platform.androidEqualizerBandSetGain(
+          AndroidEqualizerBandSetGainRequest(
+            bandIndex: entry.key,
+            gain: entry.value,
+          ),
+        );
+      }
+    } catch (_) {
+      // 原生均衡器暂不可用：保留缓存，待下次 load 完成后重放。
+    }
+  }
+
+  /// 读取均衡器参数（频段列表、dB 范围、各频段当前增益）。
+  /// 播放器尚未 load 或均衡器尚未就绪时返回 null，宿主可稍后重试。
+  Future<XyEqualizerInfo?> readInfo() async {
+    final platform = _platform;
+    if (platform == null || !_sourceLoaded) return null;
+    try {
+      final response = await platform
+          .androidEqualizerGetParameters(AndroidEqualizerGetParametersRequest());
+      final message = response.parameters;
+      return XyEqualizerInfo(
+        minDecibels: message.minDecibels,
+        maxDecibels: message.maxDecibels,
+        bands: [
+          for (final band in message.bands)
+            XyEqualizerBandInfo(
+              index: band.index,
+              centerFrequency: band.centerFrequency,
+              gain: band.gain,
+            ),
+        ],
+      );
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// 设置均衡器开关（未就绪时缓存，load 后生效）。
+  Future<void> setEnabled(bool enabled) async {
+    _enabled = enabled;
+    await _reapply();
+  }
+
+  /// 设置单个频段增益（dB，未就绪时缓存，load 后生效）。
+  Future<void> setBandGain(int index, double gain) async {
+    _bandGains[index] = gain;
+    await _reapply();
+  }
+
+  /// 整份应用：开关 + 按下标排列的各频段增益（多余的忽略，缺失的补 0）。
+  Future<void> apply({
+    required bool enabled,
+    required List<double> gains,
+  }) async {
+    _enabled = enabled;
+    _bandGains
+      ..clear()
+      ..addAll({
+        for (var i = 0; i < gains.length; i++) i: gains[i],
+      });
+    await _reapply();
+  }
+
+  /// 按频段中心频率映射应用：宿主的均衡器 UI 通常是固定频段（如 10 段
+  /// 31Hz~16kHz），而原生均衡器频段数由设备决定（常见 5 段）。这里把
+  /// 宿主各频段增益在对数频率轴上插值到原生频段，避免下标错位导致
+  /// 「低频滑杆改的是中频」甚至越界失败。
+  ///
+  /// 未就绪时缓存入参，load 后自动重放（重放时会重新读取原生频段）。
+  Future<void> applyMapped({
+    required bool enabled,
+    required List<double> gains,
+    required List<double> centerFrequencies,
+  }) async {
+    _enabled = enabled;
+    _mappedSourceGains = List<double>.of(gains);
+    _mappedSourceFreqs = List<double>.of(centerFrequencies);
+    await _refreshNativeBands();
+    await _remapAndReapply();
+  }
+
+  Future<void> _remapAndReapply() async {
+    final gains = _mappedSourceGains;
+    final freqs = _mappedSourceFreqs;
+    if (gains == null || freqs == null) return;
+    final nativeFreqs = _nativeBandFreqs;
+    _bandGains.clear();
+    if (nativeFreqs == null || nativeFreqs.isEmpty) {
+      // 原生频段未知（均衡器未就绪）：按下标直写，与旧行为兼容。
+      _bandGains.addAll({
+        for (var i = 0; i < gains.length; i++) i: gains[i],
+      });
+    } else {
+      for (var i = 0; i < nativeFreqs.length; i++) {
+        _bandGains[i] = _interpolateGain(freqs, gains, nativeFreqs[i]);
+      }
+    }
+    await _reapply();
+  }
+
+  /// 对数频率轴插值：目标频率在 [freqs] 相邻两点之间线性插值，
+  /// 超出范围时取端点值。
+  static double _interpolateGain(
+    List<double> freqs,
+    List<double> gains,
+    double target,
+  ) {
+    if (freqs.isEmpty) return 0;
+    if (target <= freqs.first) return gains.first;
+    if (target >= freqs.last) return gains.last;
+    final logTarget = log(target);
+    for (var i = 1; i < freqs.length; i++) {
+      if (target <= freqs[i]) {
+        final span = log(freqs[i]) - log(freqs[i - 1]);
+        if (span <= 0) return gains[i];
+        final t = (logTarget - log(freqs[i - 1])) / span;
+        return gains[i - 1] + (gains[i] - gains[i - 1]) * t;
+      }
+    }
+    return gains.last;
+  }
+}
+
+/// 响度增益门面：整体 dB 增益（如均衡器前级、音量增强），挂载在真实
+/// 平台播放器的原生 AndroidLoudnessEnhancer 上。生命周期与
+/// [XyAndroidEqualizer] 一致（bind/load 重放）。
+class XyAndroidLoudnessEnhancer {
+  AudioPlayerPlatform? _platform;
+  bool _sourceLoaded = false;
+  bool _enabled = false;
+  double _targetGain = 0;
+
+  void _bind(AudioPlayerPlatform platform) {
+    _platform = platform;
+    _sourceLoaded = false;
+  }
+
+  Future<void> _onSourceLoaded() async {
+    _sourceLoaded = true;
+    await _reapply();
+  }
+
+  Future<void> _reapply() async {
+    final platform = _platform;
+    if (platform == null || !_sourceLoaded) return;
+    try {
+      await platform.audioEffectSetEnabled(AudioEffectSetEnabledRequest(
+        type: 'AndroidLoudnessEnhancer',
+        enabled: _enabled,
+      ));
+      await platform.androidLoudnessEnhancerSetTargetGain(
+        AndroidLoudnessEnhancerSetTargetGainRequest(targetGain: _targetGain),
+      );
+    } catch (_) {
+      // 原生响度增益暂不可用：保留缓存，待下次 load 完成后重放。
+    }
+  }
+
+  /// 应用整体增益（dB）。未就绪时缓存，load 后自动重放。
+  Future<void> apply({required bool enabled, required double targetGain}) async {
+    _enabled = enabled;
+    _targetGain = targetGain;
+    await _reapply();
+  }
+}
+
 /// Provides the [init] method to initialise just_audio for background playback.
 class JustAudioBackground {
   /// Initialise just_audio for background playback. This should be called from
@@ -178,7 +453,16 @@ class _JustAudioPlayer extends AudioPlayerPlatform {
   _JustAudioPlayer({required this.initRequest}) : super(initRequest.id) {
     eventController.onCancel = _playerAudioHandler.cancelStreamSubscriptions;
     _playerAudioHandler._initPlayer(initRequest);
-    _audioHandler.inner = _playerAudioHandler;
+    // XY Music 本地补丁：重建播放器实例时保留宿主已安装的媒体会话
+    // 桥接（_MediaSessionBridge 套在 _playerAudioHandler 外层）。若此时
+    // 无条件把 inner 换回裸 handler，通知栏切歌/收藏/播放模式按钮会
+    // 静默失效，直到宿主下次点播兜底重装。仅当 inner 仍是初始占位
+    // BaseAudioHandler 或裸 _PlayerAudioHandler 时才执行常规挂载。
+    final currentInner = _audioHandler.inner;
+    if (identical(currentInner, _playerAudioHandler) ||
+        currentInner.runtimeType == BaseAudioHandler) {
+      _audioHandler.inner = _playerAudioHandler;
+    }
     _audioHandler.customEvent
         .whereType<PlaybackEventMessage>()
         .listen(eventController.add);
@@ -387,7 +671,89 @@ class _PlayerAudioHandler extends BaseAudioHandler
 
   Future<void> _initPlayer(InitRequest initRequest) =>
       _lock.synchronized(() async {
-        final player = await _platform.init(initRequest);
+        // XY Music 本地补丁：外层播放器不能经管线挂 AndroidEqualizer——
+        // 其激活请求发生在首次 load 之前，而 Java 侧均衡器要等 ExoPlayer
+        // attach 到 audio session（首次 load/prepare）才创建，提前取参
+        // getNumberOfBands 空指针会中断 setPlatform，播放链路卡死。
+        //
+        // 修复方式：在真实平台播放器初始化时注入原生均衡器，但必须提供
+        // 非空的默认 parameters，避免 just_audio 在 setPlatform 阶段主动
+        // 调用 getNumberOfBands / getBandLevelRange 等方法读取参数。
+        // 首次 load 完成后 audio session 建立，再由 xyAndroidEqualizer
+        // 门面按需读写真实参数。
+        //
+        // 默认参数用 5 频段常见值占位（±15dB 范围），仅用于避免空指针，
+        // 真实设备参数由 readInfo() 首次 load 后刷新。
+        final defaultBands = [
+          AndroidEqualizerBandMessage(
+            index: 0,
+            lowerFrequency: 30,
+            upperFrequency: 120,
+            centerFrequency: 60,
+            gain: 0,
+          ),
+          AndroidEqualizerBandMessage(
+            index: 1,
+            lowerFrequency: 120,
+            upperFrequency: 460,
+            centerFrequency: 230,
+            gain: 0,
+          ),
+          AndroidEqualizerBandMessage(
+            index: 2,
+            lowerFrequency: 460,
+            upperFrequency: 1800,
+            centerFrequency: 910,
+            gain: 0,
+          ),
+          AndroidEqualizerBandMessage(
+            index: 3,
+            lowerFrequency: 1800,
+            upperFrequency: 7200,
+            centerFrequency: 3600,
+            gain: 0,
+          ),
+          AndroidEqualizerBandMessage(
+            index: 4,
+            lowerFrequency: 7200,
+            upperFrequency: 20000,
+            centerFrequency: 14000,
+            gain: 0,
+          ),
+        ];
+        final defaultParams = AndroidEqualizerParametersMessage(
+          minDecibels: -15,
+          maxDecibels: 15,
+          bands: defaultBands,
+        );
+        final realInit = InitRequest(
+          id: initRequest.id,
+          audioLoadConfiguration: initRequest.audioLoadConfiguration,
+          androidAudioEffects: [
+            ...initRequest.androidAudioEffects.where((effect) =>
+                effect is! AndroidEqualizerMessage &&
+                effect is! AndroidLoudnessEnhancerMessage),
+            AndroidEqualizerMessage(
+              enabled: false,
+              parameters: defaultParams,
+            ),
+            // 响度增益（整体 dB）与均衡器同机制注入：默认停用 + 占位
+            // 参数，宿主经 xyLoudnessEnhancer 门面在 load 后按需启用。
+            AndroidLoudnessEnhancerMessage(
+              enabled: false,
+              targetGain: 0,
+            ),
+          ],
+          darwinAudioEffects: initRequest.darwinAudioEffects,
+          androidAudioOffloadPreferences:
+              initRequest.androidAudioOffloadPreferences,
+          androidOffloadSchedulingEnabled:
+              initRequest.androidOffloadSchedulingEnabled,
+          useLazyPreparation: initRequest.useLazyPreparation,
+        );
+        final player = await _platform.init(realInit);
+        xyAndroidEqualizer._bind(player);
+        xyLoudnessEnhancer._bind(player);
         _playerCompleter.complete(player);
         final playbackEventMessageStream = player.playbackEventMessageStream;
         _trackInfoSubscription = playbackEventMessageStream
@@ -455,6 +821,11 @@ class _PlayerAudioHandler extends BaseAudioHandler
       initialPosition: request.initialPosition,
       initialIndex: request.initialIndex,
     ));
+    // XY Music 本地补丁：load 完成（audio session attach、原生均衡器就绪）
+    // 后重放门面缓存的开关与增益——audio session 变化会重建原生均衡器
+    // 并把增益复位为 0。异步执行不阻塞 load 返回。
+    unawaited(xyAndroidEqualizer._onSourceLoaded());
+    unawaited(xyLoudnessEnhancer._onSourceLoaded());
     return LoadResponse(duration: response.duration);
   }
 
@@ -774,9 +1145,13 @@ class _PlayerAudioHandler extends BaseAudioHandler
     final controls = [
       if (hasPrevious) MediaControl.skipToPrevious,
       if (_playing) MediaControl.pause else MediaControl.play,
-      MediaControl.stop,
       if (hasNext) MediaControl.skipToNext,
     ];
+    // XY Music 本地补丁：通知栏不再放停止/桌面歌词等按钮。系统媒体
+    // 通知由宿主 _MediaSessionBridge 完全重建控件列表（收藏/上一首/
+    // 播放暂停/下一首/播放模式五键布局）；未装桥接时原生层也会强制
+    // 置位切歌 action bits（AudioService.java），保证 Android 13+
+    // 系统媒体卡片仍显示上一首/下一首。
     playbackState.add(playbackState.nvalue!.copyWith(
       controls: controls,
       systemActions: {
@@ -784,9 +1159,10 @@ class _PlayerAudioHandler extends BaseAudioHandler
         MediaAction.seekForward,
         MediaAction.seekBackward,
       },
-      androidCompactActionIndices: List.generate(controls.length, (i) => i)
-          .where((i) => controls[i].action != MediaAction.stop)
-          .toList(),
+      androidCompactActionIndices: List.generate(
+        controls.length,
+        (i) => i,
+      ),
       processingState: _justAudioEvent.errorCode != null
           ? AudioProcessingState.error
           : const {

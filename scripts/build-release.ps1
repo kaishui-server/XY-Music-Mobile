@@ -98,8 +98,11 @@ if (-not $SkipBuild) {
     if ($versionLine.Line -match "\+(\d+)\s*$") { $currentBuild = [int]$Matches[1] }
     $nextBuild = [Math]::Max($currentBuild + 1, 5001)
     $newLine = "version: $currentVersion+$nextBuild"
-    # 用无 BOM 的 UTF-8 写回，避免 PowerShell 5.1 的 UTF8 编码带 BOM 破坏 YAML 解析。
-    $newContent = (Get-Content $sourcePubspec) |
+    # 用无 BOM 的 UTF-8 读写：PowerShell 5.1 的 Get-Content 默认按 ANSI
+    # 解码，会把 pubspec 里的 UTF-8 中文注释读成乱码再写回，导致
+    # flutter_localizations 等条目被吞进注释、YAML 解析失败。
+    $newContent = [System.IO.File]::ReadAllLines(
+        $sourcePubspec, [System.Text.UTF8Encoding]::new($false)) |
         ForEach-Object { if ($_ -match "^version:") { $newLine } else { $_ } }
     [System.IO.File]::WriteAllLines($sourcePubspec, $newContent, (New-Object System.Text.UTF8Encoding($false)))
     Write-Host "[build-release] 构建号: $currentBuild -> $nextBuild（版本名 $currentVersion 不变）" -ForegroundColor Cyan

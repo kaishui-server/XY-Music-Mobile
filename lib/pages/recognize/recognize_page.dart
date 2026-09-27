@@ -10,6 +10,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import '../../src/favorites/favorites_provider.dart';
 import '../../src/library/library_provider.dart';
+import '../../src/navigation/sidebar_controller.dart';
 import '../../src/recognize/recognize_service.dart';
 import '../../src/recognize/system_audio_capture.dart';
 import '../../src/rust/api.dart';
@@ -331,6 +332,7 @@ class _RecognizePageState extends ConsumerState<RecognizePage>
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
+        leading: const AppSidebarMenuButton(),
         title: const Text('听歌识曲'),
         actions: [
           if (_isBusy)

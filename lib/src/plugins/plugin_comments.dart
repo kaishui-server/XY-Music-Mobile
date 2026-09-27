@@ -124,12 +124,66 @@ Future<CommentPage?> fetchSongComments({
     pluginName: plugin.name,
     musicInfo: musicItem,
   );
-  if (platform == null) return null;
-  return fetchPlatformComments(
-    platform: platform,
-    musicInfo: musicItem,
+  if (platform == null) {
+    // 平台识别失败（聚合音源常见）：惜梦 v2/v3 插件按后端地址兜底。
+    return _fetchAnimemusicComments(
+      plugin: plugin,
+      pluginData: pluginData,
+      lxInfo: lxInfo,
+      runtime: runtime,
+      page: page,
+    );
+  }
+  try {
+    final direct = await fetchPlatformComments(
+      platform: platform,
+      musicInfo: musicItem,
+      page: page,
+    );
+    if (direct != null && direct.items.isNotEmpty) return direct;
+    // 平台直连成功但空结果：惜梦系插件继续走后端兜底（baka 版无
+    // getMusicComments，wy 等直连接口失效时返回空页面不抛异常，
+    // animemusic 后端 music/comment 仍可能返回评论）；普通插件维持
+    // 直连结果，避免把「暂无评论」误报成加载失败。
+    if (plugin.animemusicApi.trim().isEmpty) return direct;
+  } catch (_) {
+    // 平台直连失败（接口失效/需签名）：惜梦 v2/v3 插件按后端地址兜底。
+  }
+  return _fetchAnimemusicComments(
+    plugin: plugin,
+    pluginData: pluginData,
+    lxInfo: lxInfo,
+    runtime: runtime,
     page: page,
   );
+}
+
+/// 惜梦聚合插件（v2 洛雪版 / v3 MusicFree 版）评论兜底：插件本体不含
+/// 评论方法，由宿主直连 animemusic 后端 music/comment。LX 歌曲的 lx
+/// 元数据包一层再交给 runtime，保持与 _animemusicSongRef 的解析约定。
+Future<CommentPage?> _fetchAnimemusicComments({
+  required EnabledMusicPlugin plugin,
+  required Map<String, dynamic> pluginData,
+  required dynamic lxInfo,
+  required PluginRuntimeService runtime,
+  required int page,
+}) async {
+  if (plugin.animemusicApi.trim().isEmpty) return null;
+  try {
+    final musicItem = lxInfo is Map
+        ? <String, dynamic>{...pluginData, 'lx': Map<String, dynamic>.from(lxInfo)}
+        : pluginData;
+    final result = await runtime
+        .getAnimemusicComments(plugin, musicItem, page)
+        .timeout(const Duration(seconds: 15));
+    final parsed = _parsePluginResult(result);
+    if (parsed != null && (parsed.items.isNotEmpty || parsed.isEnd)) {
+      return parsed;
+    }
+  } catch (_) {
+    // 后端不可用或该平台暂无评论接口，返回 null 由 UI 提示。
+  }
+  return null;
 }
 
 /// 规范化传给插件的 musicItem：补充 platform 与常见字段别名
@@ -192,6 +246,16 @@ String? detectCommentPlatform({
   final sourceKey = musicInfo?['source'];
   if (sourceKey is String && lxCodes.containsKey(sourceKey)) {
     return lxCodes[sourceKey];
+  }
+
+  // 星海聚合插件（v4）的歌曲带 _src/_source 来源标记，baka 版歌曲带
+  // animeSrc 来源标记，值均为平台码。
+  final starSrc =
+      musicInfo?['_src'] ??
+      musicInfo?['_source'] ??
+      musicInfo?['animeSrc'];
+  if (starSrc is String && lxCodes.containsKey(starSrc)) {
+    return lxCodes[starSrc];
   }
 
   var haystack = pluginName ?? '';

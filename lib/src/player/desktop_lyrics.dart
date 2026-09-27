@@ -47,6 +47,7 @@ class DesktopLyricsBridge {
     required String artist,
     required String lyrics,
     required double position,
+    required bool isPlaying,
     required bool noBackground,
     required int lyricColor,
     required int translationColor,
@@ -79,7 +80,8 @@ class DesktopLyricsBridge {
         '$title\n$artist\n$lyric\n${current.translation}\n$wordsJson\n'
         '$noBackground\n$lyricColor\n$translationColor\n'
         '$lyricFontSize\n$translationFontSize\n'
-        '$backgroundColor\n$backgroundOpacity\n$position\n$wordEffectMode\n$locked';
+        '$backgroundColor\n$backgroundOpacity\n$position\n$isPlaying\n'
+        '$wordEffectMode\n$locked';
     if (_lastPayload == payload) return;
     _lastPayload = payload;
     try {
@@ -90,6 +92,7 @@ class DesktopLyricsBridge {
         'translation': current.translation,
         'wordsJson': wordsJson,
         'position': position,
+        'isPlaying': isPlaying,
         'wordEffectMode': wordEffectMode,
         'locked': locked,
         'noBackground': noBackground,

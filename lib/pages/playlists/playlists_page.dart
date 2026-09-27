@@ -12,6 +12,7 @@ import '../../src/playlists/playlists_provider.dart';
 import '../../src/playlists/playlist_sync.dart';
 import '../../src/playlists/musicfree_backup_import.dart';
 import '../../src/library/library_provider.dart';
+import '../../src/navigation/sidebar_controller.dart';
 import '../../src/plugins/lx_playlist_import.dart';
 import '../../src/plugins/plugin_runtime.dart';
 import '../../src/player/player_provider.dart';
@@ -534,6 +535,7 @@ class _PlaylistsPageState extends ConsumerState<PlaylistsPage> {
     final playlists = ref.watch(playlistsProvider);
     return Scaffold(
       appBar: AppBar(
+        leading: const AppSidebarMenuButton(),
         title: Text(_selectionMode ? '已选择 ${_selectedIds.length} 个歌单' : '我的歌单'),
         actions: [
           if (_selectionMode) ...[
@@ -842,9 +844,10 @@ class _NetworkPlaylistImportDialogState
   static List<String> _lxPluginSources(EnabledMusicPlugin plugin) =>
       plugin.lxSources.isEmpty ? kLxSourceIds : plugin.lxSources;
 
-  /// 插件类型标记：Baka 系 / MusicFree。
+  /// 插件类型标记：按订阅源 URL 前缀识别（Baka / 惜梦 / MusicFree），
+  /// 详见 plugin_runtime 的 pluginSourceTag。
   static String _pluginTag(EnabledMusicPlugin plugin) =>
-      plugin.name.toLowerCase().contains('baka') ? 'Baka' : 'MusicFree';
+      pluginSourceTag(plugin);
 
   Future<void> _submit(List<EnabledMusicPlugin> plugins) async {
     final input = _idController.text.trim();

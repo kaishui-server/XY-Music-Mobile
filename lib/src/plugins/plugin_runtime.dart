@@ -25,11 +25,13 @@ class EnabledMusicPlugin {
     required this.path,
     this.isLx = false,
     this.lxSources = const [],
+    this.isBaka = false,
     this.isAnimemusic = false,
     this.animemusicApi = '',
     this.animemusicPlatform = 'wy',
     this.animemusicQualities = const ['128k', '192k', '320k', 'flac'],
     this.userVariables = const {},
+    this.sourceUrl = '',
   });
 
   final String id;
@@ -37,6 +39,10 @@ class EnabledMusicPlugin {
   final String path;
   final bool isLx;
   final List<String> lxSources;
+
+  /// BakaMusic 契约插件（getMvSource 方法 / animeSrc 来源标记），优先级
+  /// 低于 LX、高于 animemusic，与插件管理页的分类规则一致。
+  final bool isBaka;
 
   /// animemusic/1 自有格式插件：CommonJS Node 模块，QuickJS 无法直接
   /// 执行（没有 http/https/zlib 内置模块），宿主按其 REST 契约直连。
@@ -53,6 +59,10 @@ class EnabledMusicPlugin {
 
   /// 用户在插件管理中填写的用户变量值，加载插件时注入 env。
   final Map<String, String> userVariables;
+
+  /// 插件的订阅来源地址（安装/更新时记录），供音源分类按 URL 前缀
+  /// 识别（Baka / 惜梦 / MusicFree）。
+  final String sourceUrl;
 }
 
 class PluginSearchSong {
@@ -425,12 +435,18 @@ Future<List<EnabledMusicPlugin>> loadEnabledMusicPlugins(Ref ref) async {
         path: file.path,
         isLx: isLx,
         lxSources: isLx ? _detectLxSources(source) : const [],
+        // 分类优先级与插件管理页一致：LX > BakaMusic > animemusic。
+        isBaka: !isLx && !isAnimemusic && metadata.isBaka,
         isAnimemusic: isAnimemusic,
         animemusicApi:
             (savedVariables[id]?['api']?.trim().isNotEmpty == true
                 ? savedVariables[id]!['api']!.trim()
                 : _rewriteAnimemusicApiPort(
-                    animemusicMeta['api']?.trim() ?? '',
+                    animemusicMeta['api']?.trim().isNotEmpty == true
+                        ? animemusicMeta['api']!.trim()
+                        // v2/v3 聚合插件没有 META.api，从脚本 API_URL 提取，
+                        // 供歌词/评论直连后端兜底。
+                        : _extractAnimemusicFallbackApi(source),
                     sourceUrls[id] ?? '',
                   )),
         animemusicPlatform:
@@ -446,6 +462,7 @@ Future<List<EnabledMusicPlugin>> loadEnabledMusicPlugins(Ref ref) async {
                   .toList())
             : const ['128k', '192k', '320k', 'flac'],
         userVariables: savedVariables[id] ?? const {},
+        sourceUrl: sourceUrls[id] ?? '',
       ),
     );
   }
@@ -569,6 +586,28 @@ Map<String, String> _extractAnimemusicMeta(String source) {
   }
 }
 
+/// 从惜梦聚合插件（v2 洛雪版 / v3 MusicFree 版）脚本中提取后端地址：
+/// 两类脚本都以 `const API_URL = ".../index.php"` 声明后端，并调用
+/// `/music/url` 路由解析播放地址；本体只实现播放，歌词与评论由宿主
+/// 按该地址直连 REST 兜底。
+String _extractAnimemusicFallbackApi(String source) {
+  if (!source.contains('/music/url')) return '';
+  final match = RegExp(
+    r'''API_URL\s*=\s*["'](https?://[^"']*?/index\.php(?:\?[^"']*)?)["']''',
+  ).firstMatch(source);
+  if (match != null) return match.group(1)!.trim();
+  // baka 版（animemusic.bzxhkj.com/baka）：无 API_URL 常量，脚本以
+  // FALLBACK_BASE（站点根）拼接 `?route=music/url` 调用；站点根实际
+  // 只有数据面板，REST 入口在 /v1/index.php（与 v2/v3/v4 的 API_URL
+  // 同源）。提取站点根后补全入口路径。
+  final base = RegExp(
+    r'''(?:FALLBACK_BASE|DEFAULT_BASE)\s*=\s*["'](https?://[^"']+?)["']''',
+  ).firstMatch(source);
+  final origin = base?.group(1)?.trim().replaceAll(RegExp(r'/+$'), '');
+  if (origin == null || origin.isEmpty) return '';
+  return '$origin/v1/index.php';
+}
+
 final enabledMusicPluginsProvider = FutureProvider<List<EnabledMusicPlugin>>(
   loadEnabledMusicPlugins,
 );
@@ -615,6 +654,12 @@ class PluginRuntimeService {
   static const Duration _mediaSourceCacheTtl = Duration(minutes: 5);
   static const int _mediaSourceCacheMaxEntries = 12;
   final Map<String, _MediaSourceCacheEntry> _mediaSourceCache = {};
+
+  /// 已把插件源码同步给常驻 worker 的插件集合：worker 收到源码后会在
+  /// 自身缓存（pluginSources），后续请求无需重复携带——每次搜索/切歌
+  /// 都跨 isolate 同步拷贝数百 KB 源码字符串，会在低端机（32 位）主
+  /// isolate 上造成可感知的卡顿。worker 崩溃重启后集合清空重新同步。
+  final Set<String> _pluginSourceSyncedToWorker = {};
 
   bool get _runsPluginsInBackground =>
       httpClient == null && runtimeBootstrap == null;
@@ -782,6 +827,12 @@ class PluginRuntimeService {
     dynamic payload,
   ) async {
     final pluginSource = await _loadPluginSource(plugin);
+    // 源码只需同步一次：worker 收到请求时会先写入自身缓存再执行操作，
+    // 因此 run() 成功返回即可标记已同步；尚未同步时才携带全量源码，
+    // 避免每次请求都在主 isolate 上同步拷贝大字符串。
+    final sourceAlreadySynced = _pluginSourceSyncedToWorker.contains(
+      plugin.id,
+    );
     Object? reply;
     try {
       final worker = await _ensurePluginWorker();
@@ -790,10 +841,13 @@ class PluginRuntimeService {
         'pluginId': plugin.id,
         'pluginName': plugin.name,
         'pluginPath': plugin.path,
-        'pluginSource': pluginSource,
+        'pluginSource': sourceAlreadySynced ? '' : pluginSource,
         'userVariables': jsonEncode(plugin.userVariables),
         'payload': jsonEncode(payload),
       });
+      if (!sourceAlreadySynced) {
+        _pluginSourceSyncedToWorker.add(plugin.id);
+      }
     } on Exception {
       // 常驻工作 isolate 拉起失败或中途崩溃/卡死：回退到一次性
       // 冷启动 isolate，保证插件功能依然可用。
@@ -856,6 +910,9 @@ class PluginRuntimeService {
         if (_pluginWorker == spawned) {
           _pluginWorker = null;
           _pluginWorkerTask = null;
+          // 新 worker 的源码缓存为空，源码同步标记一并清空，
+          // 下次调用重新携带全量源码。
+          _pluginSourceSyncedToWorker.clear();
         }
       };
       _pluginWorker = spawned;
@@ -910,9 +967,20 @@ class PluginRuntimeService {
         (_isNeteaseMusicPlugin(plugin) || list.any(_looksLikeNeteaseTrack))) {
       list = await _backfillNeteaseTrackMeta(list);
     }
-    return list
+    var songs = list
         .map((raw) => _toSearchSong(plugin.id, _resetMediaItem(plugin, raw)))
         .toList();
+    // 惜梦系插件搜索空结果兜底：baka 版脚本的 FALLBACK_BASE（站点根）
+    // 部署上没有 API 路由，插件自身搜索会静默失败返回空，由宿主直连
+    // 后端 music/search 补齐。
+    if (songs.isEmpty && plugin.animemusicApi.trim().isNotEmpty) {
+      try {
+        songs = await _searchAnimemusic(plugin, keyword);
+      } catch (_) {
+        // 后端不可用时维持空结果。
+      }
+    }
+    return songs;
   }
 
   /// 获取歌手详情中的歌曲，沿用桌面端的 getArtistWorks 逻辑。
@@ -926,7 +994,41 @@ class PluginRuntimeService {
       return _searchLxPlugin(plugin, artist.title, onlySource: lxSource);
     }
     if (plugin.isAnimemusic) {
+      // animemusic/1 单平台插件：suggest 结果带 animeSrc+id 时直连
+      // 后端 music/artist 取热门歌曲（qishui 等平台后端未开放时接口
+      // 返回空列表，回退按歌手名搜索）。
+      final artistPlatform =
+          artist.rawData['animeSrc']?.toString().trim() ?? '';
+      final artistId = artist.rawData['id']?.toString().trim() ?? '';
+      if (artistPlatform.isNotEmpty && artistId.isNotEmpty) {
+        try {
+          final songs = await _getAnimemusicArtistSongs(
+            plugin,
+            artistPlatform,
+            artistId,
+            name: artist.title,
+          );
+          if (songs.isNotEmpty) return songs;
+        } catch (_) {
+          // 后端不可用：回退按歌手名搜索。
+        }
+      }
       return _searchAnimemusic(plugin, artist.title);
+    }
+    // 惜梦系歌手热门歌曲：searchArtists 的 suggest 结果带 animeSrc+id，
+    // 直连后端 music/artist 取热门歌曲（分页）。
+    final artistPlatform = artist.rawData['animeSrc']?.toString().trim() ?? '';
+    final artistId = artist.rawData['id']?.toString().trim() ?? '';
+    if (artistPlatform.isNotEmpty &&
+        artistId.isNotEmpty &&
+        plugin.animemusicApi.trim().isNotEmpty) {
+      final songs = await _getAnimemusicArtistSongs(
+        plugin,
+        artistPlatform,
+        artistId,
+        name: artist.title,
+      );
+      if (songs.isNotEmpty) return songs;
     }
     try {
       Future<List<Map<String, dynamic>>> fetchPage(int page) async {
@@ -1046,7 +1148,40 @@ class PluginRuntimeService {
       return _searchLxPlugin(plugin, album.title, onlySource: lxSource);
     }
     if (plugin.isAnimemusic) {
+      // animemusic/1 单平台插件：suggest 结果带 animeSrc+id 时直连
+      // 后端 music/album 取专辑曲目；空结果（qishui 等平台后端未
+      // 开放）回退按专辑名搜索。
+      final albumPlatform =
+          album.rawData['animeSrc']?.toString().trim() ?? '';
+      final albumId = album.rawData['id']?.toString().trim() ?? '';
+      if (albumPlatform.isNotEmpty && albumId.isNotEmpty) {
+        try {
+          final songs = await _getAnimemusicAlbumSongs(
+            plugin,
+            albumPlatform,
+            albumId,
+          );
+          if (songs.isNotEmpty) return songs;
+        } catch (_) {
+          // 后端不可用：回退按专辑名搜索。
+        }
+      }
       return _searchAnimemusic(plugin, album.title);
+    }
+    // 惜梦系专辑歌曲：searchAlbums 的 suggest 结果带 animeSrc+id，
+    // 直连后端 music/album 取专辑曲目；kw 上游无歌曲列表，空结果
+    // 继续走按专辑名搜索的回退。
+    final albumPlatform = album.rawData['animeSrc']?.toString().trim() ?? '';
+    final albumId = album.rawData['id']?.toString().trim() ?? '';
+    if (albumPlatform.isNotEmpty &&
+        albumId.isNotEmpty &&
+        plugin.animemusicApi.trim().isNotEmpty) {
+      final songs = await _getAnimemusicAlbumSongs(
+        plugin,
+        albumPlatform,
+        albumId,
+      );
+      if (songs.isNotEmpty) return songs;
     }
     try {
       final response = _runsPluginsInBackground
@@ -1105,7 +1240,30 @@ class PluginRuntimeService {
         artist: true,
       );
     }
-    if (plugin.isAnimemusic) return const [];
+    // animemusic/1 单平台插件：直连后端 music/suggest 的 singers 分组
+    // （v4/baka 等聚合插件同样依赖此兜底）；后端未开放该平台
+    // （如 qishui）时接口报错，返回空列表优雅降级。
+    if (plugin.isAnimemusic) {
+      try {
+        return await _searchAnimemusicCatalog(plugin, keyword, artist: true);
+      } catch (_) {
+        return const [];
+      }
+    }
+    // 惜梦系插件（v2/v3/v4/baka）：声明 supportedSearchType 仅 music，
+    // 歌手搜索走后端 music/suggest 的 singers 分组。
+    if (plugin.animemusicApi.trim().isNotEmpty) {
+      try {
+        final artists = await _searchAnimemusicCatalog(
+          plugin,
+          keyword,
+          artist: true,
+        );
+        if (artists.isNotEmpty) return artists;
+      } catch (_) {
+        // suggest 不可用时回退插件 artist 类型搜索。
+      }
+    }
     // Bilibili 的“歌手”实际上是 UP 主。部分插件把用户搜索暴露为
     // user 类型，另一些插件仍使用 artist 类型；优先尝试 user，并且
     // 只接受带有 mid/uid/uname 等用户字段的结果，避免把视频搜索结果
@@ -1212,7 +1370,29 @@ class PluginRuntimeService {
         artist: false,
       );
     }
-    if (plugin.isAnimemusic) return const [];
+    // animemusic/1 单平台插件：直连后端 music/suggest 的 albums 分组；
+    // 后端未开放该平台（如 qishui）时返回空列表优雅降级。
+    if (plugin.isAnimemusic) {
+      try {
+        return await _searchAnimemusicCatalog(plugin, keyword, artist: false);
+      } catch (_) {
+        return const [];
+      }
+    }
+    // 惜梦系插件（v2/v3/v4/baka）：专辑搜索走后端 music/suggest 的
+    // albums 分组。
+    if (plugin.animemusicApi.trim().isNotEmpty) {
+      try {
+        final albums = await _searchAnimemusicCatalog(
+          plugin,
+          keyword,
+          artist: false,
+        );
+        if (albums.isNotEmpty) return albums;
+      } catch (_) {
+        // suggest 不可用时回退插件 album 类型搜索。
+      }
+    }
     final list = await _searchMusicFreeType(plugin, keyword, 'album');
     return list
         .map(
@@ -1266,7 +1446,8 @@ class PluginRuntimeService {
     EnabledMusicPlugin plugin,
   ) async {
     if (plugin.isLx) return const [];
-    if (plugin.isAnimemusic) return const [];
+    // animemusic/1 单平台插件（如 qishui）：直连后端 music/toplist。
+    if (plugin.isAnimemusic) return _getAnimemusicTopLists(plugin);
     final response = _runsPluginsInBackground
         ? await _runPluginOperation(plugin, 'getTopLists', null)
         : await _callOnCurrentIsolate(plugin, 'getTopLists', []);
@@ -1290,7 +1471,10 @@ class PluginRuntimeService {
     int limit = 40,
   }) async {
     if (plugin.isLx) return const [];
-    if (plugin.isAnimemusic) return const [];
+    // animemusic/1 单平台插件（如 qishui）：直连 music/toplist/detail。
+    if (plugin.isAnimemusic) {
+      return _getAnimemusicTopListSongs(plugin, chart, limit: limit);
+    }
     final songs = await _loadMusicFreePlaylistSongs(
       plugin,
       Map<String, dynamic>.from(chart.rawData),
@@ -1427,7 +1611,41 @@ class PluginRuntimeService {
   static Map<String, dynamic> _resetMediaItem(
     EnabledMusicPlugin plugin,
     Map<String, dynamic> raw,
-  ) => <String, dynamic>{...raw, 'platform': plugin.name};
+  ) {
+    final item = <String, dynamic>{...raw, 'platform': plugin.name};
+    // 惜梦系插件（animemusicApi 非空）：后端开放 MV 的平台注入 mv
+    // 标识让播放页显示 MV 按钮（hasMvIdentifier）；qishui 等平台后端
+    // 未开放 MV，不注入以免按钮点击后解析失败。
+    if (plugin.animemusicApi.trim().isNotEmpty &&
+        item['mv'] == null &&
+        item['mvId'] == null &&
+        item['mvid'] == null &&
+        // platform 被覆盖成插件名前，用原始 raw 判断后端平台。
+        _animemusicSupportsMv(raw)) {
+      item['mv'] = true;
+    }
+    return item;
+  }
+
+  /// animemusic 后端是否为该歌曲的平台开放 MV（music/mv/search）：
+  /// 平台码（_src/_source/animeSrc/platform）需在 MV 画质表
+  /// （kg/kw/wy/tx/mg/bilibili）中；qishui 等平台后端未开放 MV。
+  static bool _animemusicSupportsMv(Map<String, dynamic> raw) {
+    final starSeaSrc =
+        raw['_src']?.toString().trim().isNotEmpty == true
+            ? raw['_src'].toString().trim()
+            : raw['_source']?.toString().trim() ?? '';
+    final animeSrc = raw['animeSrc']?.toString().trim() ?? '';
+    final rawPlatform = raw['platform']?.toString().trim() ?? '';
+    final code = _toAnimemusicPlatformCode(
+      starSeaSrc.isNotEmpty
+          ? starSeaSrc
+          : animeSrc.isNotEmpty
+          ? animeSrc
+          : rawPlatform,
+    );
+    return _animemusicMvQuality.containsKey(code);
+  }
 
   static List<PluginCatalogResult> _aggregateLxCatalog(
     String pluginId,
@@ -1480,16 +1698,32 @@ class PluginRuntimeService {
     if (onlySource != null && onlySource.isNotEmpty) {
       sources = sources.contains(onlySource) ? [onlySource] : const [];
     }
+    // 各平台并行请求：串行时总耗时为全部平台网络延迟之和（默认 5 个
+    // 平台在弱网/低端机上搜索明显偏慢）。失败平台不影响其余平台，
+    // 错误语义与原串行实现一致（全部失败且存在错误时抛出）。
+    final responses = await Future.wait(
+      sources.map((source) async {
+        try {
+          final rawJson = await lxSearch(
+            source: source,
+            keyword: keyword,
+            limit: 30,
+          ).timeout(const Duration(seconds: 20));
+          return (source, rawJson, null as Object?);
+        } catch (error) {
+          return (source, null, error as Object?);
+        }
+      }),
+    );
     final results = <PluginSearchSong>[];
     final seen = <String>{};
     Object? lastError;
-    for (final source in sources) {
+    for (final (source, rawJson, error) in responses) {
+      if (rawJson == null) {
+        if (error != null) lastError = error;
+        continue;
+      }
       try {
-        final rawJson = await lxSearch(
-          source: source,
-          keyword: keyword,
-          limit: 30,
-        ).timeout(const Duration(seconds: 20));
         final decoded = jsonDecode(rawJson);
         if (decoded is! List) continue;
         for (final value in decoded.whereType<Map>()) {
@@ -1501,8 +1735,8 @@ class PluginRuntimeService {
           if (path.isEmpty || !seen.add(path)) continue;
           results.add(_toSearchSong(plugin.id, raw));
         }
-      } catch (error) {
-        lastError = error;
+      } catch (decodeError) {
+        lastError = decodeError;
       }
     }
     if (results.isEmpty && lastError != null) {
@@ -2058,9 +2292,15 @@ class PluginRuntimeService {
   /// 直接扫描插件源码，供菜单展示前快速判断（与用户变量声明扫描同一思路）。
   Future<bool> pluginSupportsMvSource(EnabledMusicPlugin plugin) async {
     if (plugin.isLx) return false;
-    // animemusic 插件由宿主直连 REST（music/mv/search、music/mv/url），
-    // META.capabilities 恒含 mvSearch/mvUrl，无需扫描源码。
-    if (plugin.animemusicApi.trim().isNotEmpty) return true;
+    // animemusic 插件由宿主直连 REST（music/mv/search、music/mv/url）。
+    // animemusic/1 单平台插件按其平台查 MV 画质表：qishui 等后端未
+    // 开放 MV 的平台返回 false；v2/v3/v4/baka 多平台聚合保持 true。
+    if (plugin.animemusicApi.trim().isNotEmpty) {
+      if (!plugin.isAnimemusic) return true;
+      return _animemusicMvQuality.containsKey(
+        _toAnimemusicPlatformCode(plugin.animemusicPlatform),
+      );
+    }
     final cached = _mvSupportCache[plugin.id];
     if (cached != null) return cached;
     bool supported = false;
@@ -2416,20 +2656,37 @@ class PluginRuntimeService {
         return _resolveAnimemusicMediaSource(plugin, rawData, quality);
       }
       if (_runsPluginsInBackground) {
-        final response = await _runPluginOperation(
-          plugin,
-          'resolveMediaSource',
-          {'rawData': rawData, 'preferredQuality': quality},
-        );
-        final source = _toMediaSource(response);
-        if (source == null) throw Exception('插件没有返回可播放地址');
-        return source;
+        try {
+          final response = await _runPluginOperation(
+            plugin,
+            'resolveMediaSource',
+            {'rawData': rawData, 'preferredQuality': quality},
+          );
+          final source = _toMediaSource(response);
+          if (source == null) throw Exception('插件没有返回可播放地址');
+          return source;
+        } catch (error) {
+          // 惜梦系插件播放兜底：baka 版脚本的 FALLBACK_BASE（站点根）
+          // 部署上没有 API 路由，插件解析必然失败，由宿主直连后端
+          // music/url 补齐。
+          if (plugin.animemusicApi.trim().isNotEmpty) {
+            return _resolveAnimemusicMediaSource(plugin, rawData, quality);
+          }
+          rethrow;
+        }
       }
-      return _resolveMediaSourceOnCurrentIsolate(
-        plugin,
-        rawData,
-        preferredQuality: quality,
-      );
+      try {
+        return await _resolveMediaSourceOnCurrentIsolate(
+          plugin,
+          rawData,
+          preferredQuality: quality,
+        );
+      } catch (error) {
+        if (plugin.animemusicApi.trim().isNotEmpty) {
+          return _resolveAnimemusicMediaSource(plugin, rawData, quality);
+        }
+        rethrow;
+      }
     }
 
     final future = resolve(preferredQuality);
@@ -2881,7 +3138,15 @@ class PluginRuntimeService {
     EnabledMusicPlugin plugin,
     Map<String, dynamic> rawData,
   ) async {
-    if (plugin.isLx) return _getLxLyrics(rawData);
+    if (plugin.isLx) {
+      final lxLyrics = await _getLxLyrics(rawData);
+      if (lxLyrics.isNotEmpty) return lxLyrics;
+      // v2 类 LX 聚合插件（lx-animemusic）：平台直连歌词失败时按脚本
+      // 里的后端地址走 REST 兜底。
+      return plugin.animemusicApi.trim().isEmpty
+          ? ''
+          : _getAnimemusicLyrics(plugin, rawData);
+    }
     if (plugin.isAnimemusic) return _getAnimemusicLyrics(plugin, rawData);
     if (_runsPluginsInBackground) {
       final response = await _runPluginOperation(plugin, 'getLyrics', rawData);
@@ -2897,6 +3162,9 @@ class PluginRuntimeService {
     Map<String, dynamic> musicItem,
     int page,
   ) {
+    if (plugin.isAnimemusic) {
+      return _getAnimemusicComments(plugin, musicItem, page);
+    }
     if (_runsPluginsInBackground) {
       return _runPluginOperation(plugin, 'getMusicComments', {
         'musicItem': musicItem,
@@ -2909,6 +3177,15 @@ class PluginRuntimeService {
     ]);
   }
 
+  /// 惜梦聚合插件（v2 洛雪版 / v3 MusicFree 版）评论兜底：插件本体不
+  /// 含评论方法，由宿主直连 animemusic 后端 music/comment；歌曲引用
+  /// （平台码 + id）由 _animemusicSongRef 统一解析。
+  Future<Map<String, dynamic>> getAnimemusicComments(
+    EnabledMusicPlugin plugin,
+    Map<String, dynamic> musicItem,
+    int page,
+  ) => _getAnimemusicComments(plugin, musicItem, page);
+
   // ==================== animemusic/1 REST 直连 ====================
   // 插件本体是 CommonJS Node 模块，QuickJS 没有其依赖的 http/https/zlib
   // 内置模块；但插件契约只是对后端 REST 的薄封装（{api}/music/search
@@ -2917,6 +3194,15 @@ class PluginRuntimeService {
 
   /// 每个插件已确认可用的路由风格：false = PATH_INFO，true = ?route=。
   final Map<String, bool> _animemusicQueryRoute = {};
+
+  /// 每个插件的限流/故障退避截止时间：窗口内所有后端调用直接快速
+  /// 失败，不再发网络请求。播放器的换源重试会放大请求频率，把
+  /// 限流窗口越撞越长（荣耀 X50i 日志中 33→28→25 秒递减即此现象），
+  /// 必须在请求入口熔断。
+  final Map<String, DateTime> _animemusicBackoffUntil = {};
+
+  /// 从限流提示中解析「N 秒后再试」的秒数。
+  static final RegExp _animemusicRetrySecondsPattern = RegExp(r'(\d+)\s*秒');
 
   String _animemusicApiBase(EnabledMusicPlugin plugin) => plugin.animemusicApi
       .trim()
@@ -2947,6 +3233,17 @@ class PluginRuntimeService {
     if (plugin.animemusicApi.trim().isEmpty) {
       throw Exception('插件缺少后端接口地址');
     }
+    // 限流退避：窗口内快速失败，不发请求（换源重试风暴会把窗口
+    // 越撞越长，见 _animemusicBackoffUntil 注释）。
+    final backoff = _animemusicBackoffUntil[plugin.id];
+    if (backoff != null) {
+      final remaining = backoff.difference(DateTime.now());
+      if (remaining.isNegative) {
+        _animemusicBackoffUntil.remove(plugin.id);
+      } else {
+        throw Exception('音源后端限流中，请 ${remaining.inSeconds + 1} 秒后再试');
+      }
+    }
     final confirmed = _animemusicQueryRoute[plugin.id];
     final attempts =
         confirmed == null ? [false, true] : [confirmed, !confirmed];
@@ -2971,9 +3268,18 @@ class PluginRuntimeService {
         if (response.statusCode < 200 || response.statusCode >= 300) {
           throw Exception('接口返回 HTTP ${response.statusCode}');
         }
-        final decoded = jsonDecode(
-          utf8.decode(response.bodyBytes, allowMalformed: true),
-        );
+        final Object decoded;
+        try {
+          decoded = jsonDecode(
+            utf8.decode(response.bodyBytes, allowMalformed: true),
+          );
+        } catch (_) {
+          // 后端偶发返回 HTML 错误页（网关故障/防护页）。直接 jsonDecode
+          // 会抛 FormatException: Unexpected character 且上层无从得知
+          // 原因；给明确错误并短暂退避，避免立即重试再撞一次。
+          _animemusicSetBackoff(plugin.id, const Duration(seconds: 3));
+          throw Exception('音源后端暂时不可用（返回了错误页），请稍后再试');
+        }
         if (decoded is! Map) throw Exception('接口返回异常');
         final code = (decoded['code'] as num?)?.toInt() ?? 0;
         if (code == 404) {
@@ -2982,6 +3288,18 @@ class PluginRuntimeService {
         }
         if (code != 200) {
           final message = decoded['message']?.toString().trim() ?? '';
+          // 「当前时段内调用太多了请33秒后再试」等限流提示：解析秒数
+          // 进入退避窗口，本轮与后续调用都不再打后端。
+          final match = _animemusicRetrySecondsPattern.firstMatch(message);
+          if (match != null) {
+            final seconds = int.tryParse(match.group(1) ?? '') ?? 0;
+            if (seconds > 0) {
+              _animemusicSetBackoff(
+                plugin.id,
+                Duration(seconds: seconds + 2),
+              );
+            }
+          }
           throw Exception(
             message.isNotEmpty ? message : '接口返回失败（$code）',
           );
@@ -2989,29 +3307,86 @@ class PluginRuntimeService {
         _animemusicQueryRoute[plugin.id] = useQuery;
         return Map<String, dynamic>.from(decoded);
       } catch (error) {
+        // 业务错误（限流/参数错/后端 5xx）与路由风格无关，换路由重试
+        // 只会成倍放大请求频率，直接抛给上层。
         lastError = error;
-        // 已确认过路由风格后，业务错误不再换风格重试。
-        if (confirmed != null) rethrow;
+        rethrow;
       }
     }
     throw lastError ?? Exception('接口调用失败');
   }
 
+  /// 记录插件后端的退避截止时间。
+  void _animemusicSetBackoff(String pluginId, Duration duration) {
+    _animemusicBackoffUntil[pluginId] = DateTime.now().add(duration);
+  }
+
   /// 歌词响应中的平台与歌曲 id。搜索结果的 mapSong 已带 platform 字段。
+  /// 聚合音源（musicfree-animemusic / lx-animemusic）只负责解析播放地址，
+  /// 歌词/评论需要拿原始平台的标识请求后端：
+  /// - LX 歌曲（v2）：平台码与 id 在 lx 元数据（酷狗用 hash 播放）；
+  /// - MusicFree 聚合（v3）：播放其他插件搜到的歌，rawData.platform 是
+  ///   搜索插件名（如「QQ音乐[L1]」），映射回后端平台码；id 与插件的
+  ///   getMediaSource 一致（hash ?? songmid ?? id）。
   static (String, String) _animemusicSongRef(
     EnabledMusicPlugin plugin,
     Map<String, dynamic> rawData,
   ) {
+    final lxMeta = rawData['lx'];
+    if (lxMeta is Map) {
+      final source = lxMeta['source']?.toString().trim() ?? '';
+      final hash = lxMeta['hash']?.toString().trim() ?? '';
+      final songmid = lxMeta['songmid']?.toString().trim() ?? '';
+      final lxId = hash.isNotEmpty ? hash : songmid;
+      if (source.isNotEmpty && lxId.isNotEmpty) {
+        return (source, lxId);
+      }
+    }
     dynamic idValue =
-        rawData['id'] ?? rawData['songId'] ?? rawData['musicId'];
+        rawData['hash'] ??
+        rawData['songmid'] ??
+        rawData['id'] ??
+        rawData['songId'] ??
+        rawData['musicId'];
     if (idValue == null && rawData['extra'] is Map) {
       idValue = (rawData['extra'] as Map)['songId'];
     }
     final id = idValue?.toString().trim() ?? '';
-    final platform = (rawData['platform']?.toString().trim().isNotEmpty == true
-        ? rawData['platform'].toString().trim()
-        : plugin.animemusicPlatform);
+    // 来源标记优先级：星海聚合（v4）的 _src/_source、baka 版的
+    // animeSrc，值均为后端平台码；缺省回退 platform 字段或插件配置。
+    final starSeaSrc =
+        rawData['_src']?.toString().trim().isNotEmpty == true
+        ? rawData['_src'].toString().trim()
+        : rawData['_source']?.toString().trim() ?? '';
+    final animeSrc = rawData['animeSrc']?.toString().trim() ?? '';
+    final rawPlatform = rawData['platform']?.toString().trim() ?? '';
+    final platform = _toAnimemusicPlatformCode(
+      starSeaSrc.isNotEmpty
+          ? starSeaSrc
+          : animeSrc.isNotEmpty
+          ? animeSrc
+          : rawPlatform.isNotEmpty
+          ? rawPlatform
+          : plugin.animemusicPlatform,
+    );
     return (platform, id);
+  }
+
+  /// 平台文本 → animemusic 后端平台码。已是码（kg/kw/wy/tx/mg 等）直接
+  /// 返回；中文平台名（含插件名如「QQ音乐[L1]」）映射回标准码。
+  static String _toAnimemusicPlatformCode(String text) {
+    final value = text.trim();
+    if (value.isEmpty) return value;
+    if (RegExp(r'^[a-z0-9]+$').hasMatch(value)) return value;
+    if (value.contains('网易')) return 'wy';
+    if (value.toLowerCase().contains('qq')) return 'tx';
+    if (value.contains('酷狗')) return 'kg';
+    if (value.contains('酷我')) return 'kw';
+    if (value.contains('咪咕')) return 'mg';
+    if (value.toLowerCase().contains('bilibili') || value.contains('B站')) {
+      return 'bilibili';
+    }
+    return value;
   }
 
   Future<List<PluginSearchSong>> _searchAnimemusic(
@@ -3022,23 +3397,204 @@ class PluginRuntimeService {
     final trimmed = keyword.trim();
     if (trimmed.isEmpty) return const [];
     final body = await _callAnimemusicApi(plugin, 'music/search', {
-      'platform': plugin.animemusicPlatform,
+      // v4/baka 等聚合插件无 animemusicPlatform 配置（全平台聚合），
+      // 兜底搜索默认走 wy。
+      'platform': plugin.animemusicPlatform.trim().isNotEmpty
+          ? plugin.animemusicPlatform
+          : 'wy',
       'keyword': trimmed,
       'page': '$page',
       'limit': '30',
     });
     final data = body['data'];
     if (data is! List) return const [];
+    final songs = <PluginSearchSong>[];
+    for (final item in data) {
+      if (item is! Map) continue;
+      final raw = Map<String, dynamic>.from(item);
+      // animemusic 后端开放 MV 的平台注入 mv 标识让播放页显示 MV
+      // 按钮（hasMvIdentifier）；qishui 等未开放 MV 的平台不注入
+      // （_src 已带平台码，按其判断）。
+      if (_animemusicSupportsMv(raw)) raw['mv'] = true;
+      songs.add(_toSearchSong(plugin.id, raw));
+    }
+    return songs;
+  }
+
+  /// 惜梦系歌手/专辑搜索：music/suggest 的 singers/albums 分组。
+  /// v4/baka 等聚合插件声明 supportedSearchType 仅 music，歌手与专辑
+  /// 搜索由宿主直连后端 suggest 补齐；条目 rawData 带 animeSrc（平台
+  /// 码）+ id，getArtistSongs/getAlbumSongs 据此走详情接口。
+  Future<List<PluginCatalogResult>> _searchAnimemusicCatalog(
+    EnabledMusicPlugin plugin,
+    String keyword, {
+    required bool artist,
+  }) async {
+    final trimmed = keyword.trim();
+    if (trimmed.isEmpty) return const [];
+    final platform = _toAnimemusicPlatformCode(
+      plugin.animemusicPlatform.trim().isNotEmpty
+          ? plugin.animemusicPlatform
+          : 'wy',
+    );
+    final body = await _callAnimemusicApi(plugin, 'music/suggest', {
+      'platform': platform,
+      'keyword': trimmed,
+    });
+    final raw = body[artist ? 'singers' : 'albums'];
+    if (raw is! List) return const [];
+    final results = <PluginCatalogResult>[];
+    for (final item in raw) {
+      if (item is! Map) continue;
+      final entry = Map<String, dynamic>.from(item);
+      final id = entry['id']?.toString().trim() ?? '';
+      final title = entry['name']?.toString().trim() ?? '';
+      if (id.isEmpty || title.isEmpty) continue;
+      results.add(
+        PluginCatalogResult(
+          pluginId: plugin.id,
+          id: id,
+          title: title,
+          subtitle: artist ? '' : entry['artist']?.toString() ?? '',
+          coverUrl: entry['artwork']?.toString() ?? '',
+          rawData: {
+            ...entry,
+            'animeSrc': platform,
+            'platform': plugin.name,
+          },
+        ),
+      );
+    }
+    return results;
+  }
+
+  /// 惜梦系歌手热门歌曲：music/artist（按歌手 id，分页；tx 需歌名辅助）。
+  Future<List<PluginSearchSong>> _getAnimemusicArtistSongs(
+    EnabledMusicPlugin plugin,
+    String platform,
+    String artistId, {
+    String? name,
+    int page = 1,
+  }) async {
+    final body = await _callAnimemusicApi(plugin, 'music/artist', {
+      'platform': platform,
+      'id': artistId,
+      'page': '$page',
+      'limit': '50',
+      if (name?.trim().isNotEmpty == true && platform == 'tx')
+        'name': name!.trim(),
+    });
+    final data = body['list'];
+    if (data is! List) return const [];
     return [
       for (final item in data)
         if (item is Map)
-          _toSearchSong(plugin.id, {
-            // rawData 保留 platform 字段（wy），musicUrl 以它为 source。
-            ...Map<String, dynamic>.from(item),
-            // animemusic 全平台支持 mvSearch/mvUrl（META.capabilities），
-            // 注入 mv 标识让播放页显示 MV 按钮（hasMvIdentifier）。
-            'mv': true,
-          }),
+          _toSearchSong(
+            plugin.id,
+            _resetMediaItem(plugin, {
+              ...Map<String, dynamic>.from(item),
+              'animeSrc': platform,
+            }),
+          ),
+    ];
+  }
+
+  /// 惜梦系专辑歌曲：music/album（按专辑 id）。kw 上游无歌曲列表，
+  /// 空结果由调用方回退按专辑名搜索。
+  Future<List<PluginSearchSong>> _getAnimemusicAlbumSongs(
+    EnabledMusicPlugin plugin,
+    String platform,
+    String albumId, {
+    int page = 1,
+  }) async {
+    final body = await _callAnimemusicApi(plugin, 'music/album', {
+      'platform': platform,
+      'id': albumId,
+      'page': '$page',
+      'limit': '50',
+    });
+    final data = body['list'];
+    if (data is! List) return const [];
+    return [
+      for (final item in data)
+        if (item is Map)
+          _toSearchSong(
+            plugin.id,
+            _resetMediaItem(plugin, {
+              ...Map<String, dynamic>.from(item),
+              'animeSrc': platform,
+            }),
+          ),
+    ];
+  }
+
+  /// animemusic 榜单：music/toplist 返回 [{id, name, cover, desc}]，
+  /// rawData 记录 animeSrc（平台码）+ id，getTopListSongs 据此直连
+  /// music/toplist/detail。
+  Future<List<PluginCatalogResult>> _getAnimemusicTopLists(
+    EnabledMusicPlugin plugin,
+  ) async {
+    final platform = _toAnimemusicPlatformCode(
+      plugin.animemusicPlatform.trim().isNotEmpty
+          ? plugin.animemusicPlatform
+          : 'wy',
+    );
+    final body = await _callAnimemusicApi(plugin, 'music/toplist', {
+      'platform': platform,
+    });
+    final data = body['data'];
+    if (data is! List) return const [];
+    final results = <PluginCatalogResult>[];
+    for (final item in data) {
+      if (item is! Map) continue;
+      final entry = Map<String, dynamic>.from(item);
+      final id = entry['id']?.toString().trim() ?? '';
+      final title = entry['name']?.toString().trim() ?? '';
+      if (id.isEmpty || title.isEmpty) continue;
+      results.add(
+        PluginCatalogResult(
+          pluginId: plugin.id,
+          id: id,
+          title: title,
+          subtitle: entry['desc']?.toString() ?? '',
+          coverUrl: entry['cover']?.toString() ?? '',
+          rawData: {...entry, 'animeSrc': platform, 'platform': plugin.name},
+        ),
+      );
+    }
+    return results;
+  }
+
+  /// animemusic 榜单歌曲：music/toplist/detail（按榜单 id，分页）。
+  Future<List<PluginSearchSong>> _getAnimemusicTopListSongs(
+    EnabledMusicPlugin plugin,
+    PluginCatalogResult chart, {
+    int limit = 40,
+  }) async {
+    final platform =
+        chart.rawData['animeSrc']?.toString().trim().isNotEmpty == true
+        ? chart.rawData['animeSrc'].toString().trim()
+        : plugin.animemusicPlatform;
+    final chartId = chart.rawData['id']?.toString().trim() ?? '';
+    if (chartId.isEmpty) return const [];
+    final body = await _callAnimemusicApi(plugin, 'music/toplist/detail', {
+      'platform': platform,
+      'id': chartId,
+      'page': '1',
+      'limit': '$limit',
+    });
+    final data = body['list'];
+    if (data is! List) return const [];
+    return [
+      for (final item in data)
+        if (item is Map)
+          _toSearchSong(
+            plugin.id,
+            _resetMediaItem(plugin, {
+              ...Map<String, dynamic>.from(item),
+              'animeSrc': platform,
+            }),
+          ),
     ];
   }
 
@@ -3127,6 +3683,94 @@ class PluginRuntimeService {
     return joinLyrics(line);
   }
 
+  /// animemusic 评论（music/comment）：hot/list 位于响应顶层，hot 仅第
+  /// 一页返回（热门），list 为最新评论分页；kg/kw/mg/tx 暂无公开签名
+  /// 接口，后端返回空列表不报错。转换为 MusicFree 插件评论格式
+  /// （{data: [...], isEnd}）交给 plugin_comments 统一解析。
+  Future<Map<String, dynamic>> _getAnimemusicComments(
+    EnabledMusicPlugin plugin,
+    Map<String, dynamic> musicItem,
+    int page,
+  ) async {
+    final (platform, id) = _animemusicSongRef(plugin, musicItem);
+    if (id.isEmpty) return const {'data': <dynamic>[], 'isEnd': true};
+    const limit = 20;
+    final body = await _callAnimemusicApi(plugin, 'music/comment', {
+      'platform': platform,
+      'musicId': id,
+      'page': '$page',
+      'limit': '$limit',
+    });
+    final list = _animemusicCommentItems(body['list'], 'list-$page');
+    final hot = page <= 1
+        ? _animemusicCommentItems(body['hot'], 'hot')
+        : const <dynamic>[];
+    return {
+      'data': [...hot, ...list],
+      // 请求 20 条实际不足 20 条时视为最后一页。
+      'isEnd': list.length < limit,
+    };
+  }
+
+  /// animemusic 评论条目（user/avatar/content/time/location/likes）映射为
+  /// CommentItem.normalize 识别的字段名；time 为「YYYY-MM-DD」日期字符串，
+  /// 转换成毫秒时间戳。bilibili 的楼中楼（floors）映射到 replies。
+  static List<Map<String, dynamic>> _animemusicCommentItems(
+    dynamic raw,
+    String idPrefix,
+  ) {
+    if (raw is! List) return const [];
+    final items = <Map<String, dynamic>>[];
+    for (final entry in raw) {
+      if (entry is! Map) continue;
+      final item = <String, dynamic>{
+        'id': '$idPrefix-${items.length}',
+        'nickName': entry['user']?.toString() ?? '',
+        'avatar': entry['avatar']?.toString(),
+        'comment': entry['content']?.toString() ?? '',
+        'like': entry['likes'] is num ? (entry['likes'] as num).toInt() : null,
+        'createAt': _parseAnimemusicCommentTime(entry['time']),
+        'location': entry['location']?.toString(),
+      };
+      final floors = entry['floors'];
+      if (floors is List && floors.isNotEmpty) {
+        item['replies'] = _animemusicCommentItems(floors, '$idPrefix-r');
+      }
+      items.add(item);
+    }
+    return items;
+  }
+
+  static int? _parseAnimemusicCommentTime(dynamic value) {
+    final text = value?.toString().trim() ?? '';
+    if (text.isEmpty) return null;
+    final parsed = DateTime.tryParse(text);
+    if (parsed != null) return parsed.millisecondsSinceEpoch;
+    // 抖音（qishui）等平台的评论时间是美式格式
+    // 「M/D/YYYY, h:mm:ss AM/PM」，DateTime.tryParse 无法识别。
+    final us = RegExp(
+      r'^(\d{1,2})/(\d{1,2})/(\d{4})'
+      r'(?:,\s*(\d{1,2}):(\d{2})(?::(\d{2}))?\s*([AaPp][Mm]))?$',
+    ).firstMatch(text);
+    if (us != null) {
+      var hour = int.parse(us.group(4) ?? '0');
+      final minute = int.parse(us.group(5) ?? '0');
+      final second = int.parse(us.group(6) ?? '0');
+      final meridiem = (us.group(7) ?? '').toLowerCase();
+      if (meridiem == 'pm' && hour < 12) hour += 12;
+      if (meridiem == 'am' && hour == 12) hour = 0;
+      return DateTime(
+        int.parse(us.group(3)!),
+        int.parse(us.group(1)!),
+        int.parse(us.group(2)!),
+        hour,
+        minute,
+        second,
+      ).millisecondsSinceEpoch;
+    }
+    return int.tryParse(text);
+  }
+
   /// animemusic 各平台 MV 画质映射（与插件 MV_QUALITY 一致）：平台不支持
   /// 的画质映射为空串，后端自选可用画质。
   static const Map<String, Map<String, String>> _animemusicMvQuality = {
@@ -3212,6 +3856,61 @@ class PluginRuntimeService {
     return buildLxLyricsRaw(Map<String, dynamic>.from(decoded));
   }
 
+  /// QQ 音乐逐字歌词直连兜底。部分 QQ 音源插件的 getLyric 内部先请求
+  /// musicu.fcg（crypt:1 + qrc:1 拿逐字密文），失败时静默降级到老接口，
+  /// 只返回普通 LRC——逐字时间轴就此丢失（插件不报错，宿主无从感知）。
+  /// 这里改用 Rust 侧 fetchLyricFromSource('tx')（musicu.fcg qrc:1 +
+  /// 3DES 解密 + QRC 解析，与 LX 音源同一条已验证链路）按 songmid 重新
+  /// 拉取逐字歌词；失败返回空字符串，由调用方维持插件原结果。
+  Future<String> _getTxWordLyricsFallback(Map<String, dynamic> rawData) async {
+    final songmid = (rawData['songmid'] ??
+            rawData['mid'] ??
+            rawData['songMid'])
+        ?.toString()
+        .trim();
+    if (songmid == null || songmid.isEmpty) return '';
+    try {
+      final response = await fetchLyricFromSource(
+        source: 'tx',
+        songInfoJson: jsonEncode({
+          'songmid': songmid,
+          if (rawData['id'] != null) 'songId': rawData['id'],
+          'name': rawData['title'] ?? rawData['name'] ?? '',
+          'singer': rawData['artist'] ?? rawData['singer'] ?? '',
+        }),
+      ).timeout(const Duration(seconds: 20));
+      final trimmed = response.trim();
+      if (trimmed.isEmpty || trimmed == 'null') return '';
+      final decoded = jsonDecode(trimmed);
+      if (decoded is! Map) return '';
+      final raw = buildLxLyricsRaw(Map<String, dynamic>.from(decoded));
+      return _hasWordTiming(raw) ? raw : '';
+    } catch (_) {
+      return '';
+    }
+  }
+
+  /// 插件返回的 QQ 歌词无逐字时间轴（普通 LRC）时，尝试直连升级为
+  /// QRC 逐字版本；无需升级或失败时返回 null（调用方维持原歌词）。
+  /// 以 rawData 含 songmid 判定 QQ 歌曲——酷狗用 hash、酷我用 rid、
+  /// 网易用纯数字 id，均不会携带 songmid 字段，不会误触发。
+  Future<String?> _upgradeQqLyricsToWordTiming(
+    Map<String, dynamic> rawData,
+    String lyrics,
+  ) async {
+    if (_hasWordTiming(lyrics) || _isLikelyEncryptedLyrics(lyrics)) {
+      return null;
+    }
+    final songmid = (rawData['songmid'] ??
+            rawData['mid'] ??
+            rawData['songMid'])
+        ?.toString()
+        .trim();
+    if (songmid == null || songmid.isEmpty) return null;
+    final upgraded = await _getTxWordLyricsFallback(rawData);
+    return upgraded.isEmpty ? null : upgraded;
+  }
+
   Future<String> _getLyricsOnCurrentIsolate(
     EnabledMusicPlugin plugin,
     Map<String, dynamic> rawData,
@@ -3243,8 +3942,20 @@ class PluginRuntimeService {
         try {
           final response = await _callOnCurrentIsolate(plugin, method, args);
           final lyrics = await _resolveLyricsResponse(response);
+          // QQ 音源插件（crypt:1 + qrc:1）返回的是加密的 hex 密文，
+          // 丢弃会永远丢失逐字歌词——Rust 解析器自带 TripleQDES 解密，
+          // 这里必须透传，只有密文解析失败时才轮到平台兜底。
           if (lyrics.isNotEmpty) {
-            if (_hasWordTiming(lyrics) || !_isNeteaseMusicPlugin(plugin)) {
+            if (_hasWordTiming(lyrics) ||
+                _isLikelyEncryptedLyrics(lyrics) ||
+                !_isNeteaseMusicPlugin(plugin)) {
+              // QQ 歌曲拿到普通 LRC 时先尝试直连升级为逐字版本（插件
+              // 内部 musicu.fcg 失败会静默降级老接口丢失逐字）。
+              final upgraded = await _upgradeQqLyricsToWordTiming(
+                rawData,
+                lyrics,
+              );
+              if (upgraded != null) return upgraded;
               return lyrics;
             }
             bestLyrics = lyrics;
@@ -3262,8 +3973,16 @@ class PluginRuntimeService {
         rawData,
       ]);
       final lyrics = await _resolveLyricsResponse(info);
+      // 密文同上：透传给 Rust 解密，不在此丢弃。
       if (lyrics.isNotEmpty) {
-        if (_hasWordTiming(lyrics) || !_isNeteaseMusicPlugin(plugin)) {
+        if (_hasWordTiming(lyrics) ||
+            _isLikelyEncryptedLyrics(lyrics) ||
+            !_isNeteaseMusicPlugin(plugin)) {
+          final upgraded = await _upgradeQqLyricsToWordTiming(
+            rawData,
+            lyrics,
+          );
+          if (upgraded != null) return upgraded;
           return lyrics;
         }
         bestLyrics = lyrics;
@@ -3273,7 +3992,20 @@ class PluginRuntimeService {
     }
 
     final fallback = await _getPlatformLyricsFallback(plugin, rawData);
-    return fallback.isNotEmpty ? fallback : bestLyrics;
+    if (fallback.isNotEmpty) return fallback;
+    // v3 类 MusicFree 聚合插件（musicfree-animemusic）只声明
+    // getMediaSource，平台兜底也失败时按脚本里的后端地址走 REST 兜底。
+    if (plugin.animemusicApi.trim().isNotEmpty) {
+      try {
+        final aggregated = await _getAnimemusicLyrics(plugin, rawData);
+        if (aggregated.isNotEmpty) return aggregated;
+      } catch (_) {
+        // 后端不可用时维持原有返回。
+      }
+    }
+    // bestLyrics 可能是 QQ 密文（Rust 解密出逐字歌词），直接透传；
+    // 只有它本来就不存在时才返回空。
+    return bestLyrics;
   }
 
   Future<String> _resolveLyricsResponse(dynamic response) async {
@@ -3300,11 +4032,32 @@ class PluginRuntimeService {
     }
   }
 
+  /// 插件歌词全部失效（未声明方法或返回密文/空内容）时的平台直连兜底。
+  /// 平台优先按插件名识别；插件是聚合音源（如 musicfree-animemusic、
+  /// 只负责解析播放地址）时，改按歌曲 rawData 自带的 platform 字段识别
+  /// ——搜索插件写入的平台名（如「QQ音乐[L1]」）会随歌曲数据一起保留；
+  /// 星海聚合插件（v4）的歌曲用 _src/_source 标记来源平台码。
   Future<String> _getPlatformLyricsFallback(
     EnabledMusicPlugin plugin,
     Map<String, dynamic> rawData,
   ) async {
-    if (!_isNeteaseMusicPlugin(plugin)) return '';
+    final platformText =
+        '${plugin.id} ${plugin.name} ${rawData['platform'] ?? ''} '
+        '${rawData['source'] ?? ''} ${rawData['_src'] ?? ''} '
+        '${rawData['_source'] ?? ''} ${rawData['animeSrc'] ?? ''}'
+        .toLowerCase();
+    if (_isNeteaseMusicPlugin(plugin) ||
+        RegExp(r'网易|netease|\bwy\b').hasMatch(platformText)) {
+      return _getNeteaseLyricsFallback(rawData);
+    }
+    if (_isQqMusicPlugin(plugin) ||
+        RegExp(r'qq音乐|qqmusic|\bqq\b|(^|[^a-z])tx\b').hasMatch(platformText)) {
+      return _getQqLyricsFallback(rawData);
+    }
+    return '';
+  }
+
+  Future<String> _getNeteaseLyricsFallback(Map<String, dynamic> rawData) async {
     final id = (rawData['id'] ?? rawData['songId'] ?? rawData['songmid'])
         ?.toString()
         .trim();
@@ -3335,20 +4088,192 @@ class PluginRuntimeService {
     }
   }
 
-  Future<http.Response> _rawGet(Uri uri, {Map<String, String>? headers}) async {
-    final injectedClient = httpClient;
-    final canUseInjected =
-        injectedClient != null &&
-        injectedClient is! _PluginBackgroundHttpClient &&
-        injectedClient is! _PluginProxyHttpClient;
-    final http.Client client = canUseInjected ? injectedClient : http.Client();
-    try {
-      return await client
-          .get(uri, headers: headers)
-          .timeout(const Duration(seconds: 20));
-    } finally {
-      if (!canUseInjected) client.close();
+  /// QQ 音乐歌词兜底，两级尝试：
+  ///
+  /// 1. c.y.qq.com 老接口 fcg_query_lyric_new（按 songmid 查询）：
+  ///    返回 base64 明文 LRC 与 trans 翻译，实测稳定可用；
+  /// 2. musicu.fcg 的 GetPlayLyricInfo 模块（`crypt:0, qrc:0`）：
+  ///    可额外拿到 roma 罗马音，但该模块对部分网络环境要求签名
+  ///    （code 500003），仅作老接口失败（仅有数字 id 无 songmid、
+  ///    或老接口无返回）时的补充。
+  ///
+  /// 注意 `crypt:1` 会返回十六进制密文——部分 baka 音源插件 bug 的
+  /// 根源（插件不解密直接透传导致整屏乱码），本兜底不使用该组合。
+  Future<String> _getQqLyricsFallback(Map<String, dynamic> rawData) async {
+    final mid = (rawData['mid'] ?? rawData['songmid'] ?? rawData['songMid'])
+        ?.toString()
+        .trim();
+    if (mid != null && mid.isNotEmpty) {
+      final legacy = await _getQqLegacyLyrics(mid);
+      if (legacy.isNotEmpty) return legacy;
     }
+    final id = (rawData['id'] ?? rawData['songId'] ?? rawData['songid'])
+        ?.toString()
+        .trim();
+    final idIsNumeric = id != null && RegExp(r'^\d+$').hasMatch(id);
+    if (!idIsNumeric) return '';
+    final ownsClient = httpClient == null;
+    final client = httpClient ?? http.Client();
+    try {
+      final response = await client
+          .post(
+            Uri.https('u.y.qq.com', '/cgi-bin/musicu.fcg'),
+            headers: const {
+              'User-Agent':
+                  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                  'AppleWebKit/537.36 (KHTML, like Gecko) '
+                  'Chrome/120.0.0.0 Safari/537.36',
+              'Referer': 'https://y.qq.com/',
+              'Origin': 'https://y.qq.com',
+              'Content-Type': 'application/json;charset=UTF-8',
+            },
+            body: jsonEncode({
+              'comm': {'ct': 19, 'cv': 0},
+              'req': {
+                'module': 'music.musichallSong.PlayLyricInfo.GetPlayLyricInfo',
+                'method': 'GetPlayLyricInfo',
+                'param': {
+                  'crypt': 0,
+                  'qrc': 0,
+                  'trans': 1,
+                  'roma': 1,
+                  'song_id': int.parse(id),
+                  if (mid != null && mid.isNotEmpty) 'song_mid': mid,
+                },
+              },
+            }),
+          )
+          .timeout(const Duration(seconds: 20));
+      if (response.statusCode < 200 || response.statusCode >= 300) return '';
+      final decoded = jsonDecode(
+        utf8.decode(response.bodyBytes, allowMalformed: true),
+      );
+      if (decoded is! Map) return '';
+      final req = decoded['req'];
+      if (req is! Map || (req['code'] is num && (req['code'] as num) != 0)) {
+        return '';
+      }
+      final data = req['data'];
+      if (data is! Map) return '';
+      final main = _decodeBase64Text(data['lyric']);
+      if (main.isEmpty) return '';
+      final translation = _decodeBase64Text(data['trans']);
+      final romaji = _decodeBase64Text(data['roma']);
+      return [
+        main,
+        if (translation.isNotEmpty) translation,
+        if (romaji.isNotEmpty) romaji,
+      ].join('\n');
+    } catch (_) {
+      return '';
+    } finally {
+      if (ownsClient) client.close();
+    }
+  }
+
+  /// QQ 歌词老接口：按 songmid 查询，返回 base64 明文 LRC + trans 翻译。
+  Future<String> _getQqLegacyLyrics(String songmid) async {
+    try {
+      final response = await _rawGet(
+        Uri.https('c.y.qq.com', '/lyric/fcgi-bin/fcg_query_lyric_new.fcg', {
+          'songmid': songmid,
+          'g_tk': '5381',
+          'loginUin': '0',
+          'hostUin': '0',
+          'format': 'json',
+          'inCharset': 'utf8',
+          'outCharset': 'utf-8',
+          'notice': '0',
+          'platform': 'yqq.json',
+          'needNewCode': '0',
+        }),
+        headers: const {
+          'User-Agent':
+              'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+              'AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
+          'Referer': 'https://y.qq.com/',
+        },
+      );
+      if (response.statusCode < 200 || response.statusCode >= 300) return '';
+      final decoded = jsonDecode(
+        utf8.decode(response.bodyBytes, allowMalformed: true),
+      );
+      if (decoded is! Map) return '';
+      if (decoded['retcode'] is num && (decoded['retcode'] as num) != 0) {
+        return '';
+      }
+      final main = _decodeBase64Text(decoded['lyric']);
+      if (main.isEmpty) return '';
+      final translation = _decodeBase64Text(decoded['trans']);
+      return translation.isEmpty ? main : '$main\n$translation';
+    } catch (_) {
+      return '';
+    }
+  }
+
+  /// QQ 歌词接口的字段是 base64 编码文本，解码为 UTF-8 字符串。
+  static String _decodeBase64Text(dynamic value) {
+    if (value is! String || value.trim().isEmpty) return '';
+    try {
+      return utf8.decode(base64Decode(value.trim()), allowMalformed: true);
+    } catch (_) {
+      return '';
+    }
+  }
+
+  Future<http.Response> _rawGet(Uri uri, {Map<String, String>? headers}) async {
+    Future<http.Response> once(Uri target) async {
+      final injectedClient = httpClient;
+      final canUseInjected =
+          injectedClient != null &&
+          injectedClient is! _PluginBackgroundHttpClient &&
+          injectedClient is! _PluginProxyHttpClient;
+      final http.Client client =
+          canUseInjected ? injectedClient : http.Client();
+      try {
+        return await client
+            .get(target, headers: headers)
+            .timeout(const Duration(seconds: 20));
+      } finally {
+        if (!canUseInjected) client.close();
+      }
+    }
+
+    http.Response? response;
+    Object? error;
+    try {
+      response = await once(uri);
+    } catch (e) {
+      error = e;
+    }
+    // 明文 HTTP 被运营商网络劫持（连接失败/超时/text/html 拦截页）时，
+    // 自动改用 HTTPS 重试一次；HTTPS 也失败或仍返回 HTML 时维持原结果。
+    if (uri.scheme == 'http') {
+      final looksHtml =
+          (response?.headers['content-type'] ?? '')
+              .toLowerCase()
+              .contains('text/html');
+      if (error != null || looksHtml) {
+        try {
+          final retry = await once(uri.replace(scheme: 'https'));
+          if (!(retry.headers['content-type'] ?? '')
+              .toLowerCase()
+              .contains('text/html')) {
+            response = retry;
+            error = null;
+          }
+        } catch (_) {
+          // HTTPS 不可用，维持原结果。
+        }
+      }
+    }
+    if (error != null) {
+      throw error;
+    }
+    if (response == null) {
+      throw StateError('网络请求失败');
+    }
+    return response;
   }
 
   static PluginMediaSource? _toMediaSource(dynamic value) {
@@ -3971,6 +4896,24 @@ class PluginRuntimeService {
         RegExp(r'<tt[\s>]', caseSensitive: false).hasMatch(lyrics);
   }
 
+  /// 识别「疑似密文」的歌词文本：部分 QQ 音源插件用 crypt:1 请求歌词，
+  /// 接口返回的是未解密的十六进制密文（纯 [0-9a-f] 长串、无任何时间
+  /// 标签），插件不解密直接透传。这种文本当作歌词会渲染成整屏乱码，
+  /// 需要识别出来跳过，改走平台兜底拿真正的 LRC。正常纯文本歌词
+  /// 一定含有十六进制之外的字符（汉字/标点/空格换行以外的字母），
+  /// 不会被误伤。
+  static bool _isLikelyEncryptedLyrics(String lyrics) {
+    final text = lyrics.trim();
+    if (text.length < 64) return false;
+    // 含 LRC 时间标签或逐字格式的一定是正常歌词。
+    if (RegExp(r'\[\d{1,3}:\d{1,2}(?:[.:]\d+)?\]').hasMatch(text) ||
+        RegExp(r'^\[\d+,\d+\]', multiLine: true).hasMatch(text) ||
+        _hasWordTiming(text)) {
+      return false;
+    }
+    return RegExp(r'^[0-9a-fA-F\s]+$').hasMatch(text);
+  }
+
   /// 插件歌词响应还原为「主歌词 + 翻译 + 罗马音」的拼接文本，与
   /// buildLxLyricsRaw 的输出格式一致：Rust 解析器按时间戳与文字脚本
   /// 把翻译/罗马音行合并进 displayLine 的对应字段。此前只取主歌词，
@@ -3979,6 +4922,10 @@ class PluginRuntimeService {
   static String _extractLyricsWithTranslation(dynamic value) {
     final main = _extractLyrics(value);
     if (main.isEmpty || value is! Map) return main;
+    // 主歌词是密文（QQ crypt:1）时，翻译/罗马音同样是密文，按行拼接
+    // 会把多段 hex 连成一块，破坏 Rust 侧的整体解密——只返回主歌词
+    // 密文（解密后即逐字 QRC），翻译随密文一起放弃。
+    if (_isLikelyEncryptedLyrics(main)) return main;
     final translation = _extractTranslation(value);
     final romaji = _extractRomaji(value);
     if (translation.isEmpty && romaji.isEmpty) return main;
@@ -4676,6 +5623,38 @@ class PluginRuntimeService {
 bool isBilibiliPluginSource(EnabledMusicPlugin plugin) =>
     PluginRuntimeService._isBilibiliPlugin(plugin);
 
+/// 识别音源类别（歌单导入页、换源面板等处的分类标记）：
+/// - BakaMusic 契约（getMvSource / animeSrc）或订阅源前缀
+///   `music.cwo.cc.cd` / `bakp.netlify.app` / `animemusic.bzxhkj.com/baka*`
+///   →「BakaMusic」（QQ音乐[L1] 等契约插件无 baka 前缀，靠契约识别）
+/// - `animemusic.bzxhkj.com/animemusic*` → 惜梦自有音乐 APP 音源
+///   （animemusic/1）→「惜梦」
+/// - `animemusic.bzxhkj.com/v2`（洛雪）/ `/v3`（MusicFree 聚合）→
+///   惜梦适配源 →「惜梦」
+/// - 无来源记录时回退旧规则：名称含 baka →「BakaMusic」；animemusic/1
+///   格式 →「惜梦」；其余 →「MusicFree」。
+String pluginSourceTag(EnabledMusicPlugin plugin) {
+  // 契约特征最准：优先于 URL 前缀（BakaMusic 契约插件可能托管在
+  // 任意订阅源上，如 QQ音乐[L1]）。
+  if (plugin.isBaka) return 'BakaMusic';
+  final url = plugin.sourceUrl.trim().toLowerCase();
+  if (url.isNotEmpty) {
+    if (RegExp(
+      r'^https?://(music\.cwo\.cc\.cd|bakp\.netlify\.app|animemusic\.bzxhkj\.com/baka)',
+    ).hasMatch(url)) {
+      return 'BakaMusic';
+    }
+    if (RegExp(
+      r'^https?://animemusic\.bzxhkj\.com/(animemusic|v\d+)',
+    ).hasMatch(url)) {
+      return '惜梦';
+    }
+  }
+  if (plugin.name.toLowerCase().contains('baka')) return 'BakaMusic';
+  if (plugin.isAnimemusic) return '惜梦';
+  return 'MusicFree';
+}
+
 class _NeteaseTrackMeta {
   const _NeteaseTrackMeta({required this.coverUrl, required this.durationMs});
 
@@ -4903,13 +5882,56 @@ class _PluginBackgroundHttpClient extends http.BaseClient {
   @override
   Future<http.StreamedResponse> send(http.BaseRequest request) async {
     request.headers.putIfAbsent('user-agent', () => _desktopUserAgent);
-    final response = await _client
-        .send(request)
-        .timeout(const Duration(seconds: 20));
+    http.StreamedResponse? response;
+    Object? error;
+    try {
+      response = await _client
+          .send(request)
+          .timeout(const Duration(seconds: 20));
+    } catch (e) {
+      error = e;
+    }
+    // 明文 HTTP 被运营商网络劫持（连接失败/超时/text/html 拦截页）时，
+    // 自动改用 HTTPS 重试一次；HTTPS 也失败则维持原结果。
+    if (request.url.scheme == 'http') {
+      final looksHtml = response != null &&
+          (response.headers['content-type'] ?? '')
+              .toLowerCase()
+              .contains('text/html');
+      if (error != null || looksHtml) {
+        final httpsRequest = http.Request(
+          request.method,
+          request.url.replace(scheme: 'https'),
+        )..headers.addAll(request.headers);
+        if (request is http.Request && request.bodyBytes.isNotEmpty) {
+          httpsRequest.bodyBytes = request.bodyBytes;
+        }
+        try {
+          final retry = await _client
+              .send(httpsRequest)
+              .timeout(const Duration(seconds: 20));
+          if (!(retry.headers['content-type'] ?? '')
+              .toLowerCase()
+              .contains('text/html')) {
+            response = retry;
+            error = null;
+          }
+        } catch (_) {
+          // HTTPS 不可用，维持原结果。
+        }
+      }
+    }
+    if (error != null) {
+      throw error;
+    }
+    if (response == null) {
+      throw StateError('插件后台网络请求失败');
+    }
+    // 直接按原始字节 Base64 包装，避免 utf8 解码破坏二进制响应
+    // （酷我 newlyric 等接口返回二进制歌词，插件以 arraybuffer 消费）。
     final bytes = await response.stream.toBytes();
-    final body = utf8.decode(bytes, allowMalformed: true);
     return http.StreamedResponse(
-      Stream.value(utf8.encode(encodePluginHttpBody(body))),
+      Stream.value(utf8.encode(encodePluginHttpBodyBytes(bytes))),
       response.statusCode,
       contentLength: null,
       request: request,
@@ -4928,24 +5950,43 @@ class _PluginProxyHttpClient extends http.BaseClient {
   @override
   Future<http.StreamedResponse> send(http.BaseRequest request) async {
     final bodyBytes = await request.finalize().toBytes();
-    String responseJson;
-    try {
-      responseJson = await pluginHttpRequest(
-        method: request.method,
-        url: request.url.toString(),
-        headersJson: jsonEncode(request.headers),
-        body: bodyBytes.isEmpty
-            ? null
-            : utf8.decode(bodyBytes, allowMalformed: true),
-        timeout: BigInt.from(20),
-        follow: 10,
-      );
-    } catch (error) {
+    final url = request.url.toString();
+    final bodyText = bodyBytes.isEmpty
+        ? null
+        : utf8.decode(bodyBytes, allowMalformed: true);
+    Map<String, dynamic>? response = await _pluginBinaryRequest(
+      method: request.method,
+      url: url,
+      headersJson: jsonEncode(request.headers),
+      body: bodyText,
+    );
+    // 部分运营商网络会劫持明文 HTTP：连接直接失败、超时，或返回
+    // text/html 拦截页（荣耀等设备实测）。此时自动改用 HTTPS 重试一次；
+    // HTTPS 也失败或同样返回 HTML 时维持原结果，不影响仅支持 HTTP 的音源。
+    if (url.startsWith('http://')) {
+      final intercepted =
+          response == null || _pluginResponseIsHtmlPage(response);
+      if (intercepted) {
+        final retry = await _pluginBinaryRequest(
+          method: request.method,
+          url: 'https://${url.substring('http://'.length)}',
+          headersJson: jsonEncode(request.headers),
+          body: bodyText,
+        );
+        if (retry != null && !_pluginResponseIsHtmlPage(retry)) {
+          response = retry;
+        }
+      }
+    }
+    if (response == null) {
       // QuickJS XHR expects an HTTP response even when the native request
       // cannot connect. Returning a synthetic 599 response lets the plugin
       // reject the current operation normally instead of creating an
       // unhandled isolate error that replaces the whole app screen.
-      final body = jsonEncode({'code': 599, 'message': error.toString()});
+      final body = jsonEncode({
+        'code': 599,
+        'message': '网络请求失败：无法连接音源服务器（明文 HTTP 被网络拦截或服务器不可达）',
+      });
       return http.StreamedResponse(
         Stream.value(utf8.encode(encodePluginHttpBody(body))),
         599,
@@ -4954,8 +5995,7 @@ class _PluginProxyHttpClient extends http.BaseClient {
         reasonPhrase: 'Plugin network request failed',
       );
     }
-    final response = jsonDecode(responseJson) as Map<String, dynamic>;
-    final responseBody = response['body']?.toString() ?? '';
+    final bodyBase64 = response['body_base64']?.toString() ?? '';
     final headers = <String, String>{};
     final rawHeaders = response['headers'];
     if (rawHeaders is Map) {
@@ -4964,11 +6004,52 @@ class _PluginProxyHttpClient extends http.BaseClient {
       }
     }
     return http.StreamedResponse(
-      Stream.value(utf8.encode(encodePluginHttpBody(responseBody))),
+      Stream.value(
+        utf8.encode('__XY_HTTP_BODY_BASE64__$bodyBase64'),
+      ),
       (response['status'] as num?)?.toInt() ?? 500,
       headers: headers,
       request: request,
     );
+  }
+
+  /// 调用 Rust 二进制 HTTP 接口；失败（连接错误/超时）返回 null 而非抛错，
+  /// 便于上层先尝试 HTTPS 回退再决定最终结果。
+  Future<Map<String, dynamic>?> _pluginBinaryRequest({
+    required String method,
+    required String url,
+    required String headersJson,
+    String? body,
+  }) async {
+    try {
+      final responseJson = await pluginHttpRequestBinary(
+        method: method,
+        url: url,
+        headersJson: headersJson,
+        body: body,
+        timeout: BigInt.from(20),
+        follow: 10,
+      );
+      return jsonDecode(responseJson) as Map<String, dynamic>;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// 判断插件 HTTP 响应是否为 text/html 页面（运营商拦截页特征）。
+  static bool _pluginResponseIsHtmlPage(Map<String, dynamic> response) {
+    final rawHeaders = response['headers'];
+    if (rawHeaders is! Map) return false;
+    for (final key in rawHeaders.keys) {
+      if (key.toString().toLowerCase() == 'content-type') {
+        return rawHeaders[key]
+            ?.toString()
+            .toLowerCase()
+            .contains('text/html') ==
+            true;
+      }
+    }
+    return false;
   }
 }
 
@@ -4976,3 +6057,8 @@ class _PluginProxyHttpClient extends http.BaseClient {
 /// 可能在 JSON.parse 前被二次解释。使用纯 ASCII Base64 作为桥接传输格式。
 String encodePluginHttpBody(String body) =>
     '__XY_HTTP_BODY_BASE64__${base64Encode(utf8.encode(body))}';
+
+/// 按原始字节 Base64 包装（二进制安全），供插件以 arraybuffer 消费
+/// 二进制响应（酷我 newlyric 等接口）。
+String encodePluginHttpBodyBytes(List<int> bytes) =>
+    '__XY_HTTP_BODY_BASE64__${base64Encode(bytes)}';

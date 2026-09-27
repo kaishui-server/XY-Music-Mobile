@@ -16,11 +16,13 @@ publish_to: 'none' # Remove this line if you wish to publish to pub.dev
 # https://developer.apple.com/library/archive/documentation/General/Reference/InfoPlistKeyReference/Articles/CoreFoundationKeys.html
 # In Windows, build-name is used as the major, minor, and patch parts
 # of the product and file versions while build-number is used as the build suffix.
-version: 2.2.1+5292
+version: 2.2.2+5307
 
 dependency_overrides:
   just_audio_background:
     path: third_party/just_audio_background
+  audio_service:
+    path: third_party/audio_service
   flutter_inappwebview_android:
     path: third_party/flutter_inappwebview_android
 
@@ -76,6 +78,10 @@ dependencies:
   lpinyin: ^2.0.3
   tencent_kit:
     path: third_party/tencent_kit
+  # 中文本地化：长按文本框的复制/粘贴/全选等系统菜单随系统语言展示；
+  # 未配置时固定为英文。
+  flutter_localizations:
+    sdk: flutter
 
 dev_dependencies:
   flutter_test:

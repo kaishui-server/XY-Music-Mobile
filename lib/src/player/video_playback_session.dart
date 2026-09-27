@@ -13,6 +13,10 @@ class VideoPlaybackSession {
   static bool restarting = false;
   static String? error;
 
+  /// 当前 MV 画质档位与插件回传的可用档位，详情页销毁重建后仍能恢复展示。
+  static String quality = '1080P';
+  static List<String> availableQualities = const [];
+
   /// 当前视频是否来自插件的 MV 解析（非 B 站视频），用于菜单文案区分。
   static bool isMv = false;
 
@@ -54,9 +58,33 @@ class VideoPlaybackSession {
     restarting = false;
     error = null;
     isMv = false;
+    resetQuality();
     changed();
     progressChanged();
     await active?.dispose();
+  }
+
+  static void resetQuality() {
+    quality = '1080P';
+    availableQualities = const [];
+  }
+
+  /// 后台久置挂起：ExoPlayer 的 MediaCodec 表面在后台久置后会被系统
+  /// 回收，控制器大概率已不可用。释放原生资源但保留会话（songPath、
+  /// isMv、画质记录），进入错误态——用户回到软件仍停留在 MV 界面，
+  /// 可在错误面板重新加载或手动切换画质，而不是被直接退回音频播放页。
+  static Future<bool> suspendForBackgroundIdle() async {
+    final active = controller;
+    if (active == null || loading) return false;
+    controller = null;
+    loading = false;
+    error = '视频在后台停留过久已停止，请重新加载';
+    changed();
+    progressChanged();
+    try {
+      await active.dispose();
+    } catch (_) {}
+    return true;
   }
 
   static bool isFor(String? path) =>

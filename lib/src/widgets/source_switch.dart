@@ -17,12 +17,15 @@ import '../playlists/playlists_provider.dart';
 /// 单曲换源弹出一体化底部面板（搜索框 + 音源 tab + 候选列表，
 /// 排版与关联歌词面板一致），批量换源自动取最高分。
 
-/// 插件类型标记：Baka 系 / MusicFree / 洛雪 / animemusic（与歌单网络导入对话框一致）。
+/// 插件类型标记：BakaMusic 系 / MusicFree / 洛雪 / animemusic（与歌单
+/// 网络导入对话框一致）。
 String sourcePluginTag(EnabledMusicPlugin plugin) => plugin.isLx
     ? '洛雪'
     : plugin.isAnimemusic
     ? 'animemusic'
-    : (plugin.name.toLowerCase().contains('baka') ? 'Baka' : 'MusicFree');
+    : (plugin.isBaka || plugin.name.toLowerCase().contains('baka')
+          ? 'BakaMusic'
+          : 'MusicFree');
 
 /// 选择换源目标插件的底部菜单（批量换源用）；取消返回 null。
 Future<EnabledMusicPlugin?> showSourcePluginPicker(

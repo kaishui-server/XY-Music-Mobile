@@ -1,4 +1,4 @@
-import 'dart:async';
+﻿import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:math' as math;
@@ -12,8 +12,6 @@ import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 import 'package:http/http.dart' as http;
-import 'package:just_audio/just_audio.dart';
-import 'package:just_audio_background/just_audio_background.dart';
 import 'package:path/path.dart' as p;
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:video_player/video_player.dart';
@@ -326,6 +324,11 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
     _videoLoading = VideoPlaybackSession.loading;
     _resumeAudioAfterVideo = VideoPlaybackSession.resumeAudioAfterVideo;
     _videoError = VideoPlaybackSession.error;
+    // 详情页销毁重建（如后台久置挂起后再进入）时恢复 MV 上下文：
+    // 画质切换走 resolveMvSource 还是 resolveVideoSource 取决于 isMv。
+    _videoIsMv = VideoPlaybackSession.isMv;
+    _videoQuality = VideoPlaybackSession.quality;
+    _videoAvailableQualities = VideoPlaybackSession.availableQualities;
     VideoPlaybackSession.revision.addListener(_syncVideoSession);
     final controller = _videoController;
     if (controller != null) _bindVideoController(controller);
@@ -347,20 +350,37 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
   void _syncVideoSession() {
     // 共享会话在释放原生纹理前会先置空控制器；及时解除 listener，避免
     // 释放过程中再次读取 controller.value 导致 native peer 错误。
+    var controllerRemoved = false;
     if (VideoPlaybackSession.controller == null && _videoController != null) {
       final old = _videoController!;
       _unbindVideoController(old);
       _videoController = null;
-      // 会话被外部收尾（如后台久置自动关闭、切歌）时同步清空本地视频
-      // 状态。后台守护关闭视频后 current 不变（同一首歌恢复音频播放），
-      // 若不同步 songPath，build 仍判定视频在播，全屏覆盖层会黑屏滞留。
-      if (VideoPlaybackSession.songPath == null) {
-        _videoSongPath = null;
-        _videoError = null;
-        _videoLoading = false;
-        _resumeAudioAfterVideo = false;
-      }
-      if (mounted && !_videoClosing) setState(() {});
+      controllerRemoved = true;
+    }
+    // 同步会话状态，覆盖两类外部写入：后台久置挂起（保留 songPath、
+    // 写入错误态）与切歌/外部收尾（清空整个会话），页面与会话始终一致。
+    var sessionChanged = false;
+    if (_videoSongPath != VideoPlaybackSession.songPath) {
+      _videoSongPath = VideoPlaybackSession.songPath;
+      sessionChanged = true;
+    }
+    if (_videoLoading != VideoPlaybackSession.loading) {
+      _videoLoading = VideoPlaybackSession.loading;
+      sessionChanged = true;
+    }
+    if (_videoError != VideoPlaybackSession.error) {
+      _videoError = VideoPlaybackSession.error;
+      sessionChanged = true;
+    }
+    if (_videoIsMv != VideoPlaybackSession.isMv) {
+      _videoIsMv = VideoPlaybackSession.isMv;
+      sessionChanged = true;
+    }
+    if (sessionChanged && _videoSongPath == null) {
+      _resumeAudioAfterVideo = VideoPlaybackSession.resumeAudioAfterVideo;
+    }
+    if (mounted && !_videoClosing && (controllerRemoved || sessionChanged)) {
+      setState(() {});
     }
   }
 
@@ -599,108 +619,266 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
       final initialQuality = isMv ? '2160P' : '1080P';
       _videoQuality = initialQuality;
       _videoAvailableQualities = const [];
+      VideoPlaybackSession.quality = initialQuality;
+      VideoPlaybackSession.availableQualities = const [];
       _videoMuted = false;
-      final source = isMv
-          ? await ref
-                .read(pluginRuntimeProvider)
-                .resolveMvSource(plugin, pluginData,
-                    videoQuality: initialQuality)
-                .timeout(const Duration(seconds: 25))
-          : await ref
-                .read(pluginRuntimeProvider)
-                .resolveVideoSource(
-                  plugin,
-                  pluginData,
-                  videoQuality: initialQuality,
-                  path: item.path,
-                )
-                .timeout(const Duration(seconds: 25));
-      // 插件实际选中的画质优先于请求值（回落后的真实档位）。
-      if (source.selectedQuality?.trim().isNotEmpty == true) {
-        _videoQuality = source.selectedQuality!.trim();
-      }
-      if (source.availableQualities.isNotEmpty) {
-        _videoAvailableQualities = source.availableQualities;
-      }
-      if (!mounted || _videoSongPath != item.path) return;
-      VideoPlayerController? controller;
-      Object? lastVideoError;
-      for (final url in <String>[source.url, ...source.backupUrls]) {
-        VideoPlayerController? candidate;
-        try {
-          candidate = VideoPlayerController.networkUrl(
-            Uri.parse(url),
-            httpHeaders: source.headers,
-            videoPlayerOptions: VideoPlayerOptions(
-              // video_player 默认会在锁屏/切后台时暂停自身；视频歌曲需要
-              // 和普通歌曲一样保持后台播放。
-              allowBackgroundPlayback: true,
-              mixWithOthers: true,
-            ),
-          );
-          await candidate.initialize();
-          controller = candidate;
-          break;
-        } catch (error) {
-          lastVideoError = error;
-          // 初始化失败的候选地址也要释放，避免连续尝试备用地址时泄漏
-          // ExoPlayer/纹理资源。
-          try {
-            await candidate?.dispose();
-          } catch (_) {}
-        }
-      }
-      if (controller == null) {
-        throw lastVideoError ?? Exception('视频地址无法播放');
-      }
-      final activeController = controller;
+      final controller = await _loadVideoControllerWithFallback(
+        plugin: plugin,
+        pluginData: pluginData,
+        path: item.path,
+        isMv: isMv,
+        requestedQuality: initialQuality,
+      );
       if (!mounted || _videoSongPath != item.path) {
-        await activeController.dispose();
+        await controller.dispose();
         return;
       }
-      // MV/视频默认从头播放：不再同步音频播放进度（用户此前反馈
-      // 同步进度导致 MV 起始位置随机），仅保留倍速跟随。
-      final playbackSpeed = ref.read(playerProvider).playbackSpeed;
-      await activeController.setPlaybackSpeed(playbackSpeed);
-      _bindVideoController(activeController);
-      _videoController = activeController;
-      VideoPlaybackSession.controller = activeController;
-      VideoPlaybackSession.loading = false;
-      VideoPlaybackSession.changed();
-      VideoPlaybackSession.progressChanged();
-      setState(() => _videoLoading = false);
-      await activeController.play();
-      // video_player 不会自动接入 Android MediaSession。启动静音音频桥接，
-      // 让通知栏/锁屏/灵动岛进度与播放暂停按钮同步控制当前视频。
-      await notifier.enableVideoMediaBridge();
+      await _attachVideoController(controller, notifier);
     } catch (error) {
       if (!mounted || _videoSongPath != item.path) return;
-      final errorText = _errorText(error);
-      setState(() {
-        _videoSongPath = null;
-        _videoLoading = false;
-        _videoError = errorText;
-      });
-      VideoPlaybackSession.songPath = null;
-      VideoPlaybackSession.controller = null;
-      VideoPlaybackSession.loading = false;
-      VideoPlaybackSession.isMv = false;
-      VideoPlaybackSession.error = errorText;
-      VideoPlaybackSession.changed();
-      _videoController = null;
-      if (_resumeAudioAfterVideo) {
-        _resumeAudioAfterVideo = false;
-        await notifier.resumeAfterVideo();
+      // 失败不再退回音频播放页：保留 MV 覆盖层进入错误态，面板上可
+      // 重新加载（自动降档搜索低画质）或手动切换画质。
+      _enterVideoErrorState(error);
+    }
+  }
+
+  /// 低于 [failedQuality] 的画质候选，按清晰度从高到低排列。优先取
+  /// 插件回传的可用档位；插件未提供时回退内置档位。
+  List<String> _lowerVideoQualityCandidates(String failedQuality) {
+    final base = _videoAvailableQualities.isNotEmpty
+        ? _videoAvailableQualities
+        : const ['1080P', '720P', '480P'];
+    final failedRank = _videoQualityRank(failedQuality);
+    if (failedRank <= 0) return const [];
+    final candidates = base
+        .where(
+          (quality) =>
+              _videoQualityRank(quality) > 0 &&
+              _videoQualityRank(quality) < failedRank,
+        )
+        .toList()
+      ..sort(
+        (a, b) => _videoQualityRank(b).compareTo(_videoQualityRank(a)),
+      );
+    return candidates;
+  }
+
+  /// 解析播放地址并初始化控制器：主地址失败时逐一尝试备用地址。
+  /// 全部失败时抛出最后一个错误。
+  Future<VideoPlayerController> _initVideoController(
+    PluginVideoSource source,
+  ) async {
+    Object? lastVideoError;
+    for (final url in <String>[source.url, ...source.backupUrls]) {
+      VideoPlayerController? candidate;
+      try {
+        candidate = VideoPlayerController.networkUrl(
+          Uri.parse(url),
+          httpHeaders: source.headers,
+          videoPlayerOptions: VideoPlayerOptions(
+            // video_player 默认会在锁屏/切后台时暂停自身；视频歌曲需要
+            // 和普通歌曲一样保持后台播放。
+            allowBackgroundPlayback: true,
+            mixWithOthers: true,
+          ),
+        );
+        await candidate.initialize();
+        return candidate;
+      } catch (error) {
+        lastVideoError = error;
+        // 初始化失败的候选地址也要释放，避免连续尝试备用地址时泄漏
+        // ExoPlayer/纹理资源。
+        try {
+          await candidate?.dispose();
+        } catch (_) {}
       }
+    }
+    throw lastVideoError ?? Exception('视频地址无法播放');
+  }
+
+  /// 解析指定画质并初始化控制器；起播失败（地址失效/解码失败）时自动
+  /// 搜索更低画质档位逐档回落重试（最多 3 档），全部失败抛出最后一次
+  /// 错误。成功期间同步 [_videoQuality]、[_videoAvailableQualities] 与
+  /// 共享会话的画质记录。
+  Future<VideoPlayerController> _loadVideoControllerWithFallback({
+    required EnabledMusicPlugin plugin,
+    required Map<String, dynamic> pluginData,
+    required String path,
+    required bool isMv,
+    required String requestedQuality,
+  }) async {
+    final runtime = ref.read(pluginRuntimeProvider);
+    final source = await (isMv
+        ? runtime.resolveMvSource(plugin, pluginData,
+            videoQuality: requestedQuality)
+        : runtime.resolveVideoSource(
+            plugin,
+            pluginData,
+            videoQuality: requestedQuality,
+            path: path,
+          )).timeout(const Duration(seconds: 25));
+    if (source.availableQualities.isNotEmpty) {
+      _videoAvailableQualities = source.availableQualities;
+    }
+    // 插件实际选中的画质优先于请求值（回落后的真实档位）。
+    final appliedQuality = source.selectedQuality?.trim().isNotEmpty == true
+        ? source.selectedQuality!.trim()
+        : requestedQuality;
+    _videoQuality = appliedQuality;
+    Object? lastError;
+    VideoPlayerController? controller;
+    try {
+      controller = await _initVideoController(source);
+    } catch (error) {
+      lastError = error;
+    }
+    if (controller != null) {
+      VideoPlaybackSession.quality = _videoQuality;
+      VideoPlaybackSession.availableQualities = _videoAvailableQualities;
+      return controller;
+    }
+    // 起播失败：自动搜索更低画质逐档回落，给用户抢救出可播的档位。
+    for (final quality
+        in _lowerVideoQualityCandidates(appliedQuality).take(3)) {
+      try {
+        final fallback = await (isMv
+            ? runtime.resolveMvSource(plugin, pluginData,
+                videoQuality: quality)
+            : runtime.resolveVideoSource(
+                plugin,
+                pluginData,
+                videoQuality: quality,
+                path: path,
+              )).timeout(const Duration(seconds: 25));
+        if (fallback.availableQualities.isNotEmpty) {
+          _videoAvailableQualities = fallback.availableQualities;
+        }
+        final candidate = await _initVideoController(fallback);
+        _videoQuality = fallback.selectedQuality?.trim().isNotEmpty == true
+            ? fallback.selectedQuality!.trim()
+            : quality;
+        VideoPlaybackSession.quality = _videoQuality;
+        VideoPlaybackSession.availableQualities = _videoAvailableQualities;
+        return candidate;
+      } catch (error) {
+        lastError = error;
+        // 回落失败后恢复原档位，错误面板的手动画质切换以它为基准。
+        _videoQuality = appliedQuality;
+      }
+    }
+    throw lastError ?? Exception('视频地址无法播放');
+  }
+
+  /// 控制器初始化成功后的收尾：恢复倍速、绑定监听与共享会话、起播并
+  /// 接入系统媒体桥接。首次启动与错误面板重新加载共用。
+  Future<void> _attachVideoController(
+    VideoPlayerController controller,
+    PlayerNotifier notifier,
+  ) async {
+    // MV/视频默认从头播放：不再同步音频播放进度（用户此前反馈
+    // 同步进度导致 MV 起始位置随机），仅保留倍速跟随。
+    final playbackSpeed = ref.read(playerProvider).playbackSpeed;
+    await controller.setPlaybackSpeed(playbackSpeed);
+    _bindVideoController(controller);
+    _videoController = controller;
+    VideoPlaybackSession.controller = controller;
+    VideoPlaybackSession.loading = false;
+    VideoPlaybackSession.error = null;
+    VideoPlaybackSession.changed();
+    VideoPlaybackSession.progressChanged();
+    if (mounted) {
+      setState(() {
+        _videoLoading = false;
+        _videoError = null;
+      });
+    }
+    await controller.play();
+    // video_player 不会自动接入 Android MediaSession。启动静音音频桥接，
+    // 让通知栏/锁屏/灵动岛进度与播放暂停按钮同步控制当前视频。
+    await notifier.enableVideoMediaBridge();
+  }
+
+  /// 视频加载/起播失败：保留 MV 覆盖层进入错误态（不退回音频播放页、
+  /// 不恢复音频），错误面板提供重新加载与手动切换画质；关闭视频时
+  /// 才按原逻辑恢复音频播放。
+  void _enterVideoErrorState(Object error) {
+    final errorText = _errorText(error);
+    _videoController = null;
+    VideoPlaybackSession.controller = null;
+    VideoPlaybackSession.loading = false;
+    VideoPlaybackSession.error = errorText;
+    VideoPlaybackSession.quality = _videoQuality;
+    VideoPlaybackSession.availableQualities = _videoAvailableQualities;
+    VideoPlaybackSession.changed();
+    if (!mounted) return;
+    setState(() {
+      _videoLoading = false;
+      _videoError = errorText;
+    });
+  }
+
+  /// 错误面板「重新加载」：释放失效控制器（MediaCodec 可能已被系统
+  /// 回收）后按当前画质重新解析起播，失败时自动降档搜索低画质。
+  Future<void> _reloadVideoPlayback() async {
+    final item = ref.read(playerProvider).current;
+    if (item == null || _videoSongPath != item.path) return;
+    if (_videoLoading || _videoError == null) return;
+    final pluginData = item.pluginData;
+    if (pluginData == null || pluginData.isEmpty) return;
+    EnabledMusicPlugin? plugin;
+    try {
+      final plugins = await ref.read(enabledMusicPluginsProvider.future);
+      plugin = plugins.where((value) => value.id == item.pluginId).firstOrNull;
+    } catch (_) {
+      plugin = null;
+    }
+    if (plugin == null) {
       if (mounted) {
         XyNotice.show(
           context,
-          message: isMv
-              ? 'MV 播放失败：${_errorText(error)}'
-              : '视频播放失败：${_errorText(error)}',
+          message: '歌曲所属插件已停用或删除',
           type: XyNoticeType.error,
         );
       }
+      return;
+    }
+    // 释放已失效的控制器，腾出解码器资源再重新起播。
+    final broken = _videoController;
+    if (broken != null) {
+      _unbindVideoController(broken);
+      _videoController = null;
+      VideoPlaybackSession.controller = null;
+      try {
+        await broken.dispose();
+      } catch (_) {}
+    }
+    final quality = _videoQuality;
+    setState(() {
+      _videoError = null;
+      _videoLoading = true;
+    });
+    VideoPlaybackSession.error = null;
+    VideoPlaybackSession.loading = true;
+    VideoPlaybackSession.changed();
+    try {
+      final controller = await _loadVideoControllerWithFallback(
+        plugin: plugin,
+        pluginData: pluginData,
+        path: item.path,
+        isMv: _videoIsMv,
+        requestedQuality: quality,
+      );
+      if (!mounted || _videoSongPath != item.path) {
+        await controller.dispose();
+        return;
+      }
+      await _attachVideoController(
+        controller,
+        ref.read(playerProvider.notifier),
+      );
+    } catch (error) {
+      if (!mounted || _videoSongPath != item.path) return;
+      _enterVideoErrorState(error);
     }
   }
 
@@ -775,7 +953,9 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
     final oldController = _videoController;
     final resumePosition = oldController?.value.position ?? Duration.zero;
     final wasPlaying = oldController?.value.isPlaying ?? true;
-    final previousSpeed = oldController?.value.playbackSpeed ?? 1.0;
+    // 从错误面板切换时没有旧控制器，倍速跟随播放器全局设置。
+    final previousSpeed = oldController?.value.playbackSpeed ??
+        ref.read(playerProvider).playbackSpeed;
     setState(() => _videoLoading = true);
     try {
       final runtime = ref.read(pluginRuntimeProvider);
@@ -847,7 +1027,12 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
       setState(() {
         _videoQuality = appliedQuality;
         _videoLoading = false;
+        // 从错误面板手动切换画质成功：收起错误面板继续播放。
+        _videoError = null;
       });
+      VideoPlaybackSession.quality = appliedQuality;
+      VideoPlaybackSession.availableQualities = _videoAvailableQualities;
+      VideoPlaybackSession.error = null;
       if (wasPlaying) {
         await nextController.play();
       } else {
@@ -1108,6 +1293,7 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
     VideoPlaybackSession.isMv = false;
     VideoPlaybackSession.resumeAudioAfterVideo = false;
     VideoPlaybackSession.error = null;
+    VideoPlaybackSession.resetQuality();
     VideoPlaybackSession.changed();
     VideoPlaybackSession.progressChanged();
     if (mounted) setState(() {});
@@ -2584,6 +2770,15 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
           onPickQuality: () => unawaited(_pickVideoQuality()),
           onToggleMute: () => unawaited(_toggleVideoMute()),
           onDownload: () => unawaited(_downloadCurrentVideo()),
+          onReload: () => unawaited(_reloadVideoPlayback()),
+          onSelectQuality: (quality) {
+            if (_videoLoading) return;
+            unawaited(_switchVideoQuality(quality));
+          },
+          qualityChoices: _videoAvailableQualities.isNotEmpty
+              ? _videoAvailableQualities
+              : const ['1080P', '720P', '480P'],
+          currentQuality: _videoQuality,
         ),
       );
     }
@@ -4364,6 +4559,36 @@ class _PluginLyricsSearchSheetState
     }
   }
 
+  /// 关联歌词候选排序打分：标题 > 时长（秒级完全一致）> 作者。
+  /// 标题归一化完全相等 3 分、互相包含 2 分；时长与当前歌曲秒级完全
+  /// 一致 2 分；作者互相包含 1 分。
+  int _lyricsOptionScore(PluginLyricsOption option) {
+    var score = 0;
+    final targetTitle = _normalizeLyricsMatchText(widget.item.title);
+    final title = _normalizeLyricsMatchText(option.songTitle);
+    if (title.isNotEmpty && targetTitle.isNotEmpty) {
+      if (title == targetTitle) {
+        score += 3;
+      } else if (title.contains(targetTitle) || targetTitle.contains(title)) {
+        score += 2;
+      }
+    }
+    final targetSeconds = widget.item.durationMs ~/ 1000;
+    final seconds = option.durationMs ~/ 1000;
+    if (targetSeconds > 0 && seconds == targetSeconds) score += 2;
+    final targetArtist = _normalizeLyricsMatchText(widget.item.artist);
+    final artist = _normalizeLyricsMatchText(option.songArtist);
+    if (artist.isNotEmpty &&
+        targetArtist.isNotEmpty &&
+        (artist.contains(targetArtist) || targetArtist.contains(artist))) {
+      score += 1;
+    }
+    return score;
+  }
+
+  String _normalizeLyricsMatchText(String text) =>
+      text.replaceAll(RegExp(r'\s+'), ' ').trim().toLowerCase();
+
   Future<void> _initializeSearch() async {
     final remembered = await _loadRememberedQuery();
     if (!mounted) return;
@@ -4401,6 +4626,12 @@ class _PluginLyricsSearchSheetState
         };
         final options = merged.values.toList()
           ..sort((a, b) {
+            // 匹配优先：标题 > 时长（秒级完全一致）> 作者；同分按
+            // 插件名稳定排序（保持各插件结果相对顺序）。
+            final score = _lyricsOptionScore(b).compareTo(
+              _lyricsOptionScore(a),
+            );
+            if (score != 0) return score;
             final pluginOrder = a.pluginName.compareTo(b.pluginName);
             return pluginOrder != 0 ? pluginOrder : a.id.compareTo(b.id);
           });
@@ -4790,6 +5021,8 @@ class _PlayerDetailBackground extends ConsumerWidget {
                 wallpaperBlur,
                 blurred: false,
               ),
+      // 粒子动效已移除：持久化旧值归一化为流光背景。
+      PlayerDetailBackgroundMode.particle => _flowingLightBackdrop(current),
     };
 
     // 流光模式：底色是不透明封面模糊，亮色封面本身就很亮，再叠加
@@ -4798,6 +5031,7 @@ class _PlayerDetailBackground extends ConsumerWidget {
     // 背景模式维持原有可读性遮罩。
     final flowing = mode == PlayerDetailBackgroundMode.flowingLight ||
         mode == PlayerDetailBackgroundMode.coverBlur ||
+        mode == PlayerDetailBackgroundMode.particle ||
         (mode == PlayerDetailBackgroundMode.wallpaperBlur &&
             wallpaperPath.isEmpty) ||
         (mode == PlayerDetailBackgroundMode.customImage &&
@@ -4808,8 +5042,8 @@ class _PlayerDetailBackground extends ConsumerWidget {
         fit: StackFit.expand,
         children: [
           Positioned.fill(child: backdrop),
+          // 流光模式：深色压暗，blob 的 plus 叠加负责提供流动色彩。
           if (flowing)
-            // 流光模式：深色压暗，blob 的 plus 叠加负责提供流动色彩。
             ColoredBox(color: Colors.black.withValues(alpha: .24))
           else
             ColoredBox(
@@ -5164,6 +5398,10 @@ class _BilibiliVideoView extends StatefulWidget {
     this.onPickQuality,
     this.onToggleMute,
     this.onDownload,
+    this.onReload,
+    this.onSelectQuality,
+    this.qualityChoices = const [],
+    this.currentQuality = '',
   });
 
   final VideoPlayerController? controller;
@@ -5178,6 +5416,14 @@ class _BilibiliVideoView extends StatefulWidget {
   final VoidCallback? onPickQuality;
   final VoidCallback? onToggleMute;
   final VoidCallback? onDownload;
+  final VoidCallback? onReload;
+  final void Function(String quality)? onSelectQuality;
+
+  /// 错误面板展示的可选画质档位（插件回传或内置档位）。
+  final List<String> qualityChoices;
+
+  /// 当前画质档位，错误面板的档位胶囊以此为选中态。
+  final String currentQuality;
 
   @override
   State<_BilibiliVideoView> createState() => _BilibiliVideoViewState();
@@ -5314,6 +5560,19 @@ class _BilibiliVideoViewState extends State<_BilibiliVideoView> {
                 ),
               ),
             ),
+          // 播放失败/后台久置挂起：中央错误面板（参考 BakaMusic），提供
+          // 重新加载与画质切换。置于关闭按钮之前：面板铺满时右上角的
+          // 常驻关闭按钮仍绘制在其上，可直接点按退回音频播放页。
+          if (widget.error?.trim().isNotEmpty == true)
+            Positioned.fill(
+              child: _VideoErrorPanel(
+                error: widget.error!,
+                choices: widget.qualityChoices,
+                currentQuality: widget.currentQuality,
+                onReload: widget.onReload,
+                onSelectQuality: widget.onSelectQuality,
+              ),
+            ),
           // 右上角常驻关闭按钮：控制层隐藏时也能退出视频。
           if (widget.onClose != null)
             Positioned(
@@ -5400,20 +5659,6 @@ class _BilibiliVideoViewState extends State<_BilibiliVideoView> {
           if (widget.loading)
             const Center(
               child: CircularProgressIndicator(color: Colors.white),
-            ),
-          if (widget.error?.trim().isNotEmpty == true)
-            Center(
-              child: Padding(
-                padding: const EdgeInsets.all(24),
-                child: Text(
-                  '视频播放失败\n${widget.error}',
-                  textAlign: TextAlign.center,
-                  style: const TextStyle(
-                    color: Colors.white70,
-                    height: 1.5,
-                  ),
-                ),
-              ),
             ),
         ],
       ),
@@ -6644,6 +6889,8 @@ class _LyricsViewState extends ConsumerState<_LyricsView>
         ref.watch(settingsProvider).valueOrNull?.lyricFontSize ?? 18.0;
     final showTranslation =
         ref.watch(settingsProvider).valueOrNull?.showLyricsTranslation ?? true;
+    final tapSeek =
+        ref.watch(settingsProvider).valueOrNull?.lyricTapSeek ?? true;
     final textAlign = switch (lyricAlignment) {
       LyricDisplayAlignment.left => TextAlign.left,
       LyricDisplayAlignment.center => TextAlign.center,
@@ -6663,6 +6910,7 @@ class _LyricsViewState extends ConsumerState<_LyricsView>
           textAlign,
           baseFontSize,
           showTranslation,
+          tapSeek,
         ),
       );
     } else if (widget.item.pluginId != null && !widget.item.lyricsAttempted) {
@@ -6689,6 +6937,7 @@ class _LyricsViewState extends ConsumerState<_LyricsView>
           textAlign,
           baseFontSize,
           showTranslation,
+          tapSeek,
         ),
       );
     }
@@ -6702,6 +6951,7 @@ class _LyricsViewState extends ConsumerState<_LyricsView>
     TextAlign textAlign,
     double baseFontSize,
     bool showTranslation,
+    bool tapSeek,
   ) {
     if (lines.isEmpty) {
       return _lyricsEmpty(context, '暂无歌词', onLinkLyrics: widget.onLinkLyrics);
@@ -6747,14 +6997,17 @@ class _LyricsViewState extends ConsumerState<_LyricsView>
                       final selected = index == active;
                       return InkWell(
                         key: _lineKeys.putIfAbsent(index, GlobalKey.new),
-                        onTap: () => ref
-                            .read(playerProvider.notifier)
-                            .seek(
-                              playbackPositionForLyric(
-                                line.time,
-                                widget.offsetTenths,
-                              ),
-                            ),
+                        // 设置关闭“单击歌词调整进度”时禁用点击跳转。
+                        onTap: tapSeek
+                            ? () => ref
+                                  .read(playerProvider.notifier)
+                                  .seek(
+                                    playbackPositionForLyric(
+                                      line.time,
+                                      widget.offsetTenths,
+                                    ),
+                                  )
+                            : null,
                         borderRadius: BorderRadius.circular(12),
                         child: AnimatedContainer(
                           duration: const Duration(milliseconds: 220),
@@ -7895,5 +8148,157 @@ class _Controls extends ConsumerWidget {
 
   Future<void> _showQueue(BuildContext context, WidgetRef ref) {
     return showQueueSheet(context, ref);
+  }
+}
+
+/// 视频画质档位数值（'1080P' → 1080、'720p' → 720），无法解析返回 0。
+/// 供起播失败的自动降档与错误面板的档位排序共用。
+int _videoQualityRank(String label) {
+  final match = RegExp(r'(\d{3,4})').firstMatch(label);
+  return match == null ? 0 : int.parse(match.group(1)!);
+}
+
+/// MV/视频错误面板（参考 BakaMusic 的播放失败页）：中央描边圆环警示
+/// 图标 + 标题/说明 +「重新加载」按钮 + 画质档位胶囊快捷切换。用于
+/// 起播失败（自动降档也失败）与后台久置挂起两种场景。
+class _VideoErrorPanel extends StatelessWidget {
+  const _VideoErrorPanel({
+    required this.error,
+    required this.choices,
+    required this.currentQuality,
+    this.onReload,
+    this.onSelectQuality,
+  });
+
+  final String error;
+  final List<String> choices;
+  final String currentQuality;
+  final VoidCallback? onReload;
+  final void Function(String quality)? onSelectQuality;
+
+  @override
+  Widget build(BuildContext context) {
+    // 档位按清晰度从高到低排序、去重。
+    final ranked = <String>[];
+    for (final quality in choices) {
+      if (!ranked.any(
+        (existing) => existing.toLowerCase() == quality.toLowerCase(),
+      )) {
+        ranked.add(quality);
+      }
+    }
+    ranked.sort(
+      (a, b) => _videoQualityRank(b).compareTo(_videoQualityRank(a)),
+    );
+    return ColoredBox(
+      color: Colors.black.withValues(alpha: .82),
+      child: Center(
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 36),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Container(
+                width: 72,
+                height: 72,
+                decoration: BoxDecoration(
+                  shape: BoxShape.circle,
+                  color: Colors.black.withValues(alpha: .35),
+                  border: Border.all(color: Colors.white, width: 2.5),
+                ),
+                child: const Icon(
+                  Icons.error_outline_rounded,
+                  color: Colors.white,
+                  size: 42,
+                ),
+              ),
+              const SizedBox(height: 20),
+              const Text(
+                'MV 播放失败',
+                style: TextStyle(
+                  color: Colors.white,
+                  fontSize: 17,
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
+              const SizedBox(height: 8),
+              const Text(
+                '请重新加载，或选择其他清晰度',
+                style: TextStyle(color: Colors.white70, fontSize: 13),
+              ),
+              const SizedBox(height: 28),
+              OutlinedButton.icon(
+                onPressed: onReload,
+                style: OutlinedButton.styleFrom(
+                  foregroundColor: Colors.white,
+                  side: const BorderSide(color: Colors.white, width: 1.2),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(22),
+                  ),
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 24,
+                    vertical: 10,
+                  ),
+                ),
+                icon: const Icon(Icons.refresh_rounded, size: 18),
+                label: const Text(
+                  '重新加载',
+                  style: TextStyle(fontSize: 14, fontWeight: FontWeight.w600),
+                ),
+              ),
+              if (ranked.length > 1 && onSelectQuality != null) ...[
+                const SizedBox(height: 28),
+                Wrap(
+                  alignment: WrapAlignment.center,
+                  spacing: 8,
+                  runSpacing: 8,
+                  children: [
+                    for (final quality in ranked)
+                      _buildQualityChip(quality, onSelectQuality!),
+                  ],
+                ),
+              ],
+              const SizedBox(height: 20),
+              Text(
+                error,
+                maxLines: 2,
+                overflow: TextOverflow.ellipsis,
+                textAlign: TextAlign.center,
+                style: const TextStyle(color: Colors.white38, fontSize: 11),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildQualityChip(
+    String quality,
+    void Function(String quality) onSelect,
+  ) {
+    final selected = quality.toLowerCase() == currentQuality.toLowerCase();
+    return GestureDetector(
+      onTap: selected ? null : () => onSelect(quality),
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 7),
+        decoration: BoxDecoration(
+          color: selected ? Colors.white : Colors.transparent,
+          borderRadius: BorderRadius.circular(15),
+          border: Border.all(
+            color: selected ? Colors.white : Colors.white38,
+            width: 1,
+          ),
+        ),
+        child: Text(
+          quality.toUpperCase(),
+          style: TextStyle(
+            color: selected ? Colors.black : Colors.white,
+            fontSize: 12,
+            fontWeight: FontWeight.w600,
+          ),
+        ),
+      ),
+    );
   }
 }

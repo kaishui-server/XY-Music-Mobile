@@ -28,6 +28,12 @@ Future<void> main() async {
 
 Future<void> _bootstrapApp() async {
   WidgetsFlutterBinding.ensureInitialized();
+  // 解码图片（封面）缓存上限：框架默认 1000 张 / 100MB，对以小尺寸
+  // 封面为主的音乐 App 偏大，长时间浏览歌单后常驻内存明显偏高；
+  // 收紧到 512 张 / 64MB 已足够列表回滚复用，降低闲置内存占用。
+  final imageCache = PaintingBinding.instance.imageCache;
+  imageCache.maximumSize = 512;
+  imageCache.maximumSizeBytes = 64 << 20;
   // 某些使用 AudioServiceActivity 的 Android ROM 不会自动执行
   // file_picker 的 Dart 插件注册，首次调用 FilePicker.platform 时会抛出
   // LateInitializationError: Field '_instance' has not been initialized。

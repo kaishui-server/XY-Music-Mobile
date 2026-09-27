@@ -421,10 +421,13 @@ class _AccountPageState extends ConsumerState<AccountPage>
     if (await AccountCloudSync.isEnabled(accountId)) {
       await _runCloudSync();
       await AccountCloudSync.startAutoUpload(
-        ref.read(authProvider.notifier),
-        ref.read(playlistsProvider.notifier),
+        // 登录流程结束页面可能立即被销毁，await 后不能用 ref（否则
+        // "Cannot use ref after the widget was disposed" 崩溃），统一
+        // 经应用级 ProviderContainer 读取。
+        container.read(authProvider.notifier),
+        container.read(playlistsProvider.notifier),
         container,
-        favorites: ref.read(favoritesProvider.notifier),
+        favorites: container.read(favoritesProvider.notifier),
       );
       return;
     }
@@ -440,10 +443,10 @@ class _AccountPageState extends ConsumerState<AccountPage>
     if (enabled && mounted) {
       await _runCloudSync();
       await AccountCloudSync.startAutoUpload(
-        ref.read(authProvider.notifier),
-        ref.read(playlistsProvider.notifier),
+        container.read(authProvider.notifier),
+        container.read(playlistsProvider.notifier),
         container,
-        favorites: ref.read(favoritesProvider.notifier),
+        favorites: container.read(favoritesProvider.notifier),
       );
     }
   }
@@ -453,13 +456,13 @@ class _AccountPageState extends ConsumerState<AccountPage>
     final container = ProviderScope.containerOf(context, listen: false);
     setState(() => _cloudSyncing = true);
     try {
-      final auth = ref.read(authProvider.notifier);
-      final playlists = ref.read(playlistsProvider.notifier);
+      final auth = container.read(authProvider.notifier);
+      final playlists = container.read(playlistsProvider.notifier);
       final result = await AccountCloudSync.syncAll(
         auth,
         playlists,
         container,
-        favorites: ref.read(favoritesProvider.notifier),
+        favorites: container.read(favoritesProvider.notifier),
       );
       if (mounted) {
         final suffix = result.pluginErrors.isEmpty

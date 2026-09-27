@@ -3,6 +3,7 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../core/settings.dart';
 import '../favorites/favorites_provider.dart';
 import '../library/library_provider.dart';
 import '../navigation/shell.dart';
@@ -166,6 +167,12 @@ class _SongsListViewState extends ConsumerState<SongsListView> {
     final hasCurrentSong = ref.watch(
       playerProvider.select((state) => state.current != null),
     );
+    // “歌单歌曲加载封面”设置：关闭后列表中的网络歌曲不逐首下载封面。
+    final loadNetworkCovers = ref.watch(
+      settingsProvider.select(
+        (state) => state.valueOrNull?.showPlaylistSongCovers ?? true,
+      ),
+    );
     final playingPath = ref.watch(
       playerProvider.select((state) => state.current?.path),
     );
@@ -197,6 +204,7 @@ class _SongsListViewState extends ConsumerState<SongsListView> {
               dragIndex: i < widget.songs.length && !widget.selectionMode
                   ? i
                   : -1,
+              loadNetworkCover: loadNetworkCovers,
             ),
           )
         else
@@ -211,6 +219,7 @@ class _SongsListViewState extends ConsumerState<SongsListView> {
               pluginNames: pluginNames,
               playingPath: playingPath,
               dragIndex: -1,
+              loadNetworkCover: loadNetworkCovers,
             ),
           ),
         if (widget.showFloatingButtons)
@@ -234,6 +243,7 @@ class _SongsListViewState extends ConsumerState<SongsListView> {
     required Map<String, String> pluginNames,
     required String? playingPath,
     required int dragIndex,
+    required bool loadNetworkCover,
   }) {
     if (i == widget.songs.length) {
       return KeyedSubtree(
@@ -299,7 +309,7 @@ class _SongsListViewState extends ConsumerState<SongsListView> {
                     ),
                     const SizedBox(width: 8),
                   ],
-                  SongCover(song: s),
+                  SongCover(song: s, loadNetworkCover: loadNetworkCover),
                   const SizedBox(width: 11),
                   Expanded(
                     child: Column(
@@ -350,6 +360,17 @@ class _SongsListViewState extends ConsumerState<SongsListView> {
                     ),
                   ),
                   const SizedBox(width: 8),
+                  // 收藏按钮置于来源&时长左侧（时长&来源 → 收藏 → 更多）。
+                  if (!widget.selectionMode && widget.showFavoriteButton)
+                    IconButton(
+                      tooltip: isFavorite ? '取消收藏' : '收藏',
+                      icon: Icon(
+                        isFavorite ? Icons.favorite : Icons.favorite_border,
+                        size: 21,
+                        color: const Color(0xFFEC4141),
+                      ),
+                      onPressed: () => _toggleFavorite(context, ref, s),
+                    ),
                   // 来源插件名标签（参考 MusicFree）置于时长上端、右对齐，
                   // 与时长组成右侧纵向小列，不再挤压副标题行。
                   Column(
@@ -369,16 +390,6 @@ class _SongsListViewState extends ConsumerState<SongsListView> {
                       ),
                     ],
                   ),
-                  if (!widget.selectionMode && widget.showFavoriteButton)
-                    IconButton(
-                      tooltip: isFavorite ? '取消收藏' : '收藏',
-                      icon: Icon(
-                        isFavorite ? Icons.favorite : Icons.favorite_border,
-                        size: 21,
-                        color: const Color(0xFFEC4141),
-                      ),
-                      onPressed: () => _toggleFavorite(context, ref, s),
-                    ),
                   if (!widget.selectionMode)
                     IconButton(
                       tooltip: '更多',
@@ -785,12 +796,25 @@ class _SourceTag extends StatelessWidget {
 }
 
 class SongCover extends StatelessWidget {
-  const SongCover({super.key, required this.song, this.size = 44});
+  const SongCover({
+    super.key,
+    required this.song,
+    this.size = 44,
+    this.loadNetworkCover = true,
+  });
   final Song song;
   final double size;
 
+  /// 是否为网络歌曲加载网络封面。列表行在“歌单歌曲加载封面”设置
+  /// 关闭时传 false：网络封面占位显示，跳过逐首下载，加快大歌单
+  /// 打开速度。单曲场景（操作面板头部）保持默认加载。
+  final bool loadNetworkCover;
+
   @override
   Widget build(BuildContext context) {
+    if (!loadNetworkCover && song.coverUrl?.trim().isNotEmpty == true) {
+      return _CoverPlaceholder(size: size);
+    }
     return CoverImage(
       songPath: song.path,
       imageUrl: song.coverUrl,
@@ -801,6 +825,39 @@ class SongCover extends StatelessWidget {
       // 网络封面整张解码进纹理，长列表滚动时明显增加内存与解码开销。
       cacheWidth: (size * 3).round(),
       icon: Icons.music_note,
+    );
+  }
+}
+
+/// 与 CoverImage 占位样式一致的渐变占位图。
+class _CoverPlaceholder extends StatelessWidget {
+  const _CoverPlaceholder({required this.size});
+  final double size;
+
+  @override
+  Widget build(BuildContext context) {
+    return ClipRRect(
+      borderRadius: BorderRadius.circular(10),
+      child: SizedBox(
+        width: size,
+        height: size,
+        child: DecoratedBox(
+          decoration: const BoxDecoration(
+            gradient: LinearGradient(
+              begin: Alignment.topLeft,
+              end: Alignment.bottomRight,
+              colors: [Color(0xFFEC4141), Color(0xFFFF8A5C)],
+            ),
+          ),
+          child: Center(
+            child: Icon(
+              Icons.music_note,
+              color: Colors.white.withValues(alpha: 0.85),
+              size: size * 0.4,
+            ),
+          ),
+        ),
+      ),
     );
   }
 }

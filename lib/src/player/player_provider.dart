@@ -18,6 +18,8 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import '../core/db_path.dart';
 import '../core/settings.dart';
+import '../effects/effects_provider.dart';
+import '../favorites/favorites_provider.dart';
 import '../plugins/plugin_runtime.dart';
 import '../recent/recent_store.dart';
 import '../rust/api.dart';
@@ -529,9 +531,12 @@ LoopMode audioLoopModeForPlayMode(int playMode) =>
 ///
 /// 该桥接包装 just_audio_background 的内部 handler：
 /// - 在 playbackState 中补上上一首/下一首控件与对应的 MediaAction，
-///   让媒体卡片显示完整的三键布局，并让系统知道支持切歌；
-/// - 把 skipToNext/skipToPrevious 转发回 [PlayerNotifier]，由应用自己的
-///   播放队列决定切歌行为。
+///   让媒体卡片显示完整的切歌布局，并让系统知道支持切歌；
+/// - 注入「收藏」「播放模式」两个自定义按钮（对齐 QQ 音乐等主流播放器
+///   的通知栏五键布局：收藏/上一首/播放暂停/下一首/播放模式），图标随
+///   收藏状态与播放模式动态切换；
+/// - 把 skipToNext/skipToPrevious 及自定义按键转发回 [PlayerNotifier]，
+///   由应用自己的播放队列决定切歌行为。
 class _MediaSessionBridge extends audio_service.CompositeAudioHandler {
   _MediaSessionBridge(super.inner) : _innerRef = inner;
 
@@ -542,8 +547,48 @@ class _MediaSessionBridge extends audio_service.CompositeAudioHandler {
   Future<void> Function()? onSkipToNext;
   Future<void> Function()? onSkipToPrevious;
 
+  /// 查询当前曲目是否已收藏（用于通知栏收藏按钮的实心/空心图标）。
+  bool Function()? favoriteStateResolver;
+
+  /// 查询当前播放模式（0 列表循环 1 单曲循环 2 随机）。
+  int Function()? playModeResolver;
+
+  /// 由播放器注入的应用播放队列来源（返回 state.queue 的引用）。
+  /// 蓝牙 AVRCP/车机/系统媒体界面按 MediaSession 队列长度判定
+  /// 上一首/下一首是否可用；单 URL 播放模型的内部队列恒为 1 首，
+  /// 必须把应用队列同步给媒体会话，否则蓝牙耳机/车机的切歌键
+  /// 会被判定为不可用而吞掉。
+  List<QueueItem>? Function()? queueSource;
+
+  /// 当前曲目在应用队列中的下标（写入 PlaybackState.queueIndex，
+  /// 供系统媒体界面对队列高亮定位）。
+  int? Function()? queueIndexResolver;
+
+  /// 车机/系统媒体界面点击队列中某首歌时跳转播放（应用侧按
+  /// 队列下标点播，替代内部 handler 在单曲源上越界 seek 的默认行为）。
+  Future<void> Function(int index)? onSkipToQueueItem;
+
+  /// 通知栏「收藏」按钮：切换当前曲目的收藏状态。
+  Future<void> Function()? onToggleFavorite;
+
+  /// 通知栏「播放模式」按钮：循环切换列表循环/单曲循环/随机。
+  Future<void> Function()? onCyclePlayMode;
+
+  /// 发布给媒体会话的队列（应用队列转换的 MediaItem 列表）。
+  /// 覆写 [queue] 后 SwitchAudioHandler 会把它经平台通道同步到
+  /// 原生 mediaSession.setQueue，内部 handler 每次点播重载单曲
+  /// 队列的行为不再影响媒体会话侧。
+  final BehaviorSubject<List<audio_service.MediaItem>> _bridgeQueue =
+      BehaviorSubject<List<audio_service.MediaItem>>.seeded(const []);
+
+  /// 上次同步过的应用队列引用（identical 检测，避免每次状态广播
+  /// 都重复整表序列化推送）。
+  List<QueueItem>? _lastQueueSourceRef;
+
   final BehaviorSubject<audio_service.PlaybackState> _patchedPlaybackState =
       BehaviorSubject<audio_service.PlaybackState>();
+  StreamSubscription<audio_service.PlaybackState>? _innerSubscription;
+  audio_service.PlaybackState? _lastInnerState;
   bool _attached = false;
 
   /// 订阅被包装 handler 的播放状态并开始发布补丁后的状态。
@@ -551,29 +596,113 @@ class _MediaSessionBridge extends audio_service.CompositeAudioHandler {
   void attach() {
     if (_attached) return;
     _attached = true;
-    _innerRef.playbackState.listen(_publish);
+    _innerSubscription = _innerRef.playbackState.listen(_publish);
   }
 
+  /// 取消订阅（桥接被重建安装时调用，避免旧实例泄漏监听）。
+  void detach() {
+    _attached = false;
+    _innerSubscription?.cancel();
+    _innerSubscription = null;
+    _bridgeQueue.close();
+  }
+
+  /// 收藏/播放模式等自定义按钮状态变化时主动刷新通知（稳定播放中
+  /// inner handler 不会再广播新状态，必须由宿主显式触发重发布）。
+  void notifyCustomControlsChanged() {
+    final last = _lastInnerState;
+    if (last != null && !_patchedPlaybackState.isClosed) {
+      _publish(last);
+    }
+  }
+
+  audio_service.MediaControl _favoriteControl() {
+    final favorite = favoriteStateResolver?.call() ?? false;
+    return audio_service.MediaControl.custom(
+      androidIcon: 'drawable/audio_service_favorite${favorite ? '_filled' : ''}',
+      label: favorite ? '取消收藏' : '收藏',
+      name: 'toggleFavorite',
+    );
+  }
+
+  audio_service.MediaControl _playModeControl() {
+    const icons = [
+      'drawable/audio_service_repeat',
+      'drawable/audio_service_repeat_one',
+      'drawable/audio_service_shuffle',
+    ];
+    const labels = ['列表循环', '单曲循环', '随机播放'];
+    final mode = (playModeResolver?.call() ?? 0).clamp(0, 2);
+    return audio_service.MediaControl.custom(
+      androidIcon: icons[mode],
+      label: labels[mode],
+      name: 'cyclePlayMode',
+    );
+  }
+
+  /// 应用队列同步到媒体会话的条数上限：队列经 Binder 传给
+  /// mediaSession.setQueue，事务上限约 1MB，超大歌单（数千首）整表
+  /// 推送会触发 TransactionTooLargeException；蓝牙 AVRCP 的
+  /// now-playing 列表通常也只展示前几百条，截断到 500 条足够。
+  static const int _maxSyncQueueLength = 500;
+
+  /// 应用队列引用变化时把队列转换并推送到媒体会话。内部 handler
+  /// 每次点播（customLoad）都会把自身队列重置为单曲，但媒体会话
+  /// 读的是覆写后的 [queue]，不受影响；只有应用队列真正变化
+  /// （点播新列表/增删歌）才重新整表推送。
+  void _syncQueueIfNeeded() {
+    final source = queueSource?.call();
+    if (identical(source, _lastQueueSourceRef)) return;
+    _lastQueueSourceRef = source;
+    if (_bridgeQueue.isClosed) return;
+    if (source == null || source.isEmpty) {
+      _bridgeQueue.add(const []);
+      return;
+    }
+    final items = [
+      for (final item
+          in source.take(_maxSyncQueueLength))
+        _toMediaItem(item),
+    ];
+    _bridgeQueue.add(items);
+  }
+
+  /// 应用队列项转换为媒体会话的 MediaItem：id 用歌曲路径（与应用
+  /// 侧点播定位一致），时长/封面可用时附带，供车机/蓝牙界面展示。
+  audio_service.MediaItem _toMediaItem(QueueItem item) {
+    final artUri = Uri.tryParse(item.coverUrl ?? '');
+    return audio_service.MediaItem(
+      id: item.path,
+      title: item.title,
+      artist: item.artist,
+      album: item.album,
+      duration: item.durationMs > 0
+          ? Duration(milliseconds: item.durationMs)
+          : null,
+      artUri: (artUri != null && artUri.hasScheme) ? artUri : null,
+    );
+  }
+
+  @override
+  ValueStream<List<audio_service.MediaItem>> get queue => _bridgeQueue;
+
   void _publish(audio_service.PlaybackState state) {
-    final controls = [...state.controls];
-    // 单 URL 播放导致原状态里永远没有切歌控件，这里补齐成
-    // [上一首, 播放/暂停, 上一首/下一首按钮之外的原有按钮, 下一首] 的
-    // 标准三键布局（stop 保留在完整控件里但不进紧凑视图）。
-    final hasPreviousControl = controls.any(
-      (control) => control.action == audio_service.MediaAction.skipToPrevious,
-    );
-    final hasNextControl = controls.any(
-      (control) => control.action == audio_service.MediaAction.skipToNext,
-    );
-    if (!hasPreviousControl) {
-      controls.insert(0, audio_service.MediaControl.skipToPrevious);
-    }
-    if (!hasNextControl) {
-      controls.add(audio_service.MediaControl.skipToNext);
-    }
-    final compactActionIndices = <int>[
-      for (var i = 0; i < controls.length; i++)
-        if (controls[i].action != audio_service.MediaAction.stop) i,
+    _lastInnerState = state;
+    _syncQueueIfNeeded();
+    // Android 13+（含澎湃 HyperOS）系统媒体卡片按 PlaybackState 分配
+    // 按钮槽位：播放/暂停居中、上一首/下一首按 action bits，两个
+    // CustomAction 落在最外侧，最终呈
+    // [收藏][上一首][播放暂停][下一首][播放模式] 的五键布局；
+    // Android 12 及以下的展开视图按 controls 顺序渲染，紧凑视图取
+    // 索引 1/2/3（上一首/播放暂停/下一首）。
+    final controls = <audio_service.MediaControl>[
+      _favoriteControl(),
+      audio_service.MediaControl.skipToPrevious,
+      state.playing
+          ? audio_service.MediaControl.pause
+          : audio_service.MediaControl.play,
+      audio_service.MediaControl.skipToNext,
+      _playModeControl(),
     ];
     _patchedPlaybackState.add(
       state.copyWith(
@@ -583,7 +712,10 @@ class _MediaSessionBridge extends audio_service.CompositeAudioHandler {
           audio_service.MediaAction.skipToPrevious,
           audio_service.MediaAction.skipToNext,
         },
-        androidCompactActionIndices: compactActionIndices,
+        androidCompactActionIndices: const [1, 2, 3],
+        // 应用队列下标（蓝牙/车机界面对 now-playing 队列高亮定位；
+        // 单曲播放模型的内部下标恒为 0，直接覆盖）。
+        queueIndex: queueIndexResolver?.call(),
       ),
     );
   }
@@ -638,6 +770,40 @@ class _MediaSessionBridge extends audio_service.CompositeAudioHandler {
     }
     await super.skipToPrevious();
   }
+
+  /// 车机/系统媒体界面点击 now-playing 队列中的歌曲：路由到应用侧
+  /// 按队列下标点播（默认实现会在单曲源上做越界 seek，无效）。
+  @override
+  // ignore: must_call_super
+  Future<void> skipToQueueItem(int index) async {
+    final callback = onSkipToQueueItem;
+    if (callback != null) {
+      await callback(index);
+      return;
+    }
+    await super.skipToQueueItem(index);
+  }
+
+  /// 通知栏自定义按钮：custom action 经媒体会话回到这里，拦截后路由到
+  /// 注入的回调（收藏/播放模式），其余 custom action 原样转发。
+  @override
+  Future<void> customAction(String name, [Map<String, dynamic>? extras]) async {
+    switch (name) {
+      case 'toggleFavorite':
+        final callback = onToggleFavorite;
+        if (callback != null) {
+          await callback();
+          return;
+        }
+      case 'cyclePlayMode':
+        final callback = onCyclePlayMode;
+        if (callback != null) {
+          await callback();
+          return;
+        }
+    }
+    await super.customAction(name, extras);
+  }
 }
 
 class PlayerNotifier extends StateNotifier<PlaybackState>
@@ -659,44 +825,69 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
       // 否则“软件内不显示桌面歌词”时浮窗会一直停留在“暂无歌词”。
       _desktopLyricsHiddenSent = false;
       _requestDesktopLyricsSync(immediate: true);
-      // 均衡器（音效）：设置里开关/增益变化时实时应用到播放器。
-      // 记住上次已应用的值，避免无关设置项变化触发重复赋值。
-      final eqEnabled = next.valueOrNull?.equalizerEnabled ?? false;
-      final eqGains = next.valueOrNull?.equalizerGains ?? const <double>[];
-      final lastGains = _lastAppliedEqGains ?? const <double>[];
-      final gainsChanged =
-          eqGains.length != lastGains.length ||
-          () {
-            for (var i = 0; i < eqGains.length; i++) {
-              if ((eqGains[i] - lastGains[i]).abs() > 0.01) return true;
-            }
-            return false;
-          }();
-      if (eqEnabled != _lastAppliedEqEnabled || gainsChanged) {
-        _lastAppliedEqEnabled = eqEnabled;
-        _lastAppliedEqGains = eqGains;
-        unawaited(_applyEqualizer(eqEnabled, eqGains));
+    });
+    // 音效（均衡器/前级/音量增强/变速变调）：音效页的全部修改都写入
+    // effectsProvider，这里桥接到真实播放引擎——普通输出走系统原生
+    // 均衡器 + 响度增益（Android）；变速变调走 just_audio 的
+    // setSpeed/setPitch（跨平台）；独占输出由 EffectsNotifier 自行下发
+    // Rust DSP。此前均衡器误监听 AppSettings 的旧字段（音效页从不写它），
+    // 导致普通输出下全部音效无效果。
+    _ref.listen<AsyncValue<EffectsSettings>>(effectsProvider, (previous, next) {
+      final fx = next.valueOrNull;
+      if (fx == null) return;
+      final last = previous?.valueOrNull;
+      // last 为 null（首次加载）时视为全量变化。
+      var eqChanged = last == null ||
+          fx.equalizerEnabled != last.equalizerEnabled ||
+          fx.preamp != last.preamp ||
+          fx.audioBoost != last.audioBoost;
+      if (!eqChanged) {
+        final a = fx.gains, b = last.gains;
+        eqChanged = a.length != b.length;
+        for (var i = 0; !eqChanged && i < a.length && i < b.length; i++) {
+          eqChanged = (a[i] - b[i]).abs() > 0.01;
+        }
       }
+      if (eqChanged) {
+        unawaited(_applyEffectsEqualizer(fx));
+      }
+      final speedChanged = last == null ||
+          fx.playbackRate != last.playbackRate ||
+          fx.pitchShift != last.pitchShift ||
+          fx.preservesPitch != last.preservesPitch;
+      if (speedChanged) {
+        unawaited(_applyEffectsSpeedPitch());
+      }
+    });
+    // 收藏在播放页/歌曲列表/通知栏任何一处切换时，刷新通知栏收藏
+    // 按钮的实心/空心图标（通知栏按钮见 _MediaSessionBridge）。
+    _ref.listen<Set<String>>(favoritesProvider, (previous, next) {
+      if (!setEquals(previous, next)) _refreshNotificationCustomControls();
     });
     _init();
     _installCarMediaButtonChannel();
     _installVolumeKeyChannel();
     // just_audio_background 的内部 handler 要等首个 AudioPlayer 完成平台
     // 初始化才会挂到 SwitchAudioHandler 上，延迟安装 + 播放时兜底重试。
-    Future<void>.delayed(const Duration(seconds: 1)).then((_) {
+    // 用可取消的 Timer 而非 Future.delayed：dispose 时取消，避免测试
+    // 环境结束时残留 pending timer。
+    _bridgeInstallTimer = Timer(const Duration(seconds: 1), () {
       _installMediaSessionBridge();
     });
   }
 
-  bool _mediaSessionBridgeReady = false;
+  _MediaSessionBridge? _mediaSessionBridge;
+
+  /// 延迟安装媒体会话桥接的一次性定时器（构造时启动，dispose 取消）。
+  Timer? _bridgeInstallTimer;
 
   /// 安装媒体会话桥接（见 [_MediaSessionBridge]），让通知栏/锁屏/灵动岛
   /// 显示上一首/下一首按钮，并把蓝牙耳机的切歌按键转发到本播放器。
-  /// 幂等：初始化未完成时静默返回，下次播放时重试。
+  /// 幂等：初始化未完成时静默返回，每次点播时兜底重试（播放器重建可能
+  /// 把 inner 换回裸 handler，需要重新安装）。
   void _installMediaSessionBridge() {
-    if (_mediaSessionBridgeReady || kIsWeb) return;
+    if (kIsWeb) return;
     if (defaultTargetPlatform != TargetPlatform.android) {
-      _mediaSessionBridgeReady = true;
       return;
     }
     try {
@@ -704,22 +895,58 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
       // 将其藏在私有变量中，宿主无法干预媒体会话）。
       final handler = xySwitchAudioHandler;
       final current = handler.inner;
-      if (current is _MediaSessionBridge) {
-        _mediaSessionBridgeReady = true;
+      if (identical(current, _mediaSessionBridge)) {
         return;
       }
       // 只有 just_audio_background 的内部 handler 就位后才安装，避免把
       // 桥接套在初始空 handler 上，随后又被平台初始化覆盖。
       if (current.runtimeType.toString() != '_PlayerAudioHandler') return;
+      _mediaSessionBridge?.detach();
       final bridge = _MediaSessionBridge(current)
         ..onSkipToNext = next
-        ..onSkipToPrevious = previous;
+        ..onSkipToPrevious = previous
+        ..queueSource = () {
+          return state.queue;
+        }
+        ..queueIndexResolver = () {
+          return state.queueIndex >= 0 ? state.queueIndex : null;
+        }
+        ..onSkipToQueueItem = playIndex
+        ..favoriteStateResolver = () {
+          final path = state.current?.path;
+          return path != null && _ref.read(favoritesProvider).contains(path);
+        }
+        ..playModeResolver = () {
+          return normalizePlayMode(state.playMode);
+        }
+        ..onToggleFavorite = _toggleFavoriteFromNotification
+        ..onCyclePlayMode = _cyclePlayModeFromNotification;
       bridge.attach();
       handler.inner = bridge;
-      _mediaSessionBridgeReady = true;
+      _mediaSessionBridge = bridge;
     } catch (_) {
       // 媒体服务初始化失败时保持未安装，播放时重试。
     }
+  }
+
+  /// 通知栏「收藏」按钮：切换当前曲目的收藏状态，并刷新通知图标。
+  Future<void> _toggleFavoriteFromNotification() async {
+    final item = state.current;
+    if (item == null) return;
+    await _ref
+        .read(favoritesProvider.notifier)
+        .toggle(item.path, song: FavoriteSongSnapshot.fromQueueItem(item));
+  }
+
+  /// 通知栏「播放模式」按钮：循环切换播放模式（列表循环→单曲循环→
+  /// 随机），通知栏按钮图标随新模式刷新。
+  Future<void> _cyclePlayModeFromNotification() => cyclePlayMode();
+
+  /// 收藏状态与播放模式变化时刷新通知栏自定义按钮的图标。稳定播放中
+  /// inner handler 不会再广播状态，收藏从播放页/列表切换后必须显式触发
+  /// 重发布，否则通知栏心形图标会滞后。
+  void _refreshNotificationCustomControls() {
+    _mediaSessionBridge?.notifyCustomControlsChanged();
   }
 
   /// 上一次车机/方向盘按键的触发时间（节流用）。
@@ -817,20 +1044,61 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
 
   final Ref _ref;
 
-  /// 暴露给音效面板的均衡器门面：面板读取频段参数（中心频率、
-  /// dB 范围、各频段当前增益）并直接调用 setBandGain/setEnabled，
-  /// 持久化走设置 provider，本类经设置监听自动同步。
-  XyAndroidEqualizer get androidEqualizer => xyAndroidEqualizer;
-
-  /// 把设置中的均衡器开关与频段增益应用到播放器。原生均衡器挂在
-  /// 真实平台播放器上（fork 注入），首次 load 前不可用——门面缓存
-  /// 状态并在每次 load 后自动重放，此处无需关心就绪时机。
-  Future<void> _applyEqualizer(bool enabled, List<double> gains) async {
+  /// 把音效页的均衡器/前级/音量增强应用到播放引擎。
+  ///
+  /// 普通输出（扬声器/蓝牙）走系统原生音效：10 段均衡器增益按对数频率
+  /// 轴插值映射到设备实际频段（常见 5 段），前级（preamp）与音量增强
+  /// （audioBoost）合并为整体 dB 增益走原生响度增益器。均衡器未随
+  /// audio session 创建（首次 load 前）时门面自动缓存，load 后重放。
+  Future<void> _applyEffectsEqualizer(EffectsSettings fx) async {
     if (kIsWeb || defaultTargetPlatform != TargetPlatform.android) return;
     try {
-      await xyAndroidEqualizer.apply(enabled: enabled, gains: gains);
+      await xyAndroidEqualizer.applyMapped(
+        enabled: fx.equalizerEnabled,
+        gains: fx.gains,
+        centerFrequencies: eqCenterFrequencies,
+      );
+      final boost = fx.preamp + fx.audioBoost;
+      // 前级随均衡器开关，音量增强独立有效（不要求均衡器开启）。
+      final loudness = fx.equalizerEnabled
+          ? boost
+          : fx.audioBoost;
+      await xyLoudnessEnhancer.apply(
+        enabled: loudness.abs() > 0.01,
+        targetGain: loudness,
+      );
     } catch (error) {
-      debugPrint('均衡器应用失败：$error');
+      debugPrint('音效均衡器应用失败：$error');
+    }
+  }
+
+  /// 音效页变速变调与播放页倍速的合成速度：播放页倍速为档位式
+  /// （0.5/0.8/1.0/1.5/2.0），音效页变速为连续百分比，两者相乘。
+  double _combinedEffectsSpeed() {
+    final fx = _ref.read(effectsProvider).valueOrNull;
+    final rate = fx?.playbackRate ?? 100;
+    return (state.playbackSpeed * rate / 100).clamp(0.25, 4.0);
+  }
+
+  /// 合成变调：音效页变调百分比；「保持音调」关闭时变速会连带变调
+  /// （与 ExoPlayer 的 PlaybackParameters 语义一致）。
+  double _combinedEffectsPitch() {
+    final fx = _ref.read(effectsProvider).valueOrNull;
+    var pitch = (fx?.pitchShift ?? 100) / 100;
+    if (fx?.preservesPitch == false) {
+      pitch *= _combinedEffectsSpeed();
+    }
+    return pitch.clamp(0.5, 2.0);
+  }
+
+  /// 应用合成速度/变调到音频播放器（视频走自身倍速状态，不叠加变调）。
+  Future<void> _applyEffectsSpeedPitch() async {
+    try {
+      await _player.setSpeed(_combinedEffectsSpeed());
+      await _player.setPitch(_combinedEffectsPitch());
+    } catch (error) {
+      // 部分平台（如 Windows）不支持 setPitch：速度仍生效，变调忽略。
+      debugPrint('音效变速变调应用失败：$error');
     }
   }
 
@@ -864,6 +1132,20 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
   // 在原生层交错完成，最后把旧音源覆盖到新歌曲上。
   Future<void> _sourceOperation = Future<void>.value();
   String? _lastFailureKey;
+  // 连续播放失败计数：起播成功（音源就绪）时清零。换源重试风暴会
+  // 把后端限流窗口越撞越长，连续失败达到阈值后停止自动切下一首，
+  // 停止扩散并明确报错（见 _handlePlaybackFailure）。
+  int _consecutivePlaybackFailures = 0;
+  static const int _maxConsecutivePlaybackFailures = 3;
+  // 播放失败策略计数（按当前失败歌曲归组，切歌后自动重置）：
+  // 优先重试当前歌的次数、自动换源次数与已尝试过的音源（防止在
+  // 两个坏源之间来回切换形成死循环）。起播成功时整体清零。
+  String _failureStrategyPath = '';
+  int _playbackRetryAttempts = 0;
+  int _playbackSwitchAttempts = 0;
+  final Set<String> _switchAttemptedPluginIds = {};
+  // “降低音质”步骤已尝试过的档位（防止同一档反复重解析死循环）。
+  final Set<String> _qualityDropAttemptedTiers = {};
   int _relinkProposalId = 0;
   int _noticeId = 0;
   DateTime _lastPosPersist = DateTime.fromMillisecondsSinceEpoch(0);
@@ -886,9 +1168,6 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
   // 脏回跳过滤的解卡状态：连续被过滤事件的上一值与计数。
   int _staleStreakPrevMs = -1;
   int _staleStreakCount = 0;
-  // 已应用到均衡器的上次值：用于设置监听去重。
-  bool? _lastAppliedEqEnabled;
-  List<double>? _lastAppliedEqGains;
   // 听歌统计按会话增量刷写，避免定时刷写把累计 position 重复计算。
   String? _statsSessionPath;
   int _statsRecordedPositionMs = 0;
@@ -924,17 +1203,46 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
     await _restoreSession();
   }
 
-  /// 挂接 just_audio 的 position / duration / playerState 订阅。
-  /// 重建 AudioPlayer 实例（起播卡死自愈）后必须重新挂接。
-  void _attachPlayerStreams() {
-    // 逐字歌词需要比默认 200ms 更细的进度采样，但 40ms 会让全局播放状态
-    // 在手机上以 25fps 重建，首页、底栏和歌词页会同时承受不必要的开销。
-    // 80~120ms 足够逐词/渐进效果使用，也能明显降低主 isolate 的负担。
+  /// position 采样周期随前后台自适应：
+  /// - 前台逐字歌词需要比默认 200ms 更细的进度采样，但 40ms 会让全局播放
+  ///   状态在手机上以 25fps 重建，首页、底栏和歌词页会同时承受不必要的
+  ///   开销；80~120ms 足够逐词/渐进效果使用，也能明显降低主 isolate 负担。
+  /// - 退到后台后界面不再刷新，高频广播只会持续唤醒渲染引擎（后台 CPU
+  ///   高占用的主因）。降频到 1s 已足够进度持久化/睡眠定时器使用。
+  /// - 桌面歌词开启时仍需较平滑的进度驱动原生歌词窗，折中 250ms。
+  ({Duration min, Duration max}) _positionStreamPeriods() {
+    final lifecycle = WidgetsBinding.instance.lifecycleState;
+    final inForeground =
+        lifecycle == null || lifecycle == AppLifecycleState.resumed;
+    if (inForeground) {
+      return (
+        min: const Duration(milliseconds: 80),
+        max: const Duration(milliseconds: 120),
+      );
+    }
+    final desktopLyrics =
+        _ref.read(settingsProvider).valueOrNull?.desktopLyricsEnabled == true;
+    if (desktopLyrics) {
+      return (
+        min: const Duration(milliseconds: 250),
+        max: const Duration(milliseconds: 300),
+      );
+    }
+    return (
+      min: const Duration(seconds: 1),
+      max: const Duration(milliseconds: 1100),
+    );
+  }
+
+  /// 单独挂接 position 流：前后台切换时仅重挂这一条订阅（见
+  /// [_handleAppLifecycleChanged]），duration/playerState 订阅不受影响。
+  void _attachPositionStream() {
+    final periods = _positionStreamPeriods();
     _posSub = _player
         .createPositionStream(
           steps: 3600,
-          minPeriod: const Duration(milliseconds: 80),
-          maxPeriod: const Duration(milliseconds: 120),
+          minPeriod: periods.min,
+          maxPeriod: periods.max,
         )
         .listen((p) {
           // B 站视频播放时，just_audio 只是供系统媒体会话使用的静音时钟。
@@ -995,6 +1303,12 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
           _persistPositionDebounced();
           _requestDesktopLyricsSync();
         });
+  }
+
+  /// 挂接 just_audio 的 position / duration / playerState 订阅。
+  /// 重建 AudioPlayer 实例（起播卡死自愈）后必须重新挂接。
+  void _attachPlayerStreams() {
+    _attachPositionStream();
     _durSub = _player.durationStream.listen((d) {
       if (_videoMediaBridgeActive &&
           VideoPlaybackSession.isFor(state.current?.path)) {
@@ -1058,15 +1372,22 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
     if (state != AppLifecycleState.resumed) {
       _flushCurrentPlaybackStats();
     }
+    // 前后台切换时重挂 position 流，按当前生命周期选择采样周期
+    // （后台降频，降低后台 CPU 占用）；尚未挂接时忽略。
+    if (_posSub != null) {
+      _posSub?.cancel();
+      _posSub = null;
+      _attachPositionStream();
+    }
     _guardVideoSessionOnLifecycle(state);
   }
 
-  /// 后台久置自动关闭视频（应用级守护）。挂在 PlayerNotifier 而非播放
+  /// 后台久置挂起视频（应用级守护）。挂在 PlayerNotifier 而非播放
   /// 详情页上：详情页退出后视频会话仍存活，页面级监听随 dispose 失效，
   /// 覆盖不了“离开详情页后切后台久置”的场景。ExoPlayer 的 MediaCodec
   /// 表面在后台久置后会被系统回收，恢复渲染时抛 MediaCodecVideoRenderer
-  /// error；与其等用户操作时报“视频播放失败”，不如回前台时主动收尾
-  /// 并恢复音频播放。
+  /// error。不再直接关闭视频退回音频播放页，而是保留 MV 会话进入
+  /// 错误态：用户回到软件仍停在 MV 界面，可重新加载或手动切换画质。
   DateTime? _videoBackgroundedAt;
   static const _videoBackgroundCloseThreshold = Duration(seconds: 90);
 
@@ -1085,18 +1406,18 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
             _videoBackgroundCloseThreshold) {
           break;
         }
-        unawaited(_closeVideoAfterBackgroundSuspension());
+        unawaited(_suspendVideoAfterBackgroundIdle());
       default:
         break;
     }
   }
 
-  Future<void> _closeVideoAfterBackgroundSuspension() async {
-    final shouldResumeAudio = VideoPlaybackSession.resumeAudioAfterVideo;
-    await VideoPlaybackSession.stopForTrackAction();
+  Future<void> _suspendVideoAfterBackgroundIdle() async {
+    final suspended = await VideoPlaybackSession.suspendForBackgroundIdle();
+    if (!suspended) return;
+    // 视频控制器已释放，静音桥接不再有意义：暂停音频并恢复用户音量、
+    // 歌曲进度，但保持歌曲暂停——重新加载成功后会重新接入桥接。
     await disableVideoMediaBridge();
-    // 之前音频被视频桥接静音，关闭视频后从当前位置恢复播放。
-    if (shouldResumeAudio) await resumeAfterVideo();
   }
 
   Future<void> _syncDesktopLyrics() async {
@@ -1114,6 +1435,7 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
         artist: '',
         lyrics: '',
         position: 0,
+        isPlaying: false,
         noBackground: true,
         lyricColor: 0xFFFFFFFF,
         translationColor: 0xFFE1E1E6,
@@ -1132,6 +1454,7 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
       artist: item.artist,
       lyrics: item.lyricsRaw ?? '',
       position: state.position,
+      isPlaying: state.isPlaying,
       noBackground: settings.desktopLyricsNoBackground,
       lyricColor: settings.desktopLyricsLyricColor,
       translationColor: settings.desktopLyricsTranslationColor,
@@ -1755,8 +2078,17 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
       );
       if (requestId != _playRequestId) return;
       _preparedSourceRequestId = requestId;
+      _consecutivePlaybackFailures = 0;
+      _resetFailureStrategyCounters();
       await _player.setVolume(_ref.read(volumeProvider));
-      await _player.setSpeed(state.playbackSpeed);
+      // 换源后重放合成速度/变调（ExoPlayer 重建 PlaybackParameters 会
+      // 复位为 1.0）与均衡器（fork 门面在 load 后自行重放）。
+      await _player.setSpeed(_combinedEffectsSpeed());
+      try {
+        await _player.setPitch(_combinedEffectsPitch());
+      } catch (_) {
+        // 平台不支持变调：忽略，速度仍生效。
+      }
       // 最近播放是“开始播放”即记录，与桌面端行为一致。统计写入失败不应
       // 阻断音频播放，因此放到独立异步任务中执行。
       unawaited(_addToRecentHistory(item));
@@ -2455,18 +2787,23 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
       _findPluginReplacement(original);
 
   Future<({QueueItem item, String pluginName})?> _findPluginReplacement(
-    QueueItem original,
-  ) async {
+    QueueItem original, {
+    Set<String> excludePluginIds = const {},
+  }) async {
     if (original.title.trim().isEmpty ||
         original.artist.trim().isEmpty ||
         original.durationMs <= 0) {
       return null;
     }
     final plugins = await _ref.read(enabledMusicPluginsProvider.future);
-    if (plugins.isEmpty) return null;
+    final candidates = [
+      for (final plugin in plugins)
+        if (!excludePluginIds.contains(plugin.id)) plugin,
+    ];
+    if (candidates.isEmpty) return null;
     final runtime = _ref.read(pluginRuntimeProvider);
     final batches = await Future.wait(
-      plugins.map((plugin) async {
+      candidates.map((plugin) async {
         try {
           final songs = await runtime
               .search(plugin, original.title.trim())
@@ -3823,39 +4160,166 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
       return;
     }
     _lastFailureKey = failureKey;
+    _consecutivePlaybackFailures += 1;
     // 无网络或在线音源获取失败：优先在本地（下载目录、本地曲库）找
     // 同名歌曲替代，找到则直接自动切换播放并弹通知提示（不再弹“本地
     // 替代”提案询问），找不到才按播放失败设置停止或跳下一首。
+    QueueItem? failedItem;
     if (queueIndex < state.queue.length) {
-      final item = state.queue[queueIndex];
-      final localReplacement = await _findLocalReplacement(item);
+      failedItem = state.queue[queueIndex];
+      final localReplacement = await _findLocalReplacement(failedItem);
       if (requestId != _playRequestId) return;
       if (localReplacement != null) {
         await _autoRelinkToLocal(
           queueIndex: queueIndex,
-          original: item,
+          original: failedItem,
           replacement: localReplacement,
         );
         return;
       }
     }
+    final settings = _ref.read(settingsProvider).valueOrNull;
+    final retryLimit = settings?.playbackRetryCount ?? 1;
+    final switchLimit = settings?.playbackSwitchSourceCount ?? 2;
+    final priority = settings?.playbackFailurePriority ??
+        kDefaultPlaybackFailurePriority;
     state = state.copyWith(
       isPlaying: false,
       isLoading: false,
       errorMessage: _friendlyPlaybackError(error),
     );
-    final action =
-        _ref.read(settingsProvider).valueOrNull?.playbackFailureAction ??
-        PlaybackFailureAction.pause;
-    if (action != PlaybackFailureAction.playNext || state.queue.length <= 1) {
+    // 优先重试：网络抖动导致的偶发失败，直接重试当前歌（原音源）。
+    if (failedItem != null && _failureStrategyPath != failedItem.path) {
+      _failureStrategyPath = failedItem.path;
+      _playbackRetryAttempts = 0;
+      _playbackSwitchAttempts = 0;
+      _switchAttemptedPluginIds.clear();
+      _qualityDropAttemptedTiers.clear();
+    }
+    if (retryLimit > 0 && _playbackRetryAttempts < retryLimit) {
+      _playbackRetryAttempts += 1;
+      await Future<void>.delayed(const Duration(milliseconds: 80));
+      if (requestId != _playRequestId || state.queueIndex != queueIndex) {
+        return;
+      }
+      await _playAt(queueIndex);
       return;
     }
-    // 让错误状态完成一次发布，随后再切换，避免按钮短暂卡在加载状态。
-    await Future<void>.delayed(const Duration(milliseconds: 80));
-    if (requestId != _playRequestId || state.queueIndex != queueIndex) return;
-    final nextIndex = _pickNextIndex();
-    if (nextIndex < 0 || nextIndex == queueIndex) return;
-    await _playAt(nextIndex);
+    // 策略优先级：降低音质 → 换源播放 → 跳下一首 → 暂停播放（可排序）。
+    for (final step in priority) {
+      switch (step) {
+        case PlaybackFailureStep.lowerQuality:
+          if (failedItem == null ||
+              playbackSourceTypeFor(failedItem) != PlaybackSourceType.plugin) {
+            break;
+          }
+          final nextTier = _nextLowerQualityTier();
+          if (nextTier == null) break;
+          _qualityDropAttemptedTiers.add(nextTier);
+          if (requestId != _playRequestId || state.queueIndex != queueIndex) {
+            return;
+          }
+          _publishNotice(
+            '当前音质播放失败，自动降到「${qualityDisplayLabel(nextTier)}」重试',
+          );
+          // 改默认音质后重播当前歌；再失败会回到本策略链逐档下降
+          //（已试档位会被 _qualityDropAttemptedTiers 跳过）。
+          await _ref
+              .read(settingsProvider.notifier)
+              .setOnlineDefaultQuality(nextTier);
+          if (requestId != _playRequestId || state.queueIndex != queueIndex) {
+            return;
+          }
+          await _playAt(queueIndex);
+          return;
+        case PlaybackFailureStep.switchSource:
+          if (failedItem == null ||
+              switchLimit <= 0 ||
+              _playbackSwitchAttempts >= switchLimit) {
+            break;
+          }
+          _playbackSwitchAttempts += 1;
+          final currentPluginId = failedItem.pluginId;
+          if (currentPluginId != null && currentPluginId.isNotEmpty) {
+            _switchAttemptedPluginIds.add(currentPluginId);
+          }
+          try {
+            final replacement = await _findPluginReplacement(
+              failedItem,
+              excludePluginIds: _switchAttemptedPluginIds,
+            );
+            if (replacement == null) break;
+            if (requestId != _playRequestId ||
+                queueIndex < 0 ||
+                queueIndex >= state.queue.length ||
+                state.queue[queueIndex].path != failedItem.path) {
+              return;
+            }
+            _publishNotice('音源不可用，已自动换源到「${replacement.pluginName}」');
+            await switchSource(failedItem.path, replacement.item);
+            return;
+          } catch (_) {
+            // 换源失败继续尝试下一档策略。
+          }
+        case PlaybackFailureStep.playNext:
+          if (state.queue.length <= 1) break;
+          // 连败熔断：连续多首失败（后端限流/断网/音源整体故障）时继续
+          // 自动切下一首只会把请求风暴扩散到整张队列，停止自动切换，
+          // 保留最后一首的错误提示等用户手动处理。
+          if (_consecutivePlaybackFailures >= _maxConsecutivePlaybackFailures) {
+            return;
+          }
+          await Future<void>.delayed(const Duration(milliseconds: 80));
+          if (requestId != _playRequestId || state.queueIndex != queueIndex) {
+            return;
+          }
+          final nextIndex = _pickNextIndex();
+          if (nextIndex < 0 || nextIndex == queueIndex) break;
+          await _playAt(nextIndex);
+          return;
+        case PlaybackFailureStep.pause:
+          return;
+      }
+    }
+  }
+
+  /// 起播成功后清空播放失败策略计数（重试/换源/已试音源/降音质档位）。
+  void _resetFailureStrategyCounters() {
+    _failureStrategyPath = '';
+    _playbackRetryAttempts = 0;
+    _playbackSwitchAttempts = 0;
+    _switchAttemptedPluginIds.clear();
+    _qualityDropAttemptedTiers.clear();
+  }
+
+  /// “降低音质”步骤：从当前档位往下（qualityTierRank）找第一个尚未
+  /// 尝试过的更低标准档；已到最低档或全部试过返回 null（本步骤放弃，
+  /// 落到策略列表的下一档）。
+  String? _nextLowerQualityTier() {
+    const tiersByRankDesc = <String>[
+      'master',
+      'atmos_plus',
+      'atmos',
+      'dolby',
+      'vinyl',
+      'hires',
+      'flac24bit',
+      'flac',
+      '320k',
+      '192k',
+      '128k',
+      '96k',
+    ];
+    final currentQuality = state.currentQuality.trim();
+    var currentRank = qualityTierRank(
+      currentQuality.isEmpty ? '320k' : currentQuality,
+    );
+    for (final tier in tiersByRankDesc) {
+      if (qualityTierRank(tier) >= currentRank) continue;
+      if (_qualityDropAttemptedTiers.contains(tier)) continue;
+      return tier;
+    }
+    return null;
   }
 
   Future<void> _addToRecentHistory(QueueItem item) async {
@@ -4105,6 +4569,8 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
       );
       if (requestId != _playRequestId) return;
       _preparedSourceRequestId = requestId;
+      _consecutivePlaybackFailures = 0;
+      _resetFailureStrategyCounters();
       await _player.setVolume(_ref.read(volumeProvider));
       await seek(position);
       _manualPause = !wasPlaying;
@@ -4400,7 +4866,8 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
   }
 
   /// 设置当前播放速度。音频和 B 站视频共用同一速度状态，切换视频或
-  /// 关闭视频后仍保持用户刚刚选择的倍速。
+  /// 关闭视频后仍保持用户刚刚选择的倍速。实际音频速度还要乘上音效页
+  /// 的连续变速系数（见 [_combinedEffectsSpeed]），档位值只作为 UI 真源。
   Future<void> setPlaybackSpeed(double speed) async {
     const supported = <double>[0.5, 0.8, 1.0, 1.5, 2.0];
     final normalized = supported.reduce(
@@ -4408,7 +4875,7 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
     );
     state = state.copyWith(playbackSpeed: normalized);
     try {
-      await _player.setSpeed(normalized);
+      await _player.setSpeed(_combinedEffectsSpeed());
       final video = VideoPlaybackSession.isFor(state.current?.path)
           ? VideoPlaybackSession.controller
           : null;
@@ -4502,6 +4969,8 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
     await _player.setLoopMode(audioLoopModeForPlayMode(next));
     await _ref.read(settingsProvider.notifier).setPlayMode(next);
     unawaited(_persistSession());
+    // 通知栏「播放模式」按钮图标随新模式刷新（列表循环/单曲循环/随机）。
+    _refreshNotificationCustomControls();
   }
 
   Future<void> _handleTrackEndOnce() async {
@@ -4564,6 +5033,7 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
   void dispose() {
     _flushCurrentPlaybackStats();
     WidgetsBinding.instance.removeObserver(this);
+    _bridgeInstallTimer?.cancel();
     VideoPlaybackSession.progressRevision.removeListener(
       _syncVideoPlaybackState,
     );

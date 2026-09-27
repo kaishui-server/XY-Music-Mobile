@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:xy_music/src/core/db_path.dart';
 import 'package:xy_music/src/library/library_provider.dart';
 import 'package:xy_music/src/navigation/shell.dart';
 import 'package:xy_music/src/widgets/cover_image.dart';
@@ -80,6 +81,14 @@ void main() {
 
     await tester.pumpWidget(
       ProviderScope(
+        // 操作面板打开前会读取已启用插件列表（来源标签展示用），
+        // 依赖 appDataDirProvider（Rust 初始化）；测试环境没有 Rust，
+        // 不 override 会永久挂起导致面板打不开。
+        overrides: [
+          appDataDirProvider.overrideWith(
+            (ref) async => r'Z:\xymusic-widget-test-missing',
+          ),
+        ],
         child: MaterialApp(
           home: Scaffold(
             body: Stack(

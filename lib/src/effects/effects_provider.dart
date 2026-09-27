@@ -8,6 +8,12 @@ import '../rust/api.dart';
 
 const eqFreqLabels = ['31', '62', '125', '250', '500', '1k', '2k', '4k', '8k', '16k'];
 
+/// 均衡器各频段中心频率（Hz），与 [eqFreqLabels] 下标一一对应。
+/// 应用到系统原生均衡器时按对数频率轴插值映射到设备实际频段。
+const eqCenterFrequencies = <double>[
+  31, 62, 125, 250, 500, 1000, 2000, 4000, 8000, 16000,
+];
+
 class EqPreset {
   final String name;
   final List<double> gains;

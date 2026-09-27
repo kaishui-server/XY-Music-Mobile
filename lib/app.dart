@@ -2,6 +2,7 @@ import 'dart:io';
 import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart';
+import 'package:flutter_localizations/flutter_localizations.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter/services.dart';
 import 'package:dynamic_color/dynamic_color.dart';
@@ -17,6 +18,9 @@ import 'src/navigation/routes.dart';
 import 'src/ui/xy_theme.dart';
 import 'src/ui/xy_surface.dart';
 import 'src/widgets/top_notice.dart';
+
+/// 应用固定中文 locale：系统组件（长按菜单等）与应用文案保持一致。
+const _zhLocale = Locale('zh', 'CN');
 
 /// 在 Flutter 第一帧之前读取并解码自定义背景。
 ///
@@ -64,7 +68,8 @@ class XyMusicApp extends ConsumerStatefulWidget {
   ConsumerState<XyMusicApp> createState() => _XyMusicAppState();
 }
 
-class _XyMusicAppState extends ConsumerState<XyMusicApp> {
+class _XyMusicAppState extends ConsumerState<XyMusicApp>
+    with WidgetsBindingObserver {
   int? _cachedAccent;
   String? _cachedFontFamily;
   int? _cachedLightDynamicHash;
@@ -87,6 +92,7 @@ class _XyMusicAppState extends ConsumerState<XyMusicApp> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     final startup = widget.startupBackground;
     if (startup?.image != null && startup!.path.isNotEmpty) {
       _precachedBackgroundPath = startup.path;
@@ -102,8 +108,26 @@ class _XyMusicAppState extends ConsumerState<XyMusicApp> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _decodedBackgroundImage?.dispose();
     super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    // 退到后台时清空解码图片缓存：封面解码纹理是后台常驻内存的大头。
+    // 正在显示的图片由各自的 ImageStream 句柄继续持有，不受清空影响；
+    // 回前台后列表滚动到不可见再恢复的条目按需重新解码（本地封面有
+    // 磁盘缓存，网络封面走 HTTP 缓存）。
+    if (state == AppLifecycleState.hidden) {
+      PaintingBinding.instance.imageCache.clear();
+    }
+  }
+
+  @override
+  void didHaveMemoryPressure() {
+    // 系统内存吃紧（低端机/后台进程回收前）时主动释放解码图片缓存。
+    PaintingBinding.instance.imageCache.clear();
   }
 
   void _ensureThemes(
@@ -317,6 +341,11 @@ class _XyMusicAppState extends ConsumerState<XyMusicApp> {
             themeMode: themeMode,
             routerConfig: appRouter,
             builder: appBuilder,
+            // 应用内文案全部为中文，固定中文 locale 让系统组件（长按
+            // 文本菜单、日期选择器等）也显示中文。
+            locale: _zhLocale,
+            supportedLocales: const [_zhLocale],
+            localizationsDelegates: GlobalMaterialLocalizations.delegates,
           );
         }
         return MaterialApp(
@@ -326,6 +355,9 @@ class _XyMusicAppState extends ConsumerState<XyMusicApp> {
           darkTheme: darkTheme,
           themeMode: themeMode,
           builder: appBuilder,
+          locale: _zhLocale,
+          supportedLocales: const [_zhLocale],
+          localizationsDelegates: GlobalMaterialLocalizations.delegates,
           home: init.when(
             data: (_) => const _InitLoadingScreen(),
             loading: () => const _InitLoadingScreen(),

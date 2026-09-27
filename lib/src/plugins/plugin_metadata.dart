@@ -26,6 +26,10 @@ class PluginMetadata {
     this.author,
     this.remark,
     this.userVariables = const [],
+    this.isStarSea = false,
+    this.isLx = false,
+    this.isBaka = false,
+    this.isAnimemusic = false,
   });
 
   final String? id;
@@ -38,6 +42,24 @@ class PluginMetadata {
 
   /// 插件声明的用户变量列表；未声明时为空。
   final List<PluginUserVariable> userVariables;
+
+  /// 是否为星海格式插件：MusicFree 兼容的聚合变体（如惜梦
+  /// animemusic 聚合 v4），歌曲带 _src/_source 来源标记，一次搜索
+  /// 聚合多平台结果。
+  final bool isStarSea;
+
+  /// LX（洛雪）插件：走 globalThis.lx 契约而非 MusicFree
+  /// module.exports。规则与 plugin_runtime 的 _looksLikeLxPlugin 一致。
+  final bool isLx;
+
+  /// BakaMusic 契约插件：getMvSource 方法或 animeSrc 歌曲来源标记
+  /// 是该契约区别于 MusicFree/LX 的独有特征。
+  final bool isBaka;
+
+  /// animemusic 后端插件：直连 animemusic.bzxhkj.com（惜梦 v3/v4、
+  /// animemusic/1 新格式等）。baka 版的 FALLBACK_BASE 也指向该域名，
+  /// 分类时需先判 isBaka 再判本标记。
+  final bool isAnimemusic;
 
   static PluginMetadata parse(String script) {
     final constants = _parseStringConstants(script);
@@ -79,7 +101,72 @@ class PluginMetadata {
             json['remark'],
       ),
       userVariables: _parseUserVariables(script, constants),
+      isStarSea: _detectStarSea(script),
+      isLx: _detectLx(script),
+      isBaka: _detectBaka(script),
+      isAnimemusic: _detectAnimemusic(script),
     );
+  }
+
+  /// 插件 ID 归一化：转小写，把字母数字/中文/下划线/连字符以外的字符
+  /// 折叠为 '-'，再剥掉首尾 '-'。保留中文字符——剥离中文会让
+  /// 「animemusic聚合」与「animemusic」折叠成同一个 ID，批量安装时
+  /// 互相覆盖（提示装了 6 个、列表只剩 3 个）。归一化结果为空时由
+  /// 调用方回退到内容哈希。
+  static String normalizePluginId(String rawId) {
+    return rawId
+        .toLowerCase()
+        .replaceAll(RegExp(r'[^a-z0-9_\-\u3400-\u4dbf\u4e00-\u9fff]+'), '-')
+        .replaceAll(RegExp(r'^-+|-+$'), '');
+  }
+
+  /// LX（洛雪）插件静态识别（不执行脚本），与 plugin_runtime 的
+  /// _looksLikeLxPlugin 规则保持一致；压缩/混淆后的脚本可能写成
+  /// globalThis['lx']，不能只认点号形式。
+  static bool _detectLx(String script) {
+    final lower = script.toLowerCase();
+    return lower.contains('lx.event.request') ||
+        lower.contains('lx.event.on') ||
+        lower.contains('globalthis.lx') ||
+        RegExp(r'''globalthis\s*\[\s*['"]lx['"]\s*\]''').hasMatch(lower) ||
+        lower.contains('event_names.request') ||
+        lower.contains('server_script_config');
+  }
+
+  /// BakaMusic 契约静态识别：getMvSource 方法（MusicFree 的 MV 方法
+  /// 叫 getMV、LX 走事件契约）与 animeSrc 歌曲来源标记是该契约独有。
+  static bool _detectBaka(String script) {
+    final lower = script.toLowerCase();
+    return lower.contains('getmvsource') || lower.contains('animesrc');
+  }
+
+  /// animemusic（惜梦动画音乐）插件识别：
+  /// - 老站点域名 `animemusic.bzxhkj.com`；
+  /// - 新插件（如 qishui，API 域名为 `anime.bzxhkj.com`）不再包含老域名，
+  ///   但在 META 中声明 `format: "animemusic/1"` 规范，与运行时
+  ///   `_looksLikeAnimemusicPlugin` 的判定对齐，避免被误分类到
+  ///   MusicFree 插件页。
+  /// baka 版兜底地址也指向老域名，分类时先判 isBaka；v2 洛雪版同样
+  /// 命中，但分类时 isLx 优先级更高。
+  static bool _detectAnimemusic(String script) {
+    if (script.contains('animemusic.bzxhkj.com')) return true;
+    return RegExp(
+      r'''["']format["']\s*:\s*["']animemusic/1["']''',
+    ).hasMatch(script) ||
+        (RegExp(r'''module\.exports\s*=\s*\w+''').hasMatch(script) &&
+            script.contains('animemusic/1'));
+  }
+
+  /// 星海格式静态识别（不执行脚本）：
+  /// - primaryKey 含 "_src"：聚合多平台时不同平台 id 会撞车，星海规范
+  ///   要求把来源键纳入主键（如 primaryKey: ["id", "_src"]）；
+  /// - 插件读取歌曲的 `._src` / `._source` 来源标记：星海歌曲字段约定，
+  ///   MusicFree/LX 规范均无此字段。
+  static bool _detectStarSea(String script) {
+    if (RegExp(r'''primaryKey\s*:\s*\[[^\]]*_src''').hasMatch(script)) {
+      return true;
+    }
+    return RegExp(r'''\.\s*_src\b|\.\s*_source\b''').hasMatch(script);
   }
 
   /// 解析插件声明的 userVariables 数组：

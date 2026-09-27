@@ -9,6 +9,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import '../../src/core/db_path.dart';
 import '../../src/core/settings.dart';
+import '../../src/player/player_provider.dart';
 import '../../src/plugins/plugin_metadata.dart';
 import '../../src/plugins/plugin_runtime.dart';
 import '../../src/rust/api.dart';
@@ -17,6 +18,21 @@ import '../../src/ui/xy_theme.dart';
 import '../../src/widgets/top_notice.dart';
 import '../../src/navigation/sidebar_controller.dart';
 
+/// 插件分类：按契约与后端分为四页展示。
+enum _PluginKind {
+  /// BakaMusic 契约插件（getMvSource/animeSrc）。
+  baka,
+
+  /// 标准 MusicFree 插件（module.exports 契约、无特殊后端标记）。
+  musicfree,
+
+  /// LX（洛雪）音源插件（globalThis.lx 契约）。
+  lx,
+
+  /// animemusic 后端插件（直连 animemusic.bzxhkj.com，惜梦 v3/v4 等）。
+  animemusic,
+}
+
 class _PluginInfo {
   const _PluginInfo({
     required this.id,
@@ -24,10 +40,12 @@ class _PluginInfo {
     required this.version,
     required this.path,
     required this.enabled,
+    required this.kind,
     this.author,
     this.remark,
     this.sourceUrl,
     this.userVariables = const [],
+    this.isStarSea = false,
   });
 
   final String id;
@@ -39,6 +57,12 @@ class _PluginInfo {
   final String? remark;
   final String? sourceUrl;
   final List<PluginUserVariable> userVariables;
+
+  /// 星海格式插件（带 _src 来源标记的聚合变体，如惜梦 v4）。
+  final bool isStarSea;
+
+  /// 插件分类（BakaMusic/MusicFree/LX/animemusic）。
+  final _PluginKind kind;
 
   bool get isOnline => sourceUrl?.trim().isNotEmpty == true;
 }
@@ -112,6 +136,16 @@ class _PluginsNotifier extends AsyncNotifier<List<_PluginInfo>> {
       final script = file.readAsStringSync();
       final metadata = PluginMetadata.parse(script);
       final id = p.basenameWithoutExtension(file.path);
+      // 分类优先级：LX 契约 > BakaMusic 契约 > animemusic 后端 >
+      // 标准 MusicFree。v2 洛雪版虽直连 animemusic 后端但属 LX 契约；
+      // baka 版兜底地址同样指向 animemusic 域名，需先判 Baka。
+      final kind = metadata.isLx
+          ? _PluginKind.lx
+          : metadata.isBaka
+          ? _PluginKind.baka
+          : metadata.isAnimemusic
+          ? _PluginKind.animemusic
+          : _PluginKind.musicfree;
       return _PluginInfo(
         id: id,
         name: metadata.name ?? id,
@@ -122,6 +156,8 @@ class _PluginsNotifier extends AsyncNotifier<List<_PluginInfo>> {
         enabled: enabled.contains(id),
         sourceUrl: sourceUrls[id],
         userVariables: metadata.userVariables,
+        isStarSea: metadata.isStarSea,
+        kind: kind,
       );
     }).toList();
     // 拖拽保存的顺序优先；未记录过的插件（新安装）按文件名顺序追加在后。
@@ -156,10 +192,7 @@ class _PluginsNotifier extends AsyncNotifier<List<_PluginInfo>> {
         metadata.name ??
         p.basenameWithoutExtension(Uri.tryParse(origin)?.path ?? origin);
     final rawId = metadata.id ?? rawName;
-    final normalized = rawId
-        .toLowerCase()
-        .replaceAll(RegExp(r'[^a-z0-9_-]+'), '-')
-        .replaceAll(RegExp(r'^-+|-+$'), '');
+    final normalized = PluginMetadata.normalizePluginId(rawId);
     return normalized.isNotEmpty
         ? normalized
         : 'plugin-${_fnv1a(rawId).toRadixString(16)}';
@@ -269,7 +302,7 @@ class _PluginsNotifier extends AsyncNotifier<List<_PluginInfo>> {
   }) async {
     _validateScript(script);
     final metadata = PluginMetadata.parse(script);
-    final id = _pluginId(script, origin);
+    var id = _pluginId(script, origin);
     final name = displayName?.trim().isNotEmpty == true
         ? displayName!.trim()
         : (metadata.name ?? id);
@@ -290,6 +323,25 @@ class _PluginsNotifier extends AsyncNotifier<List<_PluginInfo>> {
     // LateInitializationError；插件目录本身由 Dart 写入即可。
     final pluginsDir = Directory(p.join(dataDir, 'plugins'));
     await pluginsDir.create(recursive: true);
+    if (existing == null) {
+      // 批量导入时 state 尚未刷新，existing 查不到本批次刚写入的插件：
+      // 同 ID 文件已存在说明批次内有其他插件归一化到了同一 ID（如
+      // 「animemusic聚合」与「animemusic」）。内容相同按重复导入跳过；
+      // 内容不同则追加序号共存，避免互相覆盖成「提示装了 6 个、列表
+      // 只剩 3 个」。
+      final target = File(p.join(pluginsDir.path, '$id.js'));
+      if (await target.exists()) {
+        if (await target.readAsString() == script) {
+          summary.skipped++;
+          return false;
+        }
+        var suffix = 2;
+        while (File(p.join(pluginsDir.path, '$id-$suffix.js')).existsSync()) {
+          suffix++;
+        }
+        id = '$id-$suffix';
+      }
+    }
     await File(p.join(pluginsDir.path, '$id.js')).writeAsString(script);
     final prefs = await SharedPreferences.getInstance();
     final enabled = (prefs.getStringList(_enabledKey) ?? const []).toSet()
@@ -300,7 +352,8 @@ class _PluginsNotifier extends AsyncNotifier<List<_PluginInfo>> {
       await prefs.setString(_sourceUrlsKey, jsonEncode(sources));
     }
     summary.installed++;
-    summary.names.add(name);
+    // 星海格式插件在安装提示中标注，让用户知道这是聚合变体。
+    summary.names.add(metadata.isStarSea ? '$name（星海）' : name);
     return true;
   }
 
@@ -363,8 +416,11 @@ class _PluginsNotifier extends AsyncNotifier<List<_PluginInfo>> {
 
   Future<_InstallSummary> importPlugin() async {
     final result = await FilePicker.platform.pickFiles(
-      type: FileType.custom,
-      allowedExtensions: const ['js'],
+      // 不用 FileType.custom + allowedExtensions：js 的 MIME 类型
+      // （text/javascript）在华为/荣耀等魔改 ROM 的文件选择器上
+      // 不被支持，直接抛 "Unsupported filter"。改为不限制类型，
+      // 选中后在下方按扩展名自行校验。
+      type: FileType.any,
       // 支持一次选多个插件脚本批量导入。
       allowMultiple: true,
       // Android 的 Storage Access Framework 对外部文件有时不会返回可直接
@@ -375,6 +431,10 @@ class _PluginsNotifier extends AsyncNotifier<List<_PluginInfo>> {
     final summary = _MutableInstallSummary();
     for (final file in files) {
       try {
+        final extension = p.extension(file.name).toLowerCase();
+        if (extension != '.js') {
+          throw Exception('仅支持 .js 插件脚本，所选为 $file.name');
+        }
         final path = file.path;
         final script = file.bytes != null
             ? utf8.decode(file.bytes!, allowMalformed: true)
@@ -425,11 +485,16 @@ class _PluginsNotifier extends AsyncNotifier<List<_PluginInfo>> {
     if (newIndex == oldIndex) return;
     final item = items.removeAt(oldIndex);
     items.insert(newIndex, item);
-    state = AsyncData(items);
+    await applyOrder(items);
+  }
+
+  /// 按给定顺序整体保存（分页 Tab 内拖拽时由调用方换算好全量顺序）。
+  Future<void> applyOrder(List<_PluginInfo> ordered) async {
+    state = AsyncData(ordered);
     final prefs = await SharedPreferences.getInstance();
     await prefs.setStringList(
       pluginOrderKey,
-      items.map((plugin) => plugin.id).toList(),
+      ordered.map((plugin) => plugin.id).toList(),
     );
     ref.invalidate(enabledMusicPluginsProvider);
   }
@@ -523,6 +588,9 @@ class _PluginsPageState extends ConsumerState<PluginsPage> {
   bool _busy = false;
   bool _selectionMode = false;
   final Set<String> _selectedIds = <String>{};
+
+  /// 分页 Tab：0 = 普通插件（MusicFree/星海），1 = LX 音源。
+  int _tabIndex = 0;
 
   @override
   void dispose() {
@@ -729,6 +797,12 @@ class _PluginsPageState extends ConsumerState<PluginsPage> {
             mainAxisSize: MainAxisSize.min,
             children: [
               _PluginInfoRow(label: '名称', value: plugin.name),
+              _PluginInfoRow(
+                label: '格式',
+                value: plugin.isStarSea
+                    ? '星海（聚合来源标记 _src，一次搜索聚合多平台）'
+                    : 'MusicFree 兼容',
+              ),
               _PluginInfoRow(label: '作者', value: _displayValue(plugin.author)),
               _PluginInfoRow(label: '版本', value: plugin.version),
               _PluginInfoRow(label: '备注', value: _displayValue(plugin.remark)),
@@ -963,6 +1037,10 @@ class _PluginsPageState extends ConsumerState<PluginsPage> {
         (value) => value.valueOrNull?.sidebarPosition == SidebarPosition.right,
       ),
     );
+    // 当前播放歌曲的来源插件，用于卡片上的「播放中」解析指示。
+    final playingPluginId = ref.watch(
+      playerProvider.select((state) => state.current?.pluginId),
+    );
     return Scaffold(
       appBar: AppBar(
         automaticallyImplyLeading: !widget.showSidebarButton || !sidebarOnRight,
@@ -985,6 +1063,31 @@ class _PluginsPageState extends ConsumerState<PluginsPage> {
             _selectedIds.removeWhere(
               (id) => !items.any((plugin) => plugin.id == id),
             );
+            // 四类分页计数：BakaMusic/MusicFree/LX/animemusic。
+            final kindCounts = {
+              for (final kind in _PluginKind.values)
+                kind: items.where((item) => item.kind == kind).length,
+            };
+            // 当前分类为空时回退到第一个非空分类，避免停留空页。
+            var tabIndex = _tabIndex;
+            if (kindCounts[_PluginKind.values[tabIndex]] == 0) {
+              final fallback = _PluginKind.values
+                  .where((kind) => kindCounts[kind]! > 0)
+                  .firstOrNull;
+              if (fallback != null) {
+                tabIndex = _PluginKind.values.indexOf(fallback);
+              }
+            }
+            // 只显示有插件的分类；全部为空（首次安装、清空插件）时保留
+            // 完整四类展示，避免页签整体消失。
+            final nonEmptyKinds = _PluginKind.values
+                .where((kind) => kindCounts[kind]! > 0)
+                .toList();
+            final shownKinds =
+                nonEmptyKinds.isEmpty ? _PluginKind.values : nonEmptyKinds;
+            final visible = items
+                .where((item) => item.kind == _PluginKind.values[tabIndex])
+                .toList();
             return Stack(
               children: [
                 CustomScrollView(
@@ -995,6 +1098,8 @@ class _PluginsPageState extends ConsumerState<PluginsPage> {
                         child: Column(
                           crossAxisAlignment: CrossAxisAlignment.start,
                           children: [
+                            const _PluginHeroBanner(),
+                            const SizedBox(height: 10),
                             const _SecurityNotice(),
                             const SizedBox(height: 14),
                             _InstallPanel(
@@ -1005,26 +1110,40 @@ class _PluginsPageState extends ConsumerState<PluginsPage> {
                             const SizedBox(height: 22),
                             Row(
                               children: [
-                                const Expanded(
-                                  child: Text(
-                                    '已安装插件',
-                                    style: TextStyle(
-                                      fontSize: 18,
-                                      fontWeight: FontWeight.w800,
+                                Expanded(
+                                  // 分类页签横向排布，窄屏放不下时滚动；
+                                  // 空分类不显示（见 shownKinds）。
+                                  child: SingleChildScrollView(
+                                    scrollDirection: Axis.horizontal,
+                                    child: SegmentedButton<int>(
+                                      segments: [
+                                        for (final kind in shownKinds)
+                                          ButtonSegment(
+                                            value:
+                                                _PluginKind.values.indexOf(
+                                                  kind,
+                                                ),
+                                            icon: Icon(
+                                              _kindIcon(kind),
+                                              size: 16,
+                                            ),
+                                            label: Text(
+                                              '${_kindLabel(kind)} ${kindCounts[kind]}',
+                                            ),
+                                          ),
+                                      ],
+                                      selected: {tabIndex},
+                                      onSelectionChanged: _busy
+                                          ? null
+                                          : (selection) => setState(() {
+                                              _tabIndex = selection.first;
+                                            }),
                                     ),
-                                  ),
-                                ),
-                                Text(
-                                  '${items.length} 个',
-                                  style: TextStyle(
-                                    color: Theme.of(
-                                      context,
-                                    ).colorScheme.onSurfaceVariant,
                                   ),
                                 ),
                               ],
                             ),
-                            if (items.isNotEmpty) ...[
+                            if (visible.isNotEmpty) ...[
                               const SizedBox(height: 8),
                               Wrap(
                                 spacing: 8,
@@ -1053,7 +1172,7 @@ class _PluginsPageState extends ConsumerState<PluginsPage> {
                                       onPressed: _busy
                                           ? null
                                           : () => setState(() {
-                                              final visibleIds = items
+                                              final visibleIds = visible
                                                   .map((plugin) => plugin.id)
                                                   .toSet();
                                               if (visibleIds.every(
@@ -1108,7 +1227,7 @@ class _PluginsPageState extends ConsumerState<PluginsPage> {
                         ),
                       ),
                     ),
-                    if (items.isEmpty)
+                    if (visible.isEmpty)
                       SliverPadding(
                         // 读取注入的悬浮元素遮挡高度（底栏/迷你播放栏），
                         // 最后一个插件不被悬浮元素盖住。
@@ -1122,6 +1241,12 @@ class _PluginsPageState extends ConsumerState<PluginsPage> {
                           child: _EmptyPlugins(
                             onOnline: _installFromUrl,
                             onLocal: _importLocal,
+                            hint: items.isEmpty
+                                ? '还没有安装插件'
+                                : '还没有${_kindLabel(_PluginKind.values[tabIndex])}音源',
+                            actionLabel: items.isEmpty
+                                ? '输入插件地址'
+                                : '安装到当前分类',
                           ),
                         ),
                       )
@@ -1134,16 +1259,19 @@ class _PluginsPageState extends ConsumerState<PluginsPage> {
                           MediaQuery.paddingOf(context).bottom + 24,
                         ),
                         sliver: SliverReorderableList(
-                          onReorderItem: (oldIndex, newIndex) => ref
-                              .read(_pluginsProvider.notifier)
-                              .reorder(oldIndex, newIndex),
-                          itemCount: items.length,
+                          onReorderItem: (oldIndex, newIndex) => _reorderInTab(
+                            items,
+                            visible,
+                            oldIndex,
+                            newIndex,
+                          ),
+                          itemCount: visible.length,
                           itemBuilder: (context, index) {
-                            final plugin = items[index];
+                            final plugin = visible[index];
                             return Padding(
                               key: ValueKey(plugin.id),
                               padding: EdgeInsets.only(
-                                bottom: index == items.length - 1 ? 0 : 10,
+                                bottom: index == visible.length - 1 ? 0 : 10,
                               ),
                               // 批量选择模式下不显示拖拽手柄，避免与勾选冲突。
                               child: _PluginCard(
@@ -1152,6 +1280,7 @@ class _PluginsPageState extends ConsumerState<PluginsPage> {
                                 busy: _busy,
                                 selectable: _selectionMode,
                                 selected: _selectedIds.contains(plugin.id),
+                                isPlaying: playingPluginId == plugin.id,
                                 onSelect: (value) => setState(() {
                                   value
                                       ? _selectedIds.add(plugin.id)
@@ -1193,6 +1322,48 @@ class _PluginsPageState extends ConsumerState<PluginsPage> {
       ),
     );
   }
+
+  /// 分页 Tab 内拖拽排序：先在当前分类子列表内完成移动，再把新顺序
+  /// 回填到全量列表中同类插件占用的位置槽，最后整体持久化，保证四个
+  /// Tab 的相对顺序互不干扰。
+  void _reorderInTab(
+    List<_PluginInfo> all,
+    List<_PluginInfo> visible,
+    int oldIndex,
+    int newIndex,
+  ) {
+    if (oldIndex < 0 || oldIndex >= visible.length) return;
+    if (newIndex < 0) newIndex = 0;
+    if (newIndex > visible.length) newIndex = visible.length;
+    if (newIndex == oldIndex) return;
+    final moved = visible.removeAt(oldIndex);
+    visible.insert(newIndex, moved);
+    final positions = <int>[
+      for (var i = 0; i < all.length; i++)
+        if (all[i].kind == moved.kind) i,
+    ];
+    final merged = [...all];
+    for (var v = 0; v < visible.length && v < positions.length; v++) {
+      merged[positions[v]] = visible[v];
+    }
+    ref.read(_pluginsProvider.notifier).applyOrder(merged);
+  }
+
+  /// 分类显示名（空态文案用）。
+  static String _kindLabel(_PluginKind kind) => switch (kind) {
+    _PluginKind.baka => 'BakaMusic',
+    _PluginKind.musicfree => 'MusicFree',
+    _PluginKind.lx => 'LX',
+    _PluginKind.animemusic => 'animemusic',
+  };
+
+  /// 分类页签图标（与此前四个固定 ButtonSegment 的图标保持一致）。
+  static IconData _kindIcon(_PluginKind kind) => switch (kind) {
+    _PluginKind.baka => Icons.hub_rounded,
+    _PluginKind.musicfree => Icons.extension_rounded,
+    _PluginKind.lx => Icons.cable_rounded,
+    _PluginKind.animemusic => Icons.cloud_rounded,
+  };
 }
 
 class _SecurityNotice extends StatelessWidget {
@@ -1283,10 +1454,20 @@ class _InstallPanel extends StatelessWidget {
 }
 
 class _EmptyPlugins extends StatelessWidget {
-  const _EmptyPlugins({required this.onOnline, required this.onLocal});
+  const _EmptyPlugins({
+    required this.onOnline,
+    required this.onLocal,
+    this.hint = '还没有安装插件',
+    this.actionLabel = '输入插件地址',
+  });
 
   final VoidCallback onOnline;
   final VoidCallback onLocal;
+
+  /// 空态文案：整个插件目录为空与当前分页（普通插件/LX 音源）为空
+  /// 提示不同。
+  final String hint;
+  final String actionLabel;
 
   @override
   Widget build(BuildContext context) {
@@ -1302,7 +1483,7 @@ class _EmptyPlugins extends StatelessWidget {
             ).colorScheme.onSurfaceVariant.withValues(alpha: 0.4),
           ),
           const SizedBox(height: 12),
-          const Text('还没有安装插件', style: TextStyle(fontWeight: FontWeight.w700)),
+          Text(hint, style: const TextStyle(fontWeight: FontWeight.w700)),
           const SizedBox(height: 6),
           Text(
             '从网络地址或本地文件安装兼容插件',
@@ -1311,7 +1492,7 @@ class _EmptyPlugins extends StatelessWidget {
             ),
           ),
           const SizedBox(height: 16),
-          TextButton(onPressed: onOnline, child: const Text('输入插件地址')),
+          TextButton(onPressed: onOnline, child: Text(actionLabel)),
         ],
       ),
     );
@@ -1325,6 +1506,7 @@ class _PluginCard extends StatelessWidget {
     required this.busy,
     required this.selectable,
     required this.selected,
+    required this.isPlaying,
     required this.onSelect,
     required this.onToggle,
     required this.onInfo,
@@ -1339,6 +1521,9 @@ class _PluginCard extends StatelessWidget {
   final bool busy;
   final bool selectable;
   final bool selected;
+
+  /// 当前播放歌曲正由该插件解析（播放解析指示）。
+  final bool isPlaying;
   final ValueChanged<bool> onSelect;
   final ValueChanged<bool> onToggle;
   final VoidCallback onInfo;
@@ -1385,11 +1570,25 @@ class _PluginCard extends StatelessWidget {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Text(
-                  plugin.name,
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: const TextStyle(fontWeight: FontWeight.w700),
+                Row(
+                  children: [
+                    Flexible(
+                      child: Text(
+                        plugin.name,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(fontWeight: FontWeight.w700),
+                      ),
+                    ),
+                    if (plugin.isStarSea) ...[
+                      const SizedBox(width: 6),
+                      _StarSeaBadge(),
+                    ],
+                    if (isPlaying) ...[
+                      const SizedBox(width: 6),
+                      const _PlayingBadge(),
+                    ],
+                  ],
                 ),
                 const SizedBox(height: 3),
                 Text(
@@ -1425,6 +1624,131 @@ class _PluginCard extends StatelessWidget {
                 const PopupMenuItem(value: 'update', child: Text('检查并安装更新')),
               const PopupMenuItem(value: 'remove', child: Text('卸载插件')),
             ],
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _StarSeaBadge extends StatelessWidget {
+  const _StarSeaBadge();
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final color = theme.colorScheme.primary;
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+      decoration: BoxDecoration(
+        color: color.withValues(alpha: 0.12),
+        borderRadius: BorderRadius.circular(5),
+        border: Border.all(color: color.withValues(alpha: 0.4)),
+      ),
+      child: Text(
+        '星海',
+        style: TextStyle(
+          fontSize: 10,
+          fontWeight: FontWeight.w600,
+          color: color,
+          height: 1.1,
+        ),
+      ),
+    );
+  }
+}
+
+/// 当前播放歌曲正由该插件解析的指示徽章。
+class _PlayingBadge extends StatelessWidget {
+  const _PlayingBadge();
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final color = theme.colorScheme.tertiary;
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+      decoration: BoxDecoration(
+        color: color.withValues(alpha: 0.12),
+        borderRadius: BorderRadius.circular(5),
+        border: Border.all(color: color.withValues(alpha: 0.4)),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(Icons.graphic_eq_rounded, size: 10, color: color),
+          const SizedBox(width: 3),
+          Text(
+            '播放中',
+            style: TextStyle(
+              fontSize: 10,
+              fontWeight: FontWeight.w600,
+              color: color,
+              height: 1.1,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// 插件管理页顶部横幅：说明插件把搜索范围扩展到全网音源。
+class _PluginHeroBanner extends StatelessWidget {
+  const _PluginHeroBanner();
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final color = theme.colorScheme.primary;
+    return Container(
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        borderRadius: BorderRadius.circular(XyRadii.large),
+        gradient: LinearGradient(
+          begin: Alignment.topLeft,
+          end: Alignment.bottomRight,
+          colors: [
+            color.withValues(alpha: 0.14),
+            color.withValues(alpha: 0.04),
+          ],
+        ),
+        border: Border.all(color: color.withValues(alpha: 0.25)),
+      ),
+      child: Row(
+        children: [
+          Container(
+            width: 42,
+            height: 42,
+            decoration: BoxDecoration(
+              color: color.withValues(alpha: 0.14),
+              borderRadius: BorderRadius.circular(12),
+            ),
+            child: Icon(
+              Icons.library_music_rounded,
+              size: 24,
+              color: color,
+            ),
+          ),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text(
+                  '你的音乐，更多来源',
+                  style: TextStyle(fontSize: 16, fontWeight: FontWeight.w800),
+                ),
+                const SizedBox(height: 3),
+                Text(
+                  '安装普通插件或 LX 音源，聚合搜索、播放全网歌曲',
+                  style: TextStyle(
+                    fontSize: 12,
+                    color: theme.colorScheme.onSurfaceVariant,
+                  ),
+                ),
+              ],
+            ),
           ),
         ],
       ),

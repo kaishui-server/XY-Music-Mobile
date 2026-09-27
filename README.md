@@ -130,12 +130,8 @@ flutter run
 - 移动端 UI 采用平台原生手势（Android Predictive Back），避免自定义转场耗电
 
 ## 相关项目
-“本项目部分内容参考 坤音（UI）、LX-X部分功能实现代码、弦予软件部分架构&部分功能实现代码、BakaMusic、Mineradio等音乐软件，感谢他们的支持。”
-参考项目地址：
-LX-X:https://github.com/WalnutBai/lx-lxwalnut-music-mobile
-弦予音乐：https://github.com/TaXiaoQi/XianYu-Music-Mobile
-BakaMusic：https://github.com/Zencok/BakaMusic
-Mineradio：https://github.com/XxHuberrr/Mineradio
+
+（暂无）
 
 ## 文档
 

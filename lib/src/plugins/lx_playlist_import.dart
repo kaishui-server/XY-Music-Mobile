@@ -1396,12 +1396,19 @@ Map<String, dynamic> _mgTypes(dynamic audioFormats) {
 // ---------------------------------------------------------------------------
 // 洛雪歌单本地文件导入：兼容 lx-music 的 my-list 备份 JSON。
 //
-// 支持两种结构：
+// 支持三种结构：
 //   1. 单个歌单导出：{ "info": {...}, "list": [song, ...] }
-//   2. 全部列表备份：{ "list": [{ "info": {...}, "list": [...] }, ...],
-//                      "defaultList": {...}, "loveList": {...} }
-// 歌曲条目是洛雪 SongInfo 结构（songmid/source/name/singer/interval...），
-// 归一化为与洛雪搜索一致的 raw 结构（含 `lx` 元数据与 `lx://` 虚拟路径）。
+//   2. 全部列表备份（v1）：{ "list": [{ "info": {...}, "list": [...] }, ...],
+//      "defaultList": {...}, "loveList": {...} }
+//   3. 全量备份（v2）：{ "version": "2", "data": {
+//      "defaultList": [song, ...], "loveList": [song, ...],
+//      "userList": [{ "name": "...", "list": [song, ...] }, ...] } }
+//      defaultList/loveList 直接是歌曲数组，用户歌单名称在顶层 name；
+//      歌曲条目为 v2 扁平结构（name/singer/source/interval 在顶层，
+//      songId/albumName/picUrl/_qualitys 等在 meta 嵌套，id 形如
+//      "tx_001dEI9i3VqAHc" 即 source_songmid）。
+// 歌曲条目统一归一化为与洛雪搜索一致的 raw 结构（含 `lx` 元数据与
+// `lx://` 虚拟路径）。
 // ---------------------------------------------------------------------------
 
 class LxLocalPlaylist {
@@ -1424,6 +1431,13 @@ List<LxLocalPlaylist> tryParseLxLocalPlaylists(String content) {
     return const [];
   }
   if (decoded is! Map) return const [];
+
+  // 洛雪 v2 全量备份：歌单都在 data 节点下。
+  final data = decoded['data'];
+  if (data is Map) {
+    final v2Playlists = _parseLxV2Backup(Map<String, dynamic>.from(data));
+    if (v2Playlists.isNotEmpty) return v2Playlists;
+  }
 
   // 备份多歌单（含默认列表/收藏列表）与单歌单导出统一收集。
   final entries = <Map<String, dynamic>>[];
@@ -1458,48 +1472,114 @@ List<LxLocalPlaylist> tryParseLxLocalPlaylists(String content) {
     if (name.isEmpty) name = '洛雪歌单';
     final rawSongs = entry['list'];
     if (rawSongs is! List) continue;
-    final songs = <Map<String, dynamic>>[];
-    final seen = <String>{};
-    for (final value in rawSongs.whereType<Map>()) {
-      final raw = normalizeLxLocalSong(Map<String, dynamic>.from(value));
-      if (raw == null) continue;
-      final path = raw['_sourcePath']?.toString() ?? '';
-      if (path.isEmpty || !seen.add(path)) continue;
-      songs.add(raw);
-    }
-    if (songs.isNotEmpty) playlists.add(LxLocalPlaylist(name: name, songs: songs));
+    _addLxPlaylist(playlists, name, rawSongs);
   }
   return playlists;
 }
 
+/// 洛雪 v2 全量备份的 data 节点 → 歌单列表。
+/// defaultList/loveList/tempList 是歌曲数组（应用内固定列表），
+/// userList 是用户自建歌单（名称在顶层 name，歌曲在 list）。
+List<LxLocalPlaylist> _parseLxV2Backup(Map<String, dynamic> data) {
+  final playlists = <LxLocalPlaylist>[];
+  for (final entry in const [
+    ('defaultList', '试听列表'),
+    ('loveList', '我的收藏'),
+    ('tempList', '临时列表'),
+  ]) {
+    final node = data[entry.$1];
+    if (node is! List || node.isEmpty) continue;
+    _addLxPlaylist(playlists, entry.$2, node);
+  }
+  final userList = data['userList'];
+  if (userList is List) {
+    for (final value in userList.whereType<Map>()) {
+      final item = Map<String, dynamic>.from(value);
+      final rawSongs = item['list'];
+      if (rawSongs is! List || rawSongs.isEmpty) continue;
+      var name = _text(item['name']);
+      if (name.isEmpty) name = '洛雪歌单';
+      _addLxPlaylist(playlists, name, rawSongs);
+    }
+  }
+  return playlists;
+}
+
+/// 收集一个歌单的歌曲（去重后非空才入列）。
+void _addLxPlaylist(
+  List<LxLocalPlaylist> playlists,
+  String name,
+  List<dynamic> rawSongs,
+) {
+  final songs = <Map<String, dynamic>>[];
+  final seen = <String>{};
+  for (final value in rawSongs.whereType<Map>()) {
+    final raw = normalizeLxLocalSong(Map<String, dynamic>.from(value));
+    if (raw == null) continue;
+    final path = raw['_sourcePath']?.toString() ?? '';
+    if (path.isEmpty || !seen.add(path)) continue;
+    songs.add(raw);
+  }
+  if (songs.isNotEmpty) playlists.add(LxLocalPlaylist(name: name, songs: songs));
+}
+
 /// 洛雪 SongInfo 条目 → raw 歌曲结构（对齐洛雪搜索归一化）。
-/// 不是洛雪歌曲结构（缺少 songmid/source/name）时返回 null。
+/// 不是洛雪歌曲结构（缺少 source/name 等）时返回 null。
+/// 兼容 v1 扁平导出（songmid/albumName 在顶层）与 v2 全量备份
+/// （songId/albumName/picUrl/_qualitys 在 meta 嵌套，id 带 source 前缀）。
 Map<String, dynamic>? normalizeLxLocalSong(Map<String, dynamic> item) {
   final source = _text(item['source']).toLowerCase();
-  final songmid = _text(item['songmid'] ?? item['song_mid'] ?? item['id']);
-  final name = _text(item['name'] ?? item['title']);
-  if (source.isEmpty || !kLxSourceIds.contains(source) ||
-      songmid.isEmpty || name.isEmpty) {
-    return null;
+  if (source.isEmpty || !kLxSourceIds.contains(source)) return null;
+  final meta = item['meta'] is Map
+      ? Map<String, dynamic>.from(item['meta'] as Map)
+      : const <String, dynamic>{};
+  var songmid = _text(item['songmid'] ?? item['song_mid'] ?? meta['songmid']);
+  final hash = _text(item['hash'] ?? meta['hash']);
+  // 酷狗播放走 hash（与洛雪搜索归一化一致），v2 备份的 hash 在 meta。
+  if (songmid.isEmpty && source == 'kg' && hash.isNotEmpty) songmid = hash;
+  if (songmid.isEmpty) {
+    // v2 备份 id 形如 "tx_001dEI9i3VqAHc"（source_songmid），剥离前缀
+    // 得到真正的 songmid；kg 的 id 是 "songId_hash"，取 hash 段；
+    // v1 导出的 id 本身就是 songmid。
+    final id = _text(item['id']);
+    final prefix = '${source}_';
+    if (id.startsWith(prefix)) {
+      songmid = id.substring(prefix.length);
+    } else if (source == 'kg' && id.contains('_')) {
+      songmid = id.split('_').last;
+    } else {
+      songmid = id;
+    }
   }
+  final name = _text(item['name'] ?? item['title']);
+  if (songmid.isEmpty || name.isEmpty) return null;
   final singer = _text(item['singer'] ?? item['artist']);
-  final album = _text(item['albumName'] ?? item['album_name'] ?? item['album']);
+  final album = _text(
+    item['albumName'] ??
+        item['album_name'] ??
+        item['album'] ??
+        meta['albumName'],
+  );
   final durationSec = _intervalToSeconds(item['interval'] ?? item['duration']);
-  final types = item['types'] ?? item['_types'] ?? item['lx_types'];
+  final types =
+      item['_types'] ?? item['types'] ?? meta['_qualitys'] ?? item['lx_types'];
   return _lxSong(
     source: source,
     songmid: songmid,
-    hash: item['hash'],
+    hash: hash.isNotEmpty ? hash : item['hash'],
     name: name,
     singer: singer,
     album: album,
-    albumId: item['albumId'] ?? item['album_id'],
-    strMediaMid: item['strMediaMid'] ?? item['str_media_mid'],
-    songId: item['songId'] ?? item['song_id'],
-    albumMid: item['albumMid'] ?? item['album_mid'],
+    albumId: item['albumId'] ?? item['album_id'] ?? meta['albumId'],
+    strMediaMid:
+        item['strMediaMid'] ?? item['str_media_mid'] ?? meta['strMediaMid'],
+    songId: item['songId'] ?? item['song_id'] ?? meta['songId'],
+    albumMid: item['albumMid'] ?? item['album_mid'] ?? meta['albumMid'],
     copyrightId: item['copyrightId'] ?? item['copyright_id'],
     durationSec: durationSec,
-    img: _normalizeCover(_text(item['img'] ?? item['artwork'])),
+    img: _normalizeCover(
+      _text(item['img'] ?? item['artwork'] ?? meta['picUrl']),
+    ),
     types: types is Map ? Map<String, dynamic>.from(types) : null,
   )
     // 保留洛雪导出自带的歌词，导入后无需再次请求。

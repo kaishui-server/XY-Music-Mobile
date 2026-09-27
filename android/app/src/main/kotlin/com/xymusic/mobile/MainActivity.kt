@@ -502,6 +502,7 @@ class MainActivity : AudioServiceActivity() {
                                     putExtra("translation", call.argument<String>("translation") ?: "")
                                     putExtra("wordsJson", call.argument<String>("wordsJson") ?: "[]")
                                     putExtra("position", call.argument<Number>("position")?.toDouble() ?: 0.0)
+                                    putExtra("isPlaying", call.argument<Boolean>("isPlaying") == true)
                                     putExtra("wordEffectMode", call.argument<Number>("wordEffectMode")?.toInt() ?: 2)
                                     putExtra("locked", call.argument<Boolean>("locked") == true)
                                     putExtra("noBackground", call.argument<Boolean>("noBackground") != false)

@@ -6,13 +6,14 @@ enum ThemeModePreference { system, light, dark }
 
 /// 播放详情页背景样式。
 ///
-/// [coverBlur] 已从设置中移除（v2.2.0-beta2 起不再提供“封面模糊”选项），
-/// 枚举值仅为兼容旧持久化索引保留，读取时会被归一化为 [flowingLight]。
+/// [coverBlur] 与 [particle]（粒子动效）已从设置中移除，枚举值仅为
+/// 兼容旧持久化索引保留，读取时会被归一化为 [flowingLight]。
 enum PlayerDetailBackgroundMode {
   coverBlur,
   wallpaperBlur,
   flowingLight,
   customImage,
+  particle,
 }
 
 /// 播放详情页封面样式：经典方形、圆形旋转（参考 MusicFree）、沉浸式
@@ -120,6 +121,43 @@ List<String> normalizeBottomBarItemIds(Iterable<String> stored) {
 /// 播放过程中发生错误时的处理方式。
 enum PlaybackFailureAction { playNext, pause }
 
+/// 播放失败策略步骤：降低音质 / 换源播放 / 跳下一首 / 暂停播放。
+///
+/// 用户可拖动排序；播放失败时按优先级依次尝试（重试次数与各步骤
+/// 计数用尽后落到下一档）。旧设置 playbackFailureAction 只有两档，会
+/// 迁移到该优先级列表。
+enum PlaybackFailureStep { lowerQuality, switchSource, playNext, pause }
+
+const kDefaultPlaybackFailurePriority = <PlaybackFailureStep>[
+  PlaybackFailureStep.lowerQuality,
+  PlaybackFailureStep.switchSource,
+  PlaybackFailureStep.playNext,
+  PlaybackFailureStep.pause,
+];
+
+/// 归一化播放失败策略优先级：过滤非法值、去重，并补全缺失的步骤。
+/// 若存储值恰好是旧版默认三步（未含“降低音质”），直接升级为当前
+/// 默认顺序，避免升级用户把降音质补到队尾而几乎轮不到。
+List<PlaybackFailureStep> normalizePlaybackFailurePriority(
+  List<PlaybackFailureStep> stored,
+) {
+  const legacyDefault = <PlaybackFailureStep>[
+    PlaybackFailureStep.switchSource,
+    PlaybackFailureStep.playNext,
+    PlaybackFailureStep.pause,
+  ];
+  final storedSet = stored.toSet();
+  if (storedSet.length == legacyDefault.length &&
+      legacyDefault.every(storedSet.contains)) {
+    return [...kDefaultPlaybackFailurePriority];
+  }
+  final normalized = <PlaybackFailureStep>[...stored];
+  for (final step in kDefaultPlaybackFailurePriority) {
+    if (!normalized.contains(step)) normalized.add(step);
+  }
+  return normalized;
+}
+
 /// 歌词逐字高亮样式。
 ///
 /// `wordByWord` 是旧版逐词切换高亮，`progressive` 会在每个词内部从左到右
@@ -158,6 +196,10 @@ class AppSettings {
     this.volume = 1.0,
     this.playMode = 0, // 0 顺序(列表循环) 1 单曲循环 2 随机
     this.playbackFailureAction = PlaybackFailureAction.pause,
+    // 播放失败策略：失败后优先重试当前歌、自动换源、按优先级走后续动作。
+    this.playbackRetryCount = 1,
+    this.playbackSwitchSourceCount = 2,
+    this.playbackFailurePriority = kDefaultPlaybackFailurePriority,
     this.playOtherAudioWithoutInterruption = false,
     this.lastTab = 0,
     this.keepScreenOn = true,
@@ -185,9 +227,13 @@ class AppSettings {
     this.portraitImmersiveLyrics = true,
     this.homeModules = kDefaultHomeModules,
     this.showQualityBadges = true,
+    // 列表中的网络歌曲（导入歌单/搜索结果）是否加载网络封面。
+    this.showPlaylistSongCovers = true,
     this.onlineDefaultQuality = '320k',
     this.libraryMinDurationSeconds = 0,
     this.showLyricsTranslation = true,
+    // 播放详情页歌词页：单击歌词行调整播放进度（默认开启）。
+    this.lyricTapSeek = true,
     this.lyricWordEffectMode = LyricWordEffectMode.progressive,
     this.lyricDisplayAlignment = LyricDisplayAlignment.left,
     this.lyricFontSize = 22.0,
@@ -217,6 +263,15 @@ class AppSettings {
   final double volume;
   final int playMode;
   final PlaybackFailureAction playbackFailureAction;
+
+  /// 播放失败后优先重试当前歌曲的次数（应对偶发网络抖动）。
+  final int playbackRetryCount;
+
+  /// 自动换源的最大尝试次数（在已启用的其他音源中找同名歌曲）。
+  final int playbackSwitchSourceCount;
+
+  /// 播放失败策略优先级（换源播放 → 跳下一首 → 暂停播放，可排序）。
+  final List<PlaybackFailureStep> playbackFailurePriority;
   final bool playOtherAudioWithoutInterruption;
   final int lastTab;
   final bool keepScreenOn;
@@ -269,9 +324,17 @@ class AppSettings {
   /// 首页已启用的模块 id（猜你想听固定展示，不在列表中即关闭）。
   final List<String> homeModules;
   final bool showQualityBadges;
+
+  /// 列表中的网络歌曲（导入歌单/搜索结果）是否加载网络封面。关闭后
+  /// 这类歌曲在列表中显示渐变占位图，跳过逐首下载网络封面，加快
+  /// 大歌单的打开速度；本地歌曲封面走本地缓存，不受影响。
+  final bool showPlaylistSongCovers;
   final String onlineDefaultQuality;
   final int libraryMinDurationSeconds;
   final bool showLyricsTranslation;
+
+  /// 播放详情页歌词页：单击歌词行调整播放进度。
+  final bool lyricTapSeek;
   final LyricWordEffectMode lyricWordEffectMode;
   final LyricDisplayAlignment lyricDisplayAlignment;
 
@@ -315,6 +378,9 @@ class AppSettings {
     double? volume,
     int? playMode,
     PlaybackFailureAction? playbackFailureAction,
+    int? playbackRetryCount,
+    int? playbackSwitchSourceCount,
+    List<PlaybackFailureStep>? playbackFailurePriority,
     bool? playOtherAudioWithoutInterruption,
     int? lastTab,
     bool? keepScreenOn,
@@ -341,9 +407,11 @@ class AppSettings {
     bool? portraitImmersiveLyrics,
     List<String>? homeModules,
     bool? showQualityBadges,
+    bool? showPlaylistSongCovers,
     String? onlineDefaultQuality,
     int? libraryMinDurationSeconds,
     bool? showLyricsTranslation,
+    bool? lyricTapSeek,
     LyricWordEffectMode? lyricWordEffectMode,
     LyricDisplayAlignment? lyricDisplayAlignment,
     double? lyricFontSize,
@@ -374,6 +442,12 @@ class AppSettings {
       playMode: playMode ?? this.playMode,
       playbackFailureAction:
           playbackFailureAction ?? this.playbackFailureAction,
+      playbackRetryCount: playbackRetryCount ?? this.playbackRetryCount,
+      playbackSwitchSourceCount:
+          playbackSwitchSourceCount ?? this.playbackSwitchSourceCount,
+      playbackFailurePriority: playbackFailurePriority != null
+          ? normalizePlaybackFailurePriority(playbackFailurePriority)
+          : this.playbackFailurePriority,
       playOtherAudioWithoutInterruption:
           playOtherAudioWithoutInterruption ??
           this.playOtherAudioWithoutInterruption,
@@ -408,11 +482,14 @@ class AppSettings {
           portraitImmersiveLyrics ?? this.portraitImmersiveLyrics,
       homeModules: homeModules ?? this.homeModules,
       showQualityBadges: showQualityBadges ?? this.showQualityBadges,
+      showPlaylistSongCovers:
+          showPlaylistSongCovers ?? this.showPlaylistSongCovers,
       onlineDefaultQuality: onlineDefaultQuality ?? this.onlineDefaultQuality,
       libraryMinDurationSeconds:
           libraryMinDurationSeconds ?? this.libraryMinDurationSeconds,
       showLyricsTranslation:
           showLyricsTranslation ?? this.showLyricsTranslation,
+      lyricTapSeek: lyricTapSeek ?? this.lyricTapSeek,
       lyricWordEffectMode: lyricWordEffectMode ?? this.lyricWordEffectMode,
       lyricDisplayAlignment:
           lyricDisplayAlignment ?? this.lyricDisplayAlignment,
@@ -464,6 +541,11 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
         prefs.getInt('playbackFailureAction') ??
             PlaybackFailureAction.pause.index,
       ),
+      playbackRetryCount:
+          (prefs.getInt('playbackRetryCount') ?? 1).clamp(0, 5),
+      playbackSwitchSourceCount:
+          (prefs.getInt('playbackSwitchSourceCount') ?? 2).clamp(0, 5),
+      playbackFailurePriority: _playbackFailurePriorityFromPrefs(prefs),
       playOtherAudioWithoutInterruption:
           prefs.getBool('playOtherAudioWithoutInterruption') ?? false,
       lastTab: prefs.getInt('lastTab') ?? 0,
@@ -514,9 +596,12 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
           ? kDefaultHomeModules
           : normalizeHomeModules(prefs.getStringList('homeModules')!),
       showQualityBadges: prefs.getBool('showQualityBadges') ?? true,
+      showPlaylistSongCovers:
+          prefs.getBool('showPlaylistSongCovers') ?? true,
       onlineDefaultQuality: prefs.getString('onlineDefaultQuality') ?? '320k',
       libraryMinDurationSeconds: prefs.getInt('libraryMinDurationSeconds') ?? 0,
       showLyricsTranslation: prefs.getBool('showLyricsTranslation') ?? true,
+      lyricTapSeek: prefs.getBool('lyricTapSeek') ?? true,
       lyricWordEffectMode: _lyricWordEffectModeFromPrefs(prefs),
       lyricDisplayAlignment: _lyricDisplayAlignmentFromPrefs(prefs),
       lyricFontSize:
@@ -597,8 +682,10 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
   }
 
   PlayerDetailBackgroundMode _playerDetailBackgroundModeFromInt(int value) {
-    // coverBlur（旧索引 0）已移除：统一迁移为流光背景。
-    if (value == PlayerDetailBackgroundMode.coverBlur.index) {
+    // coverBlur（旧索引 0）与 particle（旧索引 4，粒子动效）已移除：
+    // 统一迁移为流光背景。
+    if (value == PlayerDetailBackgroundMode.coverBlur.index ||
+        value == PlayerDetailBackgroundMode.particle.index) {
       return PlayerDetailBackgroundMode.flowingLight;
     }
     if (value >= 0 && value < PlayerDetailBackgroundMode.values.length) {
@@ -611,6 +698,37 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
       v == PlaybackFailureAction.playNext.index
       ? PlaybackFailureAction.playNext
       : PlaybackFailureAction.pause;
+
+  /// 读取播放失败策略优先级：新版存的是步骤名列表；旧版只有
+  /// playbackFailureAction 两档（跳下一首/暂停），迁移为对应顺序。
+  List<PlaybackFailureStep> _playbackFailurePriorityFromPrefs(
+    SharedPreferences prefs,
+  ) {
+    final stored = prefs.getStringList('playbackFailurePriority');
+    if (stored != null) {
+      final parsed = <PlaybackFailureStep>[];
+      for (final name in stored) {
+        for (final step in PlaybackFailureStep.values) {
+          if (step.name == name && !parsed.contains(step)) {
+            parsed.add(step);
+          }
+        }
+      }
+      if (parsed.isNotEmpty) return normalizePlaybackFailurePriority(parsed);
+    }
+    final legacyAction = _playbackFailureActionFromInt(
+      prefs.getInt('playbackFailureAction') ??
+          PlaybackFailureAction.pause.index,
+    );
+    return legacyAction == PlaybackFailureAction.playNext
+        ? kDefaultPlaybackFailurePriority
+        : const [
+            PlaybackFailureStep.lowerQuality,
+            PlaybackFailureStep.switchSource,
+            PlaybackFailureStep.pause,
+            PlaybackFailureStep.playNext,
+          ];
+  }
 
   LyricWordEffectMode _lyricWordEffectModeFromPrefs(SharedPreferences prefs) {
     final stored = prefs.getInt('lyricWordEffectMode');
@@ -648,6 +766,15 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
       prefs.setDouble('volume', next.volume),
       prefs.setInt('playMode', next.playMode),
       prefs.setInt('playbackFailureAction', next.playbackFailureAction.index),
+      prefs.setInt('playbackRetryCount', next.playbackRetryCount),
+      prefs.setInt(
+        'playbackSwitchSourceCount',
+        next.playbackSwitchSourceCount,
+      ),
+      prefs.setStringList(
+        'playbackFailurePriority',
+        [for (final step in next.playbackFailurePriority) step.name],
+      ),
       prefs.setBool(
         'playOtherAudioWithoutInterruption',
         next.playOtherAudioWithoutInterruption,
@@ -695,9 +822,11 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
       ),
       prefs.setStringList('homeModules', next.homeModules),
       prefs.setBool('showQualityBadges', next.showQualityBadges),
+      prefs.setBool('showPlaylistSongCovers', next.showPlaylistSongCovers),
       prefs.setString('onlineDefaultQuality', next.onlineDefaultQuality),
       prefs.setInt('libraryMinDurationSeconds', next.libraryMinDurationSeconds),
       prefs.setBool('showLyricsTranslation', next.showLyricsTranslation),
+      prefs.setBool('lyricTapSeek', next.lyricTapSeek),
       prefs.setInt('lyricWordEffectMode', next.lyricWordEffectMode.index),
       prefs.setInt('lyricDisplayAlignment', next.lyricDisplayAlignment.index),
       prefs.setDouble('lyricFontSize', next.lyricFontSize),
@@ -759,6 +888,19 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
   Future<void> setPlaybackFailureAction(PlaybackFailureAction action) => _save(
     (state.valueOrNull ?? const AppSettings()).copyWith(
       playbackFailureAction: action,
+    ),
+  );
+
+  /// 设置播放失败策略：优先重试次数 / 最大换源尝试次数 / 优先级顺序。
+  Future<void> setPlaybackFailurePolicy({
+    int? retryCount,
+    int? switchSourceCount,
+    List<PlaybackFailureStep>? priority,
+  }) => _save(
+    (state.valueOrNull ?? const AppSettings()).copyWith(
+      playbackRetryCount: retryCount?.clamp(0, 5),
+      playbackSwitchSourceCount: switchSourceCount?.clamp(0, 5),
+      playbackFailurePriority: priority,
     ),
   );
   Future<void> setPlayOtherAudioWithoutInterruption(bool value) => _save(
@@ -908,6 +1050,11 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
   Future<void> setShowQualityBadges(bool v) => _save(
     (state.valueOrNull ?? const AppSettings()).copyWith(showQualityBadges: v),
   );
+  Future<void> setShowPlaylistSongCovers(bool v) => _save(
+    (state.valueOrNull ?? const AppSettings()).copyWith(
+      showPlaylistSongCovers: v,
+    ),
+  );
   Future<void> setOnlineDefaultQuality(String q) => _save(
     (state.valueOrNull ?? const AppSettings()).copyWith(
       onlineDefaultQuality: q,
@@ -922,6 +1069,10 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
     (state.valueOrNull ?? const AppSettings()).copyWith(
       showLyricsTranslation: v,
     ),
+  );
+
+  Future<void> setLyricTapSeek(bool v) => _save(
+    (state.valueOrNull ?? const AppSettings()).copyWith(lyricTapSeek: v),
   );
   Future<void> setLyricWordEffectMode(LyricWordEffectMode mode) => _save(
     (state.valueOrNull ?? const AppSettings()).copyWith(

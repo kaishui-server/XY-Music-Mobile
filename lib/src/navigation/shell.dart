@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 
@@ -213,7 +214,7 @@ class AppShell extends ConsumerWidget {
       ],
     );
 
-    return Scaffold(
+    final scaffold = Scaffold(
       key: appScaffoldKey,
       extendBody: true,
       // 键盘避让交给各页面自己的 Scaffold：Shell 与页面是双层 Scaffold
@@ -252,6 +253,24 @@ class AppShell extends ConsumerWidget {
               ],
             )
           : content,
+    );
+
+    // 系统返回键：仅在「当前分支已无返回栈、根导航也无全屏覆盖页」时
+    // 才会落到这里（go_router 的分支内子页弹出、播放页/搜索页等覆盖
+    // 页的弹出均在此之前已被处理）。此时不再直接退出软件：侧边栏
+    // 一级页面（设置/本地音乐/云端音乐/账号等）先回到首页，
+    // 已在首页时按返回才退出软件。
+    return PopScope(
+      canPop: false,
+      onPopInvokedWithResult: (didPop, result) {
+        if (didPop) return;
+        if (currentPath == '/home') {
+          SystemNavigator.pop();
+        } else {
+          context.go('/home');
+        }
+      },
+      child: scaffold,
     );
   }
 }

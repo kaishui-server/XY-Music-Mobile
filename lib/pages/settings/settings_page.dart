@@ -81,7 +81,7 @@ const settingsSearchEntries = <SettingsSearchEntry>[
     path: ['播放'],
     route: '/settings/playback',
     icon: Icons.play_circle_outline_rounded,
-    keywords: '音量 音质 屏幕常亮',
+    keywords: '音量 音质 屏幕常亮 封面 歌单',
   ),
   SettingsSearchEntry(
     title: '布局',
@@ -261,6 +261,13 @@ const settingsSearchEntries = <SettingsSearchEntry>[
     path: ['歌词', '播放详情页歌词', '显示翻译'],
     route: '/settings/lyrics',
     icon: Icons.translate_outlined,
+  ),
+  SettingsSearchEntry(
+    title: '单击歌词调整进度',
+    path: ['歌词', '单击歌词调整进度'],
+    route: '/settings/playback-detail',
+    icon: Icons.touch_app_outlined,
+    keywords: '点击歌词 跳转 进度 seek',
   ),
   SettingsSearchEntry(
     title: '逐字动效',
@@ -777,10 +784,12 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
                   PlayerDetailBackgroundMode.flowingLight,
               isDense: true,
               alignment: AlignmentDirectional.centerEnd,
-              // 封面模糊选项已移除，仅展示其余背景模式。
+              // 封面模糊与粒子动效选项已移除，仅展示其余背景模式。
               items: PlayerDetailBackgroundMode.values
                   .where(
-                    (mode) => mode != PlayerDetailBackgroundMode.coverBlur,
+                    (mode) =>
+                        mode != PlayerDetailBackgroundMode.coverBlur &&
+                        mode != PlayerDetailBackgroundMode.particle,
                   )
                   .map(
                     (mode) => DropdownMenuItem<PlayerDetailBackgroundMode>(
@@ -956,34 +965,9 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
           ),
           onTap: () => _pickQuality(context, ref, settings, isOnline: true),
         ),
-        _tile(
-          context,
-          icon: Icons.error_outline,
-          title: '播放失败后',
-          trailing: DropdownButtonHideUnderline(
-            child: DropdownButton<PlaybackFailureAction>(
-              value:
-                  settings?.playbackFailureAction ??
-                  PlaybackFailureAction.pause,
-              isDense: true,
-              alignment: AlignmentDirectional.centerEnd,
-              items: const [
-                DropdownMenuItem<PlaybackFailureAction>(
-                  value: PlaybackFailureAction.playNext,
-                  child: Text('播放下一首'),
-                ),
-                DropdownMenuItem<PlaybackFailureAction>(
-                  value: PlaybackFailureAction.pause,
-                  child: Text('暂停播放'),
-                ),
-              ],
-              onChanged: (action) {
-                if (action != null) {
-                  notifier.setPlaybackFailureAction(action);
-                }
-              },
-            ),
-          ),
+        _PlaybackFailurePolicyEditor(
+          settings: settings ?? const AppSettings(),
+          notifier: notifier,
         ),
         _switchTile(
           context,
@@ -1002,6 +986,13 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
         ),
         _switchTile(
           context,
+          icon: Icons.image_not_supported_outlined,
+          title: '歌单歌曲加载封面',
+          value: settings?.showPlaylistSongCovers ?? true,
+          onChanged: (v) => notifier.setShowPlaylistSongCovers(v),
+        ),
+        _switchTile(
+          context,
           icon: Icons.screen_lock_rotation,
           title: '保持屏幕常亮',
           value: settings?.keepScreenOn ?? true,
@@ -1009,6 +1000,13 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
         ),
       ],
       SettingsSection.playbackDetail => [
+        _switchTile(
+          context,
+          icon: Icons.touch_app_outlined,
+          title: '单击歌词调整进度',
+          value: settings?.lyricTapSeek ?? true,
+          onChanged: (v) => notifier.setLyricTapSeek(v),
+        ),
         _tile(
           context,
           icon: Icons.lyrics_outlined,
@@ -1696,10 +1694,11 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
 
   String _playerDetailBackgroundLabel(PlayerDetailBackgroundMode mode) =>
       switch (mode) {
-        PlayerDetailBackgroundMode.coverBlur => '封面模糊',
+        PlayerDetailBackgroundMode.coverBlur => '流光',
         PlayerDetailBackgroundMode.wallpaperBlur => '壁纸模糊',
         PlayerDetailBackgroundMode.flowingLight => '流光',
         PlayerDetailBackgroundMode.customImage => '自定义图片',
+        PlayerDetailBackgroundMode.particle => '流光',
       };
 
   String _playerCoverStyleLabel(PlayerCoverStyle style) => switch (style) {
@@ -3049,6 +3048,195 @@ class _HomeModulesSheet extends ConsumerWidget {
                 .setHomeModuleEnabled(entry.key, value),
           ),
       ],
+    );
+  }
+}
+
+/// 播放失败策略编辑器：优先重试次数、最大换源尝试次数与可拖动排序的
+/// 策略优先级（降低音质 → 换源播放 → 跳下一首 → 暂停播放，按顺序
+/// 依次尝试）。
+class _PlaybackFailurePolicyEditor extends StatelessWidget {
+  const _PlaybackFailurePolicyEditor({
+    required this.settings,
+    required this.notifier,
+  });
+
+  final AppSettings settings;
+  final SettingsNotifier notifier;
+
+  static const _stepLabels = <PlaybackFailureStep, String>{
+    PlaybackFailureStep.lowerQuality: '降低音质',
+    PlaybackFailureStep.switchSource: '换源播放',
+    PlaybackFailureStep.playNext: '跳下一首',
+    PlaybackFailureStep.pause: '暂停播放',
+  };
+  static const _stepSubtitles = <PlaybackFailureStep, String>{
+    PlaybackFailureStep.lowerQuality: '同一音源逐档降低音质重新解析（如 flac → 320k）',
+    PlaybackFailureStep.switchSource: '在其他已启用音源中搜索同名歌曲自动替换',
+    PlaybackFailureStep.playNext: '切换到队列中的下一首歌曲',
+    PlaybackFailureStep.pause: '停止播放并提示错误信息',
+  };
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final priority = settings.playbackFailurePriority;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        _countTile(
+          context,
+          icon: Icons.replay_rounded,
+          title: '优先重试次数',
+          subtitle: '失败后先用原音源重试当前歌曲，应对偶发网络抖动',
+          value: settings.playbackRetryCount,
+          onChanged: (value) => unawaited(
+            notifier.setPlaybackFailurePolicy(retryCount: value),
+          ),
+        ),
+        _countTile(
+          context,
+          icon: Icons.swap_horiz_rounded,
+          title: '最大换源尝试次数',
+          subtitle: '重试仍失败时自动换到其他音源的同名歌曲',
+          value: settings.playbackSwitchSourceCount,
+          onChanged: (value) => unawaited(
+            notifier.setPlaybackFailurePolicy(switchSourceCount: value),
+          ),
+        ),
+        Padding(
+          padding: const EdgeInsets.fromLTRB(16, 12, 16, 4),
+          child: Text(
+            '播放失败策略优先级',
+            style: TextStyle(
+              fontSize: 13,
+              fontWeight: FontWeight.w700,
+              color: scheme.primary,
+            ),
+          ),
+        ),
+        ReorderableListView.builder(
+          shrinkWrap: true,
+          physics: const NeverScrollableScrollPhysics(),
+          buildDefaultDragHandles: false,
+          itemCount: priority.length,
+          onReorderItem: (oldIndex, newIndex) {
+            final next = [...priority];
+            final item = next.removeAt(oldIndex);
+            next.insert(newIndex, item);
+            unawaited(
+              notifier.setPlaybackFailurePolicy(priority: next),
+            );
+          },
+          itemBuilder: (context, index) {
+            final step = priority[index];
+            return ListTile(
+              key: ValueKey('playback-failure-step-${step.name}'),
+              leading: Container(
+                width: 26,
+                height: 26,
+                alignment: Alignment.center,
+                decoration: BoxDecoration(
+                  shape: BoxShape.circle,
+                  color: scheme.primaryContainer,
+                ),
+                child: Text(
+                  '${index + 1}',
+                  style: TextStyle(
+                    fontSize: 12,
+                    fontWeight: FontWeight.w700,
+                    color: scheme.onPrimaryContainer,
+                  ),
+                ),
+              ),
+              title: Text(_stepLabels[step] ?? step.name),
+              subtitle: Text(
+                _stepSubtitles[step] ?? '',
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+              ),
+              trailing: ReorderableDragStartListener(
+                index: index,
+                child: const Padding(
+                  padding: EdgeInsets.all(10),
+                  child: Icon(Icons.drag_handle_rounded),
+                ),
+              ),
+            );
+          },
+        ),
+      ],
+    );
+  }
+
+  Widget _countTile(
+    BuildContext context, {
+    required IconData icon,
+    required String title,
+    required String subtitle,
+    required int value,
+    required ValueChanged<int> onChanged,
+  }) {
+    return ListTile(
+      leading: Icon(icon),
+      title: Text(title),
+      subtitle: Text(
+        subtitle,
+        maxLines: 2,
+        overflow: TextOverflow.ellipsis,
+      ),
+      trailing: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          _CountButton(
+            icon: Icons.remove_rounded,
+            onTap: value > 0 ? () => onChanged(value - 1) : null,
+          ),
+          SizedBox(
+            width: 26,
+            child: Text(
+              '$value',
+              textAlign: TextAlign.center,
+              style: const TextStyle(fontWeight: FontWeight.w700),
+            ),
+          ),
+          _CountButton(
+            icon: Icons.add_rounded,
+            onTap: value < 5 ? () => onChanged(value + 1) : null,
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// 数字调节按钮（优先重试次数/换源次数用）。
+class _CountButton extends StatelessWidget {
+  const _CountButton({required this.icon, this.onTap});
+
+  final IconData icon;
+  final VoidCallback? onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return InkWell(
+      borderRadius: BorderRadius.circular(18),
+      onTap: onTap,
+      child: Container(
+        width: 34,
+        height: 34,
+        alignment: Alignment.center,
+        decoration: BoxDecoration(
+          shape: BoxShape.circle,
+          color: onTap == null ? null : scheme.primaryContainer,
+        ),
+        child: Icon(
+          icon,
+          size: 18,
+          color: onTap == null ? scheme.outlineVariant : scheme.onPrimaryContainer,
+        ),
+      ),
     );
   }
 }
