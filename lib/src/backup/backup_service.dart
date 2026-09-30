@@ -133,8 +133,11 @@ class BackupService {
   //（旧备份缺这些表时保留本机现有统计数据）。
   static const int version = 4;
 
-  /// 不随备份迁移的键：deviceId 是本机设备标识，不应在新设备复用。
-  static const _excludedKeys = <String>{'deviceId'};
+  /// 不随备份迁移的键：deviceId 是本机设备标识，不应在新设备复用；
+  /// downloadHistoryV1 是本机下载记录，指向的文件不会随备份迁移，
+  /// 恢复到新设备只会留下断链记录。导出时排除，导入时也忽略
+  /// （v4 之前的旧备份可能包含该键，跳过即可继续使用）。
+  static const _excludedKeys = <String>{'deviceId', 'downloadHistoryV1'};
 
   /// 外观文件大小上限（与设置页选择文件时的限制一致）：
   /// 图片 20MB、字体 100MB，超限的文件不进备份。
@@ -216,6 +219,8 @@ class BackupService {
     final prefs = <String, Map<String, Object>>{};
     for (final entry in rawPrefs.entries) {
       final key = entry.key.toString();
+      // 旧版本备份里可能带有下载记录等不该迁移的键，导入时直接忽略。
+      if (_excludedKeys.contains(key)) continue;
       final value = entry.value;
       if (value is! Map) continue;
       final t = value['t'];

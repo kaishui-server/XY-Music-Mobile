@@ -18,6 +18,7 @@ import 'src/navigation/routes.dart';
 import 'src/ui/xy_theme.dart';
 import 'src/ui/xy_surface.dart';
 import 'src/widgets/top_notice.dart';
+import 'src/widgets/welcome_overlay.dart';
 
 /// 应用固定中文 locale：系统组件（长按菜单等）与应用文案保持一致。
 const _zhLocale = Locale('zh', 'CN');
@@ -318,14 +319,30 @@ class _XyMusicAppState extends ConsumerState<XyMusicApp>
                 decodedImage: _decodedBackgroundPath == backgroundPath
                     ? _decodedBackgroundImage
                     : null,
-                child: child == null
-                    ? const SizedBox.shrink()
-                    : MediaQuery(
-                        data: mediaQuery.copyWith(
-                          viewInsets: EdgeInsets.only(bottom: keyboardResolved),
-                        ),
-                        child: child,
+                child: Stack(
+                  children: [
+                    Positioned.fill(
+                      child: child == null
+                          ? const SizedBox.shrink()
+                          : MediaQuery(
+                              data: mediaQuery.copyWith(
+                                viewInsets: EdgeInsets.only(
+                                  bottom: keyboardResolved,
+                                ),
+                              ),
+                              child: child,
+                            ),
+                    ),
+                    // 首次启动欢迎/初始化向导：全屏叠加在侧边栏、底栏
+                    // 与全部页面之上；完成（或稍后设置）写入标记后消失。
+                    if (ref.watch(
+                      settingsProvider.select(
+                        (s) => s.valueOrNull?.welcomeSetupCompleted == false,
                       ),
+                    ))
+                      const Positioned.fill(child: WelcomeOverlay()),
+                  ],
+                ),
               ),
             ),
           );

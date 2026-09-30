@@ -7,16 +7,22 @@ import 'animated_page_route.dart';
 ///
 /// 切换效果跟随设置中的页面切换模式（xyPageTransitionMode），与路由
 /// 过渡保持同一风格；所有非活动分支仍保留在树中，因此滚动位置、
-/// Tab 状态和各页面 Navigator 都不会丢失。
+/// Tab 状态和各页面 Navigator 都不会丢失。切换方向由路由层按用户
+/// 可见的目的地顺序（底栏/侧栏）提供，而非分支下标差。
 class AnimatedBranchContainer extends StatefulWidget {
   const AnimatedBranchContainer({
     super.key,
     required this.currentIndex,
     required this.children,
+    this.direction,
   });
 
   final int currentIndex;
   final List<Widget> children;
+
+  /// 分支切换方向：+1 新页从右侧进入，-1 从左侧进入。null 时退回
+  /// 分支下标差推断。
+  final int? direction;
 
   @override
   State<AnimatedBranchContainer> createState() =>
@@ -49,7 +55,9 @@ class _AnimatedBranchContainerState extends State<AnimatedBranchContainer>
     super.didUpdateWidget(oldWidget);
     if (oldWidget.currentIndex == widget.currentIndex) return;
     _previousIndex = oldWidget.currentIndex;
-    _direction = widget.currentIndex > oldWidget.currentIndex ? 1 : -1;
+    _direction =
+        widget.direction ??
+        (widget.currentIndex > oldWidget.currentIndex ? 1 : -1);
     _controller.forward(from: 0);
   }
 

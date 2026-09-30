@@ -28,25 +28,10 @@ const _sidebarDestinations = <String, _SidebarDestination>{
     Icons.explore_outlined,
     '/home/explore',
   ),
-  kSidebarLocalMusic: _SidebarDestination(
-    '本地音乐',
-    Icons.music_note_outlined,
-    '/local-music',
-  ),
-  kSidebarCloudMusic: _SidebarDestination(
-    '云端音乐',
-    Icons.cloud_outlined,
-    '/cloud-music',
-  ),
-  kSidebarFavorites: _SidebarDestination(
-    '我的收藏',
-    Icons.favorite_border_rounded,
-    '/home/favorites',
-  ),
-  kSidebarRecent: _SidebarDestination(
-    '最近播放',
-    Icons.history_rounded,
-    '/home/recent',
+  kSidebarMusicLibrary: _SidebarDestination(
+    '音乐库',
+    Icons.library_music_outlined,
+    '/music-library',
   ),
   kSidebarPlugins: _SidebarDestination(
     '插件管理',
@@ -62,11 +47,6 @@ const _sidebarDestinations = <String, _SidebarDestination>{
     '听歌识曲',
     Icons.mic_none_rounded,
     '/home/recognize',
-  ),
-  kSidebarPlaylists: _SidebarDestination(
-    '管理全部歌单',
-    Icons.queue_music_rounded,
-    '/home/playlists',
   ),
   kSidebarDownloads: _SidebarDestination(
     '下载管理',
@@ -97,6 +77,52 @@ bool _destinationSelected(String currentPath, String path) {
     }
   }
   return true;
+}
+
+/// 分支切换方向追踪：+1 新页从右侧进入，-1 从左侧进入。
+///
+/// 路由分支顺序（首页/音乐库/音效/设置）与用户可见的目的地顺序
+/// （可自定义的底栏/侧栏）并不一致，且「探索」是首页分支内的子路由；
+/// 若按分支下标差推断方向，沿底栏顺序前进的切换会左右不定。这里改
+/// 为按可见顺序比较新旧页面的目的地位置判定方向，供
+/// AnimatedBranchContainer 在分支切换时消费。
+final branchSwitchDirection = BranchSwitchDirectionTracker();
+
+class BranchSwitchDirectionTracker {
+  int value = 1;
+  String? _lastPath;
+  int _lastBranchIndex = 0;
+
+  /// 每次导航（AppShell 随路由状态重建）时调用；同路径/同分支的重建
+  /// 不改变方向，仅持续跟踪最新路径供下次比较。
+  void update(
+    String currentPath,
+    int currentBranchIndex,
+    List<String> visiblePaths,
+  ) {
+    final lastPath = _lastPath;
+    final lastBranchIndex = _lastBranchIndex;
+    _lastPath = currentPath;
+    _lastBranchIndex = currentBranchIndex;
+    if (lastPath == null || currentPath == lastPath) return;
+    if (currentBranchIndex == lastBranchIndex) return;
+    final from = _visiblePosition(lastPath, visiblePaths);
+    final to = _visiblePosition(currentPath, visiblePaths);
+    if (from >= 0 && to >= 0 && from != to) {
+      value = to > from ? 1 : -1;
+    } else {
+      // 新旧页面无法定位到可见目的地（如歌单详情页）时，退回分支
+      // 下标顺序，保持旧行为。
+      value = currentBranchIndex > lastBranchIndex ? 1 : -1;
+    }
+  }
+
+  static int _visiblePosition(String path, List<String> visiblePaths) {
+    for (var index = 0; index < visiblePaths.length; index++) {
+      if (_destinationSelected(path, visiblePaths[index])) return index;
+    }
+    return -1;
+  }
 }
 
 /// 自定义底栏的高度与悬浮间距（迷你播放栏据此让位）。
@@ -168,6 +194,28 @@ class AppShell extends ConsumerWidget {
             ? kMiniPlayerHeight +
                   (bottomBarVisible ? 0.0 : kMiniPlayerBottomGap)
             : 0.0);
+
+    // 分支切换方向：按用户可见的目的地顺序（底栏条目在前，其余按侧栏
+    // 顺序）跟踪导航轨迹。AppShell 每次导航都先于分支容器重建，此处
+    // 更新后由路由层在分支切换时读取。
+    final sidebarOrderIds = normalizeSidebarItemOrder(
+      shellSettings?.sidebarItemOrder ?? kDefaultSidebarItemOrder,
+    );
+    final visiblePaths = <String>[
+      for (final id in [
+        if (bottomBarVisible) ...bottomBarItemIds,
+        ...sidebarOrderIds.where(
+          (id) => !bottomBarVisible || !bottomBarItemIds.contains(id),
+        ),
+      ])
+        if (_sidebarDestinations.containsKey(id))
+          _sidebarDestinations[id]!.path,
+    ];
+    branchSwitchDirection.update(
+      currentPath,
+      navigationShell.currentIndex,
+      visiblePaths,
+    );
 
     void navigate(String path) =>
         navigateFromSidebar(context, appScaffoldKey, path);
@@ -264,6 +312,17 @@ class AppShell extends ConsumerWidget {
       canPop: false,
       onPopInvokedWithResult: (didPop, result) {
         if (didPop) return;
+        // 侧边栏打开时返回手势优先收起侧边栏。Drawer 打开时虽然会向
+        // 当前路由注册 LocalHistoryEntry（返回键先关抽屉），但该机制
+        // 的 popDisposition 会被本 PopScope 的 canPop:false 压制，
+        // 返回事件全部落到这里——不手动处理就会直接退出软件。
+        final scaffold = appScaffoldKey.currentState;
+        if (scaffold != null &&
+            (scaffold.isDrawerOpen || scaffold.isEndDrawerOpen)) {
+          scaffold.closeDrawer();
+          scaffold.closeEndDrawer();
+          return;
+        }
         if (currentPath == '/home') {
           SystemNavigator.pop();
         } else {
@@ -730,13 +789,13 @@ class _SidebarTile extends StatelessWidget {
           onTap: onTap,
           borderRadius: BorderRadius.circular(XyRadii.small),
           child: SizedBox(
-            height: 44,
+            height: 50,
             child: Row(
               children: [
                 AnimatedContainer(
                   duration: const Duration(milliseconds: 160),
                   width: 3,
-                  height: selected ? 22 : 0,
+                  height: selected ? 26 : 0,
                   decoration: BoxDecoration(
                     color: theme.colorScheme.primary,
                     borderRadius: BorderRadius.circular(3),
@@ -745,7 +804,7 @@ class _SidebarTile extends StatelessWidget {
                 const SizedBox(width: 11),
                 Icon(
                   destination.icon,
-                  size: 19,
+                  size: 22,
                   color: selected
                       ? theme.colorScheme.primary
                       : theme.colorScheme.onSurfaceVariant,
@@ -754,7 +813,7 @@ class _SidebarTile extends StatelessWidget {
                 Text(
                   destination.label,
                   style: TextStyle(
-                    fontSize: 14,
+                    fontSize: 15.5,
                     fontWeight: selected ? FontWeight.w700 : FontWeight.w500,
                   ),
                 ),
@@ -1118,11 +1177,11 @@ class _LandscapeSidebarTile extends StatelessWidget {
               onTap: onTap,
               borderRadius: BorderRadius.circular(XyRadii.medium),
               child: SizedBox(
-                height: 42,
+                height: 48,
                 child: Center(
                   child: Icon(
                     destination.icon,
-                    size: 20,
+                    size: 23,
                     color: selected
                         ? theme.colorScheme.primary
                         : theme.colorScheme.onSurfaceVariant,
@@ -1145,13 +1204,13 @@ class _LandscapeSidebarTile extends StatelessWidget {
           onTap: onTap,
           borderRadius: BorderRadius.circular(XyRadii.small),
           child: SizedBox(
-            height: 44,
+            height: 50,
             child: Row(
               children: [
                 AnimatedContainer(
                   duration: const Duration(milliseconds: 160),
                   width: 3,
-                  height: selected ? 22 : 0,
+                  height: selected ? 26 : 0,
                   decoration: BoxDecoration(
                     color: theme.colorScheme.primary,
                     borderRadius: BorderRadius.circular(3),
@@ -1160,7 +1219,7 @@ class _LandscapeSidebarTile extends StatelessWidget {
                 const SizedBox(width: 11),
                 Icon(
                   destination.icon,
-                  size: 19,
+                  size: 22,
                   color: selected
                       ? theme.colorScheme.primary
                       : theme.colorScheme.onSurfaceVariant,
@@ -1172,7 +1231,7 @@ class _LandscapeSidebarTile extends StatelessWidget {
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
                     style: TextStyle(
-                      fontSize: 14,
+                      fontSize: 15.5,
                       fontWeight: selected ? FontWeight.w700 : FontWeight.w500,
                     ),
                   ),

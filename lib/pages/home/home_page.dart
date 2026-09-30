@@ -223,6 +223,14 @@ class _HomePageState extends ConsumerState<HomePage> {
           settingsProvider.select((value) => value.valueOrNull?.homeModules),
         ) ??
         kDefaultHomeModules;
+    final sidebarOnRight =
+        ref.watch(
+          settingsProvider.select(
+            (value) =>
+                value.valueOrNull?.sidebarPosition == SidebarPosition.right,
+          ),
+        ) ==
+        true;
     final modules = <Widget>[
       if (homeModules.contains(kHomeModuleNowPlaying))
         const _NowPlayingModule(),
@@ -234,110 +242,57 @@ class _HomePageState extends ConsumerState<HomePage> {
         const _LeaderboardModule(),
     ];
     return Scaffold(
+      // 顶栏与其他页面保持一致：标准 AppBar（标题样式/位置由全局
+      // AppBarTheme 统一），侧边栏按钮跟随侧边栏左右位置。
+      appBar: AppBar(
+        automaticallyImplyLeading: !sidebarOnRight,
+        leading: sidebarOnRight ? null : const AppSidebarMenuButton(),
+        title: const Text('首页'),
+        actions: [if (sidebarOnRight) const AppSidebarMenuButton()],
+      ),
       body: XyPageBackground(
-        child: SafeArea(
-          bottom: false,
-          child: Column(
+        child: RefreshIndicator(
+          onRefresh: () async {
+            ref.invalidate(hotCommentProvider);
+            ref.invalidate(homeStatisticsProvider);
+            for (final period in LeaderboardPeriod.values) {
+              ref.invalidate(homeLeaderboardProvider(period));
+            }
+            // 热评接口有失败冷却（30 分钟），冷却期内拉取会抛错；
+            // 单模块失败不阻断其他模块刷新，也不向上抛未捕获异常。
+            await Future.wait([
+              ref
+                  .read(hotCommentProvider.future)
+                  .then((_) {}, onError: (_) {}),
+              ref
+                  .read(homeStatisticsProvider.future)
+                  .then((_) {}, onError: (_) {}),
+              ...LeaderboardPeriod.values.map(
+                (period) => ref
+                    .read(homeLeaderboardProvider(period).future)
+                    .then((_) {}, onError: (_) {}),
+              ),
+            ]);
+          },
+          child: ListView(
+            physics: const AlwaysScrollableScrollPhysics(),
+            // 悬浮元素遮挡高度已注入 MediaQuery.padding。
+            padding: EdgeInsets.fromLTRB(
+              16,
+              14,
+              16,
+              MediaQuery.paddingOf(context).bottom + 16,
+            ),
             children: [
-              // 首页 logo 栏固定在滚动内容之外；其他页面不使用此布局。
-              const Padding(
-                padding: EdgeInsets.fromLTRB(16, 12, 16, 0),
-                child: _HomeHeader(),
-              ),
-              Expanded(
-                child: RefreshIndicator(
-                  onRefresh: () async {
-                    ref.invalidate(hotCommentProvider);
-                    ref.invalidate(homeStatisticsProvider);
-                    for (final period in LeaderboardPeriod.values) {
-                      ref.invalidate(homeLeaderboardProvider(period));
-                    }
-                    // 热评接口有失败冷却（30 分钟），冷却期内拉取会抛错；
-                    // 单模块失败不阻断其他模块刷新，也不向上抛未捕获异常。
-                    await Future.wait([
-                      ref
-                          .read(hotCommentProvider.future)
-                          .then((_) {}, onError: (_) {}),
-                      ref
-                          .read(homeStatisticsProvider.future)
-                          .then((_) {}, onError: (_) {}),
-                      ...LeaderboardPeriod.values.map(
-                        (period) => ref
-                            .read(homeLeaderboardProvider(period).future)
-                            .then((_) {}, onError: (_) {}),
-                      ),
-                    ]);
-                  },
-                  child: ListView(
-                    physics: const AlwaysScrollableScrollPhysics(),
-                    // 悬浮元素遮挡高度已注入 MediaQuery.padding。
-                    padding: EdgeInsets.fromLTRB(
-                      16,
-                      14,
-                      16,
-                      MediaQuery.paddingOf(context).bottom + 16,
-                    ),
-                    children: [
-                      // 模块之间统一用 22px 间距（首个模块不加，顶部已有 padding）。
-                      for (var i = 0; i < modules.length; i++) ...[
-                        if (i > 0) const SizedBox(height: 22),
-                        modules[i],
-                      ],
-                    ],
-                  ),
-                ),
-              ),
+              // 模块之间统一用 22px 间距（首个模块不加，顶部已有 padding）。
+              for (var i = 0; i < modules.length; i++) ...[
+                if (i > 0) const SizedBox(height: 22),
+                modules[i],
+              ],
             ],
           ),
         ),
       ),
-    );
-  }
-}
-
-class _HomeHeader extends StatelessWidget {
-  const _HomeHeader();
-
-  @override
-  Widget build(BuildContext context) {
-    return Consumer(
-      builder: (context, ref, child) {
-        final right =
-            ref.watch(
-              settingsProvider.select(
-                (value) =>
-                    value.valueOrNull?.sidebarPosition == SidebarPosition.right,
-              ),
-            ) ==
-            true;
-        final logo = const Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text(
-              'XY Music',
-              style: TextStyle(fontSize: 18, fontWeight: FontWeight.w800),
-            ),
-            SizedBox(height: 1),
-            Text(
-              'XY MUSIC',
-              style: TextStyle(
-                fontSize: 9,
-                fontWeight: FontWeight.w700,
-                letterSpacing: 2.2,
-                color: Color(0xFF999999),
-              ),
-            ),
-          ],
-        );
-        return Row(
-          mainAxisAlignment: right
-              ? MainAxisAlignment.end
-              : MainAxisAlignment.start,
-          children: right
-              ? [logo, const SizedBox(width: 4), const AppSidebarMenuButton()]
-              : [const AppSidebarMenuButton(), const SizedBox(width: 4), logo],
-        );
-      },
     );
   }
 }

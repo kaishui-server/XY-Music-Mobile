@@ -148,6 +148,8 @@ ThemeData buildXyTheme({
       titleTextStyle: base.textTheme.titleLarge?.copyWith(
         color: onSurface,
         fontWeight: FontWeight.w700,
+        // 全局页面顶栏标题：M3 默认 22，整体放大一档但保持克制。
+        fontSize: 24,
         letterSpacing: -0.3,
       ),
     ),

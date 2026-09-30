@@ -4,6 +4,7 @@ import 'package:go_router/go_router.dart';
 import '../../pages/home/home_page.dart';
 import '../../pages/explore/explore_page.dart';
 import '../../pages/library/library_page.dart';
+import '../../pages/library/music_library_page.dart';
 import '../../pages/effects/effects_page.dart';
 import '../../pages/search/search_page.dart';
 import '../../pages/favorites/favorites_page.dart';
@@ -59,9 +60,13 @@ final appRouter = GoRouter(
       },
       // 自定义分支容器：替代默认 IndexedStack（瞬切无动画），
       // 用淡入淡出 + 轻微缩放做过渡，同时保留每个 tab 的状态。
+      // 方向由 AppShell 按用户可见的目的地顺序（底栏/侧栏）先行写入：
+      // 分支顺序与可见顺序不一致（「探索」还是首页分支的子路由），
+      // 不能用分支下标差推断。
       navigatorContainerBuilder: (context, navigationShell, children) {
         return AnimatedBranchContainer(
           currentIndex: navigationShell.currentIndex,
+          direction: branchSwitchDirection.value,
           children: children,
         );
       },
@@ -132,6 +137,11 @@ final appRouter = GoRouter(
               path: '/library',
               pageBuilder: (context, state) =>
                   _instantPage(state, const LibraryPage()),
+            ),
+            GoRoute(
+              path: '/music-library',
+              pageBuilder: (context, state) =>
+                  _instantPage(state, const MusicLibraryPage()),
             ),
             GoRoute(
               path: '/cloud-music',

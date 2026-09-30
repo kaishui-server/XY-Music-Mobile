@@ -2186,6 +2186,57 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
               (meta['lyricsAttempted'] == true || savedLyricsRaw != null),
         );
       }).toList();
+      // 本地歌曲（含网盘挂载）的会话只保存路径，元数据不入会话
+      // （见 buildPlaybackSessionPayload）。恢复时按路径回查曲库补齐
+      // 标题/歌手/专辑/时长/封面，避免队列里显示文件名且没有歌手。
+      final missingMetaIndexes = [
+        for (var i = 0; i < items.length; i++)
+          if (queueMeta[items[i].path] is! Map) i,
+      ];
+      if (missingMetaIndexes.isNotEmpty) {
+        try {
+          final songsJson = await getLibrarySongsByPaths(
+            dbPath: dbPath,
+            paths: [
+              for (final i in missingMetaIndexes) items[i].path,
+            ],
+          );
+          final decoded = jsonDecode(songsJson);
+          if (decoded is List) {
+            final byPath = {
+              for (final value in decoded.whereType<Map>())
+                (value['path']?.toString() ?? ''):
+                    Map<String, dynamic>.from(value),
+            };
+            for (final i in missingMetaIndexes) {
+              final songJson = byPath[items[i].path];
+              if (songJson == null) continue;
+              final enriched = _queueItemFromLibraryJson(songJson);
+              if (enriched == null || enriched.title.trim().isEmpty) {
+                continue;
+              }
+              // 保留会话恢复的字段优先级：曲库只补缺失的显示元数据，
+              // 歌词等运行时字段以恢复结果为准。
+              items[i] = QueueItem(
+                path: items[i].path,
+                title: enriched.title,
+                artist: enriched.artist,
+                album: enriched.album,
+                durationMs: enriched.durationMs > 0
+                    ? enriched.durationMs
+                    : items[i].durationMs,
+                pluginId: items[i].pluginId,
+                pluginData: items[i].pluginData,
+                coverUrl: enriched.coverUrl ?? items[i].coverUrl,
+                lyricsRaw: items[i].lyricsRaw,
+                lyricsAttempted: items[i].lyricsAttempted,
+              );
+            }
+          }
+        } catch (_) {
+          // 曲库不可用时保留路径回退的文件名标题。
+        }
+      }
       final currentPath = j['currentSongPath'] as String?;
       final startIndex = currentPath == null ? 0 : paths.indexOf(currentPath);
       final idx = startIndex < 0 ? 0 : startIndex;
@@ -2356,6 +2407,56 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
     );
     await _persistSession();
     unawaited(_syncDesktopLyrics());
+  }
+
+  /// 拖拽调整播放队列顺序。[newIndex] 为移动后的最终下标（ReorderableListView
+  /// 的 onReorderItem 已自动换算）。queueIndex 始终指向当前播放的歌曲，
+  /// 移动后重新计算其新下标，不打断播放。
+  Future<void> moveQueueItem(int oldIndex, int newIndex) async {
+    final queue = [...state.queue];
+    if (oldIndex < 0 || oldIndex >= queue.length) return;
+    final target = newIndex.clamp(0, queue.length - 1).toInt();
+    if (oldIndex == target) return;
+    final item = queue.removeAt(oldIndex);
+    queue.insert(target, item);
+    var currentIndex = state.queueIndex;
+    if (currentIndex == oldIndex) {
+      currentIndex = target;
+    } else if (currentIndex >= 0) {
+      if (oldIndex < currentIndex && target >= currentIndex) {
+        currentIndex -= 1;
+      } else if (oldIndex > currentIndex && target <= currentIndex) {
+        currentIndex += 1;
+      }
+    }
+    state = state.copyWith(queue: queue, queueIndex: currentIndex);
+    await _persistSession();
+  }
+
+  /// 从播放队列中移除一首歌（队列弹窗左滑删除）。移除的是正在播放的
+  /// 歌曲时，自动接着播放顶替其位置的歌曲；队列因此被清空时停止播放。
+  Future<void> removeQueueItem(int index) async {
+    final queue = [...state.queue];
+    if (index < 0 || index >= queue.length) return;
+    if (queue.length == 1) {
+      await clearQueue();
+      return;
+    }
+    final wasCurrent = index == state.queueIndex;
+    queue.removeAt(index);
+    var currentIndex = state.queueIndex;
+    if (wasCurrent) {
+      currentIndex = index.clamp(0, queue.length - 1).toInt();
+    } else if (index < currentIndex) {
+      currentIndex -= 1;
+    }
+    state = state.copyWith(
+      queue: queue,
+      queueIndex: currentIndex,
+      current: wasCurrent ? queue[currentIndex] : state.current,
+    );
+    await _persistSession();
+    if (wasCurrent) await _playAt(currentIndex);
   }
 
   Future<void> _playAt(int index) async {

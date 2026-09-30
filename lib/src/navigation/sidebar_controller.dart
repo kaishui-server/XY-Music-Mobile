@@ -61,8 +61,8 @@ class AppSidebarMenuButton extends ConsumerWidget {
       tooltip: '打开侧栏',
       onPressed: () => openAppSidebar(end: position == SidebarPosition.right),
       padding: EdgeInsets.zero,
-      constraints: const BoxConstraints.tightFor(width: 44, height: 44),
-      icon: const Icon(Icons.menu_rounded, size: 25),
+      constraints: const BoxConstraints.tightFor(width: 48, height: 48),
+      icon: const Icon(Icons.menu_rounded, size: 28),
     );
   }
 }

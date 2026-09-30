@@ -63,28 +63,20 @@ List<String> normalizeHomeModules(Iterable<String> stored) {
 
 const kSidebarHome = 'home';
 const kSidebarExplore = 'explore';
-const kSidebarLocalMusic = 'localMusic';
-const kSidebarCloudMusic = 'cloudMusic';
-const kSidebarFavorites = 'favorites';
-const kSidebarRecent = 'recent';
+const kSidebarMusicLibrary = 'musicLibrary';
 const kSidebarPlugins = 'plugins';
 const kSidebarAccount = 'account';
 const kSidebarRecognize = 'recognize';
-const kSidebarPlaylists = 'playlists';
 const kSidebarDownloads = 'downloads';
 const kSidebarSettings = 'settings';
 
 const kDefaultSidebarItemOrder = <String>[
   kSidebarHome,
   kSidebarExplore,
-  kSidebarLocalMusic,
-  kSidebarCloudMusic,
-  kSidebarFavorites,
-  kSidebarRecent,
+  kSidebarMusicLibrary,
   kSidebarPlugins,
   kSidebarAccount,
   kSidebarRecognize,
-  kSidebarPlaylists,
   kSidebarDownloads,
   kSidebarSettings,
 ];
@@ -216,6 +208,8 @@ class AppSettings {
     this.bottomBarEnabled = false,
     this.bottomBarItemIds = const <String>[],
     this.bottomBarShowLabels = true,
+    // 首次启动欢迎/初始化向导是否已完成（跳过或走完都算完成）。
+    this.welcomeSetupCompleted = false,
     this.customBackgroundPath = '',
     this.customBackgroundBlur = 18.0,
     this.playerDetailCustomImagePath = '',
@@ -303,6 +297,10 @@ class AppSettings {
 
   /// 底栏是否显示条目文字；关闭后仅显示图标（紧凑样式）。
   final bool bottomBarShowLabels;
+
+  /// 首次启动欢迎/初始化向导是否已完成（跳过或走完都算完成）。
+  /// false 时应用根节点叠加全屏欢迎页（覆盖侧边栏与底栏）。
+  final bool welcomeSetupCompleted;
   final String customBackgroundPath;
   final double customBackgroundBlur;
   final String playerDetailCustomImagePath;
@@ -396,6 +394,7 @@ class AppSettings {
     bool? bottomBarEnabled,
     List<String>? bottomBarItemIds,
     bool? bottomBarShowLabels,
+    bool? welcomeSetupCompleted,
     String? customBackgroundPath,
     double? customBackgroundBlur,
     String? playerDetailCustomImagePath,
@@ -467,6 +466,8 @@ class AppSettings {
       bottomBarEnabled: bottomBarEnabled ?? this.bottomBarEnabled,
       bottomBarItemIds: bottomBarItemIds ?? this.bottomBarItemIds,
       bottomBarShowLabels: bottomBarShowLabels ?? this.bottomBarShowLabels,
+      welcomeSetupCompleted:
+          welcomeSetupCompleted ?? this.welcomeSetupCompleted,
       customBackgroundPath: customBackgroundPath ?? this.customBackgroundPath,
       customBackgroundBlur: customBackgroundBlur ?? this.customBackgroundBlur,
       playerDetailCustomImagePath:
@@ -534,6 +535,12 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
   @override
   Future<AppSettings> build() async {
     final prefs = await _prefs();
+    // 覆盖安装的老用户识别：shared_preferences 中已存在任何业务键
+    // （全新安装首次启动时为空）则说明来自旧版本升级，直接视为已完成
+    // 欢迎向导，避免升级用户再次看到欢迎页。
+    final freshInstall = !prefs.getKeys().any(
+      (key) => key != 'welcomeSetupCompleted' && !key.startsWith('flutter.'),
+    );
     return AppSettings(
       volume: prefs.getDouble('volume') ?? 1.0,
       playMode: normalizePlayMode(prefs.getInt('playMode') ?? 0),
@@ -567,6 +574,8 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
               .where(kDefaultSidebarItemOrder.contains)
               .toSet()
               .toList(),
+      welcomeSetupCompleted:
+          prefs.getBool('welcomeSetupCompleted') ?? !freshInstall,
       landscapeSidebarWidth: (prefs.getDouble('landscapeSidebarWidth') ?? 176)
           .clamp(60, 420),
       bottomBarEnabled: prefs.getBool('bottomBarEnabled') ?? false,
@@ -799,6 +808,7 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
       prefs.setBool('bottomBarEnabled', next.bottomBarEnabled),
       prefs.setStringList('bottomBarItemIds', next.bottomBarItemIds),
       prefs.setBool('bottomBarShowLabels', next.bottomBarShowLabels),
+      prefs.setBool('welcomeSetupCompleted', next.welcomeSetupCompleted),
       prefs.setString('customBackgroundPath', next.customBackgroundPath),
       prefs.setDouble('customBackgroundBlur', next.customBackgroundBlur),
       prefs.setString(
@@ -983,6 +993,13 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
   Future<void> setBottomBarShowLabels(bool value) => _save(
     (state.valueOrNull ?? const AppSettings()).copyWith(
       bottomBarShowLabels: value,
+    ),
+  );
+
+  /// 完成首次启动欢迎/初始化向导（跳过或走完都调用一次，之后不再出现）。
+  Future<void> completeWelcomeSetup() => _save(
+    (state.valueOrNull ?? const AppSettings()).copyWith(
+      welcomeSetupCompleted: true,
     ),
   );
 

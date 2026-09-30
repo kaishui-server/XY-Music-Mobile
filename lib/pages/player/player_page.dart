@@ -21,7 +21,9 @@ import '../../src/core/settings.dart';
 import '../../src/auth/auth_provider.dart';
 import '../../src/effects/effects_provider.dart';
 import '../../src/favorites/favorites_provider.dart';
+import '../../src/library/library_provider.dart';
 import '../../src/lyrics/lyrics_models.dart';
+import '../../src/navigation/animated_page_route.dart';
 import '../../src/player/player_provider.dart';
 import '../../src/player/desktop_lyrics.dart';
 import '../../src/player/download_history_store.dart';
@@ -43,6 +45,7 @@ import '../../src/widgets/queue_sheet.dart';
 import '../../src/widgets/source_switch.dart';
 import '../../src/widgets/top_notice.dart';
 import 'comment_sheet.dart';
+import '../search/online_catalog_detail_page.dart';
 
 const _pluginLyricsSearchMemoryKey = 'pluginLyricsSearchQueriesV1';
 
@@ -1344,6 +1347,109 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
           ),
         ),
         onPickSleepTimer: () => unawaited(_pickSleepTimer()),
+        onShowSongInfo: () => unawaited(_showSongInfoSheet(item)),
+      ),
+    );
+  }
+
+  /// 歌曲信息面板：展示平台、歌曲 ID/MID 与作者信息（作者可点进
+  /// 作品列表页）。数据取自当前队列项的插件元数据。
+  Future<void> _showSongInfoSheet(QueueItem item) async {
+    final pluginId = item.pluginId;
+    String? platform;
+    if (pluginId != null && pluginId.isNotEmpty) {
+      final plugins = await ref.read(enabledMusicPluginsProvider.future);
+      platform = plugins
+          .where((plugin) => plugin.id == pluginId)
+          .firstOrNull
+          ?.name;
+    }
+    if (!mounted) return;
+    await showModalBottomSheet<void>(
+      context: context,
+      useRootNavigator: true,
+      showDragHandle: true,
+      isScrollControlled: true,
+      builder: (sheetContext) => _SongInfoSheet(
+        item: item,
+        platform: platform ?? '本地音乐',
+        onOpenArtist: pluginId == null || pluginId.isEmpty
+            ? null
+            : (artist) {
+                Navigator.of(sheetContext).pop();
+                unawaited(_openArtistWorks(item, artist));
+              },
+      ),
+    );
+  }
+
+  /// 查看作者发布的歌曲：以歌曲数据里的歌手条目为目录项，复用搜索页
+  /// 的歌手详情页加载作品；插件未实现详情接口时由运行时回退按名搜索。
+  Future<void> _openArtistWorks(
+    QueueItem item,
+    _SongArtistInfo artist,
+  ) async {
+    final pluginId = item.pluginId;
+    if (pluginId == null || pluginId.isEmpty) return;
+    final plugins = await ref.read(enabledMusicPluginsProvider.future);
+    final plugin = plugins
+        .where((plugin) => plugin.id == pluginId)
+        .firstOrNull;
+    if (!mounted) return;
+    if (plugin == null) {
+      XyNotice.show(
+        context,
+        message: '歌曲所属插件已停用或删除',
+        type: XyNoticeType.warning,
+      );
+      return;
+    }
+    final runtime = ref.read(pluginRuntimeProvider);
+    // 歌手条目即平台原始歌手对象（name/id/mid 等），可直接作为
+    // getArtistWorks 的 rawData；补齐 title/id 保证旧插件取到字段。
+    final raw = Map<String, dynamic>.from(artist.raw);
+    if (artist.name.isNotEmpty) {
+      raw['name'] = artist.name;
+      raw.putIfAbsent('title', () => artist.name);
+    }
+    if (artist.artistId.isNotEmpty) {
+      raw.putIfAbsent('id', () => artist.artistId);
+    }
+    final catalog = PluginCatalogResult(
+      pluginId: plugin.id,
+      id: artist.artistId.isNotEmpty ? artist.artistId : artist.name,
+      title: artist.name,
+      subtitle: plugin.name,
+      coverUrl: '',
+      rawData: raw,
+    );
+    await Navigator.of(context).push<void>(
+      XyAnimatedPageRoute(
+        builder: (_) => OnlineCatalogDetailPage(
+          title: artist.name,
+          subtitle: plugin.name,
+          coverUrl: '',
+          categoryLabel: '歌手',
+          loadSongs: () async {
+            final results = await runtime.getArtistSongs(plugin, catalog);
+            return [
+              for (final song in results)
+                if (song.title.trim().isNotEmpty)
+                  Song(
+                    path: pluginSongPath(plugin, song),
+                    title: song.title,
+                    artist: song.artist,
+                    album: song.album,
+                    albumKey: song.album,
+                    duration: (song.durationMs / 1000).round(),
+                    format: '网络',
+                    coverUrl: song.coverUrl,
+                    pluginId: plugin.id,
+                    pluginData: song.rawData,
+                  ),
+            ];
+          },
+        ),
       ),
     );
   }
@@ -2760,33 +2866,37 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
             ),
             onPressed: () => Navigator.of(context).pop(),
           ),
+          // 竖屏封面页顶栏不显示歌名/歌手（标题由底部控制卡承载）；
+          // 歌词页与横屏（控制卡无标题区）仍保留顶栏标题。
           Expanded(
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Text(
-                  current?.title ?? '正在播放',
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  textAlign: TextAlign.center,
-                  style: const TextStyle(
-                    color: Colors.white,
-                    fontSize: 16,
-                    fontWeight: FontWeight.w700,
-                  ),
-                ),
-                if ((current?.artist ?? '').isNotEmpty)
-                  Text(
-                    current!.artist,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: TextStyle(
-                      color: Colors.white.withValues(alpha: .58),
-                      fontSize: 11,
-                    ),
-                  ),
-              ],
-            ),
+            child: (isLandscape || _showLyrics)
+                ? Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Text(
+                        current?.title ?? '正在播放',
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        textAlign: TextAlign.center,
+                        style: const TextStyle(
+                          color: Colors.white,
+                          fontSize: 16,
+                          fontWeight: FontWeight.w700,
+                        ),
+                      ),
+                      if ((current?.artist ?? '').isNotEmpty)
+                        Text(
+                          current!.artist,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(
+                            color: Colors.white.withValues(alpha: .58),
+                            fontSize: 11,
+                          ),
+                        ),
+                    ],
+                  )
+                : const SizedBox.shrink(),
           ),
           // 收藏按钮仅保留：竖屏底部控制卡内 + 横屏封面右上角（见
           // _BigCover landscape 分支），顶部栏不再放收藏入口。
@@ -3620,6 +3730,7 @@ class _PlayerMoreSheet extends ConsumerStatefulWidget {
     required this.onCycleCoverStyle,
     required this.onShowComments,
     required this.onPickSleepTimer,
+    required this.onShowSongInfo,
   });
 
   final QueueItem item;
@@ -3651,6 +3762,9 @@ class _PlayerMoreSheet extends ConsumerStatefulWidget {
   final VoidCallback onCycleCoverStyle;
   final VoidCallback onShowComments;
   final VoidCallback onPickSleepTimer;
+
+  /// 打开歌曲信息面板（顶栏信息卡点击）。
+  final VoidCallback onShowSongInfo;
 
   @override
   ConsumerState<_PlayerMoreSheet> createState() => _PlayerMoreSheetState();
@@ -3883,62 +3997,82 @@ class _PlayerMoreSheetState extends ConsumerState<_PlayerMoreSheet> {
             mainAxisSize: MainAxisSize.min,
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
-              // 顶部当前歌曲信息条：封面缩略图 + 歌名/副标题，
-              // 右侧空白处放分享入口（参考 BakaMusic 弹层排版）。
+              // 顶部当前歌曲信息卡：封面缩略图 + 歌名/副标题 + 分享，
+              // 整卡可点进入歌曲信息面板（平台/ID/作者）。参考 BakaMusic
+              // 弹层排版，卡片化后与下方圆形快捷按钮区拉开层次。
               Padding(
                 padding: const EdgeInsets.symmetric(horizontal: 6),
-                child: Row(
-                  children: [
-                    CoverImage(
-                      songPath: widget.item.path,
-                      imageUrl: widget.item.coverUrl,
-                      width: 48,
-                      height: 48,
-                      radius: 10,
-                      icon: Icons.music_note_rounded,
-                    ),
-                    const SizedBox(width: 12),
-                    Expanded(
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
+                child: Material(
+                  color: scheme.surfaceContainerHighest.withValues(alpha: .55),
+                  borderRadius: BorderRadius.circular(14),
+                  clipBehavior: Clip.antiAlias,
+                  child: InkWell(
+                    onTap: () => _popThen(widget.onShowSongInfo),
+                    child: Padding(
+                      padding: const EdgeInsets.fromLTRB(10, 10, 2, 10),
+                      child: Row(
                         children: [
-                          Text(
-                            widget.item.title,
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                            style: TextStyle(
-                              fontSize: 16,
-                              fontWeight: FontWeight.w700,
-                              color: scheme.onSurface,
+                          CoverImage(
+                            songPath: widget.item.path,
+                            imageUrl: widget.item.coverUrl,
+                            width: 48,
+                            height: 48,
+                            radius: 10,
+                            icon: Icons.music_note_rounded,
+                          ),
+                          const SizedBox(width: 12),
+                          Expanded(
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Text(
+                                  widget.item.title,
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: TextStyle(
+                                    fontSize: 16,
+                                    fontWeight: FontWeight.w700,
+                                    color: scheme.onSurface,
+                                  ),
+                                ),
+                                const SizedBox(height: 3),
+                                Text(
+                                  widget.item.album.trim().isEmpty
+                                      ? widget.item.artist
+                                      : '${widget.item.artist} · '
+                                            '${widget.item.album.trim()}',
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: TextStyle(
+                                    fontSize: 12,
+                                    color: scheme.onSurfaceVariant,
+                                  ),
+                                ),
+                              ],
                             ),
                           ),
-                          const SizedBox(height: 3),
-                          Text(
-                            widget.item.album.trim().isEmpty
-                                ? widget.item.artist
-                                : '${widget.item.artist} · '
-                                      '${widget.item.album.trim()}',
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                            style: TextStyle(
-                              fontSize: 12,
+                          IconButton(
+                            tooltip: '分享',
+                            visualDensity: VisualDensity.compact,
+                            icon: Icon(
+                              Icons.share_outlined,
+                              size: 20,
                               color: scheme.onSurfaceVariant,
+                            ),
+                            onPressed: () => _popThen(widget.onShare),
+                          ),
+                          Padding(
+                            padding: const EdgeInsets.only(right: 6),
+                            child: Icon(
+                              Icons.chevron_right_rounded,
+                              size: 20,
+                              color: scheme.outline,
                             ),
                           ),
                         ],
                       ),
                     ),
-                    IconButton(
-                      tooltip: '分享',
-                      visualDensity: VisualDensity.compact,
-                      icon: Icon(
-                        Icons.share_outlined,
-                        size: 20,
-                        color: scheme.onSurfaceVariant,
-                      ),
-                      onPressed: () => _popThen(widget.onShare),
-                    ),
-                  ],
+                  ),
                 ),
               ),
               const SizedBox(height: 14),
@@ -4078,6 +4212,350 @@ class _PlayerMoreSheetState extends ConsumerState<_PlayerMoreSheet> {
             ],
           ),
         ),
+      ),
+    );
+  }
+}
+
+/// 歌曲信息面板的作者条目：平台原始歌手对象 + 提取后的展示字段。
+class _SongArtistInfo {
+  const _SongArtistInfo({
+    required this.name,
+    required this.artistId,
+    required this.artistMid,
+    required this.raw,
+  });
+
+  final String name;
+  final String artistId;
+  final String artistMid;
+
+  /// 平台原始歌手 map（含 name/id/mid 等），作为 getArtistWorks 的
+  /// rawData 直传插件。
+  final Map<String, dynamic> raw;
+}
+
+String _firstTextOf(Map<dynamic, dynamic> map, List<String> keys) {
+  for (final key in keys) {
+    final value = map[key];
+    if (value is String && value.trim().isNotEmpty) return value.trim();
+    if (value is num) return value.toString();
+  }
+  return '';
+}
+
+/// 从歌曲插件数据提取作者列表：优先归一化后的 singerList（QQ/汽水/
+/// 网易等），兼容 artists/singers/singer/ar 等原始字段；都没有时按
+/// item.artist 文本按常见分隔符拆分（无 ID，仅展示）。
+List<_SongArtistInfo> _songArtistsOf(QueueItem item) {
+  final data = item.pluginData;
+  List<dynamic> entries = const [];
+  if (data != null) {
+    final list = data['singerList'] ??
+        data['singers'] ??
+        data['artists'] ??
+        data['artistList'];
+    if (list is List) {
+      entries = list;
+    } else {
+      final single = data['singer'] ?? data['ar'] ?? data['author_info'];
+      if (single is List) {
+        entries = single;
+      } else if (single is Map) {
+        entries = [single];
+      }
+    }
+  }
+  final artists = <_SongArtistInfo>[];
+  for (final entry in entries) {
+    if (entry is Map) {
+      final map = Map<String, dynamic>.from(entry);
+      final name = _firstTextOf(map, const [
+        'name',
+        'title',
+        'artist',
+        'singer',
+        'author',
+      ]);
+      final id = _firstTextOf(map, const [
+        'id',
+        'artistId',
+        'artist_id',
+        'singerId',
+      ]);
+      final mid = _firstTextOf(map, const [
+        'mid',
+        'artistMid',
+        'artist_mid',
+        'singerMid',
+      ]);
+      if (name.isNotEmpty || id.isNotEmpty) {
+        artists.add(
+          _SongArtistInfo(name: name, artistId: id, artistMid: mid, raw: map),
+        );
+      }
+    } else if (entry is String && entry.trim().isNotEmpty) {
+      artists.add(
+        _SongArtistInfo(
+          name: entry.trim(),
+          artistId: '',
+          artistMid: '',
+          raw: {'name': entry.trim()},
+        ),
+      );
+    }
+  }
+  if (artists.isEmpty && item.artist.trim().isNotEmpty) {
+    for (final name in item.artist.split(RegExp(r'[/、,，&]'))) {
+      final trimmed = name.trim();
+      if (trimmed.isNotEmpty) {
+        artists.add(
+          _SongArtistInfo(
+            name: trimmed,
+            artistId: '',
+            artistMid: '',
+            raw: {'name': trimmed},
+          ),
+        );
+      }
+    }
+  }
+  return artists;
+}
+
+/// 歌曲信息面板：平台 + 歌曲（名称/ID/MID）+ 作者列表（点击作者查看
+/// 其发布的歌曲）。ID 类文本用 SelectableText 方便直接长按复制。
+class _SongInfoSheet extends StatelessWidget {
+  const _SongInfoSheet({
+    required this.item,
+    required this.platform,
+    this.onOpenArtist,
+  });
+
+  final QueueItem item;
+
+  /// 所属平台（插件名）；本地歌曲为「本地音乐」。
+  final String platform;
+
+  /// 点击作者查看作品；null（本地歌曲/插件缺失）时作者行不可点。
+  final void Function(_SongArtistInfo artist)? onOpenArtist;
+
+  Widget _infoRow(BuildContext context, {required String label, String? value}) {
+    if (value == null || value.trim().isEmpty) return const SizedBox.shrink();
+    final scheme = Theme.of(context).colorScheme;
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 6),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          SizedBox(
+            width: 46,
+            child: Text(
+              label,
+              style: TextStyle(fontSize: 12, color: scheme.onSurfaceVariant),
+            ),
+          ),
+          const SizedBox(width: 10),
+          Expanded(
+            child: SelectableText(
+              value,
+              style: TextStyle(
+                fontSize: 14,
+                fontWeight: FontWeight.w600,
+                color: scheme.onSurface,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final data = item.pluginData;
+    final artists = _songArtistsOf(item);
+    final rawTitle = _firstTextOf(data ?? const {}, const [
+      'title',
+      'name',
+      'songname',
+      'songName',
+    ]);
+    final songName = rawTitle.isNotEmpty ? rawTitle : item.title;
+    final songId = _firstTextOf(data ?? const {}, const [
+      'id',
+      'songId',
+      'songid',
+      'musicId',
+    ]);
+    final songMid = _firstTextOf(data ?? const {}, const [
+      'mid',
+      'songmid',
+      'songMid',
+    ]);
+    final rawAlbum = _firstTextOf(data ?? const {}, const [
+      'album',
+      'albumname',
+      'albumName',
+      'album_name',
+    ]);
+    final albumName = rawAlbum.isNotEmpty ? rawAlbum : item.album;
+    return Padding(
+      padding: EdgeInsets.only(
+        left: 20,
+        right: 20,
+        bottom: 20 + MediaQuery.viewInsetsOf(context).bottom,
+      ),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Row(
+            children: [
+              Icon(Icons.info_outline_rounded, color: scheme.primary),
+              const SizedBox(width: 12),
+              const Text('歌曲信息', style: TextStyle(fontSize: 16)),
+              const Spacer(),
+              Container(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 10,
+                  vertical: 3,
+                ),
+                decoration: BoxDecoration(
+                  color: scheme.primary.withValues(alpha: .12),
+                  borderRadius: BorderRadius.circular(999),
+                ),
+                child: Text(
+                  platform,
+                  style: TextStyle(
+                    fontSize: 11,
+                    fontWeight: FontWeight.w600,
+                    color: scheme.primary,
+                  ),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 12),
+          // 歌曲卡：名称 / ID / MID / 专辑。
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+            decoration: BoxDecoration(
+              color: scheme.surfaceContainerHighest.withValues(alpha: .5),
+              borderRadius: BorderRadius.circular(14),
+            ),
+            child: Column(
+              children: [
+                _infoRow(context, label: '名称', value: songName),
+                _infoRow(context, label: 'ID', value: songId),
+                _infoRow(context, label: 'MID', value: songMid),
+                _infoRow(context, label: '专辑', value: albumName),
+              ],
+            ),
+          ),
+          const SizedBox(height: 10),
+          // 作者卡：每位作者一行，点击查看其发布的歌曲。
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 4),
+            decoration: BoxDecoration(
+              color: scheme.surfaceContainerHighest.withValues(alpha: .5),
+              borderRadius: BorderRadius.circular(14),
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                for (final artist in artists)
+                  InkWell(
+                    borderRadius: BorderRadius.circular(10),
+                    onTap: onOpenArtist == null
+                        ? null
+                        : () => onOpenArtist!(artist),
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(vertical: 10),
+                      child: Row(
+                        children: [
+                          Container(
+                            width: 38,
+                            height: 38,
+                            decoration: BoxDecoration(
+                              color: scheme.primary.withValues(alpha: .14),
+                              shape: BoxShape.circle,
+                            ),
+                            child: Icon(
+                              Icons.person_rounded,
+                              size: 20,
+                              color: scheme.primary,
+                            ),
+                          ),
+                          const SizedBox(width: 12),
+                          Expanded(
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Text(
+                                  artist.name.isEmpty ? '未知作者' : artist.name,
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: TextStyle(
+                                    fontSize: 15,
+                                    fontWeight: FontWeight.w700,
+                                    color: scheme.onSurface,
+                                  ),
+                                ),
+                                if (artist.artistId.isNotEmpty)
+                                  Text(
+                                    'artistId：${artist.artistId}',
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: TextStyle(
+                                      fontSize: 11,
+                                      color: scheme.onSurfaceVariant,
+                                    ),
+                                  ),
+                                if (artist.artistMid.isNotEmpty)
+                                  Text(
+                                    'artistMid：${artist.artistMid}',
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: TextStyle(
+                                      fontSize: 11,
+                                      color: scheme.onSurfaceVariant,
+                                    ),
+                                  ),
+                              ],
+                            ),
+                          ),
+                          if (onOpenArtist != null) ...[
+                            Text(
+                              '作品',
+                              style: TextStyle(
+                                fontSize: 12,
+                                color: scheme.primary,
+                              ),
+                            ),
+                            Icon(
+                              Icons.chevron_right_rounded,
+                              size: 18,
+                              color: scheme.primary,
+                            ),
+                          ],
+                        ],
+                      ),
+                    ),
+                  ),
+                if (artists.isEmpty)
+                  Padding(
+                    padding: const EdgeInsets.symmetric(vertical: 12),
+                    child: Text(
+                      '未知作者',
+                      style: TextStyle(color: scheme.onSurfaceVariant),
+                    ),
+                  ),
+              ],
+            ),
+          ),
+        ],
       ),
     );
   }
@@ -5902,6 +6380,17 @@ class _BigCover extends ConsumerWidget {
     final showTonearm = ref.watch(
       settingsProvider.select((s) => s.valueOrNull?.vinylTonearm ?? true),
     );
+    // 竖屏沉浸态（控制卡隐藏、翻页区铺满内容区）：封面组居中会明显
+    // 偏下，整体上移一些让视觉重心回到中上部；非沉浸态保持居中。
+    final portraitImmersiveActive =
+        !landscape &&
+        item != null &&
+        (ref.watch(
+              settingsProvider.select(
+                (s) => s.valueOrNull?.portraitImmersiveLyrics,
+              ),
+            ) ??
+            true);
     return LayoutBuilder(
       builder: (context, constraints) {
         final double side;
@@ -5917,8 +6406,8 @@ class _BigCover extends ConsumerWidget {
           showCoverExtras = false;
         } else {
           final normalSide = math.min(
-            390.0,
-            math.min(constraints.maxWidth * .72, constraints.maxHeight - 104),
+            420.0,
+            math.min(constraints.maxWidth * .8, constraints.maxHeight - 122),
           );
           showCoverExtras = normalSide >= 150;
           side = showCoverExtras
@@ -5926,18 +6415,19 @@ class _BigCover extends ConsumerWidget {
               : math.max(
                   1.0,
                   math.min(
-                    390.0,
-                    math.min(constraints.maxWidth * .72, constraints.maxHeight),
+                    420.0,
+                    math.min(constraints.maxWidth * .8, constraints.maxHeight),
                   ),
                 );
         }
         return Stack(
           fit: StackFit.expand,
           children: [
-            Center(
+            Align(
+              alignment: Alignment(0, portraitImmersiveActive ? -.4 : 0),
               child: SizedBox(
                 width: side,
-                height: side + (showCoverExtras ? 104 : 0),
+                height: side + (showCoverExtras ? 122 : 0),
                 child: Stack(
                   clipBehavior: Clip.none,
                   children: [
@@ -5985,7 +6475,7 @@ class _BigCover extends ConsumerWidget {
                         top: side + 43,
                         left: -28,
                         right: -28,
-                        height: 56,
+                        height: 78,
                         child: AbsorbPointer(
                           child: _MiniLyrics(
                             item: item!,
@@ -6243,10 +6733,11 @@ class _ImmersiveCoverPage extends StatelessWidget {
     return LayoutBuilder(
       builder: (context, constraints) {
         // 封面尽量铺满内容区宽度（MusicFree 的沉浸式封面高=屏宽），
-        // 但要给迷你歌词留出空间；空间不足时按高度收缩。
+        // 但要给迷你歌词留出空间（78dp 展示区 + 12dp 余量）；空间不足
+        // 时按高度收缩。
         final side = math.min(
           constraints.maxWidth,
-          math.max(80.0, constraints.maxHeight - 68),
+          math.max(80.0, constraints.maxHeight - 90),
         );
         return Column(
           children: [
@@ -6310,7 +6801,7 @@ class _ImmersiveCoverPage extends StatelessWidget {
             ),
             if (current != null)
               SizedBox(
-                height: 56,
+                height: 78,
                 child: AbsorbPointer(
                   child: _MiniLyrics(item: current, offsetTenths: offsetTenths),
                 ),
@@ -6608,34 +7099,10 @@ class _MiniLyrics extends ConsumerWidget {
   final QueueItem item;
   final int offsetTenths;
 
-  /// 副行（翻译/下一句）超过该字号时不再显示，迷你歌词自动变为单行。
-  /// 展示区固定 56dp 高：主行 + 副行在字号 20 以内可完整放下。
+  /// 副行（翻译/下一句）超过该字号时不再显示，迷你歌词自动变为纯主行。
+  /// 展示区固定 78dp 高（两处容器等高）：主行最多两行 + 副行在字号 20
+  /// 以内可完整放下——英文主行换行成两行时，下方仍可接中文翻译（三行）。
   static const double _singleLineThreshold = 20;
-
-  /// 主行换行测量缓存（键：字号|可用宽度|歌词文本）。
-  /// position 高频刷新触发 rebuild，若每次都新建 TextPainter 做完整
-  /// layout 测量，播放页长时间停留会持续占用主线程（发热/掉帧来源之一）。
-  /// 同一句歌词的测量结果在会话内完全可复用，命中率高。
-  static final Map<String, bool> _wrapCache = {};
-
-  static bool _measureMainWrapped(
-    String text,
-    TextStyle style,
-    double maxWidth,
-  ) {
-    if (!maxWidth.isFinite || maxWidth <= 0) return true;
-    final key = '${style.fontSize}|${maxWidth.round()}|$text';
-    final cached = _wrapCache[key];
-    if (cached != null) return cached;
-    final painter = TextPainter(
-      text: TextSpan(text: text, style: style),
-      textDirection: TextDirection.ltr,
-    )..layout(maxWidth: maxWidth);
-    final wrapped = painter.computeLineMetrics().length > 1;
-    if (_wrapCache.length >= 512) _wrapCache.clear();
-    _wrapCache[key] = wrapped;
-    return wrapped;
-  }
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
@@ -6687,76 +7154,65 @@ class _MiniLyrics extends ConsumerWidget {
           color: Colors.white,
           fontSize: fontSize,
           fontWeight: FontWeight.w700,
+          // 显式行高让三行（主行两行 + 副行）在 78dp 展示区内可预期排布。
+          height: 1.3,
         );
+        final secondary = fontSize <= _singleLineThreshold
+            ? (translation.isNotEmpty
+                  ? translation
+                  : active + 1 < lines.length
+                  ? lines[active + 1].text
+                  : '')
+            : '';
         return _surface(
-          // LayoutBuilder + TextPainter 预测主行是否换行：换行时隐藏副行，
-          // 避免主行两行 + 副行超出 56dp 展示区。测量结果按内容键缓存。
-          LayoutBuilder(
-            builder: (context, constraints) {
-              final maxWidth = constraints.maxWidth;
-              final mainWrapped = _measureMainWrapped(
-                current.text,
-                mainStyle,
-                maxWidth,
-              );
-              final secondary = !mainWrapped && fontSize <= _singleLineThreshold
-                  ? (translation.isNotEmpty
-                        ? translation
-                        : active + 1 < lines.length
-                        ? lines[active + 1].text
-                        : '')
-                  : '';
-              return AnimatedSwitcher(
-                duration: const Duration(milliseconds: 280),
-                switchInCurve: Curves.easeOutCubic,
-                switchOutCurve: Curves.easeInCubic,
-                transitionBuilder: (child, animation) {
-                  return FadeTransition(
-                    opacity: animation,
-                    child: SlideTransition(
-                      position: Tween<Offset>(
-                        begin: const Offset(0, .22),
-                        end: Offset.zero,
-                      ).animate(animation),
-                      child: child,
-                    ),
-                  );
-                },
-                child: Column(
-                  key: ValueKey('${item.path}:${current.time}'),
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    Text(
-                      current.text,
-                      // 主行超出宽度时软换行（最多两行）且不做省略号
-                      // 截断，保证歌词完整可读。
-                      maxLines: 2,
-                      softWrap: true,
-                      overflow: TextOverflow.clip,
-                      textAlign: TextAlign.center,
-                      style: mainStyle.copyWith(
-                        shadows: [
-                          Shadow(color: Colors.black54, blurRadius: 10),
-                        ],
-                      ),
-                    ),
-                    if (secondary.trim().isNotEmpty) ...[
-                      const SizedBox(height: 3),
-                      Text(
-                        secondary,
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        textAlign: TextAlign.center,
-                        style: TextStyle(
-                          color: Colors.white.withValues(alpha: .5),
-                          fontSize: fontSize * .82,
-                        ),
-                      ),
-                    ],
-                  ],
+          AnimatedSwitcher(
+            duration: const Duration(milliseconds: 280),
+            switchInCurve: Curves.easeOutCubic,
+            switchOutCurve: Curves.easeInCubic,
+            transitionBuilder: (child, animation) {
+              return FadeTransition(
+                opacity: animation,
+                child: SlideTransition(
+                  position: Tween<Offset>(
+                    begin: const Offset(0, .22),
+                    end: Offset.zero,
+                  ).animate(animation),
+                  child: child,
                 ),
               );
             },
+            child: Column(
+              key: ValueKey('${item.path}:${current.time}'),
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(
+                  current.text,
+                  // 主行超出宽度时软换行（最多两行）且不做省略号
+                  // 截断，保证歌词完整可读；换行时副行（翻译）仍显示。
+                  maxLines: 2,
+                  softWrap: true,
+                  overflow: TextOverflow.clip,
+                  textAlign: TextAlign.center,
+                  style: mainStyle.copyWith(
+                    shadows: [Shadow(color: Colors.black54, blurRadius: 10)],
+                  ),
+                ),
+                if (secondary.trim().isNotEmpty) ...[
+                  const SizedBox(height: 3),
+                  Text(
+                    secondary,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    textAlign: TextAlign.center,
+                    style: TextStyle(
+                      color: Colors.white.withValues(alpha: .5),
+                      fontSize: fontSize * .82,
+                      height: 1.3,
+                    ),
+                  ),
+                ],
+              ],
+            ),
           ),
         );
       },
@@ -7370,7 +7826,7 @@ class _LyricFontSizeSheetState extends State<_LyricFontSizeSheet> {
           // 迷你歌词预览：与封面下方的迷你歌词展示区等高，
           // 直观展示迷你歌词字号的效果。
           Container(
-            height: 56,
+            height: 78,
             alignment: Alignment.center,
             decoration: BoxDecoration(
               color: scheme.surfaceContainerHighest.withValues(alpha: .5),
