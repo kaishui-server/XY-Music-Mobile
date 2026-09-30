@@ -1237,6 +1237,28 @@ fn normalize_krc_word_tags(raw: &str) -> String {
         .join("\n")
 }
 
+/// 多段密文按行解密：Dart 侧把主歌词/翻译/罗马音的 hex 密文用换行拼接
+/// 透传，整串解密会在段边界损坏 zlib 流——逐行独立解密，收集成功段落
+/// 再拼接；无任何可解段时返回空串（调用方维持原候选流程）。
+fn decrypt_multiline_hex(normalized: &str) -> String {
+    let mut parts = Vec::new();
+    for line in normalized.lines() {
+        let line = line.trim();
+        if line.len() <= 64 || line.len() % 2 != 0 {
+            continue;
+        }
+        if !line.chars().all(|ch| ch.is_ascii_hexdigit()) {
+            continue;
+        }
+        if let Ok(text) = crate::music::lyric_fetcher::qrc_decrypt(line) {
+            if !text.trim().is_empty() {
+                parts.push(text);
+            }
+        }
+    }
+    parts.join("\n")
+}
+
 fn parse_raw_lyrics(raw: &str) -> Vec<ParsedLine> {
     let normalized = normalize_krc_word_tags(
         &raw
@@ -1260,6 +1282,29 @@ fn parse_raw_lyrics(raw: &str) -> Vec<ParsedLine> {
         && compact_hex.len() % 2 == 0
         && compact_hex.chars().all(|ch| ch.is_ascii_hexdigit())
     {
+        // QQ 密文（crypt:1）解密产物有两种形态：QRC XML（qrc:1 逐字）与
+        // 普通 LRC（qrc:0，如《沧浪歌》）。只喂 parse_qrc 会让后者解析为
+        // 空——整首歌无歌词。这里把解密文本重新送入完整解析管线（对齐
+        // 桌面端 decrypt_plugin_lyric → parseLyrics 链路）。
+        // 输入可能是多段密文按行拼接（主歌词 + 翻译 + 罗马音，Dart 侧
+        // _extractLyricsWithTranslation 透传）：整串解密失败时逐行解密
+        // 再拼接，翻译行随主词一起进解析管线合并。
+        let decrypted = crate::music::lyric_fetcher::qrc_decrypt(&compact_hex)
+            .ok()
+            .filter(|text| !text.trim().is_empty())
+            .unwrap_or_else(|| decrypt_multiline_hex(&normalized));
+        // 防再入：解密产物理论上必是明文歌词，仍呈长 hex 形态时说明是
+        // 不可解的伪密文，跳过递归避免死循环。
+        let compact_plain = decrypted.split_whitespace().collect::<String>();
+        let plain_is_hex = compact_plain.len() > 64
+            && compact_plain.len() % 2 == 0
+            && compact_plain.chars().all(|ch| ch.is_ascii_hexdigit());
+        if !decrypted.trim().is_empty() && !plain_is_hex {
+            let nested = parse_raw_lyrics(&decrypted);
+            if !nested.is_empty() {
+                return nested;
+            }
+        }
         collect_candidate(
             &mut candidates,
             ParsedLineSourceFormat::Qrc,

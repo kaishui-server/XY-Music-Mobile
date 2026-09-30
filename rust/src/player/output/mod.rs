@@ -30,6 +30,21 @@ pub struct ExclusivePlayRequest {
     pub equalizer_settings_json: String,
     /// 音效设置 JSON（camelCase），空串 = 默认
     pub sound_effect_settings_json: String,
+    /// 共享模式 DSP 管线（日常播放）：AAudio 共享流走系统混音器输出到
+    /// 当前默认设备，全效果链（EQ/混响/空间音效/变速变调）生效。
+    /// 共享模式下 device_id 被忽略（-1 = 系统默认设备）。
+    #[serde(default)]
+    pub shared_mode: bool,
+    /// 在线流缓存直读 URL：Some(url) 时解码输入经 Rust 流缓存 Reader
+    /// （复用/启动 `start_streaming_download` 下载线程，单上游连接），
+    /// `path` 字段此时仅作扩展名探测。
+    #[serde(default)]
+    pub stream_cache_url: Option<String>,
+    /// 流缓存直链的上游请求头（Referer/User-Agent/Cookie 等），
+    /// 供 `start_streaming_download` 冷启动下载使用；命中已预热的缓存
+    /// 条目时忽略。
+    #[serde(default)]
+    pub stream_cache_headers: Option<std::collections::HashMap<String, String>>,
 }
 
 // =========================================================================
@@ -62,6 +77,42 @@ pub fn seek_exclusive(time_secs: f64, is_playing: bool) {
     #[cfg(target_os = "android")]
     {
         android_aaudio::seek_exclusive(time_secs, is_playing);
+    }
+}
+
+/// 暂停独占播放（不改变进度）。
+pub fn pause_exclusive() {
+    #[cfg(target_os = "android")]
+    {
+        android_aaudio::pause_exclusive();
+    }
+}
+
+/// 从暂停恢复独占播放（不改变进度）。
+pub fn resume_exclusive() {
+    #[cfg(target_os = "android")]
+    {
+        android_aaudio::resume_exclusive();
+    }
+}
+
+/// 查询当前独占播放输出设备/格式信息（JSON），用于前端展示与进度驱动。
+pub fn get_exclusive_device_info() -> String {
+    #[cfg(target_os = "android")]
+    {
+        android_aaudio::get_exclusive_device_info()
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        serde_json::json!({
+            "active": false,
+            "deviceName": "",
+            "sampleRate": 0,
+            "channels": 0,
+            "durationSecs": 0.0,
+            "lastError": "",
+        })
+        .to_string()
     }
 }
 

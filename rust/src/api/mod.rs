@@ -1635,6 +1635,8 @@ pub fn build_download_basename(
 
 /// 启动 USB 独占播放。返回设备名或错误信息。
 /// `device_id` = AAudio 设备 ID（USB DAC），-1 = 默认设备。
+/// `shared_mode` = true 走共享模式 DSP 管线（系统混音器，全效果链生效）。
+/// `stream_cache_url` = 在线流缓存直读 URL（None = 本地文件）。
 pub fn start_usb_exclusive_playback(
     path: String,
     device_id: i32,
@@ -1644,7 +1646,14 @@ pub fn start_usb_exclusive_playback(
     volume_balance_gain: f32,
     equalizer_settings_json: String,
     sound_effect_settings_json: String,
+    shared_mode: bool,
+    stream_cache_url: Option<String>,
+    stream_cache_headers_json: Option<String>,
 ) -> Result<String, String> {
+    let stream_cache_headers: Option<std::collections::HashMap<String, String>> =
+        stream_cache_headers_json
+            .as_deref()
+            .and_then(|s| serde_json::from_str(s).ok());
     let request = crate::player::output::ExclusivePlayRequest {
         path,
         device_id,
@@ -1654,6 +1663,9 @@ pub fn start_usb_exclusive_playback(
         volume_balance_gain,
         equalizer_settings_json,
         sound_effect_settings_json,
+        shared_mode,
+        stream_cache_url,
+        stream_cache_headers,
     };
     crate::player::output::start_exclusive_playback(request)
 }
@@ -1666,6 +1678,21 @@ pub fn stop_usb_exclusive_playback() {
 /// 跳转到指定位置（秒）。
 pub fn seek_usb_exclusive(time_secs: f64, is_playing: bool) {
     crate::player::output::seek_exclusive(time_secs, is_playing);
+}
+
+/// 暂停独占播放（不改变进度）。
+pub fn pause_usb_exclusive_playback() {
+    crate::player::output::pause_exclusive();
+}
+
+/// 从暂停恢复独占播放（不改变进度）。
+pub fn resume_usb_exclusive_playback() {
+    crate::player::output::resume_exclusive();
+}
+
+/// 查询当前独占播放输出设备/格式信息（JSON），用于前端展示与进度驱动。
+pub fn get_usb_exclusive_device_info() -> String {
+    crate::player::output::get_exclusive_device_info()
 }
 
 /// 设置用户音量（0.0–1.0）。

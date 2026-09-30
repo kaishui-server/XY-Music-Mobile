@@ -44,9 +44,7 @@ class _LibraryPageState extends ConsumerState<LibraryPage>
     if (_scanning) return;
     setState(() => _scanning = true);
     try {
-      final count = await ref
-          .read(libraryProvider.notifier)
-          .scanAllFolders();
+      final count = await ref.read(libraryProvider.notifier).scanAllFolders();
       if (!mounted) return;
       XyNotice.show(
         context,
@@ -308,13 +306,26 @@ class _AllSongsTabState extends ConsumerState<_AllSongsTab> {
   final GlobalKey _floatingHeaderKey = GlobalKey();
   double _floatingHeaderExtent = 60;
 
+  /// 多选提示行（“点击歌曲进行选择 / 已选 N 首”）的测量 Key 与实测
+  /// 高度：多选时列表顶部让出提示行高度，提示行悬浮于列表上方，
+  /// 避免与第一行歌曲重叠、把第一首歌曲盖住显示不全（与收藏页同款修复）。
+  final GlobalKey _selectionBarKey = GlobalKey();
+  double _selectionBarExtent = 56;
+
   /// 布局完成后用真实高度修正悬浮头部占位，字体缩放等场景自动适配。
   void _measureFloatingHeader() {
     if (!mounted) return;
     final size = _floatingHeaderKey.currentContext?.size;
-    if (size == null || size.height <= 0) return;
-    if ((size.height - _floatingHeaderExtent).abs() > 0.5) {
+    if (size != null &&
+        size.height > 0 &&
+        (size.height - _floatingHeaderExtent).abs() > 0.5) {
       setState(() => _floatingHeaderExtent = size.height);
+    }
+    final selectionSize = _selectionBarKey.currentContext?.size;
+    if (selectionSize != null &&
+        selectionSize.height > 0 &&
+        (selectionSize.height - _selectionBarExtent).abs() > 0.5) {
+      setState(() => _selectionBarExtent = selectionSize.height);
     }
   }
 
@@ -466,8 +477,12 @@ class _AllSongsTabState extends ConsumerState<_AllSongsTab> {
       children: [
         Positioned.fill(
           child: Padding(
+            // 多选时列表顶部让出提示行高度，避免第一行歌曲被悬浮的
+            // “已选 N 首”提示行盖住（与收藏页同款修复）。
             padding: EdgeInsets.only(
-              top: selectionMode || songs.isEmpty ? 0 : _floatingHeaderExtent,
+              top: selectionMode
+                  ? _selectionBarExtent
+                  : (songs.isEmpty ? 0 : _floatingHeaderExtent),
             ),
             child: songs.isEmpty
                 ? const Center(child: Text('没有匹配的歌曲'))
@@ -486,53 +501,64 @@ class _AllSongsTabState extends ConsumerState<_AllSongsTab> {
                   ),
           ),
         ),
+        // 提示行必须 Positioned 定位：若作为非 Positioned 子项，松约束
+        // 下 Stack 会 shrink-wrap 到提示行高度，Positioned.fill 的列表
+        // 随之被钳制（与收藏页同款问题）。
         if (selectionMode)
-          Padding(
-            padding: const EdgeInsets.fromLTRB(12, 8, 12, 4),
-            child: Row(
-              children: [
-                Expanded(
-                  child: Text(
-                    _selectedPaths.isEmpty
-                        ? '点击歌曲进行选择'
-                        : '已选 ${_selectedPaths.length} 首',
-                    style: const TextStyle(fontWeight: FontWeight.w600),
-                  ),
+          Positioned(
+            top: 0,
+            left: 0,
+            right: 0,
+            child: KeyedSubtree(
+              key: _selectionBarKey,
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(12, 8, 12, 4),
+                child: Row(
+                  children: [
+                    Expanded(
+                      child: Text(
+                        _selectedPaths.isEmpty
+                            ? '点击歌曲进行选择'
+                            : '已选 ${_selectedPaths.length} 首',
+                        style: const TextStyle(fontWeight: FontWeight.w600),
+                      ),
+                    ),
+                    TextButton(
+                      onPressed: () => _toggleAll(songs),
+                      child: Text(
+                        songs.isNotEmpty &&
+                                _selectedPaths.length == songs.length
+                            ? '取消全选'
+                            : '全选',
+                      ),
+                    ),
+                    const SizedBox(width: 4),
+                    TextButton(
+                      onPressed: _deleting || _selectedPaths.isEmpty
+                          ? null
+                          : () => _deleteSongs(
+                              songs
+                                  .where((s) => _selectedPaths.contains(s.path))
+                                  .toList(),
+                            ),
+                      style: TextButton.styleFrom(
+                        foregroundColor: Theme.of(context).colorScheme.error,
+                      ),
+                      child: _deleting
+                          ? const SizedBox.square(
+                              dimension: 18,
+                              child: CircularProgressIndicator(strokeWidth: 2),
+                            )
+                          : const Text('删除'),
+                    ),
+                    IconButton(
+                      tooltip: '取消多选',
+                      onPressed: _exitSelection,
+                      icon: const Icon(Icons.close_rounded),
+                    ),
+                  ],
                 ),
-                TextButton(
-                  onPressed: () => _toggleAll(songs),
-                  child: Text(
-                    songs.isNotEmpty &&
-                            _selectedPaths.length == songs.length
-                        ? '取消全选'
-                        : '全选',
-                  ),
-                ),
-                const SizedBox(width: 4),
-                TextButton(
-                  onPressed: _deleting || _selectedPaths.isEmpty
-                      ? null
-                      : () => _deleteSongs(
-                          songs
-                              .where((s) => _selectedPaths.contains(s.path))
-                              .toList(),
-                        ),
-                  style: TextButton.styleFrom(
-                    foregroundColor: Theme.of(context).colorScheme.error,
-                  ),
-                  child: _deleting
-                      ? const SizedBox.square(
-                          dimension: 18,
-                          child: CircularProgressIndicator(strokeWidth: 2),
-                        )
-                      : const Text('删除'),
-                ),
-                IconButton(
-                  tooltip: '取消多选',
-                  onPressed: _exitSelection,
-                  icon: const Icon(Icons.close_rounded),
-                ),
-              ],
+              ),
             ),
           )
         else
@@ -544,7 +570,8 @@ class _AllSongsTabState extends ConsumerState<_AllSongsTab> {
               key: _floatingHeaderKey,
               child: FrostedSearchField(
                 controller: _controller,
-                onChanged: (v) => setState(() => _query = v.trim().toLowerCase()),
+                onChanged: (v) =>
+                    setState(() => _query = v.trim().toLowerCase()),
                 showClearSuffix: true,
                 padding: const EdgeInsets.fromLTRB(12, 8, 12, 4),
               ),
@@ -751,9 +778,7 @@ class _FoldersTabState extends ConsumerState<_FoldersTab> {
       context: context,
       builder: (ctx) => AlertDialog(
         title: const Text('移除文件夹'),
-        content: Text(
-          '确定从音乐库移除该文件夹吗？\n${node.path}\n移除后该目录下的歌曲将不再显示。',
-        ),
+        content: Text('确定从音乐库移除该文件夹吗？\n${node.path}\n移除后该目录下的歌曲将不再显示。'),
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(ctx, false),
@@ -775,18 +800,10 @@ class _FoldersTabState extends ConsumerState<_FoldersTab> {
         _expanded.remove(node.path);
         _loadedChildren.remove(node.path);
       });
-      XyNotice.show(
-        context,
-        message: '已移除文件夹',
-        type: XyNoticeType.success,
-      );
+      XyNotice.show(context, message: '已移除文件夹', type: XyNoticeType.success);
     } catch (e) {
       if (!mounted) return;
-      XyNotice.show(
-        context,
-        message: '移除失败：$e',
-        type: XyNoticeType.error,
-      );
+      XyNotice.show(context, message: '移除失败：$e', type: XyNoticeType.error);
     }
   }
 

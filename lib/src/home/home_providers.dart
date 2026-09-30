@@ -54,25 +54,43 @@ HotComment parseHotComment(String raw) {
   );
 }
 
+/// 热评接口失败退避：上游接口挂掉时避免每次进入首页/3 分钟轮换都重试
+/// （长时间使用下产生大量无效请求与日志噪音），失败后 30 分钟内直接
+/// 抛错不再发请求，冷却结束后恢复尝试；成功即清除冷却。
+DateTime? _hotCommentCooldownUntil;
+const Duration _hotCommentRetryCooldown = Duration(minutes: 30);
+
 final hotCommentProvider = FutureProvider.autoDispose<HotComment>((ref) async {
-  final cacheBuster = DateTime.now().microsecondsSinceEpoch;
-  final responseJson = await pluginHttpRequest(
-    method: 'GET',
-    url: '$_hotCommentApi?_=$cacheBuster',
-    headersJson: jsonEncode({'Accept': 'text/plain, */*'}),
-    timeout: BigInt.from(12),
-    follow: 3,
-  );
-  final response = jsonDecode(responseJson);
-  if (response is! Map) throw const FormatException('热评接口响应无效');
-  final status = (response['status'] as num?)?.toInt() ?? 0;
-  if (status < 200 || status >= 300) {
-    throw Exception('热评接口请求失败（HTTP $status）');
+  final cooldownUntil = _hotCommentCooldownUntil;
+  if (cooldownUntil != null && DateTime.now().isBefore(cooldownUntil)) {
+    final remainMinutes =
+        cooldownUntil.difference(DateTime.now()).inMinutes + 1;
+    throw StateError('热评接口暂时不可用，约 $remainMinutes 分钟后自动重试');
   }
-  final result = parseHotComment(response['body']?.toString() ?? '');
-  final timer = Timer(const Duration(minutes: 3), ref.invalidateSelf);
-  ref.onDispose(timer.cancel);
-  return result;
+  try {
+    final cacheBuster = DateTime.now().microsecondsSinceEpoch;
+    final responseJson = await pluginHttpRequest(
+      method: 'GET',
+      url: '$_hotCommentApi?_=$cacheBuster',
+      headersJson: jsonEncode({'Accept': 'text/plain, */*'}),
+      timeout: BigInt.from(12),
+      follow: 3,
+    );
+    final response = jsonDecode(responseJson);
+    if (response is! Map) throw const FormatException('热评接口响应无效');
+    final status = (response['status'] as num?)?.toInt() ?? 0;
+    if (status < 200 || status >= 300) {
+      throw Exception('热评接口请求失败（HTTP $status）');
+    }
+    final result = parseHotComment(response['body']?.toString() ?? '');
+    _hotCommentCooldownUntil = null;
+    final timer = Timer(const Duration(minutes: 3), ref.invalidateSelf);
+    ref.onDispose(timer.cancel);
+    return result;
+  } catch (_) {
+    _hotCommentCooldownUntil = DateTime.now().add(_hotCommentRetryCooldown);
+    rethrow;
+  }
 });
 
 class HomeLyricLine {

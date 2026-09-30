@@ -252,12 +252,19 @@ class _HomePageState extends ConsumerState<HomePage> {
                     for (final period in LeaderboardPeriod.values) {
                       ref.invalidate(homeLeaderboardProvider(period));
                     }
+                    // 热评接口有失败冷却（30 分钟），冷却期内拉取会抛错；
+                    // 单模块失败不阻断其他模块刷新，也不向上抛未捕获异常。
                     await Future.wait([
-                      ref.read(hotCommentProvider.future),
-                      ref.read(homeStatisticsProvider.future),
+                      ref
+                          .read(hotCommentProvider.future)
+                          .then((_) {}, onError: (_) {}),
+                      ref
+                          .read(homeStatisticsProvider.future)
+                          .then((_) {}, onError: (_) {}),
                       ...LeaderboardPeriod.values.map(
-                        (period) =>
-                            ref.read(homeLeaderboardProvider(period).future),
+                        (period) => ref
+                            .read(homeLeaderboardProvider(period).future)
+                            .then((_) {}, onError: (_) {}),
                       ),
                     ]);
                   },

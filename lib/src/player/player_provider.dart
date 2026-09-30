@@ -20,6 +20,7 @@ import '../core/db_path.dart';
 import '../core/settings.dart';
 import '../effects/effects_provider.dart';
 import '../favorites/favorites_provider.dart';
+import '../playlists/playlists_provider.dart';
 import '../plugins/plugin_runtime.dart';
 import '../recent/recent_store.dart';
 import '../rust/api.dart';
@@ -267,10 +268,18 @@ class _RecognizedAudioSource {
 }
 
 class PlaybackDownloadSource {
-  const PlaybackDownloadSource({required this.url, this.headers = const {}});
+  const PlaybackDownloadSource({
+    required this.url,
+    this.headers = const {},
+    this.lyrics = '',
+  });
 
   final String url;
   final Map<String, String> headers;
+
+  /// 解析音源时一并取得的歌词。批量下载的歌曲列表项通常尚未加载
+  /// 歌词（lyricsRaw 为空），下载落盘 .lrc 时以此兜底。
+  final String lyrics;
 }
 
 class PluginLyricsOption {
@@ -858,6 +867,16 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
       if (speedChanged) {
         unawaited(_applyEffectsSpeedPitch());
       }
+      // DSP 管线出声期间，任何音效修改都重发完整设置到 Rust 侧。
+      if (_dspPipelineActive) {
+        unawaited(_pushDspSoundEffect());
+      } else if (_hasAdvancedEffects(fx) && state.isPlaying) {
+        // 播放中开启高级音效（混响/空间/低音增强等）：立即接管 DSP 管线。
+        // 此前接管只在切歌时发生（_startPlayback → _ensureDspPipeline），
+        // 播放中开启音效听不到任何效果，用户感知「除均衡器/变速变调外
+        // 全部失效」。暂停中开启则等恢复播放时由 _startPlayback 接管。
+        _scheduleDspTakeover();
+      }
     });
     // 收藏在播放页/歌曲列表/通知栏任何一处切换时，刷新通知栏收藏
     // 按钮的实心/空心图标（通知栏按钮见 _MediaSessionBridge）。
@@ -1037,12 +1056,295 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
   Future<void> setAppVolume(double v) async {
     final clamped = v.clamp(0.0, 1.0);
     await _ref.read(settingsProvider.notifier).setVolume(clamped);
+    // DSP 管线出声期间真实音量由管线应用，静音时钟保持 0。
+    if (_dspPipelineActive) {
+      try {
+        await setUsbExclusiveVolume(volume: clamped);
+      } catch (_) {}
+      return;
+    }
     if (!_videoMediaBridgeActive) {
       await _player.setVolume(clamped);
     }
   }
 
   final Ref _ref;
+
+  /// 是否启用了任一无原生实现路径的高级音效：混响/空间/消人声/调制/
+  /// 动态/整形/声道处理等。这些效果只能由 Rust DSP 管线出声，原生路径
+  /// 仅覆盖 5 段映射 EQ + 响度增益（preamp/audioBoost）+ setSpeed/setPitch。
+  static bool _hasAdvancedEffects(EffectsSettings fx) {
+    return fx.reverbKind != 'none' ||
+        fx.spatialMode != 'none' ||
+        fx.vocalRemoval ||
+        fx.vibratoEnabled ||
+        fx.tremoloEnabled ||
+        fx.bassBoostEnabled ||
+        fx.trebleEnabled ||
+        fx.distortionEnabled ||
+        fx.delayEnabled ||
+        fx.flangerEnabled ||
+        fx.phaserEnabled ||
+        fx.compressorEnabled ||
+        fx.noiseGateEnabled ||
+        fx.limiterEnabled ||
+        fx.exciterEnabled ||
+        fx.subBassEnabled ||
+        fx.loFiEnabled ||
+        fx.stereoWidenEnabled ||
+        fx.monoMerge ||
+        fx.channelSwap ||
+        fx.v4aEnabled;
+  }
+
+  /// 当前曲目是否需要 DSP 共享模式管线出声。
+  ///
+  /// 仅在启用任一无原生实现路径的高级音效时接管：系统原生 EQ 只有 5 段
+  /// 均衡器，混响/空间/消人声/低音增强/延迟等无原生实现。未开启高级
+  /// 音效时维持普通输出（原生 EQ + setSpeed/setPitch），避免不必要的
+  /// 双解码开销。
+  bool _dspWanted(String itemPath) {
+    if (kIsWeb || defaultTargetPlatform != TargetPlatform.android) return false;
+    // B 站视频歌曲走视频伴音 + 静音时钟桥接，管线不参与。
+    if (_videoMediaBridgeActive) return false;
+    final fx = _ref.read(effectsProvider).valueOrNull;
+    if (fx == null) return false;
+    // 任一无原生实现路径的高级音效开启即接管。原生路径只能覆盖：
+    // 5 段映射 EQ + 响度增益（preamp/audioBoost）+ setSpeed/setPitch；
+    // 混响/空间/消人声/低音增强/延迟等只能走 Rust DSP 链。
+    if (_hasAdvancedEffects(fx)) {
+      return true;
+    }
+    // 管线已在出声时保持接管（高级音效运行中关闭的回落在下次切歌），
+    // EQ 走 Rust 全 10 段精度不低于原生映射。
+    return _dspPipelineActive && _dspPipelinePath == itemPath;
+  }
+
+  /// 播放中开启高级音效时的接管防抖：音效滑条会连续触发监听，若每次
+  /// 都立即重建管线（Rust 侧 stop + 重开 AAudio 流）会爆音/卡顿；等
+  /// 300ms 静置窗后再接管一次。接管前复核播放态与音效状态，避免与
+  /// 用户后续操作（暂停/关闭音效/切歌）竞争。
+  void _scheduleDspTakeover() {
+    if (kIsWeb || defaultTargetPlatform != TargetPlatform.android) return;
+    if (_videoMediaBridgeActive) return;
+    _dspTakeoverTimer?.cancel();
+    _dspTakeoverTimer = Timer(const Duration(milliseconds: 300), () {
+      _dspTakeoverTimer = null;
+      if (_dspPipelineActive || !state.isPlaying) return;
+      final path = state.current?.path;
+      if (path == null) return;
+      final fx = _ref.read(effectsProvider).valueOrNull;
+      if (fx == null || !_hasAdvancedEffects(fx)) return;
+      unawaited(_ensureDspPipeline(_playRequestId, path));
+    });
+  }
+
+  /// 起播/恢复播放前确保 DSP 管线与当前曲目一致（[_startPlayback] 调用）。
+  ///
+  /// - 管线存活且属于当前曲：保持（播放/暂停由 playerStateStream 同步）。
+  /// - 管线已退出（曲终 EOF/断流）或属于旧曲：按当前进度重启。
+  /// - 未激活且需要接管：静音时钟后启动，失败则恢复时钟音量回退原生输出。
+  Future<void> _ensureDspPipeline(int requestId, String itemPath) async {
+    if (!_dspWanted(itemPath)) return;
+    if (_dspPipelineActive &&
+        _dspPipelinePath == itemPath &&
+        await isUsbExclusiveActive()) {
+      // 管线存活且属于当前曲：校正漂移。视频桥恢复等路径会把静音时钟
+      // seek 回歌曲进度而管线仍停在旧位置，超出阈值时补一次 seek，
+      // 后续 play()/pause() 事件照常同步播放态。
+      try {
+        final pipelinePos = await getUsbExclusivePositionSecs();
+        if ((pipelinePos - state.position).abs() > 1.5) {
+          await seekUsbExclusive(
+            timeSecs: state.position,
+            isPlaying: state.isPlaying,
+          );
+        }
+      } catch (_) {}
+      return;
+    }
+    final ok = await _startDspPipeline(
+      itemPath: itemPath,
+      startAtSecs: state.position,
+      isPlaying: true,
+    );
+    if (requestId != _playRequestId) return;
+    try {
+      // 静音时钟：真实音量转由 DSP 管线应用（setUsbExclusiveVolume）。
+      await _player.setVolume(ok ? 0 : _ref.read(volumeProvider));
+    } catch (_) {}
+  }
+
+  /// 启动 Rust 共享模式 DSP 管线。返回是否成功接管。
+  Future<bool> _startDspPipeline({
+    required String itemPath,
+    required double startAtSecs,
+    required bool isPlaying,
+  }) async {
+    if (_dspFailUntil != null && DateTime.now().isBefore(_dspFailUntil!)) {
+      return false;
+    }
+    // DSP 源信息由各音源设置点记录（本地文件/在线直链）。
+    final streamUrl = _dspStreamUrl;
+    final localPath = _dspLocalPath;
+    if (streamUrl == null && localPath == null) return false;
+    try {
+      final fx = _ref.read(effectsProvider).valueOrNull ?? const EffectsSettings();
+      final deviceName = await startUsbExclusivePlayback(
+        path: streamUrl ?? localPath!,
+        deviceId: -1,
+        volume: _ref.read(volumeProvider),
+        startTimeSecs: startAtSecs,
+        isPlaying: isPlaying,
+        volumeBalanceGain: 1.0,
+        equalizerSettingsJson: jsonEncode(fx.toEqualizerRustJson()),
+        soundEffectSettingsJson: jsonEncode(_dspSoundEffectJson(fx)),
+        sharedMode: true,
+        streamCacheUrl: streamUrl,
+        streamCacheHeadersJson: _dspStreamHeaders == null
+            ? null
+            : jsonEncode(_dspStreamHeaders!),
+      );
+      _dspPipelineActive = true;
+      _dspPipelinePath = itemPath;
+      _dspPipelinePlaying = isPlaying;
+      dspPipelineOwnsEffects = true;
+      _startDspWatchdog();
+      debugPrint('[DSP] 共享管线接管成功: $deviceName');
+      return true;
+    } catch (error) {
+      _dspFailUntil = DateTime.now().add(const Duration(seconds: 60));
+      debugPrint('[DSP] 共享管线启动失败(60s冷却)，回退原生输出: $error');
+      return false;
+    }
+  }
+
+  /// DSP 管线的音效 JSON：变速合成播放页档位 × 音效页百分比
+  ///（与静音时钟 setSpeed 一致，进度/曲终才能对齐）。
+  Map<String, dynamic> _dspSoundEffectJson(EffectsSettings fx) {
+    final speed = _combinedEffectsSpeed();
+    return {
+      ...fx.toRustJson(),
+      'playbackRate': (speed * 100).clamp(25, 400),
+    };
+  }
+
+  /// 停止 DSP 管线（just_audio 进入 idle 时由 playerStateStream 触发，
+  /// 覆盖切歌/停止/换源等所有路径）。
+  Future<void> _stopDspPipeline() async {
+    if (!_dspPipelineActive) return;
+    _dspPipelineActive = false;
+    _dspPipelinePath = null;
+    _dspPipelinePlaying = false;
+    dspPipelineOwnsEffects = false;
+    _stopDspWatchdog();
+    try {
+      await stopUsbExclusivePlayback();
+    } catch (_) {}
+  }
+
+  /// 管线存活看门狗：设备切换/断流导致 Rust 工作线程退出而静音时钟
+  /// 仍在走时，按当前进度重建管线；曲终 EOF（进度已到尾部）不重建，
+  /// 交给 just_audio 的 completed 事件正常驱动切歌。
+  void _startDspWatchdog() {
+    _dspWatchdogTimer?.cancel();
+    _dspWatchdogTimer = Timer.periodic(const Duration(seconds: 2), (_) {
+      unawaited(_checkDspPipelineAlive());
+    });
+  }
+
+  void _stopDspWatchdog() {
+    _dspWatchdogTimer?.cancel();
+    _dspWatchdogTimer = null;
+  }
+
+  Future<void> _checkDspPipelineAlive() async {
+    if (!_dspPipelineActive || !state.isPlaying) return;
+    final path = _dspPipelinePath;
+    if (path == null || state.current?.path != path) return;
+    // 曲终窗口（尾部 1.5s）不重建：管线 EOF 退出属正常路径。
+    if (state.duration > 0 && state.position >= state.duration - 1.5) return;
+    try {
+      if (await isUsbExclusiveActive()) return;
+    } catch (_) {
+      return;
+    }
+    if (!_dspPipelineActive || state.current?.path != path) return;
+    debugPrint('[DSP] 管线异常退出（断流/设备切换），按当前进度重建');
+    _dspPipelineActive = false;
+    dspPipelineOwnsEffects = false;
+    _stopDspWatchdog();
+    final ok = await _startDspPipeline(
+      itemPath: path,
+      startAtSecs: state.position,
+      isPlaying: true,
+    );
+    if (!ok) {
+      // 重建失败：解除静音时钟，回退原生输出。
+      try {
+        await _player.setVolume(_ref.read(volumeProvider));
+      } catch (_) {}
+    }
+  }
+
+  /// 把 just_audio 的播放态同步给 DSP 管线（playerStateStream 触发）。
+  /// 通知栏/蓝牙/车机的播放暂停命令作用于 just_audio（静音时钟），
+  /// 此处反向转发给真正出声的管线，两端状态保持一致。
+  Future<void> _syncDspPipelinePlaying(bool playing) async {
+    if (!_dspPipelineActive || _dspPipelinePlaying == playing) return;
+    _dspPipelinePlaying = playing;
+    try {
+      if (playing) {
+        await resumeUsbExclusivePlayback();
+        // 恢复请求发出后管线可能已死（暂停期间车机/蓝牙断流，Rust
+        // 侧已退出线程并记录 lastError）：立即验证并按当前进度重建，
+        // 不等 2 秒看门狗的静音窗口。
+        if (!await isUsbExclusiveActive()) {
+          debugPrint('[DSP] resume 时管线已死（暂停期间断流），按当前进度重建');
+          final path = _dspPipelinePath ?? state.current?.path;
+          _dspPipelineActive = false;
+          dspPipelineOwnsEffects = false;
+          _stopDspWatchdog();
+          if (path != null && path == state.current?.path) {
+            final ok = await _startDspPipeline(
+              itemPath: path,
+              startAtSecs: state.position,
+              isPlaying: true,
+            );
+            if (!ok) {
+              // 重建失败：解除静音时钟，回退原生输出。
+              try {
+                await _player.setVolume(_ref.read(volumeProvider));
+              } catch (_) {}
+            }
+          }
+        }
+      } else {
+        await pauseUsbExclusivePlayback();
+      }
+    } catch (_) {
+      _dspPipelinePlaying = !playing;
+    }
+  }
+
+  /// DSP 管线激活时重发完整音效设置（EQ + 音效链 JSON）。倍速/变调/
+  /// 任一音效参数变化后调用，管线侧与静音时钟保持一致才能进度对齐。
+  Future<void> _pushDspSoundEffect() async {
+    if (!_dspPipelineActive) return;
+    try {
+      final fx = _ref.read(effectsProvider).valueOrNull ?? const EffectsSettings();
+      await setUsbExclusiveEqualizer(
+        settingsJson: jsonEncode(fx.toEqualizerRustJson()),
+      );
+      await setUsbExclusiveSoundEffect(
+        settingsJson: jsonEncode(_dspSoundEffectJson(fx)),
+      );
+    } catch (_) {}
+  }
+
+  /// DSP 管线激活时的静音时钟音量（0）；普通输出用用户音量。
+  double _effectiveClockVolume() =>
+      _dspPipelineActive ? 0.0 : _ref.read(volumeProvider);
 
   /// 把音效页的均衡器/前级/音量增强应用到播放引擎。
   ///
@@ -1152,6 +1454,32 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
   String? _lastVideoPath;
   bool _videoMediaBridgeActive = false;
   bool _syncingVideoMediaBridge = false;
+
+  // ---- DSP 共享模式管线（混响/空间等高级音效）----
+  // 高级音效系统原生 EQ（仅 5 段）无法实现：启用混响或空间音效时由
+  // Rust AAudio 共享模式 DSP 管线出声（EQ/混响/空间/变速变调全链生效），
+  // just_audio 同步转为静音时钟驱动媒体会话与进度（复用 B 站视频桥
+  // 模式：通知栏/蓝牙/车机的播放暂停经 playerStateStream 自动同步管线，
+  // 曲终由 just_audio 的 completed 事件照常驱动切歌）。
+  bool _dspPipelineActive = false;
+  // 管线当前出声的歌曲路径（切歌/换源重启判定用）。
+  String? _dspPipelinePath;
+  // 管线启动失败冷却（60s）：坏源反复重建会拖慢切歌。
+  DateTime? _dspFailUntil;
+  // 最近一次交给 just_audio 的在线直链与防盗链头：DSP 流缓存直读复用
+  // 同一直链（Rust 侧单连接流式下载，ExoPlayer 各自连接 CDN）。
+  String? _dspStreamUrl;
+  Map<String, String>? _dspStreamHeaders;
+  // 最近一次交给 just_audio 的本地文件路径（Rust 管线直接 File::open）。
+  // content:// 等 SAF 路径 Rust 无法读取，保持 null（不接管）。
+  String? _dspLocalPath;
+  // 管线播放态同步标记：避免 playerStateStream 每次事件重复下发
+  // pause/resume（Rust 侧幂等但省一次 FFI 往返）。
+  bool _dspPipelinePlaying = false;
+  // 管线存活看门狗（断流重建，见 [_checkDspPipelineAlive]）。
+  Timer? _dspWatchdogTimer;
+  // 播放中开启高级音效时的接管防抖定时器（见 [_scheduleDspTakeover]）。
+  Timer? _dspTakeoverTimer;
 
   /// MV 播放前歌曲自身的进度/时长（见 [enableVideoMediaBridge]）。
   /// 桥接期间静音音频被 seek 到视频时间线，关闭视频时用这里记录的值
@@ -1324,6 +1652,15 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
     _stateSub = _player.playerStateStream.listen((ps) {
       final playing = ps.playing;
       final completed = ps.processingState == ProcessingState.completed;
+      // DSP 管线同步：idle（_playAt 切歌先 stop()、重建播放器、手动停止）
+      // 时释放管线，杜绝旧曲管线在新曲准备期间继续出声；其余状态把
+      // 播放态转发给真正出声的 Rust 管线（通知栏/蓝牙/车机控制的
+      // 是 just_audio 静音时钟）。
+      if (ps.processingState == ProcessingState.idle) {
+        unawaited(_stopDspPipeline());
+      } else {
+        unawaited(_syncDspPipelinePlaying(playing));
+      }
       if (completed ||
           playing != state.isPlaying ||
           (playing && state.isLoading)) {
@@ -1619,7 +1956,7 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
       _manualPause = true;
       await _player.pause();
     }
-    await _player.setVolume(_ref.read(volumeProvider));
+    await _player.setVolume(_effectiveClockVolume());
     await _restoreSongProgressAfterVideo();
   }
 
@@ -1891,7 +2228,7 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
           );
           if (idx != state.queueIndex) return; // 期间已切歌，放弃
           _preparedSourceRequestId = _playRequestId;
-          await _player.setVolume(_ref.read(volumeProvider));
+          await _player.setVolume(_effectiveClockVolume());
           await seek(pos);
           // 进程重新启动时只恢复队列、歌曲和进度，不自动恢复“正在播放”。
           // 自动播放会在首页首帧同时启动媒体服务、网络音源和高频 UI 更新，
@@ -2080,7 +2417,7 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
       _preparedSourceRequestId = requestId;
       _consecutivePlaybackFailures = 0;
       _resetFailureStrategyCounters();
-      await _player.setVolume(_ref.read(volumeProvider));
+      await _player.setVolume(_effectiveClockVolume());
       // 换源后重放合成速度/变调（ExoPlayer 重建 PlaybackParameters 会
       // 复位为 1.0）与均衡器（fork 门面在 load 后自行重放）。
       await _player.setSpeed(_combinedEffectsSpeed());
@@ -2473,7 +2810,12 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
   }) async {
     await _enqueueSourceOperation(() async {
       if (requestId != null && requestId != _playRequestId) return;
+      // DSP 源记录：在线直链交给 Rust 流缓存直读（与 ExoPlayer 各自
+      // 连接 CDN）。与 setUrl 同在串行队列内，切歌时不会记录到旧曲 URL。
       if (url.startsWith('http')) {
+        _dspStreamUrl = url;
+        _dspStreamHeaders = headers;
+        _dspLocalPath = null;
         // 预解析域名填充系统 DNS 缓存；headers 走向也记入日志，
         // 下份日志可据此区分「本地代理慢」与「DNS/网络慢」。
         await _warmUpPlaybackDns(url);
@@ -3306,6 +3648,10 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
       try {
         await _enqueueSourceOperation(() async {
           if (requestId != null && requestId != _playRequestId) return;
+          // SAF 路径 Rust 无法直接读取，DSP 不接管该曲。
+          _dspStreamUrl = null;
+          _dspStreamHeaders = null;
+          _dspLocalPath = null;
           await _player.setAudioSource(
             AudioSource.uri(Uri.parse(trimmed), tag: mediaItem),
           );
@@ -3328,6 +3674,10 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
     try {
       await _enqueueSourceOperation(() async {
         if (requestId != null && requestId != _playRequestId) return;
+        // DSP 源记录：本地文件路径直接交给 Rust File::open。
+        _dspStreamUrl = null;
+        _dspStreamHeaders = null;
+        _dspLocalPath = path;
         await _player.setFilePath(path, tag: mediaItem);
       });
     } catch (_) {
@@ -3370,6 +3720,10 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
       try {
         await _enqueueSourceOperation(() async {
           if (requestId != null && requestId != _playRequestId) return;
+          // DSP 源记录：网盘缓存命中，本地文件直读。
+          _dspStreamUrl = null;
+          _dspStreamHeaders = null;
+          _dspLocalPath = cachedPath;
           await _player.setFilePath(cachedPath, tag: mediaItem);
         });
       } catch (_) {
@@ -3838,6 +4192,13 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
       requestId: requestId,
       itemPath: itemPath,
     );
+    // 高级音效接管：Rust 共享管线出声 + just_audio 转静音时钟。
+    // 在 play() 之前启动（流缓存需最小缓冲就绪才出声），两侧起点一致
+    // 才能保证进度/曲终对齐；失败回退原生输出（音量恢复）。
+    await _ensureDspPipeline(requestId, itemPath);
+    if (requestId != _playRequestId || state.current?.path != itemPath) {
+      return;
+    }
     final playback = _player.play();
     unawaited(_watchPlayback(playback, requestId, itemPath));
     // 诊断日志：恢复播放完成后核对预期与实际进度。若出现“音频在正确
@@ -3951,8 +4312,26 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
         current: index == state.queueIndex ? queue[index] : state.current,
       );
       unawaited(_persistSession());
+      // 补拉结果回写持久化快照：收藏/歌单/最近播放里这些歌曲仍是空
+      // 封面，导出备份迁移到其他设备（如 PC 桌面版）后封面与手机上
+      // 实际显示的不一致（另一端走 pluginData 兜底拿到的是另一张图）。
+      unawaited(_backfillSnapshotCovers(item.path, cover));
     } catch (_) {
       // 封面补全失败不影响播放。
+    }
+  }
+
+  /// 把补拉到的封面回写最近播放/收藏/歌单快照（均只在快照存在且
+  /// 封面为空时填入），保证列表显示与备份迁移后的封面一致。
+  Future<void> _backfillSnapshotCovers(String path, String cover) async {
+    try {
+      await Future.wait([
+        backfillRecentSongCover(path, cover),
+        _ref.read(favoritesProvider.notifier).backfillCover(path, cover),
+        _ref.read(playlistsProvider.notifier).backfillSongCover(path, cover),
+      ]);
+    } catch (_) {
+      // 快照回写失败不影响播放。
     }
   }
 
@@ -4571,7 +4950,7 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
       _preparedSourceRequestId = requestId;
       _consecutivePlaybackFailures = 0;
       _resetFailureStrategyCounters();
-      await _player.setVolume(_ref.read(volumeProvider));
+      await _player.setVolume(_effectiveClockVolume());
       await seek(position);
       _manualPause = !wasPlaying;
       if (wasPlaying) _startPlayback(requestId, item.path);
@@ -4619,14 +4998,29 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
             .where((candidate) => candidate.id == item.pluginId)
             .firstOrNull;
         if (plugin == null) throw Exception('歌曲所属插件已停用或删除');
-        final source = await _ref
-            .read(pluginRuntimeProvider)
-            .resolveMediaSource(
-              plugin,
-              data,
-              preferredQuality: preferredQuality,
-            );
-        return PlaybackDownloadSource(url: source.url, headers: source.headers);
+        final runtime = _ref.read(pluginRuntimeProvider);
+        final source = await runtime.resolveMediaSource(
+          plugin,
+          data,
+          preferredQuality: preferredQuality,
+        );
+        // 列表歌曲在下载前通常没加载过歌词；音源解析没带歌词时
+        // 主动请求一次 getLyric，保证「同时下载歌词」能落盘 .lrc。
+        var lyrics = source.lyrics;
+        if (lyrics.trim().isEmpty) {
+          try {
+            lyrics = await runtime
+                .getLyrics(plugin, data)
+                .timeout(const Duration(seconds: 20));
+          } catch (_) {
+            lyrics = '';
+          }
+        }
+        return PlaybackDownloadSource(
+          url: source.url,
+          headers: source.headers,
+          lyrics: lyrics,
+        );
       case PlaybackSourceType.lx:
         final rawLx = item.pluginData?['lx'];
         if (rawLx is! Map) throw Exception('识曲结果缺少播放元数据');
@@ -4642,6 +5036,7 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
           return PlaybackDownloadSource(
             url: owned.url,
             headers: owned.headers,
+            lyrics: owned.lyrics,
           );
         }
         final cached = await _resolveCachedRecognizedPlugin(
@@ -4664,7 +5059,11 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
               ),
             ]).timeout(const Duration(seconds: 30), onTimeout: () => null);
         if (source == null) throw Exception('无法获取歌曲下载地址');
-        return PlaybackDownloadSource(url: source.url, headers: source.headers);
+        return PlaybackDownloadSource(
+          url: source.url,
+          headers: source.headers,
+          lyrics: source.lyrics,
+        );
       case PlaybackSourceType.networkUrl:
         return PlaybackDownloadSource(url: item.path);
       case PlaybackSourceType.localFile:
@@ -4860,7 +5259,7 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
   Future<void> resumeAfterVideo() async {
     final current = state.current;
     if (current == null || state.errorMessage != null) return;
-    await _player.setVolume(_ref.read(volumeProvider));
+    await _player.setVolume(_effectiveClockVolume());
     _manualPause = false;
     unawaited(_startPlayback(_playRequestId, current.path));
   }
@@ -4876,6 +5275,8 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
     state = state.copyWith(playbackSpeed: normalized);
     try {
       await _player.setSpeed(_combinedEffectsSpeed());
+      // 管线变速合成随档位变化，静音时钟与出声侧保持同速。
+      unawaited(_pushDspSoundEffect());
       final video = VideoPlaybackSession.isFor(state.current?.path)
           ? VideoPlaybackSession.controller
           : null;
@@ -4889,6 +5290,15 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
     final targetMs = max(0, (secs * 1000).round());
     _flushCurrentPlaybackStats();
     await _player.seek(Duration(milliseconds: targetMs));
+    // DSP 管线出声侧同步 seek（静音时钟已到位），失败不阻断 UI 进度。
+    if (_dspPipelineActive) {
+      try {
+        await seekUsbExclusive(
+          timeSecs: targetMs / 1000.0,
+          isPlaying: _player.playing,
+        );
+      } catch (_) {}
+    }
     if (_statsSessionPath == state.current?.path) {
       _statsRecordedPositionMs = targetMs;
     }
@@ -5041,11 +5451,14 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
     _sleepTimerTicker?.cancel();
     _statsFlushTimer?.cancel();
     _desktopLyricsSyncTimer?.cancel();
+    _dspWatchdogTimer?.cancel();
     _audioInterruptionSub?.cancel();
     _becomingNoisySub?.cancel();
     _posSub?.cancel();
     _durSub?.cancel();
     _stateSub?.cancel();
+    _dspTakeoverTimer?.cancel();
+    unawaited(_stopDspPipeline());
     _player.dispose();
     super.dispose();
   }

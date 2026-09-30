@@ -9,9 +9,13 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import '../../src/core/db_path.dart';
 import '../../src/core/settings.dart';
+import '../../src/favorites/favorites_provider.dart';
 import '../../src/player/player_provider.dart';
+import '../../src/playlists/playlists_provider.dart';
 import '../../src/plugins/plugin_metadata.dart';
+import '../../src/plugins/plugin_reference_migration.dart';
 import '../../src/plugins/plugin_runtime.dart';
+import '../../src/recent/recent_provider.dart';
 import '../../src/rust/api.dart';
 import '../../src/ui/xy_surface.dart';
 import '../../src/ui/xy_theme.dart';
@@ -186,38 +190,8 @@ class _PluginsNotifier extends AsyncNotifier<List<_PluginInfo>> {
     }
   }
 
-  static String _pluginId(String script, String origin) {
-    final metadata = PluginMetadata.parse(script);
-    final rawName =
-        metadata.name ??
-        p.basenameWithoutExtension(Uri.tryParse(origin)?.path ?? origin);
-    final rawId = metadata.id ?? rawName;
-    final normalized = PluginMetadata.normalizePluginId(rawId);
-    return normalized.isNotEmpty
-        ? normalized
-        : 'plugin-${_fnv1a(rawId).toRadixString(16)}';
-  }
-
-  static int _fnv1a(String input) {
-    var hash = 0x811c9dc5;
-    for (final byte in utf8.encode(input)) {
-      hash ^= byte;
-      hash = (hash * 0x01000193) & 0xffffffff;
-    }
-    return hash;
-  }
-
-  static int _compareVersion(String left, String right) {
-    final a = left.split(RegExp(r'[.-]'));
-    final b = right.split(RegExp(r'[.-]'));
-    final length = a.length > b.length ? a.length : b.length;
-    for (var index = 0; index < length; index++) {
-      final av = index < a.length ? int.tryParse(a[index]) ?? 0 : 0;
-      final bv = index < b.length ? int.tryParse(b[index]) ?? 0 : 0;
-      if (av != bv) return av.compareTo(bv);
-    }
-    return 0;
-  }
+  static String _pluginId(String script, String origin) =>
+      PluginMetadata.resolvePluginId(script, origin);
 
   static void _validateScript(String script) {
     final trimmed = script.trim();
@@ -279,16 +253,15 @@ class _PluginsNotifier extends AsyncNotifier<List<_PluginInfo>> {
       final uri = Uri.tryParse(pluginUrl);
       final sameHost =
           uri != null && uri.host.isNotEmpty && uri.host == base.host;
-      final defaultPort =
-          uri == null || !uri.hasPort || uri.port == 80;
+      final defaultPort = uri == null || !uri.hasPort || uri.port == 80;
       if (!sameHost || !defaultPort || !base.hasPort || base.port == 80) {
-        throw firstError;
+        rethrow;
       }
       final rewritten = uri.replace(port: base.port).toString();
       try {
         return (await _downloadText(rewritten), rewritten);
       } catch (_) {
-        throw firstError;
+        rethrow;
       }
     }
   }
@@ -298,24 +271,13 @@ class _PluginsNotifier extends AsyncNotifier<List<_PluginInfo>> {
     String origin,
     _MutableInstallSummary summary, {
     String? displayName,
-    String? displayVersion,
   }) async {
     _validateScript(script);
     final metadata = PluginMetadata.parse(script);
-    var id = _pluginId(script, origin);
+    final id = _pluginId(script, origin);
     final name = displayName?.trim().isNotEmpty == true
         ? displayName!.trim()
         : (metadata.name ?? id);
-    final version = displayVersion?.trim().isNotEmpty == true
-        ? displayVersion!.trim()
-        : (metadata.version ?? '0');
-    final existing = state.valueOrNull
-        ?.where((item) => item.id == id || item.name == name)
-        .firstOrNull;
-    if (existing != null && _compareVersion(version, existing.version) <= 0) {
-      summary.skipped++;
-      return false;
-    }
 
     final dataDir = await ref.read(appDataDirProvider.future);
     // 本地导入不依赖 Rust bridge。插件管理页可能在应用启动初始化 bridge
@@ -323,27 +285,49 @@ class _PluginsNotifier extends AsyncNotifier<List<_PluginInfo>> {
     // LateInitializationError；插件目录本身由 Dart 写入即可。
     final pluginsDir = Directory(p.join(dataDir, 'plugins'));
     await pluginsDir.create(recursive: true);
-    if (existing == null) {
-      // 批量导入时 state 尚未刷新，existing 查不到本批次刚写入的插件：
-      // 同 ID 文件已存在说明批次内有其他插件归一化到了同一 ID（如
-      // 「animemusic聚合」与「animemusic」）。内容相同按重复导入跳过；
-      // 内容不同则追加序号共存，避免互相覆盖成「提示装了 6 个、列表
-      // 只剩 3 个」。
-      final target = File(p.join(pluginsDir.path, '$id.js'));
-      if (await target.exists()) {
-        if (await target.readAsString() == script) {
-          summary.skipped++;
-          return false;
+
+    // 磁盘级去重：批量安装中途 state 不会刷新，列表项名称与订阅索引的
+    // 显示名也可能不一致，仅靠 state 匹配会漏判，重复导入订阅就会产生
+    // xxx.js / xxx-2.js 多组副本。这里直接扫描插件目录，把归一化 ID
+    // 相同的文件全部找出，一次性合并成一个。
+    final duplicates = <File>[];
+    if (pluginsDir.existsSync()) {
+      final files =
+          pluginsDir
+              .listSync()
+              .whereType<File>()
+              .where((file) => p.extension(file.path).toLowerCase() == '.js')
+              .toList()
+            ..sort((a, b) => a.path.compareTo(b.path));
+      for (final file in files) {
+        try {
+          final existingScript = file.readAsStringSync();
+          if (existingScript == script ||
+              _pluginId(existingScript, file.path) == id) {
+            duplicates.add(file);
+          }
+        } catch (_) {
+          // 读取失败的文件不参与去重，按全新安装处理。
         }
-        var suffix = 2;
-        while (File(p.join(pluginsDir.path, '$id-$suffix.js')).existsSync()) {
-          suffix++;
-        }
-        id = '$id-$suffix';
       }
     }
-    await File(p.join(pluginsDir.path, '$id.js')).writeAsString(script);
+
     final prefs = await SharedPreferences.getInstance();
+    if (duplicates.isNotEmpty) {
+      return _mergeDuplicates(
+        duplicates,
+        script,
+        origin,
+        id,
+        name,
+        metadata,
+        pluginsDir,
+        prefs,
+        summary,
+      );
+    }
+
+    await File(p.join(pluginsDir.path, '$id.js')).writeAsString(script);
     final enabled = (prefs.getStringList(_enabledKey) ?? const []).toSet()
       ..add(id);
     await prefs.setStringList(_enabledKey, enabled.toList());
@@ -355,6 +339,118 @@ class _PluginsNotifier extends AsyncNotifier<List<_PluginInfo>> {
     // 星海格式插件在安装提示中标注，让用户知道这是聚合变体。
     summary.names.add(metadata.isStarSea ? '$name（星海）' : name);
     return true;
+  }
+
+  /// 把磁盘上已存在的同 ID 插件副本合并为一个文件：主文件以新脚本
+  /// 覆盖，其余后缀变体删除，启用状态/订阅来源/用户变量/排序等偏好
+  /// 一并迁移到主 ID 上。内容与磁盘一致时仅清理多余副本并跳过安装。
+  Future<bool> _mergeDuplicates(
+    List<File> duplicates,
+    String script,
+    String origin,
+    String id,
+    String name,
+    PluginMetadata metadata,
+    Directory pluginsDir,
+    SharedPreferences prefs,
+    _MutableInstallSummary summary,
+  ) async {
+    final primaryPath = p.join(pluginsDir.path, '$id.js');
+    final primaryExists = duplicates.any((file) => file.path == primaryPath);
+    // 无论主文件是否在副本集合里，最终都归一到 $id.js 承载新脚本。
+    final removedIds = duplicates
+        .where((file) => file.path != primaryPath)
+        .map((file) => p.basenameWithoutExtension(file.path))
+        .toSet();
+    if (!primaryExists) {
+      // 主文件缺失时第一个副本的偏好也要迁移到主 ID。
+      removedIds.add(p.basenameWithoutExtension(duplicates.first.path));
+    }
+
+    final enabled = (prefs.getStringList(_enabledKey) ?? const []).toSet();
+    final wasEnabled = enabled.contains(id) || removedIds.any(enabled.contains);
+    enabled.removeAll(removedIds);
+    if (wasEnabled) enabled.add(id);
+    await prefs.setStringList(_enabledKey, enabled.toList());
+
+    final sources = _readSourceUrls(prefs);
+    for (final removedId in removedIds) {
+      final value = sources.remove(removedId);
+      if (value != null && sources[id]?.isNotEmpty != true) {
+        sources[id] = value;
+      }
+    }
+    if (origin.startsWith('http://') || origin.startsWith('https://')) {
+      sources[id] = origin;
+    }
+    await prefs.setString(_sourceUrlsKey, jsonEncode(sources));
+
+    final variables = readPluginUserVariables(prefs);
+    var variablesChanged = false;
+    for (final removedId in removedIds) {
+      final value = variables.remove(removedId);
+      if (value != null && !variables.containsKey(id)) {
+        variables[id] = value;
+        variablesChanged = true;
+      }
+    }
+    if (variablesChanged) {
+      await prefs.setString(pluginUserVariablesKey, jsonEncode(variables));
+    }
+
+    final order = prefs.getStringList(pluginOrderKey);
+    if (order != null && order.any(removedIds.contains)) {
+      await prefs.setStringList(
+        pluginOrderKey,
+        order.where((item) => !removedIds.contains(item)).toList(),
+      );
+    }
+
+    for (final file in duplicates) {
+      if (file.path == primaryPath) continue;
+      try {
+        await file.delete();
+      } catch (_) {
+        // 删除失败时以刷新后的实际列表为准，不阻断安装。
+      }
+    }
+
+    // 旧 ID 变体已删除、偏好已迁移到新 ID，存量歌曲数据（歌单/收藏/
+    // 最近播放里的旧 ID 引用）必须一并迁移，否则旧歌单全部断链。
+    await _migrateRenamedPluginReferences(removedIds, id);
+
+    final primary = File(primaryPath);
+    if (primary.existsSync() && await primary.readAsString() == script) {
+      summary.skipped++;
+      return false;
+    }
+    await primary.writeAsString(script);
+    summary.installed++;
+    summary.names.add(metadata.isStarSea ? '$name（星海）' : name);
+    return true;
+  }
+
+  /// 插件 ID 漂移时迁移存量歌曲数据：旧 ID 文件被合并删除后，歌单、
+  /// 收藏与最近播放里 `plugin://旧ID/` 路径和 pluginId 字段会全部
+  /// 断链（订阅插件更新后 name 加上赞助后缀、旧版本回退哈希 ID 等
+  /// 都会造成 ID 变化）。迁移完成后重建相关 provider 的内存快照。
+  Future<void> _migrateRenamedPluginReferences(
+    Set<String> removedIds,
+    String id,
+  ) async {
+    if (removedIds.isEmpty) return;
+    try {
+      final migrated = await migratePluginReferences({
+        for (final removedId in removedIds) removedId: id,
+      });
+      if (migrated > 0) {
+        ref.invalidate(playlistsProvider);
+        ref.invalidate(favoritesProvider);
+        ref.invalidate(recentSongsProvider);
+      }
+    } catch (_) {
+      // 迁移失败不阻断安装；下次合并同一插件时会再次尝试。
+    }
   }
 
   Future<_InstallSummary> installFromUrl(String url) async {
@@ -387,7 +483,6 @@ class _PluginsNotifier extends AsyncNotifier<List<_PluginInfo>> {
                 effectiveUrl,
                 summary,
                 displayName: item['name']?.toString(),
-                displayVersion: item['version']?.toString(),
               );
             } catch (error) {
               summary.failed++;
@@ -874,7 +969,9 @@ class _PluginsPageState extends ConsumerState<PluginsPage> {
                     variable.hint!,
                     style: TextStyle(
                       fontSize: 11,
-                      color: Theme.of(dialogContext).colorScheme.onSurfaceVariant,
+                      color: Theme.of(
+                        dialogContext,
+                      ).colorScheme.onSurfaceVariant,
                     ),
                   ),
                 ],
@@ -915,15 +1012,10 @@ class _PluginsPageState extends ConsumerState<PluginsPage> {
       ),
     );
     if (confirmed != true) return;
-    await ref
-        .read(_pluginsProvider.notifier)
-        .saveUserVariables(
-          plugin,
-          {
-            for (final variable in variables)
-              variable.key: controllers[variable.key]!.text.trim(),
-          },
-        );
+    await ref.read(_pluginsProvider.notifier).saveUserVariables(plugin, {
+      for (final variable in variables)
+        variable.key: controllers[variable.key]!.text.trim(),
+    });
     if (mounted) {
       XyNotice.show(
         context,
@@ -1083,8 +1175,9 @@ class _PluginsPageState extends ConsumerState<PluginsPage> {
             final nonEmptyKinds = _PluginKind.values
                 .where((kind) => kindCounts[kind]! > 0)
                 .toList();
-            final shownKinds =
-                nonEmptyKinds.isEmpty ? _PluginKind.values : nonEmptyKinds;
+            final shownKinds = nonEmptyKinds.isEmpty
+                ? _PluginKind.values
+                : nonEmptyKinds;
             final visible = items
                 .where((item) => item.kind == _PluginKind.values[tabIndex])
                 .toList();
@@ -1119,10 +1212,9 @@ class _PluginsPageState extends ConsumerState<PluginsPage> {
                                       segments: [
                                         for (final kind in shownKinds)
                                           ButtonSegment(
-                                            value:
-                                                _PluginKind.values.indexOf(
-                                                  kind,
-                                                ),
+                                            value: _PluginKind.values.indexOf(
+                                              kind,
+                                            ),
                                             icon: Icon(
                                               _kindIcon(kind),
                                               size: 16,
@@ -1185,7 +1277,9 @@ class _PluginsPageState extends ConsumerState<PluginsPage> {
                                                 _selectedIds.addAll(visibleIds);
                                               }
                                             }),
-                                      icon: const Icon(Icons.select_all_rounded),
+                                      icon: const Icon(
+                                        Icons.select_all_rounded,
+                                      ),
                                       label: const Text('全选'),
                                     ),
                                   if (_selectionMode)
@@ -1244,9 +1338,7 @@ class _PluginsPageState extends ConsumerState<PluginsPage> {
                             hint: items.isEmpty
                                 ? '还没有安装插件'
                                 : '还没有${_kindLabel(_PluginKind.values[tabIndex])}音源',
-                            actionLabel: items.isEmpty
-                                ? '输入插件地址'
-                                : '安装到当前分类',
+                            actionLabel: items.isEmpty ? '输入插件地址' : '安装到当前分类',
                           ),
                         ),
                       )
@@ -1259,12 +1351,8 @@ class _PluginsPageState extends ConsumerState<PluginsPage> {
                           MediaQuery.paddingOf(context).bottom + 24,
                         ),
                         sliver: SliverReorderableList(
-                          onReorderItem: (oldIndex, newIndex) => _reorderInTab(
-                            items,
-                            visible,
-                            oldIndex,
-                            newIndex,
-                          ),
+                          onReorderItem: (oldIndex, newIndex) =>
+                              _reorderInTab(items, visible, oldIndex, newIndex),
                           itemCount: visible.length,
                           itemBuilder: (context, index) {
                             final plugin = visible[index];
@@ -1290,8 +1378,7 @@ class _PluginsPageState extends ConsumerState<PluginsPage> {
                                     .read(_pluginsProvider.notifier)
                                     .toggle(plugin, value),
                                 onInfo: () => _showPluginInfo(plugin),
-                                onUserVariables:
-                                    plugin.userVariables.isEmpty
+                                onUserVariables: plugin.userVariables.isEmpty
                                     ? null
                                     : () => _showUserVariables(plugin),
                                 onUpdate: !plugin.isOnline
@@ -1516,6 +1603,7 @@ class _PluginCard extends StatelessWidget {
   });
 
   final _PluginInfo plugin;
+
   /// 拖拽手柄对应的列表下标；小于 0（批量选择模式）时不显示手柄。
   final int dragIndex;
   final bool busy;
@@ -1607,6 +1695,16 @@ class _PluginCard extends StatelessWidget {
               ],
             ),
           ),
+          // 在线插件在卡片上直接暴露更新入口（三点菜单里也有同项），
+          // 订阅插件频繁迭代，藏太深用户找不到更新导致旧版本越用越旧。
+          if (onUpdate != null)
+            IconButton(
+              visualDensity: VisualDensity.compact,
+              iconSize: 20,
+              tooltip: '检查并安装更新',
+              onPressed: busy ? null : onUpdate,
+              icon: const Icon(Icons.refresh_rounded),
+            ),
           Switch(value: plugin.enabled, onChanged: busy ? null : onToggle),
           PopupMenuButton<String>(
             enabled: !busy,
@@ -1724,11 +1822,7 @@ class _PluginHeroBanner extends StatelessWidget {
               color: color.withValues(alpha: 0.14),
               borderRadius: BorderRadius.circular(12),
             ),
-            child: Icon(
-              Icons.library_music_rounded,
-              size: 24,
-              color: color,
-            ),
+            child: Icon(Icons.library_music_rounded, size: 24, color: color),
           ),
           const SizedBox(width: 12),
           Expanded(

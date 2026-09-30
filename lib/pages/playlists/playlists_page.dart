@@ -11,6 +11,7 @@ import 'package:permission_handler/permission_handler.dart';
 import '../../src/playlists/playlists_provider.dart';
 import '../../src/playlists/playlist_sync.dart';
 import '../../src/playlists/musicfree_backup_import.dart';
+import '../../src/favorites/favorites_provider.dart';
 import '../../src/library/library_provider.dart';
 import '../../src/navigation/sidebar_controller.dart';
 import '../../src/plugins/lx_playlist_import.dart';
@@ -188,11 +189,14 @@ class _PlaylistsPageState extends ConsumerState<PlaylistsPage> {
       builder: (_) => const _NetworkPlaylistImportDialog(),
     );
     if (summary == null || !context.mounted) return;
-    XyNotice.show(
-      context,
-      message: '已导入“${summary.name}”，共 ${summary.count} 首',
-      type: XyNoticeType.success,
-    );
+    final message = StringBuffer('已导入“${summary.name}”，共 ${summary.count} 首');
+    if (summary.favoritedCount > 0) {
+      message.write('，其中 ${summary.favoritedCount} 首已加入我的收藏');
+    }
+    if (summary.playlistFavorited) {
+      message.write('，歌单已加入收藏歌单');
+    }
+    XyNotice.show(context, message: message.toString(), type: XyNoticeType.success);
   }
 
   Future<void> _importMusicFreeBackup(
@@ -533,6 +537,14 @@ class _PlaylistsPageState extends ConsumerState<PlaylistsPage> {
   @override
   Widget build(BuildContext context) {
     final playlists = ref.watch(playlistsProvider);
+    final favoritedPlaylists = [
+      for (final playlist in playlists)
+        if (playlist.favorited) playlist,
+    ];
+    final normalPlaylists = [
+      for (final playlist in playlists)
+        if (!playlist.favorited) playlist,
+    ];
     return Scaffold(
       appBar: AppBar(
         leading: const AppSidebarMenuButton(),
@@ -585,7 +597,7 @@ class _PlaylistsPageState extends ConsumerState<PlaylistsPage> {
               )
             : Stack(
                 children: [
-                  ListView.separated(
+                  ListView(
                     controller: _playlistsController,
                     // Shell 已把底栏+迷你播放栏的遮挡高度注入
                     // MediaQuery.padding.bottom（含系统安全区），
@@ -596,119 +608,28 @@ class _PlaylistsPageState extends ConsumerState<PlaylistsPage> {
                       16,
                       MediaQuery.paddingOf(context).bottom + 12,
                     ),
-                    itemCount: playlists.length,
-                    separatorBuilder: (_, _) => const SizedBox(height: 10),
-                    itemBuilder: (context, index) {
-                      final playlist = playlists[index];
-                      return XyPanel(
-                        padding: EdgeInsets.zero,
-                        child: ListTile(
-                          minTileHeight: 72,
-                          leading: Row(
-                            mainAxisSize: MainAxisSize.min,
-                            children: [
-                              if (_selectionMode)
-                                Checkbox(
-                                  value: _selectedIds.contains(playlist.id),
-                                  onChanged: (_) =>
-                                      _toggleSelection(playlist.id),
-                                ),
-                              Container(
-                                width: 48,
-                                height: 48,
-                                decoration: BoxDecoration(
-                                  color: Theme.of(
-                                    context,
-                                  ).colorScheme.primary.withValues(alpha: 0.14),
-                                  borderRadius: BorderRadius.circular(13),
-                                ),
-                                clipBehavior: Clip.antiAlias,
-                                child: playlist.songPaths.isNotEmpty
-                                    ? CoverImage(
-                                        songPath: playlist.songPaths.first,
-                                        imageUrl: playlist.effectiveCoverUrl,
-                                        width: 48,
-                                        height: 48,
-                                        radius: 0,
-                                        icon: Icons.queue_music_rounded,
-                                      )
-                                    : Icon(
-                                        Icons.queue_music_rounded,
-                                        color: Theme.of(
-                                          context,
-                                        ).colorScheme.primary,
-                                      ),
-                              ),
-                            ],
-                          ),
-                          title: Text(
-                            playlist.name,
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                            style: const TextStyle(fontWeight: FontWeight.w700),
-                          ),
-                          subtitle: Text(
-                            playlist.importSources.isEmpty
-                                ? '${playlist.songPaths.length} 首歌曲'
-                                : '${playlist.songPaths.length} 首歌曲'
-                                      ' · ${playlist.importSources.length} 个来源',
-                          ),
-                          trailing: _selectionMode
-                              ? null
-                              : PopupMenuButton<String>(
-                                  tooltip: '更多',
-                                  onSelected: (action) {
-                                    switch (action) {
-                                      case 'sync':
-                                        syncPlaylistWithNotice(
-                                          context,
-                                          ref,
-                                          playlist,
-                                        );
-                                      case 'rename':
-                                        _rename(context, ref, playlist);
-                                      case 'delete':
-                                        _delete(context, ref, playlist);
-                                    }
-                                  },
-                                  itemBuilder: (context) => [
-                                    if (playlist.importSources.isNotEmpty)
-                                      const PopupMenuItem(
-                                        value: 'sync',
-                                        child: ListTile(
-                                          contentPadding: EdgeInsets.zero,
-                                          leading: Icon(Icons.sync_rounded),
-                                          title: Text('同步来源'),
-                                        ),
-                                      ),
-                                    const PopupMenuItem(
-                                      value: 'rename',
-                                      child: ListTile(
-                                        contentPadding: EdgeInsets.zero,
-                                        leading: Icon(Icons.edit_outlined),
-                                        title: Text('重命名'),
-                                      ),
-                                    ),
-                                    const PopupMenuItem(
-                                      value: 'delete',
-                                      child: ListTile(
-                                        contentPadding: EdgeInsets.zero,
-                                        leading: Icon(Icons.delete_outline),
-                                        title: Text('删除歌单'),
-                                      ),
-                                    ),
-                                  ],
-                                  icon: const Icon(Icons.more_horiz_rounded),
-                                ),
-                          onTap: () => _selectionMode
-                              ? _toggleSelection(playlist.id)
-                              : context.push('/home/playlists/${playlist.id}'),
-                          onLongPress: _selectionMode
-                              ? null
-                              : () => _enterSelection(playlist.id),
+                    children: [
+                      // 收藏歌单分区与「我的收藏」（歌曲级收藏）是两个
+                      // 概念：前者是歌单级收藏，独立分区置顶显示。
+                      if (favoritedPlaylists.isNotEmpty) ...[
+                        _PlaylistSectionHeader(
+                          label: '收藏歌单',
+                          count: favoritedPlaylists.length,
+                          first: true,
                         ),
-                      );
-                    },
+                        for (final playlist in favoritedPlaylists)
+                          _playlistTile(context, playlist),
+                      ],
+                      if (normalPlaylists.isNotEmpty) ...[
+                        _PlaylistSectionHeader(
+                          label: '我的歌单',
+                          count: normalPlaylists.length,
+                          first: favoritedPlaylists.isEmpty,
+                        ),
+                        for (final playlist in normalPlaylists)
+                          _playlistTile(context, playlist),
+                      ],
+                    ],
                   ),
                   ScrollToTopButton(
                     controller: _playlistsController,
@@ -718,6 +639,176 @@ class _PlaylistsPageState extends ConsumerState<PlaylistsPage> {
                   ),
                 ],
               ),
+      ),
+    );
+  }
+
+  Widget _playlistTile(BuildContext context, MobilePlaylist playlist) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 10),
+      child: XyPanel(
+        padding: EdgeInsets.zero,
+        child: ListTile(
+          minTileHeight: 72,
+          leading: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              if (_selectionMode)
+                Checkbox(
+                  value: _selectedIds.contains(playlist.id),
+                  onChanged: (_) => _toggleSelection(playlist.id),
+                ),
+              Container(
+                width: 48,
+                height: 48,
+                decoration: BoxDecoration(
+                  color: Theme.of(context).colorScheme.primary.withValues(
+                    alpha: 0.14,
+                  ),
+                  borderRadius: BorderRadius.circular(13),
+                ),
+                clipBehavior: Clip.antiAlias,
+                child: playlist.songPaths.isNotEmpty
+                    ? CoverImage(
+                        songPath: playlist.songPaths.first,
+                        imageUrl: playlist.effectiveCoverUrl,
+                        width: 48,
+                        height: 48,
+                        radius: 0,
+                        icon: Icons.queue_music_rounded,
+                      )
+                    : Icon(
+                        Icons.queue_music_rounded,
+                        color: Theme.of(context).colorScheme.primary,
+                      ),
+              ),
+            ],
+          ),
+          title: Text(
+            playlist.name,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: const TextStyle(fontWeight: FontWeight.w700),
+          ),
+          subtitle: Text(
+            playlist.importSources.isEmpty
+                ? '${playlist.songPaths.length} 首歌曲'
+                : '${playlist.songPaths.length} 首歌曲'
+                      ' · ${playlist.importSources.length} 个来源',
+          ),
+          trailing: _selectionMode
+              ? null
+              : Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    IconButton(
+                      tooltip: playlist.favorited ? '取消收藏歌单' : '收藏歌单',
+                      visualDensity: VisualDensity.compact,
+                      onPressed: () => ref
+                          .read(playlistsProvider.notifier)
+                          .toggleFavorite(playlist.id),
+                      icon: Icon(
+                        playlist.favorited
+                            ? Icons.star_rounded
+                            : Icons.star_outline_rounded,
+                        color: playlist.favorited
+                            ? Theme.of(context).colorScheme.primary
+                            : null,
+                      ),
+                    ),
+                    PopupMenuButton<String>(
+                      tooltip: '更多',
+                      onSelected: (action) {
+                        switch (action) {
+                          case 'sync':
+                            syncPlaylistWithNotice(
+                              context,
+                              ref,
+                              playlist,
+                            );
+                          case 'rename':
+                            _rename(context, ref, playlist);
+                          case 'delete':
+                            _delete(context, ref, playlist);
+                        }
+                      },
+                      itemBuilder: (context) => [
+                        if (playlist.importSources.isNotEmpty)
+                          const PopupMenuItem(
+                            value: 'sync',
+                            child: ListTile(
+                              contentPadding: EdgeInsets.zero,
+                              leading: Icon(Icons.sync_rounded),
+                              title: Text('同步来源'),
+                            ),
+                          ),
+                        const PopupMenuItem(
+                          value: 'rename',
+                          child: ListTile(
+                            contentPadding: EdgeInsets.zero,
+                            leading: Icon(Icons.edit_outlined),
+                            title: Text('重命名'),
+                          ),
+                        ),
+                        const PopupMenuItem(
+                          value: 'delete',
+                          child: ListTile(
+                            contentPadding: EdgeInsets.zero,
+                            leading: Icon(Icons.delete_outline),
+                            title: Text('删除歌单'),
+                          ),
+                        ),
+                      ],
+                      icon: const Icon(Icons.more_horiz_rounded),
+                    ),
+                  ],
+                ),
+          onTap: () => _selectionMode
+              ? _toggleSelection(playlist.id)
+              : context.push('/home/playlists/${playlist.id}'),
+          onLongPress: _selectionMode
+              ? null
+              : () => _enterSelection(playlist.id),
+        ),
+      ),
+    );
+  }
+}
+
+class _PlaylistSectionHeader extends StatelessWidget {
+  const _PlaylistSectionHeader({
+    required this.label,
+    required this.count,
+    required this.first,
+  });
+
+  final String label;
+  final int count;
+
+  /// 是否为列表首个分区（首个分区不加上间距，避免与 AppBar 拉开过大）。
+  final bool first;
+
+  @override
+  Widget build(BuildContext context) {
+    final color = Theme.of(context).colorScheme.onSurfaceVariant;
+    return Padding(
+      padding: EdgeInsets.fromLTRB(6, first ? 4 : 18, 6, 6),
+      child: Row(
+        children: [
+          Text(
+            label,
+            style: TextStyle(
+              fontSize: 13,
+              fontWeight: FontWeight.w800,
+              color: color,
+            ),
+          ),
+          const SizedBox(width: 6),
+          Text(
+            '$count',
+            style: TextStyle(fontSize: 12, color: color.withValues(alpha: 0.7)),
+          ),
+        ],
       ),
     );
   }
@@ -784,10 +875,21 @@ class _EmptyPlaylists extends StatelessWidget {
 enum _PlaylistImportMode { network, musicFree, local }
 
 class _NetworkImportSummary {
-  const _NetworkImportSummary(this.name, this.count);
+  const _NetworkImportSummary(
+    this.name,
+    this.count,
+    this.favoritedCount,
+    this.playlistFavorited,
+  );
 
   final String name;
   final int count;
+
+  /// 同步加入「我的收藏」的歌曲数（未勾选一键收藏时为 0）。
+  final int favoritedCount;
+
+  /// 是否已把导入的歌单标记为收藏歌单。
+  final bool playlistFavorited;
 }
 
 class _NetworkPlaylistImportDialog extends ConsumerStatefulWidget {
@@ -807,6 +909,10 @@ class _NetworkPlaylistImportDialogState
   String? _selectedSourceId;
   String? _error;
   bool _importing = false;
+  // 导入同时把全部歌曲加入「我的收藏」（歌曲级收藏，与歌单本身分开）。
+  bool _favoriteAll = false;
+  // 导入同时把歌单本身标记为收藏歌单（歌单级收藏，独立分区显示）。
+  bool _favoritePlaylist = false;
 
   @override
   void dispose() {
@@ -933,6 +1039,9 @@ class _NetworkPlaylistImportDialogState
             coverUrl: importedCover,
             sources: [source],
           );
+          if (_favoritePlaylist) {
+            await notifier.setFavorite(existing.id, true);
+          }
         } else {
           await notifier.create(
             name,
@@ -941,6 +1050,7 @@ class _NetworkPlaylistImportDialogState
                 : importedCover,
             songs: songs,
             sources: [source],
+            favorited: _favoritePlaylist,
           );
         }
       } else {
@@ -949,10 +1059,25 @@ class _NetworkPlaylistImportDialogState
           coverUrl: importedCover.isEmpty ? songs.first.coverUrl : importedCover,
           songs: songs,
           sources: [source],
+          favorited: _favoritePlaylist,
         );
       }
+      var favoritedCount = 0;
+      if (_favoriteAll) {
+        favoritedCount = await ref
+            .read(favoritesProvider.notifier)
+            .addAll([for (final song in songs) FavoriteSongSnapshot.fromSong(song)]);
+      }
       if (!mounted) return;
-      Navigator.pop(context, _NetworkImportSummary(name, songs.length));
+      Navigator.pop(
+        context,
+        _NetworkImportSummary(
+          name,
+          songs.length,
+          favoritedCount,
+          _favoritePlaylist,
+        ),
+      );
     } catch (error) {
       if (!mounted) return;
       setState(() {
@@ -1045,6 +1170,24 @@ class _NetworkPlaylistImportDialogState
                   hintText: '留空则使用网络歌单名称',
                   prefixIcon: Icon(Icons.edit_rounded),
                 ),
+              ),
+              SwitchListTile(
+                contentPadding: EdgeInsets.zero,
+                value: _favoriteAll,
+                onChanged: _importing
+                    ? null
+                    : (value) => setState(() => _favoriteAll = value),
+                title: const Text('同时收藏全部歌曲'),
+                subtitle: const Text('导入后把歌单内歌曲加入「我的收藏」'),
+              ),
+              SwitchListTile(
+                contentPadding: EdgeInsets.zero,
+                value: _favoritePlaylist,
+                onChanged: _importing
+                    ? null
+                    : (value) => setState(() => _favoritePlaylist = value),
+                title: const Text('收藏该歌单'),
+                subtitle: const Text('导入后在歌单页「收藏歌单」分区置顶显示'),
               ),
               Text(
                 '来源为已启用的插件，仅可导入公开歌单。',

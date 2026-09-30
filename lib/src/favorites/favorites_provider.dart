@@ -90,6 +90,19 @@ class FavoriteSongSnapshot {
     'lyricsRaw': lyricsRaw,
   };
 
+  FavoriteSongSnapshot withCover(String newCoverUrl) => FavoriteSongSnapshot(
+    path: path,
+    title: title,
+    artist: artist,
+    album: album,
+    duration: duration,
+    format: format,
+    coverUrl: newCoverUrl,
+    pluginId: pluginId,
+    pluginData: pluginData,
+    lyricsRaw: lyricsRaw,
+  );
+
   Song toSong() {
     final savedCover = coverUrl?.trim() ?? '';
     final recoveredCover = pluginData == null
@@ -183,6 +196,22 @@ class FavoritesNotifier extends StateNotifier<Set<String>> {
       return;
     }
     _songSnapshots[song.path] = song;
+    await _persist();
+  }
+
+  /// 补拉封面回写：收藏快照存在且封面为空时填入补拉结果。
+  /// 不回写的话，收藏列表与备份迁移到其他设备后的封面都会和
+  /// 播放页实际显示的不一致。仅更新持久化快照，不触发收藏集合变更。
+  Future<void> backfillCover(String path, String coverUrl) async {
+    await _loaded;
+    final trimmed = coverUrl.trim();
+    final snapshot = _songSnapshots[path];
+    if (trimmed.isEmpty ||
+        snapshot == null ||
+        snapshot.coverUrl?.trim().isNotEmpty == true) {
+      return;
+    }
+    _songSnapshots[path] = snapshot.withCover(trimmed);
     await _persist();
   }
 

@@ -919,7 +919,9 @@ pub fn parse_folder_song_sort_mode(s: &str) -> Result<FolderSongSortMode, String
 // =========================================================================
 
 /// 随本地备份迁移的曲库用户数据表。
-/// 不包含：播放会话/播放历史/统计（会话类数据不迁移）、
+/// 播放历史与听歌统计表含曲名/歌手等元数据列，网络歌曲的展示信息
+/// 随统计行一起迁移，恢复后无需重新下载即可显示。
+/// 不包含：playback_session（活动播放会话）、
 /// remote_sources/remote_files（远程音源配置含凭据）、song_loudness（可重新扫描生成）。
 const BACKUP_TABLES: &[&str] = &[
     "songs",
@@ -928,6 +930,16 @@ const BACKUP_TABLES: &[&str] = &[
     "song_artists",
     "song_backgrounds",
     "sidebar_folders",
+    "play_history",
+    "recent_plays",
+    "song_stats",
+    "global_stats",
+    "daily_stats",
+    "hourly_stats",
+    "daily_unique_song_entries",
+    "daily_unique_artist_entries",
+    "statistics_meta",
+    "imported_exports_log",
 ];
 
 /// 把单列值转成 JSON 值（BLOB 不参与备份，转 null）。
@@ -1040,8 +1052,10 @@ pub fn import_library_tables(conn: &mut Connection, payload: &str) -> Result<(),
     let parsed: std::collections::HashMap<String, TableBackup> =
         serde_json::from_str(payload).map_err(|_| "曲库备份数据格式无效".to_string())?;
     let tx = conn.transaction().map_err(|e| e.to_string())?;
-    // 覆盖语义：先清空全部目标表（子表先清，满足外键约束；
+    // 覆盖语义：先清空目标表（子表先清，满足外键约束；
     // song_loudness 依赖 songs 的 ON DELETE CASCADE 级联清理，无需单独处理）。
+    // 播放历史与统计表仅当备份中含该表时才清空——旧版本备份
+    // （v1–v3）没有这些表，不应把用户当前统计数据连带抹掉。
     for table in [
         "song_artists",
         "song_backgrounds",
@@ -1053,15 +1067,14 @@ pub fn import_library_tables(conn: &mut Connection, payload: &str) -> Result<(),
         tx.execute(&format!("DELETE FROM {table}"), [])
             .map_err(|e| e.to_string())?;
     }
+    for table in BACKUP_TABLES.iter().copied() {
+        if parsed.contains_key(table) {
+            tx.execute(&format!("DELETE FROM {table}"), [])
+                .map_err(|e| e.to_string())?;
+        }
+    }
     // 插入（父表先插，保证外键可解析）。
-    for table in [
-        "songs",
-        "artists",
-        "song_artists",
-        "song_backgrounds",
-        "library_folders",
-        "sidebar_folders",
-    ] {
+    for table in BACKUP_TABLES.iter().copied() {
         let Some(backup) = parsed.get(table) else {
             continue;
         };
@@ -1149,6 +1162,29 @@ mod tests {
                 [],
             )
             .expect("insert song_artists");
+        // 播放历史与统计：网络歌曲的统计行自带元数据，备份恢复后
+        // 最近播放与听歌统计应完整迁移。
+        source
+            .execute(
+                "INSERT INTO play_history (song_path, played_at, played_ms, event)
+                 VALUES (?1, ?2, 0, 'recent')",
+                rusqlite::params!["plugin://wy/100", 1_700_000_000],
+            )
+            .expect("insert play_history");
+        source
+            .execute(
+                "INSERT INTO song_stats (strict_identity_key, title, artist, album, play_count)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params!["key-1", "A", "Artist A", "Album", 5],
+            )
+            .expect("insert song_stats");
+        source
+            .execute(
+                "INSERT INTO global_stats (id, total_play_count, total_play_time_ms)
+                 VALUES (1, 5, 60000)",
+                [],
+            )
+            .expect("insert global_stats");
         let payload = export_library_tables(&source).expect("export");
 
         // 目标库：先有一条额外歌曲，导入后应被覆盖清除。
@@ -1183,6 +1219,65 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM song_artists", [], |row| row.get(0))
             .unwrap();
         assert_eq!(link_count, 1);
+        let (recent_path, played_at): (String, i64) = target
+            .query_row(
+                "SELECT song_path, played_at FROM play_history",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(recent_path, "plugin://wy/100");
+        assert_eq!(played_at, 1_700_000_000);
+        let (stats_title, play_count): (String, i64) = target
+            .query_row(
+                "SELECT title, play_count FROM song_stats WHERE strict_identity_key = 'key-1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(stats_title, "A");
+        assert_eq!(play_count, 5);
+        let global_plays: i64 = target
+            .query_row(
+                "SELECT total_play_count FROM global_stats WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(global_plays, 5);
+    }
+
+    /// 旧版本备份（v1–v3）不含统计表：导入不应清空目标库现有统计数据。
+    #[test]
+    fn legacy_backup_without_stats_keeps_existing_statistics() {
+        // 仅含曲库核心表的旧备份载荷。
+        let legacy = serde_json::json!({
+            "songs": {
+                "columns": ["path", "title"],
+                "rows": [["/music/a.mp3", "A"]]
+            }
+        })
+        .to_string();
+
+        let mut target = Connection::open_in_memory().expect("open target");
+        crate::database::schema::ensure_base_schema(&target).expect("target schema");
+        target
+            .execute(
+                "INSERT INTO song_stats (strict_identity_key, title, play_count)
+                 VALUES ('keep-1', 'Keep', 3)",
+                [],
+            )
+            .expect("insert existing stats");
+        import_library_tables(&mut target, &legacy).expect("import");
+
+        let kept: i64 = target
+            .query_row(
+                "SELECT play_count FROM song_stats WHERE strict_identity_key = 'keep-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(kept, 3, "旧备份导入不应清空现有统计数据");
     }
 
     fn create_minimal_schema(conn: &Connection) {

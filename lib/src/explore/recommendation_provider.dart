@@ -405,11 +405,21 @@ final exploreRecommendationsProvider = FutureProvider<List<Song>>((ref) async {
 
 /// 探索页的歌单/专辑推荐项。保留插件和原始条目，点击时可直接交给
 /// 插件的歌单导入流程，而不是只显示一个无法操作的卡片。
+/// [isChart] 标记条目来自热门榜单（exploreHotChartsProvider）：榜单
+/// 详情需走 getTopListSongs（music/toplist/detail），而不是把榜单 id
+/// 当歌单 ID 丢给 importPlaylist（music/import 后端不认榜单 id）。
 class RecommendedPlaylist {
-  const RecommendedPlaylist({required this.plugin, required this.result});
+  const RecommendedPlaylist({
+    required this.plugin,
+    required this.result,
+    this.isChart = false,
+  });
 
   final EnabledMusicPlugin plugin;
   final PluginCatalogResult result;
+
+  /// 是否为热门榜单条目（决定详情页的歌曲加载路径）。
+  final bool isChart;
 }
 
 /// 从已启用插件的热门榜单拉取大众热门歌曲，与个人偏好无关，
@@ -656,7 +666,11 @@ final exploreHotChartsProvider = FutureProvider<List<RecommendedPlaylist>>((
   final refreshTimer = Timer(const Duration(minutes: 30), ref.invalidateSelf);
   ref.onDispose(refreshTimer.cancel);
 
-  final plugins = await ref.read(enabledMusicPluginsProvider.future);
+  // 依赖（watch）插件列表而非一次性 read：订阅更新/卸载/去重合并会
+  // 重写或删除插件文件并 invalidate 插件列表，这里必须随之重算，
+  // 否则榜单条目持有旧插件对象（path 指向已删除的文件），打开榜单
+  // 详情时读脚本直接抛 PathNotFoundException。
+  final plugins = await ref.watch(enabledMusicPluginsProvider.future);
   if (plugins.isEmpty) return const [];
   final runtime = ref.read(pluginRuntimeProvider);
   final result = <RecommendedPlaylist>[];
@@ -681,7 +695,9 @@ final exploreHotChartsProvider = FutureProvider<List<RecommendedPlaylist>>((
           if (_playlistSongCount(chart) == 1) continue;
           final key = '${_tasteText(chart.id)}|${_tasteText(chart.title)}';
           if (!seen.add(key)) continue;
-          result.add(RecommendedPlaylist(plugin: plugin, result: chart));
+          result.add(
+            RecommendedPlaylist(plugin: plugin, result: chart, isChart: true),
+          );
           if (seen.length >= 8) break;
         }
       } catch (_) {
@@ -716,6 +732,7 @@ final exploreHotChartsProvider = FutureProvider<List<RecommendedPlaylist>>((
               coverUrl: cover,
               rawData: entry.result.rawData,
             ),
+            isChart: entry.isChart,
           );
           break;
         }

@@ -117,9 +117,17 @@ pub async fn plugin_http_request_binary(
         reqwest::Method::from_bytes(method.trim().as_bytes()).map_err(|error| error.to_string())?;
 
     let redirect_limit = follow.unwrap_or(10);
+    // follow=0 表示不跟随重定向、直接返回 3xx 响应本身（含 Location 头）。
+    // reqwest 的 Policy::limited(0) 遇到重定向会报错而非返回响应，
+    // 必须用 Policy::none() 才是「maxRedirects: 0」的语义。
+    let redirect_policy = if redirect_limit == 0 {
+        reqwest::redirect::Policy::none()
+    } else {
+        reqwest::redirect::Policy::limited(redirect_limit as usize)
+    };
     let request_timeout = Duration::from_secs(timeout.unwrap_or(30));
     let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::limited(redirect_limit as usize))
+        .redirect(redirect_policy)
         .timeout(request_timeout)
         .user_agent(USER_AGENT)
         .build()

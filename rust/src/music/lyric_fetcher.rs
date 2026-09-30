@@ -498,28 +498,134 @@ fn triple_des_crypt(data: &[u8], key_schedule: &[DesSchedule; 3]) -> [u8; 8] {
     temp
 }
 
-fn qrc_decrypt(encrypted_hex: &str) -> Result<String, String> {
+/// 集成测试用：暴露 QRC 3DES 解密入口。
+pub fn test_support_qrc_decrypt(encrypted_hex: &str) -> Result<String, String> {
+    qrc_decrypt(encrypted_hex)
+}
+
+/// 集成测试用：单块 3DES + 中间值（IP 后 s0/s1、三个子密钥的 schedule
+/// 首行），用于与 Dart 翻译实现逐级比对。
+pub fn test_support_des_trace(block_hex: &str) -> String {
+    let block = hex_to_bytes(block_hex);
+    let qrc_key = b"!@#)(*$%123ZXC!@!@#)(NHL";
+    let schedule = triple_des_key_setup(qrc_key, 0);
+    let (s0, s1) = initial_permutation(&block);
+    let f0 = des_f(s1, &schedule[0][0]);
+    format!(
+        "s0={:08x} s1={:08x} f0={:08x} k0_0={} k1_0={} k2_0={}",
+        s0, s1, f0,
+        schedule[0][0].iter().map(|b| format!("{:02x}", b)).collect::<String>(),
+        schedule[1][0].iter().map(|b| format!("{:02x}", b)).collect::<String>(),
+        schedule[2][0].iter().map(|b| format!("{:02x}", b)).collect::<String>(),
+    )
+}
+
+/// 集成测试用：返回 3DES 解密后的原始字节（未解压），用于诊断密文格式。
+pub fn test_support_qrc_decrypt_raw(encrypted_hex: &str) -> Vec<u8> {
     let encrypted_bytes = hex_to_bytes(encrypted_hex);
+    let qrc_key = b"!@#)(*$%123ZXC!@!@#)(NHL";
+    let schedule = triple_des_key_setup(qrc_key, 0);
+    let mut decrypted_bytes = vec![0u8; encrypted_bytes.len()];
+    let mut i = 0;
+    while i + 8 <= encrypted_bytes.len() {
+        let block = &encrypted_bytes[i..i + 8];
+        let decrypted = triple_des_crypt(block, &schedule);
+        decrypted_bytes[i..i + 8].copy_from_slice(&decrypted);
+        i += 8;
+    }
+    decrypted_bytes
+}
+
+pub(crate) fn qrc_decrypt(encrypted_hex: &str) -> Result<String, String> {
+    let encrypted_hex = encrypted_hex.trim();
+    if encrypted_hex.is_empty() || encrypted_hex.len() % 2 != 0 {
+        return Err("Invalid hex data".to_string());
+    }
+    let mut encrypted_bytes = hex_to_bytes(encrypted_hex);
     if encrypted_bytes.is_empty() {
         return Err("No data to decrypt".to_string());
     }
+
+    // mode: 0 = 解密（schedule 逆序生成）
     let qrc_key = b"!@#)(*$%123ZXC!@!@#)(NHL";
     let schedule = triple_des_key_setup(qrc_key, 0);
 
-    let mut decrypted_bytes = vec![0u8; encrypted_bytes.len()];
-    let mut i = 0;
-    while i < encrypted_bytes.len() {
-        let block_len = std::cmp::min(8, encrypted_bytes.len() - i);
-        let mut block = [0u8; 8];
-        block[..block_len].copy_from_slice(&encrypted_bytes[i..i + block_len]);
+    // 只处理完整 8 字节块，尾部不完整块保持原样（对齐桌面端实现）。
+    for chunk in encrypted_bytes.chunks_exact_mut(8) {
+        let block: [u8; 8] = chunk.try_into().unwrap();
         let decrypted = triple_des_crypt(&block, &schedule);
-        decrypted_bytes[i..i + block_len].copy_from_slice(&decrypted[..block_len]);
-        i += 8;
+        chunk.copy_from_slice(&decrypted);
     }
 
-    // QQ 的 QRC 密文解密后是 zlib 流（0x78 0x9C 头），不是 raw deflate；
-    // 解压结果可能带 UTF-8 BOM，需一并去除。
-    decompress_zlib_to_string(&decrypted_bytes)
+    // 解压：正确密钥下产物为标准 zlib 流（0x78 0x9C 头，QQ qrc:1 逐字与
+    // qrc:0 普通 LRC 均如此）；部分变体是 sync-flush 流或无头 deflate，
+    // 保留多格式尝试兜底（对齐桌面端 qrc_decrypt）。
+    for attempt in [
+        decompress_zlib_to_bytes(&encrypted_bytes),
+        decompress_zlib_sync_flush(&encrypted_bytes),
+        decompress_deflate_to_bytes(&encrypted_bytes),
+        decompress_zlib_to_bytes_skip_header(&encrypted_bytes),
+        decompress_gzip_to_bytes(&encrypted_bytes),
+    ] {
+        if let Ok(bytes) = attempt {
+            if !bytes.is_empty() {
+                // 解压结果可能带 UTF-8 BOM，需去除。
+                let bytes = if bytes.len() >= 3
+                    && bytes[0] == 0xEF
+                    && bytes[1] == 0xBB
+                    && bytes[2] == 0xBF
+                {
+                    bytes[3..].to_vec()
+                } else {
+                    bytes
+                };
+                return String::from_utf8(bytes).map_err(|e| e.to_string());
+            }
+        }
+    }
+    Err("decompression failed".to_string())
+}
+
+/// zlib sync-flush 流解压：流中没有最终结束块时标准 inflate 会报错，
+/// 用 FlushDecompress::Sync 逐块拉取已产出数据（桌面端同款实现）。
+fn decompress_zlib_sync_flush(bytes: &[u8]) -> Result<Vec<u8>, String> {
+    use flate2::{Decompress, FlushDecompress, Status};
+    let mut d = Decompress::new(true);
+    let mut out = Vec::with_capacity(bytes.len() * 3 + 64);
+    let mut buf = [0u8; 16384];
+    let mut in_pos = 0usize;
+    let mut guard = 0usize;
+    loop {
+        guard += 1;
+        if guard > 1_000_000 {
+            return Err("zlib inflate loop limit".to_string());
+        }
+        let before = d.total_out();
+        let available_in = bytes.len().saturating_sub(in_pos);
+        let status = d
+            .decompress(
+                &bytes[in_pos..in_pos + available_in],
+                &mut buf,
+                FlushDecompress::Sync,
+            )
+            .map_err(|e| e.to_string())?;
+        out.extend_from_slice(&buf[..(d.total_out() - before) as usize]);
+        match status {
+            Status::StreamEnd => return Ok(out),
+            Status::Ok | Status::BufError => {
+                if d.total_in() as usize > in_pos {
+                    in_pos = d.total_in() as usize;
+                }
+                if available_in == 0 && status == Status::BufError {
+                    return if out.is_empty() {
+                        Err("sync flush produced nothing".to_string())
+                    } else {
+                        Ok(out)
+                    };
+                }
+            }
+        }
+    }
 }
 
 fn decompress_zlib_to_string(bytes: &[u8]) -> Result<String, String> {

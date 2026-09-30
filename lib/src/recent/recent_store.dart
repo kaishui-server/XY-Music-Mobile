@@ -52,6 +52,18 @@ class RecentSongSnapshot {
     'pluginData': pluginData,
     'coverUrl': coverUrl,
   };
+
+  RecentSongSnapshot withCover(String newCoverUrl) => RecentSongSnapshot(
+    path: path,
+    title: title,
+    artist: artist,
+    album: album,
+    durationMs: durationMs,
+    playedAt: playedAt,
+    pluginId: pluginId,
+    pluginData: pluginData,
+    coverUrl: newCoverUrl,
+  );
 }
 
 const _recentSongMetadataKey = 'recentSongMetadataV1';
@@ -102,6 +114,33 @@ Future<void> clearRecentSongSnapshots() {
   final operation = _recentSnapshotWriteQueue.then((_) async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.remove(_recentSongMetadataKey);
+  });
+  _recentSnapshotWriteQueue = operation.catchError((_) {});
+  return operation;
+}
+
+/// 补拉封面回写：快照存在且封面为空时填入补拉结果（fire-and-forget）。
+/// 播放时现场补拉的封面（如网易系 OST）只更新了队列内存态；不回写
+/// 快照的话，最近播放列表的封面与备份迁移到其他设备后的封面都会
+/// 和播放页实际显示的不一致。
+Future<void> backfillRecentSongCover(String path, String coverUrl) {
+  final trimmed = coverUrl.trim();
+  if (trimmed.isEmpty) return Future.value();
+  final operation = _recentSnapshotWriteQueue.then((_) async {
+    final prefs = await SharedPreferences.getInstance();
+    final snapshots = _decodeSnapshots(prefs.getString(_recentSongMetadataKey));
+    final snapshot = snapshots[path];
+    if (snapshot == null || snapshot.coverUrl?.trim().isNotEmpty == true) {
+      return;
+    }
+    snapshots[path] = snapshot.withCover(trimmed);
+    await prefs.setString(
+      _recentSongMetadataKey,
+      jsonEncode(
+        snapshots.map((path, value) => MapEntry(path, value.toJson())),
+        toEncodable: (value) => value.toString(),
+      ),
+    );
   });
   _recentSnapshotWriteQueue = operation.catchError((_) {});
   return operation;

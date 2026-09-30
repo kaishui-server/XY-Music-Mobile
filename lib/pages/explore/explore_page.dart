@@ -1009,31 +1009,62 @@ class _RecommendedPlaylistPageState
   }
 
   Future<List<Song>> _loadSongs() async {
-    final catalog = widget.playlist.result;
-    final raw = catalog.rawData;
-    final input = <String>[
-      for (final key in const [
-        'id',
-        'playlistId',
-        'sheetId',
-        'albumId',
-        'album_id',
-        'url',
-        'link',
-      ])
-        if (raw[key]?.toString().trim().isNotEmpty == true)
-          raw[key].toString().trim(),
-      if (catalog.id.trim().isNotEmpty) catalog.id.trim(),
-      catalog.title.trim(),
-    ].firstWhere((value) => value.isNotEmpty);
-    final imported = await ref
-        .read(pluginRuntimeProvider)
-        .importPlaylist(widget.playlist.plugin, input);
-    return imported.songs
+    final runtime = ref.read(pluginRuntimeProvider);
+    // 探索页缓存条目期间，插件可能被订阅更新/去重合并重写甚至删除
+    //（文件名变体会被归一删除）。参考弦予：执行前按插件 id 重新解析
+    // 当前启用插件，避免拿着旧对象读已删除的脚本文件而抛
+    // PathNotFoundException。解析不到时保留原对象，由运行时给出
+    // 友好提示。
+    var plugin = widget.playlist.plugin;
+    try {
+      final plugins = await ref.read(enabledMusicPluginsProvider.future);
+      for (final item in plugins) {
+        if (item.id == plugin.id) {
+          plugin = item;
+          break;
+        }
+      }
+    } catch (_) {
+      // 插件列表读取失败时按原对象执行。
+    }
+    final List<PluginSearchSong> items;
+    if (widget.playlist.isChart) {
+      // 热门榜单：走 getTopListSongs（animemusic 直连
+      // music/toplist/detail 分页取全，MusicFree 插件走
+      // getTopListDetail 分页）。榜单 id 不能丢给 importPlaylist——
+      // animemusic 后端的 music/import 只认歌单 ID/链接，会误报
+      // “歌单为空，或该插件不支持歌单导入”。
+      items = await runtime.getTopListSongs(
+        plugin,
+        widget.playlist.result,
+        fetchAll: true,
+      );
+    } else {
+      final catalog = widget.playlist.result;
+      final raw = catalog.rawData;
+      final input = <String>[
+        for (final key in const [
+          'id',
+          'playlistId',
+          'sheetId',
+          'albumId',
+          'album_id',
+          'url',
+          'link',
+        ])
+          if (raw[key]?.toString().trim().isNotEmpty == true)
+            raw[key].toString().trim(),
+        if (catalog.id.trim().isNotEmpty) catalog.id.trim(),
+        catalog.title.trim(),
+      ].firstWhere((value) => value.isNotEmpty);
+      final imported = await runtime.importPlaylist(plugin, input);
+      items = imported.songs;
+    }
+    return items
         .where((item) => item.title.trim().isNotEmpty)
         .map(
           (item) => Song(
-            path: pluginSongPath(widget.playlist.plugin, item),
+            path: pluginSongPath(plugin, item),
             title: item.title,
             artist: item.artist,
             album: item.album,
@@ -1041,7 +1072,7 @@ class _RecommendedPlaylistPageState
             duration: (item.durationMs / 1000).round(),
             format: '网络',
             coverUrl: item.coverUrl,
-            pluginId: widget.playlist.plugin.id,
+            pluginId: plugin.id,
             pluginData: item.rawData,
             lyricsRaw: _playlistEmbeddedLyrics(item.rawData),
           ),

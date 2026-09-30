@@ -10,6 +10,7 @@ import '../core/settings.dart';
 import '../library/library_provider.dart';
 import '../player/android_storage.dart';
 import '../player/download_history_store.dart';
+import '../player/download_lyrics.dart';
 import '../plugins/plugin_runtime.dart' show qualityDisplayLabel;
 import '../player/download_quality.dart';
 import '../player/downloaded_song_store.dart';
@@ -436,7 +437,14 @@ Future<void> runBatchDownload(
           songTitle: song.title,
         );
         if (verified.warning != null) downgraded.add(verified.warning!);
-        final lyrics = song.lyricsRaw?.trim() ?? '';
+        // 列表歌曲的 lyricsRaw 多为空（歌词只在播放时加载），音源解析
+        // 返回的歌词兜底；QRC/KRC 密文解码为标准 LRC 再落盘。
+        final rawLyrics = song.lyricsRaw?.trim().isNotEmpty == true
+            ? song.lyricsRaw!.trim()
+            : source.lyrics.trim();
+        final lyrics = (settings?.downloadLyrics ?? true)
+            ? await normalizeLyricsForDownload(rawLyrics)
+            : '';
         final coverUrl = song.coverUrl?.trim() ?? '';
         await finalizeDownloadExtras(
           requestJson: jsonEncode({

@@ -657,7 +657,11 @@ class EffectsNotifier extends AsyncNotifier<EffectsSettings> {
     final preset = CustomEqPreset(g, [...current.gains]);
     final list = [..._customEqPresets];
     final idx = list.indexWhere((p) => p.name == g);
-    if (idx >= 0) list[idx] = preset; else list.add(preset);
+    if (idx >= 0) {
+      list[idx] = preset;
+    } else {
+      list.add(preset);
+    }
     _customEqPresets = list;
     await _persistCustom();
     _notifyCustomChange();
@@ -726,6 +730,10 @@ class EffectsNotifier extends AsyncNotifier<EffectsSettings> {
   }
 
   Future<void> _applyToExclusiveOutput(EffectsSettings settings) async {
+    // DSP 共享管线接管期间由播放器统一下发音效 JSON：其 JSON 已合成
+    // 播放页倍速（静音时钟对齐），此处原始 toRustJson 直发会与之
+    // 竞态互相覆盖，导致管线变速与进度错位。仅 USB 独占模式直发。
+    if (dspPipelineOwnsEffects) return;
     try {
       if (!await isUsbExclusiveActive()) return;
       await setUsbExclusiveEqualizer(
@@ -737,6 +745,10 @@ class EffectsNotifier extends AsyncNotifier<EffectsSettings> {
     } catch (_) {}
   }
 }
+
+/// 播放器 DSP 共享管线是否接管出声（由 player_provider 维护）。
+/// true 时本文件 save() 的独占直发让位，见 [_applyToExclusiveOutput]。
+bool dspPipelineOwnsEffects = false;
 
 final effectsProvider = AsyncNotifierProvider<EffectsNotifier, EffectsSettings>(
   EffectsNotifier.new,

@@ -1,4 +1,5 @@
 pub mod buffered_source;
+pub mod channel_downmix;
 pub mod crossfade;
 pub mod equalizer;
 pub mod loudness;

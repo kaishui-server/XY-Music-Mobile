@@ -78,6 +78,20 @@ class PlaylistSongSnapshot {
     'lyricsRaw': lyricsRaw,
   };
 
+  PlaylistSongSnapshot withCover(String newCoverUrl) => PlaylistSongSnapshot(
+    path: path,
+    title: title,
+    artist: artist,
+    album: album,
+    duration: duration,
+    format: format,
+    coverThumbPath: coverThumbPath,
+    coverUrl: newCoverUrl,
+    pluginId: pluginId,
+    pluginData: pluginData,
+    lyricsRaw: lyricsRaw,
+  );
+
   Song toSong() => Song(
     path: path,
     title: title,
@@ -152,6 +166,7 @@ class MobilePlaylist {
     this.customOrder,
     this.importSources = const [],
     this.songSources = const {},
+    this.favorited = false,
   });
 
   final String id;
@@ -172,6 +187,10 @@ class MobilePlaylist {
   /// （同步时永不移除）；同步时来源不再包含的来源歌曲会被移出歌单。
   final Map<String, List<String>> songSources;
 
+  /// 歌单级收藏标记：收藏歌单在歌单页单独分区显示，与「我的收藏」
+  /// （歌曲级收藏）是两个概念，互不影响。
+  final bool favorited;
+
   /// 歌单没有单独设置封面时，默认使用第一首歌的封面。
   String? get effectiveCoverUrl {
     final explicit = coverUrl?.trim() ?? '';
@@ -188,6 +207,7 @@ class MobilePlaylist {
     List<String>? customOrder,
     List<PlaylistImportSource>? importSources,
     Map<String, List<String>>? songSources,
+    bool? favorited,
   }) {
     return MobilePlaylist(
       id: id,
@@ -199,6 +219,7 @@ class MobilePlaylist {
       customOrder: customOrder ?? this.customOrder,
       importSources: importSources ?? this.importSources,
       songSources: songSources ?? this.songSources,
+      favorited: favorited ?? this.favorited,
     );
   }
 
@@ -216,6 +237,7 @@ class MobilePlaylist {
       for (final source in importSources) source.toJson(),
     ],
     'songSources': songSources.map((path, keys) => MapEntry(path, keys)),
+    if (favorited) 'favorited': true,
   };
 
   factory MobilePlaylist.fromJson(Map<String, dynamic> json) {
@@ -252,6 +274,7 @@ class MobilePlaylist {
               return MapEntry(key.toString(), keys);
             })
           : const {},
+      favorited: json['favorited'] == true,
     );
   }
 }
@@ -292,6 +315,36 @@ class PlaylistsNotifier extends StateNotifier<List<MobilePlaylist>> {
     );
   }
 
+  /// 补拉封面回写：歌单内歌曲快照存在且封面为空时填入补拉结果。
+  /// 一首歌可能同时存在于多个歌单，全部回填。不回写的话，歌单列表
+  /// 与备份迁移到其他设备后的封面都会和播放页实际显示的不一致。
+  Future<void> backfillSongCover(String path, String coverUrl) async {
+    await _loaded;
+    final trimmed = coverUrl.trim();
+    if (trimmed.isEmpty) return;
+    var changed = false;
+    final next = <MobilePlaylist>[];
+    for (final playlist in state) {
+      final snapshot = playlist.songSnapshots[path];
+      if (snapshot == null || snapshot.coverUrl?.trim().isNotEmpty == true) {
+        next.add(playlist);
+        continue;
+      }
+      changed = true;
+      next.add(
+        playlist.copyWith(
+          songSnapshots: {
+            ...playlist.songSnapshots,
+            path: snapshot.withCover(trimmed),
+          },
+        ),
+      );
+    }
+    if (!changed) return;
+    state = next;
+    await _save();
+  }
+
   /// 查找与导入歌单同名的本地歌单。名称比较忽略首尾空白，但保留用户
   /// 输入的大小写和正文，避免导入时意外覆盖其他歌单。
   Future<MobilePlaylist?> findByName(String name) async {
@@ -310,6 +363,7 @@ class PlaylistsNotifier extends StateNotifier<List<MobilePlaylist>> {
     String? coverUrl,
     List<Song> songs = const [],
     List<PlaylistImportSource> sources = const [],
+    bool favorited = false,
   }) async {
     final trimmed = name.trim();
     if (trimmed.isEmpty) return null;
@@ -334,6 +388,7 @@ class PlaylistsNotifier extends StateNotifier<List<MobilePlaylist>> {
         if (sourceKeys.isNotEmpty)
           for (final song in songs) song.path: List.of(sourceKeys),
       },
+      favorited: favorited,
     );
     state = [...state, item];
     await _save();
@@ -347,6 +402,32 @@ class PlaylistsNotifier extends StateNotifier<List<MobilePlaylist>> {
       for (final item in state)
         if (item.id == id) item.copyWith(name: trimmed) else item,
     ];
+    await _save();
+  }
+
+  /// 切换歌单收藏状态（歌单级收藏，与歌曲级「我的收藏」互不影响），
+  /// 返回切换后的结果（true 表示已收藏）。
+  Future<bool> toggleFavorite(String id) async {
+    await _loaded;
+    final index = state.indexWhere((item) => item.id == id);
+    if (index < 0) return false;
+    final next = [...state];
+    final favorited = !next[index].favorited;
+    next[index] = next[index].copyWith(favorited: favorited);
+    state = next;
+    await _save();
+    return favorited;
+  }
+
+  /// 设置歌单收藏状态（确定语义，不用 toggle：导入合并到已收藏的歌单
+  /// 时勾选「收藏该歌单」不应把原收藏状态反向取消）。
+  Future<void> setFavorite(String id, bool value) async {
+    await _loaded;
+    final index = state.indexWhere((item) => item.id == id);
+    if (index < 0 || state[index].favorited == value) return;
+    final next = [...state];
+    next[index] = next[index].copyWith(favorited: value);
+    state = next;
     await _save();
   }
 

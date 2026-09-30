@@ -36,13 +36,26 @@ class _FavoritesPageState extends ConsumerState<FavoritesPage> {
   final GlobalKey _floatingHeaderKey = GlobalKey();
   double _floatingHeaderExtent = 104;
 
+  /// 多选提示行（“点击歌曲进行选择 / 已选 N 首”）的测量 Key 与实测
+  /// 高度：多选时列表顶部让出提示行高度，提示行悬浮于列表上方，
+  /// 避免与第一行歌曲重叠、把第一首歌曲盖住显示不全。
+  final GlobalKey _selectionBarKey = GlobalKey();
+  double _selectionBarExtent = 56;
+
   /// 布局完成后用真实高度修正悬浮头部占位，字体缩放等场景自动适配。
   void _measureFloatingHeader() {
     if (!mounted) return;
     final size = _floatingHeaderKey.currentContext?.size;
-    if (size == null || size.height <= 0) return;
-    if ((size.height - _floatingHeaderExtent).abs() > 0.5) {
+    if (size != null &&
+        size.height > 0 &&
+        (size.height - _floatingHeaderExtent).abs() > 0.5) {
       setState(() => _floatingHeaderExtent = size.height);
+    }
+    final selectionSize = _selectionBarKey.currentContext?.size;
+    if (selectionSize != null &&
+        selectionSize.height > 0 &&
+        (selectionSize.height - _selectionBarExtent).abs() > 0.5) {
+      setState(() => _selectionBarExtent = selectionSize.height);
     }
   }
 
@@ -186,8 +199,7 @@ class _FavoritesPageState extends ConsumerState<FavoritesPage> {
         .firstOrNull
         ?.name;
     final parts = <String>[
-      if (result.addedCount > 0)
-        '已添加 ${result.addedCount} 首到歌单“$name”',
+      if (result.addedCount > 0) '已添加 ${result.addedCount} 首到歌单“$name”',
       if (result.existsCount > 0) '${result.existsCount} 首已在歌单中',
     ];
     XyNotice.show(
@@ -281,7 +293,9 @@ class _FavoritesPageState extends ConsumerState<FavoritesPage> {
                         (missed.length > 50 ? '\n…' : ''),
                     style: TextStyle(
                       fontSize: 13,
-                      color: Theme.of(dialogContext).colorScheme.onSurfaceVariant,
+                      color: Theme.of(
+                        dialogContext,
+                      ).colorScheme.onSurfaceVariant,
                     ),
                   ),
                 ),
@@ -361,7 +375,10 @@ class _FavoritesPageState extends ConsumerState<FavoritesPage> {
           if (_selectionMode) ...[
             IconButton(
               tooltip: '添加到歌单',
-              onPressed: _switchingSource || _downloading || _deleting ||
+              onPressed:
+                  _switchingSource ||
+                      _downloading ||
+                      _deleting ||
                       _selectedPaths.isEmpty
                   ? null
                   : _addSelectedToPlaylist,
@@ -371,7 +388,10 @@ class _FavoritesPageState extends ConsumerState<FavoritesPage> {
               tooltip: _switchingSource
                   ? '换源中 $_switchingDone/$_switchingTotal'
                   : '批量换源',
-              onPressed: _switchingSource || _downloading || _deleting ||
+              onPressed:
+                  _switchingSource ||
+                      _downloading ||
+                      _deleting ||
                       _selectedPaths.isEmpty
                   ? null
                   : _switchSourceSelected,
@@ -384,7 +404,10 @@ class _FavoritesPageState extends ConsumerState<FavoritesPage> {
             ),
             IconButton(
               tooltip: '批量下载',
-              onPressed: _downloading || _switchingSource || _deleting ||
+              onPressed:
+                  _downloading ||
+                      _switchingSource ||
+                      _deleting ||
                       _selectedPaths.isEmpty
                   ? null
                   : _downloadSelected,
@@ -397,7 +420,10 @@ class _FavoritesPageState extends ConsumerState<FavoritesPage> {
             ),
             IconButton(
               tooltip: '删除所选收藏',
-              onPressed: _deleting || _switchingSource || _downloading ||
+              onPressed:
+                  _deleting ||
+                      _switchingSource ||
+                      _downloading ||
                       _selectedPaths.isEmpty
                   ? null
                   : _deleteSelected,
@@ -421,13 +447,13 @@ class _FavoritesPageState extends ConsumerState<FavoritesPage> {
               onPressed: favPaths.isEmpty
                   ? null
                   : () => setState(() {
-                        _selectionMode = true;
-                        // 多选与拖拽编辑互斥，进入多选时收起拖拽手柄。
-                        _dragEditMode = false;
-                        // 进入多选时清掉搜索过滤，保证全选覆盖整个收藏。
-                        _query = '';
-                        _searchController.clear();
-                      }),
+                      _selectionMode = true;
+                      // 多选与拖拽编辑互斥，进入多选时收起拖拽手柄。
+                      _dragEditMode = false;
+                      // 进入多选时清掉搜索过滤，保证全选覆盖整个收藏。
+                      _query = '';
+                      _searchController.clear();
+                    }),
               icon: const Icon(Icons.library_add_check_rounded),
             ),
             if (_dragEditMode)
@@ -459,255 +485,274 @@ class _FavoritesPageState extends ConsumerState<FavoritesPage> {
       body: favPaths.isEmpty
           ? const _FavoritesEmpty()
           : FutureBuilder<List<Song>>(
-                // 收藏集合变化时重新查询。
-                key: ValueKey(Object.hashAll(favPaths)),
-                future: _songsForPaths(localPaths),
-                builder: (context, snap) {
-                  if (snap.connectionState != ConnectionState.done) {
-                    return const Center(child: CircularProgressIndicator());
+              // 收藏集合变化时重新查询。
+              key: ValueKey(Object.hashAll(favPaths)),
+              future: _songsForPaths(localPaths),
+              builder: (context, snap) {
+                if (snap.connectionState != ConnectionState.done) {
+                  return const Center(child: CircularProgressIndicator());
+                }
+                if (snap.hasError) {
+                  return Center(child: Text('加载失败：${snap.error}'));
+                }
+                final songsByPath = <String, Song>{
+                  for (final song in snap.data ?? const <Song>[])
+                    song.path: song,
+                };
+                for (final path in favPaths) {
+                  final snapshot =
+                      favorites.snapshotFor(path) ?? queuedSnapshots[path];
+                  if (snapshot != null) {
+                    songsByPath[path] = snapshot.toSong();
                   }
-                  if (snap.hasError) {
-                    return Center(child: Text('加载失败：${snap.error}'));
-                  }
-                  final songsByPath = <String, Song>{
-                    for (final song in snap.data ?? const <Song>[])
-                      song.path: song,
-                  };
-                  for (final path in favPaths) {
-                    final snapshot =
-                        favorites.snapshotFor(path) ?? queuedSnapshots[path];
-                    if (snapshot != null) {
-                      songsByPath[path] = snapshot.toSong();
-                    }
-                  }
-                  // favPaths（LinkedHashSet）的迭代顺序即收藏添加顺序。
-                  final addedOrder = favPaths.toList();
-                  final List<Song> songs;
-                  switch (_sort.key) {
-                    case SongSortKey.added:
-                      final ordered =
-                          _sort.descending ? addedOrder.reversed : addedOrder;
-                      songs = [for (final path in ordered) ?songsByPath[path]];
-                    case SongSortKey.title:
-                    case SongSortKey.artist:
-                    case SongSortKey.album:
-                      String sortKey(Song song) => switch (_sort.key) {
-                        SongSortKey.artist => _pinyinKey(song.artist),
-                        SongSortKey.album => _pinyinKey(song.album),
-                        _ => _pinyinKey(song.title),
-                      };
-                      final all = [
+                }
+                // favPaths（LinkedHashSet）的迭代顺序即收藏添加顺序。
+                final addedOrder = favPaths.toList();
+                final List<Song> songs;
+                switch (_sort.key) {
+                  case SongSortKey.added:
+                    final ordered = _sort.descending
+                        ? addedOrder.reversed
+                        : addedOrder;
+                    songs = [for (final path in ordered) ?songsByPath[path]];
+                  case SongSortKey.title:
+                  case SongSortKey.artist:
+                  case SongSortKey.album:
+                    String sortKey(Song song) => switch (_sort.key) {
+                      SongSortKey.artist => _pinyinKey(song.artist),
+                      SongSortKey.album => _pinyinKey(song.album),
+                      _ => _pinyinKey(song.title),
+                    };
+                    final all = [
+                      for (final path in addedOrder) ?songsByPath[path],
+                    ];
+                    all.sort((a, b) {
+                      var result = sortKey(a).compareTo(sortKey(b));
+                      if (result == 0) {
+                        result = _pinyinKey(
+                          a.title,
+                        ).compareTo(_pinyinKey(b.title));
+                      }
+                      return _sort.descending ? -result : result;
+                    });
+                    songs = all;
+                  case SongSortKey.custom:
+                    final order = ref
+                        .read(favoritesProvider.notifier)
+                        .customOrder;
+                    if (order == null || order.isEmpty) {
+                      songs = [
                         for (final path in addedOrder) ?songsByPath[path],
                       ];
-                      all.sort((a, b) {
-                        var result = sortKey(a).compareTo(sortKey(b));
-                        if (result == 0) {
-                          result = _pinyinKey(a.title)
-                              .compareTo(_pinyinKey(b.title));
+                    } else {
+                      final rank = <String, int>{
+                        for (var i = 0; i < order.length; i++) order[i]: i,
+                      };
+                      final known = <Song>[];
+                      final appended = <Song>[];
+                      for (final path in addedOrder) {
+                        final song = songsByPath[path];
+                        if (song == null) continue;
+                        if (rank.containsKey(path)) {
+                          known.add(song);
+                        } else {
+                          appended.add(song);
                         }
-                        return _sort.descending ? -result : result;
-                      });
-                      songs = all;
-                    case SongSortKey.custom:
-                      final order =
-                          ref.read(favoritesProvider.notifier).customOrder;
-                      if (order == null || order.isEmpty) {
-                        songs = [
-                          for (final path in addedOrder) ?songsByPath[path],
-                        ];
-                      } else {
-                        final rank = <String, int>{
-                          for (var i = 0; i < order.length; i++) order[i]: i,
-                        };
-                        final known = <Song>[];
-                        final appended = <Song>[];
-                        for (final path in addedOrder) {
-                          final song = songsByPath[path];
-                          if (song == null) continue;
-                          if (rank.containsKey(path)) {
-                            known.add(song);
-                          } else {
-                            appended.add(song);
-                          }
-                        }
-                        known.sort(
-                          (a, b) => rank[a.path]!.compareTo(rank[b.path]!),
-                        );
-                        songs = [...known, ...appended];
                       }
-                  }
-                  if (songs.isEmpty) {
-                    return const Center(child: Text('收藏的歌曲已不在音乐库中'));
-                  }
-                  final query = _query.trim().toLowerCase();
-                  final filteredSongs = query.isEmpty
-                      ? songs
-                      : songs
-                            .where((song) => _matchesQuery(song, query))
-                            .toList();
-                  // 供拖拽回调读取当前展示顺序。
-                  _sortedSongs = filteredSongs;
-                  // 布局完成后修正悬浮头部占位高度。
-                  WidgetsBinding.instance.addPostFrameCallback(
-                    (_) => _measureFloatingHeader(),
-                  );
-                  // 搜索框与歌曲数行悬浮于列表上方：列表内容滚动时从
-                  // 毛玻璃下方穿过被模糊，与列表浮动按钮组观感一致。
-                  return Stack(
-                    children: [
-                      Positioned.fill(
-                        child: Padding(
-                          padding: EdgeInsets.only(
-                            top: _selectionMode || filteredSongs.isEmpty
-                                ? 0
-                                : _floatingHeaderExtent,
-                          ),
-                          child: filteredSongs.isEmpty
-                              ? Center(
+                      known.sort(
+                        (a, b) => rank[a.path]!.compareTo(rank[b.path]!),
+                      );
+                      songs = [...known, ...appended];
+                    }
+                }
+                if (songs.isEmpty) {
+                  return const Center(child: Text('收藏的歌曲已不在音乐库中'));
+                }
+                final query = _query.trim().toLowerCase();
+                final filteredSongs = query.isEmpty
+                    ? songs
+                    : songs
+                          .where((song) => _matchesQuery(song, query))
+                          .toList();
+                // 供拖拽回调读取当前展示顺序。
+                _sortedSongs = filteredSongs;
+                // 布局完成后修正悬浮头部占位高度。
+                WidgetsBinding.instance.addPostFrameCallback(
+                  (_) => _measureFloatingHeader(),
+                );
+                // 搜索框与歌曲数行悬浮于列表上方：列表内容滚动时从
+                // 毛玻璃下方穿过被模糊，与列表浮动按钮组观感一致。
+                return Stack(
+                  children: [
+                    Positioned.fill(
+                      child: Padding(
+                        // 多选时列表顶部让出提示行高度，避免第一行歌曲
+                        // 被悬浮的“已选 N 首”提示行盖住。
+                        padding: EdgeInsets.only(
+                          top: _selectionMode
+                              ? _selectionBarExtent
+                              : (filteredSongs.isEmpty
+                                    ? 0
+                                    : _floatingHeaderExtent),
+                        ),
+                        child: filteredSongs.isEmpty
+                            ? Center(
+                                child: Text(
+                                  '没有找到匹配的收藏歌曲',
+                                  style: TextStyle(
+                                    color: Theme.of(
+                                      context,
+                                    ).colorScheme.onSurfaceVariant,
+                                  ),
+                                ),
+                              )
+                            : SongsListView(
+                                songs: filteredSongs,
+                                // 悬浮元素遮挡高度已注入 MediaQuery.padding。
+                                padding: EdgeInsets.fromLTRB(
+                                  10,
+                                  0,
+                                  10,
+                                  MediaQuery.paddingOf(context).bottom + 12,
+                                ),
+                                selectionMode: _selectionMode,
+                                isSelected: (song) =>
+                                    _selectedPaths.contains(song.path),
+                                onToggleSelection: _toggleSelection,
+                                // 搜索过滤时下标与全量收藏不一致，禁止拖拽；
+                                // 拖拽手柄仅在自定义排序的编辑模式中显示。
+                                onReorder:
+                                    _sort.key == SongSortKey.custom &&
+                                        _dragEditMode &&
+                                        query.isEmpty
+                                    ? _onReorder
+                                    : null,
+                                onPlay: (list, i) => ref
+                                    .read(libraryProvider.notifier)
+                                    .playList(list, i),
+                              ),
+                      ),
+                    ),
+                    // 提示行必须 Positioned 定位：若作为非 Positioned
+                    // 子项，松约束下 Stack 会 shrink-wrap 到提示行高度，
+                    // Positioned.fill 的列表随之被钳制，歌曲全部消失。
+                    if (_selectionMode)
+                      Positioned(
+                        top: 0,
+                        left: 0,
+                        right: 0,
+                        child: KeyedSubtree(
+                          key: _selectionBarKey,
+                          child: Padding(
+                            padding: const EdgeInsets.fromLTRB(16, 4, 16, 8),
+                            child: Row(
+                              children: [
+                                Expanded(
                                   child: Text(
-                                    '没有找到匹配的收藏歌曲',
-                                    style: TextStyle(
-                                      color: Theme.of(
-                                        context,
-                                      ).colorScheme.onSurfaceVariant,
+                                    _selectedPaths.isEmpty
+                                        ? '点击歌曲进行选择'
+                                        : '已选 ${_selectedPaths.length} 首',
+                                    style: const TextStyle(
+                                      fontWeight: FontWeight.w600,
                                     ),
                                   ),
-                                )
-                              : SongsListView(
-                                  songs: filteredSongs,
-                                  // 悬浮元素遮挡高度已注入 MediaQuery.padding。
-                                  padding: EdgeInsets.fromLTRB(
-                                    10,
-                                    0,
-                                    10,
-                                    MediaQuery.paddingOf(context).bottom + 12,
-                                  ),
-                                  selectionMode: _selectionMode,
-                                  isSelected: (song) =>
-                                      _selectedPaths.contains(song.path),
-                                  onToggleSelection: _toggleSelection,
-                                  // 搜索过滤时下标与全量收藏不一致，禁止拖拽；
-                                  // 拖拽手柄仅在自定义排序的编辑模式中显示。
-                                  onReorder:
-                                      _sort.key == SongSortKey.custom &&
-                                          _dragEditMode &&
-                                          query.isEmpty
-                                      ? _onReorder
-                                      : null,
-                                  onPlay: (list, i) => ref
-                                        .read(libraryProvider.notifier)
-                                        .playList(list, i),
                                 ),
-                        ),
-                      ),
-                      if (_selectionMode)
-                        Padding(
-                          padding: const EdgeInsets.fromLTRB(16, 4, 16, 8),
-                          child: Row(
-                            children: [
-                              Expanded(
-                                child: Text(
-                                  _selectedPaths.isEmpty
-                                      ? '点击歌曲进行选择'
-                                      : '已选 ${_selectedPaths.length} 首',
-                                  style: const TextStyle(
-                                    fontWeight: FontWeight.w600,
-                                  ),
-                                ),
-                              ),
-                              TextButton(
-                                onPressed: filteredSongs.isEmpty
-                                    ? null
-                                    : () => setState(() {
+                                TextButton(
+                                  onPressed: filteredSongs.isEmpty
+                                      ? null
+                                      : () => setState(() {
                                           final allSelected =
                                               filteredSongs.isNotEmpty &&
-                                                  _selectedPaths.length ==
-                                                      filteredSongs.length;
+                                              _selectedPaths.length ==
+                                                  filteredSongs.length;
                                           if (allSelected) {
                                             _selectedPaths.clear();
                                           } else {
                                             _selectedPaths
                                               ..clear()
-                                              ..addAll(filteredSongs
-                                                  .map((s) => s.path));
+                                              ..addAll(
+                                                filteredSongs.map(
+                                                  (s) => s.path,
+                                                ),
+                                              );
                                           }
                                         }),
-                                child: Text(
-                                  filteredSongs.isNotEmpty &&
-                                          _selectedPaths.length ==
-                                              filteredSongs.length
-                                      ? '取消全选'
-                                      : '全选',
-                                ),
-                              ),
-                            ],
-                          ),
-                        )
-                      else
-                        Positioned(
-                          top: 0,
-                          left: 0,
-                          right: 0,
-                          child: KeyedSubtree(
-                            key: _floatingHeaderKey,
-                            child: Column(
-                              children: [
-                                FrostedSearchField(
-                                  controller: _searchController,
-                                  hintText: '搜索歌曲、歌手或专辑',
-                                  onChanged: (value) =>
-                                      setState(() => _query = value),
-                                  showClearSuffix: true,
-                                  padding: const EdgeInsets.fromLTRB(
-                                    16,
-                                    4,
-                                    16,
-                                    4,
-                                  ),
-                                ),
-                                Padding(
-                                  padding: const EdgeInsets.fromLTRB(
-                                    16,
-                                    4,
-                                    16,
-                                    8,
-                                  ),
-                                  child: Row(
-                                    children: [
-                                      Text(
-                                        '${filteredSongs.length} 首歌曲',
-                                        style: TextStyle(
-                                          color: Theme.of(
-                                            context,
-                                          ).colorScheme.onSurfaceVariant,
-                                        ),
-                                      ),
-                                      const Spacer(),
-                                      FilledButton.tonalIcon(
-                                        onPressed: filteredSongs.isEmpty
-                                            ? null
-                                            : () => ref
-                                                  .read(
-                                                    libraryProvider.notifier,
-                                                  )
-                                                  .playAll(filteredSongs),
-                                        icon: const Icon(
-                                          Icons.play_arrow,
-                                          size: 20,
-                                        ),
-                                        label: const Text('播放全部'),
-                                      ),
-                                    ],
+                                  child: Text(
+                                    filteredSongs.isNotEmpty &&
+                                            _selectedPaths.length ==
+                                                filteredSongs.length
+                                        ? '取消全选'
+                                        : '全选',
                                   ),
                                 ),
                               ],
                             ),
                           ),
                         ),
-                    ],
-                  );
-                },
-              ),
+                      )
+                    else
+                      Positioned(
+                        top: 0,
+                        left: 0,
+                        right: 0,
+                        child: KeyedSubtree(
+                          key: _floatingHeaderKey,
+                          child: Column(
+                            children: [
+                              FrostedSearchField(
+                                controller: _searchController,
+                                hintText: '搜索歌曲、歌手或专辑',
+                                onChanged: (value) =>
+                                    setState(() => _query = value),
+                                showClearSuffix: true,
+                                padding: const EdgeInsets.fromLTRB(
+                                  16,
+                                  4,
+                                  16,
+                                  4,
+                                ),
+                              ),
+                              Padding(
+                                padding: const EdgeInsets.fromLTRB(
+                                  16,
+                                  4,
+                                  16,
+                                  8,
+                                ),
+                                child: Row(
+                                  children: [
+                                    Text(
+                                      '${filteredSongs.length} 首歌曲',
+                                      style: TextStyle(
+                                        color: Theme.of(
+                                          context,
+                                        ).colorScheme.onSurfaceVariant,
+                                      ),
+                                    ),
+                                    const Spacer(),
+                                    FilledButton.tonalIcon(
+                                      onPressed: filteredSongs.isEmpty
+                                          ? null
+                                          : () => ref
+                                                .read(libraryProvider.notifier)
+                                                .playAll(filteredSongs),
+                                      icon: const Icon(
+                                        Icons.play_arrow,
+                                        size: 20,
+                                      ),
+                                      label: const Text('播放全部'),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ),
+                  ],
+                );
+              },
+            ),
     );
   }
 

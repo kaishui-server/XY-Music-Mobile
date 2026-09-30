@@ -17,6 +17,7 @@ import '../core/db_path.dart';
 import '../rust/api.dart';
 import '../player/lx_lyrics_builder.dart';
 import 'plugin_metadata.dart';
+import 'qrc_decrypt.dart';
 
 class EnabledMusicPlugin {
   const EnabledMusicPlugin({
@@ -193,11 +194,14 @@ List<String> pluginQualityCandidates(String? preferredQuality) => <String>{
 /// 依赖标签去重；dolby 与 atmos 是两档不同音质，标签必须可区分。
 String qualityDisplayLabel(String quality) {
   final lower = quality.trim().toLowerCase();
+  // low/super 是 one 系（moro.cn.mt）等插件使用的 MusicFree 语义档：
+  // low ≈ 96k 及以下，super 在 high 之上（多对应无损）。
+  if (lower == 'low') return '低清 96k';
   if (lower == '96k') return '低清 96k';
   if (lower == '128k' || lower == 'standard') return '标准 128k';
   if (lower == '192k') return '较高 192k';
   if (lower == '320k' || lower == 'high') return '高品质 320k';
-  if (lower == 'flac' || lower == 'lossless' || lower == 'sq') {
+  if (lower == 'flac' || lower == 'lossless' || lower == 'sq' || lower == 'super') {
     return '无损 FLAC';
   }
   if (lower == 'flac24bit') return '无损 FLAC Hires';
@@ -219,6 +223,7 @@ String qualityDisplayLabel(String quality) {
 int qualityTierRank(String quality) {
   final lower = quality.trim().toLowerCase();
   const ranks = <String, int>{
+    'low': 0,
     '96k': 0,
     '128k': 1,
     'standard': 1,
@@ -228,6 +233,7 @@ int qualityTierRank(String quality) {
     'flac': 4,
     'lossless': 4,
     'sq': 4,
+    'super': 4,
     'ape': 4,
     'wav': 4,
     'flac24bit': 5,
@@ -619,6 +625,76 @@ final pluginRuntimeProvider = Provider<PluginRuntimeService>((ref) {
 });
 
 class PluginRuntimeService {
+  /// quickjs_engine 的定时器支持不完整，这里补全浏览器语义：
+  /// ① setTimeout 把延时原样透传给 Dart 侧 Timer（按 int 解码），插件
+  ///   传浮点延时（如 kw.js 歌单分页的 200 + Math.random() * 100）时
+  ///   Dart 侧抛类型错误，Timer 永不创建、await 的 Promise 永远挂起，
+  ///   表现为歌单导入 30 秒超时——包裹一层先取整再转发；
+  /// ② 引擎完全没有 clearTimeout/setInterval/queueMicrotask，插件
+  ///   （如 moro/onemusic 混淆系列）在超时控制里调用 clearTimeout 会
+  ///   抛 ReferenceError，且被插件自身 catch 后包装成各种误导性错误
+  ///   （“unexpected data at the end”、“搜索服务不可用”等）。
+  /// clearTimeout 无法真正取消 Dart 侧 Timer，改为把引擎回调表中对
+  /// 应回调替换为空函数，Timer 到期时无害执行；setInterval 用
+  /// setTimeout 链式调度实现。setTimeout 的返回值取引擎的全局计数
+  /// （每次调用自增，与回调表索引一致），setInterval 的 id 用独立
+  /// 大偏移序列避免与 setTimeout 撞号。
+  static const String timerCompatibilityShim = '''
+    (function (nativeSetTimeout) {
+      var intervalBase = 1000000000;
+      var intervalSeq = 0;
+      var intervals = new Map();
+      function nativeTimerIndex() {
+        var counter = globalThis.__NATIVE_FLUTTER_JS__setTimeoutCount;
+        return typeof counter === 'number' ? counter : -1;
+      }
+      function clearTimer(id) {
+        var idx = Number(id);
+        if (!Number.isInteger(idx)) return;
+        intervals.delete(idx);
+        if (idx >= 0 && idx < intervalBase) {
+          var table = globalThis.__NATIVE_FLUTTER_JS__setTimeoutCallbacks;
+          if (table) {
+            var key = String(idx);
+            if (key in table) table[key] = function () {};
+          }
+        }
+      }
+      function runInterval(id, fn, delay, args) {
+        nativeSetTimeout(function () {
+          if (!intervals.has(id)) return;
+          try {
+            fn.apply(null, args);
+          } finally {
+            if (intervals.has(id)) runInterval(id, fn, delay, args);
+          }
+        }, delay);
+      }
+      globalThis.setTimeout = function (fn, delay) {
+        var args = Array.prototype.slice.call(arguments, 2);
+        nativeSetTimeout(function () {
+          if (typeof fn === 'function') fn.apply(null, args);
+        }, Math.round(Number(delay) || 0));
+        return nativeTimerIndex();
+      };
+      globalThis.clearTimeout = clearTimer;
+      globalThis.setInterval = function (fn, delay) {
+        var args = Array.prototype.slice.call(arguments, 2);
+        var id = intervalBase + (++intervalSeq);
+        intervals.set(id, true);
+        runInterval(
+            id, fn, Math.max(1, Math.round(Number(delay) || 1)), args);
+        return id;
+      };
+      globalThis.clearInterval = clearTimer;
+      if (typeof globalThis.queueMicrotask !== 'function') {
+        globalThis.queueMicrotask = function (fn) {
+          Promise.resolve().then(fn);
+        };
+      }
+    })(globalThis.setTimeout);
+  ''';
+
   PluginRuntimeService({
     this.httpClient,
     this.runtimeBootstrap,
@@ -682,6 +758,10 @@ class PluginRuntimeService {
         sourceUrl: 'xy_plugin_runtime.js',
       );
       if (result.isError) throw Exception(result.stringResult);
+      final wrapTimers = runtime.evaluate(timerCompatibilityShim);
+      if (wrapTimers.isError) {
+        throw Exception(wrapTimers.stringResult);
+      }
       final lxBootstrap =
           runtimeLxBootstrap ??
           await rootBundle.loadString('assets/lx_plugin_runtime.js');
@@ -727,7 +807,19 @@ class PluginRuntimeService {
     if (bundled != null) return Future.value(bundled);
     return _pluginSourceTasks.putIfAbsent(
       plugin.id,
-      () => File(plugin.path).readAsString(),
+      () async {
+        // 插件文件可能在订阅更新/去重合并后被重写或删除，而探索页等
+        // 缓存仍持有旧插件对象。文件缺失时给出可操作的提示，而不是
+        // 抛出裸 PathNotFoundException。
+        final file = File(plugin.path);
+        if (!await file.exists()) {
+          throw Exception(
+            '插件「${plugin.name}」的脚本文件已不存在（可能刚被音源更新'
+            '或卸载），请刷新页面或到 设置 → 插件 重新启用后重试',
+          );
+        }
+        return file.readAsString();
+      },
     );
   }
 
@@ -980,6 +1072,25 @@ class PluginRuntimeService {
         // 后端不可用时维持空结果。
       }
     }
+    // 听书类插件（如 one-酷我听书）声明仅支持 album 类型搜索，music
+    // 类型永远为空；回退 album 搜索并把最相关专辑的全部章节展平为
+    // 歌曲，让默认「歌曲」Tab 也能直接搜到可点播的章节。
+    if (songs.isEmpty) {
+      try {
+        final albums = await _searchMusicFreeType(plugin, keyword, 'album');
+        if (albums.isNotEmpty) {
+          final album = _toCatalogResult(
+            plugin.id,
+            albums.first,
+            artist: false,
+          );
+          final chapters = await getAlbumSongs(plugin, album);
+          if (chapters.isNotEmpty) return chapters;
+        }
+      } catch (_) {
+        // album 兜底失败维持空结果。
+      }
+    }
     return songs;
   }
 
@@ -1184,21 +1295,36 @@ class PluginRuntimeService {
       if (songs.isNotEmpty) return songs;
     }
     try {
-      final response = _runsPluginsInBackground
-          ? await _runPluginOperation(plugin, 'getAlbumInfo', {
-              'rawData': album.rawData,
-              'page': 1,
-            })
-          : await _callOnCurrentIsolate(plugin, 'getAlbumInfo', [
-              album.rawData,
-              1,
-            ]);
-      final list = _extractResultList(response);
-      if (list.isNotEmpty) {
+      // 听书类插件（如 one-酷我听书）一次只回一页章节，一本有声书
+      // 可达数百集；按 isEnd 循环翻页取全量，id 去重 + 页数上限防死循环。
+      final collected = <Map<String, dynamic>>[];
+      final seenIds = <String>{};
+      for (var page = 1; page <= 20; page++) {
+        final response = _runsPluginsInBackground
+            ? await _runPluginOperation(plugin, 'getAlbumInfo', {
+                'rawData': album.rawData,
+                'page': page,
+              })
+            : await _callOnCurrentIsolate(plugin, 'getAlbumInfo', [
+                album.rawData,
+                page,
+              ]);
+        final list = _extractResultList(response);
+        if (list.isEmpty) break;
+        final before = collected.length;
+        for (final raw in list) {
+          final id = raw['id']?.toString() ?? '';
+          if (id.isNotEmpty && !seenIds.add(id)) continue;
+          collected.add(raw);
+        }
+        if (collected.length == before) break;
+        if (response is Map && response['isEnd'] == true) break;
+      }
+      if (collected.isNotEmpty) {
         // 部分接口（如网易 weapi/v1/album）对 OST 专辑不返回 al.picUrl，
         // 只给超出 JS 安全整数的数值 picId，插件层无法还原封面；统一走
         // song/detail 补全，与搜索路径行为一致。
-        var songs = list;
+        var songs = collected;
         if (_isNeteaseMusicPlugin(plugin) || songs.any(_looksLikeNeteaseTrack)) {
           songs = await _backfillNeteaseTrackMeta(songs);
         }
@@ -1465,23 +1591,31 @@ class PluginRuntimeService {
 
   /// 获取某个热门榜单内的歌曲，用于推荐页混入不依赖个人喜好的
   /// 大众热门内容（类似 BakaMusic 推荐歌单的获取思路）。
+  /// [fetchAll] 为 true 时取全榜单曲目（榜单详情页使用，分页拉取到
+  /// 后端返回的 total 为止），否则只取前 [limit] 首。
   Future<List<PluginSearchSong>> getTopListSongs(
     EnabledMusicPlugin plugin,
     PluginCatalogResult chart, {
     int limit = 40,
+    bool fetchAll = false,
   }) async {
     if (plugin.isLx) return const [];
     // animemusic/1 单平台插件（如 qishui）：直连 music/toplist/detail。
     if (plugin.isAnimemusic) {
-      return _getAnimemusicTopListSongs(plugin, chart, limit: limit);
+      return _getAnimemusicTopListSongs(
+        plugin,
+        chart,
+        limit: limit,
+        fetchAll: fetchAll,
+      );
     }
     final songs = await _loadMusicFreePlaylistSongs(
       plugin,
       Map<String, dynamic>.from(chart.rawData),
       kind: 'top',
     );
-    return songs
-        .take(limit)
+    final limited = fetchAll ? songs : songs.take(limit);
+    return limited
         .map((raw) => _toSearchSong(plugin.id, _resetMediaItem(plugin, raw)))
         .where((item) => item.title.trim().isNotEmpty)
         .toList();
@@ -1828,23 +1962,113 @@ class PluginRuntimeService {
     String input,
   ) async {
     Object? lastError;
+    // 分享文案（如「歌单｜我喜欢的音乐 https://qishui.douyin.com/s/xxx/
+    // @汽水音乐」）不以 http 开头，不先抠出里面的链接就会整段文案进
+    // 搜索路径，按名称巧合搜回无关歌单（汽水「对不上」的根因）。统一
+    // 提取文案中第一条链接再走链接导入；提取不到时保留原文交由插件 /
+    // 搜索路径处理。
+    var effective = input;
+    if (!_isHttpUrl(effective)) {
+      final match = RegExp(
+        r'''https?://[^\s@，,。、"“”'）)】]+''',
+        caseSensitive: false,
+      ).firstMatch(effective);
+      if (match != null) effective = match.group(0)!;
+    }
+    final isPlainNumericId = RegExp(r'^\d+$').hasMatch(effective);
+
+    // animemusic/1 单平台插件（如惜梦汽水）：脚本是 CommonJS Node 模块，
+    // QuickJS 缺 http/https/zlib 内置模块无法执行，importMusicSheet 与
+    // 搜索回退都会失败。宿主直连后端 music/import（分享文案 / 短链 /
+    // 纯数字歌单 ID 通吃，后端自行解析），失败时给出明确错误，不再落
+    // 入 QuickJS 路径产生误导性的报错。
+    if (plugin.isAnimemusic) {
+      final imported = await _importAnimemusicPlaylist(plugin, effective);
+      if (imported != null) return imported;
+      throw Exception('歌单为空，或该插件不支持歌单导入');
+    }
 
     // 链接输入优先走插件原生 importMusicSheet：插件自己解析分享链接里的
     // 歌单 ID（如 QQ 链接 ...?id=2784566436），能拿到真实歌单名、封面和
     // 曲目。不能把整条链接当关键词传给 search——QQ 会返回一批以 URL
     // 片段命名的垃圾歌单，_bestMatchingPlaylist 按 ID 匹配不上时取第一条，
     // 最终导成完全无关的歌单（与前身 XianYu-Music-Mobile 相同的 bug）。
-    if (_isHttpUrl(input)) {
+    if (_isHttpUrl(effective)) {
+      // 短链（qishui.douyin.com/s/xxx 等）不含数字歌单 ID，而 QuickJS 的
+      // XHR 是浏览器语义：重定向被自动跟随、插件读不到 3xx Location
+      // （axios 的 maxRedirects:0 在浏览器适配器中被忽略），汽水短链必须
+      // 由宿主代为解析重定向后用真实 URL 重试。链接里的纯数字歌单 ID 也
+      // 作为兜底候选：酷我 newh5app 等新版链接格式插件正则可能未覆盖，
+      // 但纯数字 ID 路径一定支持。
+      final candidates = <String>[effective];
+      final resolved = await _resolvePlaylistShortLink(effective);
+      if (resolved != null && !candidates.contains(resolved)) {
+        candidates.add(resolved);
+      }
+      for (final candidate in List.of(candidates)) {
+        final id = _extractPlaylistIdFromUrl(candidate);
+        if (id != null && !candidates.contains(id)) candidates.add(id);
+      }
+      // 汽水链接：插件 importMusicSheet 走 QuickJS XHR，大歌单（300KB+
+      // 响应）会触发 xhr.dart 静默吞异常缺陷，回调永不执行、30 秒超
+      // 时。宿主直连官方接口导入（参考 XianYu-Music-Desktop），直连
+      // 失败再回退插件路径，两个方向都保底。
+      if (_isQishuiPlugin(plugin) && _isQishuiLink(effective)) {
+        try {
+          final direct = await _importQishuiSheetDirect(plugin, effective);
+          if (direct != null) return direct;
+        } catch (_) {
+          // 直连失败（接口变更/网络问题）时回退插件路径
+        }
+      }
+      for (final candidate in candidates) {
+        try {
+          final imported = await _importViaImportMusicSheet(plugin, candidate);
+          if (imported != null) return imported;
+        } catch (error) {
+          lastError = error;
+        }
+      }
+      // URL 作为搜索关键词永远匹配不到目标歌单（QQ 的教训），链接导入
+      // 失败时直接给出明确错误，不再落入搜索回退导入无关歌单。
+      // 旧版 BakaMusic 契约插件只提供 importPlaylist 而无
+      // importMusicSheet，明确引导更新插件而不是笼统地说「链接不匹配」。
+      final message = lastError == null
+          ? ''
+          : _friendlyError(lastError.toString());
+      throw Exception(
+        message.contains('importMusicSheet')
+            ? '该插件不支持链接导入歌单（可能版本较旧），请到 '
+              '设置 → 插件 更新插件后重试，或换用其他音源插件'
+            : message.isEmpty
+                  ? '无法从该链接导入歌单，请确认链接与所选插件匹配'
+                  : message,
+      );
+    }
+
+    // 纯数字输入（酷狗码、歌单 ID）：先走插件整单导入，搜索回退放后。
+    // 数字当关键词搜索返回的是名称巧合的无关歌单，按 ID 精确匹配不上
+    // 时不应采用。
+    if (isPlainNumericId) {
+      // 汽水插件 + 纯 ID：同样优先宿主直连（插件 XHR 大响应挂起）
+      if (_isQishuiPlugin(plugin)) {
+        try {
+          final direct = await _importQishuiSheetDirect(plugin, effective);
+          if (direct != null) return direct;
+        } catch (_) {
+          // 直连失败回退插件路径
+        }
+      }
       try {
-        final imported = await _importViaImportMusicSheet(plugin, input);
+        final imported = await _importViaImportMusicSheet(plugin, effective);
         if (imported != null) return imported;
       } catch (error) {
         lastError = error;
       }
     }
 
-    // 与电脑版一致：输入的是歌单名称、ID 或链接，先让 MusicFree 插件搜索，
-    // 这样能保留真实歌单名称、封面和插件自己的媒体字段。
+    // 与电脑版一致：输入歌单名称时先让 MusicFree 插件搜索，这样能保留
+    // 真实歌单名称、封面和插件自己的媒体字段。
     for (final type in const ['sheet', 'playlist', 'album']) {
       try {
         final searched = await _callOnCurrentIsolate(plugin, 'search', [
@@ -1855,6 +2079,7 @@ class PluginRuntimeService {
         final sheets = _extractResultList(searched);
         if (sheets.isEmpty) continue;
         final sheet = _bestMatchingPlaylist(sheets, input);
+        if (sheet == null) continue;
         final songs = await _loadMusicFreePlaylistSongs(
           plugin,
           sheet,
@@ -1868,16 +2093,23 @@ class PluginRuntimeService {
           };
         }
       } catch (error) {
-        lastError = error;
+        // 搜索回退的失败不应覆盖主路径错误：数字 ID 输入时
+        // importMusicSheet 已失败（如 30 秒超时），若被回退路径里插件
+        // 的内部错误（如 kw.js searchAlbum 读错字段报 map of
+        // undefined）覆盖，用户看到的报错与真正失败原因完全无关。
+        lastError ??= error;
       }
     }
 
     // 收藏夹/纯 ID 导入兼容路径，B 站、酷狗等插件常只实现此接口。
-    try {
-      final imported = await _importViaImportMusicSheet(plugin, input);
-      if (imported != null) return imported;
-    } catch (error) {
-      lastError = error;
+    // 纯数字输入在上面已经尝试过整单导入，不再重复。
+    if (!isPlainNumericId) {
+      try {
+        final imported = await _importViaImportMusicSheet(plugin, input);
+        if (imported != null) return imported;
+      } catch (error) {
+        lastError = error;
+      }
     }
 
     // 电脑版的最后一层回退：部分插件不能搜索歌单，但提供排行榜列表。
@@ -1886,25 +2118,178 @@ class PluginRuntimeService {
       final topLists = _extractTopListItems(response);
       if (topLists.isNotEmpty) {
         final sheet = _bestMatchingPlaylist(topLists, input);
-        final songs = await _loadMusicFreePlaylistSongs(
-          plugin,
-          sheet,
-          kind: 'top',
-        );
-        if (songs.isNotEmpty) {
-          return {
-            'name': _playlistName(sheet, plugin.name),
-            'coverUrl': _extractCover(sheet),
-            'songs': songs,
-          };
+        if (sheet != null) {
+          final songs = await _loadMusicFreePlaylistSongs(
+            plugin,
+            sheet,
+            kind: 'top',
+          );
+          if (songs.isNotEmpty) {
+            return {
+              'name': _playlistName(sheet, plugin.name),
+              'coverUrl': _extractCover(sheet),
+              'songs': songs,
+            };
+          }
         }
       }
     } catch (error) {
-      lastError = error;
+      // 与搜索回退同理：榜单回退的错误不应覆盖主路径错误。
+      lastError ??= error;
     }
     throw Exception(
       lastError == null ? '该插件不支持歌单导入' : _friendlyError(lastError.toString()),
     );
+  }
+
+  /// 从歌单分享链接中提取纯数字歌单 ID（playlist_detail/123、
+  /// playlist/123、pid=123、dissid=123、id=123 等常见格式）。
+  static String? _extractPlaylistIdFromUrl(String url) {
+    for (final pattern in [
+      RegExp(r'playlist[_a-z]*[/=](\d{4,})', caseSensitive: false),
+      RegExp(r'[?&]pid=(\d{4,})', caseSensitive: false),
+      RegExp(r'[?&]dissid=(\d{4,})', caseSensitive: false),
+      RegExp(r'[?&]id=(\d{4,})', caseSensitive: false),
+    ]) {
+      final match = pattern.firstMatch(url);
+      if (match != null) return match.group(1);
+    }
+    return null;
+  }
+
+  /// 解析不含数字歌单 ID 的短链：宿主逐跳读取 3xx Location，直到拿到
+  /// 带数字歌单 ID 的真实地址（最多 5 跳）。QuickJS 的 XHR 读不到重
+  /// 定向 Location（浏览器语义自动跟随且 axios 的 maxRedirects:0 被
+  /// 忽略），插件自身无法解析短链，必须由宿主代劳。
+  ///
+  /// 字节系短链服务会按客户端 TLS/请求指纹分流：部分客户端拿到 302，
+  /// 另一部分直接返回 200 落地页（内嵌歌单数据）。因此采用三通道：
+  /// 先走 Rust HTTP 层（follow:0 逐跳 Location），未拿到时再用
+  /// dart:io HttpClient 逐跳重试（指纹不同，分流结果可能不同），仍拿
+  /// 不到时最后用 Googlebot UA 重试——字节系服务对搜索引擎爬虫稳定
+  /// 放行 302；任一通道遇到 200 页面时都会尝试从页面内容直接提取歌单
+  /// ID 兜底（与 XianYu-Music-Desktop 的 resolveRedirectId 对齐）。
+  Future<String?> _resolvePlaylistShortLink(String url) async {
+    if (_extractPlaylistIdFromUrl(url) != null) return null;
+    final viaRust = await _resolveShortLinkViaRust(url);
+    if (viaRust != null) return viaRust;
+    final viaDart = await _resolveShortLinkViaDartHttp(url);
+    if (viaDart != null) return viaDart;
+    return _resolveShortLinkViaDartHttp(url, userAgent: _googlebotUserAgent);
+  }
+
+  /// 从落地页内容中提取歌单 ID（og:url / 内嵌 JSON 等都会带
+  /// playlist_id=xxx 之类的串），复用 URL 提取的同一组正则。
+  static String? _extractPlaylistIdFromPage(String body) {
+    if (body.isEmpty) return null;
+    final id = _extractPlaylistIdFromUrl(body);
+    if (id != null) return id;
+    return RegExp(
+      r'playlist_id[=/]([0-9]{6,})',
+      caseSensitive: false,
+    ).firstMatch(body)?.group(1);
+  }
+
+  /// Rust HTTP 层通道：follow:0 逐跳读 Location；200 时从页面提取 ID。
+  Future<String?> _resolveShortLinkViaRust(String url) async {
+    var current = url;
+    for (var hop = 0; hop < 5; hop++) {
+      try {
+        final responseJson = await pluginHttpRequestBinary(
+          method: 'GET',
+          url: current,
+          headersJson: jsonEncode(const {
+            'User-Agent':
+                'Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 '
+                '(KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36',
+            'Accept': '*/*',
+          }),
+          timeout: BigInt.from(15),
+          follow: 0,
+        );
+        final response = jsonDecode(responseJson) as Map<String, dynamic>;
+        final status = (response['status'] as num?)?.toInt() ?? 0;
+        if (status >= 300 && status < 400) {
+          final headers = response['headers'];
+          if (headers is! Map) return null;
+          String? location;
+          for (final entry in headers.entries) {
+            if (entry.key.toString().toLowerCase() == 'location') {
+              location = entry.value?.toString();
+              break;
+            }
+          }
+          if (location == null || location.trim().isEmpty) return null;
+          final base = Uri.tryParse(current);
+          final resolved = base?.resolve(location.trim()).toString();
+          if (resolved == null || resolved == current) return null;
+          if (_extractPlaylistIdFromUrl(resolved) != null) return resolved;
+          current = resolved;
+          continue;
+        }
+        if (status == 200) {
+          // 不重定向而直接给落地页（指纹分流）：从页面内容提取 ID。
+          final bodyBase64 = response['body_base64']?.toString() ?? '';
+          final body = bodyBase64.isEmpty
+              ? ''
+              : utf8.decode(base64Decode(bodyBase64), allowMalformed: true);
+          final id = _extractPlaylistIdFromPage(body);
+          if (id != null) return id;
+        }
+        return null;
+      } catch (_) {
+        return null;
+      }
+    }
+    return null;
+  }
+
+  /// dart:io HttpClient 通道：与 Rust 层指纹不同，作为短链被风控分流
+  /// 时的第二通道。逐跳读 Location；200 时从页面内容提取 ID。
+  /// [userAgent] 默认模拟安卓 Chrome，可传 Googlebot UA 作为第三通道。
+  Future<String?> _resolveShortLinkViaDartHttp(
+    String url, {
+    String userAgent =
+        'Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 '
+        '(KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36',
+  }) async {
+    HttpClient? client;
+    try {
+      client = HttpClient()..connectionTimeout = const Duration(seconds: 15);
+      var current = url;
+      for (var hop = 0; hop < 5; hop++) {
+        final request = await client.getUrl(Uri.parse(current))
+          ..followRedirects = false
+          ..maxRedirects = 0;
+        request.headers.set(HttpHeaders.userAgentHeader, userAgent);
+        request.headers.set(HttpHeaders.acceptHeader, '*/*');
+        final response = await request.close();
+        final status = response.statusCode;
+        if (status >= 300 && status < 400) {
+          final location =
+              response.headers.value(HttpHeaders.locationHeader);
+          if (location == null || location.trim().isEmpty) return null;
+          final resolved =
+              Uri.parse(current).resolve(location.trim()).toString();
+          if (resolved == current) return null;
+          if (_extractPlaylistIdFromUrl(resolved) != null) return resolved;
+          current = resolved;
+          continue;
+        }
+        if (status == 200) {
+          final body = await response
+              .transform(const Utf8Decoder(allowMalformed: true))
+              .join();
+          return _extractPlaylistIdFromPage(body);
+        }
+        return null;
+      }
+      return null;
+    } catch (_) {
+      return null;
+    } finally {
+      client?.close();
+    }
   }
 
   /// 用插件的 importMusicSheet 整单导入（分享链接的优先路径、纯 ID 的兼容路径）。
@@ -1940,6 +2325,556 @@ class PluginRuntimeService {
       'coverUrl': _extractCover(songs.first),
       'songs': songs,
     };
+  }
+
+  // ==================== 汽水歌单宿主直连导入 ====================
+  // 参考 XianYu-Music-Desktop 的 playlistImportQishui.ts：汽水插件的
+  // importMusicSheet 走 QuickJS XHR，大歌单响应（300KB 级）会触发
+  // quickjs_engine xhr.dart Dart 侧回调链被静默吞异常的缺陷，Promise
+  // 永久挂起直至 30 秒超时。因此汽水链接/ID 由宿主直接调官方接口导
+  // 入：PC API（LunaPC UA）cursor 翻页取全，失败时 web 分享页
+  // （Googlebot UA）兜底。歌曲字段结构与汽水插件 parseTrackItem 完
+  // 全一致，播放与音质解析继续走插件管线（getMediaSource 只依赖
+  // id 与 qualities）。
+
+  static const String _googlebotUserAgent =
+      'Mozilla/5.0 (compatible; Googlebot/2.1; '
+      '+http://www.google.com/bot.html)';
+
+  static const String _qishuiPcApiBase = 'https://api.qishui.com/luna/pc';
+  static const String _qishuiWebShareUrl =
+      'https://music.douyin.com/qishui/share/playlist';
+  static const String _qishuiImageBase = 'https://p3-luna.douyinpic.com/img/';
+
+  static const String _qishuiPcQuery =
+      'aid=386088&app_name=luna_pc&region=cn&geo_region=cn&os_region=cn'
+      '&sim_region=&device_id=2081836196178571&cdid=&iid=2081836182667'
+      '&version_name=3.8.0&version_code=30080000&channel=official'
+      '&build_mode=master&network_carrier=&ac=wifi&tz_name=Asia/Shanghai'
+      '&resolution=&device_platform=windows&device_type=Windows'
+      '&os_version=Windows%2011%20Pro%20for%20Workstations'
+      '&fp=2081836196178571';
+
+  static const Map<String, String> _qishuiPcHeaders = {
+    'Accept': '*/*',
+    'Content-Type': 'application/json; charset=utf-8',
+    'Accept-Encoding': 'gzip, deflate',
+    'User-Agent': 'LunaPC/3.8.0(467160162)',
+    'x-luna-background-type': 'foreground',
+    'x-luna-is-background-req': '0',
+    'x-luna-is-local-user': '0',
+  };
+
+  static const Map<String, String> _qishuiWebShareHeaders = {
+    'Accept':
+        'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    'User-Agent': _googlebotUserAgent,
+  };
+
+  /// 汽水原始音质标识 → baka 系音质键（与汽水插件一致）。
+  static const Map<String, String> _qishuiQualityToBaka = {
+    'medium': '128k',
+    'higher': '192k',
+    'highest': '320k',
+    'lossless': 'flac',
+    'hi_res': 'hires',
+    'spatial': 'atmos',
+  };
+
+  static const Map<String, int> _qishuiQualityFallbackBitrate = {
+    'medium': 128000,
+    'higher': 192000,
+    'highest': 320000,
+    'lossless': 1411000,
+    'hi_res': 2304000,
+    'spatial': 324000,
+  };
+
+  /// 是否为汽水系插件（名称含「汽水」/「qishui」）。
+  static bool _isQishuiPlugin(EnabledMusicPlugin plugin) {
+    final name = plugin.name.toLowerCase();
+    return name.contains('汽水') || name.contains('qishui');
+  }
+
+  /// 输入是否为汽水链接（qishui / 汽水 / douyin.com 特征）。
+  static bool _isQishuiLink(String input) {
+    final t = input.toLowerCase();
+    return t.contains('qishui') ||
+        t.contains('汽水') ||
+        t.contains('douyin.com');
+  }
+
+  /// 汽水歌单宿主直连导入：解析 ID（短链/分享文案/纯 ID 通吃）→ PC API
+  /// 翻页取全 → 格式化为插件同构的曲目列表。返回 null 表示未取到歌单
+  /// （ID 不可识别 / 歌单为空 / 接口失败），由调用方回退插件路径。
+  Future<Map<String, dynamic>?> _importQishuiSheetDirect(
+    EnabledMusicPlugin plugin,
+    String input,
+  ) async {
+    final id = await _extractQishuiPlaylistId(input);
+    if (id == null) return null;
+    final detail = await _fetchQishuiPlaylistDetail(id);
+    if (detail == null) return null;
+    final rawTracks = detail['media_resources'];
+    if (rawTracks is! List || rawTracks.isEmpty) return null;
+    final songs = <Map<String, dynamic>>[];
+    for (final raw in rawTracks) {
+      if (raw is! Map) continue;
+      final item = _formatQishuiTrack(raw);
+      if (item != null) songs.add(_resetMediaItem(plugin, item));
+    }
+    if (songs.isEmpty) return null;
+    final sheet = _parseQishuiSheetItem(detail['playlistInfo']);
+    final title = sheet?['title']?.toString().trim() ?? '';
+    final artwork = sheet?['artwork']?.toString() ?? '';
+    return {
+      'name': title.isNotEmpty ? title : '${plugin.name}歌单',
+      'coverUrl': artwork.isNotEmpty ? artwork : _extractCover(songs.first),
+      'songs': songs,
+    };
+  }
+
+  /// 从输入（纯 ID / 分享链接 / 短链 / 分享文案）提取汽水歌单 ID。
+  Future<String?> _extractQishuiPlaylistId(String input) async {
+    final trimmed = input.trim();
+    if (trimmed.isEmpty) return null;
+    if (RegExp(r'^\d+$').hasMatch(trimmed)) return trimmed;
+    final direct = _extractPlaylistIdFromUrl(trimmed);
+    if (direct != null) return direct;
+    // 分享文案中裸露的长数字（歌单 ID 本体）
+    final longId = RegExp(r'\d{10,}').firstMatch(trimmed)?.group(0);
+    if (longId != null) return longId;
+    // 抠出文案中的链接逐条尝试：直接可提取的用 ID，短链交给宿主解析
+    final urlMatches = RegExp(
+      r'''https?://[^\s@，,。、"“”'）)】]+''',
+      caseSensitive: false,
+    ).allMatches(trimmed);
+    for (final match in urlMatches) {
+      final url = match.group(0)!;
+      final urlId = _extractPlaylistIdFromUrl(url);
+      if (urlId != null) return urlId;
+      final lower = url.toLowerCase();
+      if (lower.contains('douyin.com/s/') ||
+          lower.contains('qishui.douyin.com')) {
+        final resolved = await _resolvePlaylistShortLink(url);
+        if (resolved != null) {
+          final id = _extractPlaylistIdFromUrl(resolved) ??
+              (RegExp(r'^\d+$').hasMatch(resolved) ? resolved : null);
+          if (id != null) return id;
+        }
+      }
+    }
+    return null;
+  }
+
+  /// 拉取汽水歌单详情：PC API cursor 翻页取全，失败/为空时 web 分享页
+  /// 兜底。返回 {playlistInfo, media_resources}；两条通道都失败返回
+  /// null。
+  Future<Map<String, dynamic>?> _fetchQishuiPlaylistDetail(String id) async {
+    final apiDetail = await _fetchQishuiDetailFromApi(id);
+    if (apiDetail != null) return apiDetail;
+    return _fetchQishuiDetailFromWeb(id);
+  }
+
+  Future<Map<String, dynamic>?> _fetchQishuiDetailFromApi(String id) async {
+    final ownsClient = httpClient == null;
+    final client = httpClient ?? http.Client();
+    try {
+      var cursor = '';
+      Map<String, dynamic>? playlistInfo;
+      final resources = <Map<String, dynamic>>[];
+      final seenCursors = <String>{};
+      for (var page = 0; page < 10000; page++) {
+        final response = await client
+            .get(
+              Uri.parse(
+                '$_qishuiPcApiBase/playlist/detail?$_qishuiPcQuery'
+                '&playlist_id=$id'
+                '&cursor=${Uri.encodeComponent(cursor)}&count=100',
+              ),
+              headers: _qishuiPcHeaders,
+            )
+            .timeout(const Duration(seconds: 20));
+        if (response.statusCode < 200 || response.statusCode >= 300) {
+          return null;
+        }
+        final decoded = jsonDecode(_decodeResponseBody(response.bodyBytes));
+        if (decoded is! Map) return null;
+        final mediaResources = decoded['media_resources'];
+        if (mediaResources is! List) {
+          if (page == 0) return null;
+          throw Exception('汽水歌单分页数据异常');
+        }
+        if (playlistInfo == null && decoded['playlist'] is Map) {
+          playlistInfo = Map<String, dynamic>.from(decoded['playlist'] as Map);
+        }
+        for (final item in mediaResources) {
+          if (item is Map) resources.add(Map<String, dynamic>.from(item));
+        }
+        final hasMore = decoded['has_more'] == true ||
+            decoded['has_more'] == 1 ||
+            decoded['has_more'] == '1';
+        if (!hasMore) {
+          return {'playlistInfo': playlistInfo, 'media_resources': resources};
+        }
+        final next = decoded['next_cursor']?.toString() ?? '';
+        if (resources.isEmpty ||
+            next.isEmpty ||
+            next == cursor ||
+            seenCursors.contains(next)) {
+          throw Exception('汽水歌单分页游标未推进');
+        }
+        seenCursors.add(next);
+        cursor = next;
+      }
+      return null;
+    } catch (_) {
+      return null;
+    } finally {
+      if (ownsClient) client.close();
+    }
+  }
+
+  /// web 分享页兜底：Googlebot UA 拿分享页 HTML，从内嵌 _ROUTER_DATA
+  /// 提取歌单信息与曲目（PC API 被风控时的备用通道）。
+  Future<Map<String, dynamic>?> _fetchQishuiDetailFromWeb(String id) async {
+    final ownsClient = httpClient == null;
+    final client = httpClient ?? http.Client();
+    try {
+      final response = await client
+          .get(
+            Uri.parse('$_qishuiWebShareUrl?playlist_id=$id'),
+            headers: _qishuiWebShareHeaders,
+          )
+          .timeout(const Duration(seconds: 20));
+      if (response.statusCode < 200 || response.statusCode >= 300) return null;
+      final html = _decodeResponseBody(response.bodyBytes);
+      final routerData = _extractQishuiRouterData(html);
+      if (routerData == null) return null;
+      final loaderData = routerData['loaderData'];
+      final playlistPage = loaderData is Map ? loaderData['playlist_page'] : null;
+      if (playlistPage is! Map) return null;
+      final info = playlistPage['playlistInfo'];
+      // 校验落地页歌单与请求 ID 一致，防止风控页/错误页误判
+      if (info is! Map || info['id']?.toString() != id) return null;
+      final medias = playlistPage['medias'];
+      return {
+        'playlistInfo': Map<String, dynamic>.from(info),
+        'media_resources': [
+          for (final media in (medias is List ? medias : const []))
+            if (media is Map) Map<String, dynamic>.from(media),
+        ],
+      };
+    } catch (_) {
+      return null;
+    } finally {
+      if (ownsClient) client.close();
+    }
+  }
+
+  static Map<String, dynamic>? _extractQishuiRouterData(String html) {
+    const assignment = '_ROUTER_DATA = ';
+    final start = html.indexOf(assignment);
+    if (start == -1) return null;
+    final jsonStart = start + assignment.length;
+    var jsonEnd = html.indexOf(';\nfunction runWindowFn', jsonStart);
+    if (jsonEnd == -1) jsonEnd = html.indexOf(';</script>', jsonStart);
+    if (jsonEnd == -1) return null;
+    try {
+      final decoded = jsonDecode(html.substring(jsonStart, jsonEnd));
+      return decoded is Map ? Map<String, dynamic>.from(decoded) : null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// 汽水 media_resource → 插件 parseTrackItem 同构的媒体条目。
+  static Map<String, dynamic>? _formatQishuiTrack(Map raw) {
+    final track = _qishuiNormalizeTrack(raw);
+    if (track == null) return null;
+    final isVideo = _qishuiIsVideoTrack(raw, track);
+    final album = track['album'] is Map
+        ? Map<String, dynamic>.from(track['album'] as Map)
+        : const <String, dynamic>{};
+    final videoId = _qishuiFirstText([
+      track['video_id'],
+      track['ugc_video_id'],
+      track['id'],
+      track['vid'],
+    ]);
+    final artwork = _qishuiFirstNonEmpty([
+      _qishuiCoverUrl(album['url_cover']),
+      _qishuiCoverUrl(track['cover_url']),
+      _qishuiFirstUrl(track['image_url']),
+      _qishuiFirstUrl(track['share_cover_url']),
+      track['coverURL']?.toString() ?? '',
+      track['firstFrameURL']?.toString() ?? '',
+    ]);
+    var artistEntries = [
+      for (final artist
+          in (track['artists'] is List ? track['artists'] as List : const []))
+        if (artist is Map) Map<String, dynamic>.from(artist),
+    ];
+    if (artistEntries.isEmpty && track['author_info'] is Map) {
+      artistEntries = [Map<String, dynamic>.from(track['author_info'] as Map)];
+    }
+    final singerList = _qishuiSingerList(artistEntries);
+    final primary = singerList.isNotEmpty
+        ? singerList.first
+        : const <String, dynamic>{};
+    final labelInfo = track['label_info'] is Map
+        ? Map<String, dynamic>.from(track['label_info'] as Map)
+        : const <String, dynamic>{};
+    final id = track['id']?.toString() ?? '';
+    final finalId = id.isNotEmpty ? id : videoId;
+    if (finalId.isEmpty) return null;
+    final title = _qishuiFirstNonEmpty([
+      track['name']?.toString() ?? '',
+      track['title']?.toString() ?? '',
+      track['videoName']?.toString() ?? '',
+      track['desc']?.toString() ?? '',
+    ]);
+    final artist = _qishuiFirstNonEmpty([
+      primary['name']?.toString() ?? '',
+      track['artistName']?.toString() ?? '',
+      track['author']?.toString() ?? '',
+    ]);
+    return {
+      'id': finalId,
+      'title': title,
+      'artist': artist,
+      'artistId': primary['id']?.toString() ?? '',
+      'singerList': singerList,
+      'album': album['name']?.toString() ?? '',
+      'albumId': album['id']?.toString() ?? '',
+      'artwork': artwork,
+      'duration': _qishuiDurationSeconds(
+        track['duration'] ?? track['duration_ms'],
+      ),
+      'qualities': _qishuiQualitiesFromBitRates(track['bit_rates']),
+      'fee': labelInfo['only_vip_playable'] == true ? 1 : 0,
+      if (isVideo) ...{
+        'mv': videoId,
+        'vid': videoId,
+        'is_video': true,
+        'videoId': videoId,
+      } else
+        'vid': _qishuiFirstText([track['vid'], track['video_id']]),
+    };
+  }
+
+  /// 还原曲目本体：与汽水插件 normalizeTrack 相同的层级解包。
+  static Map<String, dynamic>? _qishuiNormalizeTrack(Map raw) {
+    final entity = raw['entity'];
+    if (entity is Map) {
+      final wrapper = entity['track_wrapper'];
+      if (wrapper is Map && wrapper['track'] is Map) {
+        return Map<String, dynamic>.from(wrapper['track'] as Map);
+      }
+      for (final key in const ['track', 'video', 'ugc_video']) {
+        final inner = entity[key];
+        if (inner is Map) return Map<String, dynamic>.from(inner);
+      }
+    }
+    final track = raw['track'];
+    if (track is Map) return Map<String, dynamic>.from(track);
+    return Map<String, dynamic>.from(raw);
+  }
+
+  /// 与汽水插件 isVideoTrack 一致的视频条目判定。
+  static bool _qishuiIsVideoTrack(Map raw, Map track) {
+    final entity = raw['entity'];
+    if (entity is Map &&
+        (entity['video'] != null || entity['ugc_video'] != null)) {
+      return true;
+    }
+    if (raw['type'] == 'video' || raw['media_type'] == 'video') return true;
+    if (track['video_id'] != null || track['ugc_video_id'] != null) {
+      return true;
+    }
+    if (track['type'] == 'ugc_video' || track['video_type'] == 'ugc_video') {
+      return true;
+    }
+    if (track['media_type'] == 'ugc_video') return true;
+    return track['videoName'] != null;
+  }
+
+  /// 汽水封面对象（{uri, template_prefix, urls} 或字符串）→ 图片 URL。
+  static String _qishuiCoverUrl(dynamic urlCover, [String size = '960:960']) {
+    if (urlCover == null) return '';
+    if (urlCover is String) return urlCover;
+    if (urlCover is! Map) return '';
+    final uri = urlCover['uri']?.toString() ?? '';
+    final templatePrefix = urlCover['template_prefix']?.toString() ?? '';
+    if (uri.isNotEmpty && templatePrefix.isNotEmpty) {
+      return '$_qishuiImageBase$uri~$templatePrefix-resize:$size.png';
+    }
+    final urls = urlCover['urls'];
+    if (urls is List && urls.isNotEmpty) {
+      final first = urls.first?.toString() ?? '';
+      if (first.isNotEmpty) {
+        if (uri.isEmpty || first.contains(uri)) return first;
+        return '$first$uri';
+      }
+    }
+    return '';
+  }
+
+  static String _qishuiFirstUrl(dynamic cover) {
+    if (cover is Map) {
+      final urls = cover['urls'];
+      if (urls is List) {
+        for (final url in urls) {
+          final s = url?.toString() ?? '';
+          if (s.isNotEmpty) return s;
+        }
+      }
+    }
+    return '';
+  }
+
+  static String _qishuiFirstText(List<dynamic> values) {
+    for (final value in values) {
+      final s = value?.toString() ?? '';
+      if (s.isNotEmpty && s != 'null') return s;
+    }
+    return '';
+  }
+
+  static String _qishuiFirstNonEmpty(List<String> candidates) {
+    for (final candidate in candidates) {
+      if (candidate.isNotEmpty) return candidate;
+    }
+    return '';
+  }
+
+  /// 与汽水插件 buildSingerList 一致的歌手列表构造。
+  static List<Map<String, dynamic>> _qishuiSingerList(
+    List<Map<String, dynamic>> artists,
+  ) {
+    final out = <Map<String, dynamic>>[];
+    for (final artist in artists) {
+      dynamic info = artist['user_info'];
+      if (info is! Map) info = artist['author_info'];
+      final userInfo = info is Map ? Map<String, dynamic>.from(info) : artist;
+      final id = _qishuiFirstNonEmpty([
+        userInfo['id']?.toString() ?? '',
+        artist['id']?.toString() ?? '',
+      ]);
+      final name = _qishuiFirstNonEmpty([
+        userInfo['name']?.toString() ?? '',
+        userInfo['nickname']?.toString() ?? '',
+        artist['name']?.toString() ?? '',
+      ]);
+      final avatar = _qishuiFirstNonEmpty([
+        userInfo['avatar']?.toString() ?? '',
+        _qishuiCoverUrl(userInfo['url_avatar'], '100:100'),
+        _qishuiCoverUrl(userInfo['medium_avatar_url'], '100:100'),
+        _qishuiCoverUrl(userInfo['thumb_avatar_url'], '100:100'),
+      ]);
+      if (id.isNotEmpty || name.isNotEmpty) {
+        out.add({'id': id, 'name': name, 'avatar': avatar});
+      }
+    }
+    return out;
+  }
+
+  /// 汽水 bit_rates → 插件同构 qualities（baka 键 →
+  /// {size, bitrate, qishuiQuality}），spatial 条目按码率+体积排序映
+  /// 射为 atmos / atmos_plus。
+  static Map<String, dynamic> _qishuiQualitiesFromBitRates(dynamic bitRates) {
+    final qualities = <String, dynamic>{};
+    if (bitRates is! List) return qualities;
+    final spatialEntries = <Map<String, dynamic>>[];
+    for (final entry in bitRates) {
+      if (entry is! Map) continue;
+      final qishuiQuality = entry['quality']?.toString() ?? '';
+      final bitrate = entry['br'] is num
+          ? (entry['br'] as num).toInt()
+          : _qishuiQualityFallbackBitrate[qishuiQuality] ?? 0;
+      if (qishuiQuality == 'spatial') {
+        spatialEntries.add({
+          'size': entry['size'],
+          'bitrate': bitrate,
+          'qishuiQuality': qishuiQuality,
+        });
+        continue;
+      }
+      final qualityKey = _qishuiQualityToBaka[qishuiQuality];
+      if (qualityKey == null || qualities.containsKey(qualityKey)) continue;
+      qualities[qualityKey] = {
+        'size': entry['size'],
+        'bitrate': bitrate,
+        'qishuiQuality': qishuiQuality,
+      };
+    }
+    if (spatialEntries.isNotEmpty) {
+      num score(Map<String, dynamic> entry) =>
+          (entry['bitrate'] as num) * 1000000000 + _qishuiSizeScore(entry['size']);
+      spatialEntries.sort((a, b) => score(b).compareTo(score(a)));
+      if (spatialEntries.length > 1) {
+        qualities['atmos_plus'] = spatialEntries[0];
+        qualities['atmos'] = spatialEntries[1];
+      } else {
+        qualities['atmos'] = spatialEntries[0];
+      }
+    }
+    return qualities;
+  }
+
+  static num _qishuiSizeScore(dynamic size) =>
+      size is num ? size : (int.tryParse(size?.toString() ?? '') ?? 0);
+
+  static int? _qishuiDurationSeconds(dynamic duration) {
+    final n = duration is num ? duration.toInt() : int.tryParse('$duration');
+    if (n == null || n <= 0) return null;
+    return n > 10000 ? n ~/ 1000 : n;
+  }
+
+  /// 汽水 playlist 信息 → 插件 parsePlaylistItem 同构的歌单元数据。
+  static Map<String, dynamic>? _parseQishuiSheetItem(dynamic raw) {
+    if (raw is! Map) return null;
+    final owner = raw['owner'] is Map
+        ? Map<String, dynamic>.from(raw['owner'] as Map)
+        : const <String, dynamic>{};
+    final userArtistInfo = raw['user_artist_info'];
+    final userBrief = userArtistInfo is Map && userArtistInfo['user_brief'] is Map
+        ? Map<String, dynamic>.from(userArtistInfo['user_brief'] as Map)
+        : const <String, dynamic>{};
+    final resourceCnt = raw['resource_cnt'];
+    final worksNum = _qishuiToInt(raw['count_tracks']) ??
+        _qishuiToInt(resourceCnt is Map ? resourceCnt['track_cnt'] : null) ??
+        0;
+    final labelInfo = raw['label_info'];
+    return {
+      'id': raw['id']?.toString() ?? '',
+      'title': _qishuiFirstNonEmpty([
+        raw['title']?.toString() ?? '',
+        raw['public_title']?.toString() ?? '',
+        raw['name']?.toString() ?? '',
+      ]),
+      'artist': _qishuiFirstNonEmpty([
+        owner['nickname']?.toString() ?? '',
+        userBrief['nickname']?.toString() ?? '',
+      ]),
+      'createUserId': _qishuiFirstNonEmpty([
+        owner['id']?.toString() ?? '',
+        userBrief['id']?.toString() ?? '',
+      ]),
+      'description': raw['desc']?.toString() ?? '',
+      'artwork': _qishuiCoverUrl(raw['url_cover']),
+      'createTime': _qishuiToInt(raw['create_time']) ?? 0,
+      'worksNum': worksNum,
+      'fee': labelInfo is Map && labelInfo['only_vip_playable'] == true
+          ? 1
+          : 0,
+      '_bakaSourceType': 'playlist',
+    };
+  }
+
+  static int? _qishuiToInt(dynamic value) {
+    if (value is num && value.isFinite) return value.toInt();
+    return null;
   }
 
   /// QQ 歌单超出插件单次整单上限（约 999 首）时，直接调用官方
@@ -2218,7 +3153,11 @@ class PluginRuntimeService {
     return result;
   }
 
-  static Map<String, dynamic> _bestMatchingPlaylist(
+  /// 输入携带数字 ID（分享链接、酷狗码、纯数字歌单 ID）时要求搜索结果
+  /// 的 ID 精确一致才采用；对不上返回 null 让调用方继续下一层回退——
+  /// 把链接/数字码当关键词搜出的歌单与目标歌单无关（酷狗搜索纯数字
+  /// 会返回名称巧合的热门歌单，曾被误导入）。纯文本名称输入仍取第一条。
+  static Map<String, dynamic>? _bestMatchingPlaylist(
     List<Map<String, dynamic>> sheets,
     String input,
   ) {
@@ -2230,6 +3169,7 @@ class PluginRuntimeService {
           if (sheet[key]?.toString() == wanted) return sheet;
         }
       }
+      return null;
     }
     return sheets.first;
   }
@@ -3566,10 +4506,13 @@ class PluginRuntimeService {
   }
 
   /// animemusic 榜单歌曲：music/toplist/detail（按榜单 id，分页）。
+  /// [fetchAll] 为 true 时按 total 分页取全（榜单详情页），每页 100 首，
+  /// 与 music/import 相同按 id 去重、防止后端翻页返回重复条目。
   Future<List<PluginSearchSong>> _getAnimemusicTopListSongs(
     EnabledMusicPlugin plugin,
     PluginCatalogResult chart, {
     int limit = 40,
+    bool fetchAll = false,
   }) async {
     final platform =
         chart.rawData['animeSrc']?.toString().trim().isNotEmpty == true
@@ -3577,25 +4520,117 @@ class PluginRuntimeService {
         : plugin.animemusicPlatform;
     final chartId = chart.rawData['id']?.toString().trim() ?? '';
     if (chartId.isEmpty) return const [];
-    final body = await _callAnimemusicApi(plugin, 'music/toplist/detail', {
-      'platform': platform,
-      'id': chartId,
-      'page': '1',
-      'limit': '$limit',
-    });
-    final data = body['list'];
-    if (data is! List) return const [];
+    if (!fetchAll) {
+      final body = await _callAnimemusicApi(plugin, 'music/toplist/detail', {
+        'platform': platform,
+        'id': chartId,
+        'page': '1',
+        'limit': '$limit',
+      });
+      final data = body['list'];
+      if (data is! List) return const [];
+      return [
+        for (final item in data)
+          if (item is Map)
+            _toSearchSong(
+              plugin.id,
+              _resetMediaItem(plugin, {
+                ...Map<String, dynamic>.from(item),
+                'animeSrc': platform,
+              }),
+            ),
+      ];
+    }
+    // 榜单详情页：分页拉全（对齐 music/import 的翻页策略）。
+    final songs = <Map<String, dynamic>>[];
+    final seenIds = <String>{};
+    var total = 0;
+    const pageSize = 100;
+    for (var page = 1; page <= 50; page++) {
+      final body = await _callAnimemusicApi(plugin, 'music/toplist/detail', {
+        'platform': platform,
+        'id': chartId,
+        'page': '$page',
+        'limit': '$pageSize',
+      });
+      final list = body['list'];
+      if (list is! List) break;
+      if (total <= 0) total = (body['total'] as num?)?.toInt() ?? 0;
+      var added = 0;
+      for (final item in list) {
+        if (item is! Map) continue;
+        final raw = Map<String, dynamic>.from(item);
+        final id = raw['id']?.toString().trim() ?? '';
+        if (id.isEmpty || !seenIds.add(id)) continue;
+        songs.add({...raw, 'animeSrc': platform});
+        added++;
+      }
+      final hasMore = total > 0
+          ? page * pageSize < total
+          : list.length >= pageSize;
+      if (!hasMore || added == 0) break;
+    }
     return [
-      for (final item in data)
-        if (item is Map)
-          _toSearchSong(
-            plugin.id,
-            _resetMediaItem(plugin, {
-              ...Map<String, dynamic>.from(item),
-              'animeSrc': platform,
-            }),
-          ),
+      for (final raw in songs)
+        _toSearchSong(plugin.id, _resetMediaItem(plugin, raw)),
     ];
+  }
+
+  /// animemusic/1 单平台插件的歌单导入：直连后端 music/import。分享文案
+  /// / 短链 / 纯数字歌单 ID 均由后端自行解析，宿主只负责分页取全曲目与
+  /// 条目归一化：该接口的条目不带 _src（music/search 才有），必须注入
+  /// animeSrc（平台码）供播放解析（music/url）使用。
+  Future<Map<String, dynamic>?> _importAnimemusicPlaylist(
+    EnabledMusicPlugin plugin,
+    String input,
+  ) async {
+    final configured = plugin.animemusicPlatform.trim();
+    final params = <String, String>{
+      'url': input,
+      'page': '1',
+      'limit': '100',
+      // 聚合插件（platform 为空或 all）不传，由后端按链接自动识别平台。
+      if (configured.isNotEmpty && configured != 'all') 'platform': configured,
+    };
+    var platform = _toAnimemusicPlatformCode(configured);
+    final songs = <Map<String, dynamic>>[];
+    var title = '';
+    var cover = '';
+    final seenIds = <String>{};
+    // 安全上限：防止接口异常时无限翻页；正常会因取满 total 提前结束。
+    for (var page = 1; page <= 100; page++) {
+      params['page'] = '$page';
+      final body = await _callAnimemusicApi(plugin, 'music/import', params);
+      final bodyPlatform = body['platform']?.toString().trim() ?? '';
+      if (bodyPlatform.isNotEmpty) {
+        platform = _toAnimemusicPlatformCode(bodyPlatform);
+      }
+      if (title.isEmpty) {
+        title = body['title']?.toString().trim() ?? '';
+        cover = _normalizeImageUrl(body['cover']?.toString() ?? '');
+      }
+      final list = body['list'];
+      if (list is! List) break;
+      var added = 0;
+      for (final item in list) {
+        if (item is! Map) continue;
+        final raw = Map<String, dynamic>.from(item);
+        final id = raw['id']?.toString().trim() ?? '';
+        // 个别后端翻页时返回重复条目，按 id 去重。
+        if (id.isEmpty || !seenIds.add(id)) continue;
+        songs.add(_resetMediaItem(plugin, {...raw, 'animeSrc': platform}));
+        added++;
+      }
+      final total = (body['total'] as num?)?.toInt() ?? 0;
+      final hasMore = total > 0 ? page * 100 < total : list.length >= 100;
+      if (!hasMore || added == 0) break;
+    }
+    if (songs.isEmpty) return null;
+    return {
+      'name': title.isNotEmpty ? title : '${plugin.name}歌单',
+      'coverUrl': cover,
+      'songs': songs,
+    };
   }
 
   String _normalizeAnimemusicQuality(String? quality) {
@@ -3942,13 +4977,25 @@ class PluginRuntimeService {
         try {
           final response = await _callOnCurrentIsolate(plugin, method, args);
           final lyrics = await _resolveLyricsResponse(response);
-          // QQ 音源插件（crypt:1 + qrc:1）返回的是加密的 hex 密文，
-          // 丢弃会永远丢失逐字歌词——Rust 解析器自带 TripleQDES 解密，
-          // 这里必须透传，只有密文解析失败时才轮到平台兜底。
+          // QQ 音源插件（crypt:1 + qrc:1）返回的是加密的 hex 密文：先在
+          // Dart 侧解密（与 Rust qrc_decrypt 同算法），成功返回明文
+          // （词级时间轴交给下游解析器，行级 LRC 直接展示）；解密失败
+          // 走平台老接口兜底，均不可用时返回空串——绝不把密文透传给
+          // 下载/备份链路落盘成乱码。
           if (lyrics.isNotEmpty) {
-            if (_hasWordTiming(lyrics) ||
-                _isLikelyEncryptedLyrics(lyrics) ||
-                !_isNeteaseMusicPlugin(plugin)) {
+            if (_isLikelyEncryptedLyrics(lyrics)) {
+              final decrypted = decryptQrcLyrics(lyrics);
+              if (decrypted != null && decrypted.trim().isNotEmpty) {
+                return decrypted;
+              }
+              final fallback = await _getPlatformLyricsFallback(
+                plugin,
+                rawData,
+              );
+              if (fallback.isNotEmpty) return fallback;
+              return '';
+            }
+            if (_hasWordTiming(lyrics) || !_isNeteaseMusicPlugin(plugin)) {
               // QQ 歌曲拿到普通 LRC 时先尝试直连升级为逐字版本（插件
               // 内部 musicu.fcg 失败会静默降级老接口丢失逐字）。
               final upgraded = await _upgradeQqLyricsToWordTiming(
@@ -3973,11 +5020,18 @@ class PluginRuntimeService {
         rawData,
       ]);
       final lyrics = await _resolveLyricsResponse(info);
-      // 密文同上：透传给 Rust 解密，不在此丢弃。
+      // 密文处理同上：Dart 侧解密，失败走平台兜底。
       if (lyrics.isNotEmpty) {
-        if (_hasWordTiming(lyrics) ||
-            _isLikelyEncryptedLyrics(lyrics) ||
-            !_isNeteaseMusicPlugin(plugin)) {
+        if (_isLikelyEncryptedLyrics(lyrics)) {
+          final decrypted = decryptQrcLyrics(lyrics);
+          if (decrypted != null && decrypted.trim().isNotEmpty) {
+            return decrypted;
+          }
+          final fallback = await _getPlatformLyricsFallback(plugin, rawData);
+          if (fallback.isNotEmpty) return fallback;
+          return '';
+        }
+        if (_hasWordTiming(lyrics) || !_isNeteaseMusicPlugin(plugin)) {
           final upgraded = await _upgradeQqLyricsToWordTiming(
             rawData,
             lyrics,
@@ -4003,8 +5057,14 @@ class PluginRuntimeService {
         // 后端不可用时维持原有返回。
       }
     }
-    // bestLyrics 可能是 QQ 密文（Rust 解密出逐字歌词），直接透传；
-    // 只有它本来就不存在时才返回空。
+    // bestLyrics 只保留明文：rawData 内嵌 lyric 字段可能就是密文而插件
+    // 方法全部失败，这里最后一道拦截解密，失败宁可返回空串也不把密文
+    // 透传给下载/备份链路落盘成乱码。
+    if (bestLyrics.isNotEmpty && _isLikelyEncryptedLyrics(bestLyrics)) {
+      final decrypted = decryptQrcLyrics(bestLyrics);
+      if (decrypted != null && decrypted.trim().isNotEmpty) return decrypted;
+      return '';
+    }
     return bestLyrics;
   }
 
@@ -4922,10 +5982,20 @@ class PluginRuntimeService {
   static String _extractLyricsWithTranslation(dynamic value) {
     final main = _extractLyrics(value);
     if (main.isEmpty || value is! Map) return main;
-    // 主歌词是密文（QQ crypt:1）时，翻译/罗马音同样是密文，按行拼接
-    // 会把多段 hex 连成一块，破坏 Rust 侧的整体解密——只返回主歌词
-    // 密文（解密后即逐字 QRC），翻译随密文一起放弃。
-    if (_isLikelyEncryptedLyrics(main)) return main;
+    // 主歌词是密文（QQ crypt:1）时，翻译/罗马音同样是密文。此前直接丢弃
+    // 翻译；现在把密文的翻译/罗马音按行拼接透传，Rust 侧逐行解密后把
+    // 翻译行合并进解析管线（对齐桌面端 combined 链路）。明文翻译在密文
+    // 主词场景下无法随行拼接（会破坏 hex 检测），仍维持放弃。
+    if (_isLikelyEncryptedLyrics(main)) {
+      final parts = <String>[main];
+      for (final extra in [
+        _extractTranslation(value),
+        _extractRomaji(value),
+      ]) {
+        if (_isLikelyEncryptedLyrics(extra)) parts.add(extra);
+      }
+      return parts.join('\n');
+    }
     final translation = _extractTranslation(value);
     final romaji = _extractRomaji(value);
     if (translation.isEmpty && romaji.isEmpty) return main;
@@ -5248,7 +6318,9 @@ class PluginRuntimeService {
     ]) {
       final value = raw[key];
       if (value is num && value > 0) {
-        return value > 1000 ? value.floor() : (value * 1000).floor();
+        // 听书章节可达 30+ 分钟（1800 秒），阈值取 10000：秒值
+        // （16 分钟内）按秒换算，毫秒值（10 秒以上）保持原样。
+        return value > 10000 ? value.floor() : (value * 1000).floor();
       }
       if (value is String && value.contains(':')) {
         final parts = value.split(':').map(int.tryParse).toList();
@@ -5262,7 +6334,7 @@ class PluginRuntimeService {
       }
       final number = value is String ? double.tryParse(value) : null;
       if (number != null && number > 0) {
-        return number > 1000 ? number.floor() : (number * 1000).floor();
+        return number > 10000 ? number.floor() : (number * 1000).floor();
       }
     }
     return 0;

@@ -16,6 +16,7 @@ import '../../src/core/custom_font.dart';
 import '../../src/auth/auth_provider.dart';
 import '../../src/backup/backup_service.dart';
 import '../../src/favorites/favorites_provider.dart';
+import '../../src/home/home_providers.dart';
 import '../../src/navigation/sidebar_controller.dart';
 import '../../src/player/desktop_lyrics.dart';
 import '../../src/playlists/playlists_provider.dart';
@@ -515,6 +516,7 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
       final libraryInfo = data.librarySongCount > 0
           ? '与 ${data.librarySongCount} 首本地曲库'
           : '';
+      final historyInfo = data.hasPlaybackHistory ? '、最近播放与听歌统计' : '';
       final appearanceInfo = data.appearance.isEmpty
           ? ''
           : '、外观自定义文件（壁纸/字体）';
@@ -525,7 +527,7 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
           content: Text(
             '备份导出于 $exportedAt，包含 '
             '${data.prefCount} 项数据、${data.pluginCount} 个插件'
-            '$libraryInfo$appearanceInfo。\n\n'
+            '$libraryInfo$historyInfo$appearanceInfo。\n\n'
             '导入将覆盖当前同名的歌单、收藏、插件、本地曲库与设置，'
             '建议先停止播放后继续。',
           ),
@@ -559,14 +561,21 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
       ref.invalidate(recentSongsProvider);
       ref.invalidate(enabledMusicPluginsProvider);
       if (data.librarySongCount > 0) ref.invalidate(libraryProvider);
+      if (data.hasPlaybackHistory) {
+        // 听歌统计与榜单直接读 SQLite 统计表，恢复后需重建缓存。
+        ref.invalidate(homeStatisticsProvider);
+        for (final period in LeaderboardPeriod.values) {
+          ref.invalidate(homeLeaderboardProvider(period));
+        }
+      }
       if (!mounted) return;
       await showDialog<void>(
         context: context,
         builder: (dialogContext) => AlertDialog(
           title: const Text('导入完成'),
-          content: const Text(
+          content: Text(
             '设置与主题已生效；本地曲库已恢复；'
-            '歌单与收藏已恢复。',
+            '歌单与收藏已恢复${data.hasPlaybackHistory ? '；最近播放与听歌统计已恢复' : ''}。',
           ),
           actions: [
             FilledButton(

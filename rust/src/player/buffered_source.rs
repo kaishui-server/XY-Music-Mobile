@@ -15,7 +15,8 @@
 //!
 //! ## 关键设计
 //! - **有界 `sync_channel` + `try_send`**：后台线程用非阻塞 `try_send` 推送样本块，
-//!   通道满时短 sleep 重试，绝不长时间阻塞 → 始终能及时响应 seek 命令，无死锁。
+//!   通道满时等待消费信号（[`FreeSlotSignal`]），绝不长时间阻塞 → 始终能及时
+//!   响应 seek 命令，无死锁。
 //! - **块传输**：每块 1024 样本（~11.6ms @ 44100 立体声），减少通道原子操作开销。
 //! - **seek 同步 rendezvous**：音频线程发 Seek 命令 → 后台线程 seek 内部源 + 回 ack
 //!   → 音频线程排空陈旧样本。后台线程因 `try_send` 不阻塞，seek 必然及时响应。
@@ -25,7 +26,7 @@ use std::collections::VecDeque;
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -39,6 +40,33 @@ const CHANNEL_BLOCKS: usize = 64;
 
 /// 后台线程满载时的退避间隔。短到不影响 seek 响应，长到不空转浪费 CPU。
 const BACKOFF: Duration = Duration::from_micros(400);
+
+/// 满载等待消费信号的安全超时：防信号丢失（消费端异常退出/暂停不消费）
+/// 导致生产者永久沉睡。正常路径下消费一块 notify 一次，等待会立即结束。
+const FREE_SLOT_WAIT_TIMEOUT: Duration = Duration::from_millis(50);
+
+/// 通道空闲信号：消费端每取走一个样本块（或 Drop/seek 排空释放缓冲）就
+/// `notify`，生产端满载时阻塞等待该信号。
+///
+/// 之前满载退避是固定 400µs sleep 重试：播放稳态下解码远快于实时消费，
+/// 通道在整个歌曲期间保持满载，生产者以约 2500 次/秒的频率空转唤醒，
+/// 是移动端长时间播放发热的直接来源之一。改为按消费事件唤醒后，生产者
+/// 唤醒频率与消费速率对齐（约每块一次，~100Hz），空闲时接近零唤醒。
+#[derive(Clone, Default)]
+struct FreeSlotSignal(Arc<(Mutex<()>, Condvar)>);
+
+impl FreeSlotSignal {
+    /// 消费端调用：唤醒一个正在等待空位的生产者。
+    fn notify(&self) {
+        self.0 .1.notify_one();
+    }
+
+    /// 生产端调用：阻塞等待空位出现（或超时兜底）。
+    fn wait(&self, timeout: Duration) {
+        let guard = self.0 .0.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = self.0 .1.wait_timeout(guard, timeout);
+    }
+}
 
 #[cfg(test)]
 const CONSUMER_WAIT_TIMEOUT: Duration = Duration::from_millis(500);
@@ -125,6 +153,8 @@ pub struct BufferedSource<P> {
     sample_rx: Receiver<Vec<f32>>,
     cmd_tx: SyncSender<Command>,
     ack_rx: Receiver<SeekAck>,
+    /// 消费一块就通知一次满载等待中的生产者（见 [`FreeSlotSignal`]）。
+    free_slot: FreeSlotSignal,
     sample_rate: u32,
     channels: u16,
     total_duration: Option<Duration>,
@@ -180,6 +210,8 @@ where
         let stop_flag = Arc::new(AtomicBool::new(false));
         let stop_flag_clone = stop_flag.clone();
         let monitor_clone = monitor.clone();
+        let free_slot = FreeSlotSignal::default();
+        let free_slot_clone = free_slot.clone();
 
         let thread_handle = thread::Builder::new()
             .name("xy-buffered-source".to_string())
@@ -191,6 +223,7 @@ where
                     ack_tx,
                     stop_flag_clone,
                     monitor_clone,
+                    free_slot_clone,
                 )
             })
             .ok();
@@ -199,6 +232,7 @@ where
             sample_rx,
             cmd_tx,
             ack_rx,
+            free_slot,
             sample_rate,
             channels,
             total_duration,
@@ -222,6 +256,7 @@ where
         match self.sample_rx.recv_timeout(PREFILL_TIMEOUT) {
             Ok(block) => {
                 self.set_starvation(false);
+                self.free_slot.notify();
                 if block.is_empty() {
                     self.exhausted = true;
                 } else {
@@ -278,6 +313,9 @@ where
         match self.sample_rx.recv_timeout(CONSUMER_WAIT_TIMEOUT) {
             Ok(block) => {
                 self.set_starvation(false);
+                // 通道腾出一个空位：唤醒满载等待中的生产者（发热治理，
+                // 见 FreeSlotSignal 文档）。
+                self.free_slot.notify();
                 if block.is_empty() {
                     // 空块视为 EOF 信号
                     self.exhausted = true;
@@ -315,6 +353,8 @@ where
 
         // 排空通道中 seek 前的陈旧样本块
         while self.sample_rx.try_recv().is_ok() {}
+        // 一次释放出全部空位：唤醒满载等待中的生产者立即补货。
+        self.free_slot.notify();
         self.current_block.clear();
         self.exhausted = false;
         // 预填充 seek 后首个样本块，消除 seek 后短暂静音
@@ -331,6 +371,7 @@ fn producer_loop<P: BlockProducer + Send>(
     ack_tx: std::sync::mpsc::Sender<SeekAck>,
     stop_flag: Arc<AtomicBool>,
     monitor: Option<Arc<BufferedMonitor>>,
+    free_slot: FreeSlotSignal,
 ) {
     // 提升生产者线程优先级（Windows: ABOVE_NORMAL），防止系统负载下被抢占导致缓冲排空。
     elevate_thread_priority();
@@ -426,7 +467,10 @@ fn producer_loop<P: BlockProducer + Send>(
                     }
                     Err(mpsc::TrySendError::Full(b)) => {
                         block = b;
-                        thread::sleep(BACKOFF);
+                        // 满载：等待消费信号（消费端取走一块即 notify），
+                        // 替代固定 400µs sleep 轮询——稳态满载下后者每秒
+                        // 空转唤醒约 2500 次，长时间播放发热的来源之一。
+                        free_slot.wait(FREE_SLOT_WAIT_TIMEOUT);
                     }
                     Err(mpsc::TrySendError::Disconnected(_)) => return,
                 }

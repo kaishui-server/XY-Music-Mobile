@@ -1115,6 +1115,8 @@ Future<String> buildDownloadBasename({
 
 /// 启动 USB 独占播放。返回设备名或错误信息。
 /// `device_id` = AAudio 设备 ID（USB DAC），-1 = 默认设备。
+/// `shared_mode` = true 走共享模式 DSP 管线（系统混音器，全效果链生效）。
+/// `stream_cache_url` = 在线流缓存直读 URL（None = 本地文件）。
 Future<String> startUsbExclusivePlayback({
   required String path,
   required int deviceId,
@@ -1124,6 +1126,9 @@ Future<String> startUsbExclusivePlayback({
   required double volumeBalanceGain,
   required String equalizerSettingsJson,
   required String soundEffectSettingsJson,
+  required bool sharedMode,
+  String? streamCacheUrl,
+  String? streamCacheHeadersJson,
 }) => RustLib.instance.api.crateApiStartUsbExclusivePlayback(
   path: path,
   deviceId: deviceId,
@@ -1133,6 +1138,9 @@ Future<String> startUsbExclusivePlayback({
   volumeBalanceGain: volumeBalanceGain,
   equalizerSettingsJson: equalizerSettingsJson,
   soundEffectSettingsJson: soundEffectSettingsJson,
+  sharedMode: sharedMode,
+  streamCacheUrl: streamCacheUrl,
+  streamCacheHeadersJson: streamCacheHeadersJson,
 );
 
 /// 停止 USB 独占播放并释放设备。
@@ -1147,6 +1155,18 @@ Future<void> seekUsbExclusive({
   timeSecs: timeSecs,
   isPlaying: isPlaying,
 );
+
+/// 暂停独占播放（不改变进度）。
+Future<void> pauseUsbExclusivePlayback() =>
+    RustLib.instance.api.crateApiPauseUsbExclusivePlayback();
+
+/// 从暂停恢复独占播放（不改变进度）。
+Future<void> resumeUsbExclusivePlayback() =>
+    RustLib.instance.api.crateApiResumeUsbExclusivePlayback();
+
+/// 查询当前独占播放输出设备/格式信息（JSON），用于前端展示与进度驱动。
+Future<String> getUsbExclusiveDeviceInfo() =>
+    RustLib.instance.api.crateApiGetUsbExclusiveDeviceInfo();
 
 /// 设置用户音量（0.0–1.0）。
 Future<void> setUsbExclusiveVolume({required double volume}) =>

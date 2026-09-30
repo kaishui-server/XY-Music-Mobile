@@ -34,6 +34,58 @@ const Set<String> _losslessQualityTokens = {
 bool _isLosslessQuality(String quality) =>
     _losslessQualityTokens.contains(quality.trim().toLowerCase());
 
+bool isLosslessQuality(String quality) => _isLosslessQuality(quality);
+
+/// 播放页音质按钮的缩写标签（对齐 MusicFree builtinQualityAbbr）：
+/// 96k/128k→LQ、192k→MQ、320k→HQ、flac→SQ、flac24bit/hires→HR、
+/// vinyl→VN、dolby→DB、atmos→AT、atmos_plus→A+、master→MS。
+/// 同组别名（flac/lossless/sq/super 等）映射到同一缩写；未知档位
+/// 回退前两字符大写；无音质信息（本地/未知）时回退 HQ。
+String qualityShortLabel(String quality) {
+  final lower = quality.trim().toLowerCase();
+  if (lower.isEmpty) return 'HQ';
+  switch (lower) {
+    case '96k':
+    case '128k':
+    case 'standard':
+    case 'low':
+    case 'mgg':
+      return 'LQ';
+    case '192k':
+      return 'MQ';
+    case '320k':
+    case 'high':
+      return 'HQ';
+    case 'flac':
+    case 'lossless':
+    case 'sq':
+    case 'super':
+      return 'SQ';
+    case 'flac24bit':
+    case 'hires':
+    case 'hi-res':
+      return 'HR';
+    case 'vinyl':
+      return 'VN';
+    case 'dolby':
+      return 'DB';
+    case 'atmos':
+      return 'AT';
+    case 'atmos_plus':
+      return 'A+';
+    case 'ape':
+      return 'APE';
+    case 'wav':
+      return 'WAV';
+    default:
+      if (lower.contains('master')) return 'MS';
+      if (lower.contains('24bit')) return 'HR';
+      // MusicFree 兜底规则：未知档位取前两字符大写。
+      final raw = quality.trim();
+      return raw.length <= 2 ? raw.toUpperCase() : raw.substring(0, 2).toUpperCase();
+  }
+}
+
 bool _isLosslessFormat(String? format) =>
     format == 'flac' || format == 'wav';
 

@@ -363,6 +363,14 @@ class DesktopLyricsService : Service() {
             if (view.text.toString() != p.translation) {
                 view.text = p.translation
             }
+            // 无翻译且无罗马音的歌曲不显示副行：空文本的 TextView 仍会
+            // 占一行高度，副行残留为空白行，因此按内容显隐整个视图。
+            val translationVisible = p.translation.isNotBlank()
+            val desiredVisibility =
+                if (translationVisible) View.VISIBLE else View.GONE
+            if (view.visibility != desiredVisibility) {
+                view.visibility = desiredVisibility
+            }
             if (lastTranslationColor != p.translationColor) {
                 lastTranslationColor = p.translationColor
                 view.setTextColor(p.translationColor)

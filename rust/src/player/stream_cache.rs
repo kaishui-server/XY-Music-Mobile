@@ -195,6 +195,9 @@ pub struct StreamingTempFileState {
     pub post_check_pending: Option<Arc<AtomicBool>>,
     /// 下载失败原因（供前端诊断）
     pub download_error: Arc<std::sync::Mutex<Option<String>>>,
+    /// 共享总长槽位（字节，0 = 未知）：下载线程回填 Content-Length 后实时可读。
+    /// symphonia FLAC/MP3 demuxer 的 seek 依赖 MediaSource::byte_len() 提供二分上界。
+    pub content_length_shared: Arc<AtomicU64>,
 }
 
 impl std::fmt::Debug for StreamingTempFileState {
@@ -273,6 +276,17 @@ impl StreamingTempFileState {
     pub fn download_error(&self) -> Option<String> {
         self.download_error.lock().ok().and_then(|e| e.clone())
     }
+
+    /// 共享总长（字节）：下载线程回填 Content-Length 后实时可读，未知返回 None。
+    /// symphonia FLAC/MP3 demuxer 的 seek 依赖 MediaSource::byte_len() 提供二分上界。
+    pub fn shared_total_bytes(&self) -> Option<u64> {
+        let v = self.content_length_shared.load(Ordering::Relaxed);
+        if v == 0 {
+            None
+        } else {
+            Some(v)
+        }
+    }
 }
 
 struct CacheEntry {
@@ -282,6 +296,9 @@ struct CacheEntry {
     downloaded_bytes: Arc<AtomicU64>,
     download_complete: Arc<AtomicBool>,
     download_failed: Arc<AtomicBool>,
+    /// 共享总长槽位（字节，0 = 未知）：下载线程回填，state/reader 实时读。
+    /// 同一 URL 的 start_streaming_download 复用路径必须拿到同一线程写的槽。
+    content_length_shared: Arc<AtomicU64>,
     /// 下载线程句柄（detach，不阻塞；线程结束后自然回收）
     _download_handle: Option<std::thread::JoinHandle<()>>,
 }
@@ -366,6 +383,7 @@ impl StreamCacheManager {
                     downloaded_bytes: Arc::new(AtomicU64::new(size)),
                     download_complete: Arc::new(AtomicBool::new(true)),
                     download_failed: Arc::new(AtomicBool::new(false)),
+                    content_length_shared: Arc::new(AtomicU64::new(size)),
                     _download_handle: None,
                 },
             );
@@ -478,6 +496,7 @@ pub fn start_streaming_download(
                 ekey: Arc::new(std::sync::Mutex::new(ekey.map(|s| s.to_string()))),
                 post_check_pending: None,
                 download_error: Arc::new(std::sync::Mutex::new(None)),
+                content_length_shared: entry.content_length_shared.clone(),
             });
         }
         // 下载进行中：复用同一个文件和下载状态
@@ -490,6 +509,7 @@ pub fn start_streaming_download(
             ekey: Arc::new(std::sync::Mutex::new(ekey.map(|s| s.to_string()))),
             post_check_pending: None,
             download_error: Arc::new(std::sync::Mutex::new(None)),
+            content_length_shared: entry.content_length_shared.clone(),
         });
     }
 
@@ -511,6 +531,7 @@ pub fn start_streaming_download(
     let shared_ekey = Arc::new(std::sync::Mutex::new(ekey.map(|s| s.to_string())));
     let download_error: Arc<std::sync::Mutex<Option<String>>> =
         Arc::new(std::sync::Mutex::new(None));
+    let content_length_shared = Arc::new(AtomicU64::new(0));
 
     // 启动后台下载线程
     let url_clone = url.to_string();
@@ -524,6 +545,7 @@ pub fn start_streaming_download(
     let dl_post_check = post_check_pending.clone();
     let dl_ekey = shared_ekey.clone();
     let dl_error = download_error.clone();
+    let dl_content_length = content_length_shared.clone();
 
     let handle = std::thread::spawn(move || {
         download_thread(
@@ -538,6 +560,7 @@ pub fn start_streaming_download(
             dl_post_check,
             dl_ekey,
             dl_error,
+            dl_content_length,
         );
     });
 
@@ -550,6 +573,7 @@ pub fn start_streaming_download(
             downloaded_bytes: downloaded_bytes.clone(),
             download_complete: download_complete.clone(),
             download_failed: download_failed.clone(),
+            content_length_shared: content_length_shared.clone(),
             _download_handle: Some(handle),
         },
     );
@@ -564,6 +588,7 @@ pub fn start_streaming_download(
         ekey: shared_ekey,
         post_check_pending: Some(post_check_pending),
         download_error,
+        content_length_shared,
     })
 }
 
@@ -1028,6 +1053,7 @@ fn download_thread(
     _post_check_pending: Arc<AtomicBool>,
     ekey: Arc<std::sync::Mutex<Option<String>>>,
     download_error: Arc<std::sync::Mutex<Option<String>>>,
+    content_length_shared: Arc<AtomicU64>,
 ) {
     let fail_download = |reason: &str, bytes_written: u64| {
         downloaded_bytes.store(bytes_written, Ordering::Relaxed);
@@ -1198,6 +1224,10 @@ fn download_thread(
         .get(reqwest::header::CONTENT_LENGTH)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse::<u64>().ok());
+    // 总长实时回填共享槽位：解码器 byte_len() 依赖它提供 seek 二分上界
+    if let Some(total) = total_bytes {
+        content_length_shared.store(total, Ordering::Relaxed);
+    }
 
     let mut file = match OpenOptions::new().write(true).open(&path) {
         Ok(f) => f,
@@ -1269,6 +1299,10 @@ fn download_thread(
         }
     }
 
+    // 无 Content-Length 的响应在完成后用实际字节数回填总长
+    if content_length_shared.load(Ordering::Relaxed) == 0 {
+        content_length_shared.store(bytes_written, Ordering::Relaxed);
+    }
     download_complete.store(true, Ordering::Relaxed);
 
     // 更新缓存大小

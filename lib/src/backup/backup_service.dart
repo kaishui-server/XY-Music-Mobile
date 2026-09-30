@@ -7,6 +7,8 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import '../core/custom_font.dart';
 import '../core/db_path.dart';
+import '../plugins/plugin_metadata.dart';
+import '../plugins/plugin_reference_migration.dart';
 import '../rust/api.dart' as rust;
 
 /// 备份/恢复失败时抛出的异常，[message] 直接展示给用户。
@@ -90,11 +92,17 @@ class BackupData {
     final rows = songs['rows'];
     return rows is List ? rows.length : 0;
   }
+
+  /// 备份是否包含播放历史与听歌统计表（v4 起；旧备份为 false）。
+  bool get hasPlaybackHistory => library['play_history'] is Map;
 }
 
 /// 导入完成后的统计。
 class BackupImportResult {
-  const BackupImportResult({required this.prefCount, required this.pluginCount});
+  const BackupImportResult({
+    required this.prefCount,
+    required this.pluginCount,
+  });
 
   final int prefCount;
   final int pluginCount;
@@ -107,12 +115,23 @@ class BackupImportResult {
 class BackupService {
   const BackupService();
 
+  // 插件偏好存储键（与 plugins_page / plugin_runtime 保持一致）：
+  // 归一化插件 ID 时需要迁移这些偏好。
+  static const _enabledPluginsKey = 'mobileEnabledPlugins';
+  static const _sourceUrlsKey = 'mobilePluginSourceUrlsV1';
+  static const _pluginOrderKey = 'mobilePluginOrder';
+  static const _pluginUserVariablesKey = 'mobilePluginUserVariablesV1';
+
   static const formatId = 'xymusic-backup';
   // v2：新增内嵌本地曲库表（songs/library_folders/artists 等），本地收藏与
   // 歌单歌曲依赖这些缓存才能恢复显示。读取时兼容 v1（无曲库字段）。
   // v3：新增外观自定义文件（全局壁纸、播放详情页背景、自定义字体），
   // 导入时写回 appearance 目录并修正设置中的绝对路径。读取时兼容 v1/v2。
-  static const int version = 3;
+  // v4：曲库表导出范围扩展到播放历史与听歌统计（play_history/
+  // song_stats 等），网络歌曲的统计行自带曲名/歌手元数据，恢复后
+  // 最近播放与听歌统计无需重新下载即可显示。读取时兼容 v1–v3
+  //（旧备份缺这些表时保留本机现有统计数据）。
+  static const int version = 4;
 
   /// 不随备份迁移的键：deviceId 是本机设备标识，不应在新设备复用。
   static const _excludedKeys = <String>{'deviceId'};
@@ -294,23 +313,25 @@ class BackupService {
     }
     final pluginCount = data.plugins.length;
     if (data.plugins.isNotEmpty) {
-      final dir = Directory(
-        p.join(await resolveAppDataDir(), 'plugins'),
-      );
+      final dir = Directory(p.join(await resolveAppDataDir(), 'plugins'));
       if (!dir.existsSync()) dir.createSync(recursive: true);
       for (final entry in data.plugins.entries) {
-        await File(p.join(dir.path, '${entry.key}.js')).writeAsString(
-          entry.value,
-        );
+        await File(
+          p.join(dir.path, '${entry.key}.js'),
+        ).writeAsString(entry.value);
       }
+      // 备份里的插件文件名沿用导出设备的 ID，脚本内容重新计算的 ID
+      // 可能已经漂移（旧版本安装时回退了哈希 ID、订阅插件 name 加了
+      // 赞助后缀等）。导入后立即归一化到内容 ID，并把启用状态、订阅
+      // 来源与歌单/收藏等歌曲数据引用一并迁移——否则下次更新合并时
+      // 旧 ID 文件被删，备份恢复的歌单会全部断链（搜不到插件）。
+      await _canonicalizePluginIds(dir);
     }
 
     // 外观自定义文件（v3 起）：写回 appearance 目录，并把 prefs 里的
     // 图片路径改写为本机路径（备份里的路径指向导出设备，在本机无效）。
     if (!data.appearance.isEmpty) {
-      final dir = Directory(
-        p.join(await resolveAppDataDir(), 'appearance'),
-      );
+      final dir = Directory(p.join(await resolveAppDataDir(), 'appearance'));
       if (!dir.existsSync()) dir.createSync(recursive: true);
       final imageEntries = <String, BackupAppearanceFile?>{
         'customBackgroundPath': data.appearance.background,
@@ -334,9 +355,9 @@ class BackupService {
         try {
           // 字体固定写 custom_font.ttf（与 customFontFilePath 一致），
           // fontFamily 设置已随 prefs 恢复，无需改写路径。
-          await File(await customFontFilePath()).writeAsBytes(
-            base64Decode(font.base64),
-          );
+          await File(
+            await customFontFilePath(),
+          ).writeAsBytes(base64Decode(font.base64));
         } on FileSystemException {
           // 写回失败时字体回退系统默认，不影响其余数据。
         }
@@ -346,6 +367,118 @@ class BackupService {
       prefCount: data.prefCount,
       pluginCount: pluginCount,
     );
+  }
+
+  /// 把 plugins 目录内文件名 ID 与脚本内容 ID 不一致的插件归一化：
+  /// - 内容 ID 的主文件已存在：本文件视为变体，删除（内容与偏好以
+  ///   主文件为准）；
+  /// - 不存在：文件改名为内容 ID。
+  /// 两种情况都把启用状态、订阅来源、用户变量、拖拽顺序等偏好从旧
+  /// ID 迁移到新 ID，并调用 [migratePluginReferences] 迁移歌单、收藏
+  /// 与最近播放里的旧 ID 引用，保证备份恢复的歌单不断链。
+  Future<void> _canonicalizePluginIds(Directory dir) async {
+    if (!dir.existsSync()) return;
+    final files =
+        dir
+            .listSync()
+            .whereType<File>()
+            .where((file) => p.extension(file.path).toLowerCase() == '.js')
+            .toList()
+          ..sort((a, b) => a.path.compareTo(b.path));
+    final renames = <String, String>{};
+    for (final file in files) {
+      final fileId = p.basenameWithoutExtension(file.path);
+      String script;
+      try {
+        script = file.readAsStringSync();
+      } catch (_) {
+        continue;
+      }
+      final contentId = PluginMetadata.resolvePluginId(script, file.path);
+      if (contentId == fileId) continue;
+      final target = File(p.join(dir.path, '$contentId.js'));
+      try {
+        if (target.existsSync()) {
+          // 同内容 ID 的主文件已在（本机已装新版）：变体直接删除。
+          await file.delete();
+        } else {
+          await file.rename(target.path);
+        }
+      } catch (_) {
+        // 删除/改名失败时保留原文件，偏好与引用不迁移，下次再试。
+        continue;
+      }
+      renames[fileId] = contentId;
+    }
+    if (renames.isEmpty) return;
+
+    final prefs = await SharedPreferences.getInstance();
+    final enabled = (prefs.getStringList(_enabledPluginsKey) ?? const [])
+        .toSet();
+    var enabledChanged = false;
+    for (final entry in renames.entries) {
+      if (enabled.remove(entry.key)) {
+        enabled.add(entry.value);
+        enabledChanged = true;
+      }
+    }
+    if (enabledChanged) {
+      await prefs.setStringList(_enabledPluginsKey, enabled.toList());
+    }
+
+    final sourcesRaw = prefs.getString(_sourceUrlsKey);
+    if (sourcesRaw != null) {
+      try {
+        final sources = (jsonDecode(sourcesRaw) as Map).map(
+          (key, value) => MapEntry(key.toString(), value.toString()),
+        );
+        var sourcesChanged = false;
+        for (final entry in renames.entries) {
+          final value = sources.remove(entry.key);
+          if (value != null) {
+            sources.putIfAbsent(entry.value, () => value);
+            sourcesChanged = true;
+          }
+        }
+        if (sourcesChanged) {
+          await prefs.setString(_sourceUrlsKey, jsonEncode(sources));
+        }
+      } catch (_) {
+        // 来源表损坏时跳过，不影响其余迁移。
+      }
+    }
+
+    final order = prefs.getStringList(_pluginOrderKey);
+    if (order != null && order.any(renames.containsKey)) {
+      await prefs.setStringList(_pluginOrderKey, [
+        for (final id in order) renames[id] ?? id,
+      ]);
+    }
+
+    final variablesRaw = prefs.getString(_pluginUserVariablesKey);
+    if (variablesRaw != null) {
+      try {
+        final variables = (jsonDecode(variablesRaw) as Map).map(
+          (key, value) =>
+              MapEntry(key.toString(), Map<String, String>.from(value as Map)),
+        );
+        var variablesChanged = false;
+        for (final entry in renames.entries) {
+          final value = variables.remove(entry.key);
+          if (value != null) {
+            variables.putIfAbsent(entry.value, () => value);
+            variablesChanged = true;
+          }
+        }
+        if (variablesChanged) {
+          await prefs.setString(_pluginUserVariablesKey, jsonEncode(variables));
+        }
+      } catch (_) {
+        // 变量表损坏时跳过，不影响其余迁移。
+      }
+    }
+
+    await migratePluginReferences(renames);
   }
 
   /// 按运行时类型把 SharedPreferences 的值编码成 {t, v} 条目；
@@ -381,8 +514,7 @@ class BackupService {
 
   /// 插件 id 只允许字母/数字/下划线/连字符，杜绝目录分隔符与 ".."
   /// 穿越。
-  bool _isSafePluginId(String id) =>
-      RegExp(r'^[A-Za-z0-9_\-]+$').hasMatch(id);
+  bool _isSafePluginId(String id) => RegExp(r'^[A-Za-z0-9_\-]+$').hasMatch(id);
 
   /// 外观文件名只允许字母/数字/下划线/连字符/点，且不能以点开头或
   /// 包含 ".."，杜绝路径分隔符与目录穿越。
@@ -392,9 +524,7 @@ class BackupService {
 
   /// 导出外观自定义文件：全局壁纸、播放详情页背景与自定义字体。
   /// 文件缺失、不可读或超限时跳过对应条目，不影响其余数据导出。
-  Future<BackupAppearance> _exportAppearance(
-    SharedPreferences prefs,
-  ) async {
+  Future<BackupAppearance> _exportAppearance(SharedPreferences prefs) async {
     final background = await _encodeAppearanceFile(
       prefs.getString('customBackgroundPath'),
       maxBytes: _maxImageBytes,
@@ -470,8 +600,8 @@ class BackupService {
       if (entity is! File) continue;
       if (p.extension(entity.path).toLowerCase() != '.js') continue;
       try {
-        sources[p.basenameWithoutExtension(entity.path)] =
-            await entity.readAsString();
+        sources[p.basenameWithoutExtension(entity.path)] = await entity
+            .readAsString();
       } on FileSystemException {
         // 单个脚本读取失败时跳过，不影响其余数据导出。
       }

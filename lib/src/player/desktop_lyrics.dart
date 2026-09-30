@@ -190,12 +190,20 @@ class DesktopLyricsBridge {
                 )
                 .where((word) => word.text.isNotEmpty)
                 .toList();
+            // 副行显示翻译；无翻译时回退显示罗马音/音译。
+            // 两者都缺（纯原文歌曲）时副行为空，原生侧将隐藏第二行。
+            final translationText = _cleanDesktopLyricText(
+              line['translation']?.toString() ?? '',
+            );
+            final romajiText = _cleanDesktopLyricText(
+              line['romaji']?.toString() ?? '',
+            );
             return _DesktopLyricLine(
               time: (line['time'] as num?)?.toDouble() ?? 0,
               text: _cleanDesktopLyricText(line['text']?.toString() ?? ''),
-              translation: _cleanDesktopLyricText(
-                line['translation']?.toString() ?? '',
-              ),
+              translation: translationText.isNotEmpty
+                  ? translationText
+                  : romajiText,
               words: words,
             );
           })

@@ -1,21 +1,20 @@
 import 'dart:convert';
 import 'dart:math' as math;
 
+import 'package:path/path.dart' as p;
+
 /// 插件声明的用户变量（userVariables）。插件在脚本中声明变量键名、
 /// 显示名和提示文案，由宿主提供编辑界面并把用户填写的值注入 env。
 class PluginUserVariable {
-  const PluginUserVariable({
-    required this.key,
-    this.name,
-    this.hint,
-  });
+  const PluginUserVariable({required this.key, this.name, this.hint});
 
   final String key;
   final String? name;
   final String? hint;
 
   /// 展示名，缺省时回退为键名。
-  String get displayName => name?.trim().isNotEmpty == true ? name!.trim() : key;
+  String get displayName =>
+      name?.trim().isNotEmpty == true ? name!.trim() : key;
 }
 
 class PluginMetadata {
@@ -86,7 +85,9 @@ class PluginMetadata {
             constMeta['version'],
       ),
       author: _clean(
-        header['author'] ?? exported['author'] ?? json['author'] ??
+        header['author'] ??
+            exported['author'] ??
+            json['author'] ??
             constMeta['author'],
       ),
       remark: _clean(
@@ -120,6 +121,36 @@ class PluginMetadata {
         .replaceAll(RegExp(r'^-+|-+$'), '');
   }
 
+  /// 由脚本内容与安装来源推断插件 ID（安装、更新、备份恢复、去重
+  /// 共用同一套规则，避免同一插件在不同入口算出不同 ID）：
+  /// metadata.id → metadata.name（MusicFree 的 platform）→ 来源 URL
+  /// 文件名，归一化后作为稳定 ID；归一化为空（纯符号名）时回退到
+  /// 内容哈希 plugin-xxxxxxxx。订阅插件更新后 name 变化（如加上了
+  /// 「(赞助版)[永久]」后缀）会导致 ID 漂移，调用方需迁移旧 ID 引用
+  /// （见 plugin_reference_migration.dart）。
+  static String resolvePluginId(String script, String origin) {
+    final metadata = PluginMetadata.parse(script);
+    final uriPath = Uri.tryParse(origin)?.path ?? '';
+    final rawName =
+        metadata.name ??
+        p.basenameWithoutExtension(uriPath.isNotEmpty ? uriPath : origin);
+    final rawId = metadata.id ?? rawName;
+    final normalized = normalizePluginId(rawId);
+    return normalized.isNotEmpty
+        ? normalized
+        : 'plugin-${_fnv1a(rawId).toRadixString(16)}';
+  }
+
+  /// FNV-1a 32 位哈希，用于无法归一化的插件名生成回退 ID。
+  static int _fnv1a(String input) {
+    var hash = 0x811c9dc5;
+    for (final byte in utf8.encode(input)) {
+      hash ^= byte;
+      hash = (hash * 0x01000193) & 0xffffffff;
+    }
+    return hash;
+  }
+
   /// LX（洛雪）插件静态识别（不执行脚本），与 plugin_runtime 的
   /// _looksLikeLxPlugin 规则保持一致；压缩/混淆后的脚本可能写成
   /// globalThis['lx']，不能只认点号形式。
@@ -151,8 +182,8 @@ class PluginMetadata {
   static bool _detectAnimemusic(String script) {
     if (script.contains('animemusic.bzxhkj.com')) return true;
     return RegExp(
-      r'''["']format["']\s*:\s*["']animemusic/1["']''',
-    ).hasMatch(script) ||
+          r'''["']format["']\s*:\s*["']animemusic/1["']''',
+        ).hasMatch(script) ||
         (RegExp(r'''module\.exports\s*=\s*\w+''').hasMatch(script) &&
             script.contains('animemusic/1'));
   }
@@ -195,7 +226,9 @@ class PluginMetadata {
           _fieldValue(objectText, 'key') ?? '',
           constants,
         );
-        if (key == null || key.trim().isEmpty || !seen.add(key.trim())) continue;
+        if (key == null || key.trim().isEmpty || !seen.add(key.trim())) {
+          continue;
+        }
         result.add(
           PluginUserVariable(
             key: key.trim(),
