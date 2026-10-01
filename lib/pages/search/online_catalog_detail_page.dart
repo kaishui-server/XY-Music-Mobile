@@ -164,6 +164,14 @@ class _OnlineCatalogDetailPageState
                                     fontWeight: FontWeight.w600,
                                   ),
                                 ),
+                                const SizedBox(height: 10),
+                                FilledButton.tonalIcon(
+                                  onPressed: _loading || _songs.isEmpty
+                                      ? null
+                                      : _showAddToPlaylist,
+                                  icon: const Icon(Icons.playlist_add_rounded),
+                                  label: const Text('添加到歌单'),
+                                ),
                               ],
                             ),
                           ),
