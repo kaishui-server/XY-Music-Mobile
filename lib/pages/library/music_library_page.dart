@@ -97,6 +97,10 @@ class _MusicLibraryPageState extends ConsumerState<MusicLibraryPage>
   final Set<String> _localSelectedPaths = <String>{};
   bool _localSelectionMode = false;
 
+  /// 歌曲子分页的排序：custom 表示曲库原始顺序（扫描序），其余键
+  /// 按拼音排序；歌手 / 专辑子分页固定按拼音分组，不参与排序。
+  SongSort _localSort = const SongSort(SongSortKey.custom);
+
   /// 曲库重扫进行中（本地音乐 / 文件夹分页共用的刷新按钮状态）。
   bool _libraryScanning = false;
 
@@ -280,6 +284,11 @@ class _MusicLibraryPageState extends ConsumerState<MusicLibraryPage>
           ];
         }
         return [
+          // 排序仅对歌曲子分页生效（歌手/专辑子分页固定拼音分组）。
+          SongSortMenuButton(
+            sort: _localSort,
+            onSortChanged: (sort) => setState(() => _localSort = sort),
+          ),
           IconButton(
             tooltip: '多选',
             onPressed: _localTabController.index == 0 &&
@@ -875,7 +884,6 @@ class _MusicLibraryPageState extends ConsumerState<MusicLibraryPage>
                                     ? 12
                                     : MediaQuery.paddingOf(context).bottom + 12,
                               ),
-                              showFloatingButtons: false,
                               selectionMode: _favSelectionMode,
                               isSelected: (song) =>
                                   _favSelectedPaths.contains(song.path),
@@ -1485,19 +1493,37 @@ class _MusicLibraryPageState extends ConsumerState<MusicLibraryPage>
   }
 
   Widget _buildLocalSongsTab(BuildContext context, List<Song> songs) {
-    final allSelected = songs.isNotEmpty &&
-        _localSelectedPaths.length == songs.length &&
-        songs.every((song) => _localSelectedPaths.contains(song.path));
+    // 排序仅作用于歌曲子分页的展示与播放顺序；custom = 曲库扫描序。
+    final sortedSongs = _localSort.key == SongSortKey.custom
+        ? songs
+        : [...songs]..sort((a, b) {
+            var result = switch (_localSort.key) {
+              SongSortKey.artist => _pinyinKey(
+                a.artist,
+              ).compareTo(_pinyinKey(b.artist)),
+              SongSortKey.album => _pinyinKey(a.album).compareTo(
+                _pinyinKey(b.album),
+              ),
+              _ => _pinyinKey(a.title).compareTo(_pinyinKey(b.title)),
+            };
+            if (result == 0) {
+              result = _pinyinKey(a.title).compareTo(_pinyinKey(b.title));
+            }
+            return _localSort.descending ? -result : result;
+          });
+    final allSelected = sortedSongs.isNotEmpty &&
+        _localSelectedPaths.length == sortedSongs.length &&
+        sortedSongs.every((song) => _localSelectedPaths.contains(song.path));
     return Column(
       children: [
         _TabHeaderBar(
-          countLabel: '${songs.length} 首歌曲',
-          onPlayAll: () => ref.read(libraryProvider.notifier).playAll(songs),
+          countLabel: '${sortedSongs.length} 首歌曲',
+          onPlayAll: () =>
+              ref.read(libraryProvider.notifier).playAll(sortedSongs),
         ),
         Expanded(
           child: SongsListView(
-            songs: songs,
-            showFloatingButtons: false,
+            songs: sortedSongs,
             padding: EdgeInsets.fromLTRB(
               10,
               0,
