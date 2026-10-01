@@ -227,6 +227,20 @@ final appRouter = GoRouter(
                   ),
                 ),
                 GoRoute(
+                  path: 'sidebar-layout',
+                  pageBuilder: (context, state) => _instantPage(
+                    state,
+                    const SettingsPage(section: SettingsSection.sidebarLayout),
+                  ),
+                ),
+                GoRoute(
+                  path: 'bottom-bar',
+                  pageBuilder: (context, state) => _instantPage(
+                    state,
+                    const SettingsPage(section: SettingsSection.bottomBar),
+                  ),
+                ),
+                GoRoute(
                   path: 'playback',
                   pageBuilder: (context, state) => _instantPage(
                     state,

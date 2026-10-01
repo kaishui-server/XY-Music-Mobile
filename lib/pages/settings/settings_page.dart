@@ -31,6 +31,8 @@ enum SettingsSection {
   account,
   appearance,
   layout,
+  sidebarLayout,
+  bottomBar,
   playback,
   playbackDetail,
   lyrics,
@@ -226,9 +228,16 @@ const settingsSearchEntries = <SettingsSearchEntry>[
   SettingsSearchEntry(
     title: '侧边栏布局',
     path: ['布局', '侧边栏布局'],
-    route: '/settings/layout',
+    route: '/settings/sidebar-layout',
     icon: Icons.view_sidebar_outlined,
     keywords: '菜单 显示 隐藏 开关 拖拽 排序',
+  ),
+  SettingsSearchEntry(
+    title: '自定义底栏',
+    path: ['布局', '自定义底栏'],
+    route: '/settings/bottom-bar',
+    icon: Icons.view_compact_outlined,
+    keywords: '底栏 导航栏 目的地 显示 隐藏 拖拽 排序',
   ),
   SettingsSearchEntry(
     title: '音量',
@@ -1033,32 +1042,15 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
             builder: (_) => const _HomeModulesSheet(),
           ),
         ),
-        Padding(
-          padding: const EdgeInsets.fromLTRB(16, 20, 16, 4),
-          child: Text(
-            '侧边栏布局',
-            style: TextStyle(
-              fontSize: 13,
-              fontWeight: FontWeight.w700,
-              color: Theme.of(context).colorScheme.primary,
-            ),
-          ),
-        ),
+      ],
+      // 侧边栏布局与自定义底栏体量大，改为独立页面，根页只留入口卡片。
+      SettingsSection.sidebarLayout => [
         _SidebarLayoutEditor(
           settings: settings ?? const AppSettings(),
           notifier: notifier,
         ),
-        Padding(
-          padding: const EdgeInsets.fromLTRB(16, 20, 16, 4),
-          child: Text(
-            '自定义底栏',
-            style: TextStyle(
-              fontSize: 13,
-              fontWeight: FontWeight.w700,
-              color: Theme.of(context).colorScheme.primary,
-            ),
-          ),
-        ),
+      ],
+      SettingsSection.bottomBar => [
         _BottomBarLayoutEditor(
           settings: settings ?? const AppSettings(),
           notifier: notifier,
@@ -1530,6 +1522,18 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
         title: '布局',
         children: tiles(SettingsSection.layout),
       ),
+      _entryCard(
+        context,
+        title: '侧边栏布局',
+        subtitle: '菜单显示、隐藏与拖拽排序',
+        route: '/settings/sidebar-layout',
+      ),
+      _entryCard(
+        context,
+        title: '自定义底栏',
+        subtitle: '挑选底栏目的地并拖动排序',
+        route: '/settings/bottom-bar',
+      ),
       _sectionCard(
         context,
         title: '播放',
@@ -1737,6 +1741,8 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
     SettingsSection.account => '账号',
     SettingsSection.appearance => '外观',
     SettingsSection.layout => '布局',
+    SettingsSection.sidebarLayout => '侧边栏布局',
+    SettingsSection.bottomBar => '自定义底栏',
     SettingsSection.playback => '播放',
     SettingsSection.playbackDetail => '歌词',
     SettingsSection.lyrics => '播放详情页歌词',
