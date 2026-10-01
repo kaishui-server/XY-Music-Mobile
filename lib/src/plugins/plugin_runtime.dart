@@ -6993,15 +6993,23 @@ class _PluginBackgroundHttpClient extends http.BaseClient {
         }
       }
     }
-    if (error != null) {
-      throw error;
-    }
-    if (response == null) {
-      throw StateError('插件后台网络请求失败');
+    if (error != null || response == null) {
+      return _syntheticPluginNetworkFailure(
+        request,
+        '网络请求失败：无法连接音源服务器（网络受限或服务器不可达）',
+      );
     }
     // 直接按原始字节 Base64 包装，避免 utf8 解码破坏二进制响应
     // （酷我 newlyric 等接口返回二进制歌词，插件以 arraybuffer 消费）。
-    final bytes = await response.stream.toBytes();
+    List<int> bytes;
+    try {
+      bytes = await response.stream.toBytes();
+    } catch (_) {
+      return _syntheticPluginNetworkFailure(
+        request,
+        '网络请求失败：响应传输中断（网络受限或服务器不可达）',
+      );
+    }
     return http.StreamedResponse(
       Stream.value(utf8.encode(encodePluginHttpBodyBytes(bytes))),
       response.statusCode,
@@ -7011,6 +7019,24 @@ class _PluginBackgroundHttpClient extends http.BaseClient {
       isRedirect: response.isRedirect,
       persistentConnection: response.persistentConnection,
       reasonPhrase: response.reasonPhrase,
+    );
+  }
+
+  /// 网络失败不能向 QuickJS XHR 桥接抛出：桥接（quickjs_engine 的
+  /// xhr.dart）Dart 回调链没有异常保护，抛出会让 JS 侧 Promise 永久
+  /// 挂起，用户侧表现为播放长时间转圈后失败。与 _PluginProxyHttpClient
+  /// 一致返回合成 599 JSON，让插件立即以明确错误 reject。
+  static http.StreamedResponse _syntheticPluginNetworkFailure(
+    http.BaseRequest request,
+    String message,
+  ) {
+    final body = jsonEncode({'code': 599, 'message': message});
+    return http.StreamedResponse(
+      Stream.value(utf8.encode(encodePluginHttpBody(body))),
+      599,
+      headers: const {'content-type': 'application/json'},
+      request: request,
+      reasonPhrase: 'Plugin network request failed',
     );
   }
 

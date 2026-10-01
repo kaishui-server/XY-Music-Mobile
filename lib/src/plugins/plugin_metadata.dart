@@ -130,7 +130,11 @@ class PluginMetadata {
   /// （见 plugin_reference_migration.dart）。
   static String resolvePluginId(String script, String origin) {
     final metadata = PluginMetadata.parse(script);
-    final uriPath = Uri.tryParse(origin)?.path ?? '';
+    // file_picker/下载管理器给的来源路径常带中文，Uri.path 会以百分号
+    // 编码返回（QQ音乐 → %E9%9F%B3%E4%B9%90），不解码会让回退 ID 变成
+    // qq-e9-9f-b3 这类 UTF-8 字节十六进制串。
+    final uri = Uri.tryParse(origin);
+    final uriPath = uri == null ? '' : _decodeUriPath(uri.path);
     final rawName =
         metadata.name ??
         p.basenameWithoutExtension(uriPath.isNotEmpty ? uriPath : origin);
@@ -139,6 +143,15 @@ class PluginMetadata {
     return normalized.isNotEmpty
         ? normalized
         : 'plugin-${_fnv1a(rawId).toRadixString(16)}';
+  }
+
+  static String _decodeUriPath(String path) {
+    if (!path.contains('%')) return path;
+    try {
+      return Uri.decodeComponent(path);
+    } on ArgumentError {
+      return path;
+    }
   }
 
   /// FNV-1a 32 位哈希，用于无法归一化的插件名生成回退 ID。
@@ -366,10 +379,106 @@ class PluginMetadata {
         }
       }
     }
-    if (lastMatch == null) return const {};
+    if (lastMatch != null) {
+      final result = _parseExportFields(
+        _extractExportObjectBody(script, lastMatch.end),
+        constants,
+      );
+      if (result.isNotEmpty) return result;
+    }
+    return _parseVariableExport(script, constants);
+  }
 
-    final end = math.min(script.length, lastMatch.end + 16 * 1024);
-    final scope = script.substring(lastMatch.end, end);
+  /// `module.exports = MF_PLUGIN;`（导出的是变量而非对象字面量，
+  /// 插件改造器生成的插件常见）：定位该标识符的 const/let/var 对象
+  /// 字面量声明，再从声明的对象体中解析元数据字段。
+  static Map<String, String> _parseVariableExport(
+    String script,
+    Map<String, String> constants,
+  ) {
+    final variablePatterns = [
+      RegExp(r'module\.exports\s*=\s*([A-Za-z_$][\w$]*)\s*;'),
+      RegExp(r'exports\.default\s*=\s*([A-Za-z_$][\w$]*)\s*;'),
+      RegExp(r'export\s+default\s+([A-Za-z_$][\w$]*)\s*;'),
+    ];
+    for (final pattern in variablePatterns) {
+      for (final match in pattern.allMatches(script)) {
+        final identifier = match.group(1)!;
+        final declaration = RegExp(
+          '(?:const|let|var)\\s+${RegExp.escape(identifier)}\\s*=\\s*\\{',
+        ).firstMatch(script);
+        if (declaration == null) continue;
+        final result = _parseExportFields(
+          _extractExportObjectBody(script, declaration.end),
+          constants,
+        );
+        if (result.isNotEmpty) return result;
+      }
+    }
+    return const {};
+  }
+
+  /// 提取导出对象字面量的正文（`{` 之后到配对 `}` 之前）：跳过字符串、
+  /// 模板字符串与注释中的花括号。不按配对括号截断时，对象之后的代码
+  /// （如插件内置的示例歌曲 `id: 'qq_xxx'`）会污染 id/name 字段。
+  static String _extractExportObjectBody(String script, int bodyStart) {
+    final n = script.length;
+    var depth = 1;
+    var i = bodyStart;
+    while (i < n && depth > 0) {
+      final ch = script.codeUnitAt(i);
+      if (ch == 0x27 || ch == 0x22 || ch == 0x60) {
+        final quote = ch;
+        i++;
+        while (i < n) {
+          final c = script.codeUnitAt(i);
+          if (c == 0x5C) {
+            i += 2;
+            continue;
+          }
+          if (c == quote) {
+            i++;
+            break;
+          }
+          i++;
+        }
+        continue;
+      }
+      if (ch == 0x2F &&
+          i + 1 < n &&
+          (script.codeUnitAt(i + 1) == 0x2F ||
+              script.codeUnitAt(i + 1) == 0x2A)) {
+        final block = script.codeUnitAt(i + 1) == 0x2A;
+        i += 2;
+        if (block) {
+          while (i + 1 < n &&
+              !(script.codeUnitAt(i) == 0x2A &&
+                  script.codeUnitAt(i + 1) == 0x2F)) {
+            i++;
+          }
+          i += 2;
+        } else {
+          while (i < n && script.codeUnitAt(i) != 0x0A) {
+            i++;
+          }
+        }
+        continue;
+      }
+      if (ch == 0x7B) depth++;
+      if (ch == 0x7D) depth--;
+      i++;
+    }
+    final end = depth == 0 ? i - 1 : i;
+    return script.substring(
+      bodyStart,
+      math.min(end, math.min(n, bodyStart + 16 * 1024)),
+    );
+  }
+
+  static Map<String, String> _parseExportFields(
+    String scope,
+    Map<String, String> constants,
+  ) {
     final result = <String, String>{};
     for (final key in const [
       'id',
@@ -385,12 +494,84 @@ class PluginMetadata {
         '(?:^|[,\\r\\n])\\s*["\\\']?$key["\\\']?\\s*:\\s*([^\\r\\n,}]+)',
         caseSensitive: false,
         multiLine: true,
-      ).firstMatch(scope);
+      ).firstMatch(_maskNestedScope(scope));
       if (field == null) continue;
       final value = _resolveExpression(field.group(1)!, constants);
       if (value != null && value.isNotEmpty) result[key] = value;
     }
     return result;
+  }
+
+  /// 把导出对象正文中嵌套层级（方法体、数组、内层对象）的内容替换为
+  /// 空白，只保留顶层字段供提取：插件方法体内的示例数据（如 debug
+  /// 方法的 fakeItem）带 id/name 字段，不屏蔽会污染插件元数据。
+  static String _maskNestedScope(String scope) {
+    final n = scope.length;
+    final buffer = StringBuffer();
+    var depth = 0;
+    var i = 0;
+    while (i < n) {
+      final ch = scope.codeUnitAt(i);
+      if (ch == 0x27 || ch == 0x22 || ch == 0x60) {
+        final quote = ch;
+        var j = i + 1;
+        while (j < n) {
+          final c = scope.codeUnitAt(j);
+          if (c == 0x5C) {
+            j += 2;
+            continue;
+          }
+          if (c == quote) {
+            j++;
+            break;
+          }
+          j++;
+        }
+        if (depth == 0) {
+          buffer.write(scope.substring(i, j));
+        } else {
+          buffer.write(' ' * (j - i));
+        }
+        i = j;
+        continue;
+      }
+      if (ch == 0x2F && i + 1 < n) {
+        final next = scope.codeUnitAt(i + 1);
+        if (next == 0x2F || next == 0x2A) {
+          var j = i + 2;
+          if (next == 0x2A) {
+            while (j + 1 < n &&
+                !(scope.codeUnitAt(j) == 0x2A &&
+                    scope.codeUnitAt(j + 1) == 0x2F)) {
+              j++;
+            }
+            j += 2;
+          } else {
+            while (j < n && scope.codeUnitAt(j) != 0x0A) {
+              j++;
+            }
+          }
+          buffer.write(' ' * (j - i));
+          i = j;
+          continue;
+        }
+      }
+      if (ch == 0x7B || ch == 0x5B) {
+        depth++;
+        buffer.write(' ');
+        i++;
+        continue;
+      }
+      if (ch == 0x7D || ch == 0x5D) {
+        if (depth > 0) depth--;
+        buffer.write(' ');
+        i++;
+        continue;
+      }
+      buffer.writeCharCode(depth == 0 ? ch : 0x20);
+      i++;
+    }
+    return buffer.toString();
   }
 
   static String? _resolveExpression(

@@ -613,86 +613,116 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
     final auth = ref.watch(authProvider);
     final dynamicColorSupported = ref.watch(dynamicColorSupportedProvider);
 
-    final children = switch (section) {
-      SettingsSection.root => [
-        _categoryTile(
-          context,
-          icon: Icons.manage_accounts_outlined,
-          title: '账号',
-          subtitle: auth.isLoggedIn ? auth.user!.nickname : '登录、注册与账号安全',
-          route: '/account?from=settings',
-        ),
-        _categoryTile(
-          context,
-          icon: Icons.extension_outlined,
-          title: '插件管理',
-          subtitle: '安装、启用与管理音乐插件',
-          route: '/settings/plugins',
-        ),
-        _categoryTile(
-          context,
-          icon: Icons.palette_outlined,
-          title: '外观',
-          subtitle: '主题模式与主题色',
-          route: '/settings/appearance',
-        ),
-        _categoryTile(
-          context,
-          icon: Icons.view_quilt_outlined,
-          title: '布局',
-          subtitle: '顶栏位置与侧边栏排序',
-          route: '/settings/layout',
-        ),
-        _categoryTile(
-          context,
-          icon: Icons.play_circle_outline_rounded,
-          title: '播放',
-          subtitle: '音量、在线音质与屏幕常亮',
-          route: '/settings/playback',
-        ),
-        _categoryTile(
-          context,
-          icon: Icons.queue_music_outlined,
-          title: '歌词',
-          subtitle: '播放详情页中的歌词显示设置',
-          route: '/settings/playback-detail',
-        ),
-        _categoryTile(
-          context,
-          icon: Icons.download_outlined,
-          title: '下载',
-          subtitle: '保存位置、音质与歌词',
-          route: '/settings/download',
-        ),
-        _categoryTile(
-          context,
-          icon: Icons.backup_outlined,
-          title: '备份与恢复',
-          subtitle: '导出或导入歌单、收藏、本地曲库、插件与设置',
-          route: '/settings/backup',
-        ),
-        _categoryTile(
-          context,
-          icon: Icons.cleaning_services_outlined,
-          title: '存储与缓存',
-          subtitle: '查看并清理封面、播放缓存与临时文件',
-          route: '/settings/storage',
-        ),
-        _categoryTile(
-          context,
-          icon: Icons.tune_rounded,
-          title: '其他',
-          subtitle: '听歌统计与关于',
-          route: '/settings/other',
-        ),
-        _categoryTile(
-          context,
-          icon: Icons.feedback_outlined,
-          title: '问题反馈',
-          subtitle: '提交问题、建议并查看处理进度',
-          route: '/settings/feedback',
-        ),
-      ],
+    // 根页改为卡片流：入口型分类（账号/插件管理/备份与恢复/存储与
+    // 缓存/问题反馈）做成无图标卡片，点击进入独立页面；其余分类的
+    // 名称写在大框上方，内容直接内嵌展示，不再跳转子页。
+    final children = section == SettingsSection.root
+        ? _rootCards(
+            context,
+            settings: settings,
+            notifier: notifier,
+            auth: auth,
+            dynamicColorSupported: dynamicColorSupported,
+          )
+        : _sectionTiles(
+            context,
+            section: section,
+            settings: settings,
+            notifier: notifier,
+            auth: auth,
+            dynamicColorSupported: dynamicColorSupported,
+          );
+
+    // 布局完成后修正悬浮头部占位高度。
+    WidgetsBinding.instance.addPostFrameCallback(
+      (_) => _measureFloatingHeader(),
+    );
+
+    return Scaffold(
+      appBar: AppBar(
+        automaticallyImplyLeading:
+            section != SettingsSection.root ||
+            settings?.sidebarPosition != SidebarPosition.right,
+        leading:
+            section == SettingsSection.root &&
+                settings?.sidebarPosition != SidebarPosition.right
+            ? const AppSidebarMenuButton()
+            : null,
+        title: Text(_pageTitle),
+        actions: [
+          if (section == SettingsSection.root &&
+              settings?.sidebarPosition == SidebarPosition.right)
+            const AppSidebarMenuButton(),
+        ],
+      ),
+      // 搜索框悬浮于设置列表上方：列表内容滚动时从毛玻璃下方穿过被
+      // 模糊，与列表浮动按钮组观感一致。
+      body: Stack(
+        children: [
+          Positioned.fill(
+            child: Padding(
+              padding: EdgeInsets.only(
+                top: section == SettingsSection.root
+                    ? _floatingHeaderExtent
+                    : 0,
+              ),
+              child: ListView(
+                padding: EdgeInsets.only(
+                  top: 6,
+                  // 消费 Shell 注入的悬浮底栏/播放栏高度（padding.bottom），
+                  // 否则布局页等底部的设置项会被自定义底栏盖住。
+                  bottom: 24 + MediaQuery.paddingOf(context).bottom,
+                ),
+                children: [
+                  if (section == SettingsSection.root &&
+                      _query.isNotEmpty)
+                    ..._searchResultTiles(context),
+                  if (section != SettingsSection.root || _query.isEmpty)
+                    ...children,
+                ],
+              ),
+            ),
+          ),
+          if (section == SettingsSection.root)
+            Positioned(
+              top: 0,
+              left: 0,
+              right: 0,
+              child: KeyedSubtree(
+                key: _floatingHeaderKey,
+                child: Padding(
+                  padding: const EdgeInsets.fromLTRB(16, 8, 16, 10),
+                  child: FrostedSearchField(
+                    controller: _searchController,
+                    hintText: '搜索设置',
+                    onChanged: (value) => setState(() => _query = value.trim()),
+                    showClearSuffix: true,
+                    onCleared: () {
+                      _searchController.clear();
+                      setState(() => _query = '');
+                    },
+                    padding: EdgeInsets.zero,
+                  ),
+                ),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+
+  /// 各分类的设置项列表：根页内嵌卡片与子页面（搜索结果直达）共用。
+  List<Widget> _sectionTiles(
+    BuildContext context, {
+    required SettingsSection section,
+    required AppSettings? settings,
+    required SettingsNotifier notifier,
+    required AuthState auth,
+    required AsyncValue<bool> dynamicColorSupported,
+  }) {
+    return switch (section) {
+      // 根页内容由 _rootCards 组装（含内嵌分类卡片），不走此列表。
+      SettingsSection.root => const [],
       SettingsSection.account => [
         _tile(
           context,
@@ -1316,7 +1346,6 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
       ],
       SettingsSection.backup => [
         ListTile(
-          leading: const Icon(Icons.info_outline_rounded),
           title: const Text('备份内容'),
           subtitle: const Text(
             '歌单、收藏、本地曲库（扫描文件夹与歌曲信息）、'
@@ -1359,17 +1388,9 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
         ),
         _categoryTile(
           context,
-          icon: Icons.bug_report_outlined,
           title: '日志与调试',
           subtitle: '日志保存、筛选与导出',
           route: '/settings/logs-debug',
-        ),
-        _tile(
-          context,
-          icon: Icons.feedback_outlined,
-          title: '问题反馈',
-          trailing: const Text('提交与查看'),
-          onTap: () => context.push('/settings/feedback'),
         ),
       ],
       SettingsSection.logsDebug => [
@@ -1383,78 +1404,172 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
       ],
       SettingsSection.feedback => const [],
     };
+  }
 
-    // 布局完成后修正悬浮头部占位高度。
-    WidgetsBinding.instance.addPostFrameCallback(
-      (_) => _measureFloatingHeader(),
+  /// 根页卡片流：入口型分类做独立卡片，普通分类标题写在大框上方、
+  /// 内容直接内嵌展示（与子页面共用 _sectionTiles 的内容列表）。
+  List<Widget> _rootCards(
+    BuildContext context, {
+    required AppSettings? settings,
+    required SettingsNotifier notifier,
+    required AuthState auth,
+    required AsyncValue<bool> dynamicColorSupported,
+  }) {
+    List<Widget> tiles(SettingsSection section) => _sectionTiles(
+      context,
+      section: section,
+      settings: settings,
+      notifier: notifier,
+      auth: auth,
+      dynamicColorSupported: dynamicColorSupported,
     );
-    return Scaffold(
-      appBar: AppBar(
-        automaticallyImplyLeading:
-            section != SettingsSection.root ||
-            settings?.sidebarPosition != SidebarPosition.right,
-        leading:
-            section == SettingsSection.root &&
-                settings?.sidebarPosition != SidebarPosition.right
-            ? const AppSidebarMenuButton()
-            : null,
-        title: Text(_pageTitle),
-        actions: [
-          if (section == SettingsSection.root &&
-              settings?.sidebarPosition == SidebarPosition.right)
-            const AppSidebarMenuButton(),
-        ],
+    return [
+      _entryCard(
+        context,
+        title: '账号',
+        subtitle: auth.isLoggedIn ? auth.user!.nickname : '登录、注册与账号安全',
+        route: '/account?from=settings',
       ),
-      // 搜索框悬浮于设置列表上方：列表内容滚动时从毛玻璃下方穿过被
-      // 模糊，与列表浮动按钮组观感一致。
-      body: Stack(
-        children: [
-          Positioned.fill(
-            child: Padding(
-              padding: EdgeInsets.only(
-                top: section == SettingsSection.root
-                    ? _floatingHeaderExtent
-                    : 0,
-              ),
-              child: ListView(
-                padding: EdgeInsets.only(
-                  // 消费 Shell 注入的悬浮底栏/播放栏高度（padding.bottom），
-                  // 否则布局页等底部的设置项会被自定义底栏盖住。
-                  bottom: 24 + MediaQuery.paddingOf(context).bottom,
+      _entryCard(
+        context,
+        title: '插件管理',
+        subtitle: '安装、启用与管理音乐插件',
+        route: '/settings/plugins',
+      ),
+      _sectionCard(
+        context,
+        title: '外观',
+        children: tiles(SettingsSection.appearance),
+      ),
+      _sectionCard(
+        context,
+        title: '布局',
+        children: tiles(SettingsSection.layout),
+      ),
+      _sectionCard(
+        context,
+        title: '播放',
+        children: tiles(SettingsSection.playback),
+      ),
+      _sectionCard(
+        context,
+        title: '歌词',
+        children: tiles(SettingsSection.playbackDetail),
+      ),
+      _sectionCard(
+        context,
+        title: '下载',
+        children: tiles(SettingsSection.download),
+      ),
+      _entryCard(
+        context,
+        title: '备份与恢复',
+        subtitle: '导出或导入歌单、收藏、本地曲库、插件与设置',
+        route: '/settings/backup',
+      ),
+      _entryCard(
+        context,
+        title: '存储与缓存',
+        subtitle: '查看并清理封面、播放缓存与临时文件',
+        route: '/settings/storage',
+      ),
+      _sectionCard(
+        context,
+        title: '其他',
+        children: tiles(SettingsSection.other),
+      ),
+      _entryCard(
+        context,
+        title: '问题反馈',
+        subtitle: '提交问题、建议并查看处理进度',
+        route: '/settings/feedback',
+      ),
+    ];
+  }
+
+  /// 入口卡片：需要独立页面的分类（无图标），点击进入。
+  Widget _entryCard(
+    BuildContext context, {
+    required String title,
+    required String subtitle,
+    required String route,
+  }) {
+    final scheme = Theme.of(context).colorScheme;
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
+      child: Material(
+        color: scheme.surfaceContainerLow,
+        borderRadius: BorderRadius.circular(16),
+        clipBehavior: Clip.antiAlias,
+        child: InkWell(
+          onTap: () => context.push(route),
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+            child: Row(
+              children: [
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        title,
+                        style: const TextStyle(
+                          fontSize: 15,
+                          fontWeight: FontWeight.w700,
+                        ),
+                      ),
+                      const SizedBox(height: 2),
+                      Text(
+                        subtitle,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                          fontSize: 12,
+                          color: scheme.onSurfaceVariant,
+                        ),
+                      ),
+                    ],
+                  ),
                 ),
-                children: [
-                  if (section == SettingsSection.root &&
-                      _query.isNotEmpty)
-                    ..._searchResultTiles(context),
-                  if (section != SettingsSection.root || _query.isEmpty)
-                    ...children,
-                ],
+                const SizedBox(width: 8),
+                Icon(Icons.chevron_right_rounded, color: scheme.outline),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// 内容卡片：分类名称写在大框上方，设置项直接展示在框内。
+  Widget _sectionCard(
+    BuildContext context, {
+    required String title,
+    required List<Widget> children,
+  }) {
+    final scheme = Theme.of(context).colorScheme;
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Padding(
+            padding: const EdgeInsets.only(left: 4, bottom: 7),
+            child: Text(
+              title,
+              style: TextStyle(
+                fontSize: 14,
+                fontWeight: FontWeight.w700,
+                color: scheme.primary,
               ),
             ),
           ),
-          if (section == SettingsSection.root)
-            Positioned(
-              top: 0,
-              left: 0,
-              right: 0,
-              child: KeyedSubtree(
-                key: _floatingHeaderKey,
-                child: Padding(
-                  padding: const EdgeInsets.fromLTRB(16, 8, 16, 10),
-                  child: FrostedSearchField(
-                    controller: _searchController,
-                    hintText: '搜索设置',
-                    onChanged: (value) => setState(() => _query = value.trim()),
-                    showClearSuffix: true,
-                    onCleared: () {
-                      _searchController.clear();
-                      setState(() => _query = '');
-                    },
-                    padding: EdgeInsets.zero,
-                  ),
-                ),
-              ),
-            ),
+          Material(
+            color: scheme.surfaceContainerLow,
+            borderRadius: BorderRadius.circular(16),
+            clipBehavior: Clip.antiAlias,
+            child: Column(children: children),
+          ),
         ],
       ),
     );
@@ -1552,23 +1667,13 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
 
   Widget _categoryTile(
     BuildContext context, {
-    required IconData icon,
     required String title,
     required String subtitle,
     required String route,
   }) {
     final scheme = Theme.of(context).colorScheme;
     return ListTile(
-      minTileHeight: 68,
-      leading: Container(
-        width: 40,
-        height: 40,
-        decoration: BoxDecoration(
-          color: scheme.primaryContainer.withValues(alpha: .72),
-          borderRadius: BorderRadius.circular(12),
-        ),
-        child: Icon(icon, color: scheme.onPrimaryContainer, size: 22),
-      ),
+      minTileHeight: 64,
       title: Text(title, style: const TextStyle(fontWeight: FontWeight.w600)),
       subtitle: Text(subtitle, maxLines: 1, overflow: TextOverflow.ellipsis),
       trailing: Icon(Icons.chevron_right, color: scheme.outline),
@@ -1584,7 +1689,6 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
     VoidCallback? onTap,
   }) {
     return ListTile(
-      leading: Icon(icon),
       title: Text(title),
       trailing: onTap == null
           ? trailing
@@ -1613,7 +1717,6 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
     String? subtitle,
   }) {
     return SwitchListTile(
-      secondary: Icon(icon),
       title: Text(title),
       subtitle: subtitle == null ? null : Text(subtitle),
       value: value,
@@ -1635,10 +1738,6 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
         ? '跟随 Android 12+ 系统壁纸颜色'
         : '当前系统不支持（需要 Android 12 或更高版本）';
     return SwitchListTile(
-      secondary: Icon(
-        Icons.auto_awesome_outlined,
-        color: enabled ? null : Theme.of(context).disabledColor,
-      ),
       title: Text(
         '动态取色',
         style: enabled
@@ -3187,7 +3286,6 @@ class _PlaybackFailurePolicyEditor extends StatelessWidget {
     required ValueChanged<int> onChanged,
   }) {
     return ListTile(
-      leading: Icon(icon),
       title: Text(title),
       subtitle: Text(
         subtitle,

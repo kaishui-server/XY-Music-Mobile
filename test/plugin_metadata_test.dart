@@ -24,6 +24,59 @@ module.exports = {
     expect(metadata.author, '测试作者');
   });
 
+  test('module.exports 导出变量（改造器插件）时从声明对象解析元数据', () {
+    const script = r'''
+const IMPORTED_BASE_URL = "https://example.com/api";
+async function search(query, page, type) {
+  return { isEnd: true, data: [] };
+}
+const MF_PLUGIN = {
+  platform: 'QQ音乐',
+  version: '插件改造器 · 1.0',
+  author: '橘子出品',
+  description: '搜索走 QQ 官方；播放走第三方 API',
+  primaryKey: ['id', 'songmid'],
+  userVariables: [{ key: 'key', name: 'API Key', hint: '已内置' }],
+  search,
+  getMediaSource: async () => ({}),
+};
+module.exports = MF_PLUGIN;
+
+// 对象之后的示例歌曲/文档片段不得污染 id/name 字段
+const DEFAULT_SONG = {
+  id: 'qq_0039MnYb0qxYhV',
+  title: '示例歌曲',
+};
+''';
+
+    final metadata = PluginMetadata.parse(script);
+    expect(metadata.id, isNull);
+    expect(metadata.name, 'QQ音乐');
+    expect(metadata.version, '插件改造器 · 1.0');
+    expect(metadata.author, '橘子出品');
+    expect(metadata.userVariables.length, 1);
+    expect(metadata.userVariables[0].key, 'key');
+    final id = PluginMetadata.resolvePluginId(
+      script,
+      '/data/user/0/cache/file_picker/QQ音乐(迟言API)(6).js',
+    );
+    expect(id, 'qq音乐');
+  });
+
+  test('元数据缺失时文件名回退 ID 解码百分号编码路径', () {
+    const script = r'''
+async function search(query, page, type) {
+  return { isEnd: true, data: [] };
+}
+module.exports = { search };
+''';
+    final id = PluginMetadata.resolvePluginId(
+      script,
+      '/data/user/0/cache/file_picker/QQ音乐(迟言API)(6).js',
+    );
+    expect(id, 'qq音乐-迟言api-6');
+  });
+
   test('LX 注释头优先作为插件元数据', () {
     const script = r'''
 /**
