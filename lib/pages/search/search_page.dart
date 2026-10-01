@@ -13,6 +13,7 @@ import '../../src/navigation/sidebar_controller.dart';
 import '../../src/player/player_provider.dart';
 import '../../src/plugins/plugin_runtime.dart';
 import '../../src/ui/xy_surface.dart';
+import '../../src/widgets/cover_image.dart';
 import '../../src/widgets/frosted_search_field.dart';
 import '../../src/widgets/mini_player_bar.dart';
 import '../../src/widgets/song_list_view.dart';
@@ -1100,6 +1101,9 @@ class _CatalogListViewState extends State<_CatalogListView> {
                         )
                       : Image.network(
                           cover,
+                          // 网易等音源 CDN 会对 Dart 默认 UA 返回 403，
+                          // 必须带上浏览器请求头，否则头像/封面一律占位图。
+                          headers: coverImageNetworkHeaders(cover),
                           fit: BoxFit.cover,
                           errorBuilder: (_, _, _) => ColoredBox(
                             color: scheme.surfaceContainerHighest,

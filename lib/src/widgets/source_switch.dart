@@ -6,6 +6,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../library/library_provider.dart';
 import '../player/player_provider.dart';
+import '../plugins/lx_playlist_import.dart' show kLxSourceIds, lxSourceLabel;
 import '../plugins/plugin_runtime.dart';
 import '../favorites/favorites_provider.dart';
 import '../playlists/playlists_provider.dart';
@@ -27,8 +28,25 @@ String sourcePluginTag(EnabledMusicPlugin plugin) => plugin.isLx
           ? 'BakaMusic'
           : 'MusicFree');
 
-/// 选择换源目标插件的底部菜单（批量换源用）；取消返回 null。
-Future<EnabledMusicPlugin?> showSourcePluginPicker(
+/// 选择换源目标插件的底部菜单（批量换源用）。洛雪插件内含多个平台
+/// （kw/kg/tx/wy/mg），选中后追加二级菜单选择具体平台（或全部）；
+/// 返回 (插件, 洛雪平台短码|null)，取消返回 null。
+Future<(EnabledMusicPlugin, String?)?> showSourcePluginPicker(
+  BuildContext context,
+  List<EnabledMusicPlugin> plugins, {
+  String? excludePluginId,
+}) async {
+  final picked = await _pickPlugin(context, plugins,
+      excludePluginId: excludePluginId);
+  if (picked == null || !context.mounted) return null;
+  if (!picked.isLx) return (picked, null);
+  // 洛雪：二次选择子平台；空串表示「全部平台」，取消（null）则放弃。
+  final source = await _pickLxSource(context, picked);
+  if (source == null) return null;
+  return (picked, source.isEmpty ? null : source);
+}
+
+Future<EnabledMusicPlugin?> _pickPlugin(
   BuildContext context,
   List<EnabledMusicPlugin> plugins, {
   String? excludePluginId,
@@ -100,13 +118,79 @@ Future<EnabledMusicPlugin?> showSourcePluginPicker(
   );
 }
 
+/// 洛雪子平台二级选择：全部平台（返回空串）+ 插件声明的平台列表
+/// （未声明时用洛雪默认五平台）；取消返回 null。
+Future<String?> _pickLxSource(
+  BuildContext context,
+  EnabledMusicPlugin plugin,
+) {
+  final sources = plugin.lxSources.isEmpty ? kLxSourceIds : plugin.lxSources;
+  return showModalBottomSheet<String?>(
+    context: context,
+    useRootNavigator: true,
+    showDragHandle: true,
+    builder: (sheetContext) => SafeArea(
+      child: Padding(
+        padding: const EdgeInsets.only(bottom: 8),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Padding(
+              padding: const EdgeInsets.fromLTRB(20, 0, 20, 10),
+              child: Text(
+                '${plugin.name} · 选择平台',
+                style: TextStyle(
+                  fontSize: 16,
+                  fontWeight: FontWeight.w700,
+                  color: Theme.of(sheetContext).colorScheme.onSurface,
+                ),
+              ),
+            ),
+            ListTile(
+              dense: true,
+              leading: Icon(
+                Icons.all_inclusive_rounded,
+                size: 22,
+                color: Theme.of(sheetContext).colorScheme.onSurfaceVariant,
+              ),
+              title: const Text(
+                '全部平台',
+                style: TextStyle(fontWeight: FontWeight.w600),
+              ),
+              subtitle: const Text('跨平台搜索，自动取最佳匹配'),
+              onTap: () => Navigator.pop(sheetContext, ''),
+            ),
+            for (final source in sources)
+              ListTile(
+                dense: true,
+                leading: Icon(
+                  Icons.album_rounded,
+                  size: 22,
+                  color: Theme.of(sheetContext).colorScheme.onSurfaceVariant,
+                ),
+                title: Text(
+                  lxSourceLabel(source),
+                  style: const TextStyle(fontWeight: FontWeight.w600),
+                ),
+                onTap: () => Navigator.pop(sheetContext, source),
+              ),
+          ],
+        ),
+      ),
+    ),
+  );
+}
+
 /// 在目标插件上搜索替换候选，按匹配度降序返回（仅保留标题匹配的结果）。
+/// [lxSource]：洛雪插件限定子平台（kw/kg/tx/wy/mg），null 为全部平台。
 Future<List<PluginSearchSong>> searchReplacementCandidates(
   WidgetRef ref,
   EnabledMusicPlugin plugin, {
   required String title,
   required String artist,
   int durationMs = 0,
+  String? lxSource,
 }) =>
     searchReplacementCandidatesWithKeyword(
       ref,
@@ -117,11 +201,13 @@ Future<List<PluginSearchSong>> searchReplacementCandidates(
       title: title,
       artist: artist,
       durationMs: durationMs,
+      lxSource: lxSource,
     );
 
 /// 按关键词在目标插件上搜索替换候选。默认关键词（歌名 + 歌手）时按
 /// `recognizedSongMatchScore` 过滤并排序；自定义关键词时保留插件原始
 /// 排序（最多 50 条），方便手动搜索翻唱、Live 等其他版本。
+/// [lxSource]：洛雪插件限定子平台（kw/kg/tx/wy/mg），null 为全部平台。
 Future<List<PluginSearchSong>> searchReplacementCandidatesWithKeyword(
   WidgetRef ref,
   EnabledMusicPlugin plugin, {
@@ -130,10 +216,11 @@ Future<List<PluginSearchSong>> searchReplacementCandidatesWithKeyword(
   required String artist,
   int durationMs = 0,
   bool scoreFilter = true,
+  String? lxSource,
 }) async {
   final results = await ref
       .read(pluginRuntimeProvider)
-      .search(plugin, keyword)
+      .search(plugin, keyword, lxSource: lxSource)
       .timeout(const Duration(seconds: 20), onTimeout: () => const []);
   if (!scoreFilter) return results.take(50).toList();
   final scored = <(int, PluginSearchSong)>[];
@@ -558,12 +645,42 @@ class _SourceSwitchSheetState extends ConsumerState<_SourceSwitchSheet> {
             maxLines: 1,
             overflow: TextOverflow.ellipsis,
           ),
-          trailing: Text(
-            duration.isEmpty ? '--:--' : duration,
-            style: TextStyle(
-              fontSize: 12,
-              color: Theme.of(context).colorScheme.onSurfaceVariant,
-            ),
+          trailing: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              // 洛雪/animemusic 等「单插件多平台」源显示子平台标签，
+              // 区分同一首歌的不同平台候选。
+              if (song.platform.isNotEmpty) ...[
+                Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 6,
+                    vertical: 2,
+                  ),
+                  decoration: BoxDecoration(
+                    color: Theme.of(context).colorScheme.primaryContainer,
+                    borderRadius: BorderRadius.circular(6),
+                  ),
+                  child: Text(
+                    song.platform,
+                    style: TextStyle(
+                      fontSize: 11,
+                      fontWeight: FontWeight.w600,
+                      color: Theme.of(
+                        context,
+                      ).colorScheme.onPrimaryContainer,
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 8),
+              ],
+              Text(
+                duration.isEmpty ? '--:--' : duration,
+                style: TextStyle(
+                  fontSize: 12,
+                  color: Theme.of(context).colorScheme.onSurfaceVariant,
+                ),
+              ),
+            ],
           ),
           onTap: () => Navigator.pop(context, (plugin, song)),
         );

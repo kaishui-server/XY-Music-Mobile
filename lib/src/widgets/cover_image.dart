@@ -269,7 +269,29 @@ String normalizeCoverImageUrl(String? imageUrl) {
   if (normalized.startsWith('http://') && !isLocalHost) {
     normalized = 'https://${normalized.substring(7)}';
   }
-  return _applyNeteaseCoverScale(normalized);
+  return _applyNeteaseCoverScale(_stripBilibiliImageTransform(normalized));
+}
+
+/// Bilibili 图床（hdslb.com/biliimg.com）的 /bfs/ 路径常带
+/// `@320w_180h_1c.avif` 缩放后缀，AVIF 格式 Flutter 解码器不支持，
+/// 会显示占位图；剥离后缀还原成原图（与 plugin_runtime 侧同款逻辑，
+/// 双层兜底：旧收藏/歌单数据里已持久化的地址也会在渲染时被还原）。
+String _stripBilibiliImageTransform(String url) {
+  final uri = Uri.tryParse(url);
+  if (uri == null || !uri.hasScheme || uri.host.isEmpty) return url;
+  final host = uri.host.toLowerCase();
+  final isBiliCdn =
+      host == 'hdslb.com' ||
+      host.endsWith('.hdslb.com') ||
+      host == 'biliimg.com' ||
+      host.endsWith('.biliimg.com');
+  if (!isBiliCdn) return url;
+  final path = uri.path;
+  if (!path.contains('/bfs/')) return url;
+  final atIndex = path.lastIndexOf('@');
+  if (atIndex <= 0) return url;
+  if (path.substring(atIndex + 1).contains('/')) return url;
+  return uri.replace(path: path.substring(0, atIndex)).toString();
 }
 
 /// 网易云 CDN 的 picUrl 指向原始尺寸图片，部分专辑（如「一生一世 影视

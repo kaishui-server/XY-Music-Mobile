@@ -164,6 +164,14 @@ class _OnlineCatalogDetailPageState
                                     fontWeight: FontWeight.w600,
                                   ),
                                 ),
+                                const SizedBox(height: 10),
+                                FilledButton.tonalIcon(
+                                  onPressed: _loading || _songs.isEmpty
+                                      ? null
+                                      : _showAddToPlaylist,
+                                  icon: const Icon(Icons.playlist_add_rounded),
+                                  label: const Text('添加到歌单'),
+                                ),
                               ],
                             ),
                           ),
@@ -412,6 +420,8 @@ class _CatalogCover extends StatelessWidget {
               )
             : Image.network(
                 coverUrl,
+                // 网易等音源 CDN 对 Dart 默认 UA 返回 403，需带浏览器请求头。
+                headers: coverImageNetworkHeaders(coverUrl),
                 fit: BoxFit.cover,
                 errorBuilder: (_, _, _) => ColoredBox(
                   color: scheme.surfaceContainerHighest,

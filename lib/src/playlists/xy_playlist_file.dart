@@ -2,7 +2,8 @@ import 'dart:convert';
 
 import 'playlists_provider.dart';
 
-/// XY Music 歌单文件（.xyplaylist）格式标识。
+/// XY Music 歌单文件格式标识（新版导出为 .json，旧版为 .xyplaylist，
+/// 导入端按内容中的 format 字段识别，两种扩展名均兼容）。
 const kXyPlaylistFormat = 'xy-playlist';
 
 /// 当前导出的格式版本（导入端按此做兼容判断）。

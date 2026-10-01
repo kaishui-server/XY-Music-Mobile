@@ -20,6 +20,7 @@ import 'package:go_router/go_router.dart';
 import '../library/library_provider.dart';
 import '../logging/app_log_store.dart';
 import '../player/player_provider.dart';
+import '../widgets/cover_image.dart';
 
 class XyDeepLink {
   static const MethodChannel _channel = MethodChannel(
@@ -213,6 +214,8 @@ class _ShareLinkPreviewDialog extends StatelessWidget {
                   )
                 : Image.network(
                     cover,
+                    // 网易等音源 CDN 对 Dart 默认 UA 返回 403，需带浏览器请求头。
+                    headers: coverImageNetworkHeaders(cover),
                     width: 140,
                     height: 140,
                     fit: BoxFit.cover,

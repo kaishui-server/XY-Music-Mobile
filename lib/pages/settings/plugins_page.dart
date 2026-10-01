@@ -625,6 +625,29 @@ class _PluginsNotifier extends AsyncNotifier<List<_PluginInfo>> {
     return installFromUrl(url);
   }
 
+  /// 一键更新全部订阅插件：逐个从安装时记录的来源地址重新拉取安装，
+  /// 内容未变的跳过，单个失败不中断其余更新。与单曲更新一致走
+  /// _persistScript 的去重合并链路（含偏好与歌单引用迁移）。
+  Future<_InstallSummary> updateAll() async {
+    final summary = _MutableInstallSummary();
+    final online = (state.valueOrNull ?? const <_PluginInfo>[])
+        .where((plugin) => plugin.isOnline)
+        .toList();
+    for (final plugin in online) {
+      final url = plugin.sourceUrl!.trim();
+      try {
+        final content = await _downloadText(url);
+        await _persistScript(content, url, summary);
+      } catch (error) {
+        summary.failed++;
+        summary.errors.add('${plugin.name}：$error');
+      }
+    }
+    state = AsyncData(await _load());
+    ref.invalidate(enabledMusicPluginsProvider);
+    return summary.freeze();
+  }
+
   Future<void> remove(_PluginInfo plugin) async {
     await removeMany([plugin]);
   }
@@ -870,6 +893,34 @@ class _PluginsPageState extends ConsumerState<PluginsPage> {
       _showResult(
         await ref.read(_pluginsProvider.notifier).updatePlugin(plugin),
       );
+    } catch (error) {
+      if (mounted) {
+        XyNotice.show(context, message: '$error', type: XyNoticeType.error);
+      }
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  /// 一键更新全部订阅插件：逐个从来源地址重新拉取，内容未变的跳过。
+  Future<void> _updateAll() async {
+    if (_busy) return;
+    final onlineCount =
+        ref.read(_pluginsProvider).valueOrNull
+            ?.where((plugin) => plugin.isOnline)
+            .length ??
+        0;
+    if (onlineCount == 0) {
+      XyNotice.show(
+        context,
+        message: '没有订阅插件可更新',
+        type: XyNoticeType.warning,
+      );
+      return;
+    }
+    setState(() => _busy = true);
+    try {
+      _showResult(await ref.read(_pluginsProvider.notifier).updateAll());
     } catch (error) {
       if (mounted) {
         XyNotice.show(context, message: '$error', type: XyNoticeType.error);
@@ -1133,6 +1184,9 @@ class _PluginsPageState extends ConsumerState<PluginsPage> {
     final playingPluginId = ref.watch(
       playerProvider.select((state) => state.current?.pluginId),
     );
+    // 订阅插件数：决定一键更新按钮是否可用。
+    final onlineCount =
+        plugins.valueOrNull?.where((plugin) => plugin.isOnline).length ?? 0;
     return Scaffold(
       appBar: AppBar(
         automaticallyImplyLeading: !widget.showSidebarButton || !sidebarOnRight,
@@ -1143,6 +1197,16 @@ class _PluginsPageState extends ConsumerState<PluginsPage> {
             : const BackButton(),
         title: const Text('插件管理'),
         actions: [
+          IconButton(
+            tooltip: _busy ? '更新中...' : '一键更新订阅插件',
+            onPressed: _busy || onlineCount == 0 ? null : _updateAll,
+            icon: _busy
+                ? const SizedBox.square(
+                    dimension: 20,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  )
+                : const Icon(Icons.cloud_sync_rounded),
+          ),
           if (widget.showSidebarButton && sidebarOnRight)
             const AppSidebarMenuButton(),
         ],

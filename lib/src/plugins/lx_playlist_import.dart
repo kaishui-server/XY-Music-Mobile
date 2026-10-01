@@ -1435,8 +1435,18 @@ List<LxLocalPlaylist> tryParseLxLocalPlaylists(String content) {
   // 洛雪 v2 全量备份：歌单都在 data 节点下。
   final data = decoded['data'];
   if (data is Map) {
-    final v2Playlists = _parseLxV2Backup(Map<String, dynamic>.from(data));
+    final dataMap = Map<String, dynamic>.from(data);
+    final v2Playlists = _parseLxV2Backup(dataMap);
     if (v2Playlists.isNotEmpty) return v2Playlists;
+    // 单歌单导出（.lxmc 解压后，type=playListPart_v2）：
+    // data 即歌单本体（id/name/list），歌曲结构与 v2 备份一致。
+    final partList = dataMap['list'];
+    final partName = _text(dataMap['name']);
+    if (partList is List && partName.isNotEmpty) {
+      final playlists = <LxLocalPlaylist>[];
+      _addLxPlaylist(playlists, partName, partList);
+      if (playlists.isNotEmpty) return playlists;
+    }
   }
 
   // 备份多歌单（含默认列表/收藏列表）与单歌单导出统一收集。
