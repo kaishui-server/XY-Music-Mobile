@@ -534,7 +534,17 @@ class _DownloadManagerPageState extends ConsumerState<DownloadManagerPage> {
                   ),
                 ),
               ]
-            : null,
+            : [
+                // 一键清空：等价于全选+批量删除，复用同一确认弹窗
+                //（含「同时删除本地音乐文件」选项），不另起删除管线。
+                IconButton(
+                  tooltip: '清空下载记录',
+                  onPressed: entries.isEmpty
+                      ? null
+                      : () => _confirmDelete(List.of(entries)),
+                  icon: const Icon(Icons.delete_sweep_outlined),
+                ),
+              ],
       ),
       // 搜索框悬浮于列表上方：列表内容滚动时从毛玻璃下方穿过被模糊，
       // 与列表浮动按钮组观感一致。

@@ -10,6 +10,46 @@ class MusicFreeBackupPlaylist {
   final List<Song> songs;
 }
 
+/// 平台短码 → MusicFree 标准平台名（备份互转的展示字段用）。
+String musicFreePlatformLabel(String code) => switch (code) {
+  'wy' => '网易云音乐',
+  'tx' => 'QQ音乐',
+  'kw' => '酷我音乐',
+  'kg' => '酷狗音乐',
+  'mg' => '咪咕音乐',
+  'bilibili' => '哔哩哔哩',
+  'local' => '本地',
+  _ => code,
+};
+
+/// 从通用音乐条目（MusicFree/洛雪风格：id + source/platform + 展示
+/// 字段，无 XY 私有的 path/pluginId/extra）重建可播放歌曲。XY v5 备份
+/// 导入端用：外部格式转换工具产出的网络歌走这里关联已安装插件；
+/// 返回 null 表示无法关联（未安装对应插件或字段不全）。
+Song? rebuildOnlineSongFromGenericEntry(
+  Map<String, dynamic> raw,
+  List<EnabledMusicPlugin> plugins,
+) {
+  final entry = Map<String, dynamic>.from(raw);
+  // XY 导出端的 platform 兜底值「插件」无匹配意义，清掉让 source 兜底。
+  final platform = entry['platform']?.toString() ?? '';
+  if (platform.isEmpty || platform == '插件') entry.remove('platform');
+  // 洛雪风格的 id 是 "<source>_<songId>" 复合形式，拆出真实歌曲 id。
+  final source = entry['source']?.toString().trim() ?? '';
+  final id = entry['id']?.toString().trim() ?? '';
+  if (source.isNotEmpty && id.startsWith('${source}_')) {
+    entry['id'] = id.substring(source.length + 1);
+  }
+  // 洛雪 meta 字段（songId/albumId 等）平移到顶层供 _toSong 提取。
+  final meta = entry['meta'];
+  if (meta is Map) {
+    for (final key in const ['songId', 'albumId', 'hash']) {
+      if (entry[key] == null && meta[key] != null) entry[key] = meta[key];
+    }
+  }
+  return _toSong(entry, plugins: plugins, localSongs: const []);
+}
+
 class MusicFreeBackupImportResult {
   const MusicFreeBackupImportResult({
     required this.playlists,
@@ -173,14 +213,7 @@ Song? _toSong(
       _text(raw['source']) ??
       _text(raw['sourceName']) ??
       _text(raw['source_name']);
-  final idValue =
-      raw['id'] ??
-      raw['musicId'] ??
-      raw['songmid'] ??
-      raw['songId'] ??
-      raw['songid'] ??
-      raw['mid'] ??
-      raw['hash'];
+  final idValue = _pickPlayableId(raw);
   final id = idValue?.toString().trim() ?? '';
   if (platform == null || platform.isEmpty || id.isEmpty) return null;
   final plugin = _matchPlugin(platform, plugins);
@@ -191,19 +224,29 @@ Song? _toSong(
         _matchLxSource(platform, plugin) ??
         (plugin.lxSources.isNotEmpty ? plugin.lxSources.first : null);
     if (source == null) return null;
+    // BakaMusic 备份的专辑字段用小写 albumid/albummid；酷狗歌的 hash
+    // 常放在 id 里而非独立 hash 字段，播放走 hash 时需回退。
+    final hash = _text(raw['hash']) ?? (source == 'kg' ? id : null);
+    final songId =
+        raw['songId'] ??
+        raw['songid'] ??
+        num.tryParse(raw['id']?.toString() ?? '');
+    final types = _typesFromQualities(raw['qualities']);
     final lx = <String, dynamic>{
       'songmid': id,
       'source': source,
       'name': title,
       'singer': artist,
       'albumName': album,
-      'interval': duration,
+      'interval': _formatIntervalText(duration),
+      if (duration > 0) '_interval': duration * 1000,
       'img': cover,
-      'hash': raw['hash'],
-      'songId': raw['songId'] ?? raw['songid'],
-      'albumId': raw['albumId'] ?? raw['album_id'],
+      'hash': ?hash,
+      'songId': ?songId,
+      'albumId': raw['albumId'] ?? raw['album_id'] ?? raw['albumid'],
       'albumMid': raw['albumMid'] ?? raw['albummid'],
       'strMediaMid': raw['strMediaMid'] ?? raw['mediaMid'],
+      '_types': ?types,
     };
     return Song(
       path: 'lx://$source/${Uri.encodeComponent(id)}',
@@ -221,7 +264,9 @@ Song? _toSong(
 
   final pluginData = Map<String, dynamic>.from(raw);
   // MusicFree 插件通常使用 id；旧备份可能只保留 musicId/songmid。
-  pluginData['id'] ??= idValue;
+  // BakaMusic 的 QQ 歌 id 是数字 songId，可播放 mid 在 songmid，统一
+  // 用修正后的 id 回填（保留原始类型），避免回放时拿错字段。
+  pluginData['id'] = idValue;
   pluginData['title'] ??= title;
   pluginData['artist'] ??= artist;
   pluginData['album'] ??= album;
@@ -375,6 +420,42 @@ int _durationSeconds(Map<String, dynamic> raw) {
   final number = value is num ? value.toDouble() : double.tryParse('$value');
   if (number == null || number <= 0) return 0;
   return (number > 1000 ? number / 1000 : number).round();
+}
+
+/// 选择可播放 id。BakaMusic 的 QQ 歌同时携带数字 songId（id 字段）与
+/// 字符串 songmid，洛雪 tx 源必须用 songmid；其余平台两者一致或只有
+/// 单一字段，保持原始 id（保留数字类型）。
+dynamic _pickPlayableId(Map<String, dynamic> raw) {
+  final songmid = _text(raw['songmid']) ?? _text(raw['song_mid']);
+  final idValue =
+      raw['id'] ??
+      raw['musicId'] ??
+      raw['songId'] ??
+      raw['songid'] ??
+      raw['mid'] ??
+      raw['hash'];
+  if (songmid != null &&
+      songmid.isNotEmpty &&
+      songmid != idValue?.toString().trim()) {
+    return songmid;
+  }
+  return idValue ?? songmid;
+}
+
+/// 秒 → 洛雪 interval 文本（"MM:SS"）。
+String _formatIntervalText(int seconds) {
+  if (seconds <= 0) return '';
+  final minutes = seconds ~/ 60;
+  return '${minutes.toString().padLeft(2, '0')}:${(seconds % 60).toString().padLeft(2, '0')}';
+}
+
+/// MusicFree qualities（{128k: {url, size}}）→ 洛雪 _types 音质表。
+Map<String, dynamic>? _typesFromQualities(dynamic qualities) {
+  if (qualities is! Map || qualities.isEmpty) return null;
+  return {
+    for (final entry in qualities.entries)
+      if (entry.value != null) entry.key.toString(): entry.value,
+  };
 }
 
 String _localPath(Map<String, dynamic> raw) {

@@ -1425,6 +1425,8 @@ class _PlaylistCover extends StatelessWidget {
       borderRadius: BorderRadius.circular(10),
       child: Image.network(
         url,
+        // 网易等音源 CDN 对 Dart 默认 UA 返回 403，需带浏览器请求头。
+        headers: coverImageNetworkHeaders(url),
         width: size,
         height: size,
         fit: BoxFit.cover,

@@ -107,6 +107,106 @@ void main() {
     expect(song.pluginData?['lx']['songmid'], '9988');
   });
 
+  test('BakaMusic tx 歌曲优先用 songmid 构造 lx 路径', () {
+    // BakaMusic 的 QQ 歌同时有数字 songId（id 字段）与字符串 songmid，
+    // 洛雪 tx 源必须用 songmid 播放；songId/albummid（小写）保留进 lx。
+    final plugin = const EnabledMusicPlugin(
+      id: 'lx-linglan',
+      name: '聆澜音源(赞助版)[永久]',
+      path: '/plugins/lx-linglan.js',
+      isLx: true,
+      lxSources: ['kw', 'kg', 'tx', 'wy', 'mg'],
+    );
+    final result = parseMusicFreeBackup(
+      jsonEncode({
+        'schema': 'bakamusic.music-sheet-backup',
+        'version': 3,
+        'data': {
+          'musicSheets': [
+            {
+              'id': 'fav',
+              'title': '我喜欢',
+              'musicList': [
+                {
+                  'id': 575785845,
+                  'songmid': '0006A93H2qAQu2',
+                  'title': '恋落花',
+                  'singer': '陈语淇',
+                  'albumName': '恋落花',
+                  'albumid': 66615606,
+                  'albummid': '001uSLEI3v9rnZ',
+                  'duration': 180,
+                  'platform': 'QQ音乐',
+                  'qualities': {
+                    '128k': {'size': 2887874},
+                    '320k': {'size': 7218953},
+                  },
+                },
+              ],
+            },
+          ],
+        },
+      }),
+      plugins: [plugin],
+    );
+
+    final song = result.playlists.single.songs.single;
+    expect(song.path, 'lx://tx/0006A93H2qAQu2');
+    final lx = song.pluginData!['lx'] as Map<String, dynamic>;
+    expect(lx['songmid'], '0006A93H2qAQu2');
+    expect(lx['source'], 'tx');
+    expect(lx['songId'], 575785845);
+    expect(lx['albumId'], 66615606);
+    expect(lx['albumMid'], '001uSLEI3v9rnZ');
+    expect(lx['interval'], '03:00');
+    expect(lx['_interval'], 180000);
+    expect((lx['_types'] as Map).containsKey('320k'), isTrue);
+  });
+
+  test('酷狗歌曲无 hash 字段时回退 id 并构建音质表', () {
+    // mf 原版导出的酷狗歌把 hash 放在 id 字段，lx.hash 需回退 id，
+    // interval 格式化为 "MM:SS"、qualities 转成 _types。
+    final plugin = const EnabledMusicPlugin(
+      id: 'lx',
+      name: '落雪音源',
+      path: '/plugins/lx.js',
+      isLx: true,
+      lxSources: ['kg'],
+    );
+    final result = parseMusicFreeBackup(
+      jsonEncode({
+        'musicSheets': [
+          {
+            'title': '我喜欢',
+            'musicList': [
+              {
+                'id': '2D44700BFB234137DEF21A00DC0DC076',
+                'title': '五百年沧海桑田',
+                'artist': '星火社',
+                'album': '五百年沧海桑田',
+                'duration': 216,
+                'platform': '酷狗音乐(赞助版)[永久]',
+                'qualities': {
+                  '128k': {'hash': '2D44700BFB234137DEF21A00DC0DC076'},
+                  'flac': {'hash': '1C8D85FD26D4E01D44F2912EEF05C4D3'},
+                },
+              },
+            ],
+          },
+        ],
+      }),
+      plugins: [plugin],
+    );
+
+    final song = result.playlists.single.songs.single;
+    expect(song.path, 'lx://kg/2D44700BFB234137DEF21A00DC0DC076');
+    final lx = song.pluginData!['lx'] as Map<String, dynamic>;
+    expect(lx['hash'], '2D44700BFB234137DEF21A00DC0DC076');
+    expect(lx['interval'], '03:36');
+    expect(lx['_interval'], 216000);
+    expect((lx['_types'] as Map).containsKey('flac'), isTrue);
+  });
+
   test('统计没有匹配插件的在线歌曲', () {
     final result = parseMusicFreeBackup(
       jsonEncode({

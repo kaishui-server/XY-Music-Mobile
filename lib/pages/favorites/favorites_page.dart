@@ -227,8 +227,9 @@ class _FavoritesPageState extends ConsumerState<FavoritesPage> {
       );
       return;
     }
-    final plugin = await showSourcePluginPicker(context, plugins);
-    if (plugin == null || !mounted) return;
+    final picked = await showSourcePluginPicker(context, plugins);
+    if (picked == null || !mounted) return;
+    final (plugin, lxSource) = picked;
     setState(() {
       _switchingSource = true;
       _switchingDone = 0;
@@ -246,6 +247,7 @@ class _FavoritesPageState extends ConsumerState<FavoritesPage> {
           title: song.title,
           artist: song.artist,
           durationMs: song.duration * 1000,
+          lxSource: lxSource,
         );
         if (candidates.isEmpty) {
           missed.add(song.title);

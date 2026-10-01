@@ -16,7 +16,6 @@ import '../../src/core/custom_font.dart';
 import '../../src/auth/auth_provider.dart';
 import '../../src/backup/backup_service.dart';
 import '../../src/favorites/favorites_provider.dart';
-import '../../src/home/home_providers.dart';
 import '../../src/navigation/sidebar_controller.dart';
 import '../../src/player/desktop_lyrics.dart';
 import '../../src/playlists/playlists_provider.dart';
@@ -470,13 +469,97 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
     super.dispose();
   }
 
-  /// 导出全部本地数据（歌单、收藏、插件与用户变量、主题、设置）到
+  /// 导出前先弹勾选框：仅收藏 / 歌单 / 插件 / 设置四类可勾选，
+  /// 最近播放、听歌统计、下载记录等其余数据一律不进备份。
+  Future<BackupExportOptions?> _showBackupOptionsDialog() {
+    var favorites = true;
+    var playlists = true;
+    var plugins = true;
+    var settings = true;
+    return showDialog<BackupExportOptions>(
+      context: context,
+      builder: (dialogContext) => StatefulBuilder(
+        builder: (dialogContext, setDialogState) => AlertDialog(
+          title: const Text('选择备份内容'),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              CheckboxListTile(
+                value: favorites,
+                onChanged: (value) =>
+                    setDialogState(() => favorites = value ?? false),
+                title: const Text('收藏'),
+                subtitle: const Text('收藏的歌曲与排序'),
+                contentPadding: EdgeInsets.zero,
+                dense: true,
+                controlAffinity: ListTileControlAffinity.leading,
+              ),
+              CheckboxListTile(
+                value: playlists,
+                onChanged: (value) =>
+                    setDialogState(() => playlists = value ?? false),
+                title: const Text('歌单'),
+                subtitle: const Text('全部歌单及其歌曲'),
+                contentPadding: EdgeInsets.zero,
+                dense: true,
+                controlAffinity: ListTileControlAffinity.leading,
+              ),
+              CheckboxListTile(
+                value: plugins,
+                onChanged: (value) =>
+                    setDialogState(() => plugins = value ?? false),
+                title: const Text('插件'),
+                subtitle: const Text('插件脚本与用户变量'),
+                contentPadding: EdgeInsets.zero,
+                dense: true,
+                controlAffinity: ListTileControlAffinity.leading,
+              ),
+              CheckboxListTile(
+                value: settings,
+                onChanged: (value) =>
+                    setDialogState(() => settings = value ?? false),
+                title: const Text('设置'),
+                subtitle: const Text('全部设置与主题、壁纸、字体'),
+                contentPadding: EdgeInsets.zero,
+                dense: true,
+                controlAffinity: ListTileControlAffinity.leading,
+              ),
+            ],
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(dialogContext),
+              child: const Text('取消'),
+            ),
+            FilledButton(
+              onPressed: favorites || playlists || plugins || settings
+                  ? () => Navigator.pop(
+                      dialogContext,
+                      BackupExportOptions(
+                        favorites: favorites,
+                        playlists: playlists,
+                        plugins: plugins,
+                        settings: settings,
+                      ),
+                    )
+                  : null,
+              child: const Text('导出'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// 导出本地数据（按勾选项：收藏、歌单、插件、设置与主题）到
   /// 用户选择的 JSON 文件。
   Future<void> _exportBackup() async {
     if (_exportingBackup) return;
+    final options = await _showBackupOptionsDialog();
+    if (!mounted || options == null) return;
     setState(() => _exportingBackup = true);
     try {
-      final path = await const BackupService().exportBackup();
+      final path = await const BackupService().exportBackup(options: options);
       if (!mounted || path == null) return;
       XyNotice.show(context, message: '备份已导出');
     } catch (error) {
@@ -508,7 +591,13 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
     setState(() => _importingBackup = true);
     try {
       final service = const BackupService();
-      final data = await service.readBackup(filePath);
+      // 已启用插件列表：v5 备份里无 XY 私有 path 的网络条目（外部
+      // 格式转换工具产出）按平台匹配插件重建。
+      final plugins = await ref.read(enabledMusicPluginsProvider.future);
+      final data = await service.readBackup(
+        filePath,
+        enabledPlugins: plugins,
+      );
       if (!mounted) return;
       final exportedAt = data.exportedAt.isNotEmpty
           ? data.exportedAt.replaceFirst('T', ' ').split('.').first
@@ -516,20 +605,23 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
       final libraryInfo = data.librarySongCount > 0
           ? '与 ${data.librarySongCount} 首本地曲库'
           : '';
-      final historyInfo = data.hasPlaybackHistory ? '、最近播放与听歌统计' : '';
       final appearanceInfo = data.appearance.isEmpty
           ? ''
           : '、外观自定义文件（壁纸/字体）';
+      // v5 备份（仿 MusicFree 结构）直接展示歌单与歌曲数。
+      final sheetInfo = data.sheetCount > 0
+          ? '${data.sheetCount} 个歌单/收藏（共 ${data.songCount} 首）、'
+          : '${data.prefCount} 项数据、';
       final confirmed = await showDialog<bool>(
         context: context,
         builder: (dialogContext) => AlertDialog(
           title: const Text('导入备份？'),
           content: Text(
             '备份导出于 $exportedAt，包含 '
-            '${data.prefCount} 项数据、${data.pluginCount} 个插件'
-            '$libraryInfo$historyInfo$appearanceInfo。\n\n'
+            '$sheetInfo${data.pluginCount} 个插件'
+            '$libraryInfo$appearanceInfo。\n\n'
             '导入将覆盖当前同名的歌单、收藏、插件、本地曲库与设置，'
-            '建议先停止播放后继续。',
+            '建议先停止播放后继续。最近播放与听歌统计不受备份影响。',
           ),
           actions: [
             TextButton(
@@ -561,21 +653,13 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
       ref.invalidate(recentSongsProvider);
       ref.invalidate(enabledMusicPluginsProvider);
       if (data.librarySongCount > 0) ref.invalidate(libraryProvider);
-      if (data.hasPlaybackHistory) {
-        // 听歌统计与榜单直接读 SQLite 统计表，恢复后需重建缓存。
-        ref.invalidate(homeStatisticsProvider);
-        for (final period in LeaderboardPeriod.values) {
-          ref.invalidate(homeLeaderboardProvider(period));
-        }
-      }
       if (!mounted) return;
       await showDialog<void>(
         context: context,
         builder: (dialogContext) => AlertDialog(
           title: const Text('导入完成'),
-          content: Text(
-            '设置与主题已生效；本地曲库已恢复；'
-            '歌单与收藏已恢复${data.hasPlaybackHistory ? '；最近播放与听歌统计已恢复' : ''}。',
+          content: const Text(
+            '设置与主题已生效；本地曲库已恢复；歌单与收藏已恢复。',
           ),
           actions: [
             FilledButton(

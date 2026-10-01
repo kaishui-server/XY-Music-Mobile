@@ -142,20 +142,20 @@ Future<void> showPlaylistImportOptions(
             ListTile(
               leading: const Icon(Icons.extension_rounded),
               title: const Text('从 MusicFree 备份导入'),
-              subtitle: const Text('选择 MusicFree 导出的 JSON 备份文件'),
+              subtitle: const Text('选择 MusicFree / BakaMusic 导出的 JSON 备份文件'),
               onTap: () =>
                   Navigator.pop(sheetContext, PlaylistImportMode.musicFree),
             ),
             ListTile(
               leading: const Icon(Icons.insert_drive_file_rounded),
               title: const Text('从本地文件导入'),
-              subtitle: const Text('支持 M3U / M3U8 / 洛雪 JSON 歌单'),
+              subtitle: const Text('M3U / 洛雪 / MusicFree / BakaMusic / XY 歌单，自动识别格式'),
               onTap: () => Navigator.pop(sheetContext, PlaylistImportMode.local),
             ),
             ListTile(
               leading: const Icon(Icons.library_music_rounded),
               title: const Text('从 XY Music 歌单文件导入'),
-              subtitle: const Text('选择 XY Music 导出的 .xyplaylist 文件'),
+              subtitle: const Text('选择 XY Music 导出的歌单文件（.json / .xyplaylist）'),
               onTap: () => Navigator.pop(sheetContext, PlaylistImportMode.xy),
             ),
           ],
@@ -212,84 +212,8 @@ Future<void> _importMusicFreeBackup(
         ? ''
         : await File(file.path!).readAsString();
     if (content.trim().isEmpty) throw const FormatException('无法读取备份文件');
-    final plugins = await ref.read(enabledMusicPluginsProvider.future);
-    final result = parseMusicFreeBackup(
-      content,
-      plugins: plugins,
-      localSongs: ref.read(libraryProvider).songs,
-    );
-    var playlistCount = 0;
-    for (final playlist in result.playlists) {
-      final notifier = ref.read(playlistsProvider.notifier);
-      final existing = await notifier.findByName(playlist.name);
-      if (existing != null) {
-        if (!context.mounted) return;
-        final action = await confirmDuplicatePlaylist(
-          context,
-          playlist.name,
-        );
-        if (!context.mounted || action == null) continue;
-        if (action == DuplicatePlaylistAction.merge) {
-          await notifier.mergeImportedSongs(existing.id, playlist.songs);
-          playlistCount++;
-          continue;
-        }
-      }
-      final created = await notifier.create(
-        playlist.name,
-        songs: playlist.songs,
-      );
-      if (created != null) playlistCount++;
-    }
     if (!context.mounted) return;
-    if (result.unmatchedPluginSongs > 0) {
-      await showDialog<void>(
-        context: context,
-        useRootNavigator: true,
-        builder: (dialogContext) => AlertDialog(
-          title: const Text('导入完成'),
-          content: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text(
-                '成功导入${result.importedSongs}首歌曲，'
-                '${result.unmatchedPluginSongs}首歌曲因无匹配插件无法关联，'
-                '请您安装完整对应插件后重试',
-              ),
-              if (result.missingPluginSources.isNotEmpty) ...[
-                const SizedBox(height: 14),
-                Text(
-                  '缺失插件：${result.missingPluginSources.join('、')}',
-                  style: TextStyle(
-                    color: Theme.of(dialogContext).colorScheme.error,
-                    fontWeight: FontWeight.w600,
-                  ),
-                ),
-              ],
-            ],
-          ),
-          actions: [
-            FilledButton(
-              onPressed: () => Navigator.pop(dialogContext),
-              child: const Text('确定'),
-            ),
-          ],
-        ),
-      );
-    } else {
-      final skipped = result.skippedSongs > 0
-          ? '，跳过 ${result.skippedSongs} 首数据不完整的歌曲'
-          : '';
-      XyNotice.show(
-        context,
-        message:
-            '已从 MusicFree 备份导入 $playlistCount 个歌单、${result.importedSongs} 首歌曲$skipped',
-        type: result.skippedSongs > 0
-            ? XyNoticeType.warning
-            : XyNoticeType.success,
-      );
-    }
+    await _importMusicFreeContent(context, ref, content);
   } catch (error) {
     if (!context.mounted) return;
     XyNotice.show(
@@ -301,25 +225,126 @@ Future<void> _importMusicFreeBackup(
   }
 }
 
-Future<void> _importLocal(BuildContext context, WidgetRef ref) async {
-  final result = await FilePicker.platform.pickFiles(
-    type: FileType.custom,
-    allowedExtensions: const ['m3u', 'm3u8', 'json'],
+/// MusicFree / BakaMusic 备份内容的实际导入逻辑（供文件选择与本地
+/// 导入的内容嗅探两条入口复用）。
+Future<void> _importMusicFreeContent(
+  BuildContext context,
+  WidgetRef ref,
+  String content,
+) async {
+  final plugins = await ref.read(enabledMusicPluginsProvider.future);
+  final result = parseMusicFreeBackup(
+    content,
+    plugins: plugins,
+    localSongs: ref.read(libraryProvider).songs,
   );
-  final filePath = result?.files.single.path;
+  var playlistCount = 0;
+  for (final playlist in result.playlists) {
+    final notifier = ref.read(playlistsProvider.notifier);
+    final existing = await notifier.findByName(playlist.name);
+    if (existing != null) {
+      if (!context.mounted) return;
+      final action = await confirmDuplicatePlaylist(
+        context,
+        playlist.name,
+      );
+      if (!context.mounted || action == null) continue;
+      if (action == DuplicatePlaylistAction.merge) {
+        await notifier.mergeImportedSongs(existing.id, playlist.songs);
+        playlistCount++;
+        continue;
+      }
+    }
+    final created = await notifier.create(
+      playlist.name,
+      songs: playlist.songs,
+    );
+    if (created != null) playlistCount++;
+  }
+  if (!context.mounted) return;
+  if (result.unmatchedPluginSongs > 0) {
+    await showDialog<void>(
+      context: context,
+      useRootNavigator: true,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('导入完成'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              '成功导入${result.importedSongs}首歌曲，'
+              '${result.unmatchedPluginSongs}首歌曲因无匹配插件无法关联，'
+              '请您安装完整对应插件后重试',
+            ),
+            if (result.missingPluginSources.isNotEmpty) ...[
+              const SizedBox(height: 14),
+              Text(
+                '缺失插件：${result.missingPluginSources.join('、')}',
+                style: TextStyle(
+                  color: Theme.of(dialogContext).colorScheme.error,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+            ],
+          ],
+        ),
+        actions: [
+          FilledButton(
+            onPressed: () => Navigator.pop(dialogContext),
+            child: const Text('确定'),
+          ),
+        ],
+      ),
+    );
+  } else {
+    final skipped = result.skippedSongs > 0
+        ? '，跳过 ${result.skippedSongs} 首数据不完整的歌曲'
+        : '';
+    XyNotice.show(
+      context,
+      message:
+          '已从 MusicFree 备份导入 $playlistCount 个歌单、${result.importedSongs} 首歌曲$skipped',
+      type: result.skippedSongs > 0
+          ? XyNoticeType.warning
+          : XyNoticeType.success,
+    );
+  }
+}
+
+Future<void> _importLocal(BuildContext context, WidgetRef ref) async {
+  // 选择器用 FileType.any：.lxmc（gzip）等自定义扩展名在 Android SAF
+  // 上没有 MIME 映射，按扩展名过滤会直接隐藏文件；格式改由内容嗅探。
+  final result = await FilePicker.platform.pickFiles(
+    type: FileType.any,
+    withData: true,
+  );
+  final file = result?.files.singleOrNull;
+  final filePath = file?.path;
   if (filePath == null || !context.mounted) return;
   try {
-    // 洛雪歌单导出是 JSON 结构，按扩展名分流处理。
-    if (p.extension(filePath).toLowerCase() == '.json') {
-      await _importLxLocalFile(context, ref, filePath);
+    final bytes = file?.bytes != null && file!.bytes!.isNotEmpty
+        ? file.bytes!
+        : await File(filePath).readAsBytes();
+    if (bytes.isEmpty) throw const FormatException('无法读取歌单文件');
+    // gzip 魔数（0x1F 0x8B）：洛雪 .lxmc 单歌单导出是 gzip 压缩 JSON。
+    String content;
+    if (bytes.length > 2 && bytes[0] == 0x1F && bytes[1] == 0x8B) {
+      content = utf8.decode(gzip.decode(bytes), allowMalformed: true);
+    } else {
+      content = utf8.decode(bytes, allowMalformed: true);
+    }
+    if (content.trim().startsWith('{')) {
+      if (!context.mounted) return;
+      await _importJsonPlaylistFile(context, ref, content, filePath);
       return;
     }
     if (!await _ensureLocalAudioPermission()) {
       throw Exception('未授予本地音乐访问权限，无法读取歌单中的歌曲');
     }
-    final file = File(filePath);
-    final base = file.parent.path;
-    final lines = await file.readAsLines();
+    // 非 JSON：按 M3U 本地歌单处理。
+    final base = File(filePath).parent.path;
+    final lines = const LineSplitter().convert(content);
     final paths = lines
         .map((line) => line.trim())
         .where((line) => line.isNotEmpty && !line.startsWith('#'))
@@ -358,13 +383,50 @@ Future<void> _importLocal(BuildContext context, WidgetRef ref) async {
   }
 }
 
-/// 导入洛雪歌单导出的 JSON 文件（单歌单或 my-list 全量备份）。
-Future<void> _importLxLocalFile(
+/// JSON 歌单文件的内容路由：XY Music / MusicFree（含 BakaMusic）/
+/// 洛雪（全量备份与单歌单导出），按结构嗅探分流。
+Future<void> _importJsonPlaylistFile(
   BuildContext context,
   WidgetRef ref,
+  String content,
   String filePath,
 ) async {
-  final content = await File(filePath).readAsString();
+  final Object decoded;
+  try {
+    decoded = jsonDecode(content);
+  } catch (_) {
+    throw const FormatException('不是有效的 JSON 歌单文件');
+  }
+  if (decoded is Map) {
+    // XY Music 歌单文件（format 标识）。
+    if (decoded['format'] == kXyPlaylistFormat) {
+      await _importXyPlaylistContent(context, ref, content);
+      return;
+    }
+    // MusicFree / BakaMusic 备份（歌单在 musicSheets 或 data.musicSheets）。
+    final data = decoded['data'];
+    if (decoded['musicSheets'] != null ||
+        (data is Map && data['musicSheets'] != null)) {
+      await _importMusicFreeContent(context, ref, content);
+      return;
+    }
+    // 洛雪歌单导出（v1/v2 全量备份与单歌单导出）。
+    if (tryParseLxLocalPlaylists(content).isNotEmpty) {
+      await _importLxLocalContent(context, ref, content);
+      return;
+    }
+  }
+  throw const FormatException(
+    '无法识别的 JSON 歌单格式（支持 XY Music、MusicFree、BakaMusic、洛雪导出）',
+  );
+}
+
+/// 导入洛雪歌单导出的 JSON 内容（单歌单或 my-list 全量备份）。
+Future<void> _importLxLocalContent(
+  BuildContext context,
+  WidgetRef ref,
+  String content,
+) async {
   final playlists = tryParseLxLocalPlaylists(content);
   if (playlists.isEmpty) {
     throw Exception('不是有效的洛雪歌单文件');
@@ -419,8 +481,11 @@ Future<void> _importLxLocalFile(
   );
 }
 
-/// 导出为 XY Music 歌单文件（.xyplaylist）：在线歌曲带完整快照，
-/// 本地歌曲带路径，跨设备导入时快照直接还原、本地路径尽力匹配。
+/// 导出为 XY Music 歌单文件：JSON 内容带 app/format/version 标识，
+/// 在线歌曲带完整快照，本地歌曲带路径，跨设备导入时快照直接还原、
+/// 本地路径尽力匹配。扩展名用通用的 .json（有标准 MIME 映射，
+/// 所有系统文件选择器都可见；旧版无映射的 .xyplaylist 在部分
+/// Android SAF 选择器里根本显示不出来）。
 Future<void> exportXyPlaylistFile(
   BuildContext context,
   WidgetRef ref,
@@ -440,9 +505,9 @@ Future<void> exportXyPlaylistFile(
     );
     final safeName = playlist.name.replaceAll(RegExp(r'[\\/:*?"<>|]'), '_');
     final outputPath = await FilePicker.platform.saveFile(
-      fileName: '$safeName.xyplaylist',
+      fileName: '$safeName.json',
       type: FileType.custom,
-      allowedExtensions: const ['xyplaylist'],
+      allowedExtensions: const ['json'],
       bytes: Uint8List.fromList(utf8.encode(content)),
     );
     if (outputPath == null) return;
@@ -464,13 +529,15 @@ Future<void> exportXyPlaylistFile(
 
 /// 从 XY Music 歌单文件导入：快照歌曲直接还原，本地歌曲先匹配
 /// 本机曲库、再尝试按路径解析音频，均失败的歌曲跳过。
+/// 选择器用 FileType.any（自定义扩展名过滤在 Android SAF 上会隐藏
+/// 无 MIME 映射的文件），是否为 XY 歌单由内容嗅探（format 字段）判断，
+/// 同时兼容旧版 .xyplaylist 与新版 .json 导出文件。
 Future<void> importXyPlaylistFile(
   BuildContext context,
   WidgetRef ref,
 ) async {
   final picked = await FilePicker.platform.pickFiles(
-    type: FileType.custom,
-    allowedExtensions: const ['xyplaylist', 'json'],
+    type: FileType.any,
     withData: true,
   );
   final file = picked?.files.singleOrNull;
@@ -483,74 +550,8 @@ Future<void> importXyPlaylistFile(
         ? ''
         : await File(file.path!).readAsString();
     if (content.trim().isEmpty) throw const FormatException('无法读取歌单文件');
-    final data = parseXyPlaylistFile(content);
-    final localPaths = [
-      for (final path in data.songPaths)
-        if (!data.songSnapshots.containsKey(path)) path,
-    ];
-    final songsByPath = <String, Song>{};
-    if (localPaths.isNotEmpty) {
-      final librarySongs = await ref
-          .read(libraryProvider.notifier)
-          .songsByPaths(localPaths);
-      for (final song in librarySongs) {
-        songsByPath[song.path] = song;
-      }
-      final missing = localPaths
-          .where((path) => !songsByPath.containsKey(path))
-          .toList();
-      if (missing.isNotEmpty && await _ensureLocalAudioPermission()) {
-        try {
-          final parsed = jsonDecode(
-            await parseAudioFiles(pathsJson: jsonEncode(missing)),
-          );
-          if (parsed is List) {
-            for (final item in parsed.whereType<Map>()) {
-              final song = Song.fromJson(Map<String, dynamic>.from(item));
-              songsByPath[song.path] = song;
-            }
-          }
-        } catch (_) {
-          // 设备上不存在的本地路径直接跳过，不影响快照歌曲导入。
-        }
-      }
-    }
-    final songs = [
-      for (final path in data.songPaths)
-        data.songSnapshots[path]?.toSong() ?? songsByPath[path],
-    ].whereType<Song>().toList();
-    if (songs.isEmpty) throw const FormatException('歌单文件中没有可导入的歌曲');
-    final notifier = ref.read(playlistsProvider.notifier);
-    final existing = await notifier.findByName(data.name);
-    if (existing != null) {
-      if (!context.mounted) return;
-      final action = await confirmDuplicatePlaylist(context, data.name);
-      if (!context.mounted || action == null) return;
-      if (action == DuplicatePlaylistAction.merge) {
-        await notifier.mergeImportedSongs(
-          existing.id,
-          songs,
-          coverUrl: data.coverUrl,
-        );
-        if (!context.mounted) return;
-        XyNotice.show(
-          context,
-          message: '已合并到“${data.name}”，新增 ${songs.length} 首',
-          type: XyNoticeType.success,
-        );
-        return;
-      }
-    }
-    await notifier.create(data.name, songs: songs, coverUrl: data.coverUrl);
     if (!context.mounted) return;
-    final skipped = data.songPaths.length - songs.length;
-    XyNotice.show(
-      context,
-      message:
-          '已导入“${data.name}”，共 ${songs.length} 首'
-          '${skipped > 0 ? '（跳过 $skipped 首本机不存在的本地歌曲）' : ''}',
-      type: skipped > 0 ? XyNoticeType.warning : XyNoticeType.success,
-    );
+    await _importXyPlaylistContent(context, ref, content);
   } catch (error) {
     if (!context.mounted) return;
     XyNotice.show(
@@ -560,6 +561,83 @@ Future<void> importXyPlaylistFile(
       type: XyNoticeType.error,
     );
   }
+}
+
+/// XY Music 歌单文件内容的实际导入逻辑（供文件选择与本地导入的
+/// 内容嗅探两条入口复用）。
+Future<void> _importXyPlaylistContent(
+  BuildContext context,
+  WidgetRef ref,
+  String content,
+) async {
+  final data = parseXyPlaylistFile(content);
+  final localPaths = [
+    for (final path in data.songPaths)
+      if (!data.songSnapshots.containsKey(path)) path,
+  ];
+  final songsByPath = <String, Song>{};
+  if (localPaths.isNotEmpty) {
+    final librarySongs = await ref
+        .read(libraryProvider.notifier)
+        .songsByPaths(localPaths);
+    for (final song in librarySongs) {
+      songsByPath[song.path] = song;
+    }
+    final missing = localPaths
+        .where((path) => !songsByPath.containsKey(path))
+        .toList();
+    if (missing.isNotEmpty && await _ensureLocalAudioPermission()) {
+      try {
+        final parsed = jsonDecode(
+          await parseAudioFiles(pathsJson: jsonEncode(missing)),
+        );
+        if (parsed is List) {
+          for (final item in parsed.whereType<Map>()) {
+            final song = Song.fromJson(Map<String, dynamic>.from(item));
+            songsByPath[song.path] = song;
+          }
+        }
+      } catch (_) {
+        // 设备上不存在的本地路径直接跳过，不影响快照歌曲导入。
+      }
+    }
+  }
+  final songs = [
+    for (final path in data.songPaths)
+      data.songSnapshots[path]?.toSong() ?? songsByPath[path],
+  ].whereType<Song>().toList();
+  if (songs.isEmpty) throw const FormatException('歌单文件中没有可导入的歌曲');
+  final notifier = ref.read(playlistsProvider.notifier);
+  final existing = await notifier.findByName(data.name);
+  if (existing != null) {
+    if (!context.mounted) return;
+    final action = await confirmDuplicatePlaylist(context, data.name);
+    if (!context.mounted || action == null) return;
+    if (action == DuplicatePlaylistAction.merge) {
+      await notifier.mergeImportedSongs(
+        existing.id,
+        songs,
+        coverUrl: data.coverUrl,
+      );
+      if (!context.mounted) return;
+      XyNotice.show(
+        context,
+        message: '已合并到“${data.name}”，新增 ${songs.length} 首',
+        type: XyNoticeType.success,
+      );
+      return;
+    }
+  }
+  await notifier.create(data.name, songs: songs, coverUrl: data.coverUrl);
+  if (!context.mounted) return;
+  final skipped = data.songPaths.length - songs.length;
+  XyNotice.show(
+    context,
+    message:
+        '已导入“${data.name}”，共 ${songs.length} 首'
+        '${skipped > 0 ? '（跳过 $skipped 首本机不存在的本地歌曲）' : ''}',
+    type: skipped > 0 ? XyNoticeType.warning : XyNoticeType.success,
+  );
 }
 
 Future<bool> _ensureLocalAudioPermission() async {

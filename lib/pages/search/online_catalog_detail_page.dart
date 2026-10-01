@@ -412,6 +412,8 @@ class _CatalogCover extends StatelessWidget {
               )
             : Image.network(
                 coverUrl,
+                // 网易等音源 CDN 对 Dart 默认 UA 返回 403，需带浏览器请求头。
+                headers: coverImageNetworkHeaders(coverUrl),
                 fit: BoxFit.cover,
                 errorBuilder: (_, _, _) => ColoredBox(
                   color: scheme.surfaceContainerHighest,

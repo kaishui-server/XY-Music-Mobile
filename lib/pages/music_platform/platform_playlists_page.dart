@@ -8,6 +8,7 @@ import '../../src/music_platform/platform_session.dart';
 import '../../src/playlists/playlists_provider.dart';
 import '../../src/plugins/lx_playlist_import.dart';
 import '../../src/plugins/plugin_runtime.dart';
+import '../../src/widgets/cover_image.dart';
 import '../../src/widgets/top_notice.dart';
 
 enum _DuplicatePlaylistAction { merge, keepBoth }
@@ -365,6 +366,11 @@ class _PlaylistTile extends StatelessWidget {
                         )
                       : Image.network(
                           playlist.coverUrl,
+                          // 网易等音源 CDN 对 Dart 默认 UA 返回 403，
+                          // 需带浏览器请求头。
+                          headers: coverImageNetworkHeaders(
+                            playlist.coverUrl,
+                          ),
                           width: 56,
                           height: 56,
                           fit: BoxFit.cover,

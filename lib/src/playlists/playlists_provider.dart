@@ -166,6 +166,7 @@ class MobilePlaylist {
     this.customOrder,
     this.importSources = const [],
     this.songSources = const {},
+    this.favorited = false,
   });
 
   final String id;
@@ -186,6 +187,10 @@ class MobilePlaylist {
   /// （同步时永不移除）；同步时来源不再包含的来源歌曲会被移出歌单。
   final Map<String, List<String>> songSources;
 
+  /// 歌单级收藏标记：收藏歌单在音乐库歌单页单独分区置顶显示，
+  /// 与「已收藏」（歌曲级收藏）是两个概念，互不影响。
+  final bool favorited;
+
   /// 歌单没有单独设置封面时，默认使用第一首歌的封面。
   String? get effectiveCoverUrl {
     final explicit = coverUrl?.trim() ?? '';
@@ -202,6 +207,7 @@ class MobilePlaylist {
     List<String>? customOrder,
     List<PlaylistImportSource>? importSources,
     Map<String, List<String>>? songSources,
+    bool? favorited,
   }) {
     return MobilePlaylist(
       id: id,
@@ -213,6 +219,7 @@ class MobilePlaylist {
       customOrder: customOrder ?? this.customOrder,
       importSources: importSources ?? this.importSources,
       songSources: songSources ?? this.songSources,
+      favorited: favorited ?? this.favorited,
     );
   }
 
@@ -230,6 +237,7 @@ class MobilePlaylist {
       for (final source in importSources) source.toJson(),
     ],
     'songSources': songSources.map((path, keys) => MapEntry(path, keys)),
+    if (favorited) 'favorited': true,
   };
 
   factory MobilePlaylist.fromJson(Map<String, dynamic> json) {
@@ -266,6 +274,7 @@ class MobilePlaylist {
               return MapEntry(key.toString(), keys);
             })
           : const {},
+      favorited: json['favorited'] == true,
     );
   }
 }
@@ -391,6 +400,31 @@ class PlaylistsNotifier extends StateNotifier<List<MobilePlaylist>> {
       for (final item in state)
         if (item.id == id) item.copyWith(name: trimmed) else item,
     ];
+    await _save();
+  }
+
+  /// 切换歌单收藏状态（歌单级收藏，与歌曲级「已收藏」互不影响），
+  /// 返回切换后的结果（true 表示已收藏）。
+  Future<bool> toggleFavorite(String id) async {
+    await _loaded;
+    final index = state.indexWhere((item) => item.id == id);
+    if (index < 0) return false;
+    final next = [...state];
+    final favorited = !next[index].favorited;
+    next[index] = next[index].copyWith(favorited: favorited);
+    state = next;
+    await _save();
+    return favorited;
+  }
+
+  /// 设置歌单收藏状态（确定语义，不用 toggle：外部以明确目标值调用）。
+  Future<void> setFavorite(String id, bool value) async {
+    await _loaded;
+    final index = state.indexWhere((item) => item.id == id);
+    if (index < 0 || state[index].favorited == value) return;
+    final next = [...state];
+    next[index] = next[index].copyWith(favorited: value);
+    state = next;
     await _save();
   }
 

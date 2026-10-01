@@ -9,6 +9,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../../src/player/player_provider.dart';
 import '../../src/plugins/plugin_comments.dart';
 import '../../src/plugins/plugin_runtime.dart';
+import '../../src/widgets/cover_image.dart';
 
 /// 歌曲评论弹层：传入当前播放队列项（需携带 pluginId + pluginData）。
 class CommentSheet extends ConsumerStatefulWidget {
@@ -612,6 +613,8 @@ class _Avatar extends StatelessWidget {
     return ClipOval(
       child: Image.network(
         url!,
+        // 评论用户头像多为网易 CDN，对 Dart 默认 UA 返回 403。
+        headers: coverImageNetworkHeaders(url!),
         width: size,
         height: size,
         fit: BoxFit.cover,

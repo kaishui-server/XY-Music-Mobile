@@ -48,4 +48,38 @@ void main() {
       'yD9vbpuILH-tqNRIaP640g==/109951163038292176.jpg?param=800y800',
     );
   });
+
+  test('B站图床头像剥离 @缩略后缀还原原图', () {
+    // B站插件返回的 UP 主头像常带 @160w_160h_1c_1s.avif 缩略后缀，
+    // AVIF 多数设备解码失败会显示占位图；插件自身的剥离逻辑依赖
+    // quickjs 不存在的 URL 类而失效，由宿主统一剥离。
+    expect(
+      extractPluginCoverUrl({
+        'avatar': '//i0.hdslb.com/bfs/face/abc123.jpg@160w_160h_1c_1s.avif',
+      }),
+      'https://i0.hdslb.com/bfs/face/abc123.jpg',
+    );
+    // 视频封面同理（web-search-common-cover 等缩略形式）。
+    expect(
+      extractPluginCoverUrl({
+        'artwork':
+            'https://i2.hdslb.com/bfs/archive/x.jpg'
+            '@320w_180h_1c_!web-search-common-cover.avif',
+      }),
+      'https://i2.hdslb.com/bfs/archive/x.jpg',
+    );
+    // 非 B站图床、@ 在路径中间的地址不受影响。
+    expect(
+      extractPluginCoverUrl({
+        'avatar': 'https://p2.music.126.net/key/face@2x.jpg',
+      }),
+      'https://p2.music.126.net/key/face@2x.jpg?param=800y800',
+    );
+    expect(
+      extractPluginCoverUrl({
+        'avatar': 'https://i2.hdslb.com/bfs/face/a@b/c.jpg',
+      }),
+      'https://i2.hdslb.com/bfs/face/a@b/c.jpg',
+    );
+  });
 }

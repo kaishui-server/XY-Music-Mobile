@@ -129,4 +129,57 @@ void main() {
     expect(rawV1, isNotNull);
     expect(rawV1!['id'], '001dEI9i3VqAHc');
   });
+
+  test('洛雪单歌单导出（playListPart_v2）解析', () {
+    // .lxmc 单歌单导出解压后的结构：data 即歌单本体（id/name/list），
+    // 歌曲条目与 v2 全量备份一致（id 带 source 前缀、meta 嵌套）。
+    const content = '''
+{
+  "type": "playListPart_v2",
+  "data": {
+    "id": "love",
+    "name": "我的收藏",
+    "list": [
+      {
+        "id": "wy_29097542",
+        "name": "临安初雨",
+        "singer": "等什么君",
+        "source": "wy",
+        "interval": "03:26",
+        "meta": {
+          "songId": 29097542,
+          "albumName": "辞九门回忆",
+          "albumId": "35895862",
+          "picUrl": "https://p3.music.126.net/cover.jpg",
+          "_qualitys": {"128k": {"size": "3.2 MB"}}
+        }
+      },
+      {
+        "id": "tx_0006A93H2qAQu2",
+        "name": "恋落花",
+        "singer": "陈语淇",
+        "source": "tx",
+        "interval": "03:00"
+      }
+    ]
+  }
+}''';
+    final playlists = tryParseLxLocalPlaylists(content);
+    expect(playlists, hasLength(1));
+    expect(playlists.single.name, '我的收藏');
+    expect(playlists.single.songs, hasLength(2));
+
+    final first = playlists.single.songs.first;
+    expect(first['id'], '29097542');
+    expect(first['title'], '临安初雨');
+    expect(first['_sourcePath'], 'lx://wy/29097542');
+    final lx = first['lx'] as Map<String, dynamic>;
+    expect(lx['songmid'], '29097542');
+    expect(lx['songId'], 29097542);
+    expect(lx['interval'], '03:26');
+
+    final second = playlists.single.songs[1];
+    expect(second['id'], '0006A93H2qAQu2');
+    expect(second['_sourcePath'], 'lx://tx/0006A93H2qAQu2');
+  });
 }

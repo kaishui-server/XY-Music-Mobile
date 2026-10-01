@@ -76,6 +76,7 @@ class PluginSearchSong {
     required this.durationMs,
     required this.coverUrl,
     required this.rawData,
+    this.platform = '',
   });
 
   final String pluginId;
@@ -86,6 +87,10 @@ class PluginSearchSong {
   final int durationMs;
   final String coverUrl;
   final Map<String, dynamic> rawData;
+
+  /// 展示用平台名（洛雪/animemusic 等「单插件多平台」源的子平台，
+  /// 如「酷我」「B站」）；单平台插件为空（Tab 已显示插件名，不重复）。
+  final String platform;
 }
 
 /// 插件分类搜索结果（歌手或专辑）。
@@ -4396,7 +4401,9 @@ class PluginRuntimeService {
           id: id,
           title: title,
           subtitle: artist ? '' : entry['artist']?.toString() ?? '',
-          coverUrl: entry['artwork']?.toString() ?? '',
+          // 后端 artwork 可能是 http://（tx 歌手头像）或 // 开头地址：
+          // Android 禁明文 HTTP、渲染层要求完整 URL，统一过规范化。
+          coverUrl: _normalizeImageUrl(entry['artwork']?.toString() ?? ''),
           rawData: {
             ...entry,
             'animeSrc': platform,
@@ -6172,7 +6179,33 @@ class PluginRuntimeService {
       normalized = 'https://${normalized.substring(7)}';
     }
     if (!_isHttpUrl(normalized)) return '';
+    normalized = _stripBilibiliImageTransform(normalized);
     return _withNeteaseCoverScale(normalized);
+  }
+
+  /// Bilibili 图床（hdslb.com/biliimg.com）会在 /bfs/ 路径尾部追加
+  /// `@320w_180h_1c.avif` 之类的缩放后缀，部分接口的 UP 主头像、视频
+  /// 封面默认返回 .avif 缩略图。Flutter 图片解码器不支持 AVIF（部分
+  /// Android ROM 也缺），这类地址直接解码失败显示占位图。B站插件本想
+  /// 剥离该后缀，但其 `stripBilibiliImageTransform` 依赖 quickjs 环境
+  /// 不存在的 `URL` 类而静默失效；宿主统一用字符串操作剥离，让所有
+  /// 插件的 B站图片地址还原成原图。
+  static String _stripBilibiliImageTransform(String url) {
+    final uri = Uri.tryParse(url);
+    if (uri == null || !uri.hasScheme || uri.host.isEmpty) return url;
+    final host = uri.host.toLowerCase();
+    final isBiliCdn =
+        host == 'hdslb.com' ||
+        host.endsWith('.hdslb.com') ||
+        host == 'biliimg.com' ||
+        host.endsWith('.biliimg.com');
+    if (!isBiliCdn) return url;
+    final path = uri.path;
+    if (!path.contains('/bfs/')) return url;
+    final atIndex = path.lastIndexOf('@');
+    if (atIndex <= 0) return url;
+    if (path.substring(atIndex + 1).contains('/')) return url;
+    return uri.replace(path: path.substring(0, atIndex)).toString();
   }
 
   /// 与 cover_image.dart 的 normalizeCoverImageUrl 一致：网易云 CDN 封面
@@ -6303,8 +6336,35 @@ class PluginRuntimeService {
       durationMs: _parseDuration(raw),
       coverUrl: _extractCover(raw),
       rawData: raw,
+      platform: _extractSubPlatform(raw),
     );
   }
+
+  /// 提取「单插件多平台」源的子平台展示名：洛雪（lx.source 短码）与
+  /// animemusic 后端（animeSrc/_src/_source 短码）。MusicFree 系的
+  /// platform 字段已被 _resetMediaItem 覆盖为插件名（冗余），不提取。
+  static String _extractSubPlatform(Map<String, dynamic> raw) {
+    final lx = raw['lx'];
+    if (lx is Map) {
+      final code = lx['source']?.toString().trim() ?? '';
+      if (code.isNotEmpty) return _platformCodeLabel(code);
+    }
+    final code = _toAnimemusicPlatformCode(
+      (raw['animeSrc'] ?? raw['_src'] ?? raw['_source'] ?? '').toString(),
+    );
+    return code.isEmpty ? '' : _platformCodeLabel(code);
+  }
+
+  /// 平台短码 → 展示名（与洛雪音源命名一致，含 animemusic 的扩展平台）。
+  static String _platformCodeLabel(String code) => switch (code) {
+    'wy' => '网易云',
+    'tx' => 'QQ音乐',
+    'kw' => '酷我',
+    'kg' => '酷狗',
+    'mg' => '咪咕',
+    'bilibili' => 'B站',
+    _ => code.toUpperCase(),
+  };
 
   static int _parseDuration(Map<String, dynamic> raw) {
     for (final key in const [
