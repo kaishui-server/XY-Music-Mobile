@@ -3,6 +3,7 @@ package com.xymusic.mobile
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.content.res.Configuration
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Color
@@ -132,6 +133,13 @@ class MiniPlayerOverlayService : Service() {
     private var coverRequestSeq = 0
     private var loadedCoverPath: String? = null
 
+    /** 当前是否有歌曲在播。三个面板的可见性统一由它 + [queueExpanded] 决定。 */
+    private var hasSong = false
+
+    /** 队列是否处于展开态。必须跨 update 保持，否则每次同步进度都会
+     * 把播放面板重新显示出来，表现为「没点收起队列自己关闭」。 */
+    private var queueExpanded = false
+
     // ---- 拖动与进度拖动状态 ----
     private var draggingWindow = false
     private var draggingSeek = false
@@ -179,6 +187,8 @@ class MiniPlayerOverlayService : Service() {
         playPauseView = null
         queueList = null
         queueItemViews = mutableListOf()
+        queueExpanded = false
+        hasSong = false
         super.onDestroy()
     }
 
@@ -226,6 +236,16 @@ class MiniPlayerOverlayService : Service() {
     private fun ensurePanel() {
         if (root != null) return
 
+        // 横屏时系统可用高度小，用紧凑尺寸避免浮窗几乎占满屏幕导致难以拖动。
+        val compact = resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
+        val coverSize = if (compact) dp(96f) else dp(160f)
+        val coverBoxHeight = if (compact) dp(104f) else dp(168f)
+        val queueListHeight = if (compact) dp(160f) else dp(232f)
+
+        // 右上角常驻关闭按钮占据内容区右缘约 26dp，顶部文案需对称内缩避让，
+        // 否则长标题/「收起」会被 × 盖住。
+        val headerSideInset = dp(26f)
+
         val title = TextView(this).apply {
             setTextColor(TEXT_PRIMARY)
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
@@ -233,6 +253,8 @@ class MiniPlayerOverlayService : Service() {
             gravity = Gravity.CENTER
             maxLines = 2
             ellipsize = android.text.TextUtils.TruncateAt.END
+            // 对称内缩：视觉中心不变，右缘退避到关闭按钮左侧。
+            setPadding(headerSideInset, 0, headerSideInset, 0)
         }
         val artist = TextView(this).apply {
             setTextColor(TEXT_SECONDARY)
@@ -253,7 +275,7 @@ class MiniPlayerOverlayService : Service() {
         val coverWrap = FrameLayout(this).apply {
             addView(
                 cover,
-                FrameLayout.LayoutParams(dp(160f), dp(160f), Gravity.CENTER),
+                FrameLayout.LayoutParams(coverSize, coverSize, Gravity.CENTER),
             )
         }
         val seek = SeekBar(this).apply {
@@ -304,7 +326,7 @@ class MiniPlayerOverlayService : Service() {
             )
             addView(
                 coverWrap,
-                LinearLayout.LayoutParams(-1, dp(168f)).apply { topMargin = dp(10f) },
+                LinearLayout.LayoutParams(-1, coverBoxHeight).apply { topMargin = dp(10f) },
             )
             addView(seek, LinearLayout.LayoutParams(-1, -2))
             addView(timeRow, LinearLayout.LayoutParams(-1, -2))
@@ -331,6 +353,8 @@ class MiniPlayerOverlayService : Service() {
         val headerRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
+            // 右缘内缩避让右上角关闭按钮，避免「收起」被 × 遮挡而点不到。
+            setPadding(0, 0, headerSideInset, 0)
             addView(queueHeader, LinearLayout.LayoutParams(0, -2, 1f))
             addView(queueBack, LinearLayout.LayoutParams(-2, -2))
         }
@@ -347,7 +371,7 @@ class MiniPlayerOverlayService : Service() {
             addView(headerRow, LinearLayout.LayoutParams(-1, -2))
             addView(
                 scroll,
-                LinearLayout.LayoutParams(-1, dp(232f)).apply { topMargin = dp(6f) },
+                LinearLayout.LayoutParams(-1, queueListHeight).apply { topMargin = dp(6f) },
             )
         }
 
@@ -551,8 +575,28 @@ class MiniPlayerOverlayService : Service() {
     }
 
     private fun showQueuePane(show: Boolean) {
-        playerPane?.visibility = if (show) View.GONE else View.VISIBLE
-        queuePane?.visibility = if (show) View.VISIBLE else View.GONE
+        queueExpanded = show
+        applyPaneVisibility()
+    }
+
+    /** 统一决定「播放 / 队列 / 空态」三个面板的可见性，避免各处各写一套导致
+     * 状态漂移（表现为队列「一会在内一会在下」）。
+     *
+     * 竖屏：队列展开时播放面板保留，队列追加显示在其下方（在下）。
+     * 横屏：可用高度小，队列展开时就地替换播放面板（在内），避免整体超出屏幕。 */
+    private fun applyPaneVisibility() {
+        if (!hasSong) {
+            playerPane?.visibility = View.GONE
+            queuePane?.visibility = View.GONE
+            emptyPane?.visibility = View.VISIBLE
+            return
+        }
+        emptyPane?.visibility = View.GONE
+        queuePane?.visibility = if (queueExpanded) View.VISIBLE else View.GONE
+        val landscape =
+            resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
+        playerPane?.visibility =
+            if (queueExpanded && landscape) View.GONE else View.VISIBLE
     }
 
     // ---------------------------------------------------------------- 更新入口
@@ -565,9 +609,11 @@ class MiniPlayerOverlayService : Service() {
             return
         }
         ensurePanel()
-        val hasSong = p.title.isNotBlank()
-        playerPane?.visibility = if (hasSong) View.VISIBLE else View.GONE
-        emptyPane?.visibility = if (hasSong) View.GONE else View.VISIBLE
+        // 队列展开态必须跨 update 保持：此前每次都强制显示播放面板，
+        // 导致进度同步到来时队列被顶掉，表现为「没点收起队列自己关闭」。
+        hasSong = p.title.isNotBlank()
+        if (!hasSong) queueExpanded = false
+        applyPaneVisibility()
         if (!hasSong) {
             playing = false
             uiHandler.removeCallbacks(progressTicker)
