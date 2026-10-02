@@ -352,6 +352,18 @@ class AccountCloudSync {
           }
         }
         if (isLegacyFavorites) continue;
+        // 云端记录的导入来源（旧版云端快照没有该字段，解析为空即可）。
+        final importedSources = <PlaylistImportSource>[];
+        final rawSources = value['importSources'];
+        if (rawSources is List) {
+          for (final item in rawSources.whereType<Map>()) {
+            final source = PlaylistImportSource.fromJson(
+              Map<String, dynamic>.from(item),
+            );
+            if (source.input.isEmpty && source.pluginId.isEmpty) continue;
+            importedSources.add(source);
+          }
+        }
         await playlists.mergeCloudPlaylist(
           id: id,
           name: value['name']?.toString() ?? '未命名歌单',
@@ -362,6 +374,7 @@ class AccountCloudSync {
               value['cloudCoverUrl']?.toString() ??
               value['coverUrl']?.toString(),
           songs: songs,
+          sources: importedSources,
         );
         downloadedPlaylists++;
         downloadedSongs += songs.length;
@@ -482,6 +495,11 @@ class AccountCloudSync {
       'createdAt': playlist.createdAt.toIso8601String(),
       'cloudCoverUrl': playlist.effectiveCoverUrl,
       'isFavorite': false,
+      // 导入来源随歌单一起上云：否则云端快照缺少 importSources，重装/
+      // 重登后恢复的歌单会丢失「同步来源」按钮，只能重新导入。
+      'importSources': [
+        for (final source in playlist.importSources) source.toJson(),
+      ],
       'songs': songs,
     };
   }

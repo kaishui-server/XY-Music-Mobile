@@ -830,6 +830,12 @@ public class AudioServicePlugin implements FlutterPlugin, ActivityAware {
         }
 
         @Override
+        public void onNotificationClicked() {
+            // XY Music 定制：通知栏单击（广播路径）转交 Dart，不启动 Activity。
+            invokeMethod("onNotificationClicked", mapOf("clicked", true));
+        }
+
+        @Override
         public void onMethodCall(MethodCall call, Result result) {
             try {
                 Map<?, ?> args = (Map<?, ?>)call.arguments;

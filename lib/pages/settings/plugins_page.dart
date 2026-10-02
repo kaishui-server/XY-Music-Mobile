@@ -35,6 +35,10 @@ enum _PluginKind {
 
   /// animemusic 后端插件（直连 animemusic.bzxhkj.com，惜梦 v3/v4 等）。
   animemusic,
+
+  /// 其他：不属于上述契约族、或用户手动归位的插件。仅影响分栏展示，
+  /// 播放时仍按脚本内容识别契约。
+  other,
 }
 
 class _PluginInfo {
@@ -48,6 +52,7 @@ class _PluginInfo {
     this.author,
     this.remark,
     this.sourceUrl,
+    this.sourceLabel,
     this.userVariables = const [],
     this.isStarSea = false,
   });
@@ -60,12 +65,16 @@ class _PluginInfo {
   final String? author;
   final String? remark;
   final String? sourceUrl;
+
+  /// 多租户订阅源标识（IKUN / 聆澜…）：同一订阅里按 `?source=` 发放的
+  /// 专属脚本，安装时记下来源，列表中在名称旁以小标签展示。
+  final String? sourceLabel;
   final List<PluginUserVariable> userVariables;
 
   /// 星海格式插件（带 _src 来源标记的聚合变体，如惜梦 v4）。
   final bool isStarSea;
 
-  /// 插件分类（BakaMusic/MusicFree/LX/animemusic）。
+  /// 插件分类（BakaMusic/MusicFree/LX/animemusic/其他）。
   final _PluginKind kind;
 
   bool get isOnline => sourceUrl?.trim().isNotEmpty == true;
@@ -200,6 +209,8 @@ class _PluginsNotifier extends AsyncNotifier<List<_PluginInfo>> {
     final enabled = (prefs.getStringList(_enabledKey) ?? const []).toSet();
     final sourceUrls = _readSourceUrls(prefs);
     final displayNames = readPluginDisplayNames(prefs);
+    final sourceLabels = readPluginSourceLabels(prefs);
+    final kinds = readPluginKinds(prefs);
     final files =
         directory
             .listSync()
@@ -217,13 +228,36 @@ class _PluginsNotifier extends AsyncNotifier<List<_PluginInfo>> {
       // 分类优先级：LX 契约 > BakaMusic 契约 > animemusic 后端 >
       // 标准 MusicFree。v2 洛雪版虽直连 animemusic 后端但属 LX 契约；
       // baka 版兜底地址同样指向 animemusic 域名，需先判 Baka。
-      final kind = metadata.isLx
+      var kind = metadata.isLx
           ? _PluginKind.lx
           : metadata.isBaka
           ? _PluginKind.baka
           : metadata.isAnimemusic
           ? _PluginKind.animemusic
           : _PluginKind.musicfree;
+      // BakaMusic 与 MusicFree 脚本同构、内容无法可靠区分：用已记录的订阅
+      // 类型提示 + 来源 URL 判定（BakaMusic 只是兼容 MusicFree 协议，不是
+      // MusicFree）。提示优先于 URL——它来自本次导入时的分栏、订阅结构判定
+      // 或插件信息弹窗的手动改类，是明确意图；URL 仅作提示缺失时的兜底。
+      //
+      // URL 不能优先：同 ID 插件被另一族的插件覆盖时来源 URL 会从旧插件
+      // 继承（本地导入不写 http 来源，旧的 Baka 订阅 URL 会留存），此时
+      // Baka URL 会把新装的 MusicFree 插件错误顶到 BakaMusic 分栏，手动
+      // 改类也会被它反复覆盖、看似无效。
+      // 手动归入「其他」是明确的用户意图，优先于自动识别（含 LX/animemusic），
+      // 只影响分栏展示，不改播放契约。
+      if (kinds[id] == pluginKindOther) {
+        kind = _PluginKind.other;
+      } else if (kind == _PluginKind.musicfree || kind == _PluginKind.baka) {
+        final kindHint = kinds[id];
+        if (kindHint == pluginKindBaka) {
+          kind = _PluginKind.baka;
+        } else if (kindHint == pluginKindMusicFree) {
+          kind = _PluginKind.musicfree;
+        } else if (PluginMetadata.isBakaSourceUrl(sourceUrls[id] ?? '')) {
+          kind = _PluginKind.baka;
+        }
+      }
       items.add(
         _PluginInfo(
           id: id,
@@ -234,6 +268,7 @@ class _PluginsNotifier extends AsyncNotifier<List<_PluginInfo>> {
           path: file.path,
           enabled: enabled.contains(id),
           sourceUrl: sourceUrls[id],
+          sourceLabel: sourceLabels[id],
           userVariables: metadata.userVariables,
           isStarSea: metadata.isStarSea,
           kind: kind,
@@ -355,6 +390,8 @@ class _PluginsNotifier extends AsyncNotifier<List<_PluginInfo>> {
     String origin,
     _MutableInstallSummary summary, {
     String? displayName,
+    String? kindHint,
+    String? subscriptionSource,
     _PluginIdIndex? index,
   }) async {
     _validateScript(script);
@@ -363,6 +400,13 @@ class _PluginsNotifier extends AsyncNotifier<List<_PluginInfo>> {
     final metadata = PluginMetadata.parse(script);
     final id = PluginMetadata.resolvePluginIdFromMetadata(metadata, origin);
     final indexName = displayName?.trim() ?? '';
+    final source = subscriptionSource?.trim() ?? '';
+    final sourceLabel = source.isEmpty ? '' : _subscriptionSourceLabel(source);
+    // 多租户订阅源（BakaMusic 的 music.cwo.cc.cd 按 `?source=` 对同一插件
+    // 发放不同授权的脚本）只记录来源标签用于界面区分，**不**改动插件 ID：
+    // ID 一旦带后缀，歌曲/歌单里记录的旧 ID（如 `qq音乐`）就对不上新插件
+    // （`qq音乐-ikun`），播放时报「歌曲所属插件已停用或删除」。同名插件按
+    // 后装覆盖前装，界面上以来源标签标明当前装的是哪个渠道的版本。
     final name = indexName.isNotEmpty
         ? indexName
         : (metadata.name?.trim().isNotEmpty == true
@@ -377,6 +421,10 @@ class _PluginsNotifier extends AsyncNotifier<List<_PluginInfo>> {
     await pluginsDir.create(recursive: true);
 
     final prefs = await SharedPreferences.getInstance();
+    // 来源标签（IKUN / 聆澜…）随安装写入，供列表在音源名旁展示来源徽标。
+    if (sourceLabel.isNotEmpty) {
+      await _saveSourceLabel(prefs, id, sourceLabel);
+    }
 
     // 磁盘级去重：批量安装中途 state 不会刷新，列表项名称与订阅索引的
     // 显示名也可能不一致，仅靠 state 匹配会漏判，重复导入订阅就会产生
@@ -397,8 +445,13 @@ class _PluginsNotifier extends AsyncNotifier<List<_PluginInfo>> {
       if (!skipVersionCheck) {
         final existingVersion = await _latestExistingVersion(duplicates);
         final incomingVersion = metadata.version?.trim() ?? '';
+        // 仅当两边都是可比较的数字版本时才判断「旧版本不覆盖」。
+        // 描述性 version（部分 MusicFree 改造器插件写成人名/说明文案）
+        // 无法比较，若参与校验会被折算成 0.0.0 而永远被跳过。
         if (existingVersion.isNotEmpty &&
             incomingVersion.isNotEmpty &&
+            PluginMetadata.isComparableVersion(incomingVersion) &&
+            PluginMetadata.isComparableVersion(existingVersion) &&
             PluginMetadata.compareVersions(incomingVersion, existingVersion) <
                 0) {
           summary.skipped++;
@@ -416,7 +469,8 @@ class _PluginsNotifier extends AsyncNotifier<List<_PluginInfo>> {
         prefs,
         summary,
         session,
-        displayName: indexName.isNotEmpty ? indexName : null,
+        displayName: indexName.isNotEmpty ? name : null,
+        kindHint: kindHint,
       );
     }
 
@@ -430,8 +484,13 @@ class _PluginsNotifier extends AsyncNotifier<List<_PluginInfo>> {
       final sources = _readSourceUrls(prefs)..[id] = origin;
       await prefs.setString(_sourceUrlsKey, jsonEncode(sources));
     }
+    // 显示名覆盖表：订阅索引给的名字写入后，脚本被混淆/无元信息时也能
+    // 显示正确名称。
     if (indexName.isNotEmpty) {
-      await _saveDisplayName(prefs, id, indexName);
+      await _saveDisplayName(prefs, id, name);
+    }
+    if (kindHint != null && kindHint.isNotEmpty) {
+      await _savePluginKind(prefs, id, kindHint);
     }
     summary.installed++;
     // 星海格式插件在安装提示中标注，让用户知道这是聚合变体。
@@ -469,6 +528,68 @@ class _PluginsNotifier extends AsyncNotifier<List<_PluginInfo>> {
     await prefs.setString(pluginDisplayNamesKey, jsonEncode(names));
   }
 
+  /// 写入/覆盖插件来源标签表（仅多租户订阅源的专属脚本调用）。
+  Future<void> _saveSourceLabel(
+    SharedPreferences prefs,
+    String id,
+    String label,
+  ) async {
+    final labels = readPluginSourceLabels(prefs)..[id] = label;
+    await prefs.setString(pluginSourceLabelsKey, jsonEncode(labels));
+  }
+
+  /// 写入/覆盖插件订阅类型表（仅在线导入时调用）。
+  Future<void> _savePluginKind(
+    SharedPreferences prefs,
+    String id,
+    String kind,
+  ) async {
+    final kinds = readPluginKinds(prefs)..[id] = kind;
+    await prefs.setString(pluginKindsKey, jsonEncode(kinds));
+  }
+
+  /// 从订阅源响应推断插件类型提示。
+  ///
+  /// 实测三类源的差异：
+  /// - MusicFree 索引：`{plugins:[{name,url,version}]}`（部分含 desc）；
+  /// - BakaMusic 订阅：同为 `{plugins:[...]}`，但额外带 `yourinfo`
+  ///   （{ip,ua}）字段，URL 亦常为 `subscription.json`；
+  /// - 洛雪源：返回**纯 JS 脚本**（非 JSON），由脚本内容判定，无提示。
+  ///
+  /// BakaMusic 与 MusicFree 插件脚本同构，内容层无法可靠区分，故用订阅
+  /// 结构判定；无法判定时归 MusicFree（默认家族）。
+  String _subscriptionKindHint(String url, Object? decoded) {
+    final lower = url.toLowerCase();
+    if (lower.contains('baka') || lower.contains('subscription.json')) {
+      return pluginKindBaka;
+    }
+    if (decoded is Map && decoded.containsKey('yourinfo')) {
+      return pluginKindBaka;
+    }
+    return pluginKindMusicFree;
+  }
+
+  /// 从插件脚本 URL 提取多租户订阅源标识（`?source=ikun`）。
+  ///
+  /// BakaMusic 的多租户订阅（如 music.cwo.cc.cd）对**同一插件**按 source
+  /// 发放不同授权的脚本：文件名相同（qq.js）、`platform` 相同（QQ音乐），
+  /// 只有内嵌的授权不同。不带上 source 就会算出同一个插件 ID，导入第二个
+  /// 订阅时把第一个覆盖掉（IKUN 与聆澜只能留下最后一个）。
+  static String _subscriptionSourceTag(String url) {
+    final uri = Uri.tryParse(url.trim());
+    return uri?.queryParameters['source']?.trim() ?? '';
+  }
+
+  /// 多租户订阅源标识的展示名：已知来源给出规范写法，未知来源原样展示。
+  static String _subscriptionSourceLabel(String source) {
+    final trimmed = source.trim();
+    return switch (trimmed.toLowerCase()) {
+      'ikun' => 'IKUN',
+      'linglan' => '聆澜',
+      _ => trimmed,
+    };
+  }
+
   /// 把磁盘上已存在的同 ID 插件副本合并为一个文件：主文件以新脚本
   /// 覆盖，其余后缀变体删除，启用状态/订阅来源/用户变量/排序等偏好
   /// 一并迁移到主 ID 上。内容与磁盘一致时仅清理多余副本并跳过安装。
@@ -484,6 +605,7 @@ class _PluginsNotifier extends AsyncNotifier<List<_PluginInfo>> {
     _MutableInstallSummary summary,
     _PluginIdIndex session, {
     String? displayName,
+    String? kindHint,
   }) async {
     final primaryPath = p.join(pluginsDir.path, '$id.js');
     final primaryExists = duplicates.any((file) => file.path == primaryPath);
@@ -555,6 +677,40 @@ class _PluginsNotifier extends AsyncNotifier<List<_PluginInfo>> {
       await prefs.setString(pluginDisplayNamesKey, jsonEncode(names));
     }
 
+    // 订阅类型表：旧 ID 的类型迁移到主 ID，本次导入的来源类型优先。
+    final kinds = readPluginKinds(prefs);
+    var kindsChanged = false;
+    for (final removedId in removedIds) {
+      final value = kinds.remove(removedId);
+      if (value != null && !kinds.containsKey(id)) {
+        kinds[id] = value;
+        kindsChanged = true;
+      }
+    }
+    final hint = kindHint?.trim() ?? '';
+    if (hint.isNotEmpty && kinds[id] != hint) {
+      kinds[id] = hint;
+      kindsChanged = true;
+    }
+    if (kindsChanged) {
+      await prefs.setString(pluginKindsKey, jsonEncode(kinds));
+    }
+
+    // 来源标签表：旧 ID 的标签迁移到主 ID（本次导入已按新 ID 写入来源，
+    // 存在时不覆盖）。
+    final labels = readPluginSourceLabels(prefs);
+    var labelsChanged = false;
+    for (final removedId in removedIds) {
+      final value = labels.remove(removedId);
+      if (value != null && !labels.containsKey(id)) {
+        labels[id] = value;
+        labelsChanged = true;
+      }
+    }
+    if (labelsChanged) {
+      await prefs.setString(pluginSourceLabelsKey, jsonEncode(labels));
+    }
+
     final removedFiles = <File>[];
     for (final file in duplicates) {
       if (file.path == primaryPath) continue;
@@ -607,7 +763,10 @@ class _PluginsNotifier extends AsyncNotifier<List<_PluginInfo>> {
     }
   }
 
-  Future<_InstallSummary> installFromUrl(String url) async {
+  /// [kindHint] 为安装时用户所在分栏的分类标识：单文件插件（直链/本地）
+  /// 的脚本内容无法区分 BakaMusic 与 MusicFree（多契约插件字段完全重叠），
+  /// 只能靠用户所在分栏兜底，否则一律落进 MusicFree 分栏。
+  Future<_InstallSummary> installFromUrl(String url, {String? kindHint}) async {
     final summary = _MutableInstallSummary();
     final content = await _downloadText(url);
     final trimmed = content.trim();
@@ -621,6 +780,15 @@ class _PluginsNotifier extends AsyncNotifier<List<_PluginInfo>> {
             : null;
         if (rawItems is List && rawItems.isNotEmpty) {
           final base = Uri.parse(url);
+          // 订阅源类型提示：Baka 订阅索引与 MusicFree 索引结构相同、
+          // 仅多出 yourinfo 字段，据此把整批插件归入正确分栏。
+          // 订阅结构判定为 Baka 是强信号（BakaMusic 官方订阅固定带
+          // yourinfo）；判定为 MusicFree 只是默认兜底，此时用户所在分栏
+          // 更可信，用它的分类提示覆盖。
+          final structuralKind = _subscriptionKindHint(url, decoded);
+          final indexKind = structuralKind == pluginKindBaka
+              ? structuralKind
+              : (kindHint ?? structuralKind);
           // 整批共用一份目录索引，且每装完一个让出一次事件循环。
           final index = await _newInstallIndex();
           for (final raw in rawItems.take(_maxIndexItems)) {
@@ -639,6 +807,10 @@ class _PluginsNotifier extends AsyncNotifier<List<_PluginInfo>> {
                 effectiveUrl,
                 summary,
                 displayName: item['name']?.toString(),
+                kindHint: indexKind,
+                // 多租户订阅：按脚本 URL 的 source 区分同一插件的不同授权，
+                // 避免 IKUN / 聆澜 等来源互相覆盖。
+                subscriptionSource: _subscriptionSourceTag(effectiveUrl),
                 index: index,
               );
             } catch (error) {
@@ -657,7 +829,15 @@ class _PluginsNotifier extends AsyncNotifier<List<_PluginInfo>> {
     }
 
     try {
-      await _persistScript(content, url, summary);
+      // 直链也可能是多租户订阅的源专属脚本（带 ?source=），同样带上来源
+      // 标识，保证与订阅批量安装算出的 ID 一致、互不覆盖。
+      await _persistScript(
+        content,
+        url,
+        summary,
+        kindHint: kindHint,
+        subscriptionSource: _subscriptionSourceTag(url),
+      );
     } catch (error) {
       summary.failed++;
       summary.errors.add(error.toString());
@@ -667,7 +847,7 @@ class _PluginsNotifier extends AsyncNotifier<List<_PluginInfo>> {
     return summary.freeze();
   }
 
-  Future<_InstallSummary> importPlugin() async {
+  Future<_InstallSummary> importPlugin({String? kindHint}) async {
     final result = await FilePicker.platform.pickFiles(
       // 不用 FileType.custom + allowedExtensions：js 的 MIME 类型
       // （text/javascript）在华为/荣耀等魔改 ROM 的文件选择器上
@@ -701,7 +881,13 @@ class _PluginsNotifier extends AsyncNotifier<List<_PluginInfo>> {
           throw Exception('无法读取所选插件文件，请重新选择');
         }
         // path 为空时使用文件名作为来源，保证插件 ID 仍能稳定生成。
-        await _persistScript(script, path ?? file.name, summary, index: index);
+        await _persistScript(
+          script,
+          path ?? file.name,
+          summary,
+          kindHint: kindHint,
+          index: index,
+        );
       } catch (error) {
         summary.failed++;
         summary.errors.add('${file.name}：$error');
@@ -754,6 +940,11 @@ class _PluginsNotifier extends AsyncNotifier<List<_PluginInfo>> {
       ordered.map((plugin) => plugin.id).toList(),
     );
     ref.invalidate(enabledMusicPluginsProvider);
+  }
+
+  /// 重新读取插件目录与分类表（手动更改分类后刷新列表）。
+  Future<void> reload() async {
+    state = AsyncData(await _load());
   }
 
   /// 保存插件用户变量并让运行时按新值重新加载插件。
@@ -851,6 +1042,12 @@ class _PluginsNotifier extends AsyncNotifier<List<_PluginInfo>> {
       names.removeWhere((id, _) => ids.contains(id));
       await prefs.setString(pluginDisplayNamesKey, jsonEncode(names));
     }
+    // 来源标签表同理随卸载清理。
+    final labels = readPluginSourceLabels(prefs);
+    if (labels.isNotEmpty && labels.keys.any(ids.contains)) {
+      labels.removeWhere((id, _) => ids.contains(id));
+      await prefs.setString(pluginSourceLabelsKey, jsonEncode(labels));
+    }
     state = AsyncData(await _load());
     ref.invalidate(enabledMusicPluginsProvider);
   }
@@ -907,7 +1104,11 @@ class _PluginsPageState extends ConsumerState<PluginsPage> {
   Future<void> _importLocal() async {
     setState(() => _busy = true);
     try {
-      _showResult(await ref.read(_pluginsProvider.notifier).importPlugin());
+      _showResult(
+        await ref
+            .read(_pluginsProvider.notifier)
+            .importPlugin(kindHint: _currentKindHint()),
+      );
     } catch (error) {
       // 文件选择器、系统存储权限或插件解析失败都不能静默吞掉，
       // 否则用户点击“本地导入”后看起来像按钮没有反应。
@@ -923,7 +1124,7 @@ class _PluginsPageState extends ConsumerState<PluginsPage> {
     }
   }
 
-  Future<void> _installFromUrl() async {
+  Future<void> _installFromUrl([String? kindHint]) async {
     final controller = _installUrlController..clear();
     final url = await showDialog<String>(
       context: context,
@@ -1045,7 +1246,7 @@ class _PluginsPageState extends ConsumerState<PluginsPage> {
     try {
       final result = await ref
           .read(_pluginsProvider.notifier)
-          .installFromUrl(url);
+          .installFromUrl(url, kindHint: kindHint);
       _showResult(result);
     } catch (error) {
       if (mounted) {
@@ -1124,6 +1325,15 @@ class _PluginsPageState extends ConsumerState<PluginsPage> {
               ),
               _PluginInfoRow(label: '作者', value: _displayValue(plugin.author)),
               _PluginInfoRow(label: '版本', value: plugin.version),
+              _PluginInfoRow(
+                label: '分类',
+                value: _kindLabel(plugin.kind),
+              ),
+              if (plugin.sourceLabel?.trim().isNotEmpty == true)
+                _PluginInfoRow(
+                  label: '来源',
+                  value: plugin.sourceLabel!.trim(),
+                ),
               _PluginInfoRow(label: '备注', value: _displayValue(plugin.remark)),
               if (plugin.isOnline) ...[
                 const SizedBox(height: 4),
@@ -1141,6 +1351,14 @@ class _PluginsPageState extends ConsumerState<PluginsPage> {
           ),
         ),
         actions: [
+          TextButton(
+            onPressed: () {
+              // 先关闭信息弹窗，再弹分类选择，避免两个弹窗叠在一起。
+              Navigator.pop(dialogContext);
+              _changePluginKind(plugin);
+            },
+            child: const Text('更改分类'),
+          ),
           TextButton(
             onPressed: () => Navigator.pop(dialogContext),
             child: const Text('关闭'),
@@ -1392,7 +1610,7 @@ class _PluginsPageState extends ConsumerState<PluginsPage> {
             _selectedIds.removeWhere(
               (id) => !items.any((plugin) => plugin.id == id),
             );
-            // 四类分页计数：BakaMusic/MusicFree/LX/animemusic。
+            // 各分类分页计数：BakaMusic/MusicFree/LX/animemusic/其他。
             final kindCounts = {
               for (final kind in _PluginKind.values)
                 kind: items.where((item) => item.kind == kind).length,
@@ -1408,7 +1626,7 @@ class _PluginsPageState extends ConsumerState<PluginsPage> {
               }
             }
             // 只显示有插件的分类；全部为空（首次安装、清空插件）时保留
-            // 完整四类展示，避免页签整体消失。
+            // 完整分类展示，避免页签整体消失。
             final nonEmptyKinds = _PluginKind.values
                 .where((kind) => kindCounts[kind]! > 0)
                 .toList();
@@ -1434,7 +1652,8 @@ class _PluginsPageState extends ConsumerState<PluginsPage> {
                             const SizedBox(height: 14),
                             _InstallPanel(
                               busy: _busy,
-                              onOnline: _installFromUrl,
+                              onOnline: () =>
+                                  _installFromUrl(_currentKindHint()),
                               onLocal: _importLocal,
                               skipVersionCheck: ref.watch(
                                 settingsProvider.select(
@@ -1582,7 +1801,8 @@ class _PluginsPageState extends ConsumerState<PluginsPage> {
                         ),
                         sliver: SliverToBoxAdapter(
                           child: _EmptyPlugins(
-                            onOnline: _installFromUrl,
+                            onOnline: () =>
+                                _installFromUrl(_currentKindHint()),
                             onLocal: _importLocal,
                             hint: items.isEmpty
                                 ? '还没有安装插件'
@@ -1691,15 +1911,75 @@ class _PluginsPageState extends ConsumerState<PluginsPage> {
     _PluginKind.musicfree => 'MusicFree',
     _PluginKind.lx => 'LX',
     _PluginKind.animemusic => 'animemusic',
+    _PluginKind.other => '其他',
   };
 
-  /// 分类页签图标（与此前四个固定 ButtonSegment 的图标保持一致）。
+  /// 分类页签图标（与此前固定 ButtonSegment 的图标保持一致）。
   static IconData _kindIcon(_PluginKind kind) => switch (kind) {
     _PluginKind.baka => Icons.hub_rounded,
     _PluginKind.musicfree => Icons.extension_rounded,
     _PluginKind.lx => Icons.cable_rounded,
     _PluginKind.animemusic => Icons.cloud_rounded,
+    _PluginKind.other => Icons.category_rounded,
   };
+
+  /// 分栏分类对应的持久化标识（写入插件分类覆盖表用）。
+  static String _kindKey(_PluginKind kind) => switch (kind) {
+    _PluginKind.baka => pluginKindBaka,
+    _PluginKind.musicfree => pluginKindMusicFree,
+    _PluginKind.lx => pluginKindLx,
+    _PluginKind.animemusic => pluginKindAnimemusic,
+    _PluginKind.other => pluginKindOther,
+  };
+
+  /// 当前分栏的分类标识：单文件安装（直链/本地文件）无法从脚本内容区分
+  /// BakaMusic 与 MusicFree，用用户所在分栏作为分类提示。
+  String _currentKindHint() {
+    final index = _tabIndex.clamp(0, _PluginKind.values.length - 1);
+    return _kindKey(_PluginKind.values[index]);
+  }
+
+  /// 手动更改插件分类：多契约插件（同时兼容 BakaMusic/MusicFree/LX）
+  /// 脚本内容完全重叠、自动识别无法可靠区分，提供手动归位入口。
+  Future<void> _changePluginKind(_PluginInfo plugin) async {
+    final chosen = await showDialog<_PluginKind>(
+      context: context,
+      builder: (dialogContext) => SimpleDialog(
+        title: Text('${plugin.name} 的分类'),
+        children: [
+          for (final kind in _PluginKind.values)
+            SimpleDialogOption(
+              onPressed: () => Navigator.pop(dialogContext, kind),
+              child: Row(
+                children: [
+                  Icon(_kindIcon(kind), size: 20),
+                  const SizedBox(width: 12),
+                  Text(
+                    _kindLabel(kind),
+                    style: TextStyle(
+                      fontWeight: kind == plugin.kind
+                          ? FontWeight.w800
+                          : FontWeight.w400,
+                    ),
+                  ),
+                  if (kind == plugin.kind) ...[
+                    const Spacer(),
+                    const Icon(Icons.check_rounded, size: 18),
+                  ],
+                ],
+              ),
+            ),
+        ],
+      ),
+    );
+    if (chosen == null || chosen == plugin.kind) return;
+    final prefs = await SharedPreferences.getInstance();
+    final kinds = readPluginKinds(prefs)..[plugin.id] = _kindKey(chosen);
+    await prefs.setString(pluginKindsKey, jsonEncode(kinds));
+    if (!mounted) return;
+    await ref.read(_pluginsProvider.notifier).reload();
+    ref.invalidate(enabledMusicPluginsProvider);
+  }
 }
 
 class _SecurityNotice extends StatelessWidget {
@@ -1763,7 +2043,8 @@ class _InstallPanel extends StatelessWidget {
           ),
           const SizedBox(height: 5),
           Text(
-            '与电脑端一致，支持网络直链、JSON 插件索引和本地文件。',
+            '与电脑端一致，支持网络直链、JSON 插件索引和本地文件。'
+            '单文件插件无法自动区分 BakaMusic/MusicFree，按当前分栏归入对应分类。',
             style: TextStyle(
               fontSize: 12,
               color: Theme.of(context).colorScheme.onSurfaceVariant,
@@ -1944,6 +2225,10 @@ class _PluginCard extends StatelessWidget {
                       const SizedBox(width: 6),
                       _StarSeaBadge(),
                     ],
+                    if (plugin.sourceLabel?.trim().isNotEmpty == true) ...[
+                      const SizedBox(width: 6),
+                      _PluginSourceBadge(label: plugin.sourceLabel!.trim()),
+                    ],
                     if (isPlaying) ...[
                       const SizedBox(width: 6),
                       const _PlayingBadge(),
@@ -2017,6 +2302,40 @@ class _StarSeaBadge extends StatelessWidget {
       ),
       child: Text(
         '星海',
+        style: TextStyle(
+          fontSize: 10,
+          fontWeight: FontWeight.w600,
+          color: color,
+          height: 1.1,
+        ),
+      ),
+    );
+  }
+}
+
+/// 音源来源徽标（IKUN / 聆澜…）。
+///
+/// 多租户订阅源里同一插件（如「QQ音乐」）按 `?source=` 有多个授权版本，
+/// 它们名称完全相同、靠 ID 后缀区分才能并存。ID 不适合展示，故在名称旁
+/// 挂一个来源小标签，让用户在列表里一眼分辨这条音源来自哪个渠道。
+class _PluginSourceBadge extends StatelessWidget {
+  const _PluginSourceBadge({required this.label});
+
+  final String label;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final color = theme.colorScheme.tertiary;
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+      decoration: BoxDecoration(
+        color: color.withValues(alpha: 0.12),
+        borderRadius: BorderRadius.circular(5),
+        border: Border.all(color: color.withValues(alpha: 0.4)),
+      ),
+      child: Text(
+        label,
         style: TextStyle(
           fontSize: 10,
           fontWeight: FontWeight.w600,

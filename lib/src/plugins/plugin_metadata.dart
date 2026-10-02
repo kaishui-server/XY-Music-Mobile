@@ -167,6 +167,17 @@ class PluginMetadata {
     return 0;
   }
 
+  /// 版本号是否可参与数值比较：首个 `.`/`-` 分段必须是纯数字。
+  /// 部分 MusicFree 改造器插件把 version 写成描述性文案（如
+  /// 「插件改造器 · 猫头猫 · 迟言」），这类值经 [compareVersions] 会被
+  /// 折算成 0.0.0，永远判为比已装插件旧而被静默跳过（安装提示
+  /// 「成功 0 个、跳过 1 个」）。不可比较的版本必须排除在版本校验外。
+  static bool isComparableVersion(String version) {
+    final trimmed = version.trim();
+    if (trimmed.isEmpty) return false;
+    return int.tryParse(trimmed.split(RegExp(r'[.-]')).first) != null;
+  }
+
   static String _decodeUriPath(String path) {
     if (!path.contains('%')) return path;
     try {
@@ -186,10 +197,30 @@ class PluginMetadata {
     return hash;
   }
 
+  /// MusicFree/BakaMusic 家族契约识别：脚本导出含 `getMediaSource` 的
+  /// 宿主对象（module.exports/export default）。BakaMusic 是 MusicFree
+  /// 的衍生契约，两者脚本同构；这类插件即使内嵌 LX 兼容分支（如万象
+  /// API 的 `IS_LX = !!(globalThis.lx && globalThis.lx.EVENT_NAMES)`），
+  /// 主导出仍是 MusicFree 对象，不能判为洛雪。
+  static bool looksLikeMusicFreeContract(String script) {
+    final lower = script.toLowerCase();
+    final hasExport =
+        lower.contains('module.exports') ||
+        lower.contains('exports.default') ||
+        lower.contains('export default');
+    return hasExport && lower.contains('getmediasource');
+  }
+
   /// LX（洛雪）插件静态识别（不执行脚本），与 plugin_runtime 的
   /// _looksLikeLxPlugin 规则保持一致；压缩/混淆后的脚本可能写成
   /// globalThis['lx']，不能只认点号形式。
+  ///
+  /// 关键：先排除 MusicFree 家族契约。混合契约插件（同时支持
+  /// BakaMusic/MusicFree/LX）会在兼容判断里读取 `globalThis.lx`，
+  /// 若仅凭字符串命中就判为 LX，会把 MusicFree 插件误分类到洛雪
+  /// （搜索页出现平台下拉副行、插件页进错分栏）。
   static bool _detectLx(String script) {
+    if (looksLikeMusicFreeContract(script)) return false;
     final lower = script.toLowerCase();
     return lower.contains('lx.event.request') ||
         lower.contains('lx.event.on') ||
@@ -199,11 +230,32 @@ class PluginMetadata {
         lower.contains('server_script_config');
   }
 
-  /// BakaMusic 契约静态识别：getMvSource 方法（MusicFree 的 MV 方法
-  /// 叫 getMV、LX 走事件契约）与 animeSrc 歌曲来源标记是该契约独有。
+  /// BakaMusic 契约静态识别：以 `animeSrc` 歌曲来源标记为独有特征。
+  ///
+  /// 不再使用 `getMvSource`：MusicFree 通用插件为兼容 BakaMusic 也会
+  /// 导出 getMvSource（实测万象 API/部分第三方插件均带），用它判 Baka
+  /// 会把 MusicFree 插件误分类到 Baka 分栏，这是本次误判的根因。
+  /// BakaMusic 与 MusicFree 脚本同构，内容层无法可靠区分，导入时以
+  /// 订阅来源类型（见 plugins_page 的订阅类型提示）兜底。
   static bool _detectBaka(String script) {
-    final lower = script.toLowerCase();
-    return lower.contains('getmvsource') || lower.contains('animesrc');
+    return script.toLowerCase().contains('animesrc');
+  }
+
+  /// 订阅来源 URL 判定 BakaMusic 音源。
+  ///
+  /// BakaMusic 官方订阅及其镜像固定把插件脚本托管在这些域名下，插件脚本
+  /// URL 命中即视为 BakaMusic。BakaMusic 只是「兼容」MusicFree 协议（实测
+  /// 其官方插件既无 `animeSrc`，内容与 MusicFree 脚本也完全同构），因此
+  /// 不能靠脚本内容区分；订阅类型提示只在本次导入有效，旧版本安装的插件
+  /// 没有提示，且提示会被后续 MusicFree 导入覆盖。此函数依据持久化的
+  /// 来源 URL 兜底，保证 BakaMusic 插件稳定归入 BakaMusic 分栏。
+  static bool isBakaSourceUrl(String url) {
+    final lower = url.trim().toLowerCase();
+    if (lower.isEmpty) return false;
+    return RegExp(
+      r'^https?://(music\.cwo\.cc\.cd|bakp\.netlify\.app|'
+      r'animemusic\.bzxhkj\.com/baka)',
+    ).hasMatch(lower);
   }
 
   /// animemusic（惜梦动画音乐）插件识别：

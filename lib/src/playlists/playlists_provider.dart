@@ -435,6 +435,7 @@ class PlaylistsNotifier extends StateNotifier<List<MobilePlaylist>> {
     required DateTime createdAt,
     required Iterable<PlaylistSongSnapshot> songs,
     String? coverUrl,
+    Iterable<PlaylistImportSource> sources = const [],
   }) async {
     await _loaded;
     final incoming = songs.toList();
@@ -449,6 +450,7 @@ class PlaylistsNotifier extends StateNotifier<List<MobilePlaylist>> {
           createdAt: createdAt,
           coverUrl: coverUrl?.trim().isEmpty == true ? null : coverUrl?.trim(),
           songSnapshots: {for (final song in incoming) song.path: song},
+          importSources: sources.toList(),
         ),
       ];
     } else {
@@ -461,11 +463,20 @@ class PlaylistsNotifier extends StateNotifier<List<MobilePlaylist>> {
         if (!paths.contains(song.path)) paths.add(song.path);
         snapshots[song.path] = song;
       }
+      // 导入来源按 key 取并集：本地已有的来源不能被云端快照覆盖丢失
+      // （旧版云端快照不含来源，云端为空时保留本地记录）。
+      final mergedSources = [...current.importSources];
+      for (final source in sources) {
+        if (!mergedSources.any((item) => item.key == source.key)) {
+          mergedSources.add(source);
+        }
+      }
       final next = current.copyWith(
         name: name.trim().isEmpty ? current.name : name.trim(),
         songPaths: paths,
         coverUrl: current.coverUrl ?? coverUrl,
         songSnapshots: snapshots,
+        importSources: mergedSources,
       );
       final nextState = [...state];
       nextState[index] = next;

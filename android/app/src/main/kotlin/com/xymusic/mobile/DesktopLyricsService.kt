@@ -21,6 +21,7 @@ import android.view.Gravity
 import android.view.View
 import android.view.WindowManager
 import android.view.MotionEvent
+import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.TextView
 import org.json.JSONArray
@@ -44,8 +45,8 @@ class DesktopLyricsUpdateParams(
     val translationFontSize: Float,
     val backgroundColor: Int,
     val backgroundOpacity: Float,
-    /** 上下位移（dp）：叠加在拖动基准位置之上的垂直偏移，正值上移。 */
-    val verticalOffset: Float,
+    /** 纵向位置（百分制）：0 = 屏幕最顶端、50 = 屏幕正中、100 = 屏幕最底端。 */
+    val verticalPercent: Float,
     /** 自定义字体文件绝对路径（空 = 系统默认），供 Typeface.createFromFile。 */
     val lyricFontPath: String,
 )
@@ -65,6 +66,19 @@ class DesktopLyricsService : Service() {
         /** 运行中的服务实例，供 MainActivity 直连分发 update。 */
         @Volatile
         var instance: DesktopLyricsService? = null
+
+        /** 浮窗默认纵向位置（百分制）：未设置过时的初始位置，靠近屏幕底部。 */
+        const val DEFAULT_PERCENT = 90f
+
+        /** 手动拖动结束后回传纵向位置（百分制），让设置页滑块跟随实际位置。
+         * 不同步会发生「拖动后再收到一次旧滑块值 → 位置被拉回」的复位。 */
+        @Volatile
+        var positionReporter: ((Float) -> Unit)? = null
+
+        /** 浮窗关闭按钮被点击后回调 Dart：同步关闭设置里的桌面歌词开关。
+         * 浮窗已自行 stopSelf，这里只负责让设置页开关同步为关闭。 */
+        @Volatile
+        var closeReporter: (() -> Unit)? = null
 
         private fun wordProgress(span: WordSpan, position: Double): Double = when {
             position <= span.timeStart -> 0.0
@@ -94,12 +108,32 @@ class DesktopLyricsService : Service() {
     private var startY = 0
 
     // ---- 位置与字体状态 ----
-    /** 用户拖动确定的基准 y（不含滑块偏移），单位 px，自屏幕底部起算。 */
-    private var baseY = 76
-    /** 设置页「上下位移」滑块值（dp），叠加在基准位置之上。 */
-    private var verticalOffsetDp = 0f
+    /** 浮窗当前纵向位置（px，自屏幕底边起算），由 [appliedPercent] 换算而来。 */
+    private var baseY = 0
+    /** 已应用到浮窗的纵向位置（百分制）：0 = 顶端、50 = 居中、100 = 底端。
+     * 作为位置唯一真源，浮窗高度/整屏高度变化后都据此重算，不会漂移。 */
+    private var appliedPercent = DEFAULT_PERCENT
     /** 已应用的自定义字体路径（空 = 系统默认），避免重复创建 Typeface。 */
     private var appliedFontPath: String? = null
+
+    // ---- 关闭按钮与长按判定 ----
+    /** 关闭按钮（默认隐藏，长按浮窗显示）。 */
+    private var closeButton: View? = null
+    /** 歌词内容层（承载背景色/圆角）。背景色必须设在它上面：外层 root
+     * 只是叠放关闭按钮的容器，设在外层会被内容层自身背景盖住。 */
+    private var panelContent: View? = null
+    /** 本次手势是否已触发长按：触发后手势转为「显示关闭按钮」，不再拖动。 */
+    private var longPressTriggered = false
+    /** 是否正在手动拖动浮窗：拖动期间忽略按百分制重算位置（否则每 500ms
+     * 的进度同步会把浮窗拉回上一次滑块刻度值，表现为「整十吸附」）。 */
+    private var dragging = false
+    private val longPressRunnable = Runnable {
+        longPressTriggered = true
+        showCloseButton()
+    }
+    private val hideCloseRunnable = Runnable {
+        closeButton?.visibility = View.GONE
+    }
 
     // ---- 逐字渲染状态 ----
     // Dart 侧只按内容变化/低频(500ms)位置校正推送，帧循环用 Choreographer
@@ -177,7 +211,7 @@ class DesktopLyricsService : Service() {
         translationFontSize = intent.getFloatExtra("translationFontSize", 13f),
         backgroundColor = intent.getIntExtra("backgroundColor", 0xFF18181C.toInt()),
         backgroundOpacity = intent.getFloatExtra("backgroundOpacity", .85f),
-        verticalOffset = intent.getFloatExtra("verticalOffset", 0f),
+        verticalPercent = intent.getFloatExtra("verticalPercent", DEFAULT_PERCENT),
         lyricFontPath = intent.getStringExtra("lyricFontPath").orEmpty(),
     )
 
@@ -230,9 +264,44 @@ class DesktopLyricsService : Service() {
                 setStroke(1, Color.argb(75, 255, 255, 255))
             }
         }
+        // 关闭按钮：默认隐藏，长按浮窗才显示（平时不碍眼）。用 FrameLayout
+        // 叠放在歌词右上角，不影响歌词自身布局与浮窗高度。
+        val density = resources.displayMetrics.density
+        val close = TextView(this).apply {
+            text = "×"
+            setTextColor(Color.WHITE)
+            textSize = 16f
+            gravity = Gravity.CENTER
+            includeFontPadding = false
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.OVAL
+                setColor(Color.argb(205, 0, 0, 0))
+                setStroke(1, Color.argb(100, 255, 255, 255))
+            }
+            visibility = View.GONE
+        }
+        close.setOnClickListener {
+            // 点关闭：同步关闭设置里的桌面歌词开关，再移除浮窗。
+            closeReporter?.invoke()
+            stopSelf()
+        }
+        val closeSize = (26 * density).toInt()
+        val root = FrameLayout(this).apply {
+            addView(content, FrameLayout.LayoutParams(-1, -2))
+            addView(
+                close,
+                FrameLayout.LayoutParams(closeSize, closeSize, Gravity.TOP or Gravity.END)
+                    .apply {
+                        topMargin = (4 * density).toInt()
+                        rightMargin = (4 * density).toInt()
+                    },
+            )
+        }
+        closeButton = close
         lyricView = lyric
         translationView = translation
-        panel = content
+        panelContent = content
+        panel = root
         val type = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
         } else {
@@ -244,47 +313,75 @@ class DesktopLyricsService : Service() {
             WindowManager.LayoutParams.WRAP_CONTENT,
             type,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
+                WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
+                // 让坐标空间覆盖状态栏：默认浮窗坐标区不含状态栏，导致歌词
+                // 最多只能拖到状态栏下沿、顶不上去。
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
             PixelFormat.TRANSLUCENT,
         ).apply {
             gravity = Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
             val prefs = getSharedPreferences("desktop_lyrics", MODE_PRIVATE)
             x = prefs.getInt("x", 0)
-            baseY = prefs.getInt("y", 76)
-            y = clampY(baseY)
+            // 恢复已应用的纵向位置：服务被回收重建时 Dart 会把当前滑块值
+            // 再推一次，记住已应用值才不会造成位置跳变。
+            appliedPercent = prefs.getFloat("percent", DEFAULT_PERCENT)
+            baseY = clampY(percentToY(appliedPercent))
+            y = baseY
         }
         overlayParams = params
-        content.setOnTouchListener { _, event ->
+        val touchSlop = android.view.ViewConfiguration.get(this).scaledTouchSlop
+        root.setOnTouchListener { _, event ->
             when (event.actionMasked) {
                 MotionEvent.ACTION_DOWN -> {
                     downX = event.rawX
                     downY = event.rawY
                     startX = params.x
                     startY = baseY
+                    longPressTriggered = false
+                    // 进入拖动：期间忽略按百分制重算位置，保证拖动连续不吸附。
+                    dragging = true
+                    // 长按 450ms 显示关闭按钮；开始拖动会取消该定时。
+                    root.postDelayed(longPressRunnable, 450)
                     true
                 }
                 MotionEvent.ACTION_MOVE -> {
+                    if (longPressTriggered) {
+                        // 长按已触发：本次手势转为「显示关闭按钮」，不再拖动。
+                        return@setOnTouchListener true
+                    }
+                    if (abs(event.rawX - downX) > touchSlop ||
+                        abs(event.rawY - downY) > touchSlop
+                    ) {
+                        root.removeCallbacks(longPressRunnable)
+                    }
                     params.x = startX + (event.rawX - downX).toInt()
-                    // 拖动只改变不含滑块偏移的基准位置，实际 y 再叠加
-                    // 偏移并按整屏范围钳制。
-                    baseY = startY - (event.rawY - downY).toInt()
-                    params.y = clampY(baseY + verticalOffsetPx())
+                    // 拖动直接写浮窗位置；拖动结束后再换算回百分制回传。
+                    // 按整屏（含状态栏）高度钳制，允许一直拖到屏幕最顶端。
+                    baseY = clampY(startY - (event.rawY - downY).toInt())
+                    params.y = baseY
                     try {
-                        windowManager?.updateViewLayout(content, params)
+                        windowManager?.updateViewLayout(root, params)
                     } catch (_: Exception) {
                         // 系统回收浮窗时忽略最后一次拖动。
                     }
                     true
                 }
                 MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
-                    // 持久化基准位置（不含滑块偏移），避免下次启动重复叠加；
-                    // 基准同时按整屏高度收敛，防止越界值被反复带回。
-                    baseY = baseY.coerceIn(0, resources.displayMetrics.heightPixels)
+                    root.removeCallbacks(longPressRunnable)
+                    // 先退出拖动态，后续同步即可按新的百分制值校正（值已一致）。
+                    dragging = false
+                    if (longPressTriggered) {
+                        // 长按手势不产生位置回传。
+                        longPressTriggered = false
+                        return@setOnTouchListener true
+                    }
                     getSharedPreferences("desktop_lyrics", MODE_PRIVATE)
                         .edit()
                         .putInt("x", params.x)
-                        .putInt("y", baseY)
                         .apply()
+                    // 把拖动结果换算成纵向位置（百分制）回传 Dart：设置页滑块
+                    // 跟随实际位置，且随后的更新不会再用旧滑块值把浮窗拉回去。
+                    reportPercent()
                     true
                 }
                 else -> true
@@ -292,14 +389,16 @@ class DesktopLyricsService : Service() {
         }
         // 浮窗首次测量/内容高度变化时重算 y：整屏钳制的上边界依赖浮窗
         // 实际高度，布局完成前拿不到，需在布局变化后补一次钳制。
-        content.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ ->
+        root.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ ->
             applyWindowPosition()
         }
         windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
         try {
-            windowManager?.addView(content, params)
+            windowManager?.addView(root, params)
         } catch (_: Exception) {
             panel = null
+            closeButton = null
+            panelContent = null
             lyricView = null
             translationView = null
             overlayParams = null
@@ -324,16 +423,17 @@ class DesktopLyricsService : Service() {
         ensurePanel()
         val lyric = p.lyric.ifBlank { "暂无歌词" }
 
-        // 位置/字体类参数：滑块位移、自定义字体。这些参数变化频率极低
-        // （仅用户调节时推送），每次更新时幂等应用即可。
-        verticalOffsetDp = p.verticalOffset
+        // 位置/字体类参数：纵向位置百分制、自定义字体。这些参数变化频率
+        // 极低（仅用户调节时推送），每次更新时幂等应用即可。
+        applyPercent(p.verticalPercent)
         applyFont(p.lyricFontPath)
         applyWindowPosition()
 
         overlayParams?.let { params ->
             val desiredFlags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
                 WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
-                if (p.locked) WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE else 0
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                (if (p.locked) WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE else 0)
             if (params.flags != desiredFlags) {
                 params.flags = desiredFlags
                 try {
@@ -430,7 +530,9 @@ class DesktopLyricsService : Service() {
         val backgroundKey = "${p.noBackground}|${p.backgroundColor}|${p.backgroundOpacity}"
         if (backgroundKey != lastBackgroundKey) {
             lastBackgroundKey = backgroundKey
-            panel?.background = if (p.noBackground) {
+            // 背景色设在歌词内容层：内容层自带一层深色背景，若设在外层
+            // root 上会被内容层完全遮住，表现为「背景色设置不生效」。
+            panelContent?.background = if (p.noBackground) {
                 ColorDrawable(Color.TRANSPARENT)
             } else {
                 GradientDrawable().apply {
@@ -575,32 +677,91 @@ class DesktopLyricsService : Service() {
 
     // ---- 位置与字体应用 ----
 
-    /** 滑块偏移换算为纵向像素（正值上移，浮窗 y 减小）。 */
-    private fun verticalOffsetPx(): Int =
-        (verticalOffsetDp * resources.displayMetrics.density).toInt()
-
-    /// 浮窗 y 钳制：范围覆盖整屏（自屏幕底部 0 到屏幕顶部）。
-    /// y 是相对屏幕底边的偏移，上限取「屏幕高 - 浮窗高」，保证浮窗
-    /// 仍完整可见，可一直拖到贴近屏幕顶端。
-    private fun clampY(value: Int): Int {
-        val screenHeight = resources.displayMetrics.heightPixels
-        val panelHeight = panel?.height?.takeIf { it > 0 } ?: 0
-        val maxY = (screenHeight - panelHeight).coerceAtLeast(0)
-        return value.coerceIn(0, maxY)
+    /** 整屏高度（含状态栏）：配合 FLAG_LAYOUT_IN_SCREEN 取真实显示尺寸，
+     * 不用 Resources.displayMetrics（默认已扣掉系统栏，顶不到状态栏）。 */
+    private fun screenHeightPx(): Int {
+        val wm = windowManager ?: getSystemService(WINDOW_SERVICE) as WindowManager
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            wm.currentWindowMetrics.bounds.height()
+        } else {
+            val point = android.graphics.Point()
+            @Suppress("DEPRECATION")
+            wm.defaultDisplay.getRealSize(point)
+            point.y
+        }
     }
 
-    /** 按当前基准 + 滑块偏移重算 y 并下发。 */
+    /** 浮窗可移动的纵向范围（px）：整屏高度减去浮窗自身高度。 */
+    private fun availableHeightPx(): Int {
+        val panelHeight = panel?.height?.takeIf { it > 0 } ?: 0
+        return (screenHeightPx() - panelHeight).coerceAtLeast(0)
+    }
+
+    /// 浮窗 y 钳制：y 自屏幕底边起算，上限取「整屏高 - 浮窗高」，
+    /// 保证浮窗完整可见且能一直贴到屏幕最顶端（可覆盖状态栏）。
+    private fun clampY(value: Int): Int = value.coerceIn(0, availableHeightPx())
+
+    /** 百分制纵向位置 → 浮窗 y（px，自屏幕底边起算）。
+     * 0 = 屏幕最顶端（y 取最大值，浮窗顶边贴屏顶）；100 = 屏幕最底端。 */
+    private fun percentToY(percent: Float): Int {
+        val available = availableHeightPx()
+        return (available * (1f - percent.coerceIn(0f, 100f) / 100f)).toInt()
+    }
+
+    /** 浮窗 y（px）→ 百分制纵向位置，与 [percentToY] 互为反算。 */
+    private fun yToPercent(y: Int): Float {
+        val available = availableHeightPx()
+        if (available <= 0) return appliedPercent
+        return ((1f - y.toFloat() / available) * 100f).coerceIn(0f, 100f)
+    }
+
+    /** 浮窗高度变化后重新按当前百分制位置摆放（可移动范围依赖浮窗高度）。
+     * 手动拖动期间必须跳过：否则每 500ms 的进度同步会按「上一次已应用的
+     * 百分制值」重算 y，把浮窗吸回滑块刻度（整十）位置。 */
     private fun applyWindowPosition() {
+        if (dragging) return
         val params = overlayParams ?: return
-        val target = clampY(baseY + verticalOffsetPx())
+        val target = clampY(percentToY(appliedPercent))
         if (params.y != target) {
             params.y = target
+            baseY = target
             try {
                 panel?.let { windowManager?.updateViewLayout(it, params) }
             } catch (_: Exception) {
                 // 浮窗已被系统回收时忽略位置更新。
             }
         }
+    }
+
+    /** 应用设置页「上下位置」滑块（百分制）。
+     *
+     * 百分制是位置唯一真源、浮窗 y 始终由它换算，因此手动拖动后不会再被
+     * 旧的绝对值重算拉回原位（旧实现按「滑块绝对值」反复平移导致复位）。 */
+    private fun applyPercent(incomingPercent: Float) {
+        val target = incomingPercent.coerceIn(0f, 100f)
+        if (abs(target - appliedPercent) < 0.01f) return
+        appliedPercent = target
+        getSharedPreferences("desktop_lyrics", MODE_PRIVATE)
+            .edit().putFloat("percent", appliedPercent).apply()
+    }
+
+    /** 手动拖动结束后，把浮窗实际位置换算成百分制回传 Dart：设置页滑块
+     * 跟随实际位置，并作为后续更新的真源（避免拖动后被旧滑块值拉回）。 */
+    private fun reportPercent() {
+        val percent = yToPercent(baseY)
+        if (abs(percent - appliedPercent) < 0.5f) return
+        appliedPercent = percent
+        getSharedPreferences("desktop_lyrics", MODE_PRIVATE)
+            .edit().putFloat("percent", appliedPercent).apply()
+        positionReporter?.invoke(percent)
+    }
+
+    /** 长按浮窗后显示关闭按钮，4 秒后自动隐藏（避免一直挂在浮窗上）。 */
+    private fun showCloseButton() {
+        val button = closeButton ?: return
+        button.removeCallbacks(hideCloseRunnable)
+        button.visibility = View.VISIBLE
+        button.postDelayed(hideCloseRunnable, 4000)
     }
 
     /// 应用自定义字体；路径为空或创建失败时回退系统默认字体。
@@ -648,6 +809,8 @@ class DesktopLyricsService : Service() {
             }
         }
         panel = null
+        closeButton = null
+        panelContent = null
         lyricView = null
         translationView = null
         overlayParams = null

@@ -95,6 +95,12 @@ Future<void> _initBackgroundAudio() async {
           defaultTargetPlatform == TargetPlatform.macOS)) {
     return;
   }
+  // 必须在创建 AudioPlayer 之前完成：部分机型（实测 OnePlus Android 16）
+  // 音频 HAL 不提供系统均衡器，AudioEffect 构造直接抛 RuntimeException，
+  // 而 just_audio 只要被注入效果就会在 audio session 建立时构造，异常
+  // 发生在主线程无人捕获会导致进程判为崩溃。先探测能力，不支持的机型
+  // 干脆不注入对应效果（音效降级，但不再崩溃）。
+  await _probeAndroidAudioEffects();
   try {
     await JustAudioBackground.init(
       androidNotificationChannelId: 'com.xymusic.mobile.playback',
@@ -102,6 +108,9 @@ Future<void> _initBackgroundAudio() async {
       androidNotificationChannelDescription: '显示正在播放的歌曲和播放控制',
       androidNotificationIcon: 'drawable/ic_stat_xy_music',
       androidNotificationOngoing: true,
+      // 单击通知不拉起 Activity：改为广播事件转交 Dart，只弹迷你播放器
+      // 悬浮窗而不把应用切到前台（配合 audio_service 的定制广播接收器）。
+      androidNotificationClickStartsActivity: false,
       androidStopForegroundOnPause: false,
       // MediaSession 会经 Binder 传递封面位图。512x512 的 ARGB 位图
       // 已接近 1MB 事务上限，部分 ROM 会连同整张媒体卡片一起丢弃。
@@ -114,5 +123,29 @@ Future<void> _initBackgroundAudio() async {
   } catch (error, stackTrace) {
     debugPrint('后台音频初始化失败：$error');
     debugPrintStack(stackTrace: stackTrace);
+  }
+}
+
+/// 探测设备原生音频效果（均衡器、响度增益）是否可用，并写入
+/// just_audio_background 的能力标志。
+///
+/// 原生侧会试建一次对应 `AudioEffect` 再立即释放；失败（机型音频 HAL
+/// 不提供该效果）返回 false。探测本身异常时按“不支持”处理——宁可没有
+/// 音效，也不要让进程在首次播放时崩溃。
+Future<void> _probeAndroidAudioEffects() async {
+  if (kIsWeb || defaultTargetPlatform != TargetPlatform.android) return;
+  try {
+    final supported = await const MethodChannel('com.xymusic.mobile/device_info')
+        .invokeMethod<Map<Object?, Object?>>('probeAudioEffects');
+    xySetAndroidAudioEffectsSupported(
+      equalizer: supported?['equalizer'] == true,
+      loudnessEnhancer: supported?['loudnessEnhancer'] == true,
+    );
+  } catch (error) {
+    debugPrint('音频效果能力探测失败，按不支持处理：$error');
+    xySetAndroidAudioEffectsSupported(
+      equalizer: false,
+      loudnessEnhancer: false,
+    );
   }
 }

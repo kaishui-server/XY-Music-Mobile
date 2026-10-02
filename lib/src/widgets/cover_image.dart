@@ -45,8 +45,10 @@ class CoverImage extends ConsumerStatefulWidget {
 }
 
 class _CoverImageState extends ConsumerState<CoverImage> {
-  // 按歌曲路径缓存缩略图路径，避免重复触发 Rust 提取。
-  static final Map<String, String> _cache = {};
+  // 按歌曲路径缓存缩略图路径，避免重复触发 Rust 提取。走 LRU 上限，
+  // 否则长时间播放/浏览大量歌曲后该静态表只增不减，常驻内存持续升高。
+  static final LinkedHashMap<String, String> _cache = LinkedHashMap();
+  static const _pathCacheLimit = 256;
   static final LinkedHashMap<String, Uint8List> _proxyCache = LinkedHashMap();
   static final Map<String, Future<Uint8List?>> _proxyTasks = {};
   static const _proxyCacheLimit = 64;
@@ -78,7 +80,7 @@ class _CoverImageState extends ConsumerState<CoverImage> {
   Future<void> _load() async {
     final imageUrl = normalizeCoverImageUrl(widget.imageUrl);
     if (imageUrl.isNotEmpty) return;
-    final cached = _cache[_cacheKey];
+    final cached = _cacheGet(_cacheKey);
     if (cached != null) {
       if (mounted) setState(() => _path = cached.isEmpty ? null : cached);
       return;
@@ -97,16 +99,30 @@ class _CoverImageState extends ConsumerState<CoverImage> {
               cacheRoot: cacheRoot,
               path: widget.songPath,
             ));
-      _cache[_cacheKey] = p;
+      _cachePut(_cacheKey, p);
       if (mounted) setState(() => _path = p.isEmpty ? null : p);
     } catch (_) {
-      _cache[_cacheKey] = '';
+      _cachePut(_cacheKey, '');
       if (mounted) setState(() => _path = null);
     }
   }
 
   String get _cacheKey =>
       '${widget.highQuality ? 'full' : 'thumb'}:${widget.songPath}';
+
+  static String? _cacheGet(String key) {
+    final value = _cache.remove(key);
+    if (value != null) _cache[key] = value;
+    return value;
+  }
+
+  static void _cachePut(String key, String value) {
+    _cache.remove(key);
+    _cache[key] = value;
+    while (_cache.length > _pathCacheLimit) {
+      _cache.remove(_cache.keys.first);
+    }
+  }
 
   Future<void> _loadProxiedImage(String imageUrl) async {
     if (_proxyLoading || _proxyFailed) return;

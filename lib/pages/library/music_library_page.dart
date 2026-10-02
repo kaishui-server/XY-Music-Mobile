@@ -556,16 +556,14 @@ class _MusicLibraryPageState extends ConsumerState<MusicLibraryPage>
             : addedOrder;
         return [for (final path in ordered) ?songsByPath[path]];
       case SongSortKey.title:
+      case SongSortKey.fileName:
+      case SongSortKey.path:
       case SongSortKey.artist:
       case SongSortKey.album:
-        String sortKey(Song song) => switch (_favSort.key) {
-          SongSortKey.artist => _pinyinKey(song.artist),
-          SongSortKey.album => _pinyinKey(song.album),
-          _ => _pinyinKey(song.title),
-        };
+      case SongSortKey.modified:
         final all = [for (final path in addedOrder) ?songsByPath[path]];
         all.sort((a, b) {
-          var result = sortKey(a).compareTo(sortKey(b));
+          var result = compareSongsBySortKey(_favSort.key, a, b, _pinyinKey);
           if (result == 0) {
             result = _pinyinKey(a.title).compareTo(_pinyinKey(b.title));
           }
@@ -1586,15 +1584,12 @@ class _MusicLibraryPageState extends ConsumerState<MusicLibraryPage>
     final sortedSongs = _localSort.key == SongSortKey.custom
         ? songs
         : [...songs]..sort((a, b) {
-            var result = switch (_localSort.key) {
-              SongSortKey.artist => _pinyinKey(
-                a.artist,
-              ).compareTo(_pinyinKey(b.artist)),
-              SongSortKey.album => _pinyinKey(a.album).compareTo(
-                _pinyinKey(b.album),
-              ),
-              _ => _pinyinKey(a.title).compareTo(_pinyinKey(b.title)),
-            };
+            var result = compareSongsBySortKey(
+              _localSort.key,
+              a,
+              b,
+              _pinyinKey,
+            );
             if (result == 0) {
               result = _pinyinKey(a.title).compareTo(_pinyinKey(b.title));
             }

@@ -63,6 +63,19 @@ const DEFAULT_SONG = {
     expect(id, 'qq音乐');
   });
 
+  test('描述性 version 不参与版本数值比较（避免安装被静默跳过）', () {
+    // 改造器插件常把 version 写成说明文案；compareVersions 会把它折算成
+    // 0.0.0，若不排除就会永远判为比已装的数字版本插件旧，安装提示
+    // 「成功 0 个、跳过 1 个」。
+    const descriptive = '插件改造器 · 猫头猫 · 迟言';
+    expect(PluginMetadata.isComparableVersion(descriptive), isFalse);
+    expect(PluginMetadata.isComparableVersion(''), isFalse);
+    expect(PluginMetadata.isComparableVersion('1.0.0'), isTrue);
+    expect(PluginMetadata.isComparableVersion('2-beta3'), isTrue);
+    // 说明为何要排除：描述性版本会被折算为 0.0.0，比 1.0.0 旧。
+    expect(PluginMetadata.compareVersions(descriptive, '1.0.0') < 0, isTrue);
+  });
+
   test('元数据缺失时文件名回退 ID 解码百分号编码路径', () {
     const script = r'''
 async function search(query, page, type) {

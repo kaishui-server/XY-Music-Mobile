@@ -19,6 +19,8 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
     <!-- 桌面歌词悬浮窗 -->
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW"/>
+    <!-- 均衡器/响度增益等系统音频效果：AudioEffect 需要该权限才能挂到音频会话 -->
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS"/>
     <!-- 从后台下载并打开 APK 安装程序 -->
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES"/>
     <application
@@ -122,6 +124,13 @@
             android:exported="false"/>
         <service
             android:name=".DesktopLyricsService"
+            android:exported="false"/>
+        <!-- 迷你播放器悬浮窗：替代画中画，窗口内按钮与进度条可点击 -->
+        <service
+            android:name=".MiniPlayerOverlayService"
+            android:exported="false"/>
+        <receiver
+            android:name="com.ryanheise.audioservice.NotificationClickReceiver"
             android:exported="false"/>
         <receiver
             android:name="com.ryanheise.audioservice.MediaButtonReceiver"

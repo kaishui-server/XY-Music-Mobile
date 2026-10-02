@@ -18,6 +18,7 @@ import '../../src/backup/backup_service.dart';
 import '../../src/favorites/favorites_provider.dart';
 import '../../src/navigation/sidebar_controller.dart';
 import '../../src/player/desktop_lyrics.dart';
+import '../../src/player/mini_player_overlay.dart';
 import '../../src/playlists/playlists_provider.dart';
 import '../../src/plugins/plugin_runtime.dart';
 import '../../src/recent/recent_provider.dart';
@@ -1113,6 +1114,14 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
           value: settings?.keepScreenOn ?? true,
           onChanged: (v) => notifier.setKeepScreenOn(v),
         ),
+        _switchTile(
+          context,
+          icon: Icons.picture_in_picture_alt_outlined,
+          title: '迷你播放器浮窗',
+          subtitle: '通知栏单击媒体卡片弹出浮窗，封面/进度条/切歌按钮可直接操作',
+          value: settings?.miniPlayerOverlayEnabled ?? false,
+          onChanged: (v) => _setMiniPlayerOverlay(context, ref, v),
+        ),
       ],
       SettingsSection.playbackDetail => [
         _switchTile(
@@ -1245,30 +1254,7 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
           value: settings?.desktopLyricsLocked ?? false,
           onChanged: (value) => notifier.setDesktopLyricsLocked(value),
         ),
-        _tile(
-          context,
-          icon: Icons.height_rounded,
-          title: '上下位移',
-          trailing: SizedBox(
-            width: 165,
-            // 位移范围覆盖整屏：滑块上下限取屏幕高度（dp），歌词可从
-            // 屏幕底部一路推到顶端（原生侧再按浮窗实际高度做边界钳制）。
-            child: Slider(
-              value: (settings?.desktopLyricsVerticalOffset ?? 0).clamp(
-                -MediaQuery.sizeOf(context).height,
-                MediaQuery.sizeOf(context).height,
-              ),
-              min: -MediaQuery.sizeOf(context).height,
-              max: MediaQuery.sizeOf(context).height,
-              label: (settings?.desktopLyricsVerticalOffset ?? 0) == 0
-                  ? '默认'
-                  : '${(settings?.desktopLyricsVerticalOffset ?? 0) > 0 ? '上移' : '下移'} '
-                        '${(settings?.desktopLyricsVerticalOffset ?? 0).abs().round()}',
-              onChanged: (value) =>
-                  notifier.setDesktopLyricsVerticalOffset(value),
-            ),
-          ),
-        ),
+        _desktopLyricsPositionTile(context, settings, notifier),
         _tile(
           context,
           icon: Icons.format_color_text_outlined,
@@ -1795,6 +1781,68 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
     );
   }
 
+  /// 桌面歌词纵向位置（百分制）：0% = 屏幕最顶端、50% = 屏幕正中、
+  /// 100% = 屏幕最底端。滑块每 10% 一个刻度（divisions: 10），与播放页
+  /// 歌词字号滑块的刻度样式一致。
+  Widget _desktopLyricsPositionTile(
+    BuildContext context,
+    AppSettings? settings,
+    SettingsNotifier notifier,
+  ) {
+    final percent = (settings?.desktopLyricsVerticalPercent ?? 90.0).clamp(
+      0.0,
+      100.0,
+    );
+    final label = '${percent.round()}%';
+    final scheme = Theme.of(context).colorScheme;
+    final hintStyle = TextStyle(fontSize: 11, color: scheme.outline);
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 12, 16, 4),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Icon(
+                Icons.vertical_align_center_rounded,
+                size: 20,
+                color: scheme.onSurfaceVariant,
+              ),
+              const SizedBox(width: 12),
+              const Expanded(child: Text('上下位置')),
+              Text(
+                label,
+                style: TextStyle(
+                  fontWeight: FontWeight.w700,
+                  color: scheme.onSurfaceVariant,
+                ),
+              ),
+            ],
+          ),
+          Slider(
+            value: percent,
+            min: 0,
+            max: 100,
+            divisions: 10,
+            label: label,
+            onChanged: notifier.setDesktopLyricsVerticalPercent,
+          ),
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 10),
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                Text('顶部 0%', style: hintStyle),
+                Text('居中 50%', style: hintStyle),
+                Text('底部 100%', style: hintStyle),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
   Widget _tile(
     BuildContext context, {
     required IconData icon,
@@ -2064,6 +2112,31 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
       await DesktopLyricsBridge.setEnabled(false);
     }
     await notifier.setDesktopLyricsEnabled(enabled);
+  }
+
+  /// 迷你播放器浮窗开关：开启前先让原生校验悬浮窗权限（未授权会拉起授权
+  /// 页），通过后再写入设置；写入设置会触发根节点同步显示浮窗。
+  Future<void> _setMiniPlayerOverlay(
+    BuildContext context,
+    WidgetRef ref,
+    bool enabled,
+  ) async {
+    if (enabled) {
+      final accepted = await MiniPlayerOverlayBridge.setEnabled(true);
+      if (!accepted) {
+        if (context.mounted) {
+          ScaffoldMessenger.of(
+            context,
+          ).showSnackBar(const SnackBar(content: Text('请授予悬浮窗权限后再开启迷你播放器浮窗')));
+        }
+        return;
+      }
+    } else {
+      await MiniPlayerOverlayBridge.setEnabled(false);
+    }
+    await ref
+        .read(settingsProvider.notifier)
+        .setMiniPlayerOverlayEnabled(enabled);
   }
 
   Widget _desktopColorDot(BuildContext context, int value) {

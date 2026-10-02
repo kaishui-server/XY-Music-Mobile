@@ -12,6 +12,35 @@ class DesktopLyricsBridge {
   DesktopLyricsBridge._();
 
   static const _channel = MethodChannel('com.xymusic.mobile/desktop_lyrics');
+
+  /// 原生手动拖动浮窗后回传的纵向位置（百分制）：0 = 屏幕最顶端、
+  /// 50 = 屏幕正中、100 = 屏幕最底端。设置页滑块据此跟随实际位置，避免
+  /// 下一次更新用旧滑块值把浮窗拉回（拖动后被复位）。未注册时忽略该回调。
+  static void Function(double percent)? onPositionChanged;
+
+  /// 原生浮窗关闭按钮被点击后的回调：播放层据此把「桌面歌词」开关同步为
+  /// 关闭（浮窗本身已由原生移除）。未注册时忽略该回调。
+  static void Function()? onCloseRequested;
+
+  static bool _handlerInstalled = false;
+
+  /// 安装原生 → Dart 的回调监听（只装一次）。原生浮窗拖动结束后会把纵向
+  /// 位置（百分制）经 `onPositionChanged` 回传，这里转交给
+  /// [onPositionChanged] 由播放层写回设置，使滑块与实际位置保持一致。
+  static void _ensureHandler() {
+    if (_handlerInstalled) return;
+    _handlerInstalled = true;
+    _channel.setMethodCallHandler((call) async {
+      if (call.method == 'onPositionChanged') {
+        final value = (call.arguments as num?)?.toDouble();
+        if (value != null) onPositionChanged?.call(value);
+      } else if (call.method == 'onCloseRequested') {
+        onCloseRequested?.call();
+      }
+      return null;
+    });
+  }
+
   static bool? _lastEnabled;
   static String? _lastContentSignature;
   static bool? _lastIsPlayingSent;
@@ -83,10 +112,11 @@ class DesktopLyricsBridge {
     required int backgroundColor,
     required double backgroundOpacity,
     required int wordEffectMode,
-    required double verticalOffset,
+    required double verticalPercent,
     required String lyricFontPath,
   }) async {
     if (!Platform.isAndroid) return;
+    _ensureHandler();
     final generation = ++_syncGeneration;
     if (_lastEnabled != enabled) {
       final accepted = await setEnabled(enabled);
@@ -125,7 +155,7 @@ class DesktopLyricsBridge {
       backgroundOpacity,
       wordEffectMode,
       locked,
-      verticalOffset,
+      verticalPercent,
       lyricFontPath,
     ].join('\u0000');
     final now = DateTime.now();
@@ -159,7 +189,7 @@ class DesktopLyricsBridge {
         'translationFontSize': translationFontSize,
         'backgroundColor': backgroundColor,
         'backgroundOpacity': backgroundOpacity,
-        'verticalOffset': verticalOffset,
+        'verticalPercent': verticalPercent,
         'lyricFontPath': lyricFontPath,
       });
     } on PlatformException {

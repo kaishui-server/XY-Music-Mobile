@@ -33,6 +33,7 @@ class EnabledMusicPlugin {
     this.animemusicQualities = const ['128k', '192k', '320k', 'flac'],
     this.userVariables = const {},
     this.sourceUrl = '',
+    this.sourceLabel,
   });
 
   final String id;
@@ -64,6 +65,11 @@ class EnabledMusicPlugin {
   /// 插件的订阅来源地址（安装/更新时记录），供音源分类按 URL 前缀
   /// 识别（Baka / 惜梦 / MusicFree）。
   final String sourceUrl;
+
+  /// 多租户订阅源标识（IKUN / 聆澜…）。BakaMusic 的多租户订阅按
+  /// `?source=` 对同一插件发放不同授权的脚本，名称相同、内容不同，换源
+  /// 列表需要据此区分展示（同名音源各带一个来源标签）。
+  final String? sourceLabel;
 }
 
 class PluginSearchSong {
@@ -424,6 +430,8 @@ Future<List<EnabledMusicPlugin>> loadEnabledMusicPlugins(Ref ref) async {
   final savedVariables = readPluginUserVariables(prefs);
   final sourceUrls = _readPluginSourceUrls(prefs, sourceUrlsKey);
   final displayNames = readPluginDisplayNames(prefs);
+  final sourceLabels = readPluginSourceLabels(prefs);
+  final kinds = readPluginKinds(prefs);
   final plugins = <EnabledMusicPlugin>[];
   for (final file in directory.listSync().whereType<File>()) {
     if (p.extension(file.path).toLowerCase() != '.js') continue;
@@ -443,6 +451,24 @@ Future<List<EnabledMusicPlugin>> loadEnabledMusicPlugins(Ref ref) async {
     // 订阅索引声明的显示名优先：脚本混淆/无元信息时也能显示正确名称。
     final overrideName = displayNames[id]?.trim() ?? '';
     if (overrideName.isNotEmpty) pluginName = overrideName;
+    // 分类优先级与插件管理页一致：LX > BakaMusic > animemusic。BakaMusic
+    // 只是兼容 MusicFree 协议（官方插件无 animeSrc、内容同构），靠订阅类型
+    // 提示与来源 URL 判定；提示是明确意图（导入分栏/订阅结构/手动改类），
+    // 优先于 URL，URL 仅在提示缺失时兜底——同 ID 插件被另一族覆盖时来源
+    // URL 会从旧插件继承，若 URL 优先会把 MusicFree 插件误标成 BakaMusic。
+    var isBaka = !isLx && !isAnimemusic && metadata.isBaka;
+    if (!isLx && !isAnimemusic) {
+      final kindHint = kinds[id];
+      if (kindHint == pluginKindBaka) {
+        isBaka = true;
+      } else if (kindHint == pluginKindMusicFree ||
+          kindHint == pluginKindOther) {
+        // 手动归入「其他」的插件按 MusicFree 族处理，不强制 Baka 契约。
+        isBaka = false;
+      } else if (PluginMetadata.isBakaSourceUrl(sourceUrls[id] ?? '')) {
+        isBaka = true;
+      }
+    }
     plugins.add(
       EnabledMusicPlugin(
         id: id,
@@ -450,9 +476,9 @@ Future<List<EnabledMusicPlugin>> loadEnabledMusicPlugins(Ref ref) async {
         path: file.path,
         isLx: isLx,
         lxSources: isLx ? _detectLxSources(source) : const [],
-        // 分类优先级与插件管理页一致：LX > BakaMusic > animemusic。
-        isBaka: !isLx && !isAnimemusic && metadata.isBaka,
+        isBaka: isBaka,
         isAnimemusic: isAnimemusic,
+        sourceLabel: sourceLabels[id],
         animemusicApi:
             (savedVariables[id]?['api']?.trim().isNotEmpty == true
                 ? savedVariables[id]!['api']!.trim()
@@ -508,10 +534,74 @@ const pluginUserVariablesKey = 'mobilePluginUserVariablesV1';
 /// 名称）时，重新加载列表仍能显示订阅源给的正确名称，而不是回退成插件 ID。
 const pluginDisplayNamesKey = 'mobilePluginDisplayNamesV1';
 
+/// SharedPreferences 中持久化插件订阅来源类型的键：
+/// {pluginId: 'baka'|'musicfree'|'lx'|'animemusic'|'other'}。
+///
+/// BakaMusic 是 MusicFree 的衍生契约，两者脚本同构（都导出
+/// module.exports + search/getMediaSource，第三方 MusicFree 通用插件
+/// 还可能为兼容 Baka 而附带 getMvSource），**内容层无法可靠区分**。
+/// 因此在导入时按订阅源响应结构记录类型，分类时优先于内容静态检测，
+/// 使在线导入的 baka / 洛雪 / musicfree 分栏不再出错。
+const pluginKindsKey = 'mobilePluginKindsV1';
+
+/// 订阅类型标识（与插件管理页 _PluginKind 的分栏名对齐）。
+const pluginKindBaka = 'baka';
+const pluginKindMusicFree = 'musicfree';
+const pluginKindLx = 'lx';
+const pluginKindAnimemusic = 'animemusic';
+
+/// 「其他」分栏：不属于上述任一契约族、或用户手动归位的插件。
+/// 仅影响插件管理页的分栏展示，播放仍按脚本内容自动识别契约；
+/// 运行时按 MusicFree 族处理，不强制 Baka 契约。
+const pluginKindOther = 'other';
+
+/// 读取插件订阅类型覆盖表，只保留合法字符串键值。
+Map<String, String> readPluginKinds(SharedPreferences prefs) {
+  try {
+    final raw = prefs.getString(pluginKindsKey);
+    if (raw == null || raw.isEmpty) return {};
+    final decoded = jsonDecode(raw);
+    if (decoded is! Map) return {};
+    return {
+      for (final entry in decoded.entries)
+        if (entry.value is String && (entry.value as String).trim().isNotEmpty)
+          entry.key.toString(): (entry.value as String).trim(),
+    };
+  } catch (_) {
+    return {};
+  }
+}
+
 /// 读取全部插件的显示名覆盖表，只保留合法的字符串键值。
 Map<String, String> readPluginDisplayNames(SharedPreferences prefs) {
   try {
     final raw = prefs.getString(pluginDisplayNamesKey);
+    if (raw == null || raw.isEmpty) return {};
+    final decoded = jsonDecode(raw);
+    if (decoded is! Map) return {};
+    return {
+      for (final entry in decoded.entries)
+        if (entry.value is String && (entry.value as String).trim().isNotEmpty)
+          entry.key.toString(): (entry.value as String).trim(),
+    };
+  } catch (_) {
+    return {};
+  }
+}
+
+/// SharedPreferences 中持久化插件「来源标签」的键：{pluginId: 'IKUN'|'聆澜'}。
+///
+/// 多租户订阅源（如 BakaMusic 的 music.cwo.cc.cd）对同一插件按 `?source=`
+/// 发放不同授权的脚本：文件名与 platform 都相同（同名「QQ音乐」），内容却
+/// 不同。安装时需在插件 ID 上带来源后缀才能并存（见插件管理页），但 ID 只
+/// 用于磁盘文件与内部引用、不适合展示，故额外记录来源标签，由音源列表在
+/// 名称旁渲染徽标，用户一眼看出这条音源来自 IKUN 还是聆澜。
+const pluginSourceLabelsKey = 'mobilePluginSourceLabelsV1';
+
+/// 读取插件来源标签表，只保留合法的字符串键值。
+Map<String, String> readPluginSourceLabels(SharedPreferences prefs) {
+  try {
+    final raw = prefs.getString(pluginSourceLabelsKey);
     if (raw == null || raw.isEmpty) return {};
     final decoded = jsonDecode(raw);
     if (decoded is! Map) return {};
@@ -567,6 +657,10 @@ Future<String?> loadInstalledMusicPluginName(Ref ref, String pluginId) async {
 }
 
 bool _looksLikeLxPlugin(String source) {
+  // 先排除 MusicFree/BakaMusic 家族契约：混合契约插件（同时支持
+  // BakaMusic/MusicFree/LX）只在兼容判断里读取 globalThis.lx，主导出
+  // 仍是 MusicFree 对象，若判为 LX 会用错误的契约驱动插件。
+  if (PluginMetadata.looksLikeMusicFreeContract(source)) return false;
   final lower = source.toLowerCase();
   return lower.contains('lx.event.request') ||
       lower.contains('lx.event.on') ||
@@ -754,6 +848,11 @@ class PluginRuntimeService {
   final Map<String, Future<String>> _pluginSourceTasks = {};
   final Map<String, _NeteaseTrackMeta> _neteaseTrackMetaCache = {};
   final Map<String, Future<List<String>>> _qualityDiscoveryCache = {};
+
+  /// 上述两张表都按歌曲/插件维度常驻，长时间在线播放会持续累积；
+  /// 加硬上限并按插入顺序淘汰最旧条目，避免常驻内存随播放时长攀升。
+  static const int _neteaseTrackMetaCacheLimit = 256;
+  static const int _qualityDiscoveryCacheLimit = 64;
 
   /// 已解析播放源的短时缓存：同一首歌曲短时间内重复播放（切歌回切、
   /// 下一首预取）时直接复用 URL，跳过插件网络解析。音源返回的 CDN
@@ -3495,6 +3594,9 @@ class PluginRuntimeService {
             : previous?.durationMs ?? 0,
       );
     }
+    while (_neteaseTrackMetaCache.length > _neteaseTrackMetaCacheLimit) {
+      _neteaseTrackMetaCache.remove(_neteaseTrackMetaCache.keys.first);
+    }
   }
 
   Future<List<Map<String, dynamic>>> _searchQqWebFallback(
@@ -3763,6 +3865,9 @@ class PluginRuntimeService {
       _qualityCacheKey(plugin, rawData),
       () => _discoverQualitiesUncached(plugin, rawData),
     );
+    while (_qualityDiscoveryCache.length > _qualityDiscoveryCacheLimit) {
+      _qualityDiscoveryCache.remove(_qualityDiscoveryCache.keys.first);
+    }
     return future.then((qualities) {
       final preferred = preferredQuality?.trim() ?? '';
       // 探测结果可能只包含当前音质能够解析出的子集。始终保留歌曲
@@ -6782,13 +6887,11 @@ bool isBilibiliPluginSource(EnabledMusicPlugin plugin) =>
     PluginRuntimeService._isBilibiliPlugin(plugin);
 
 /// 识别音源类别（歌单导入页、换源面板等处的分类标记）：
-/// - BakaMusic 契约（getMvSource / animeSrc）或订阅源前缀
-///   `music.cwo.cc.cd` / `bakp.netlify.app` / `animemusic.bzxhkj.com/baka*`
-///   →「BakaMusic」（QQ音乐[L1] 等契约插件无 baka 前缀，靠契约识别）
-/// - `animemusic.bzxhkj.com/animemusic*` → 惜梦自有音乐 APP 音源
-///   （animemusic/1）→「惜梦」
-/// - `animemusic.bzxhkj.com/v2`（洛雪）/ `/v3`（MusicFree 聚合）→
-///   惜梦适配源 →「惜梦」
+/// - BakaMusic：由 [EnabledMusicPlugin.isBaka] 判定，其中已包含契约特征
+///   （animeSrc）、订阅类型提示与来源 URL 兜底，此处不再重复按 URL 判定，
+///   否则会在「提示为 MusicFree 但来源 URL 仍是旧 Baka 订阅」时与插件
+///   管理页分栏不一致。
+/// - `animemusic.bzxhkj.com/animemusic*` / `/v2` / `/v3` →「惜梦」
 /// - 无来源记录时回退旧规则：名称含 baka →「BakaMusic」；animemusic/1
 ///   格式 →「惜梦」；其余 →「MusicFree」。
 String pluginSourceTag(EnabledMusicPlugin plugin) {
@@ -6796,17 +6899,11 @@ String pluginSourceTag(EnabledMusicPlugin plugin) {
   // 任意订阅源上，如 QQ音乐[L1]）。
   if (plugin.isBaka) return 'BakaMusic';
   final url = plugin.sourceUrl.trim().toLowerCase();
-  if (url.isNotEmpty) {
-    if (RegExp(
-      r'^https?://(music\.cwo\.cc\.cd|bakp\.netlify\.app|animemusic\.bzxhkj\.com/baka)',
-    ).hasMatch(url)) {
-      return 'BakaMusic';
-    }
-    if (RegExp(
-      r'^https?://animemusic\.bzxhkj\.com/(animemusic|v\d+)',
-    ).hasMatch(url)) {
-      return '惜梦';
-    }
+  if (url.isNotEmpty &&
+      RegExp(
+        r'^https?://animemusic\.bzxhkj\.com/(animemusic|v\d+)',
+      ).hasMatch(url)) {
+    return '惜梦';
   }
   if (plugin.name.toLowerCase().contains('baka')) return 'BakaMusic';
   if (plugin.isAnimemusic) return '惜梦';

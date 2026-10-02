@@ -518,18 +518,21 @@ class _FavoritesPageState extends ConsumerState<FavoritesPage> {
                         : addedOrder;
                     songs = [for (final path in ordered) ?songsByPath[path]];
                   case SongSortKey.title:
+                  case SongSortKey.fileName:
+                  case SongSortKey.path:
                   case SongSortKey.artist:
                   case SongSortKey.album:
-                    String sortKey(Song song) => switch (_sort.key) {
-                      SongSortKey.artist => _pinyinKey(song.artist),
-                      SongSortKey.album => _pinyinKey(song.album),
-                      _ => _pinyinKey(song.title),
-                    };
+                  case SongSortKey.modified:
                     final all = [
                       for (final path in addedOrder) ?songsByPath[path],
                     ];
                     all.sort((a, b) {
-                      var result = sortKey(a).compareTo(sortKey(b));
+                      var result = compareSongsBySortKey(
+                        _sort.key,
+                        a,
+                        b,
+                        _pinyinKey,
+                      );
                       if (result == 0) {
                         result = _pinyinKey(
                           a.title,

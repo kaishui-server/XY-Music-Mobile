@@ -121,18 +121,16 @@ class _PlaylistDetailPageState extends ConsumerState<PlaylistDetailPage> {
       case SongSortKey.added:
         return _sort.descending ? songs.reversed.toList() : songs;
       case SongSortKey.title:
+      case SongSortKey.fileName:
+      case SongSortKey.path:
       case SongSortKey.artist:
       case SongSortKey.album:
-        String sortKey(Song song) => switch (_sort.key) {
-          SongSortKey.artist => _pinyinKey(song.artist),
-          SongSortKey.album => _pinyinKey(song.album),
-          _ => _pinyinKey(song.title),
-        };
+      case SongSortKey.modified:
         final sorted = [...songs]
           ..sort((a, b) {
-            var result = sortKey(a).compareTo(sortKey(b));
+            var result = compareSongsBySortKey(_sort.key, a, b, _pinyinKey);
             if (result == 0) {
-              // 艺术家/专辑相同时回落到歌名，保持组内稳定。
+              // 主键相同时回落到歌名，保持组内稳定。
               result = _pinyinKey(a.title).compareTo(_pinyinKey(b.title));
             }
             return _sort.descending ? -result : result;

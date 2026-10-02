@@ -244,7 +244,8 @@ class AppSettings {
     this.desktopLyricsTranslationFontSize = 13.0,
     this.desktopLyricsBackgroundColor = 0xFF18181C,
     this.desktopLyricsBackgroundOpacity = .85,
-    this.desktopLyricsVerticalOffset = 0.0,
+    this.desktopLyricsVerticalPercent = 90.0,
+    this.miniPlayerOverlayEnabled = false,
     this.downloadPath = '',
     this.downloadQuality = '320k',
     this.askDownloadDetails = true,
@@ -360,9 +361,14 @@ class AppSettings {
   final int desktopLyricsBackgroundColor;
   final double desktopLyricsBackgroundOpacity;
 
-  /// 桌面歌词上下位移（dp）：在拖动基准位置上叠加的垂直偏移，
-  /// 正值上移、负值下移，范围覆盖整屏高度（原生侧再做边界钳制）。
-  final double desktopLyricsVerticalOffset;
+  /// 桌面歌词纵向位置（百分制）：0 = 屏幕最顶端，50 = 屏幕正中，
+  /// 100 = 屏幕最底端。原生侧按整屏高度（含状态栏）换算实际像素位置，
+  /// 拖动手势也会把结果换算回百分制回传。
+  final double desktopLyricsVerticalPercent;
+
+  /// 迷你播放器悬浮窗：开启后通知栏单击媒体卡片会弹出系统级浮窗，浮窗内的
+  /// 封面/标题/进度条与切歌按钮均可直接操作，无需切回应用。默认关闭。
+  final bool miniPlayerOverlayEnabled;
 
   /// 兼容旧调用方：只要不是“不显示逐字”就视为已开启逐字效果。
   bool get enableWordEffect => lyricWordEffectMode != LyricWordEffectMode.none;
@@ -442,7 +448,8 @@ class AppSettings {
     double? desktopLyricsTranslationFontSize,
     int? desktopLyricsBackgroundColor,
     double? desktopLyricsBackgroundOpacity,
-    double? desktopLyricsVerticalOffset,
+    double? desktopLyricsVerticalPercent,
+    bool? miniPlayerOverlayEnabled,
     String? downloadPath,
     String? downloadQuality,
     bool? askDownloadDetails,
@@ -536,8 +543,10 @@ class AppSettings {
           desktopLyricsBackgroundColor ?? this.desktopLyricsBackgroundColor,
       desktopLyricsBackgroundOpacity:
           desktopLyricsBackgroundOpacity ?? this.desktopLyricsBackgroundOpacity,
-      desktopLyricsVerticalOffset:
-          desktopLyricsVerticalOffset ?? this.desktopLyricsVerticalOffset,
+      desktopLyricsVerticalPercent:
+          desktopLyricsVerticalPercent ?? this.desktopLyricsVerticalPercent,
+      miniPlayerOverlayEnabled:
+          miniPlayerOverlayEnabled ?? this.miniPlayerOverlayEnabled,
       downloadPath: downloadPath ?? this.downloadPath,
       downloadQuality: downloadQuality ?? this.downloadQuality,
       askDownloadDetails: askDownloadDetails ?? this.askDownloadDetails,
@@ -671,10 +680,12 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
           prefs.getInt('desktopLyricsBackgroundColor') ?? 0xFF18181C,
       desktopLyricsBackgroundOpacity:
           prefs.getDouble('desktopLyricsBackgroundOpacity') ?? .85,
-      desktopLyricsVerticalOffset:
-          (prefs.getDouble('desktopLyricsVerticalOffset') ?? 0.0)
-              .clamp(-4000.0, 4000.0)
+      desktopLyricsVerticalPercent:
+          (prefs.getDouble('desktopLyricsVerticalPercent') ?? 90.0)
+              .clamp(0.0, 100.0)
               .toDouble(),
+      miniPlayerOverlayEnabled:
+          prefs.getBool('miniPlayerOverlayEnabled') ?? false,
       downloadPath: prefs.getString('downloadPath') ?? '',
       downloadQuality: prefs.getString('downloadQuality') ?? '320k',
       askDownloadDetails: prefs.getBool('askDownloadDetails') ?? true,
@@ -908,8 +919,12 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
         next.desktopLyricsBackgroundOpacity,
       ),
       prefs.setDouble(
-        'desktopLyricsVerticalOffset',
-        next.desktopLyricsVerticalOffset,
+        'desktopLyricsVerticalPercent',
+        next.desktopLyricsVerticalPercent,
+      ),
+      prefs.setBool(
+        'miniPlayerOverlayEnabled',
+        next.miniPlayerOverlayEnabled,
       ),
       prefs.setString('downloadPath', next.downloadPath),
       prefs.setString('downloadQuality', next.downloadQuality),
@@ -1175,6 +1190,11 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
       desktopLyricsEnabled: value,
     ),
   );
+  Future<void> setMiniPlayerOverlayEnabled(bool value) => _save(
+    (state.valueOrNull ?? const AppSettings()).copyWith(
+      miniPlayerOverlayEnabled: value,
+    ),
+  );
 
   /// 均衡器开关与频段增益。增益值按设备频段数截断，写入后由播放器
   /// 侧的应用方法实时生效。
@@ -1240,10 +1260,10 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
       desktopLyricsBackgroundOpacity: value.clamp(0.1, 1.0).toDouble(),
     ),
   );
-  Future<void> setDesktopLyricsVerticalOffset(double value) => _save(
+  Future<void> setDesktopLyricsVerticalPercent(double value) => _save(
     (state.valueOrNull ?? const AppSettings()).copyWith(
-      // 全屏范围位移：上限放宽到 ±4000dp，由原生侧按实际屏幕高度钳制。
-      desktopLyricsVerticalOffset: value.clamp(-4000.0, 4000.0).toDouble(),
+      // 百分制纵向位置：0 = 屏幕最顶端、50 = 屏幕正中、100 = 屏幕最底端。
+      desktopLyricsVerticalPercent: value.clamp(0.0, 100.0).toDouble(),
     ),
   );
 

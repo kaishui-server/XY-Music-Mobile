@@ -819,6 +819,30 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
     with WidgetsBindingObserver {
   PlayerNotifier(this._ref) : super(const PlaybackState()) {
     WidgetsBinding.instance.addObserver(this);
+    // 原生浮窗手动拖动结束后回传纵向位置（百分制），写回设置让滑块跟随
+    // 实际位置。否则下一次同步会用旧滑块值把浮窗拉回（拖动后复位）。
+    // 写回设定会触发 settingsProvider 监听再次同步，但此时原生收到的
+    // 位置与已应用值相同，不会造成位置跳动。
+    DesktopLyricsBridge.onPositionChanged = (percent) {
+      final current = _ref.read(settingsProvider).valueOrNull;
+      if (current == null) return;
+      if ((current.desktopLyricsVerticalPercent - percent).abs() < 0.5) {
+        return;
+      }
+      unawaited(
+        _ref.read(settingsProvider.notifier)
+            .setDesktopLyricsVerticalPercent(percent),
+      );
+    };
+    // 原生浮窗关闭按钮被点击：把「桌面歌词」开关同步为关闭（浮窗已由
+    // 原生移除），设置页开关与状态保持一致。
+    DesktopLyricsBridge.onCloseRequested = () {
+      final current = _ref.read(settingsProvider).valueOrNull;
+      if (current == null || !current.desktopLyricsEnabled) return;
+      unawaited(
+        _ref.read(settingsProvider.notifier).setDesktopLyricsEnabled(false),
+      );
+    };
     _statsFlushTimer = Timer.periodic(const Duration(seconds: 15), (_) {
       if (state.current != null && state.isPlaying) {
         _flushCurrentPlaybackStats();
@@ -1708,6 +1732,11 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
     // 避免系统回收进程后丢失最后一段播放时长。
     if (state != AppLifecycleState.resumed) {
       _flushCurrentPlaybackStats();
+      // 退出/切后台前把引擎实时进度并入状态并强制落库。只靠播放中的 5s
+      // 防抖写入，退出瞬间最后一段进度会丢；进程被系统回收时更是整段丢失，
+      // 表现为重进后“记不住上次播放位置”。
+      _syncPositionFromEngine();
+      unawaited(_persistSession());
     }
     // 前后台切换时重挂 position 流，按当前生命周期选择采样周期
     // （后台降频，降低后台 CPU 占用）；尚未挂接时忽略。
@@ -1782,7 +1811,7 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
         backgroundOpacity: .85,
         wordEffectMode: LyricWordEffectMode.none.index,
         locked: false,
-        verticalOffset: 0,
+        verticalPercent: 90,
         lyricFontPath: '',
       );
       return;
@@ -1808,7 +1837,7 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
           ? settings.lyricWordEffectMode.index
           : LyricWordEffectMode.none.index,
       locked: settings.desktopLyricsLocked,
-      verticalOffset: settings.desktopLyricsVerticalOffset,
+      verticalPercent: settings.desktopLyricsVerticalPercent,
       lyricFontPath: lyricFontPath,
     );
   }
@@ -2276,6 +2305,10 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
       await _ref.read(settingsProvider.notifier).setPlayMode(mode);
       // 后台异步预加载音源：成功则用户点播放即可直接起播；失败也不
       // 污染 UI 状态，toggle() 检测到音源未就绪会自动重走切歌链。
+      // 记录本次恢复请求：预加载期间用户若已点播（_playAt 递增请求号），
+      // 过期预加载不能再改写 _preparedSourceRequestId / seek，否则会与
+      // 新的切歌请求竞争、把播放位置改回恢复点。
+      final restoreRequestId = _playRequestId;
       unawaited(() async {
         try {
           await _player.setLoopMode(audioLoopModeForPlayMode(mode));
@@ -2284,8 +2317,9 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
             queueIndex: idx,
             preferredQualityOverride: restoredQuality,
           );
+          if (restoreRequestId != _playRequestId) return;
           if (idx != state.queueIndex) return; // 期间已切歌，放弃
-          _preparedSourceRequestId = _playRequestId;
+          _preparedSourceRequestId = restoreRequestId;
           await _player.setVolume(_effectiveClockVolume());
           await seek(pos);
           // 进程重新启动时只恢复队列、歌曲和进度，不自动恢复“正在播放”。
@@ -2332,6 +2366,22 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
         );
       } catch (_) {}
     });
+  }
+
+  /// 把引擎实时进度并入 state（仅供退出/切后台前落库使用）。
+  ///
+  /// 只接受“前进且漂移不大”的值：切源瞬间原生基准可能为 0，直接采用会把
+  /// 已记录的进度改小；不允许回退也能避免把恢复出来的进度抹掉。
+  void _syncPositionFromEngine() {
+    final item = state.current;
+    if (item == null) return;
+    if (_preparedSourceRequestId != _playRequestId) return;
+    if (_videoMediaBridgeActive && VideoPlaybackSession.isFor(item.path)) return;
+    final engineMs = _player.position.inMilliseconds;
+    final stateMs = (state.position * 1000).round();
+    if (engineMs > stateMs && engineMs - stateMs <= 10000) {
+      state = state.copyWith(position: engineMs / 1000.0);
+    }
   }
 
   /// 播放一组歌曲（替换队列）。随机模式下使用一次洗牌，保证一轮内
@@ -2466,7 +2516,9 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
     if (wasCurrent) await _playAt(currentIndex);
   }
 
-  Future<void> _playAt(int index) async {
+  /// [startPositionSecs] 非空时从指定进度继续播放（恢复会话后重试起播用）；
+  /// 为空表示从头播放，普通切歌/点播行为不变。
+  Future<void> _playAt(int index, {double? startPositionSecs}) async {
     if (index < 0 || index >= state.queue.length) return;
     _installMediaSessionBridge();
     // 重新点播歌曲（包括正在以视频形式播放的 B 站歌曲）时，先结束
@@ -2496,9 +2548,10 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
       queue[index] = item;
       state = state.copyWith(queue: queue);
     }
+    final resumeSecs = max(0.0, startPositionSecs ?? 0.0);
     final previous = state;
     _flushPlaybackStats(previous);
-    _beginStatsSession(item);
+    _beginStatsSession(item, initialPositionMs: (resumeSecs * 1000).round());
     // stop() 会发出 playing=false；切换音源期间先抑制自动下一首，真正
     // 开始新歌曲前再复位，否则手动点开的歌曲播放结束后永远不会循环。
     _manualPause = true;
@@ -2508,7 +2561,7 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
       queueIndex: index,
       current: item,
       isPlaying: false,
-      position: 0,
+      position: resumeSecs,
       duration: item.durationMs / 1000.0,
       isLoading: true,
       errorMessage: null,
@@ -2533,6 +2586,13 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
         await _player.setPitch(_combinedEffectsPitch());
       } catch (_) {
         // 平台不支持变调：忽略，速度仍生效。
+      }
+      // 恢复会话后重试起播：先把播放器定位到记录的进度再起播，否则会从
+      // 0 开始，用户感受为“记不住上次播放位置”。普通切歌 resumeSecs 为 0，
+      // 不会多一次 seek。
+      if (resumeSecs > 0) {
+        await seek(resumeSecs);
+        if (requestId != _playRequestId) return;
       }
       // 最近播放是“开始播放”即记录，与桌面端行为一致。统计写入失败不应
       // 阻断音频播放，因此放到独立异步任务中执行。
@@ -5339,7 +5399,11 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
         // _startPlayback：_preparedSourceRequestId 校验不通过会静默返回，
         // 用户看到「点播放没反应」，形同卡死。此时重新走完整切歌链。
         if (_preparedSourceRequestId != _playRequestId) {
-          await _playAt(state.queueIndex);
+          // 音源未就绪（恢复会话的预加载未完成或失败、上首播放失败等）时
+          // 重走切歌链，但必须带上当前进度：否则“退出重进”后点播放会从 0
+          // 开始，表现为记不住上次播放位置（插件/在线音源预加载慢或失败时
+          // 每次都会走到这里，所以这个分支是高频路径）。
+          await _playAt(state.queueIndex, startPositionSecs: state.position);
           return;
         }
         _manualPause = false;
@@ -5550,6 +5614,10 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
   @override
   void dispose() {
     _flushCurrentPlaybackStats();
+    // 销毁前尽力落库一次（Provider 容器销毁等路径）。_persistSession 内部
+    // 已吞掉 ref 已失效的异常，失败不影响后续释放流程。
+    _syncPositionFromEngine();
+    unawaited(_persistSession());
     WidgetsBinding.instance.removeObserver(this);
     _bridgeInstallTimer?.cancel();
     VideoPlaybackSession.progressRevision.removeListener(
