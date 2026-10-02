@@ -108,6 +108,7 @@ class MiniPlayerOverlayService : Service() {
     private var modeView: ImageView? = null
     private var playPauseView: ImageView? = null
     private var queueList: LinearLayout? = null
+    private var queueScroll: ScrollView? = null
     private var queueItemViews: MutableList<QueueItemViews> = mutableListOf()
 
     private class QueueItemViews(
@@ -186,6 +187,7 @@ class MiniPlayerOverlayService : Service() {
         modeView = null
         playPauseView = null
         queueList = null
+        queueScroll = null
         queueItemViews = mutableListOf()
         queueExpanded = false
         hasSong = false
@@ -353,8 +355,6 @@ class MiniPlayerOverlayService : Service() {
         val headerRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            // 右缘内缩避让右上角关闭按钮，避免「收起」被 × 遮挡而点不到。
-            setPadding(0, 0, headerSideInset, 0)
             addView(queueHeader, LinearLayout.LayoutParams(0, -2, 1f))
             addView(queueBack, LinearLayout.LayoutParams(-2, -2))
         }
@@ -390,17 +390,18 @@ class MiniPlayerOverlayService : Service() {
             )
         }
 
-        val cardView = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
+        // 卡片用 FrameLayout：播放面板常驻并决定浮窗尺寸；队列作为子视图叠加其上，
+        // 竖屏挂在播放面板下方，横屏从顶部下拉覆盖（下拉菜单形式），窗口不会因此被撑大。
+        val cardView = FrameLayout(this).apply {
             setPadding(dp(16f), dp(14f), dp(16f), dp(12f))
             background = GradientDrawable().apply {
                 cornerRadius = dp(18f).toFloat()
                 setColor(Color.WHITE)
                 setStroke(dp(1f), 0x1A000000)
             }
-            addView(player, LinearLayout.LayoutParams(-1, -2))
-            addView(queue, LinearLayout.LayoutParams(-1, -2))
-            addView(empty, LinearLayout.LayoutParams(-1, -2))
+            addView(player, FrameLayout.LayoutParams(-1, -2))
+            addView(empty, FrameLayout.LayoutParams(-1, -2, Gravity.CENTER))
+            addView(queue, FrameLayout.LayoutParams(-1, -2))
         }
 
         // 关闭按钮：常驻卡片右上角，点击移除浮窗并同步关闭设置开关。
@@ -445,6 +446,7 @@ class MiniPlayerOverlayService : Service() {
         modeView = mode
         playPauseView = playPause
         queueList = list
+        queueScroll = scroll
         playerPane = player
         queuePane = queue
         emptyPane = empty
@@ -582,8 +584,9 @@ class MiniPlayerOverlayService : Service() {
     /** 统一决定「播放 / 队列 / 空态」三个面板的可见性，避免各处各写一套导致
      * 状态漂移（表现为队列「一会在内一会在下」）。
      *
-     * 竖屏：队列展开时播放面板保留，队列追加显示在其下方（在下）。
-     * 横屏：可用高度小，队列展开时就地替换播放面板（在内），避免整体超出屏幕。 */
+     * 播放面板始终保留（它决定浮窗尺寸）：
+     * 竖屏：队列追加显示在播放面板下方；
+     * 横屏：队列作为下拉菜单从卡片顶部覆盖，浮窗不被撑大。 */
     private fun applyPaneVisibility() {
         if (!hasSong) {
             playerPane?.visibility = View.GONE
@@ -592,11 +595,45 @@ class MiniPlayerOverlayService : Service() {
             return
         }
         emptyPane?.visibility = View.GONE
-        queuePane?.visibility = if (queueExpanded) View.VISIBLE else View.GONE
+        playerPane?.visibility = View.VISIBLE
         val landscape =
             resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
-        playerPane?.visibility =
-            if (queueExpanded && landscape) View.GONE else View.VISIBLE
+        queuePane?.visibility = if (queueExpanded) View.VISIBLE else View.GONE
+        if (queueExpanded) positionQueue(landscape)
+    }
+
+    /** 摆放队列面板并约束其列表高度。
+     *
+     * 竖屏：挂在播放面板下方（topMargin = 播放面板高度 + 间距）。
+     * 横屏：作为下拉菜单从卡片顶部覆盖（固定 topMargin），列表高度收紧，
+     * 使「下拉高度 + 列表高度」不超过播放面板高度，浮窗尺寸保持不变。 */
+    private fun positionQueue(landscape: Boolean) {
+        val scroll = queueScroll ?: return
+        val queue = queuePane ?: return
+        val scrollParams = scroll.layoutParams as? LinearLayout.LayoutParams
+        val queueParams = queue.layoutParams as? FrameLayout.LayoutParams
+        if (landscape) {
+            scrollParams?.height = dp(150f)
+            queueParams?.topMargin = dp(44f)
+        } else {
+            scrollParams?.height = dp(232f)
+            val playerHeight = playerPane?.height ?: 0
+            queueParams?.topMargin = playerHeight + dp(10f)
+            // 播放面板尚未完成布局时，下一帧再摆一次，避免队列压到播放面板上。
+            if (playerHeight == 0) playerPane?.post { positionQueue(false) }
+        }
+        scrollParams?.let { scroll.layoutParams = it }
+        queueParams?.let { queue.layoutParams = it }
+        // 横屏下拉菜单需要实底背景，否则会与下方播放面板内容叠影；竖屏沿用卡片白底。
+        queue.background = if (landscape) {
+            GradientDrawable().apply {
+                cornerRadius = dp(12f).toFloat()
+                setColor(Color.WHITE)
+                setStroke(dp(1f), 0x1A000000)
+            }
+        } else {
+            null
+        }
     }
 
     // ---------------------------------------------------------------- 更新入口
