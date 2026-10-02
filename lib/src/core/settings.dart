@@ -243,6 +243,8 @@ class AppSettings {
     this.desktopLyricsTranslationFontSize = 13.0,
     this.desktopLyricsBackgroundColor = 0xFF18181C,
     this.desktopLyricsBackgroundOpacity = .85,
+    this.desktopLyricsVerticalOffset = 0.0,
+    this.desktopLyricsAvoidStatusBar = true,
     this.downloadPath = '',
     this.downloadQuality = '320k',
     this.askDownloadDetails = true,
@@ -353,6 +355,13 @@ class AppSettings {
   final int desktopLyricsBackgroundColor;
   final double desktopLyricsBackgroundOpacity;
 
+  /// 桌面歌词上下位移（dp）：在拖动基准位置上叠加的垂直偏移，
+  /// 正值上移、负值下移，用于精细调整浮窗位置。
+  final double desktopLyricsVerticalOffset;
+
+  /// 桌面歌词状态栏避让：开启时浮窗顶部不会顶到状态栏下方（默认开启）。
+  final bool desktopLyricsAvoidStatusBar;
+
   /// 兼容旧调用方：只要不是“不显示逐字”就视为已开启逐字效果。
   bool get enableWordEffect => lyricWordEffectMode != LyricWordEffectMode.none;
   final String downloadPath;
@@ -426,6 +435,8 @@ class AppSettings {
     double? desktopLyricsTranslationFontSize,
     int? desktopLyricsBackgroundColor,
     double? desktopLyricsBackgroundOpacity,
+    double? desktopLyricsVerticalOffset,
+    bool? desktopLyricsAvoidStatusBar,
     String? downloadPath,
     String? downloadQuality,
     bool? askDownloadDetails,
@@ -517,6 +528,10 @@ class AppSettings {
           desktopLyricsBackgroundColor ?? this.desktopLyricsBackgroundColor,
       desktopLyricsBackgroundOpacity:
           desktopLyricsBackgroundOpacity ?? this.desktopLyricsBackgroundOpacity,
+      desktopLyricsVerticalOffset:
+          desktopLyricsVerticalOffset ?? this.desktopLyricsVerticalOffset,
+      desktopLyricsAvoidStatusBar:
+          desktopLyricsAvoidStatusBar ?? this.desktopLyricsAvoidStatusBar,
       downloadPath: downloadPath ?? this.downloadPath,
       downloadQuality: downloadQuality ?? this.downloadQuality,
       askDownloadDetails: askDownloadDetails ?? this.askDownloadDetails,
@@ -644,6 +659,12 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
           prefs.getInt('desktopLyricsBackgroundColor') ?? 0xFF18181C,
       desktopLyricsBackgroundOpacity:
           prefs.getDouble('desktopLyricsBackgroundOpacity') ?? .85,
+      desktopLyricsVerticalOffset:
+          (prefs.getDouble('desktopLyricsVerticalOffset') ?? 0.0)
+              .clamp(-200.0, 200.0)
+              .toDouble(),
+      desktopLyricsAvoidStatusBar:
+          prefs.getBool('desktopLyricsAvoidStatusBar') ?? true,
       downloadPath: prefs.getString('downloadPath') ?? '',
       downloadQuality: prefs.getString('downloadQuality') ?? '320k',
       askDownloadDetails: prefs.getBool('askDownloadDetails') ?? true,
@@ -872,6 +893,14 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
       prefs.setDouble(
         'desktopLyricsBackgroundOpacity',
         next.desktopLyricsBackgroundOpacity,
+      ),
+      prefs.setDouble(
+        'desktopLyricsVerticalOffset',
+        next.desktopLyricsVerticalOffset,
+      ),
+      prefs.setBool(
+        'desktopLyricsAvoidStatusBar',
+        next.desktopLyricsAvoidStatusBar,
       ),
       prefs.setString('downloadPath', next.downloadPath),
       prefs.setString('downloadQuality', next.downloadQuality),
@@ -1189,6 +1218,16 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
   Future<void> setDesktopLyricsBackgroundOpacity(double value) => _save(
     (state.valueOrNull ?? const AppSettings()).copyWith(
       desktopLyricsBackgroundOpacity: value.clamp(0.1, 1.0).toDouble(),
+    ),
+  );
+  Future<void> setDesktopLyricsVerticalOffset(double value) => _save(
+    (state.valueOrNull ?? const AppSettings()).copyWith(
+      desktopLyricsVerticalOffset: value.clamp(-200.0, 200.0).toDouble(),
+    ),
+  );
+  Future<void> setDesktopLyricsAvoidStatusBar(bool value) => _save(
+    (state.valueOrNull ?? const AppSettings()).copyWith(
+      desktopLyricsAvoidStatusBar: value,
     ),
   );
 

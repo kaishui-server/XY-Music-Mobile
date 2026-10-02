@@ -1782,9 +1782,15 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
         backgroundOpacity: .85,
         wordEffectMode: LyricWordEffectMode.none.index,
         locked: false,
+        verticalOffset: 0,
+        avoidStatusBar: true,
+        lyricFontPath: '',
       );
       return;
     }
+    final lyricFontPath = settings.fontFamily.trim().isEmpty
+        ? ''
+        : await DesktopLyricsBridge.resolveCustomFontPath();
     await DesktopLyricsBridge.sync(
       enabled: true,
       title: item.title,
@@ -1803,6 +1809,9 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
           ? settings.lyricWordEffectMode.index
           : LyricWordEffectMode.none.index,
       locked: settings.desktopLyricsLocked,
+      verticalOffset: settings.desktopLyricsVerticalOffset,
+      avoidStatusBar: settings.desktopLyricsAvoidStatusBar,
+      lyricFontPath: lyricFontPath,
     );
   }
 

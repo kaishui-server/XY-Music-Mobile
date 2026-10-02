@@ -7014,6 +7014,12 @@ class _PluginBackgroundHttpClient extends http.BaseClient {
   @override
   Future<http.StreamedResponse> send(http.BaseRequest request) async {
     request.headers.putIfAbsent('user-agent', () => _desktopUserAgent);
+    // 该客户端由常驻 worker isolate 长期持有，默认复用 keep-alive 连接。
+    // 手机在 Wi-Fi/蜂窝间切换或 CDN 静默断开空闲连接后，复用旧 socket 会
+    // 在 TLS 层解密失败（BAD_DECRYPT / DECRYPTION_FAILED_OR_BAD_RECORD_MAC）
+    // 或被直接重置，表现为「无法连接音源服务器」。插件请求均为用户触发的
+    // 低频请求，禁用连接复用带来的握手开销可忽略，却能根除陈旧连接问题。
+    request.persistentConnection = false;
     http.StreamedResponse? response;
     Object? error;
     try {

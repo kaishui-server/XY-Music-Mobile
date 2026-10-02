@@ -512,6 +512,10 @@ class MainActivity : AudioServiceActivity() {
                                 ?: 0xFF18181C.toInt(),
                             backgroundOpacity = call.argument<Number>("backgroundOpacity")
                                 ?.toFloat() ?: .85f,
+                            verticalOffset = call.argument<Number>("verticalOffset")
+                                ?.toFloat() ?: 0f,
+                            avoidStatusBar = call.argument<Boolean>("avoidStatusBar") != false,
+                            lyricFontPath = call.argument<String>("lyricFontPath") ?: "",
                         )
                         // 服务已在运行时直连分发，省去每次进度刷新的
                         // startService binder 往返；未运行（被系统回收）时
@@ -544,6 +548,9 @@ class MainActivity : AudioServiceActivity() {
                                     putExtra("translationFontSize", params.translationFontSize)
                                     putExtra("backgroundColor", params.backgroundColor)
                                     putExtra("backgroundOpacity", params.backgroundOpacity)
+                                    putExtra("verticalOffset", params.verticalOffset)
+                                    putExtra("avoidStatusBar", params.avoidStatusBar)
+                                    putExtra("lyricFontPath", params.lyricFontPath)
                                 },
                             )
                             result.success(true)

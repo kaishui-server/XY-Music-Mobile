@@ -3,6 +3,7 @@ import 'dart:io';
 
 import 'package:flutter/services.dart';
 
+import '../core/custom_font.dart';
 import '../rust/api.dart';
 
 /// Android 悬浮桌面歌词桥接。桌面歌词默认关闭，只有用户主动开启并授予
@@ -25,6 +26,20 @@ class DesktopLyricsBridge {
     _lastIsPlayingSent = null;
     _lastSentPosition = -1e9;
     _lastSendTime = DateTime.fromMillisecondsSinceEpoch(0);
+  }
+
+  static Future<String>? _customFontPathFuture;
+
+  /// 自定义字体文件绝对路径（供原生悬浮窗 Typeface.createFromFile 加载）。
+  /// 路径固定，仅缓存路径解析；文件是否存在每次实时判断，未启用或文件
+  /// 缺失时返回空串，原生回退系统默认字体。
+  static Future<String> resolveCustomFontPath() async {
+    try {
+      final path = await (_customFontPathFuture ??= customFontFilePath());
+      return File(path).existsSync() ? path : '';
+    } catch (_) {
+      return '';
+    }
   }
 
   static Future<bool> setEnabled(bool enabled) async {
@@ -68,6 +83,9 @@ class DesktopLyricsBridge {
     required int backgroundColor,
     required double backgroundOpacity,
     required int wordEffectMode,
+    required double verticalOffset,
+    required bool avoidStatusBar,
+    required String lyricFontPath,
   }) async {
     if (!Platform.isAndroid) return;
     final generation = ++_syncGeneration;
@@ -108,6 +126,9 @@ class DesktopLyricsBridge {
       backgroundOpacity,
       wordEffectMode,
       locked,
+      verticalOffset,
+      avoidStatusBar,
+      lyricFontPath,
     ].join('\u0000');
     final now = DateTime.now();
     final positionDelta = (position - _lastSentPosition).abs();
@@ -140,6 +161,9 @@ class DesktopLyricsBridge {
         'translationFontSize': translationFontSize,
         'backgroundColor': backgroundColor,
         'backgroundOpacity': backgroundOpacity,
+        'verticalOffset': verticalOffset,
+        'avoidStatusBar': avoidStatusBar,
+        'lyricFontPath': lyricFontPath,
       });
     } on PlatformException {
       // 浮窗属于附加能力，权限或系统回收时不影响正常播放。

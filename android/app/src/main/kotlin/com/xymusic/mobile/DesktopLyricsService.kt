@@ -44,6 +44,12 @@ class DesktopLyricsUpdateParams(
     val translationFontSize: Float,
     val backgroundColor: Int,
     val backgroundOpacity: Float,
+    /** 上下位移（dp）：叠加在拖动基准位置之上的垂直偏移，正值上移。 */
+    val verticalOffset: Float,
+    /** 状态栏避让：开启时浮窗顶部不越过状态栏下沿。 */
+    val avoidStatusBar: Boolean,
+    /** 自定义字体文件绝对路径（空 = 系统默认），供 Typeface.createFromFile。 */
+    val lyricFontPath: String,
 )
 
 /** 系统级桌面歌词浮窗。只展示当前歌曲和当前时间点歌词，不抢占焦点。 */
@@ -88,6 +94,16 @@ class DesktopLyricsService : Service() {
     private var downY = 0f
     private var startX = 0
     private var startY = 0
+
+    // ---- 位置与字体状态 ----
+    /** 用户拖动确定的基准 y（不含滑块偏移），单位 px，自屏幕底部起算。 */
+    private var baseY = 76
+    /** 设置页「上下位移」滑块值（dp），叠加在基准位置之上。 */
+    private var verticalOffsetDp = 0f
+    /** 状态栏避让：开启时浮窗顶部不越过状态栏下沿。 */
+    private var avoidStatusBar = true
+    /** 已应用的自定义字体路径（空 = 系统默认），避免重复创建 Typeface。 */
+    private var appliedFontPath: String? = null
 
     // ---- 逐字渲染状态 ----
     // Dart 侧只按内容变化/低频(500ms)位置校正推送，帧循环用 Choreographer
@@ -165,6 +181,9 @@ class DesktopLyricsService : Service() {
         translationFontSize = intent.getFloatExtra("translationFontSize", 13f),
         backgroundColor = intent.getIntExtra("backgroundColor", 0xFF18181C.toInt()),
         backgroundOpacity = intent.getFloatExtra("backgroundOpacity", .85f),
+        verticalOffset = intent.getFloatExtra("verticalOffset", 0f),
+        avoidStatusBar = intent.getBooleanExtra("avoidStatusBar", true),
+        lyricFontPath = intent.getStringExtra("lyricFontPath").orEmpty(),
     )
 
     private fun ensurePanel() {
@@ -236,7 +255,8 @@ class DesktopLyricsService : Service() {
             gravity = Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
             val prefs = getSharedPreferences("desktop_lyrics", MODE_PRIVATE)
             x = prefs.getInt("x", 0)
-            y = prefs.getInt("y", 76)
+            baseY = prefs.getInt("y", 76)
+            y = baseY
         }
         overlayParams = params
         content.setOnTouchListener { _, event ->
@@ -245,12 +265,15 @@ class DesktopLyricsService : Service() {
                     downX = event.rawX
                     downY = event.rawY
                     startX = params.x
-                    startY = params.y
+                    startY = baseY
                     true
                 }
                 MotionEvent.ACTION_MOVE -> {
                     params.x = startX + (event.rawX - downX).toInt()
-                    params.y = startY - (event.rawY - downY).toInt()
+                    // 拖动只改变不含滑块偏移的基准位置，实际 y 再叠加
+                    // 偏移并做状态栏避让钳制。
+                    baseY = startY - (event.rawY - downY).toInt()
+                    params.y = clampY(baseY + verticalOffsetPx())
                     try {
                         windowManager?.updateViewLayout(content, params)
                     } catch (_: Exception) {
@@ -259,15 +282,21 @@ class DesktopLyricsService : Service() {
                     true
                 }
                 MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                    // 持久化基准位置（不含滑块偏移），避免下次启动重复叠加。
                     getSharedPreferences("desktop_lyrics", MODE_PRIVATE)
                         .edit()
                         .putInt("x", params.x)
-                        .putInt("y", params.y)
+                        .putInt("y", baseY)
                         .apply()
                     true
                 }
                 else -> true
             }
+        }
+        // 浮窗首次测量/内容高度变化时重算 y：状态栏避让的上边界依赖
+        // 浮窗实际高度，布局完成前拿不到，需在布局变化后补一次钳制。
+        content.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ ->
+            applyWindowPosition()
         }
         windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
         try {
@@ -297,6 +326,13 @@ class DesktopLyricsService : Service() {
         }
         ensurePanel()
         val lyric = p.lyric.ifBlank { "暂无歌词" }
+
+        // 位置/字体类参数：滑块位移、状态栏避让、自定义字体。这些参数
+        // 变化频率极低（仅用户调节时推送），每次更新时幂等应用即可。
+        verticalOffsetDp = p.verticalOffset
+        avoidStatusBar = p.avoidStatusBar
+        applyFont(p.lyricFontPath)
+        applyWindowPosition()
 
         overlayParams?.let { params ->
             val desiredFlags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
@@ -539,6 +575,91 @@ class DesktopLyricsService : Service() {
             Color.green(color),
             Color.blue(color),
         )
+    }
+
+    // ---- 位置与字体应用 ----
+
+    /** 滑块偏移换算为纵向像素（正值上移，浮窗 y 减小）。 */
+    private fun verticalOffsetPx(): Int =
+        (verticalOffsetDp * resources.displayMetrics.density).toInt()
+
+    /** 状态栏高度（px）；取不到时回退 0。 */
+    private fun statusBarHeight(): Int {
+        val id = resources.getIdentifier("status_bar_height", "dimen", "android")
+        if (id > 0) {
+            val h = resources.getDimensionPixelSize(id)
+            if (h > 0) return h
+        }
+        return 0
+    }
+
+    /** 导航栏高度（px）；取不到时回退 0。 */
+    private fun navigationBarHeight(): Int {
+        val id = resources.getIdentifier("navigation_bar_height", "dimen", "android")
+        if (id > 0) {
+            val h = resources.getDimensionPixelSize(id)
+            if (h > 0) return h
+        }
+        return 0
+    }
+
+    /// 浮窗 y 钳制：下边界不小于 0（不越出屏幕底），开启状态栏避让时
+    /// 上边界不超过「屏幕高 - 状态栏 - 导航栏 - 浮窗高」。
+    private fun clampY(value: Int): Int {
+        val screenHeight = resources.displayMetrics.heightPixels
+        var maxY = screenHeight
+        if (avoidStatusBar) {
+            val panelHeight = panel?.height?.takeIf { it > 0 } ?: 0
+            maxY = screenHeight - statusBarHeight() - navigationBarHeight() - panelHeight
+        }
+        return value.coerceIn(0, maxY.coerceAtLeast(0))
+    }
+
+    /** 按当前基准 + 滑块偏移重算 y 并下发。 */
+    private fun applyWindowPosition() {
+        val params = overlayParams ?: return
+        val target = clampY(baseY + verticalOffsetPx())
+        if (params.y != target) {
+            params.y = target
+            try {
+                panel?.let { windowManager?.updateViewLayout(it, params) }
+            } catch (_: Exception) {
+                // 浮窗已被系统回收时忽略位置更新。
+            }
+        }
+    }
+
+    /// 应用自定义字体；路径为空或创建失败时回退系统默认字体。
+    private fun applyFont(path: String) {
+        if (path == appliedFontPath) return
+        appliedFontPath = path
+        val fallback = android.graphics.Typeface.create(
+            android.graphics.Typeface.DEFAULT,
+            android.graphics.Typeface.BOLD,
+        )
+        val custom = if (path.isEmpty()) {
+            fallback
+        } else {
+            try {
+                android.graphics.Typeface.createFromFile(path)
+            } catch (_: Exception) {
+                fallback
+            }
+        }
+        lyricView?.typeface = custom
+        translationView?.typeface = if (path.isEmpty()) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                android.graphics.Typeface.create(
+                    android.graphics.Typeface.DEFAULT,
+                    800,
+                    false,
+                )
+            } else {
+                fallback
+            }
+        } else {
+            custom
+        }
     }
 
     override fun onDestroy() {

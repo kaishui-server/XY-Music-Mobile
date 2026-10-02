@@ -19,6 +19,7 @@ import '../../src/playlists/playlist_sync.dart';
 import '../../src/playlists/playlists_provider.dart';
 import '../../src/plugins/plugin_runtime.dart';
 import '../../src/recent/recent_provider.dart';
+import '../../src/rust/api.dart';
 import '../../src/ui/xy_surface.dart';
 import '../../src/widgets/batch_download.dart';
 import '../../src/widgets/cover_image.dart';
@@ -51,7 +52,7 @@ class _MusicLibraryPageState extends ConsumerState<MusicLibraryPage>
     vsync: this,
   );
 
-  static const _tabs = ['收藏', '歌单', '本地音乐', '最近播放', '播放列表', '文件夹'];
+  static const _tabs = ['收藏', '歌单', '本地音乐', '文件夹', '最近播放', '播放列表'];
 
   // ---- 收藏分页状态 ----
   String _favQuery = '';
@@ -96,6 +97,7 @@ class _MusicLibraryPageState extends ConsumerState<MusicLibraryPage>
   // ---- 本地音乐分页状态 ----
   final Set<String> _localSelectedPaths = <String>{};
   bool _localSelectionMode = false;
+  bool _localDeleting = false;
 
   /// 歌曲子分页的排序：custom 表示曲库原始顺序（扫描序），其余键
   /// 按拼音排序；歌手 / 专辑子分页固定按拼音分组，不参与排序。
@@ -126,7 +128,18 @@ class _MusicLibraryPageState extends ConsumerState<MusicLibraryPage>
     _localTabController.addListener(_onTabChanged);
   }
 
+  /// 上一次的分页索引：TabController 的监听在切换动画期间每帧都会触发，
+  /// 若每帧都 setState，会让整页（含 6 个分页的构建）在动画期间反复重建，
+  /// 这是分页切换卡顿的主因。仅在索引真正变化时刷新一次。
+  int _lastTabIndex = 0;
+  int _lastLocalTabIndex = 0;
+
   void _onTabChanged() {
+    final changed = _tabController.index != _lastTabIndex ||
+        _localTabController.index != _lastLocalTabIndex;
+    if (!changed) return;
+    _lastTabIndex = _tabController.index;
+    _lastLocalTabIndex = _localTabController.index;
     // 切换分页（含本地音乐子分页）时重建 AppBar（右上角按钮跟随变化）。
     if (mounted) setState(() {});
   }
@@ -309,27 +322,6 @@ class _MusicLibraryPageState extends ConsumerState<MusicLibraryPage>
           ),
         ];
       case 3:
-        // 最近播放：搜索 + 清空。
-        if (_recentSearchMode) {
-          return [
-            TextButton(onPressed: _exitRecentSearch, child: const Text('取消')),
-          ];
-        }
-        final hasRecent =
-            (ref.read(recentSongsProvider).valueOrNull ?? const []).isNotEmpty;
-        return [
-          IconButton(
-            tooltip: '搜索',
-            onPressed: _enterRecentSearch,
-            icon: const Icon(Icons.search_rounded),
-          ),
-          IconButton(
-            tooltip: '清空最近播放',
-            onPressed: hasRecent ? _clearRecent : null,
-            icon: const Icon(Icons.delete_sweep_rounded),
-          ),
-        ];
-      case 5:
         // 文件夹：扫描目录 + 搜索 + 刷新。
         if (_folderSearchMode) {
           return [
@@ -361,6 +353,27 @@ class _MusicLibraryPageState extends ConsumerState<MusicLibraryPage>
                     child: CircularProgressIndicator(strokeWidth: 2),
                   )
                 : const Icon(Icons.refresh_rounded),
+          ),
+        ];
+      case 4:
+        // 最近播放：搜索 + 清空。
+        if (_recentSearchMode) {
+          return [
+            TextButton(onPressed: _exitRecentSearch, child: const Text('取消')),
+          ];
+        }
+        final hasRecent =
+            (ref.read(recentSongsProvider).valueOrNull ?? const []).isNotEmpty;
+        return [
+          IconButton(
+            tooltip: '搜索',
+            onPressed: _enterRecentSearch,
+            icon: const Icon(Icons.search_rounded),
+          ),
+          IconButton(
+            tooltip: '清空最近播放',
+            onPressed: hasRecent ? _clearRecent : null,
+            icon: const Icon(Icons.delete_sweep_rounded),
           ),
         ];
       default:
@@ -409,9 +422,9 @@ class _MusicLibraryPageState extends ConsumerState<MusicLibraryPage>
             _buildFavoritesTab(context),
             _buildPlaylistsTab(context),
             _buildLocalTab(context),
+            _buildFoldersTab(context),
             _buildRecentTab(context),
             _buildQueueTab(context),
-            _buildFoldersTab(context),
           ],
         ),
       ),
@@ -1372,6 +1385,72 @@ class _MusicLibraryPageState extends ConsumerState<MusicLibraryPage>
     );
   }
 
+  /// 多选批量删除本地音乐：永久删除设备上的文件，并同步移除收藏与曲库。
+  Future<void> _localDeleteSelected() async {
+    if (_localDeleting || _localSelectedPaths.isEmpty) return;
+    final songs = ref
+        .read(libraryProvider)
+        .songs
+        .where((song) => _localSelectedPaths.contains(song.path))
+        .toList();
+    if (songs.isEmpty) return;
+    final message = songs.length == 1
+        ? '确定永久删除《${songs.first.title}》吗？\n该操作会删除设备上的音乐文件，不可恢复。'
+        : '确定永久删除选中的 ${songs.length} 首歌曲吗？\n该操作会删除设备上的音乐文件，不可恢复。';
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('删除歌曲'),
+        content: Text(message),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            style: FilledButton.styleFrom(
+              backgroundColor: Theme.of(ctx).colorScheme.error,
+            ),
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('删除'),
+          ),
+        ],
+      ),
+    );
+    if (ok != true || !mounted) return;
+    setState(() => _localDeleting = true);
+    var failed = 0;
+    try {
+      for (final song in songs) {
+        try {
+          await deleteMusicFile(path: song.path);
+        } catch (_) {
+          failed++;
+        }
+      }
+      // 同步收藏：已删除文件的收藏项一并移除，避免残留失效路径。
+      final favorites = ref.read(favoritesProvider);
+      for (final song in songs) {
+        if (favorites.contains(song.path)) {
+          await ref.read(favoritesProvider.notifier).toggle(song.path);
+        }
+      }
+      // 重扫文件夹把删除同步进数据库（增量 diff，只处理变更）。
+      await ref.read(libraryProvider.notifier).scanAllFolders();
+      if (!mounted) return;
+      _localExitSelection();
+      XyNotice.show(
+        context,
+        message: failed > 0
+            ? '已删除 ${songs.length - failed} 首，$failed 首删除失败'
+            : '已删除 ${songs.length} 首',
+        type: failed > 0 ? XyNoticeType.warning : XyNoticeType.success,
+      );
+    } finally {
+      if (mounted) setState(() => _localDeleting = false);
+    }
+  }
+
   /// 多选批量添加到歌单。
   Future<void> _localAddSelectedToPlaylist() async {
     if (_localSelectedPaths.isEmpty) return;
@@ -1565,6 +1644,13 @@ class _MusicLibraryPageState extends ConsumerState<MusicLibraryPage>
                 onTap: _localSelectedPaths.isEmpty
                     ? null
                     : _localAddSelectedToPlaylist,
+              ),
+              _SelectionAction(
+                icon: const Icon(Icons.delete_outline_rounded),
+                label: '删除',
+                onTap: _localSelectedPaths.isEmpty || _localDeleting
+                    ? null
+                    : _localDeleteSelected,
               ),
             ],
           ),

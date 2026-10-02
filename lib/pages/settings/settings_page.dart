@@ -1245,6 +1245,36 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
           value: settings?.desktopLyricsLocked ?? false,
           onChanged: (value) => notifier.setDesktopLyricsLocked(value),
         ),
+        _switchTile(
+          context,
+          icon: Icons.fit_screen_outlined,
+          title: '状态栏避让',
+          value: settings?.desktopLyricsAvoidStatusBar ?? true,
+          onChanged: (value) => notifier.setDesktopLyricsAvoidStatusBar(value),
+        ),
+        _tile(
+          context,
+          icon: Icons.height_rounded,
+          title: '上下位移',
+          trailing: SizedBox(
+            width: 145,
+            child: Slider(
+              value: (settings?.desktopLyricsVerticalOffset ?? 0).clamp(
+                -200,
+                200,
+              ),
+              min: -200,
+              max: 200,
+              divisions: 40,
+              label: (settings?.desktopLyricsVerticalOffset ?? 0) == 0
+                  ? '默认'
+                  : '${(settings?.desktopLyricsVerticalOffset ?? 0) > 0 ? '上移' : '下移'} '
+                        '${(settings?.desktopLyricsVerticalOffset ?? 0).abs().round()}',
+              onChanged: (value) =>
+                  notifier.setDesktopLyricsVerticalOffset(value),
+            ),
+          ),
+        ),
         _tile(
           context,
           icon: Icons.format_color_text_outlined,

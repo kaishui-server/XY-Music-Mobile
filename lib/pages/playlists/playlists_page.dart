@@ -168,7 +168,10 @@ class _PlaylistsPageState extends ConsumerState<PlaylistsPage> {
               )
             : Stack(
                 children: [
-                  ListView(
+                  // 懒加载构建：此前 ListView(children: [...]) 会一次性构建
+                  // 全部歌单卡片（每张都含封面、副标题等），歌单较多时首帧
+                  // 卡顿、滚动掉帧；builder 只构建可见行。
+                  ListView.builder(
                     controller: _playlistsController,
                     // Shell 已把底栏+迷你播放栏的遮挡高度注入
                     // MediaQuery.padding.bottom（含系统安全区），
@@ -179,15 +182,17 @@ class _PlaylistsPageState extends ConsumerState<PlaylistsPage> {
                       16,
                       MediaQuery.paddingOf(context).bottom + 12,
                     ),
-                    children: [
-                      _PlaylistSectionHeader(
-                        label: '我的歌单',
-                        count: playlists.length,
-                        first: true,
-                      ),
-                      for (final playlist in playlists)
-                        _playlistTile(context, playlist),
-                    ],
+                    itemCount: playlists.length + 1,
+                    itemBuilder: (context, index) {
+                      if (index == 0) {
+                        return _PlaylistSectionHeader(
+                          label: '我的歌单',
+                          count: playlists.length,
+                          first: true,
+                        );
+                      }
+                      return _playlistTile(context, playlists[index - 1]);
+                    },
                   ),
                   ScrollToTopButton(
                     controller: _playlistsController,
