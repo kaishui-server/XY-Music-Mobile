@@ -874,6 +874,7 @@ class _SearchPageState extends ConsumerState<SearchPage>
         (value) => (
           path: value.valueOrNull?.customBackgroundPath ?? '',
           blur: value.valueOrNull?.customBackgroundBlur ?? 18.0,
+          fade: value.valueOrNull?.customBackgroundFade ?? 0.0,
         ),
       ),
     );
@@ -1022,6 +1023,7 @@ class _SearchPageState extends ConsumerState<SearchPage>
           ? XyAppBackground(
               imagePath: backgroundSettings.path,
               blur: backgroundSettings.blur,
+              fade: backgroundSettings.fade,
               child: scaffold,
             )
           : scaffold,

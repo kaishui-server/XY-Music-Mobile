@@ -269,6 +269,7 @@ class _XyMusicAppState extends ConsumerState<XyMusicApp>
         settings?.customBackgroundPath.trim() ?? startup?.path ?? '';
     final backgroundBlur =
         settings?.customBackgroundBlur ?? startup?.blur ?? 18.0;
+    final backgroundFade = settings?.customBackgroundFade ?? 0.0;
     _precacheBackground(backgroundPath);
     final accent = settings?.accentColor ?? 0xFFEC4141;
     final fontFamily = settings?.fontFamily ?? '';
@@ -316,6 +317,7 @@ class _XyMusicAppState extends ConsumerState<XyMusicApp>
               child: XyAppBackground(
                 imagePath: backgroundPath,
                 blur: backgroundBlur,
+                fade: backgroundFade,
                 decodedImage: _decodedBackgroundPath == backgroundPath
                     ? _decodedBackgroundImage
                     : null,

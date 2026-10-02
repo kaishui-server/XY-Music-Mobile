@@ -64,12 +64,17 @@ class XyAppBackground extends StatefulWidget {
     required this.child,
     this.imagePath = '',
     this.blur = 18,
+    this.fade = 0,
     this.decodedImage,
   });
 
   final Widget child;
   final String imagePath;
   final double blur;
+
+  /// 背景淡化强度（0~1）：叠加在基础蒙层之上，深色模式加深黑色蒙层、
+  /// 浅色模式加深白色蒙层，数值越高壁纸越暗/越白。
+  final double fade;
   final ui.Image? decodedImage;
 
   @override
@@ -80,6 +85,7 @@ class _XyAppBackgroundState extends State<XyAppBackground> {
   Widget? _backgroundLayer;
   String? _layerPath;
   double? _layerBlur;
+  double? _layerFade;
   ui.Image? _layerImage;
   Brightness? _layerBrightness;
 
@@ -99,6 +105,7 @@ class _XyAppBackgroundState extends State<XyAppBackground> {
     final brightness = Theme.of(context).brightness;
     final path = widget.imagePath.trim();
     final blur = widget.blur.clamp(0, 40).toDouble();
+    final fade = widget.fade.clamp(0.0, 1.0).toDouble();
     final inherited = XyBackgroundScope.maybeOf(context);
     final decodedImage =
         widget.decodedImage ??
@@ -106,17 +113,20 @@ class _XyAppBackgroundState extends State<XyAppBackground> {
     if (_backgroundLayer != null &&
         _layerPath == path &&
         _layerBlur == blur &&
+        _layerFade == fade &&
         identical(_layerImage, decodedImage) &&
         _layerBrightness == brightness) {
       return;
     }
     _layerPath = path;
     _layerBlur = blur;
+    _layerFade = fade;
     _layerImage = decodedImage;
     _layerBrightness = brightness;
     _backgroundLayer = _buildBackgroundLayer(
       path: path,
       blur: blur,
+      fade: fade,
       decodedImage: decodedImage,
       brightness: brightness,
     );
@@ -125,6 +135,7 @@ class _XyAppBackgroundState extends State<XyAppBackground> {
   Widget _buildBackgroundLayer({
     required String path,
     required double blur,
+    required double fade,
     required ui.Image? decodedImage,
     required Brightness brightness,
   }) {
@@ -169,7 +180,7 @@ class _XyAppBackgroundState extends State<XyAppBackground> {
                   ),
                   ColoredBox(
                     color: (dark ? Colors.black : Colors.white).withValues(
-                      alpha: dark ? .38 : .28,
+                      alpha: ((dark ? .38 : .28) + fade).clamp(0.0, 1.0),
                     ),
                   ),
                 ],

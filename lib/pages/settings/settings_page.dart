@@ -2484,6 +2484,7 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
   ) async {
     var imagePath = settings?.customBackgroundPath ?? '';
     var blur = settings?.customBackgroundBlur ?? 18.0;
+    var fade = settings?.customBackgroundFade ?? 0.0;
     final result = await showModalBottomSheet<_CustomBackgroundResult>(
       context: context,
       useRootNavigator: true,
@@ -2596,6 +2597,7 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
                       child: XyAppBackground(
                         imagePath: imagePath,
                         blur: blur,
+                        fade: fade,
                         child: Center(
                           child: Text(
                             imagePath.isEmpty ? '尚未选择壁纸' : 'XY Music 壁纸预览',
@@ -2633,6 +2635,24 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
                   const SizedBox(height: 4),
                   Row(
                     children: [
+                      const Icon(Icons.brightness_6_outlined, size: 20),
+                      const SizedBox(width: 8),
+                      const Text('背景淡化'),
+                      const Spacer(),
+                      Text('${(fade * 100).toStringAsFixed(0)}%'),
+                    ],
+                  ),
+                  Slider(
+                    value: fade.clamp(0.0, 1.0),
+                    min: 0,
+                    max: 1,
+                    divisions: 20,
+                    label: '${(fade * 100).toStringAsFixed(0)}%',
+                    onChanged: (value) => setSheetState(() => fade = value),
+                  ),
+                  const SizedBox(height: 4),
+                  Row(
+                    children: [
                       OutlinedButton.icon(
                         onPressed: pickImage,
                         icon: const Icon(Icons.upload_file_outlined),
@@ -2648,7 +2668,7 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
                       FilledButton(
                         onPressed: () => Navigator.pop(
                           sheetContext,
-                          _CustomBackgroundResult(imagePath, blur),
+                          _CustomBackgroundResult(imagePath, blur, fade),
                         ),
                         child: const Text('应用'),
                       ),
@@ -2665,6 +2685,7 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
     final notifier = ref.read(settingsProvider.notifier);
     await notifier.setCustomBackgroundPath(result.path);
     await notifier.setCustomBackgroundBlur(result.blur);
+    await notifier.setCustomBackgroundFade(result.fade);
   }
 
   /// 自定义字体面板：选择 .ttf/.otf 立即应用到全局，或恢复系统默认。
@@ -3854,8 +3875,9 @@ class _SettingsLyricFontSizeSheetState
 }
 
 class _CustomBackgroundResult {
-  const _CustomBackgroundResult(this.path, this.blur);
+  const _CustomBackgroundResult(this.path, this.blur, this.fade);
 
   final String path;
   final double blur;
+  final double fade;
 }

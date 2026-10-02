@@ -212,6 +212,7 @@ class AppSettings {
     this.welcomeSetupCompleted = false,
     this.customBackgroundPath = '',
     this.customBackgroundBlur = 18.0,
+    this.customBackgroundFade = 0.0,
     this.playerDetailCustomImagePath = '',
     this.playerDetailBackgroundMode = PlayerDetailBackgroundMode.flowingLight,
     this.playerCoverStyle = PlayerCoverStyle.classic,
@@ -305,6 +306,10 @@ class AppSettings {
   final bool welcomeSetupCompleted;
   final String customBackgroundPath;
   final double customBackgroundBlur;
+
+  /// 自定义壁纸的背景淡化强度（0~1），叠加在基础蒙层之上：深色模式加黑
+  /// 蒙层、浅色模式加白蒙层，数值越高壁纸越暗（深色）/ 越白（浅色）。
+  final double customBackgroundFade;
   final String playerDetailCustomImagePath;
   final PlayerDetailBackgroundMode playerDetailBackgroundMode;
   final PlayerCoverStyle playerCoverStyle;
@@ -407,6 +412,7 @@ class AppSettings {
     bool? welcomeSetupCompleted,
     String? customBackgroundPath,
     double? customBackgroundBlur,
+    double? customBackgroundFade,
     String? playerDetailCustomImagePath,
     PlayerDetailBackgroundMode? playerDetailBackgroundMode,
     PlayerCoverStyle? playerCoverStyle,
@@ -482,6 +488,7 @@ class AppSettings {
           welcomeSetupCompleted ?? this.welcomeSetupCompleted,
       customBackgroundPath: customBackgroundPath ?? this.customBackgroundPath,
       customBackgroundBlur: customBackgroundBlur ?? this.customBackgroundBlur,
+      customBackgroundFade: customBackgroundFade ?? this.customBackgroundFade,
       playerDetailCustomImagePath:
           playerDetailCustomImagePath ?? this.playerDetailCustomImagePath,
       playerDetailBackgroundMode:
@@ -601,6 +608,10 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
       bottomBarShowLabels: prefs.getBool('bottomBarShowLabels') ?? true,
       customBackgroundPath: prefs.getString('customBackgroundPath') ?? '',
       customBackgroundBlur: prefs.getDouble('customBackgroundBlur') ?? 18.0,
+      customBackgroundFade:
+          (prefs.getDouble('customBackgroundFade') ?? 0.0)
+              .clamp(0.0, 1.0)
+              .toDouble(),
       playerDetailCustomImagePath:
           prefs.getString('playerDetailCustomImagePath') ?? '',
       playerDetailBackgroundMode: _playerDetailBackgroundModeFromInt(
@@ -833,6 +844,7 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
       prefs.setBool('welcomeSetupCompleted', next.welcomeSetupCompleted),
       prefs.setString('customBackgroundPath', next.customBackgroundPath),
       prefs.setDouble('customBackgroundBlur', next.customBackgroundBlur),
+      prefs.setDouble('customBackgroundFade', next.customBackgroundFade),
       prefs.setString(
         'playerDetailCustomImagePath',
         next.playerDetailCustomImagePath,
@@ -1041,6 +1053,13 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
   Future<void> setCustomBackgroundBlur(double value) => _save(
     (state.valueOrNull ?? const AppSettings()).copyWith(
       customBackgroundBlur: value.clamp(0, 40).toDouble(),
+    ),
+  );
+
+  /// 自定义壁纸背景淡化强度（0~1），叠加在基础蒙层之上。
+  Future<void> setCustomBackgroundFade(double value) => _save(
+    (state.valueOrNull ?? const AppSettings()).copyWith(
+      customBackgroundFade: value.clamp(0.0, 1.0).toDouble(),
     ),
   );
   Future<void> setPlayerDetailCustomImagePath(String path) => _save(

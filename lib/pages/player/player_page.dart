@@ -1304,9 +1304,9 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
   }
 
   /// 更多菜单：底部弹层（截图样式）。顶部为 5 个圆形快捷按钮
-  /// （下载/加到歌单/换源+还原/音质/歌词字号），下方为 9 行设置列表。
-  /// 开关行与封面样式切换在弹层内直接生效；其余条目收起弹层后
-  /// 由本页面拉起对应面板。
+  /// （下载——本地歌曲时为歌词偏移/加到歌单/换源+还原/音质/关联歌词），
+  /// 下方为设置列表。开关行与封面样式切换在弹层内直接生效；其余条目
+  /// 收起弹层后由本页面拉起对应面板。
   Future<void> _showMoreMenu(QueueItem item) async {
     final notifier = ref.read(playerProvider.notifier);
     final restorable = await notifier.hasSwitchedSource(item.path);
@@ -1321,7 +1321,6 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
       isScrollControlled: true,
       builder: (sheetContext) => _PlayerMoreSheet(
         item: item,
-        initialOffsetTenths: _lyricsOffsetTenths,
         isLandscape: viewport.width > viewport.height,
         restorableSource: restorable,
         hasLyricsAssociation: associated != null,
@@ -2910,6 +2909,23 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
       ),
     );
 
+    // 竖屏沉浸式歌词：开启后封面页/歌词页铺满内容区，播放栏隐藏、
+    // 单击原播放栏位置弹出（上浮动画），5 秒无操作自动隐藏。
+    final portraitImmersive =
+        ref.watch(
+          settingsProvider.select(
+            (s) => s.valueOrNull?.portraitImmersiveLyrics,
+          ),
+        ) ??
+        false;
+    // 沉浸模式下迷你歌词行数：播放栏隐藏时展示四行（当前 + 后续歌词，
+    // 翻译单独占行），播放栏弹出（上浮动画）时自然收为两行，自动隐藏
+    // 后恢复四行。展示区预留行数恒为 4，避免封面随行数抖动。
+    final immersiveMiniLyrics = portraitImmersive && current != null;
+    final miniLyricRows =
+        immersiveMiniLyrics && !_portraitControlsVisible ? 4 : 2;
+    final miniLyricReserveRows = immersiveMiniLyrics ? 4 : 2;
+
     final detailPager = LayoutBuilder(
       builder: (context, constraints) => Listener(
         behavior: HitTestBehavior.translucent,
@@ -2942,6 +2958,8 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
                 // 竖屏时封面本体铺到屏幕顶端（见 _ImmersiveTopCover），
                 // 这里退化为透明手势占位（横屏由左侧封面栏直接绘制）。
                 paintCover: false,
+                miniLyricRows: miniLyricRows,
+                miniLyricReserveRows: miniLyricReserveRows,
                 onTap: current == null ? null : _toggleLyrics,
                 onLongPress: current == null
                     ? null
@@ -2953,6 +2971,8 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
                 item: current,
                 offsetTenths: _lyricsOffsetTenths,
                 style: coverStyle,
+                miniLyricRows: miniLyricRows,
+                miniLyricReserveRows: miniLyricReserveRows,
                 onTap: current == null ? null : _toggleLyrics,
                 // 长按封面直接弹出“更多”菜单，与右上角更多按钮一致。
                 onLongPress: current == null
@@ -2986,6 +3006,9 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
         onDownload: current == null
             ? null
             : () => unawaited(_downloadCurrent(current)),
+        onLyricsOffset: current == null
+            ? null
+            : () => unawaited(_showLyricsOffsetSheet(current)),
         onLinkLyrics: current == null
             ? null
             : () => unawaited(_linkLyrics(current)),
@@ -3010,14 +3033,8 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
 
     // 竖屏沉浸式：封面页与歌词页统一铺满内容区（封面 + 迷你歌词 /
     // 纯歌词），播放栏隐藏，单击原播放栏位置弹出，5 秒无操作自动
-    // 隐藏（与横屏逻辑一致）。
-    final portraitImmersive =
-        ref.watch(
-          settingsProvider.select(
-            (s) => s.valueOrNull?.portraitImmersiveLyrics,
-          ),
-        ) ??
-        false;
+    // 隐藏（与横屏逻辑一致）。portraitImmersive 已在 detailPager
+    // 构建前求出（迷你歌词行数需要）。
 
     // 横屏右栏的播放控制卡：标题/歌手已在顶部展示，仅保留操作按钮行。
     Widget buildLandscapeControls() => Padding(
@@ -3029,6 +3046,9 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
         onDownload: current == null
             ? null
             : () => unawaited(_downloadCurrent(current)),
+        onLyricsOffset: current == null
+            ? null
+            : () => unawaited(_showLyricsOffsetSheet(current)),
         onLinkLyrics: current == null
             ? null
             : () => unawaited(_linkLyrics(current)),
@@ -3704,14 +3724,13 @@ class _QualitySelectorState extends State<_QualitySelector> {
   }
 }
 
-/// 播放页更多菜单底部弹层：顶部 5 个圆形快捷按钮（下载/加到歌单/换源+
-/// 还原/音质/歌词字号）+ 下方 9 行设置列表。开关行与封面样式切换在弹层
-/// 内直接生效（watch 设置即时刷新）；其余条目收起弹层后由宿主页面
-/// 拉起对应面板。
+/// 播放页更多菜单底部弹层：顶部 5 个圆形快捷按钮（下载——本地歌曲时为
+/// 歌词偏移/加到歌单/换源+还原/音质/关联歌词）+ 下方设置列表。开关行与
+/// 封面样式切换在弹层内直接生效（watch 设置即时刷新）；其余条目收起弹层
+/// 后由宿主页面拉起对应面板。
 class _PlayerMoreSheet extends ConsumerStatefulWidget {
   const _PlayerMoreSheet({
     required this.item,
-    required this.initialOffsetTenths,
     required this.isLandscape,
     required this.restorableSource,
     required this.hasLyricsAssociation,
@@ -3734,9 +3753,6 @@ class _PlayerMoreSheet extends ConsumerStatefulWidget {
   });
 
   final QueueItem item;
-
-  /// 打开菜单时的歌词偏移快照（子面板实时应用后本弹层已收起）。
-  final int initialOffsetTenths;
 
   /// 打开菜单时的屏幕方向：决定沉浸式歌词开关读写哪个设置。
   final bool isLandscape;
@@ -3783,7 +3799,8 @@ class _PlayerMoreSheetState extends ConsumerState<_PlayerMoreSheet> {
   /// 圆形快捷按钮：圆形底 + 图标 + 下方文字标签（可选附加小按钮）。
   Widget _quickButton(
     BuildContext context, {
-    required IconData icon,
+    IconData? icon,
+    Widget? iconOverride,
     required String label,
     required VoidCallback onTap,
     Widget? extra,
@@ -3801,7 +3818,9 @@ class _PlayerMoreSheetState extends ConsumerState<_PlayerMoreSheet> {
             child: SizedBox(
               width: 52,
               height: 52,
-              child: Icon(icon, size: 23, color: scheme.onSurface),
+              child:
+                  iconOverride ??
+                  Icon(icon!, size: 23, color: scheme.onSurface),
             ),
           ),
         ),
@@ -3983,6 +4002,9 @@ class _PlayerMoreSheetState extends ConsumerState<_PlayerMoreSheet> {
     final sleepTimerEndsAt = ref.watch(
       playerProvider.select((state) => state.sleepTimerEndsAt),
     );
+    // 本地歌曲无下载意义，快捷按钮位的「下载」改为「歌词偏移」。
+    final isLocal =
+        playbackSourceTypeFor(widget.item) == PlaybackSourceType.localFile;
 
     // 弹层总高不超过屏幕 60%：信息条与 5 个快捷按钮固定可见，
     // 下方设置列表独立滚动。
@@ -4081,12 +4103,19 @@ class _PlayerMoreSheetState extends ConsumerState<_PlayerMoreSheet> {
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   Expanded(
-                    child: _quickButton(
-                      context,
-                      icon: Icons.download_rounded,
-                      label: '下载',
-                      onTap: () => _popThen(widget.onDownload),
-                    ),
+                    child: isLocal
+                        ? _quickButton(
+                            context,
+                            icon: Icons.sync_alt_rounded,
+                            label: '歌词偏移',
+                            onTap: () => _popThen(widget.onShowLyricsOffset),
+                          )
+                        : _quickButton(
+                            context,
+                            icon: Icons.download_rounded,
+                            label: '下载',
+                            onTap: () => _popThen(widget.onDownload),
+                          ),
                   ),
                   Expanded(
                     child: _quickButton(
@@ -4118,7 +4147,17 @@ class _PlayerMoreSheetState extends ConsumerState<_PlayerMoreSheet> {
                   Expanded(
                     child: _quickButton(
                       context,
-                      icon: Icons.lyrics_outlined,
+                      iconOverride: Center(
+                        child: Text(
+                          '词',
+                          style: TextStyle(
+                            fontSize: 20,
+                            height: 1,
+                            fontWeight: FontWeight.w800,
+                            color: scheme.onSurface,
+                          ),
+                        ),
+                      ),
                       label: '关联歌词',
                       onTap: () => _popThen(widget.onLinkLyrics),
                       extra: _hasLyricsAssociation
@@ -4129,7 +4168,7 @@ class _PlayerMoreSheetState extends ConsumerState<_PlayerMoreSheet> {
                 ],
               ),
               const SizedBox(height: 14),
-              // 9 行设置列表：超出剩余高度时仅在区域内滚动。
+              // 设置列表：超出剩余高度时仅在区域内滚动。
               Flexible(
                 child: SingleChildScrollView(
                   child: Column(
@@ -4170,13 +4209,6 @@ class _PlayerMoreSheetState extends ConsumerState<_PlayerMoreSheet> {
                                     .read(settingsProvider.notifier)
                                     .setPortraitImmersiveLyrics(next);
                         },
-                      ),
-                      _panelRow(
-                        context,
-                        icon: Icons.sync_alt_rounded,
-                        title: '歌词偏移',
-                        value: lyricsOffsetLabel(widget.initialOffsetTenths),
-                        onOpen: widget.onShowLyricsOffset,
                       ),
                       _panelRow(
                         context,
@@ -4224,11 +4256,15 @@ class _SongArtistInfo {
     required this.artistId,
     required this.artistMid,
     required this.raw,
+    this.avatar = '',
   });
 
   final String name;
   final String artistId;
   final String artistMid;
+
+  /// 平台头像地址；部分平台（如 QQ/网易歌手条目）不提供，为空时回退占位图标。
+  final String avatar;
 
   /// 平台原始歌手 map（含 name/id/mid 等），作为 getArtistWorks 的
   /// rawData 直传插件。
@@ -4243,6 +4279,85 @@ String _firstTextOf(Map<dynamic, dynamic> map, List<String> keys) {
   }
   return '';
 }
+
+/// 从歌手对象提取头像地址。兼容字符串与 `{url: ...}` / `{urlTemplate: ...}`
+/// 形式的嵌套值；顶层找不到时再查 user_info/author_info/user 等嵌套对象
+/// （汽水等平台的歌手信息包裹在 user_info 里）。
+String _artistAvatarOf(Map<String, dynamic> map) {
+  const keys = [
+    'avatar',
+    'avatarUrl',
+    'avatar_url',
+    'avatarImgUrlStr',
+    'headImg',
+    'headPic',
+    'headUrl',
+    'head_url',
+    'singerPic',
+    'singerImg',
+    'artistPic',
+    'artistImg',
+    'pic',
+    'picUrl',
+    'pic_url',
+    'img',
+    'imgUrl',
+    'img_url',
+    'img1v1Url',
+    'img1v1',
+    'image',
+    'photo',
+    'upic',
+    'face',
+    'userFace',
+    'user_face',
+    'cover',
+    'coverUrl',
+    'cover_url',
+  ];
+  String readFrom(Map<dynamic, dynamic> source) {
+    for (final key in keys) {
+      final value = source[key];
+      if (value is String && value.trim().isNotEmpty) return value.trim();
+      if (value is Map) {
+        final nested = value['url'] ?? value['urlTemplate'] ?? value['src'];
+        if (nested is String && nested.trim().isNotEmpty) {
+          return nested.trim();
+        }
+      }
+    }
+    return '';
+  }
+
+  final direct = readFrom(map);
+  if (direct.isNotEmpty) return direct;
+  for (final nestedKey in const ['user_info', 'author_info', 'user', 'artist']) {
+    final nested = map[nestedKey];
+    if (nested is Map) {
+      final found = readFrom(nested);
+      if (found.isNotEmpty) return found;
+    }
+  }
+  return '';
+}
+
+/// 是否为 QQ 音乐曲目：封面/artwork 指向 y.gtimg.cn（其他平台不会命中）。
+bool _isQqSong(QueueItem item) {
+  final data = item.pluginData;
+  final urls = <String?>[
+    item.coverUrl,
+    data?['artwork']?.toString(),
+    data?['cover']?.toString(),
+    data?['coverUrl']?.toString(),
+  ];
+  return urls.any((url) => (url ?? '').contains('gtimg.cn'));
+}
+
+/// QQ 音乐歌手头像约定地址（与桌面端 LxMusicSdk、Rust lx_search 一致）：
+/// 歌手条目只带 mid，无头像字段，需按 T001 规则拼接。
+String _qqSingerAvatarUrl(String mid) => mid.isEmpty
+    ? ''
+    : 'https://y.gtimg.cn/music/photo_new/T001R500x500M000$mid.jpg';
 
 /// 从歌曲插件数据提取作者列表：优先归一化后的 singerList（QQ/汽水/
 /// 网易等），兼容 artists/singers/singer/ar 等原始字段；都没有时按
@@ -4267,6 +4382,8 @@ List<_SongArtistInfo> _songArtistsOf(QueueItem item) {
     }
   }
   final artists = <_SongArtistInfo>[];
+  // QQ 歌手条目无头像字段，按 mid 拼 T001 头像地址兜底。
+  final qqSong = _isQqSong(item);
   for (final entry in entries) {
     if (entry is Map) {
       final map = Map<String, dynamic>.from(entry);
@@ -4290,8 +4407,17 @@ List<_SongArtistInfo> _songArtistsOf(QueueItem item) {
         'singerMid',
       ]);
       if (name.isNotEmpty || id.isNotEmpty) {
+        final avatar = _artistAvatarOf(map);
         artists.add(
-          _SongArtistInfo(name: name, artistId: id, artistMid: mid, raw: map),
+          _SongArtistInfo(
+            name: name,
+            artistId: id,
+            artistMid: mid,
+            avatar: avatar.isNotEmpty
+                ? avatar
+                : (qqSong ? _qqSingerAvatarUrl(mid) : ''),
+            raw: map,
+          ),
         );
       }
     } else if (entry is String && entry.trim().isNotEmpty) {
@@ -4475,19 +4601,33 @@ class _SongInfoSheet extends StatelessWidget {
                       padding: const EdgeInsets.symmetric(vertical: 10),
                       child: Row(
                         children: [
-                          Container(
-                            width: 38,
-                            height: 38,
-                            decoration: BoxDecoration(
-                              color: scheme.primary.withValues(alpha: .14),
-                              shape: BoxShape.circle,
-                            ),
-                            child: Icon(
-                              Icons.person_rounded,
-                              size: 20,
-                              color: scheme.primary,
-                            ),
-                          ),
+                          // 有平台头像时加载真实头像，否则回退到人形占位图标。
+                          artist.avatar.isEmpty
+                              ? Container(
+                                  width: 38,
+                                  height: 38,
+                                  decoration: BoxDecoration(
+                                    color: scheme.primary.withValues(alpha: .14),
+                                    shape: BoxShape.circle,
+                                  ),
+                                  child: Icon(
+                                    Icons.person_rounded,
+                                    size: 20,
+                                    color: scheme.primary,
+                                  ),
+                                )
+                              : CoverImage(
+                                  songPath: '',
+                                  imageUrl: artist.avatar,
+                                  width: 38,
+                                  height: 38,
+                                  radius: 19,
+                                  icon: Icons.person_rounded,
+                                  gradient: [
+                                    scheme.primary.withValues(alpha: .7),
+                                    scheme.primary,
+                                  ],
+                                ),
                           const SizedBox(width: 12),
                           Expanded(
                             child: Column(
@@ -6360,6 +6500,8 @@ class _BigCover extends ConsumerWidget {
     this.onTap,
     this.onLongPress,
     this.landscape = false,
+    this.miniLyricRows = 2,
+    this.miniLyricReserveRows = 2,
   });
   final QueueItem? item;
   final int offsetTenths;
@@ -6371,6 +6513,13 @@ class _BigCover extends ConsumerWidget {
 
   /// 横屏平分式布局：封面在左半屏正中缩放，不排迷你歌词与桌面反光。
   final bool landscape;
+
+  /// 迷你歌词当前展示行数（沉浸模式播放栏隐藏 4 行、弹出 2 行）。
+  final int miniLyricRows;
+
+  /// 迷你歌词展示区预留行数：沉浸模式恒按 4 行预留，播放栏弹出
+  /// 收为 2 行时封面不随之抖动。
+  final int miniLyricReserveRows;
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
@@ -6391,6 +6540,10 @@ class _BigCover extends ConsumerWidget {
               ),
             ) ??
             true);
+    // 封面下缘迷你歌词展示区高度（按预留行数取），及其占用的总高度
+    //（43dp 间距 + 展示区）。
+    final lyricArea = _MiniLyrics.heightFor(miniLyricReserveRows);
+    final extrasHeight = 43 + lyricArea;
     return LayoutBuilder(
       builder: (context, constraints) {
         final double side;
@@ -6407,7 +6560,10 @@ class _BigCover extends ConsumerWidget {
         } else {
           final normalSide = math.min(
             420.0,
-            math.min(constraints.maxWidth * .8, constraints.maxHeight - 122),
+            math.min(
+              constraints.maxWidth * .8,
+              constraints.maxHeight - extrasHeight,
+            ),
           );
           showCoverExtras = normalSide >= 150;
           side = showCoverExtras
@@ -6427,7 +6583,7 @@ class _BigCover extends ConsumerWidget {
               alignment: Alignment(0, portraitImmersiveActive ? -.4 : 0),
               child: SizedBox(
                 width: side,
-                height: side + (showCoverExtras ? 122 : 0),
+                height: side + (showCoverExtras ? extrasHeight : 0),
                 child: Stack(
                   clipBehavior: Clip.none,
                   children: [
@@ -6473,13 +6629,15 @@ class _BigCover extends ConsumerWidget {
                     if (item != null && showCoverExtras)
                       Positioned(
                         top: side + 43,
-                        left: -28,
-                        right: -28,
-                        height: 78,
+                        // 与封面同宽（不再向两侧溢出 28dp），歌词不贴屏边。
+                        left: 0,
+                        right: 0,
+                        height: lyricArea,
                         child: AbsorbPointer(
                           child: _MiniLyrics(
                             item: item!,
                             offsetTenths: offsetTenths,
+                            maxRows: miniLyricRows,
                           ),
                         ),
                       ),
@@ -6716,6 +6874,8 @@ class _ImmersiveCoverPage extends StatelessWidget {
     this.onTap,
     this.onLongPress,
     this.paintCover = true,
+    this.miniLyricRows = 2,
+    this.miniLyricReserveRows = 2,
   });
 
   final QueueItem? item;
@@ -6727,17 +6887,25 @@ class _ImmersiveCoverPage extends StatelessWidget {
   /// 不变）：封面本体由播放页外层 Stack 绘制，铺到屏幕顶端。
   final bool paintCover;
 
+  /// 迷你歌词当前展示行数（沉浸模式播放栏隐藏 4 行、弹出 2 行）。
+  final int miniLyricRows;
+
+  /// 迷你歌词展示区预留行数：沉浸模式恒按 4 行预留，播放栏弹出
+  /// 收为 2 行时封面不随之抖动。
+  final int miniLyricReserveRows;
+
   @override
   Widget build(BuildContext context) {
     final current = item;
+    final lyricArea = _MiniLyrics.heightFor(miniLyricReserveRows);
     return LayoutBuilder(
       builder: (context, constraints) {
         // 封面尽量铺满内容区宽度（MusicFree 的沉浸式封面高=屏宽），
-        // 但要给迷你歌词留出空间（78dp 展示区 + 12dp 余量）；空间不足
+        // 但要给迷你歌词留出空间（展示区 + 12dp 余量）；空间不足
         // 时按高度收缩。
         final side = math.min(
           constraints.maxWidth,
-          math.max(80.0, constraints.maxHeight - 90),
+          math.max(80.0, constraints.maxHeight - (lyricArea + 12)),
         );
         return Column(
           children: [
@@ -6801,9 +6969,17 @@ class _ImmersiveCoverPage extends StatelessWidget {
             ),
             if (current != null)
               SizedBox(
-                height: 78,
-                child: AbsorbPointer(
-                  child: _MiniLyrics(item: current, offsetTenths: offsetTenths),
+                height: lyricArea,
+                // 左右各留 26dp：歌词不贴屏幕两侧，长句换行更从容。
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 26),
+                  child: AbsorbPointer(
+                    child: _MiniLyrics(
+                      item: current,
+                      offsetTenths: offsetTenths,
+                      maxRows: miniLyricRows,
+                    ),
+                  ),
                 ),
               ),
           ],
@@ -7094,15 +7270,26 @@ class _VinylSheenPainter extends CustomPainter {
 }
 
 class _MiniLyrics extends ConsumerWidget {
-  const _MiniLyrics({required this.item, required this.offsetTenths});
+  const _MiniLyrics({
+    required this.item,
+    required this.offsetTenths,
+    this.maxRows = 2,
+  });
 
   final QueueItem item;
   final int offsetTenths;
 
-  /// 副行（翻译/下一句）超过该字号时不再显示，迷你歌词自动变为纯主行。
-  /// 展示区固定 78dp 高（两处容器等高）：主行最多两行 + 副行在字号 20
-  /// 以内可完整放下——英文主行换行成两行时，下方仍可接中文翻译（三行）。
+  /// 展示的最大行数：普通页面 2 行；沉浸模式（播放栏隐藏）4 行，
+  /// 播放栏弹出（上浮动画）时回落 2 行，自动隐藏后恢复 4 行。
+  final int maxRows;
+
+  /// 翻译跟随当前行展示的字号上限：超过则只显示歌词行，避免展示区
+  /// 被小字挤满。
   static const double _singleLineThreshold = 20;
+
+  /// 迷你歌词展示区高度：2 行 78dp、4 行 144dp。父容器按「预留行数」
+  /// 取用，保证沉浸模式下播放栏弹出/隐藏时封面不随歌词行数抖动。
+  static double heightFor(int rows) => rows >= 4 ? 144 : 78;
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
@@ -7148,74 +7335,133 @@ class _MiniLyrics extends ConsumerWidget {
         if (lines.isEmpty) return _message('暂无歌词', fontSize);
         var active = lines.lastIndexWhere((line) => line.time <= position);
         if (active < 0) active = 0;
-        final current = lines[active];
-        final translation = current.translation.trim();
-        final mainStyle = TextStyle(
-          color: Colors.white,
-          fontSize: fontSize,
-          fontWeight: FontWeight.w700,
-          // 显式行高让三行（主行两行 + 副行）在 78dp 展示区内可预期排布。
-          height: 1.3,
-        );
-        final secondary = fontSize <= _singleLineThreshold
-            ? (translation.isNotEmpty
-                  ? translation
-                  : active + 1 < lines.length
-                  ? lines[active + 1].text
-                  : '')
-            : '';
+        final rows = _collectRows(lines, active, fontSize);
+        if (rows.isEmpty) return _message('暂无歌词', fontSize);
         return _surface(
-          AnimatedSwitcher(
-            duration: const Duration(milliseconds: 280),
-            switchInCurve: Curves.easeOutCubic,
-            switchOutCurve: Curves.easeInCubic,
-            transitionBuilder: (child, animation) {
-              return FadeTransition(
-                opacity: animation,
-                child: SlideTransition(
-                  position: Tween<Offset>(
-                    begin: const Offset(0, .22),
-                    end: Offset.zero,
-                  ).animate(animation),
-                  child: child,
-                ),
-              );
-            },
-            child: Column(
-              key: ValueKey('${item.path}:${current.time}'),
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Text(
-                  current.text,
-                  // 主行超出宽度时软换行（最多两行）且不做省略号
-                  // 截断，保证歌词完整可读；换行时副行（翻译）仍显示。
-                  maxLines: 2,
-                  softWrap: true,
-                  overflow: TextOverflow.clip,
-                  textAlign: TextAlign.center,
-                  style: mainStyle.copyWith(
-                    shadows: [Shadow(color: Colors.black54, blurRadius: 10)],
+          AnimatedSize(
+            duration: const Duration(milliseconds: 260),
+            curve: Curves.easeOutCubic,
+            alignment: Alignment.center,
+            child: AnimatedSwitcher(
+              duration: const Duration(milliseconds: 280),
+              switchInCurve: Curves.easeOutCubic,
+              switchOutCurve: Curves.easeInCubic,
+              transitionBuilder: (child, animation) {
+                return FadeTransition(
+                  opacity: animation,
+                  child: SlideTransition(
+                    position: Tween<Offset>(
+                      begin: const Offset(0, .22),
+                      end: Offset.zero,
+                    ).animate(animation),
+                    child: child,
                   ),
-                ),
-                if (secondary.trim().isNotEmpty) ...[
-                  const SizedBox(height: 3),
-                  Text(
-                    secondary,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    textAlign: TextAlign.center,
-                    style: TextStyle(
-                      color: Colors.white.withValues(alpha: .5),
-                      fontSize: fontSize * .82,
-                      height: 1.3,
-                    ),
-                  ),
+                );
+              },
+              // 当前行推进或行数变化（沉浸模式播放栏弹出/隐藏）时都重建，
+              // 由 AnimatedSize 平滑收放行数。
+              child: Column(
+                key: ValueKey('${item.path}:${lines[active].time}:$maxRows'),
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  for (var i = 0; i < rows.length; i++) ...[
+                    if (i > 0) const SizedBox(height: 3),
+                    _rowText(rows[i], fontSize),
+                  ],
                 ],
-              ],
+              ),
             ),
           ),
         );
       },
+    );
+  }
+
+  /// 收集窗口内的歌词行（均为独立歌词行）：
+  /// - 4 行模式：上一行（已播放）+ 当前行 + 下两行（未播放）；
+  /// - 2 行模式：当前行 + 下一行。
+  /// 当前行的翻译作为小字紧随其后，不额外占用行数。
+  List<_MiniLyricRow> _collectRows(
+    List<LyricLine> lines,
+    int active,
+    double fontSize,
+  ) {
+    final start = maxRows >= 4 ? math.max(0, active - 1) : active;
+    final showTranslation = fontSize <= _singleLineThreshold;
+    final rows = <_MiniLyricRow>[];
+    for (var i = start; i < lines.length && rows.length < maxRows; i++) {
+      final text = lines[i].text.trim();
+      if (text.isEmpty) continue;
+      rows.add(
+        _MiniLyricRow(
+          text: text,
+          isActive: i == active,
+          translation: i == active && showTranslation
+              ? lines[i].translation.trim()
+              : '',
+        ),
+      );
+    }
+    return rows;
+  }
+
+  /// 单行渲染：当前行高亮加粗（其下可跟随小字翻译），其余行淡色小字。
+  Widget _rowText(_MiniLyricRow row, double fontSize) {
+    if (!row.isActive) {
+      return Text(
+        row.text,
+        maxLines: 1,
+        overflow: TextOverflow.ellipsis,
+        textAlign: TextAlign.center,
+        style: TextStyle(
+          color: Colors.white.withValues(alpha: .5),
+          fontSize: fontSize * .82,
+          height: 1.3,
+        ),
+      );
+    }
+    final lyric = Text(
+      row.text,
+      // 当前行换行上限：四行窗口每行单行；两行窗口仅在无翻译且字号
+      // 不大时允许软换行（否则「当前行两行 + 翻译 + 下一行」会超出
+      // 展示区高度）。
+      maxLines:
+          maxRows <= 2 &&
+              row.translation.isEmpty &&
+              fontSize <= _singleLineThreshold
+          ? 2
+          : 1,
+      softWrap: true,
+      overflow: maxRows <= 2
+          ? TextOverflow.clip
+          : TextOverflow.ellipsis,
+      textAlign: TextAlign.center,
+      style: TextStyle(
+        color: Colors.white,
+        fontSize: fontSize,
+        fontWeight: FontWeight.w700,
+        height: 1.3,
+        shadows: const [Shadow(color: Colors.black54, blurRadius: 10)],
+      ),
+    );
+    if (row.translation.isEmpty) return lyric;
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        lyric,
+        const SizedBox(height: 2),
+        Text(
+          row.translation,
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+          textAlign: TextAlign.center,
+          style: TextStyle(
+            color: Colors.white.withValues(alpha: .62),
+            fontSize: fontSize * .78,
+            height: 1.3,
+          ),
+        ),
+      ],
     );
   }
 
@@ -7237,6 +7483,19 @@ class _MiniLyrics extends ConsumerWidget {
   Widget _surface(Widget child) {
     return Center(child: child);
   }
+}
+
+/// 迷你歌词单行数据：一行歌词，当前行可携带随行小字翻译。
+class _MiniLyricRow {
+  const _MiniLyricRow({
+    required this.text,
+    required this.isActive,
+    this.translation = '',
+  });
+
+  final String text;
+  final bool isActive;
+  final String translation;
 }
 
 class _LyricsView extends ConsumerStatefulWidget {
@@ -8060,6 +8319,7 @@ class _GlassControlCard extends ConsumerWidget {
     this.onQuality,
     this.onLyricFontSizePage,
     this.onPlayMv,
+    this.onLyricsOffset,
   });
   final PlayerNotifier notifier;
   final QueueItem? current;
@@ -8070,6 +8330,7 @@ class _GlassControlCard extends ConsumerWidget {
   final VoidCallback? onQuality;
   final VoidCallback? onLyricFontSizePage;
   final VoidCallback? onPlayMv;
+  final VoidCallback? onLyricsOffset;
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
@@ -8100,6 +8361,7 @@ class _GlassControlCard extends ConsumerWidget {
                   onQuality: onQuality,
                   onLyricFontSizePage: onLyricFontSizePage,
                   onPlayMv: onPlayMv,
+                  onLyricsOffset: onLyricsOffset,
                 ),
                 if (errorMessage != null) ...[
                   const SizedBox(height: 10),
@@ -8231,6 +8493,7 @@ class _TitleRow extends ConsumerWidget {
     this.onQuality,
     this.onLyricFontSizePage,
     this.onPlayMv,
+    this.onLyricsOffset,
   });
   final QueueItem current;
   final bool showMetadata;
@@ -8240,6 +8503,9 @@ class _TitleRow extends ConsumerWidget {
   final VoidCallback? onQuality;
   final VoidCallback? onLyricFontSizePage;
   final VoidCallback? onPlayMv;
+
+  /// 本地歌曲时快捷按钮位的「歌词偏移」入口。
+  final VoidCallback? onLyricsOffset;
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
@@ -8322,8 +8588,8 @@ class _TitleRow extends ConsumerWidget {
                   song: FavoriteSongSnapshot.fromQueueItem(current),
                 ),
           ),
-        // 歌词页快捷按钮：音质（当前歌曲实际音质缩写）→ 下载 → 关联歌词
-        // → 字号调整 → 桌面歌词。
+        // 歌词页快捷按钮：音质（当前歌曲实际音质缩写）→ 下载（本地歌曲
+        // 无下载意义，改为歌词偏移）→ 关联歌词 → 字号调整 → 桌面歌词。
         if (!showMetadata)
           _qualityBadgeAction(
             context,
@@ -8332,16 +8598,23 @@ class _TitleRow extends ConsumerWidget {
             onPressed: isLocal ? null : onQuality,
           ),
         if (!showMetadata)
-          _quickAction(
-            context,
-            icon: Icons.download_rounded,
-            tooltip: '下载',
-            onPressed: isLocal ? null : onDownload,
-          ),
+          isLocal
+              ? _quickAction(
+                  context,
+                  icon: Icons.sync_alt_rounded,
+                  tooltip: '歌词偏移',
+                  onPressed: onLyricsOffset,
+                )
+              : _quickAction(
+                  context,
+                  icon: Icons.download_rounded,
+                  tooltip: '下载',
+                  onPressed: onDownload,
+                ),
         if (!showMetadata)
-          _quickAction(
+          _charAction(
             context,
-            icon: Icons.lyrics_outlined,
+            text: '词',
             tooltip: '关联歌词',
             onPressed: onLinkLyrics,
           ),
@@ -8389,7 +8662,7 @@ class _TitleRow extends ConsumerWidget {
         overflow: TextOverflow.ellipsis,
         softWrap: false,
         style: const TextStyle(
-          fontSize: 13,
+          fontSize: 15,
           fontWeight: FontWeight.w800,
           letterSpacing: .5,
           color: Colors.white70,
@@ -8403,14 +8676,40 @@ class _TitleRow extends ConsumerWidget {
     required IconData icon,
     required String tooltip,
     required VoidCallback? onPressed,
-    Color? color,
+    double size = 26,
   }) {
     return IconButton(
       tooltip: tooltip,
-      icon: Icon(icon, color: color ?? Colors.white70),
+      icon: Icon(icon, size: size, color: Colors.white70),
       onPressed: onPressed,
       // 与封面界面的收藏按钮保持同一尺寸和内边距，切换页面时图标
       // 中心位置不会发生跳动；所有快捷按钮也因此保持同一水平基线。
+      visualDensity: VisualDensity.standard,
+      padding: const EdgeInsets.all(8),
+      constraints: const BoxConstraints(minWidth: 48, minHeight: 48),
+    );
+  }
+
+  /// 汉字图标按钮：用单个中文字（如“词”）代替图标字形，视觉大小
+  /// 按字号对齐同排的 [Icon] 快捷按钮。
+  Widget _charAction(
+    BuildContext context, {
+    required String text,
+    required String tooltip,
+    required VoidCallback? onPressed,
+  }) {
+    return IconButton(
+      tooltip: tooltip,
+      icon: Text(
+        text,
+        style: const TextStyle(
+          fontSize: 22,
+          height: 1,
+          fontWeight: FontWeight.w800,
+          color: Colors.white70,
+        ),
+      ),
+      onPressed: onPressed,
       visualDensity: VisualDensity.standard,
       padding: const EdgeInsets.all(8),
       constraints: const BoxConstraints(minWidth: 48, minHeight: 48),
@@ -8527,7 +8826,6 @@ class _Controls extends ConsumerWidget {
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
-    final scheme = Theme.of(context).colorScheme;
     final player = ref.watch(
       playerProvider.select(
         (state) => (
@@ -8538,13 +8836,12 @@ class _Controls extends ConsumerWidget {
         ),
       ),
     );
-    return _buildControls(context, ref, scheme, player);
+    return _buildControls(context, ref, player);
   }
 
   Widget _buildControls(
     BuildContext context,
     WidgetRef ref,
-    ColorScheme scheme,
     ({bool isPlaying, bool isLoading, int playMode, bool hasQueue}) player,
   ) {
     final icons = [Icons.repeat, Icons.repeat_one, Icons.shuffle];
@@ -8552,7 +8849,7 @@ class _Controls extends ConsumerWidget {
       mainAxisAlignment: MainAxisAlignment.spaceBetween,
       children: [
         IconButton(
-          iconSize: 24,
+          iconSize: 30,
           icon: Icon(icons[player.playMode], color: Colors.white70),
           onPressed: notifier.cyclePlayMode,
         ),
@@ -8561,38 +8858,26 @@ class _Controls extends ConsumerWidget {
           icon: const Icon(Icons.skip_previous, color: Colors.white),
           onPressed: notifier.previous,
         ),
-        // 主题色实心播放键
-        Container(
-          width: 72,
-          height: 72,
-          decoration: BoxDecoration(
-            shape: BoxShape.circle,
-            color: scheme.primary,
-            boxShadow: [
-              BoxShadow(
-                color: scheme.primary.withValues(alpha: 0.4),
-                blurRadius: 20,
-                offset: const Offset(0, 7),
-              ),
-            ],
-          ),
-          child: IconButton(
-            icon: player.isLoading
-                ? const SizedBox(
-                    width: 28,
-                    height: 28,
-                    child: CircularProgressIndicator(
-                      strokeWidth: 2.8,
-                      color: Colors.white,
-                    ),
-                  )
-                : Icon(
-                    player.isPlaying ? Icons.pause : Icons.play_arrow,
+        // 播放键：去掉主题色圆形底与投影，只保留图标本身。
+        IconButton(
+          iconSize: 54,
+          icon: player.isLoading
+              ? const SizedBox(
+                  width: 34,
+                  height: 34,
+                  child: CircularProgressIndicator(
+                    strokeWidth: 2.8,
                     color: Colors.white,
                   ),
-            iconSize: 38,
-            onPressed: player.isLoading ? null : notifier.toggle,
-          ),
+                )
+              : Icon(
+                  player.isPlaying ? Icons.pause : Icons.play_arrow,
+                  color: Colors.white,
+                  shadows: const [
+                    Shadow(color: Colors.black54, blurRadius: 12),
+                  ],
+                ),
+          onPressed: player.isLoading ? null : notifier.toggle,
         ),
         IconButton(
           iconSize: 36,
@@ -8600,7 +8885,7 @@ class _Controls extends ConsumerWidget {
           onPressed: notifier.next,
         ),
         IconButton(
-          iconSize: 24,
+          iconSize: 30,
           icon: const Icon(Icons.queue_music, color: Colors.white70),
           onPressed: !player.hasQueue ? null : () => _showQueue(context, ref),
         ),

@@ -134,10 +134,10 @@ class _QueueSheetState extends ConsumerState<QueueSheet> {
                         .read(playerProvider.notifier)
                         .moveQueueItem(oldIndex, newIndex);
                   },
-                  proxyDecorator: _dragProxyDecorator,
+                  proxyDecorator: queueDragProxyDecorator,
                   itemBuilder: (context, index) {
                     final item = queue[index];
-                    return _QueueRowCard(
+                    return QueueRowCard(
                       key: ValueKey('queue-row-${item.path}#$index'),
                       index: index,
                       item: item,
@@ -165,131 +165,151 @@ class _QueueSheetState extends ConsumerState<QueueSheet> {
         ),
       );
   }
-
-  /// 拖拽跟随预览：条式卡片带阴影浮起，替代默认的全宽 Material。
-  Widget _dragProxyDecorator(
-    Widget child,
-    int index,
-    Animation<double> animation,
-  ) {
-    return AnimatedBuilder(
-      animation: animation,
-      builder: (context, child) {
-        return Material(
-          elevation: 6 * animation.value,
-          borderRadius: BorderRadius.circular(12),
-          color: Colors.transparent,
-          shadowColor: Colors.black54,
-          child: child,
-        );
-      },
-      child: child,
-    );
-  }
 }
 
-/// 单首歌的条式卡片：左滑删除（Dismissible）+ 点按切歌 + 右侧拖拽把手。
-class _QueueRowCard extends StatelessWidget {
-  const _QueueRowCard({
+/// 拖拽跟随预览：条式卡片带阴影浮起，替代默认的全宽 Material。
+/// 供播放队列弹窗与音乐库播放列表共用。
+Widget queueDragProxyDecorator(
+  Widget child,
+  int index,
+  Animation<double> animation,
+) {
+  return AnimatedBuilder(
+    animation: animation,
+    builder: (context, child) {
+      return Material(
+        elevation: 6 * animation.value,
+        borderRadius: BorderRadius.circular(12),
+        color: Colors.transparent,
+        shadowColor: Colors.black54,
+        child: child,
+      );
+    },
+    child: child,
+  );
+}
+
+/// 单首歌的条式卡片：点按切歌 + 右侧拖拽把手。删除方式二选一——
+/// [onDismissed] 提供左滑删除（播放详情页队列），[onDelete] 提供红色
+/// 删除按钮（音乐库播放列表，替换原播放图标的位置）。
+class QueueRowCard extends StatelessWidget {
+  const QueueRowCard({
     super.key,
     required this.index,
     required this.item,
     required this.current,
     required this.onTap,
-    required this.onDismissed,
+    this.onDismissed,
+    this.onDelete,
   });
 
   final int index;
   final QueueItem item;
   final bool current;
   final Future<void> Function() onTap;
-  final VoidCallback onDismissed;
+  final VoidCallback? onDismissed;
+  final VoidCallback? onDelete;
 
-  static const _accent = Color(0xFFEC4141);
+  static const accent = Color(0xFFEC4141);
 
   @override
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
-    return Padding(
+    final card = Padding(
       padding: const EdgeInsets.fromLTRB(12, 4, 12, 4),
-      child: Dismissible(
-        key: ValueKey('queue-dismiss-${item.path}#${identityHashCode(item)}'),
-        direction: DismissDirection.endToStart,
-        background: _dismissBackdrop(scheme),
-        secondaryBackground: _dismissBackdrop(scheme),
-        onDismissed: (_) => onDismissed(),
-        child: Material(
-          color: current
-              ? _accent.withValues(alpha: .08)
-              : scheme.surfaceContainerHigh,
-          shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(12),
-            side: current
-                ? BorderSide(color: _accent.withValues(alpha: .35))
-                : BorderSide(
-                    color: scheme.outlineVariant.withValues(alpha: .5),
-                  ),
-          ),
-          clipBehavior: Clip.antiAlias,
-          child: InkWell(
-            onTap: onTap,
-            child: SizedBox(
-              height: 68,
-              child: Row(
-                children: [
-                  const SizedBox(width: 12),
-                  // 与歌曲列表一致的封面图标：本地读内嵌封面、在线用
-                  // coverUrl，无封面时显示渐变音符占位。
-                  _songCover(),
-                  const SizedBox(width: 12),
-                  Expanded(
-                    child: Column(
-                      mainAxisAlignment: MainAxisAlignment.center,
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text(
-                          item.title,
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: TextStyle(
-                            fontSize: 15,
-                            color: current ? _accent : scheme.onSurface,
-                            fontWeight: current
-                                ? FontWeight.w700
-                                : FontWeight.w500,
-                          ),
-                        ),
-                        const SizedBox(height: 2),
-                        Text(
-                          _subtitle(),
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: TextStyle(
-                            fontSize: 12.5,
-                            color: scheme.onSurfaceVariant,
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
-                  ReorderableDragStartListener(
-                    index: index,
-                    child: Padding(
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 10,
-                        vertical: 8,
+      child: _cardBody(scheme),
+    );
+    final dismiss = onDismissed;
+    if (dismiss == null) return card;
+    return Dismissible(
+      key: ValueKey('queue-dismiss-${item.path}#${identityHashCode(item)}'),
+      direction: DismissDirection.endToStart,
+      background: _dismissBackdrop(scheme),
+      secondaryBackground: _dismissBackdrop(scheme),
+      onDismissed: (_) => dismiss(),
+      child: card,
+    );
+  }
+
+  Widget _cardBody(ColorScheme scheme) {
+    return Material(
+      color: current
+          ? accent.withValues(alpha: .08)
+          : scheme.surfaceContainerHigh,
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(12),
+        side: current
+            ? BorderSide(color: accent.withValues(alpha: .35))
+            : BorderSide(
+                color: scheme.outlineVariant.withValues(alpha: .5),
+              ),
+      ),
+      clipBehavior: Clip.antiAlias,
+      child: InkWell(
+        onTap: onTap,
+        child: SizedBox(
+          height: 68,
+          child: Row(
+            children: [
+              const SizedBox(width: 12),
+              // 与歌曲列表一致的封面图标：本地读内嵌封面、在线用
+              // coverUrl，无封面时显示渐变音符占位。
+              _songCover(),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      item.title,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        fontSize: 15,
+                        color: current ? accent : scheme.onSurface,
+                        fontWeight: current
+                            ? FontWeight.w700
+                            : FontWeight.w500,
                       ),
-                      child: Icon(
-                        Icons.drag_handle,
-                        size: 24,
+                    ),
+                    const SizedBox(height: 2),
+                    Text(
+                      _subtitle(),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        fontSize: 12.5,
                         color: scheme.onSurfaceVariant,
                       ),
                     ),
-                  ),
-                  const SizedBox(width: 4),
-                ],
+                  ],
+                ),
               ),
-            ),
+              ReorderableDragStartListener(
+                index: index,
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 10,
+                    vertical: 8,
+                  ),
+                  child: Icon(
+                    Icons.drag_handle,
+                    size: 24,
+                    color: scheme.onSurfaceVariant,
+                  ),
+                ),
+              ),
+              // 音乐库播放列表：红色删除按钮占据原播放图标的最右侧位置。
+              if (onDelete != null)
+                IconButton(
+                  tooltip: '从播放队列删除',
+                  visualDensity: VisualDensity.compact,
+                  onPressed: onDelete,
+                  icon: const Icon(Icons.delete_outline, color: accent),
+                ),
+              const SizedBox(width: 4),
+            ],
           ),
         ),
       ),
@@ -349,7 +369,7 @@ class _QueueRowCard extends StatelessWidget {
             child: Container(
               padding: const EdgeInsets.all(3),
               decoration: const BoxDecoration(
-                color: _accent,
+                color: accent,
                 shape: BoxShape.circle,
               ),
               child: const Icon(

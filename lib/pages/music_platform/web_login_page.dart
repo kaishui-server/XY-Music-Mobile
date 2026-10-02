@@ -259,6 +259,7 @@ class _WebLoginPageState extends ConsumerState<WebLoginPage> {
         (value) => (
           path: value.valueOrNull?.customBackgroundPath ?? '',
           blur: value.valueOrNull?.customBackgroundBlur ?? 18.0,
+          fade: value.valueOrNull?.customBackgroundFade ?? 0.0,
         ),
       ),
     );
@@ -267,6 +268,7 @@ class _WebLoginPageState extends ConsumerState<WebLoginPage> {
       // 避免透明 Scaffold 造成“两页叠加”。
       imagePath: backgroundSettings.path,
       blur: backgroundSettings.blur,
+      fade: backgroundSettings.fade,
       child: Scaffold(
         appBar: AppBar(
           leading: const BackButton(),

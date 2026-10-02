@@ -24,6 +24,7 @@ import '../../src/ui/xy_surface.dart';
 import '../../src/widgets/batch_download.dart';
 import '../../src/widgets/cover_image.dart';
 import '../../src/widgets/frosted_search_field.dart';
+import '../../src/widgets/queue_sheet.dart';
 import '../../src/widgets/song_list_view.dart';
 import '../../src/widgets/source_switch.dart';
 import '../../src/widgets/top_notice.dart';
@@ -121,6 +122,14 @@ class _MusicLibraryPageState extends ConsumerState<MusicLibraryPage>
   final TextEditingController _folderSearchController = TextEditingController();
   final FocusNode _folderSearchFocus = FocusNode();
 
+  // ---- 播放列表分页状态 ----
+  /// 播放列表（播放队列）的滚动控制器：「定位当前播放」按钮用它把正在
+  /// 播放的歌曲滚动到可视区中部。
+  final ScrollController _queueScrollController = ScrollController();
+
+  /// 队列单行高度（卡片 68 + 上下各 4 的间隙），用于精确定位当前播放曲。
+  static const double _queueItemExtent = 76;
+
   @override
   void initState() {
     super.initState();
@@ -156,6 +165,7 @@ class _MusicLibraryPageState extends ConsumerState<MusicLibraryPage>
     _recentSearchFocus.dispose();
     _folderSearchController.dispose();
     _folderSearchFocus.dispose();
+    _queueScrollController.dispose();
     super.dispose();
   }
 
@@ -1146,7 +1156,7 @@ class _MusicLibraryPageState extends ConsumerState<MusicLibraryPage>
       children: [
         _TabHeaderBar(
           countLabel: '${playlists.length} 个歌单',
-          onPlayAll: () => _playAllPlaylists(),
+          onAction: () => _playAllPlaylists(),
         ),
         Expanded(
           child: ListView.builder(
@@ -1597,7 +1607,7 @@ class _MusicLibraryPageState extends ConsumerState<MusicLibraryPage>
       children: [
         _TabHeaderBar(
           countLabel: '${sortedSongs.length} 首歌曲',
-          onPlayAll: () =>
+          onAction: () =>
               ref.read(libraryProvider.notifier).playAll(sortedSongs),
         ),
         Expanded(
@@ -1678,7 +1688,7 @@ class _MusicLibraryPageState extends ConsumerState<MusicLibraryPage>
       children: [
         _TabHeaderBar(
           countLabel: '${names.length} $unitLabel',
-          onPlayAll: () => ref.read(libraryProvider.notifier).playAll(songs),
+          onAction: () => ref.read(libraryProvider.notifier).playAll(songs),
         ),
         Expanded(
           child: ListView.builder(
@@ -1811,7 +1821,7 @@ class _MusicLibraryPageState extends ConsumerState<MusicLibraryPage>
               countLabel: query.isEmpty
                   ? '${songs.length} 首歌曲'
                   : '${songs.length} / ${entries.length} 首歌曲',
-              onPlayAll: songs.isEmpty
+              onAction: songs.isEmpty
                   ? null
                   : () => ref.read(libraryProvider.notifier).playAll(songs),
             ),
@@ -1841,8 +1851,36 @@ class _MusicLibraryPageState extends ConsumerState<MusicLibraryPage>
   }
 
   // ==========================================================================
-  // 播放列表分页：当前播放队列，点击条目跳转播放。
+  // 播放列表分页：与播放详情页的播放队列同款条式卡片——点按切歌、
+  // 右侧把手拖拽排序、当前曲红色高亮；差异仅在删除方式：用红色删除
+  // 按钮（占据原播放图标的位置）替代左滑删除。
   // ==========================================================================
+
+  /// 删除时按歌曲实例（其次按路径）重新定位最新下标，避免连续删除
+  /// 时用过期下标误删别的歌。
+  int _liveQueueIndex(QueueItem item) {
+    final queue = ref.read(playerProvider).queue;
+    final byIdentity = queue.indexOf(item);
+    if (byIdentity >= 0) return byIdentity;
+    return queue.indexWhere((candidate) => candidate.path == item.path);
+  }
+
+  /// 「定位当前播放」：把正在播放的歌曲滚动到可视区中部。
+  void _scrollToCurrentQueueItem() {
+    if (!_queueScrollController.hasClients) return;
+    final player = ref.read(playerProvider);
+    final index = player.queueIndex;
+    if (index < 0 || index >= player.queue.length) return;
+    final position = _queueScrollController.position;
+    final target = (index * _queueItemExtent -
+            (position.viewportDimension - _queueItemExtent) / 2)
+        .clamp(0.0, position.maxScrollExtent);
+    _queueScrollController.animateTo(
+      target,
+      duration: const Duration(milliseconds: 300),
+      curve: Curves.easeOutCubic,
+    );
+  }
 
   Widget _buildQueueTab(BuildContext context) {
     final queue = ref.watch(playerProvider.select((s) => s.queue));
@@ -1850,62 +1888,46 @@ class _MusicLibraryPageState extends ConsumerState<MusicLibraryPage>
     if (queue.isEmpty) {
       return const _EmptyHint('播放队列为空\n播放一首歌后这里会显示队列');
     }
-    final scheme = Theme.of(context).colorScheme;
     return Column(
       children: [
         _TabHeaderBar(
           countLabel: '${queue.length} 首歌曲',
-          onPlayAll: () => ref.read(playerProvider.notifier).playIndex(0),
+          onAction: _scrollToCurrentQueueItem,
+          actionIcon: Icons.my_location_rounded,
+          actionLabel: '定位当前播放',
         ),
         Expanded(
-          child: ListView.builder(
-            padding: const EdgeInsets.fromLTRB(16, 2, 16, 24),
+          child: ReorderableListView.builder(
+            scrollController: _queueScrollController,
+            // 行高固定，指定 itemExtent 让「定位当前播放」的偏移量精确。
+            itemExtent: _queueItemExtent,
+            // 拖拽只从右侧把手发起，与整行点按切歌的手势互不冲突。
+            buildDefaultDragHandles: false,
+            padding: const EdgeInsets.only(bottom: 16),
             itemCount: queue.length,
+            onReorderItem: (oldIndex, newIndex) {
+              ref
+                  .read(playerProvider.notifier)
+                  .moveQueueItem(oldIndex, newIndex);
+            },
+            proxyDecorator: queueDragProxyDecorator,
             itemBuilder: (context, index) {
               final item = queue[index];
-              final current = index == queueIndex;
-              return Padding(
-                padding: const EdgeInsets.only(bottom: 8),
-                child: XyPanel(
-                  padding: EdgeInsets.zero,
-                  child: ListTile(
-                    contentPadding: const EdgeInsets.symmetric(
-                      horizontal: 12,
-                      vertical: 4,
-                    ),
-                    leading: CoverImage(
-                      songPath: item.path,
-                      imageUrl: item.coverUrl,
-                      width: 44,
-                      height: 44,
-                      radius: 12,
-                    ),
-                    title: Text(
-                      item.title,
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: TextStyle(
-                        fontWeight: FontWeight.w700,
-                        color: current ? scheme.primary : null,
-                      ),
-                    ),
-                    subtitle: Text(
-                      item.artist,
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                    ),
-                    trailing: Icon(
-                      current
-                          ? Icons.graphic_eq_rounded
-                          : Icons.play_arrow_rounded,
-                      color: current
-                          ? scheme.primary
-                          : scheme.onSurfaceVariant,
-                    ),
-                    onTap: () =>
-                        ref.read(playerProvider.notifier).playIndex(index),
-                  ),
-                ),
+              return QueueRowCard(
+                key: ValueKey('library-queue-row-${item.path}#$index'),
+                index: index,
+                item: item,
+                current: index == queueIndex,
+                onTap: () =>
+                    ref.read(playerProvider.notifier).playIndex(index),
+                onDelete: () {
+                  final liveIndex = _liveQueueIndex(item);
+                  if (liveIndex >= 0) {
+                    ref
+                        .read(playerProvider.notifier)
+                        .removeQueueItem(liveIndex);
+                  }
+                },
               );
             },
           ),
@@ -2016,7 +2038,7 @@ class _MusicLibraryPageState extends ConsumerState<MusicLibraryPage>
           countLabel: query.isEmpty
               ? '${root.length} 个根目录'
               : '${nodes.length} / ${root.length} 个根目录',
-          onPlayAll: () => _playFolderSongs(null),
+          onAction: () => _playFolderSongs(null),
         ),
         Expanded(
           child: nodes.isEmpty
@@ -2087,14 +2109,23 @@ class _MusicLibraryPageState extends ConsumerState<MusicLibraryPage>
   }
 }
 
-/// 各分页顶部的「数量 + 播放全部」行。
+/// 各分页顶部的「数量 + 操作按钮」行。
 class _TabHeaderBar extends StatelessWidget {
-  const _TabHeaderBar({required this.countLabel, this.onPlayAll});
+  const _TabHeaderBar({
+    required this.countLabel,
+    this.onAction,
+    this.actionIcon = Icons.play_arrow,
+    this.actionLabel = '播放全部',
+  });
 
   final String countLabel;
 
   /// null 或列表为空时按钮禁用。
-  final VoidCallback? onPlayAll;
+  final VoidCallback? onAction;
+
+  /// 按钮图标与文案；播放列表分页改为「定位当前播放」。
+  final IconData actionIcon;
+  final String actionLabel;
 
   @override
   Widget build(BuildContext context) {
@@ -2112,9 +2143,9 @@ class _TabHeaderBar extends StatelessWidget {
             ),
           ),
           FilledButton.tonalIcon(
-            onPressed: onPlayAll,
-            icon: const Icon(Icons.play_arrow, size: 20),
-            label: const Text('播放全部'),
+            onPressed: onAction,
+            icon: Icon(actionIcon, size: 20),
+            label: Text(actionLabel),
           ),
         ],
       ),
