@@ -7279,11 +7279,12 @@ class _MiniLyrics extends ConsumerWidget {
   final QueueItem item;
   final int offsetTenths;
 
-  /// 展示的最大行数：普通页面 2 行；沉浸模式（播放栏隐藏）4 行，
-  /// 播放栏弹出（上浮动画）时回落 2 行，自动隐藏后恢复 4 行。
+  /// 展示的最大行数（按视觉行计，歌词与翻译各占一行）：普通页面 2 行；
+  /// 沉浸模式（播放栏隐藏）4 行，播放栏弹出（上浮动画）时回落 2 行，
+  /// 自动隐藏后恢复 4 行。因此有翻译时 4 行窗口只放得下当前句 + 下一句。
   final int maxRows;
 
-  /// 翻译跟随当前行展示的字号上限：超过则只显示歌词行，避免展示区
+  /// 翻译跟随歌词展示的字号上限：超过则只显示歌词行，避免展示区
   /// 被小字挤满。
   static const double _singleLineThreshold = 20;
 
@@ -7377,72 +7378,77 @@ class _MiniLyrics extends ConsumerWidget {
     );
   }
 
-  /// 收集窗口内的歌词行（均为独立歌词行）：
-  /// - 4 行模式：上一行（已播放）+ 当前行 + 下两行（未播放）；
-  /// - 2 行模式：当前行 + 下一行。
-  /// 当前行的翻译作为小字紧随其后，不额外占用行数。
+  /// 收集窗口内的歌词行。歌词与翻译各占一行，按「行」而非「句」控制预算：
+  /// - 有翻译（字号 ≤ 阈值且当前句带译文）：4 行窗口 = 当前句 + 下一句
+  ///   （各含歌词与翻译，共 4 行）；2 行窗口 = 仅当前句（歌词 + 翻译）。
+  /// - 无翻译：4 行窗口 = 上一行 + 当前行 + 下两行；2 行窗口 = 当前 + 下一行。
   List<_MiniLyricRow> _collectRows(
     List<LyricLine> lines,
     int active,
     double fontSize,
   ) {
-    final start = maxRows >= 4 ? math.max(0, active - 1) : active;
     final showTranslation = fontSize <= _singleLineThreshold;
+    final activeHasTranslation =
+        showTranslation && lines[active].translation.trim().isNotEmpty;
+    // 有翻译时窗口从当前句起算（上一句不占额度），无翻译时保留上一句做上下文。
+    final start = activeHasTranslation
+        ? active
+        : (maxRows >= 4 ? math.max(0, active - 1) : active);
     final rows = <_MiniLyricRow>[];
-    for (var i = start; i < lines.length && rows.length < maxRows; i++) {
+    var used = 0;
+    for (var i = start; i < lines.length; i++) {
       final text = lines[i].text.trim();
       if (text.isEmpty) continue;
+      final translation = showTranslation ? lines[i].translation.trim() : '';
+      // 歌词恒占 1 行；有译文再加 1 行，超出窗口预算即停止。
+      final cost = translation.isEmpty ? 1 : 2;
+      if (used + cost > maxRows) break;
+      used += cost;
       rows.add(
         _MiniLyricRow(
           text: text,
           isActive: i == active,
-          translation: i == active && showTranslation
-              ? lines[i].translation.trim()
-              : '',
+          translation: translation,
         ),
       );
     }
     return rows;
   }
 
-  /// 单行渲染：当前行高亮加粗（其下可跟随小字翻译），其余行淡色小字。
+  /// 单行渲染：当前行高亮加粗，其余行淡色小字；两者都可在下方跟随
+  /// 一行小字翻译（翻译同样占用展示行数）。
   Widget _rowText(_MiniLyricRow row, double fontSize) {
-    if (!row.isActive) {
-      return Text(
-        row.text,
-        maxLines: 1,
-        overflow: TextOverflow.ellipsis,
-        textAlign: TextAlign.center,
-        style: TextStyle(
-          color: Colors.white.withValues(alpha: .5),
-          fontSize: fontSize * .82,
-          height: 1.3,
-        ),
-      );
-    }
+    final isActive = row.isActive;
     final lyric = Text(
       row.text,
       // 当前行换行上限：四行窗口每行单行；两行窗口仅在无翻译且字号
       // 不大时允许软换行（否则「当前行两行 + 翻译 + 下一行」会超出
       // 展示区高度）。
       maxLines:
-          maxRows <= 2 &&
+          isActive &&
+              maxRows <= 2 &&
               row.translation.isEmpty &&
               fontSize <= _singleLineThreshold
           ? 2
           : 1,
       softWrap: true,
-      overflow: maxRows <= 2
+      overflow: isActive && maxRows <= 2
           ? TextOverflow.clip
           : TextOverflow.ellipsis,
       textAlign: TextAlign.center,
-      style: TextStyle(
-        color: Colors.white,
-        fontSize: fontSize,
-        fontWeight: FontWeight.w700,
-        height: 1.3,
-        shadows: const [Shadow(color: Colors.black54, blurRadius: 10)],
-      ),
+      style: isActive
+          ? TextStyle(
+              color: Colors.white,
+              fontSize: fontSize,
+              fontWeight: FontWeight.w700,
+              height: 1.3,
+              shadows: const [Shadow(color: Colors.black54, blurRadius: 10)],
+            )
+          : TextStyle(
+              color: Colors.white.withValues(alpha: .5),
+              fontSize: fontSize * .82,
+              height: 1.3,
+            ),
     );
     if (row.translation.isEmpty) return lyric;
     return Column(
@@ -7456,8 +7462,8 @@ class _MiniLyrics extends ConsumerWidget {
           overflow: TextOverflow.ellipsis,
           textAlign: TextAlign.center,
           style: TextStyle(
-            color: Colors.white.withValues(alpha: .62),
-            fontSize: fontSize * .78,
+            color: Colors.white.withValues(alpha: isActive ? .62 : .4),
+            fontSize: fontSize * (isActive ? .78 : .72),
             height: 1.3,
           ),
         ),
@@ -7485,7 +7491,7 @@ class _MiniLyrics extends ConsumerWidget {
   }
 }
 
-/// 迷你歌词单行数据：一行歌词，当前行可携带随行小字翻译。
+/// 迷你歌词单行数据：一行歌词，可携带随行小字翻译（翻译另占一行）。
 class _MiniLyricRow {
   const _MiniLyricRow({
     required this.text,
