@@ -19,14 +19,16 @@ import '../playlists/playlists_provider.dart';
 /// 排版与关联歌词面板一致），批量换源自动取最高分。
 
 /// 插件类型标记：BakaMusic 系 / MusicFree / 洛雪 / animemusic（与歌单
-/// 网络导入对话框一致）。
+/// 网络导入对话框、插件管理页分栏一致）。分类只认插件已解析的类型，
+/// 不再按名称包含 "baka" 兜底——MusicFree 通用插件也可能带 Baka 兼容
+/// 分支或名称中含 baka 字样，按名称判定会与分栏不一致。
 String sourcePluginTag(EnabledMusicPlugin plugin) => plugin.isLx
     ? '洛雪'
     : plugin.isAnimemusic
     ? 'animemusic'
-    : (plugin.isBaka || plugin.name.toLowerCase().contains('baka')
-          ? 'BakaMusic'
-          : 'MusicFree');
+    : plugin.isBaka
+    ? 'BakaMusic'
+    : 'MusicFree';
 
 /// 选择换源目标插件的底部菜单（批量换源用）。洛雪插件内含多个平台
 /// （kw/kg/tx/wy/mg），选中后追加二级菜单选择具体平台（或全部）；
@@ -96,11 +98,23 @@ Future<EnabledMusicPlugin?> _pickPlugin(
                     size: 22,
                     color: Theme.of(sheetContext).colorScheme.onSurfaceVariant,
                   ),
-                  title: Text(
-                    plugin.name,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: const TextStyle(fontWeight: FontWeight.w600),
+                  title: Row(
+                    children: [
+                      Flexible(
+                        child: Text(
+                          plugin.name,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(fontWeight: FontWeight.w600),
+                        ),
+                      ),
+                      // 多租户订阅源（IKUN / 聆澜…）里同名音源各有独立授权
+                      // 脚本，名称相同，靠来源标签区分。
+                      if (plugin.sourceLabel?.trim().isNotEmpty == true) ...[
+                        const SizedBox(width: 6),
+                        _SourceLabelTag(label: plugin.sourceLabel!.trim()),
+                      ],
+                    ],
                   ),
                   trailing: Text(
                     sourcePluginTag(plugin),
@@ -685,6 +699,35 @@ class _SourceSwitchSheetState extends ConsumerState<_SourceSwitchSheet> {
           onTap: () => Navigator.pop(context, (plugin, song)),
         );
       },
+    );
+  }
+}
+
+/// 音源来源小标签（IKUN / 聆澜…），与插件管理页的徽标同款样式。
+class _SourceLabelTag extends StatelessWidget {
+  const _SourceLabelTag({required this.label});
+
+  final String label;
+
+  @override
+  Widget build(BuildContext context) {
+    final color = Theme.of(context).colorScheme.tertiary;
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
+      decoration: BoxDecoration(
+        color: color.withValues(alpha: 0.12),
+        borderRadius: BorderRadius.circular(4),
+        border: Border.all(color: color.withValues(alpha: 0.4)),
+      ),
+      child: Text(
+        label,
+        style: TextStyle(
+          fontSize: 10,
+          fontWeight: FontWeight.w600,
+          color: color,
+          height: 1.1,
+        ),
+      ),
     );
   }
 }

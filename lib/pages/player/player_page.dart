@@ -7967,7 +7967,7 @@ class _TimedLyricText extends StatelessWidget {
   }
 }
 
-class _ProgressiveLyricWord extends StatelessWidget {
+class _ProgressiveLyricWord extends StatefulWidget {
   const _ProgressiveLyricWord({
     required this.text,
     required this.style,
@@ -7979,8 +7979,61 @@ class _ProgressiveLyricWord extends StatelessWidget {
   final double progress;
 
   @override
+  State<_ProgressiveLyricWord> createState() => _ProgressiveLyricWordState();
+}
+
+class _ProgressiveLyricWordState extends State<_ProgressiveLyricWord> {
+  /// 已排版的白色字形画笔。文本/样式/缩放未变时跨帧复用以消除逐帧
+  /// TextPainter.layout（字形排版是逐字扫光的主要开销）。
+  TextPainter? _painter;
+  TextStyle? _resolved;
+  String? _layoutText;
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    _ensurePainter();
+  }
+
+  @override
+  void didUpdateWidget(_ProgressiveLyricWord oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.text != widget.text || oldWidget.style != widget.style) {
+      _ensurePainter();
+    }
+  }
+
+  /// 合并 DefaultTextStyle 与主题缩放后按需重排；输入不变则直接复用。
+  void _ensurePainter() {
+    final resolved = DefaultTextStyle.of(context).style.merge(widget.style);
+    final scaler = MediaQuery.textScalerOf(context);
+    if (_painter != null &&
+        _layoutText == widget.text &&
+        _resolved == resolved) {
+      return;
+    }
+    _painter?.dispose();
+    _layoutText = widget.text;
+    _resolved = resolved;
+    _painter = TextPainter(
+      text: TextSpan(
+        text: widget.text,
+        style: resolved.copyWith(color: Colors.white),
+      ),
+      textDirection: TextDirection.ltr,
+      textScaler: scaler,
+    )..layout();
+  }
+
+  @override
+  void dispose() {
+    _painter?.dispose();
+    super.dispose();
+  }
+
+  @override
   Widget build(BuildContext context) {
-    final value = progress.clamp(0.0, 1.0);
+    final value = widget.progress.clamp(0.0, 1.0);
     // 前景画笔方案：child（暗色整词）走普通 Text 渲染路径，与未扫光
     // 的词完全一致；白色字形由 TextPainter 按相同 style 绘制并水平裁剪。
     // 不引入 saveLayer/混合模式，WidgetSpan 内字形底部（下降部）不会
@@ -7990,51 +8043,39 @@ class _ProgressiveLyricWord extends StatelessWidget {
     // WidgetSpan 内的 Text 会与 DefaultTextStyle 合并（字体族等来自
     // 主题）；画笔必须用同一份合并后的样式布局，否则 child 与画笔
     // 用两套字体渲染出大小不一的重影。
-    final resolved = DefaultTextStyle.of(context).style.merge(style);
+    final resolved = _resolved ?? widget.style;
     final dim = Colors.white.withValues(alpha: .55);
     if (value <= 0) {
-      return Text(text, style: resolved.copyWith(color: dim));
+      return Text(widget.text, style: resolved.copyWith(color: dim));
     }
     if (value >= 1) {
-      return Text(text, style: resolved.copyWith(color: Colors.white));
+      return Text(widget.text, style: resolved.copyWith(color: Colors.white));
     }
     return CustomPaint(
       foregroundPainter: _SweepWordPainter(
-        text: text,
-        style: resolved,
+        painter: _painter,
         progress: value,
-        textScaler: MediaQuery.textScalerOf(context),
       ),
-      child: Text(text, style: resolved.copyWith(color: dim)),
+      child: Text(widget.text, style: resolved.copyWith(color: dim)),
     );
   }
 }
 
 /// 逐字扫光前景画笔：在暗色整词之上，按进度水平裁剪绘制白色字形。
+///
+/// 画笔只负责裁剪绘制，字形由 [_ProgressiveLyricWordState] 预排版并复用，
+/// 因此每次 paint 不再触发 TextPainter.layout；画笔本身不持有/释放
+/// TextPainter（原生 Paragraph 由 State 在其 dispose 时统一释放）。
 class _SweepWordPainter extends CustomPainter {
-  _SweepWordPainter({
-    required this.text,
-    required this.style,
-    required this.progress,
-    required this.textScaler,
-  });
+  _SweepWordPainter({required this.painter, required this.progress});
 
-  final String text;
-  final TextStyle style;
+  final TextPainter? painter;
   final double progress;
-  final TextScaler textScaler;
 
   @override
   void paint(Canvas canvas, Size size) {
-    if (progress <= 0) return;
-    final tp = TextPainter(
-      text: TextSpan(
-        text: text,
-        style: style.copyWith(color: Colors.white),
-      ),
-      textDirection: TextDirection.ltr,
-      textScaler: textScaler,
-    )..layout();
+    final tp = painter;
+    if (tp == null || progress <= 0) return;
     final clipWidth = tp.width * progress.clamp(0.0, 1.0);
     if (clipWidth <= 0) return;
     canvas.save();
@@ -8045,7 +8086,7 @@ class _SweepWordPainter extends CustomPainter {
 
   @override
   bool shouldRepaint(_SweepWordPainter old) =>
-      old.progress != progress || old.text != text;
+      old.progress != progress || old.painter != painter;
 }
 
 /// 毛玻璃控制卡：标题 + 进度 + 播放控制。

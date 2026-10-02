@@ -323,7 +323,7 @@ class BackupService {
   /// 把曲库 songs 表（columns + rows）转成 {path: 行 Map} 索引，
   /// 供音乐列表给本地歌曲补全标题/歌手/专辑/时长/格式。结构不符
   /// 或没有 path 列时返回空表（本地歌退化为仅带路径）。
-  Map<String, Map<String, Object>> _buildSongsIndex(
+  Map<String, Map<String, Object?>> _buildSongsIndex(
     Map<String, dynamic> library,
   ) {
     final songs = library['songs'];
@@ -337,7 +337,7 @@ class BackupService {
     }
     final pathIdx = colIndex['path'];
     if (pathIdx == null) return const {};
-    final index = <String, Map<String, Object>>{};
+    final index = <String, Map<String, Object?>>{};
     for (final row in rows) {
       if (row is! List || pathIdx >= row.length) continue;
       final path = row[pathIdx];
@@ -353,7 +353,7 @@ class BackupService {
   /// 收藏表（id 固定为 favorite，与 MusicFree 的「我喜欢」一致）。
   Map<String, Object?> _buildFavoriteSheet(
     SharedPreferences prefs,
-    Map<String, Map<String, Object>> songsIndex,
+    Map<String, Map<String, Object?>> songsIndex,
   ) {
     final paths = prefs.getStringList('favoritePaths') ?? const <String>[];
     final meta = _decodeJsonMap(prefs.getString('favoriteSongMetadataV1'));
@@ -380,7 +380,7 @@ class BackupService {
   /// 各歌单曲（每张歌单一个 musicSheet，字段名对齐 MobilePlaylist）。
   List<Map<String, Object?>> _buildPlaylistSheets(
     SharedPreferences prefs,
-    Map<String, Map<String, Object>> songsIndex,
+    Map<String, Map<String, Object?>> songsIndex,
   ) {
     final raw = prefs.getString('mobilePlaylistsV1');
     if (raw == null || raw.isEmpty) return const [];

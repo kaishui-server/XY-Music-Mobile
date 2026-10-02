@@ -22,6 +22,14 @@ class Song {
   final String? pluginId;
   final Map<String, dynamic>? pluginData;
   final String? lyricsRaw;
+
+  /// 文件名（不含目录），用于“按文件名”排序；缺失时回落到 path 的末段。
+  final String fileName;
+
+  /// 入库时间 / 文件修改时间（秒或毫秒，仅用于时间排序比较）。
+  final int addedAt;
+  final int fileModifiedAt;
+
   const Song({
     required this.path,
     required this.title,
@@ -35,19 +43,36 @@ class Song {
     this.pluginId,
     this.pluginData,
     this.lyricsRaw,
+    this.fileName = '',
+    this.addedAt = 0,
+    this.fileModifiedAt = 0,
   });
 
-  factory Song.fromJson(Map<String, dynamic> j) => Song(
-    path: j['path'] as String? ?? '',
-    title: j['title'] as String? ?? '',
-    artist: j['artist'] as String? ?? '',
-    album: j['album'] as String? ?? '',
-    albumKey: j['album_key'] as String? ?? '',
-    duration: (j['duration'] as num?)?.toInt() ?? 0,
-    format: j['format'] as String? ?? '',
-    coverThumbPath: j['cover_thumb_path'] as String?,
-    coverUrl: j['cover_url'] as String?,
-  );
+  factory Song.fromJson(Map<String, dynamic> j) {
+    final path = j['path'] as String? ?? '';
+    // Rust LibrarySong 未重命名字段，序列化为 snake_case；兼容 camelCase。
+    final rawName = (j['name'] ?? j['fileName']) as String? ?? '';
+    return Song(
+      path: path,
+      title: j['title'] as String? ?? '',
+      artist: j['artist'] as String? ?? '',
+      album: j['album'] as String? ?? '',
+      albumKey: j['album_key'] as String? ?? '',
+      duration: (j['duration'] as num?)?.toInt() ?? 0,
+      format: j['format'] as String? ?? '',
+      coverThumbPath: j['cover_thumb_path'] as String?,
+      coverUrl: j['cover_url'] as String?,
+      fileName: rawName.isNotEmpty ? rawName : _fileNameFromPath(path),
+      addedAt: (j['added_at'] as num?)?.toInt() ?? 0,
+      fileModifiedAt: (j['file_modified_at'] as num?)?.toInt() ?? 0,
+    );
+  }
+
+  static String _fileNameFromPath(String path) {
+    final normalized = path.replaceAll('\\', '/');
+    final index = normalized.lastIndexOf('/');
+    return index < 0 ? normalized : normalized.substring(index + 1);
+  }
 
   QueueItem toQueueItem() => QueueItem(
     path: path,

@@ -37,8 +37,14 @@ class MainActivity : AudioServiceActivity() {
         private const val DEEPLINK_CHANNEL = "com.xymusic.mobile/deeplink"
         private const val MEDIA_BUTTON_CHANNEL = "com.xymusic.mobile/media_buttons"
         private const val VOLUME_KEY_CHANNEL = "com.xymusic.mobile/volume_keys"
+        private const val MINI_PLAYER_CHANNEL = "com.xymusic.mobile/mini_player"
         private const val CAPTURE_REQUEST = 4217
         private const val DIRECTORY_REQUEST = 4218
+
+        /// audio_service 单击媒体通知时拉起 Activity 所用的固定 action
+        /// （对应 AudioService.NOTIFICATION_CLICK_ACTION）。
+        private const val NOTIFICATION_CLICK_ACTION =
+            "com.ryanheise.audioservice.NOTIFICATION_CLICK"
     }
 
     private var pendingStartResult: MethodChannel.Result? = null
@@ -46,6 +52,14 @@ class MainActivity : AudioServiceActivity() {
     private var deepLinkChannel: MethodChannel? = null
     private var pendingDeepLink: String? = null
     private var mediaButtonChannel: MethodChannel? = null
+
+    /// 迷你播放器悬浮窗通道：Dart 侧据此启停浮窗、同步播放状态，并接收
+    /// 浮窗内按钮/进度条的操作回调。
+    private var miniPlayerChannel: MethodChannel? = null
+
+    /// 通知栏单击发生在 Flutter 引擎就绪前（冷启动）时置位，等通道建好
+    /// 再通知 Dart 打开迷你播放器悬浮窗。
+    private var pendingMiniPlayerRequest = false
 
     /// 音量键拦截开关（Flutter 侧按设置推送）：开启时应用前台的
     /// 音量键只调本应用播放音量，不动系统媒体音量。
@@ -65,6 +79,9 @@ class MainActivity : AudioServiceActivity() {
         CrashHandler.install(this)
         // 冷启动深链暂存：Flutter 引擎就绪后由 getInitialDeepLink 取走。
         pendingDeepLink = extractDeepLink(intent)
+        // 通知栏单击冷启动：通知 Dart 打开迷你播放器悬浮窗（通道未就绪时
+        // 先暂存，见 requestMiniPlayerFromNotification）。
+        if (isNotificationClick(intent)) requestMiniPlayerFromNotification()
         acquirePlaybackWifiLock()
     }
 
@@ -103,7 +120,68 @@ class MainActivity : AudioServiceActivity() {
         extractDeepLink(intent)?.let { raw ->
             deepLinkChannel?.invokeMethod("onDeepLink", raw)
         }
+        // 通知栏单击：通知 Dart 打开迷你播放器悬浮窗。
+        if (isNotificationClick(intent)) requestMiniPlayerFromNotification()
     }
+
+    /// 是否为系统媒体通知的单击拉起（audio_service 固定 action）。
+    /// 这里直接用字面量而非 `AudioService.NOTIFICATION_CLICK_ACTION`：
+    /// 引用该类会使 Kotlin 要求其父类 androidx.media.MediaBrowserServiceCompat
+    /// 出现在 app 模块编译类路径上，而 app 并未直接依赖 androidx.media。
+    private fun isNotificationClick(intent: Intent?): Boolean =
+        intent?.action == NOTIFICATION_CLICK_ACTION
+
+    /// 通知栏单击后请求 Dart 打开迷你播放器悬浮窗。Dart 侧会把设置开关
+    /// 置为开启并回调 setEnabled，由统一的 setEnabled 链路完成悬浮窗权限
+    /// 校验与启动，避免原生/Dart 两处各起一次浮窗。通道未就绪（冷启动
+    /// 早于 Flutter 引擎）时暂存，等 configureFlutterEngine 建好通道再发。
+    private fun requestMiniPlayerFromNotification() {
+        val channel = miniPlayerChannel
+        if (channel == null) {
+            pendingMiniPlayerRequest = true
+            return
+        }
+        try {
+            channel.invokeMethod("onNotificationClick", null)
+        } catch (_: Exception) {
+            // 引擎已销毁时忽略。
+        }
+    }
+
+    /// 音频效果能力探测结果缓存（null 表示尚未探测）。
+    @Volatile
+    private var audioEffectsProbe: Map<String, Boolean>? = null
+
+    /// 探测音频 HAL 是否提供系统均衡器/响度增益效果。
+    ///
+    /// 部分机型（实测 OnePlus Android 16）的音频 HAL 不含均衡器实现，
+    /// `android.media.audiofx.AudioEffect` 构造时抛 RuntimeException
+    /// （"Cannot initialize effect engine for type: 0bed4300-... Error: -3"）。
+    /// just_audio 一旦被注入 AndroidEqualizer，就会在 audio session 建立
+    /// （每次 load / 切歌）时构造 Equalizer；该异常发生在主线程且无人
+    /// 捕获，会直接把整个进程判为崩溃退出。这里用全局会话（0）试建一次
+    /// 得出能力结论，宿主据此决定是否向播放管线注入对应效果。
+    private fun probeAudioEffects(): Map<String, Boolean> {
+        audioEffectsProbe?.let { return it }
+        val result = mapOf(
+            "equalizer" to canCreateAudioEffect {
+                android.media.audiofx.Equalizer(0, 0).release()
+            },
+            "loudnessEnhancer" to canCreateAudioEffect {
+                android.media.audiofx.LoudnessEnhancer(0).release()
+            },
+        )
+        audioEffectsProbe = result
+        return result
+    }
+
+    private inline fun canCreateAudioEffect(create: () -> Unit): Boolean =
+        try {
+            create()
+            true
+        } catch (_: Throwable) {
+            false
+        }
 
     /// 提取 xymusic:// 深链（分享落地页拉起播放）。
     private fun extractDeepLink(intent: Intent?): String? {
@@ -133,6 +211,116 @@ class MainActivity : AudioServiceActivity() {
                     result.notImplemented()
                 }
             }
+        }
+        val miniChannel = MethodChannel(
+            flutterEngine.dartExecutor.binaryMessenger,
+            MINI_PLAYER_CHANNEL,
+        )
+        miniPlayerChannel = miniChannel
+        // 浮窗按钮/进度条操作回传 Dart：在播放层执行切歌/暂停/seek。
+        MiniPlayerOverlayService.actionReporter = { action, value ->
+            try {
+                miniChannel.invokeMethod(
+                    "onAction",
+                    mapOf("action" to action, "value" to value),
+                )
+            } catch (_: Exception) {
+                // 引擎已销毁时忽略。
+            }
+        }
+        // 浮窗关闭按钮被点击后回传 Dart，同步关闭设置里的迷你播放器开关。
+        MiniPlayerOverlayService.closeReporter = {
+            try {
+                miniChannel.invokeMethod("onCloseRequested", null)
+            } catch (_: Exception) {
+                // 引擎已销毁时忽略。
+            }
+        }
+        miniChannel.setMethodCallHandler { call, result ->
+            when (call.method) {
+                "setEnabled" -> {
+                    val enabled = call.argument<Boolean>("enabled") == true
+                    if (!enabled) {
+                        stopService(Intent(this, MiniPlayerOverlayService::class.java))
+                        result.success(true)
+                        return@setMethodCallHandler
+                    }
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M &&
+                        !Settings.canDrawOverlays(this)
+                    ) {
+                        startActivity(
+                            Intent(
+                                Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                                Uri.parse("package:$packageName"),
+                            ),
+                        )
+                        result.success(false)
+                        return@setMethodCallHandler
+                    }
+                    try {
+                        startService(
+                            Intent(this, MiniPlayerOverlayService::class.java).apply {
+                                action = MiniPlayerOverlayService.ACTION_SHOW
+                            },
+                        )
+                        result.success(true)
+                    } catch (_: Exception) {
+                        result.success(false)
+                    }
+                }
+                "update" -> {
+                    val params = MiniPlayerUpdateParams(
+                        title = call.argument<String>("title") ?: "",
+                        artist = call.argument<String>("artist") ?: "",
+                        isPlaying = call.argument<Boolean>("isPlaying") == true,
+                        isLoading = call.argument<Boolean>("isLoading") == true,
+                        positionMs = call.argument<Number>("positionMs")?.toLong() ?: 0L,
+                        durationMs = call.argument<Number>("durationMs")?.toLong() ?: 0L,
+                        playMode = call.argument<Number>("playMode")?.toInt() ?: 0,
+                        coverPath = call.argument<String>("coverPath") ?: "",
+                        queueJson = call.argument<String>("queueJson") ?: "",
+                        queueIndex = call.argument<Number>("queueIndex")?.toInt() ?: -1,
+                    )
+                    // 服务已在运行时直连分发，省去每次进度刷新的 startService
+                    // binder 往返；未运行（被系统回收）时才拉起服务恢复浮窗。
+                    val running = MiniPlayerOverlayService.instance
+                    if (running != null) {
+                        try {
+                            running.applyUpdate(params)
+                            result.success(true)
+                        } catch (_: Exception) {
+                            result.success(false)
+                        }
+                        return@setMethodCallHandler
+                    }
+                    try {
+                        startService(
+                            Intent(this, MiniPlayerOverlayService::class.java).apply {
+                                action = MiniPlayerOverlayService.ACTION_UPDATE
+                                putExtra("title", params.title)
+                                putExtra("artist", params.artist)
+                                putExtra("isPlaying", params.isPlaying)
+                                putExtra("isLoading", params.isLoading)
+                                putExtra("positionMs", params.positionMs)
+                                putExtra("durationMs", params.durationMs)
+                                putExtra("playMode", params.playMode)
+                                putExtra("coverPath", params.coverPath)
+                                putExtra("queueJson", params.queueJson)
+                                putExtra("queueIndex", params.queueIndex)
+                            },
+                        )
+                        result.success(true)
+                    } catch (_: Exception) {
+                        result.success(false)
+                    }
+                }
+                else -> result.notImplemented()
+            }
+        }
+        // 冷启动通知栏单击：通道就绪后补发一次打开请求。
+        if (pendingMiniPlayerRequest) {
+            pendingMiniPlayerRequest = false
+            requestMiniPlayerFromNotification()
         }
         deepLinkChannel = MethodChannel(
             flutterEngine.dartExecutor.binaryMessenger,
@@ -404,6 +592,10 @@ class MainActivity : AudioServiceActivity() {
                     result.success(CrashHandler.crashDir(this).absolutePath)
                     return@setMethodCallHandler
                 }
+                if (call.method == "probeAudioEffects") {
+                    result.success(probeAudioEffects())
+                    return@setMethodCallHandler
+                }
                 if (call.method != "getDeviceInfo") {
                     result.notImplemented()
                     return@setMethodCallHandler
@@ -456,7 +648,26 @@ class MainActivity : AudioServiceActivity() {
                     result.error("INSTALL_FAILED", error.message ?: "无法打开安装程序", null)
                 }
             }
-        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, DESKTOP_LYRICS_CHANNEL)
+        val desktopLyricsChannel =
+            MethodChannel(flutterEngine.dartExecutor.binaryMessenger, DESKTOP_LYRICS_CHANNEL)
+        // 手动拖动浮窗后把纵向位置（百分制）回传 Dart，让设置页滑块与
+        // 实际位置同步，避免下一次进度更新用旧滑块值把浮窗拉回（位置复位）。
+        DesktopLyricsService.positionReporter = { percent ->
+            try {
+                desktopLyricsChannel.invokeMethod("onPositionChanged", percent)
+            } catch (_: Exception) {
+                // 引擎已销毁时忽略。
+            }
+        }
+        // 浮窗关闭按钮被点击后回传 Dart，同步关闭设置里的桌面歌词开关。
+        DesktopLyricsService.closeReporter = {
+            try {
+                desktopLyricsChannel.invokeMethod("onCloseRequested", null)
+            } catch (_: Exception) {
+                // 引擎已销毁时忽略。
+            }
+        }
+        desktopLyricsChannel
             .setMethodCallHandler { call, result ->
                 when (call.method) {
                     "setEnabled" -> {
@@ -512,8 +723,8 @@ class MainActivity : AudioServiceActivity() {
                                 ?: 0xFF18181C.toInt(),
                             backgroundOpacity = call.argument<Number>("backgroundOpacity")
                                 ?.toFloat() ?: .85f,
-                            verticalOffset = call.argument<Number>("verticalOffset")
-                                ?.toFloat() ?: 0f,
+                            verticalPercent = call.argument<Number>("verticalPercent")
+                                ?.toFloat() ?: 90f,
                             lyricFontPath = call.argument<String>("lyricFontPath") ?: "",
                         )
                         // 服务已在运行时直连分发，省去每次进度刷新的
@@ -547,7 +758,7 @@ class MainActivity : AudioServiceActivity() {
                                     putExtra("translationFontSize", params.translationFontSize)
                                     putExtra("backgroundColor", params.backgroundColor)
                                     putExtra("backgroundOpacity", params.backgroundOpacity)
-                                    putExtra("verticalOffset", params.verticalOffset)
+                                    putExtra("verticalPercent", params.verticalPercent)
                                     putExtra("lyricFontPath", params.lyricFontPath)
                                 },
                             )

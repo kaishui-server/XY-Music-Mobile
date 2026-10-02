@@ -13,6 +13,7 @@ import 'src/deeplink/deep_link_handler.dart';
 import 'src/core/settings.dart';
 import 'src/navigation/animated_page_route.dart';
 import 'src/library/library_provider.dart';
+import 'src/player/mini_player_overlay.dart';
 import 'src/player/player_provider.dart';
 import 'src/navigation/routes.dart';
 import 'src/ui/xy_theme.dart';
@@ -105,6 +106,8 @@ class _XyMusicAppState extends ConsumerState<XyMusicApp>
     Future.microtask(() => ref.read(libraryProvider.notifier));
     // 分享深链（xymusic://song?...）：注册原生回调 + 取回冷启动深链。
     Future.microtask(() => XyDeepLink.init(ref, appRouter));
+    // 迷你播放器悬浮窗桥：接收原生按钮/进度条操作与通知栏单击回调。
+    MiniPlayerOverlayBridge.init(ref);
   }
 
   @override
@@ -261,6 +264,18 @@ class _XyMusicAppState extends ConsumerState<XyMusicApp>
         duration: const Duration(milliseconds: 1100),
       );
     });
+    // 迷你播放器悬浮窗：开关变化立即同步（含授予权限后的首次显示），
+    // 播放状态变化按节流增量同步（换歌/进度/播放态/队列）。
+    ref.listen<bool>(
+      settingsProvider.select(
+        (s) => s.valueOrNull?.miniPlayerOverlayEnabled ?? false,
+      ),
+      (_, _) => MiniPlayerOverlayBridge.requestSync(immediate: true),
+    );
+    ref.listen<PlaybackState>(
+      playerProvider,
+      (_, _) => MiniPlayerOverlayBridge.requestSync(),
+    );
     // 同步页面切换模式到路由层（transitionsBuilder 无法访问 ref）。
     xyPageTransitionMode =
         settings?.pageTransitionMode ?? PageTransitionMode.fade;

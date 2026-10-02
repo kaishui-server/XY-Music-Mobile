@@ -36,6 +36,27 @@ final XyAndroidEqualizer xyAndroidEqualizer = XyAndroidEqualizer();
 final XyAndroidLoudnessEnhancer xyLoudnessEnhancer =
     XyAndroidLoudnessEnhancer();
 
+/// XY Music 本地补丁：设备原生音频效果可用性。
+///
+/// 宿主应在初始化音频之前探测并写入结果（见 [xySetAndroidAudioEffectsSupported]）。
+/// 部分机型（实测 OnePlus Android 16）的音频 HAL 不提供系统均衡器实现，
+/// `android.media.audiofx.AudioEffect` 构造时抛 RuntimeException
+/// （"Cannot initialize effect engine for type: 0bed4300-... Error: -3"）。
+/// just_audio 只要被注入 AndroidEqualizer/AndroidLoudnessEnhancer，就会在
+/// audio session 建立时构造对应效果；该异常发生在主线程且无人捕获，会直接
+/// 把整个进程判为崩溃退出。因此不可用时干脆不注入，音效在该机型上降级。
+bool xyAndroidEqualizerSupported = true;
+bool xyAndroidLoudnessEnhancerSupported = true;
+
+/// 写入原生音频效果能力探测结果（宿主在音频初始化前调用一次）。
+void xySetAndroidAudioEffectsSupported({
+  required bool equalizer,
+  required bool loudnessEnhancer,
+}) {
+  xyAndroidEqualizerSupported = equalizer;
+  xyAndroidLoudnessEnhancerSupported = loudnessEnhancer;
+}
+
 /// 均衡器单个频段的可读信息。
 class XyEqualizerBandInfo {
   const XyEqualizerBandInfo({
@@ -726,24 +747,30 @@ class _PlayerAudioHandler extends BaseAudioHandler
           maxDecibels: 15,
           bands: defaultBands,
         );
+        // 设备能力探测：音频 HAL 不提供对应效果时（见
+        // [xyAndroidEqualizerSupported]）不注入，否则原生构造 AudioEffect
+        // 会抛未捕获异常直接杀死进程。
+        final injectedAudioEffects = <AudioEffectMessage>[
+          ...initRequest.androidAudioEffects.where((effect) =>
+              effect is! AndroidEqualizerMessage &&
+              effect is! AndroidLoudnessEnhancerMessage),
+        ];
+        if (xyAndroidEqualizerSupported) {
+          injectedAudioEffects.add(
+            AndroidEqualizerMessage(enabled: false, parameters: defaultParams),
+          );
+        }
+        if (xyAndroidLoudnessEnhancerSupported) {
+          // 响度增益（整体 dB）与均衡器同机制注入：默认停用 + 占位
+          // 参数，宿主经 xyLoudnessEnhancer 门面在 load 后按需启用。
+          injectedAudioEffects.add(
+            AndroidLoudnessEnhancerMessage(enabled: false, targetGain: 0),
+          );
+        }
         final realInit = InitRequest(
           id: initRequest.id,
           audioLoadConfiguration: initRequest.audioLoadConfiguration,
-          androidAudioEffects: [
-            ...initRequest.androidAudioEffects.where((effect) =>
-                effect is! AndroidEqualizerMessage &&
-                effect is! AndroidLoudnessEnhancerMessage),
-            AndroidEqualizerMessage(
-              enabled: false,
-              parameters: defaultParams,
-            ),
-            // 响度增益（整体 dB）与均衡器同机制注入：默认停用 + 占位
-            // 参数，宿主经 xyLoudnessEnhancer 门面在 load 后按需启用。
-            AndroidLoudnessEnhancerMessage(
-              enabled: false,
-              targetGain: 0,
-            ),
-          ],
+          androidAudioEffects: injectedAudioEffects,
           darwinAudioEffects: initRequest.darwinAudioEffects,
           androidAudioOffloadPreferences:
               initRequest.androidAudioOffloadPreferences,

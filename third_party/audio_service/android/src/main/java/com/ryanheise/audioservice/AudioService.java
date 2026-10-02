@@ -392,22 +392,41 @@ public class AudioService extends MediaBrowserServiceCompat {
             ? config.androidNotificationChannelId
             : getApplication().getPackageName() + ".channel";
 
-        if (config.activityClassName != null) {
-            Context context = getApplicationContext();
-            Intent intent = new Intent((String)null);
-            intent.setComponent(new ComponentName(context, config.activityClassName));
-            //Intent intent = new Intent(context, config.activityClassName);
-            intent.setAction(NOTIFICATION_CLICK_ACTION);
-            int flags = PendingIntent.FLAG_UPDATE_CURRENT;
-            if (Build.VERSION.SDK_INT >= 23) {
-                flags |= PendingIntent.FLAG_IMMUTABLE;
+        Context context = getApplicationContext();
+        Intent intent = new Intent((String)null);
+        int flags = PendingIntent.FLAG_UPDATE_CURRENT;
+        if (Build.VERSION.SDK_INT >= 23) {
+            flags |= PendingIntent.FLAG_IMMUTABLE;
+        }
+        if (config.androidNotificationClickStartsActivity) {
+            if (config.activityClassName != null) {
+                intent.setComponent(new ComponentName(context, config.activityClassName));
+                //Intent intent = new Intent(context, config.activityClassName);
+                intent.setAction(NOTIFICATION_CLICK_ACTION);
+                contentIntent = PendingIntent.getActivity(context, REQUEST_CONTENT_INTENT, intent, flags);
+            } else {
+                contentIntent = null;
             }
-            contentIntent = PendingIntent.getActivity(context, REQUEST_CONTENT_INTENT, intent, flags);
         } else {
-            contentIntent = null;
+            // XY Music 定制：单击通知不拉起 Activity（否则会把应用切到前台），
+            // 改为向进程内广播单击事件，由 NotificationClickReceiver 转交 Dart
+            // 的 AudioHandler，从而只弹出迷你播放器悬浮窗。
+            intent.setClass(context, NotificationClickReceiver.class);
+            intent.setAction(NOTIFICATION_CLICK_ACTION);
+            contentIntent = PendingIntent.getBroadcast(context, REQUEST_CONTENT_INTENT, intent, flags);
         }
         if (!config.androidResumeOnClick) {
             mediaSession.setMediaButtonReceiver(null);
+        }
+    }
+
+    /// XY Music 定制：contentIntent 为广播时，由 NotificationClickReceiver 调用，
+    /// 把通知栏单击事件转交 Dart 的 AudioHandler（onNotificationClicked），
+    /// 不启动任何 Activity。
+    public static void handleNotificationClick() {
+        ServiceListener current = listener;
+        if (current != null) {
+            current.onNotificationClicked();
         }
     }
 
@@ -683,6 +702,10 @@ public class AudioService extends MediaBrowserServiceCompat {
         }
         if (config.androidNotificationClickStartsActivity)
             builder.setContentIntent(mediaSession.getController().getSessionActivity());
+        else if (contentIntent != null)
+            // XY Music 定制：clickStartsActivity 关闭时仍挂上广播 PendingIntent，
+            // 保证单击通知（以及快捷设置里的媒体卡片）能触发悬浮窗。
+            builder.setContentIntent(contentIntent);
         // TODO: Look at setColorized
         if (config.notificationColor != -1)
             builder.setColor(config.notificationColor);
@@ -1202,5 +1225,6 @@ public class AudioService extends MediaBrowserServiceCompat {
         void onTaskRemoved();
         void onClose();
         void onDestroy();
+        void onNotificationClicked();
     }
 }

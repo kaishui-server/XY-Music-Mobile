@@ -1161,10 +1161,44 @@ enum SongSortKey {
   added('按添加时间'),
   title('按歌曲名'),
   artist('按艺术家'),
-  album('按专辑名');
+  album('按专辑名'),
+  // 以下为参照主流播放器补充的排序键（仅新增，既有键的含义与顺序不变）。
+  fileName('按文件名'),
+  path('按路径'),
+  modified('按修改日期');
 
   const SongSortKey(this.label);
   final String label;
+}
+
+/// 按排序键计算两首歌的升序比较结果（供各列表复用）。
+///
+/// 拼音键由调用方以 [pinyinKey] 注入，避免各页重复实现；[SongSortKey.custom]
+/// 返回 0，自定义顺序由调用方自行处理。不处理正/倒序，调用方按需取反。
+int compareSongsBySortKey(
+  SongSortKey key,
+  Song a,
+  Song b,
+  String Function(String raw) pinyinKey,
+) {
+  switch (key) {
+    case SongSortKey.title:
+      return pinyinKey(a.title).compareTo(pinyinKey(b.title));
+    case SongSortKey.fileName:
+      return a.fileName.toLowerCase().compareTo(b.fileName.toLowerCase());
+    case SongSortKey.path:
+      return a.path.toLowerCase().compareTo(b.path.toLowerCase());
+    case SongSortKey.artist:
+      return pinyinKey(a.artist).compareTo(pinyinKey(b.artist));
+    case SongSortKey.album:
+      return pinyinKey(a.album).compareTo(pinyinKey(b.album));
+    case SongSortKey.added:
+      return a.addedAt.compareTo(b.addedAt);
+    case SongSortKey.modified:
+      return a.fileModifiedAt.compareTo(b.fileModifiedAt);
+    case SongSortKey.custom:
+      return 0;
+  }
 }
 
 /// 排序状态：排序键 + 正倒序（custom 无方向，其余键均可正倒序）。
