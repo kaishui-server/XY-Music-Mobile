@@ -113,6 +113,76 @@ class _MutableInstallSummary {
   );
 }
 
+/// 批量安装期间的插件目录索引：把「插件 ID → 磁盘文件」的映射只扫描
+/// 解析一次，并在写入新文件后增量维护。
+///
+/// 原实现每安装一个插件都全目录 `readAsStringSync` + `PluginMetadata
+/// .parse`（几十个正则跑在整段脚本上）来查重；批量导入 N 个插件会退化
+/// 成 O(N²) 次读取与解析。脚本可达数百 KB 时，主线程被长时间占满，
+/// 中低端机上直接 ANR / 闪退（用户实测导入到第 15 个左右崩溃）。
+class _PluginIdIndex {
+  _PluginIdIndex(this.directory);
+
+  final Directory directory;
+  Map<String, List<File>>? _index;
+
+  /// 首次调用时全量扫描一次；index 为 null 表示尚未扫描。
+  Future<Map<String, List<File>>> _ensure() async {
+    final cached = _index;
+    if (cached != null) return cached;
+    final index = <String, List<File>>{};
+    if (directory.existsSync()) {
+      final files =
+          directory
+              .listSync()
+              .whereType<File>()
+              .where((file) => p.extension(file.path).toLowerCase() == '.js')
+              .toList()
+            ..sort((a, b) => a.path.compareTo(b.path));
+      for (final file in files) {
+        String id;
+        try {
+          // 与旧逻辑保持一致：按「脚本内容 + 来源路径」算出 ID 后查重。
+          id = PluginMetadata.resolvePluginId(
+            await file.readAsString(),
+            file.path,
+          );
+        } catch (_) {
+          id = p.basenameWithoutExtension(file.path);
+        }
+        index.putIfAbsent(id, () => <File>[]).add(file);
+      }
+    }
+    _index = index;
+    return index;
+  }
+
+  /// 返回磁盘上 ID 相同的全部副本（含主文件）。尚未扫描时不触发扫描，
+  /// 由调用方决定是否查询。
+  Future<List<File>> duplicatesOf(String id) async {
+    final index = await _ensure();
+    return List<File>.unmodifiable(index[id] ?? const <File>[]);
+  }
+
+  /// 新写入插件后登记，避免同批次后续插件重复扫描目录。
+  void register(String id, File file) {
+    final index = _index;
+    if (index == null) return;
+    index.putIfAbsent(id, () => <File>[]).add(file);
+  }
+
+  /// 删除/合并后移除登记，保持索引与磁盘一致。
+  void unregister(Iterable<File> files) {
+    final index = _index;
+    if (index == null) return;
+    final paths = files.map((file) => file.path).toSet();
+    for (final entry in index.entries) {
+      entry.value.removeWhere((file) => paths.contains(file.path));
+    }
+    index.removeWhere((_, value) => value.isEmpty);
+  }
+}
+
 class _PluginsNotifier extends AsyncNotifier<List<_PluginInfo>> {
   static const _enabledKey = 'mobileEnabledPlugins';
   static const _sourceUrlsKey = 'mobilePluginSourceUrlsV1';
@@ -129,6 +199,7 @@ class _PluginsNotifier extends AsyncNotifier<List<_PluginInfo>> {
     final prefs = await SharedPreferences.getInstance();
     final enabled = (prefs.getStringList(_enabledKey) ?? const []).toSet();
     final sourceUrls = _readSourceUrls(prefs);
+    final displayNames = readPluginDisplayNames(prefs);
     final files =
         directory
             .listSync()
@@ -136,8 +207,11 @@ class _PluginsNotifier extends AsyncNotifier<List<_PluginInfo>> {
             .where((file) => p.extension(file.path).toLowerCase() == '.js')
             .toList()
           ..sort((a, b) => a.path.compareTo(b.path));
-    final items = files.map((file) {
-      final script = file.readAsStringSync();
+    // 逐文件异步读取：脚本可达数百 KB，批量装了几十个后若同步读完整个
+    // 目录会长时间阻塞主线程；await 读取会在文件之间让出事件循环。
+    final items = <_PluginInfo>[];
+    for (final file in files) {
+      final script = await file.readAsString();
       final metadata = PluginMetadata.parse(script);
       final id = p.basenameWithoutExtension(file.path);
       // 分类优先级：LX 契约 > BakaMusic 契约 > animemusic 后端 >
@@ -150,20 +224,22 @@ class _PluginsNotifier extends AsyncNotifier<List<_PluginInfo>> {
           : metadata.isAnimemusic
           ? _PluginKind.animemusic
           : _PluginKind.musicfree;
-      return _PluginInfo(
-        id: id,
-        name: metadata.name ?? id,
-        version: metadata.version ?? '未知版本',
-        author: metadata.author,
-        remark: metadata.remark,
-        path: file.path,
-        enabled: enabled.contains(id),
-        sourceUrl: sourceUrls[id],
-        userVariables: metadata.userVariables,
-        isStarSea: metadata.isStarSea,
-        kind: kind,
+      items.add(
+        _PluginInfo(
+          id: id,
+          name: displayNames[id] ?? metadata.name ?? id,
+          version: metadata.version ?? '未知版本',
+          author: metadata.author,
+          remark: metadata.remark,
+          path: file.path,
+          enabled: enabled.contains(id),
+          sourceUrl: sourceUrls[id],
+          userVariables: metadata.userVariables,
+          isStarSea: metadata.isStarSea,
+          kind: kind,
+        ),
       );
-    }).toList();
+    }
     // 拖拽保存的顺序优先；未记录过的插件（新安装）按文件名顺序追加在后。
     final orderedIds = prefs.getStringList(pluginOrderKey) ?? const [];
     if (orderedIds.isNotEmpty) {
@@ -190,8 +266,16 @@ class _PluginsNotifier extends AsyncNotifier<List<_PluginInfo>> {
     }
   }
 
-  static String _pluginId(String script, String origin) =>
-      PluginMetadata.resolvePluginId(script, origin);
+  /// 创建一次批量安装共享的插件目录索引：同批次所有插件复用同一份
+  /// 扫描结果，避免逐个插件重复全目录读取 + 正则解析（O(N²)）。
+  Future<_PluginIdIndex> _newInstallIndex() async {
+    final dataDir = await ref.read(appDataDirProvider.future);
+    return _PluginIdIndex(Directory(p.join(dataDir, 'plugins')));
+  }
+
+  /// 批量安装的每个插件之间让出一次事件循环，避免长时间独占主线程
+  /// 导致界面无响应（导入几十个插件时尤为明显）。
+  Future<void> _yieldToUi() => Future<void>.delayed(Duration.zero);
 
   static void _validateScript(String script) {
     final trimmed = script.trim();
@@ -271,13 +355,19 @@ class _PluginsNotifier extends AsyncNotifier<List<_PluginInfo>> {
     String origin,
     _MutableInstallSummary summary, {
     String? displayName,
+    _PluginIdIndex? index,
   }) async {
     _validateScript(script);
+    // 一次解析复用：ID 推导、显示名与版本读取共用同一份元数据，避免对
+    // 同一段（可能数百 KB 的）脚本反复跑整套正则。
     final metadata = PluginMetadata.parse(script);
-    final id = _pluginId(script, origin);
-    final name = displayName?.trim().isNotEmpty == true
-        ? displayName!.trim()
-        : (metadata.name ?? id);
+    final id = PluginMetadata.resolvePluginIdFromMetadata(metadata, origin);
+    final indexName = displayName?.trim() ?? '';
+    final name = indexName.isNotEmpty
+        ? indexName
+        : (metadata.name?.trim().isNotEmpty == true
+              ? metadata.name!.trim()
+              : id);
 
     final dataDir = await ref.read(appDataDirProvider.future);
     // 本地导入不依赖 Rust bridge。插件管理页可能在应用启动初始化 bridge
@@ -286,34 +376,35 @@ class _PluginsNotifier extends AsyncNotifier<List<_PluginInfo>> {
     final pluginsDir = Directory(p.join(dataDir, 'plugins'));
     await pluginsDir.create(recursive: true);
 
+    final prefs = await SharedPreferences.getInstance();
+
     // 磁盘级去重：批量安装中途 state 不会刷新，列表项名称与订阅索引的
     // 显示名也可能不一致，仅靠 state 匹配会漏判，重复导入订阅就会产生
-    // xxx.js / xxx-2.js 多组副本。这里直接扫描插件目录，把归一化 ID
-    // 相同的文件全部找出，一次性合并成一个。
-    final duplicates = <File>[];
-    if (pluginsDir.existsSync()) {
-      final files =
-          pluginsDir
-              .listSync()
-              .whereType<File>()
-              .where((file) => p.extension(file.path).toLowerCase() == '.js')
-              .toList()
-            ..sort((a, b) => a.path.compareTo(b.path));
-      for (final file in files) {
-        try {
-          final existingScript = file.readAsStringSync();
-          if (existingScript == script ||
-              _pluginId(existingScript, file.path) == id) {
-            duplicates.add(file);
-          }
-        } catch (_) {
-          // 读取失败的文件不参与去重，按全新安装处理。
+    // xxx.js / xxx-2.js 多组副本。改用批内索引（同批次只全目录扫描解析
+    // 一次）找出归一化 ID 相同的文件，一次性合并成一个。
+    final session = index ?? _PluginIdIndex(pluginsDir);
+    final duplicates = List<File>.from(await session.duplicatesOf(id));
+
+    if (duplicates.isNotEmpty) {
+      // 版本校验（默认开启）：同 ID 插件来自不同订阅源时，旧版本不应覆盖
+      // 已安装的新版本。开启「安装插件不校验版本」后始终以新内容覆盖。
+      final skipVersionCheck =
+          ref
+              .read(settingsProvider)
+              .valueOrNull
+              ?.pluginInstallSkipVersionCheck ??
+          false;
+      if (!skipVersionCheck) {
+        final existingVersion = await _latestExistingVersion(duplicates);
+        final incomingVersion = metadata.version?.trim() ?? '';
+        if (existingVersion.isNotEmpty &&
+            incomingVersion.isNotEmpty &&
+            PluginMetadata.compareVersions(incomingVersion, existingVersion) <
+                0) {
+          summary.skipped++;
+          return false;
         }
       }
-    }
-
-    final prefs = await SharedPreferences.getInstance();
-    if (duplicates.isNotEmpty) {
       return _mergeDuplicates(
         duplicates,
         script,
@@ -324,10 +415,14 @@ class _PluginsNotifier extends AsyncNotifier<List<_PluginInfo>> {
         pluginsDir,
         prefs,
         summary,
+        session,
+        displayName: indexName.isNotEmpty ? indexName : null,
       );
     }
 
-    await File(p.join(pluginsDir.path, '$id.js')).writeAsString(script);
+    final file = File(p.join(pluginsDir.path, '$id.js'));
+    await file.writeAsString(script);
+    session.register(id, file);
     final enabled = (prefs.getStringList(_enabledKey) ?? const []).toSet()
       ..add(id);
     await prefs.setStringList(_enabledKey, enabled.toList());
@@ -335,10 +430,43 @@ class _PluginsNotifier extends AsyncNotifier<List<_PluginInfo>> {
       final sources = _readSourceUrls(prefs)..[id] = origin;
       await prefs.setString(_sourceUrlsKey, jsonEncode(sources));
     }
+    if (indexName.isNotEmpty) {
+      await _saveDisplayName(prefs, id, indexName);
+    }
     summary.installed++;
     // 星海格式插件在安装提示中标注，让用户知道这是聚合变体。
     summary.names.add(metadata.isStarSea ? '$name（星海）' : name);
     return true;
+  }
+
+  /// 取磁盘上某组同 ID 副本中最高的版本号（用于安装前的版本校验）。
+  Future<String> _latestExistingVersion(List<File> duplicates) async {
+    var latest = '';
+    for (final file in duplicates) {
+      try {
+        final version = PluginMetadata.parse(
+          await file.readAsString(),
+        ).version?.trim();
+        if (version == null || version.isEmpty) continue;
+        if (latest.isEmpty ||
+            PluginMetadata.compareVersions(version, latest) > 0) {
+          latest = version;
+        }
+      } catch (_) {
+        // 读取/解析失败的文件不参与版本比较。
+      }
+    }
+    return latest;
+  }
+
+  /// 写入/覆盖插件显示名覆盖表（仅在订阅索引提供了显式名称时调用）。
+  Future<void> _saveDisplayName(
+    SharedPreferences prefs,
+    String id,
+    String name,
+  ) async {
+    final names = readPluginDisplayNames(prefs)..[id] = name;
+    await prefs.setString(pluginDisplayNamesKey, jsonEncode(names));
   }
 
   /// 把磁盘上已存在的同 ID 插件副本合并为一个文件：主文件以新脚本
@@ -354,7 +482,9 @@ class _PluginsNotifier extends AsyncNotifier<List<_PluginInfo>> {
     Directory pluginsDir,
     SharedPreferences prefs,
     _MutableInstallSummary summary,
-  ) async {
+    _PluginIdIndex session, {
+    String? displayName,
+  }) async {
     final primaryPath = p.join(pluginsDir.path, '$id.js');
     final primaryExists = duplicates.any((file) => file.path == primaryPath);
     // 无论主文件是否在副本集合里，最终都归一到 $id.js 承载新脚本。
@@ -406,14 +536,36 @@ class _PluginsNotifier extends AsyncNotifier<List<_PluginInfo>> {
       );
     }
 
+    // 显示名覆盖表：旧 ID 的名称迁移到主 ID，订阅索引给的新名称优先。
+    final names = readPluginDisplayNames(prefs);
+    var namesChanged = false;
+    for (final removedId in removedIds) {
+      final value = names.remove(removedId);
+      if (value != null && !names.containsKey(id)) {
+        names[id] = value;
+        namesChanged = true;
+      }
+    }
+    final overrideName = displayName?.trim() ?? '';
+    if (overrideName.isNotEmpty && names[id] != overrideName) {
+      names[id] = overrideName;
+      namesChanged = true;
+    }
+    if (namesChanged) {
+      await prefs.setString(pluginDisplayNamesKey, jsonEncode(names));
+    }
+
+    final removedFiles = <File>[];
     for (final file in duplicates) {
       if (file.path == primaryPath) continue;
       try {
         await file.delete();
+        removedFiles.add(file);
       } catch (_) {
         // 删除失败时以刷新后的实际列表为准，不阻断安装。
       }
     }
+    session.unregister(removedFiles);
 
     // 旧 ID 变体已删除、偏好已迁移到新 ID，存量歌曲数据（歌单/收藏/
     // 最近播放里的旧 ID 引用）必须一并迁移，否则旧歌单全部断链。
@@ -421,10 +573,12 @@ class _PluginsNotifier extends AsyncNotifier<List<_PluginInfo>> {
 
     final primary = File(primaryPath);
     if (primary.existsSync() && await primary.readAsString() == script) {
+      session.register(id, primary);
       summary.skipped++;
       return false;
     }
     await primary.writeAsString(script);
+    session.register(id, primary);
     summary.installed++;
     summary.names.add(metadata.isStarSea ? '$name（星海）' : name);
     return true;
@@ -467,6 +621,8 @@ class _PluginsNotifier extends AsyncNotifier<List<_PluginInfo>> {
             : null;
         if (rawItems is List && rawItems.isNotEmpty) {
           final base = Uri.parse(url);
+          // 整批共用一份目录索引，且每装完一个让出一次事件循环。
+          final index = await _newInstallIndex();
           for (final raw in rawItems.take(_maxIndexItems)) {
             if (raw is! Map) continue;
             final item = Map<String, dynamic>.from(raw);
@@ -483,11 +639,13 @@ class _PluginsNotifier extends AsyncNotifier<List<_PluginInfo>> {
                 effectiveUrl,
                 summary,
                 displayName: item['name']?.toString(),
+                index: index,
               );
             } catch (error) {
               summary.failed++;
               summary.errors.add('${item['name'] ?? pluginUrl}：$error');
             }
+            await _yieldToUi();
           }
           state = AsyncData(await _load());
           ref.invalidate(enabledMusicPluginsProvider);
@@ -524,6 +682,9 @@ class _PluginsNotifier extends AsyncNotifier<List<_PluginInfo>> {
     );
     final files = result?.files ?? const <PlatformFile>[];
     final summary = _MutableInstallSummary();
+    // 整批共用一份目录索引，且每装完一个让出一次事件循环（批量选几十个
+    // 脚本时避免主线程长时间独占导致无响应/闪退）。
+    final index = files.isEmpty ? null : await _newInstallIndex();
     for (final file in files) {
       try {
         final extension = p.extension(file.name).toLowerCase();
@@ -540,11 +701,12 @@ class _PluginsNotifier extends AsyncNotifier<List<_PluginInfo>> {
           throw Exception('无法读取所选插件文件，请重新选择');
         }
         // path 为空时使用文件名作为来源，保证插件 ID 仍能稳定生成。
-        await _persistScript(script, path ?? file.name, summary);
+        await _persistScript(script, path ?? file.name, summary, index: index);
       } catch (error) {
         summary.failed++;
         summary.errors.add('${file.name}：$error');
       }
+      await _yieldToUi();
     }
     if (files.isEmpty) {
       return const _InstallSummary(
@@ -633,15 +795,20 @@ class _PluginsNotifier extends AsyncNotifier<List<_PluginInfo>> {
     final online = (state.valueOrNull ?? const <_PluginInfo>[])
         .where((plugin) => plugin.isOnline)
         .toList();
+    // 与批量安装一致：整批共用一份目录索引，逐个之间让出事件循环。
+    final index = await _newInstallIndex();
     for (final plugin in online) {
       final url = plugin.sourceUrl!.trim();
       try {
         final content = await _downloadText(url);
-        await _persistScript(content, url, summary);
+        // 不传 displayName：保留已存在的显示名覆盖，新脚本的名称由元数据
+        // 决定（若插件来源后来改名，ID 漂移由去重合并链路负责迁移）。
+        await _persistScript(content, url, summary, index: index);
       } catch (error) {
         summary.failed++;
         summary.errors.add('${plugin.name}：$error');
       }
+      await _yieldToUi();
     }
     state = AsyncData(await _load());
     ref.invalidate(enabledMusicPluginsProvider);
@@ -677,6 +844,12 @@ class _PluginsNotifier extends AsyncNotifier<List<_PluginInfo>> {
     if (variables.isNotEmpty) {
       variables.removeWhere((id, _) => ids.contains(id));
       await prefs.setString(pluginUserVariablesKey, jsonEncode(variables));
+    }
+    // 显示名覆盖表随插件卸载清理，避免重装同 ID 时残留旧名称。
+    final names = readPluginDisplayNames(prefs);
+    if (names.isNotEmpty && names.keys.any(ids.contains)) {
+      names.removeWhere((id, _) => ids.contains(id));
+      await prefs.setString(pluginDisplayNamesKey, jsonEncode(names));
     }
     state = AsyncData(await _load());
     ref.invalidate(enabledMusicPluginsProvider);
@@ -1263,6 +1436,18 @@ class _PluginsPageState extends ConsumerState<PluginsPage> {
                               busy: _busy,
                               onOnline: _installFromUrl,
                               onLocal: _importLocal,
+                              skipVersionCheck: ref.watch(
+                                settingsProvider.select(
+                                  (value) =>
+                                      value
+                                          .valueOrNull
+                                          ?.pluginInstallSkipVersionCheck ??
+                                      false,
+                                ),
+                              ),
+                              onSkipVersionCheckChanged: (value) => ref
+                                  .read(settingsProvider.notifier)
+                                  .setPluginInstallSkipVersionCheck(value),
                             ),
                             const SizedBox(height: 22),
                             Row(
@@ -1554,11 +1739,17 @@ class _InstallPanel extends StatelessWidget {
     required this.busy,
     required this.onOnline,
     required this.onLocal,
+    required this.skipVersionCheck,
+    required this.onSkipVersionCheckChanged,
   });
 
   final bool busy;
   final VoidCallback onOnline;
   final VoidCallback onLocal;
+
+  /// 安装插件不校验版本：开启后新内容始终覆盖已安装的同 ID 插件。
+  final bool skipVersionCheck;
+  final ValueChanged<bool> onSkipVersionCheckChanged;
 
   @override
   Widget build(BuildContext context) {
@@ -1597,6 +1788,23 @@ class _InstallPanel extends StatelessWidget {
                 ),
               ),
             ],
+          ),
+          const SizedBox(height: 6),
+          // 关闭时（默认）同 ID 插件的新内容版本更低则不覆盖，避免多个
+          // 订阅源互相覆盖；开启后始终以最新拉取的内容覆盖。
+          SwitchListTile.adaptive(
+            value: skipVersionCheck,
+            onChanged: busy ? null : onSkipVersionCheckChanged,
+            contentPadding: EdgeInsets.zero,
+            dense: true,
+            title: const Text('安装插件不校验版本', style: TextStyle(fontSize: 14)),
+            subtitle: Text(
+              '开启后新内容始终覆盖同 ID 插件（可能被低版本订阅源覆盖）',
+              style: TextStyle(
+                fontSize: 11,
+                color: Theme.of(context).colorScheme.onSurfaceVariant,
+              ),
+            ),
           ),
         ],
       ),

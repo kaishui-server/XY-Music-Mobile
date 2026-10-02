@@ -46,8 +46,6 @@ class DesktopLyricsUpdateParams(
     val backgroundOpacity: Float,
     /** 上下位移（dp）：叠加在拖动基准位置之上的垂直偏移，正值上移。 */
     val verticalOffset: Float,
-    /** 状态栏避让：开启时浮窗顶部不越过状态栏下沿。 */
-    val avoidStatusBar: Boolean,
     /** 自定义字体文件绝对路径（空 = 系统默认），供 Typeface.createFromFile。 */
     val lyricFontPath: String,
 )
@@ -100,8 +98,6 @@ class DesktopLyricsService : Service() {
     private var baseY = 76
     /** 设置页「上下位移」滑块值（dp），叠加在基准位置之上。 */
     private var verticalOffsetDp = 0f
-    /** 状态栏避让：开启时浮窗顶部不越过状态栏下沿。 */
-    private var avoidStatusBar = true
     /** 已应用的自定义字体路径（空 = 系统默认），避免重复创建 Typeface。 */
     private var appliedFontPath: String? = null
 
@@ -182,7 +178,6 @@ class DesktopLyricsService : Service() {
         backgroundColor = intent.getIntExtra("backgroundColor", 0xFF18181C.toInt()),
         backgroundOpacity = intent.getFloatExtra("backgroundOpacity", .85f),
         verticalOffset = intent.getFloatExtra("verticalOffset", 0f),
-        avoidStatusBar = intent.getBooleanExtra("avoidStatusBar", true),
         lyricFontPath = intent.getStringExtra("lyricFontPath").orEmpty(),
     )
 
@@ -256,7 +251,7 @@ class DesktopLyricsService : Service() {
             val prefs = getSharedPreferences("desktop_lyrics", MODE_PRIVATE)
             x = prefs.getInt("x", 0)
             baseY = prefs.getInt("y", 76)
-            y = baseY
+            y = clampY(baseY)
         }
         overlayParams = params
         content.setOnTouchListener { _, event ->
@@ -271,7 +266,7 @@ class DesktopLyricsService : Service() {
                 MotionEvent.ACTION_MOVE -> {
                     params.x = startX + (event.rawX - downX).toInt()
                     // 拖动只改变不含滑块偏移的基准位置，实际 y 再叠加
-                    // 偏移并做状态栏避让钳制。
+                    // 偏移并按整屏范围钳制。
                     baseY = startY - (event.rawY - downY).toInt()
                     params.y = clampY(baseY + verticalOffsetPx())
                     try {
@@ -282,7 +277,9 @@ class DesktopLyricsService : Service() {
                     true
                 }
                 MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
-                    // 持久化基准位置（不含滑块偏移），避免下次启动重复叠加。
+                    // 持久化基准位置（不含滑块偏移），避免下次启动重复叠加；
+                    // 基准同时按整屏高度收敛，防止越界值被反复带回。
+                    baseY = baseY.coerceIn(0, resources.displayMetrics.heightPixels)
                     getSharedPreferences("desktop_lyrics", MODE_PRIVATE)
                         .edit()
                         .putInt("x", params.x)
@@ -293,8 +290,8 @@ class DesktopLyricsService : Service() {
                 else -> true
             }
         }
-        // 浮窗首次测量/内容高度变化时重算 y：状态栏避让的上边界依赖
-        // 浮窗实际高度，布局完成前拿不到，需在布局变化后补一次钳制。
+        // 浮窗首次测量/内容高度变化时重算 y：整屏钳制的上边界依赖浮窗
+        // 实际高度，布局完成前拿不到，需在布局变化后补一次钳制。
         content.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ ->
             applyWindowPosition()
         }
@@ -327,10 +324,9 @@ class DesktopLyricsService : Service() {
         ensurePanel()
         val lyric = p.lyric.ifBlank { "暂无歌词" }
 
-        // 位置/字体类参数：滑块位移、状态栏避让、自定义字体。这些参数
-        // 变化频率极低（仅用户调节时推送），每次更新时幂等应用即可。
+        // 位置/字体类参数：滑块位移、自定义字体。这些参数变化频率极低
+        // （仅用户调节时推送），每次更新时幂等应用即可。
         verticalOffsetDp = p.verticalOffset
-        avoidStatusBar = p.avoidStatusBar
         applyFont(p.lyricFontPath)
         applyWindowPosition()
 
@@ -583,36 +579,14 @@ class DesktopLyricsService : Service() {
     private fun verticalOffsetPx(): Int =
         (verticalOffsetDp * resources.displayMetrics.density).toInt()
 
-    /** 状态栏高度（px）；取不到时回退 0。 */
-    private fun statusBarHeight(): Int {
-        val id = resources.getIdentifier("status_bar_height", "dimen", "android")
-        if (id > 0) {
-            val h = resources.getDimensionPixelSize(id)
-            if (h > 0) return h
-        }
-        return 0
-    }
-
-    /** 导航栏高度（px）；取不到时回退 0。 */
-    private fun navigationBarHeight(): Int {
-        val id = resources.getIdentifier("navigation_bar_height", "dimen", "android")
-        if (id > 0) {
-            val h = resources.getDimensionPixelSize(id)
-            if (h > 0) return h
-        }
-        return 0
-    }
-
-    /// 浮窗 y 钳制：下边界不小于 0（不越出屏幕底），开启状态栏避让时
-    /// 上边界不超过「屏幕高 - 状态栏 - 导航栏 - 浮窗高」。
+    /// 浮窗 y 钳制：范围覆盖整屏（自屏幕底部 0 到屏幕顶部）。
+    /// y 是相对屏幕底边的偏移，上限取「屏幕高 - 浮窗高」，保证浮窗
+    /// 仍完整可见，可一直拖到贴近屏幕顶端。
     private fun clampY(value: Int): Int {
         val screenHeight = resources.displayMetrics.heightPixels
-        var maxY = screenHeight
-        if (avoidStatusBar) {
-            val panelHeight = panel?.height?.takeIf { it > 0 } ?: 0
-            maxY = screenHeight - statusBarHeight() - navigationBarHeight() - panelHeight
-        }
-        return value.coerceIn(0, maxY.coerceAtLeast(0))
+        val panelHeight = panel?.height?.takeIf { it > 0 } ?: 0
+        val maxY = (screenHeight - panelHeight).coerceAtLeast(0)
+        return value.coerceIn(0, maxY)
     }
 
     /** 按当前基准 + 滑块偏移重算 y 并下发。 */

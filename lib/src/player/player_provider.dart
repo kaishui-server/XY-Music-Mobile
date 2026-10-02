@@ -1783,7 +1783,6 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
         wordEffectMode: LyricWordEffectMode.none.index,
         locked: false,
         verticalOffset: 0,
-        avoidStatusBar: true,
         lyricFontPath: '',
       );
       return;
@@ -1810,7 +1809,6 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
           : LyricWordEffectMode.none.index,
       locked: settings.desktopLyricsLocked,
       verticalOffset: settings.desktopLyricsVerticalOffset,
-      avoidStatusBar: settings.desktopLyricsAvoidStatusBar,
       lyricFontPath: lyricFontPath,
     );
   }

@@ -514,7 +514,6 @@ class MainActivity : AudioServiceActivity() {
                                 ?.toFloat() ?: .85f,
                             verticalOffset = call.argument<Number>("verticalOffset")
                                 ?.toFloat() ?: 0f,
-                            avoidStatusBar = call.argument<Boolean>("avoidStatusBar") != false,
                             lyricFontPath = call.argument<String>("lyricFontPath") ?: "",
                         )
                         // 服务已在运行时直连分发，省去每次进度刷新的
@@ -549,7 +548,6 @@ class MainActivity : AudioServiceActivity() {
                                     putExtra("backgroundColor", params.backgroundColor)
                                     putExtra("backgroundOpacity", params.backgroundOpacity)
                                     putExtra("verticalOffset", params.verticalOffset)
-                                    putExtra("avoidStatusBar", params.avoidStatusBar)
                                     putExtra("lyricFontPath", params.lyricFontPath)
                                 },
                             )

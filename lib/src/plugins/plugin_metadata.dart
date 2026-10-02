@@ -128,8 +128,16 @@ class PluginMetadata {
   /// 内容哈希 plugin-xxxxxxxx。订阅插件更新后 name 变化（如加上了
   /// 「(赞助版)[永久]」后缀）会导致 ID 漂移，调用方需迁移旧 ID 引用
   /// （见 plugin_reference_migration.dart）。
-  static String resolvePluginId(String script, String origin) {
-    final metadata = PluginMetadata.parse(script);
+  static String resolvePluginId(String script, String origin) =>
+      resolvePluginIdFromMetadata(parse(script), origin);
+
+  /// 与 [resolvePluginId] 同规则，但复用已解析好的元数据，避免批量安装时
+  /// 对同一段脚本重复执行整套正则解析（脚本可达数百 KB，重复解析是批量
+  /// 导入卡顿的主要来源）。
+  static String resolvePluginIdFromMetadata(
+    PluginMetadata metadata,
+    String origin,
+  ) {
     // file_picker/下载管理器给的来源路径常带中文，Uri.path 会以百分号
     // 编码返回（QQ音乐 → %E9%9F%B3%E4%B9%90），不解码会让回退 ID 变成
     // qq-e9-9f-b3 这类 UTF-8 字节十六进制串。
@@ -143,6 +151,20 @@ class PluginMetadata {
     return normalized.isNotEmpty
         ? normalized
         : 'plugin-${_fnv1a(rawId).toRadixString(16)}';
+  }
+
+  /// 插件版本号比较（按 `.` `-` 分段做数字比较，段缺失按 0）。
+  /// 返回正数表示 [left] 更新、0 表示相同、负数表示更旧。
+  static int compareVersions(String left, String right) {
+    final a = left.split(RegExp(r'[.-]'));
+    final b = right.split(RegExp(r'[.-]'));
+    final length = a.length > b.length ? a.length : b.length;
+    for (var i = 0; i < length; i++) {
+      final av = i < a.length ? int.tryParse(a[i]) ?? 0 : 0;
+      final bv = i < b.length ? int.tryParse(b[i]) ?? 0 : 0;
+      if (av != bv) return av.compareTo(bv);
+    }
+    return 0;
   }
 
   static String _decodeUriPath(String path) {

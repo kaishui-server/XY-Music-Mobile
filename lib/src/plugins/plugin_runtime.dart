@@ -423,6 +423,7 @@ Future<List<EnabledMusicPlugin>> loadEnabledMusicPlugins(Ref ref) async {
   final enabled = (prefs.getStringList(enabledKey) ?? const []).toSet();
   final savedVariables = readPluginUserVariables(prefs);
   final sourceUrls = _readPluginSourceUrls(prefs, sourceUrlsKey);
+  final displayNames = readPluginDisplayNames(prefs);
   final plugins = <EnabledMusicPlugin>[];
   for (final file in directory.listSync().whereType<File>()) {
     if (p.extension(file.path).toLowerCase() != '.js') continue;
@@ -439,6 +440,9 @@ Future<List<EnabledMusicPlugin>> loadEnabledMusicPlugins(Ref ref) async {
     var pluginName = metadata.name ?? id;
     final metaName = animemusicMeta['name']?.trim() ?? '';
     if (isAnimemusic && metaName.isNotEmpty) pluginName = metaName;
+    // 订阅索引声明的显示名优先：脚本混淆/无元信息时也能显示正确名称。
+    final overrideName = displayNames[id]?.trim() ?? '';
+    if (overrideName.isNotEmpty) pluginName = overrideName;
     plugins.add(
       EnabledMusicPlugin(
         id: id,
@@ -498,6 +502,28 @@ const pluginOrderKey = 'mobilePluginOrder';
 
 /// SharedPreferences 中持久化插件用户变量的键：{pluginId: {key: value}}。
 const pluginUserVariablesKey = 'mobilePluginUserVariablesV1';
+
+/// SharedPreferences 中持久化插件显示名的键：{pluginId: name}。
+/// 订阅索引声明的显示名在安装时写入：脚本被混淆/不含元信息（解析不到
+/// 名称）时，重新加载列表仍能显示订阅源给的正确名称，而不是回退成插件 ID。
+const pluginDisplayNamesKey = 'mobilePluginDisplayNamesV1';
+
+/// 读取全部插件的显示名覆盖表，只保留合法的字符串键值。
+Map<String, String> readPluginDisplayNames(SharedPreferences prefs) {
+  try {
+    final raw = prefs.getString(pluginDisplayNamesKey);
+    if (raw == null || raw.isEmpty) return {};
+    final decoded = jsonDecode(raw);
+    if (decoded is! Map) return {};
+    return {
+      for (final entry in decoded.entries)
+        if (entry.value is String && (entry.value as String).trim().isNotEmpty)
+          entry.key.toString(): (entry.value as String).trim(),
+    };
+  } catch (_) {
+    return {};
+  }
+}
 
 /// 读取全部插件的用户变量，只保留合法的字符串键值。
 Map<String, Map<String, String>> readPluginUserVariables(

@@ -244,10 +244,10 @@ class AppSettings {
     this.desktopLyricsBackgroundColor = 0xFF18181C,
     this.desktopLyricsBackgroundOpacity = .85,
     this.desktopLyricsVerticalOffset = 0.0,
-    this.desktopLyricsAvoidStatusBar = true,
     this.downloadPath = '',
     this.downloadQuality = '320k',
     this.askDownloadDetails = true,
+    this.pluginInstallSkipVersionCheck = false,
     this.downloadLyrics = true,
     this.downloadWriteMetadata = true,
     this.organizeRule = '{Artist}/{Album}/{Title}',
@@ -356,17 +356,18 @@ class AppSettings {
   final double desktopLyricsBackgroundOpacity;
 
   /// 桌面歌词上下位移（dp）：在拖动基准位置上叠加的垂直偏移，
-  /// 正值上移、负值下移，用于精细调整浮窗位置。
+  /// 正值上移、负值下移，范围覆盖整屏高度（原生侧再做边界钳制）。
   final double desktopLyricsVerticalOffset;
-
-  /// 桌面歌词状态栏避让：开启时浮窗顶部不会顶到状态栏下方（默认开启）。
-  final bool desktopLyricsAvoidStatusBar;
 
   /// 兼容旧调用方：只要不是“不显示逐字”就视为已开启逐字效果。
   bool get enableWordEffect => lyricWordEffectMode != LyricWordEffectMode.none;
   final String downloadPath;
   final String downloadQuality;
   final bool askDownloadDetails;
+
+  /// 安装插件时不校验版本：同名（同 ID）插件来自不同订阅源时也直接覆盖，
+  /// 不做版本高低比较。默认关闭（校验版本），避免多个订阅源互相覆盖。
+  final bool pluginInstallSkipVersionCheck;
   final bool downloadLyrics;
 
   /// 下载后向音频文件写入元数据标签（标题/艺术家/专辑/歌词/封面）。
@@ -436,10 +437,10 @@ class AppSettings {
     int? desktopLyricsBackgroundColor,
     double? desktopLyricsBackgroundOpacity,
     double? desktopLyricsVerticalOffset,
-    bool? desktopLyricsAvoidStatusBar,
     String? downloadPath,
     String? downloadQuality,
     bool? askDownloadDetails,
+    bool? pluginInstallSkipVersionCheck,
     bool? downloadLyrics,
     bool? downloadWriteMetadata,
     String? organizeRule,
@@ -530,11 +531,11 @@ class AppSettings {
           desktopLyricsBackgroundOpacity ?? this.desktopLyricsBackgroundOpacity,
       desktopLyricsVerticalOffset:
           desktopLyricsVerticalOffset ?? this.desktopLyricsVerticalOffset,
-      desktopLyricsAvoidStatusBar:
-          desktopLyricsAvoidStatusBar ?? this.desktopLyricsAvoidStatusBar,
       downloadPath: downloadPath ?? this.downloadPath,
       downloadQuality: downloadQuality ?? this.downloadQuality,
       askDownloadDetails: askDownloadDetails ?? this.askDownloadDetails,
+      pluginInstallSkipVersionCheck:
+          pluginInstallSkipVersionCheck ?? this.pluginInstallSkipVersionCheck,
       downloadLyrics: downloadLyrics ?? this.downloadLyrics,
       downloadWriteMetadata:
           downloadWriteMetadata ?? this.downloadWriteMetadata,
@@ -661,13 +662,13 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
           prefs.getDouble('desktopLyricsBackgroundOpacity') ?? .85,
       desktopLyricsVerticalOffset:
           (prefs.getDouble('desktopLyricsVerticalOffset') ?? 0.0)
-              .clamp(-200.0, 200.0)
+              .clamp(-4000.0, 4000.0)
               .toDouble(),
-      desktopLyricsAvoidStatusBar:
-          prefs.getBool('desktopLyricsAvoidStatusBar') ?? true,
       downloadPath: prefs.getString('downloadPath') ?? '',
       downloadQuality: prefs.getString('downloadQuality') ?? '320k',
       askDownloadDetails: prefs.getBool('askDownloadDetails') ?? true,
+      pluginInstallSkipVersionCheck:
+          prefs.getBool('pluginInstallSkipVersionCheck') ?? false,
       downloadLyrics: prefs.getBool('downloadLyrics') ?? true,
       downloadWriteMetadata: prefs.getBool('downloadWriteMetadata') ?? true,
       organizeRule:
@@ -898,13 +899,13 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
         'desktopLyricsVerticalOffset',
         next.desktopLyricsVerticalOffset,
       ),
-      prefs.setBool(
-        'desktopLyricsAvoidStatusBar',
-        next.desktopLyricsAvoidStatusBar,
-      ),
       prefs.setString('downloadPath', next.downloadPath),
       prefs.setString('downloadQuality', next.downloadQuality),
       prefs.setBool('askDownloadDetails', next.askDownloadDetails),
+      prefs.setBool(
+        'pluginInstallSkipVersionCheck',
+        next.pluginInstallSkipVersionCheck,
+      ),
       prefs.setBool('downloadLyrics', next.downloadLyrics),
       prefs.setBool('downloadWriteMetadata', next.downloadWriteMetadata),
       prefs.setString('organizeRule', next.organizeRule),
@@ -1222,12 +1223,8 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
   );
   Future<void> setDesktopLyricsVerticalOffset(double value) => _save(
     (state.valueOrNull ?? const AppSettings()).copyWith(
-      desktopLyricsVerticalOffset: value.clamp(-200.0, 200.0).toDouble(),
-    ),
-  );
-  Future<void> setDesktopLyricsAvoidStatusBar(bool value) => _save(
-    (state.valueOrNull ?? const AppSettings()).copyWith(
-      desktopLyricsAvoidStatusBar: value,
+      // 全屏范围位移：上限放宽到 ±4000dp，由原生侧按实际屏幕高度钳制。
+      desktopLyricsVerticalOffset: value.clamp(-4000.0, 4000.0).toDouble(),
     ),
   );
 
@@ -1244,6 +1241,13 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
   Future<void> setAskDownloadDetails(bool value) => _save(
     (state.valueOrNull ?? const AppSettings()).copyWith(
       askDownloadDetails: value,
+    ),
+  );
+
+  /// 安装插件不校验版本（默认关闭）。
+  Future<void> setPluginInstallSkipVersionCheck(bool value) => _save(
+    (state.valueOrNull ?? const AppSettings()).copyWith(
+      pluginInstallSkipVersionCheck: value,
     ),
   );
   Future<void> setDownloadLyrics(bool v) => _save(

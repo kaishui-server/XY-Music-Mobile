@@ -1245,27 +1245,21 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
           value: settings?.desktopLyricsLocked ?? false,
           onChanged: (value) => notifier.setDesktopLyricsLocked(value),
         ),
-        _switchTile(
-          context,
-          icon: Icons.fit_screen_outlined,
-          title: '状态栏避让',
-          value: settings?.desktopLyricsAvoidStatusBar ?? true,
-          onChanged: (value) => notifier.setDesktopLyricsAvoidStatusBar(value),
-        ),
         _tile(
           context,
           icon: Icons.height_rounded,
           title: '上下位移',
           trailing: SizedBox(
-            width: 145,
+            width: 165,
+            // 位移范围覆盖整屏：滑块上下限取屏幕高度（dp），歌词可从
+            // 屏幕底部一路推到顶端（原生侧再按浮窗实际高度做边界钳制）。
             child: Slider(
               value: (settings?.desktopLyricsVerticalOffset ?? 0).clamp(
-                -200,
-                200,
+                -MediaQuery.sizeOf(context).height,
+                MediaQuery.sizeOf(context).height,
               ),
-              min: -200,
-              max: 200,
-              divisions: 40,
+              min: -MediaQuery.sizeOf(context).height,
+              max: MediaQuery.sizeOf(context).height,
               label: (settings?.desktopLyricsVerticalOffset ?? 0) == 0
                   ? '默认'
                   : '${(settings?.desktopLyricsVerticalOffset ?? 0) > 0 ? '上移' : '下移'} '

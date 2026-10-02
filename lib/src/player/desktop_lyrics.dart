@@ -84,7 +84,6 @@ class DesktopLyricsBridge {
     required double backgroundOpacity,
     required int wordEffectMode,
     required double verticalOffset,
-    required bool avoidStatusBar,
     required String lyricFontPath,
   }) async {
     if (!Platform.isAndroid) return;
@@ -127,7 +126,6 @@ class DesktopLyricsBridge {
       wordEffectMode,
       locked,
       verticalOffset,
-      avoidStatusBar,
       lyricFontPath,
     ].join('\u0000');
     final now = DateTime.now();
@@ -162,7 +160,6 @@ class DesktopLyricsBridge {
         'backgroundColor': backgroundColor,
         'backgroundOpacity': backgroundOpacity,
         'verticalOffset': verticalOffset,
-        'avoidStatusBar': avoidStatusBar,
         'lyricFontPath': lyricFontPath,
       });
     } on PlatformException {
