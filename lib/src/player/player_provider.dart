@@ -29,6 +29,7 @@ import '../widgets/cover_image.dart';
 import 'downloaded_song_store.dart';
 import 'desktop_lyrics.dart';
 import 'lx_lyrics_builder.dart';
+import 'playback_probe.dart';
 import 'video_playback_session.dart';
 
 /// 播放中的单曲信息（小而美：仅保留 UI 需要的最小字段）。
@@ -859,7 +860,7 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
       _desktopLyricsHiddenSent = false;
       _requestDesktopLyricsSync(immediate: true);
     });
-    // 音效（均衡器/前级/音量增强/变速变调）：音效页的全部修改都写入
+    // 音效（均衡器/前级/变速变调）：音效页的全部修改都写入
     // effectsProvider，这里桥接到真实播放引擎——普通输出走系统原生
     // 均衡器 + 响度增益（Android）；变速变调走 just_audio 的
     // setSpeed/setPitch（跨平台）；独占输出由 EffectsNotifier 自行下发
@@ -872,8 +873,7 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
       // last 为 null（首次加载）时视为全量变化。
       var eqChanged = last == null ||
           fx.equalizerEnabled != last.equalizerEnabled ||
-          fx.preamp != last.preamp ||
-          fx.audioBoost != last.audioBoost;
+          fx.preamp != last.preamp;
       if (!eqChanged) {
         final a = fx.gains, b = last.gains;
         eqChanged = a.length != b.length;
@@ -894,11 +894,11 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
       // DSP 管线出声期间，任何音效修改都重发完整设置到 Rust 侧。
       if (_dspPipelineActive) {
         unawaited(_pushDspSoundEffect());
-      } else if (_hasAdvancedEffects(fx) && state.isPlaying) {
-        // 播放中开启高级音效（混响/空间/低音增强等）：立即接管 DSP 管线。
-        // 此前接管只在切歌时发生（_startPlayback → _ensureDspPipeline），
-        // 播放中开启音效听不到任何效果，用户感知「除均衡器/变速变调外
-        // 全部失效」。暂停中开启则等恢复播放时由 _startPlayback 接管。
+      } else if (state.isPlaying) {
+        // 管线未出声但正在播放（起播时接管失败/已被看门狗回收）：补一次
+        // 接管。默认接管后正常路径下管线在起播即已激活，此处主要覆盖
+        // 失败冷却过期、源信息晚到等边界，避免整段播放都退回原生输出、
+        // 用户感知「除均衡器/变速变调外全部音效失效」。
         _scheduleDspTakeover();
       }
     });
@@ -1094,54 +1094,28 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
 
   final Ref _ref;
 
-  /// 是否启用了任一无原生实现路径的高级音效：混响/空间/消人声/调制/
-  /// 动态/整形/声道处理等。这些效果只能由 Rust DSP 管线出声，原生路径
-  /// 仅覆盖 5 段映射 EQ + 响度增益（preamp/audioBoost）+ setSpeed/setPitch。
-  static bool _hasAdvancedEffects(EffectsSettings fx) {
-    return fx.reverbKind != 'none' ||
-        fx.spatialMode != 'none' ||
-        fx.vocalRemoval ||
-        fx.vibratoEnabled ||
-        fx.tremoloEnabled ||
-        fx.bassBoostEnabled ||
-        fx.trebleEnabled ||
-        fx.distortionEnabled ||
-        fx.delayEnabled ||
-        fx.flangerEnabled ||
-        fx.phaserEnabled ||
-        fx.compressorEnabled ||
-        fx.noiseGateEnabled ||
-        fx.limiterEnabled ||
-        fx.exciterEnabled ||
-        fx.subBassEnabled ||
-        fx.loFiEnabled ||
-        fx.stereoWidenEnabled ||
-        fx.monoMerge ||
-        fx.channelSwap ||
-        fx.v4aEnabled;
-  }
-
   /// 当前曲目是否需要 DSP 共享模式管线出声。
   ///
-  /// 仅在启用任一无原生实现路径的高级音效时接管：系统原生 EQ 只有 5 段
-  /// 均衡器，混响/空间/消人声/低音增强/延迟等无原生实现。未开启高级
-  /// 音效时维持普通输出（原生 EQ + setSpeed/setPitch），避免不必要的
-  /// 双解码开销。
+  /// 参考 XianYu-Music-Mobile：Android 播放默认由 Rust 共享管线出声，
+  /// 保证全部音效（含无原生实现的混响/空间/消人声/低音增强/延迟等）
+  /// 始终生效。接管失败时回退原生输出，不影响正常播放。
   bool _dspWanted(String itemPath) {
     if (kIsWeb || defaultTargetPlatform != TargetPlatform.android) return false;
     // B 站视频歌曲走视频伴音 + 静音时钟桥接，管线不参与。
     if (_videoMediaBridgeActive) return false;
-    final fx = _ref.read(effectsProvider).valueOrNull;
-    if (fx == null) return false;
-    // 任一无原生实现路径的高级音效开启即接管。原生路径只能覆盖：
-    // 5 段映射 EQ + 响度增益（preamp/audioBoost）+ setSpeed/setPitch；
-    // 混响/空间/消人声/低音增强/延迟等只能走 Rust DSP 链。
-    if (_hasAdvancedEffects(fx)) {
-      return true;
-    }
-    // 管线已在出声时保持接管（高级音效运行中关闭的回落在下次切歌），
-    // EQ 走 Rust 全 10 段精度不低于原生映射。
-    return _dspPipelineActive && _dspPipelinePath == itemPath;
+    // 参考 XianYu-Music-Mobile：Android 播放默认由 Rust 共享模式 DSP 管线
+    // 出声，而非「只在开启高级音效时按需接管」。
+    //
+    // 原按需接管存在链路脆弱点：只要接管未能成功（effectsProvider 尚未
+    // 就绪、60s 失败冷却、源信息时序错位等），播放就静默回退到原生输出，
+    // 而原生路径只能覆盖 5 段映射 EQ + 响度增益 + setSpeed/setPitch，
+    // 混响/空间/消人声/低音增强/延迟等「无原生实现」的音效全部失效——
+    // 用户感知即「除均衡器和变速变调外其他音效失效」。
+    //
+    // 改为默认接管后，全音效链始终生效；接管失败由 [_startDspPipeline]
+    // 记 60s 冷却并回退原生输出（静音时钟音量恢复），不影响正常播放。
+    // content:// 等无直读地址的源由 [_startDspPipeline] 内部兜底为原生输出。
+    return true;
   }
 
   /// 播放中开启高级音效时的接管防抖：音效滑条会连续触发监听，若每次
@@ -1157,8 +1131,8 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
       if (_dspPipelineActive || !state.isPlaying) return;
       final path = state.current?.path;
       if (path == null) return;
-      final fx = _ref.read(effectsProvider).valueOrNull;
-      if (fx == null || !_hasAdvancedEffects(fx)) return;
+      // 默认接管：只要播放中且管线不在出声（含失败冷却过期后的重试），
+      // 就重新接管一次，避免一次失败后整段播放都退回无音效的原生输出。
       unawaited(_ensureDspPipeline(_playRequestId, path));
     });
   }
@@ -1211,7 +1185,12 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
     // DSP 源信息由各音源设置点记录（本地文件/在线直链）。
     final streamUrl = _dspStreamUrl;
     final localPath = _dspLocalPath;
-    if (streamUrl == null && localPath == null) return false;
+    if (streamUrl == null && localPath == null) {
+      // content://（SAF/网盘直链等 Rust 无法直读的源）没有可直读地址，
+      // 管线不接管，保持在原生输出。
+      debugPrint('[DSP] 无可直读播放源（$itemPath），不接管，走原生输出');
+      return false;
+    }
     try {
       final fx = _ref.read(effectsProvider).valueOrNull ?? const EffectsSettings();
       final deviceName = await startUsbExclusivePlayback(
@@ -1370,11 +1349,11 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
   double _effectiveClockVolume() =>
       _dspPipelineActive ? 0.0 : _ref.read(volumeProvider);
 
-  /// 把音效页的均衡器/前级/音量增强应用到播放引擎。
+  /// 把音效页的均衡器/前级应用到播放引擎。
   ///
   /// 普通输出（扬声器/蓝牙）走系统原生音效：10 段均衡器增益按对数频率
-  /// 轴插值映射到设备实际频段（常见 5 段），前级（preamp）与音量增强
-  /// （audioBoost）合并为整体 dB 增益走原生响度增益器。均衡器未随
+  /// 轴插值映射到设备实际频段（常见 5 段），前级（preamp）作为整体 dB
+  /// 增益走原生响度增益器。均衡器未随
   /// audio session 创建（首次 load 前）时门面自动缓存，load 后重放。
   Future<void> _applyEffectsEqualizer(EffectsSettings fx) async {
     if (kIsWeb || defaultTargetPlatform != TargetPlatform.android) return;
@@ -1384,11 +1363,11 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
         gains: fx.gains,
         centerFrequencies: eqCenterFrequencies,
       );
-      final boost = fx.preamp + fx.audioBoost;
-      // 前级随均衡器开关，音量增强独立有效（不要求均衡器开启）。
+      final boost = fx.preamp;
+      // 前级随均衡器开关。
       final loudness = fx.equalizerEnabled
           ? boost
-          : fx.audioBoost;
+          : 0.0;
       await xyLoudnessEnhancer.apply(
         enabled: loudness.abs() > 0.01,
         targetGain: loudness,
@@ -1532,6 +1511,28 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
   final Stopwatch _statsWallClock = Stopwatch()..start();
   int _statsLastFlushElapsedMs = 0;
 
+  // 久播卡死探针（小米澎湃等机型长时间播放后无声卡住）：仅在异常时
+  // 把播放快照与原生音频输出层信号写进日志，用于区分媒体层停滞与
+  // AudioTrack/AAudio 停摆。常态开销只有每 5s 一次读取。
+  late final PlaybackProbe _playbackProbe = PlaybackProbe(
+    sample: _probeSample,
+  );
+
+  /// 探针采样：无歌曲时返回 null（不采样）；有歌曲时给出进度、缓冲、
+  /// 解码状态与 DSP 管线占用情况。
+  PlaybackProbeSample? _probeSample() {
+    if (state.current == null) return null;
+    return PlaybackProbeSample(
+      positionMs: _player.position.inMilliseconds,
+      bufferedMs: _player.bufferedPosition.inMilliseconds,
+      durationMs: _player.duration?.inMilliseconds ?? 0,
+      processingState: _player.processingState.name,
+      playing: state.isPlaying,
+      dspActive: _dspPipelineActive,
+      dspPlaying: _dspPipelinePlaying,
+    );
+  }
+
   Future<void> _init() async {
     final allowOtherAudio =
         _ref
@@ -1552,6 +1553,7 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
       });
     }
     _attachPlayerStreams();
+    _playbackProbe.start();
     await _restoreSession();
   }
 
@@ -4335,6 +4337,12 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
   }
 
   Future<void> _startPlayback(int requestId, String itemPath) async {
+    // 真正起播前确保媒体会话桥接已安装。此前只在 _playAt（切歌链）里安装，
+    // 而恢复会话后点播放走的是 toggle() → _startPlayback 的直连 resume 分支，
+    // 绕过了 _playAt；构造期的 1s 兜底定时器又可能在平台 handler 就位前触发
+    // 而安装失败，导致「应用打开后第一次播放，任务栏只显示单个播放/暂停键，
+    // 切歌后才出现上/下一首」。这里作为所有起播路径的唯一汇聚点补装。
+    _installMediaSessionBridge();
     // Android 13+ 要求先获得通知权限，媒体服务才能把 MediaStyle 通知写入
     // 状态栏、锁屏和系统媒体中心。之前这里与 play() 并发执行，权限弹窗
     // 尚未完成时音频服务已经启动，部分系统会直接丢弃首个媒体通知。
@@ -5634,6 +5642,7 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
     _durSub?.cancel();
     _stateSub?.cancel();
     _dspTakeoverTimer?.cancel();
+    _playbackProbe.stop();
     unawaited(_stopDspPipeline());
     _player.dispose();
     super.dispose();

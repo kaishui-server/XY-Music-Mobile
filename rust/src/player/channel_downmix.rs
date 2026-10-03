@@ -45,9 +45,22 @@ pub fn downmix_frame(frame: &[f32]) -> (f32, f32) {
     }
 }
 
-/// 把 >2 声道的交错样本块下混为立体声；≤2 声道原样拷贝。
+/// 把交错样本块规整为立体声：>2 声道下混、单声道上混（复制到左右）、
+/// 立体声原样拷贝。共享流的 DSP 链固定按 2 声道处理，故源为单声道时
+/// 必须上混，否则请求 1ch 会被系统混音器重协商成 2ch 而无法建流。
 pub fn downmix_block(samples: &[f32], channels: u16) -> Vec<f32> {
-    if channels <= 2 {
+    if channels == 0 {
+        return Vec::new();
+    }
+    if channels == 1 {
+        let mut out = Vec::with_capacity(samples.len() * 2);
+        for &s in samples {
+            out.push(s);
+            out.push(s);
+        }
+        return out;
+    }
+    if channels == 2 {
         return samples.to_vec();
     }
     let ch = channels as usize;

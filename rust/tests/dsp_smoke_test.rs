@@ -126,6 +126,31 @@ fn bass_boost_produces_audible_diff() {
     );
 }
 
+/// 高音增强是前端音效页独有的开关。此前 Rust 侧缺少 `treble` 字段，
+/// serde 会静默丢弃前端下发的参数，且 has_audible_processing() 不计入它，
+/// 导致「只开高音增强」时整条音效链被硬旁路（出音与输入完全相同）。
+/// 该用例同时覆盖「字段能被解析」与「确实产生增益」两点。
+#[test]
+fn treble_boost_produces_audible_diff() {
+    let mut settings: SoundEffectSettings = serde_json::from_str(DART_JSON_REVERB).unwrap();
+    settings.reverb_kind = xymusic_core::player::sound_effect::ReverbKind::None;
+    settings.reverb_wet = 0.0;
+    settings.treble.enabled = true;
+    settings.treble.gain = 10.0;
+    // 12kHz 高频正弦（highshelf @ 8kHz 的目标频段）
+    let input = sine_wave(44100, 2, 12000.0);
+    let mut proc = SoundEffectBlockProcessor::new(44100, 2);
+    proc.set_settings(settings);
+    let out = proc.process_block(input.clone());
+    let in_rms = rms(&input);
+    let out_rms = rms(&out);
+    println!("treble: in_rms={in_rms:.4} out_rms={out_rms:.4}");
+    assert!(
+        out_rms > in_rms * 1.2,
+        "高音增强未放大高频（字段可能被丢弃或整链被硬旁路）: in={in_rms} out={out_rms}"
+    );
+}
+
 #[test]
 fn vocal_removal_produces_audible_diff() {
     let mut settings: SoundEffectSettings = serde_json::from_str(DART_JSON_REVERB).unwrap();

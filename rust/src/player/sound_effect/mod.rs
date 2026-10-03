@@ -319,6 +319,19 @@ pub struct BassBoostParams {
     pub dynamic: bool,
 }
 
+/// 高音增强参数。对应前端音效页「高音增强」开关 + 增益（dB）。
+/// 桌面端音效链中该效果以 highshelf 实现；此前本端缺失该字段，导致
+/// 前端下发的 `treble` 被 serde 静默丢弃、开关单独打开时整条音效链
+/// 被硬旁路（has_audible_processing 不含 treble），表现为「高级音效无效」。
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct TrebleParams {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub gain: f32,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct DynamicEqParams {
@@ -402,6 +415,7 @@ pub struct SoundEffectSettings {
     pub stereo_separation: StereoSepParams,
     pub crossfeed: CrossfeedParams,
     pub bass_boost: BassBoostParams,
+    pub treble: TrebleParams,
     pub dynamic_eq: DynamicEqParams,
     // 组合
     pub v4a_enabled: bool,
@@ -452,6 +466,7 @@ impl Default for SoundEffectSettings {
             stereo_separation: StereoSepParams::default(),
             crossfeed: CrossfeedParams::default(),
             bass_boost: BassBoostParams::default(),
+            treble: TrebleParams::default(),
             dynamic_eq: DynamicEqParams::default(),
             v4a_enabled: false,
             bypass: false,
@@ -508,6 +523,7 @@ impl SoundEffectSettings {
             || self.stereo_separation.enabled
             || self.crossfeed.enabled
             || self.bass_boost.enabled
+            || self.treble.enabled
             || self.dynamic_eq.enabled
             || self.v4a_enabled
     }

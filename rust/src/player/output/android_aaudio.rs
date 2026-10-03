@@ -911,9 +911,11 @@ fn run_exclusive_playback(
     let source_channels = decoder.channels;
     let total_duration = decoder.total_duration;
 
-    // 共享模式走系统混音器：>2 声道流（伪 6ch 全景声等）混音器不做声道映射
-    // 会直接破音，样本层下混为立体声（ITU BS.775）；独占模式仍按源声道直出。
-    let playback_channels: u16 = if request.shared_mode && source_channels > 2 {
+    // 共享模式走系统混音器：DSP 链固定按立体声处理。>2 声道流（伪 6ch 全景声）
+    // 混音器不做声道映射会直接破音需下混（ITU BS.775）；单声道流若按 1ch 请求
+    // 共享流，系统混音器会重协商成 2ch 导致建流失败，故统一上混为立体声。
+    // 独占模式仍按源声道直出。
+    let playback_channels: u16 = if request.shared_mode {
         2
     } else {
         source_channels
@@ -979,6 +981,22 @@ fn run_exclusive_playback(
             return;
         }
     };
+
+    // 流实际采样率被系统重协商时（共享流常见：混音器原生率 48000），在写出
+    // 前做一次重采样对齐，否则整段音频会变速走调。进度仍按重采样前的样本数
+    // 在源采样率域累计（见下方 samples_played），seek/曲终判定不受影响。
+    let mut resampler = if stream_sample_rate != source_sample_rate {
+        Some(LinearResampler::new(
+            playback_channels as usize,
+            source_sample_rate as f64 / stream_sample_rate as f64,
+        ))
+    } else {
+        None
+    };
+
+    // 共享流声道数被系统重协商（如请求 2ch 实得 1/6ch）时，写出前做声道
+    // 映射，使数据布局与流声道数一致；不再因失配丢流回退。
+    let channel_remap_active = stream_channels != playback_channels;
 
     let effective_rate = sound_effect.effective_sample_rate();
     progress
@@ -1158,6 +1176,20 @@ fn run_exclusive_playback(
         let normalized = normalizer.process_block(&block);
         let eq_applied = equalizer.process_block(&normalized);
         let effected = sound_effect.process_block(eq_applied);
+        // 进度/曲终按源采样率域的样本数累计，重采样只改变写入的字节数。
+        let produced = effected.len() as u64;
+        let effected = match resampler.as_mut() {
+            Some(rs) => rs.process(&effected),
+            None => effected,
+        };
+        let effected = if channel_remap_active {
+            map_channels(&effected, playback_channels, stream_channels)
+        } else {
+            effected
+        };
+        if effected.is_empty() {
+            continue;
+        }
 
         // 应用用户音量 + clip guard + 格式转换
         let vol = f32::from_bits(user_volume.load(Ordering::Relaxed));
@@ -1181,7 +1213,7 @@ fn run_exclusive_playback(
 
         progress
             .samples_played
-            .fetch_add(effected.len() as u64, Ordering::Relaxed);
+            .fetch_add(produced, Ordering::Relaxed);
 
         // 写入 AAudio
         let frames_written = unsafe {
@@ -1239,6 +1271,94 @@ fn note_disconnect(
     }
 }
 
+/// 把交错样本块从 `from` 声道映射到 `to` 声道（用于共享流声道数被系统
+/// 重协商后仍能正确写出，避免丢流回退）。规则：降到 1ch 取各声道均值；
+/// 升到多声道时，单声道复制到每一路，其余按取模补足。
+fn map_channels(samples: &[f32], from: u16, to: u16) -> Vec<f32> {
+    let fch = from as usize;
+    let tch = to as usize;
+    if fch == 0 || tch == 0 || fch == tch {
+        return samples.to_vec();
+    }
+    let frames = samples.len() / fch;
+    let mut out = Vec::with_capacity(frames * tch);
+    for frame in samples.chunks(fch).take(frames) {
+        if tch == 1 {
+            let sum: f32 = frame.iter().sum();
+            out.push(sum / fch as f32);
+        } else if fch == 1 {
+            let s = frame[0];
+            for _ in 0..tch {
+                out.push(s);
+            }
+        } else {
+            for i in 0..tch {
+                out.push(frame[i % fch]);
+            }
+        }
+    }
+    out
+}
+
+/// 采样率对齐用的线性插值重采样器（交错多声道，跨块保持相位连续）。
+///
+/// AAudio 文档明确共享流的实际采样率可能与请求值不同（由系统混音器决定，
+/// 常见为 48000）。本管线按源采样率产出样本，若直接写入会整体变速走调；
+/// 用 `in_rate / out_rate` 的帧步进做线性插值，把样本转换到流采样率域。
+/// 线性插值与管线内变调处理器一致，不引入额外依赖。
+struct LinearResampler {
+    channels: usize,
+    /// 每个输出帧在输入域推进的帧数 = in_rate / out_rate。
+    step: f64,
+    /// 下一个输出帧在输入域中的位置（帧为单位，含小数）。
+    pos: f64,
+    /// 尚未消费完的输入样本（交错），用于跨块插值。
+    buf: Vec<f32>,
+}
+
+impl LinearResampler {
+    fn new(channels: usize, step: f64) -> Self {
+        Self {
+            channels: channels.max(1),
+            step: step.max(1e-6),
+            pos: 0.0,
+            buf: Vec::new(),
+        }
+    }
+
+    /// 追加一块输入并产出尽可能多的输出帧；不足两帧的尾巴留到下一块。
+    fn process(&mut self, input: &[f32]) -> Vec<f32> {
+        let ch = self.channels;
+        self.buf.extend_from_slice(input);
+        let frames = self.buf.len() / ch;
+        if frames < 2 {
+            return Vec::new();
+        }
+        let mut out = Vec::with_capacity((((frames as f64 - 1.0) / self.step) as usize + 1) * ch);
+        loop {
+            let i0 = self.pos.floor() as usize;
+            // 插值需要第 i0 与第 i0+1 帧同时存在。
+            if i0 + 1 >= frames {
+                break;
+            }
+            let frac = (self.pos - i0 as f64) as f32;
+            let a = i0 * ch;
+            let b = a + ch;
+            for c in 0..ch {
+                out.push(self.buf[a + c] * (1.0 - frac) + self.buf[b + c] * frac);
+            }
+            self.pos += self.step;
+        }
+        // 已完全消费的帧回收，pos 回退到剩余缓冲的起点。
+        let consumed = self.pos.floor() as usize;
+        if consumed > 0 {
+            self.buf.drain(0..consumed * ch);
+            self.pos -= consumed as f64;
+        }
+        out
+    }
+}
+
 /// 协商创建 AAudio 流。独占模式先试 Float32 再试 Int16；
 /// 共享模式走系统混音器（SHARED），系统可能重协商格式，按实际格式回读。
 fn create_aaudio_stream(
@@ -1270,15 +1390,12 @@ fn create_aaudio_stream(
                         continue;
                     }
                 };
-                // 共享流按源参数写入：声道数/采样率被系统重协商时，立体声
-                // 数据会被错位写入（变速乱音）。本管线不做 SRC/声道转换，
-                // 失配时放弃该流（继续尝试下一格式，全部失败则回退普通输出）。
-                if shared
-                    && (actual_channels != channels || actual_rate != sample_rate)
-                {
-                    unsafe { (lib.stream_close)(s) };
-                    continue;
-                }
+                // 共享流的采样率与声道数都可能被系统混音器重协商（原生率
+                // 常见 48000、声道常见 2）。二者都不再放弃流：采样率交由
+                // 调用方按实际流率重采样对齐（LinearResampler），声道数交由
+                // 调用方按实际流声道数做上/下混映射（map_channels）。若在此
+                // 因一次失配就关闭流重试，全部格式失败后会回退普通输出，
+                // 整个高级音效链被静默禁用（"无法创建 AAudio 共享流"）。
                 return Ok((s, actual_fmt, actual_rate, actual_channels));
             }
             Err(_e) => continue,
@@ -1286,7 +1403,7 @@ fn create_aaudio_stream(
     }
 
     Err(if shared {
-        "无法创建 AAudio 共享流（需要 Android API 26+，或系统重协商了声道/采样率）".to_string()
+        "无法创建 AAudio 共享流（需要 Android API 26+，或重协商后的声道数与请求不符）".to_string()
     } else {
         "无法创建 AAudio 独占流（设备不支持独占模式或已被占用）".to_string()
     })
@@ -1391,5 +1508,33 @@ mod tests {
     fn device_format_bytes_per_sample() {
         assert_eq!(DeviceFormat::Float32.bytes_per_sample(), 4);
         assert_eq!(DeviceFormat::Int16.bytes_per_sample(), 2);
+    }
+
+    #[test]
+    fn resampler_44100_to_48000_frame_ratio() {
+        // 44100Hz 源 → 48000Hz 流：输出帧数应为输入的 48000/44100 倍。
+        let mut rs = LinearResampler::new(2, 44100.0 / 48000.0);
+        let input = vec![0.25f32; 2 * 44100];
+        let out = rs.process(&input);
+        let frames = out.len() / 2;
+        assert!(
+            frames.abs_diff(48000) <= 2,
+            "帧数不符: got {frames}, expect ~48000"
+        );
+    }
+
+    #[test]
+    fn resampler_is_continuous_across_blocks() {
+        // 直流信号跨多块重采样后应保持常量，说明块边界插值状态连续。
+        let mut rs = LinearResampler::new(2, 44100.0 / 48000.0);
+        let block = vec![0.5f32; 2 * 512];
+        let mut out = Vec::new();
+        for _ in 0..10 {
+            out.extend_from_slice(&rs.process(&block));
+        }
+        assert!(!out.is_empty());
+        for (i, s) in out.iter().enumerate() {
+            assert!((s - 0.5).abs() < 1e-4, "样本 {i} 失真: {s}");
+        }
     }
 }

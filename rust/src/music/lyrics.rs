@@ -1259,6 +1259,57 @@ fn decrypt_multiline_hex(normalized: &str) -> String {
     parts.join("\n")
 }
 
+/// 抽取 QQ 音乐 QRC 容器 XML 的歌词正文。
+///
+/// QRC 容器的正文放在 `LyricContent="…"` 属性的值里，多段歌词
+/// （`Lyric_1` 主词、`Lyric_2` 翻译等）依次排列。逐行解析器只认
+/// `[start,duration]` 正文行，直接喂整段容器会一行都解析不出。这里把所有
+/// LyricContent 值按出现顺序取出、反转义 XML 实体后按换行拼接，交回常规
+/// 解析管线（多段由时间轴合并）。不含 `LyricContent=` 时原样返回。
+fn strip_qrc_container(raw: &str) -> String {
+    if !raw.contains("LyricContent=") {
+        return raw.to_string();
+    }
+    let mut parts = Vec::new();
+    let mut rest = raw;
+    while let Some(idx) = rest.find("LyricContent=") {
+        let after = &rest[idx + "LyricContent=".len()..];
+        let Some(quote) = after.chars().next() else {
+            break;
+        };
+        if quote != '"' && quote != '\'' {
+            // 不是属性赋值（如正文里出现的普通词），跳过继续找。
+            rest = after;
+            continue;
+        }
+        let body = &after[quote.len_utf8()..];
+        let Some(end) = body.find(quote) else {
+            break;
+        };
+        parts.push(unescape_xml_entities(&body[..end]));
+        rest = &body[end + quote.len_utf8()..];
+    }
+    if parts.is_empty() {
+        return raw.to_string();
+    }
+    parts.join("\n")
+}
+
+/// 反转义 QRC 容器属性里的 XML 实体（`&amp;` 必须最后处理，避免二次反转义）。
+fn unescape_xml_entities(input: &str) -> String {
+    if !input.contains('&') {
+        return input.to_string();
+    }
+    input
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&#10;", "\n")
+        .replace("&#13;", "")
+        .replace("&amp;", "&")
+}
+
 fn parse_raw_lyrics(raw: &str) -> Vec<ParsedLine> {
     let normalized = normalize_krc_word_tags(
         &raw
@@ -1266,6 +1317,10 @@ fn parse_raw_lyrics(raw: &str) -> Vec<ParsedLine> {
             .replace("\r\n", "\n")
             .replace('\r', "\n"),
     );
+    // QQ 音乐 QRC 容器包装（`<QrcInfos>…<Lyric_1 LyricContent="…"/>`）：
+    // 逐行解析器只认 `[start,duration]` 正文行，会把整段容器判成无歌词。
+    // 先抽取 LyricContent（含 XML 实体反转义）再走常规格式分派。
+    let normalized = strip_qrc_container(&normalized);
 
     let mut candidates = Vec::new();
 
@@ -3738,6 +3793,45 @@ mod tests {
         assert_eq!(
             word_timed, total,
             "应所有行都有词级时间，实际 {word_timed}/{total}"
+        );
+    }
+
+    /// QQ 音乐 QRC 容器 XML（`<QrcInfos>…<Lyric_1 LyricContent="…"/>`）此前
+    /// 被逐行解析器当普通文本，正文行全部解析失败 → 无歌词。且下载链路会把这
+    /// 段原始 XML 直接写进 .lrc / 音频标签，第三方播放器（光锥、椒盐）打开就
+    /// 显示整段 XML。该用例断言容器能被抽出并解析出展示行（含词级时间）。
+    #[test]
+    fn parses_qrc_container_xml_into_display_lines() {
+        let container = concat!(
+            "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n",
+            "<QrcInfos>\n",
+            "<QrcHeadInfo SaveTime=\"200\" Version=\"100\"/>\n",
+            "<LyricInfo LyricCount=\"1\">\n",
+            "<Lyric_1 LyricType=\"1\" LyricContent=\"[ti:花寂寥]\n",
+            "[0,2000]花(0,700)寂(700,700)寥(1400,600)\n",
+            "[2000,1500]夜色(2000,800)渐浓(2800,700)\"/>\n",
+            "</LyricInfo>\n",
+            "</QrcInfos>\n",
+        );
+        let payload = build_structured_lyrics_payload(container.to_string());
+        assert!(
+            !payload.display_lines.is_empty(),
+            "QRC 容器应解析出展示行，实际 0 行"
+        );
+        let joined = payload
+            .display_lines
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>()
+            .join("|");
+        assert!(joined.contains("花寂寥"), "正文缺失: {joined}");
+        assert!(joined.contains("夜色渐浓"), "正文缺失: {joined}");
+        assert!(
+            payload
+                .display_lines
+                .iter()
+                .any(|line| line.words.as_ref().is_some_and(|w| !w.is_empty())),
+            "应保留词级时间"
         );
     }
 

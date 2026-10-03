@@ -464,8 +464,13 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
   /// 布局完成后用真实高度修正悬浮头部占位，字体缩放等场景自动适配。
   void _measureFloatingHeader() {
     if (!mounted) return;
-    final size = _floatingHeaderKey.currentContext?.size;
-    if (size == null || size.height <= 0) return;
+    // 直接读 currentContext.size 会在渲染对象尚未完成布局时抛
+    // 「RenderBox was not laid out」（首帧/字体缩放重建时偶发），
+    // 因此先取 RenderObject 并显式判断 hasSize。
+    final renderObject = _floatingHeaderKey.currentContext?.findRenderObject();
+    if (renderObject is! RenderBox || !renderObject.hasSize) return;
+    final size = renderObject.size;
+    if (size.height <= 0) return;
     if ((size.height - _floatingHeaderExtent).abs() > 0.5) {
       setState(() => _floatingHeaderExtent = size.height);
     }

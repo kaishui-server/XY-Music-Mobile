@@ -88,61 +88,7 @@ class EffectsSettings {
     this.spatialIntensity = 9,
     this.virtualSurroundMode = '7.1',
     this.virtualSurroundSpread = 10,
-    this.vocalRemoval = false,
-    this.vibratoEnabled = false,
-    this.vibratoRate = 5,
-    this.vibratoDepth = 3,
-    this.tremoloEnabled = false,
-    this.tremoloRate = 6,
-    this.tremoloDepth = 30,
-    this.bassBoostEnabled = false,
-    this.bassBoostGain = 6,
-    this.bassBoostDynamic = true,
-    this.trebleEnabled = false,
-    this.trebleGain = 6,
-    this.distortionEnabled = false,
-    this.distortionAmount = 10,
-    this.distortionType = 'soft',
-    this.delayEnabled = false,
-    this.delayTime = 300,
-    this.delayFeedback = 40,
-    this.delayMix = 30,
-    this.delayType = 'single',
-    this.flangerEnabled = false,
-    this.flangerRate = 0.5,
-    this.flangerDepth = 2,
-    this.flangerFeedback = 30,
-    this.flangerMix = 35,
-    this.phaserEnabled = false,
-    this.phaserRate = 0.5,
-    this.phaserDepth = 1,
-    this.phaserFeedback = 30,
-    this.phaserMix = 50,
-    this.compressorEnabled = false,
-    this.compressorThreshold = -18,
-    this.compressorRatio = 4,
-    this.compressorAttack = 8,
-    this.compressorRelease = 400,
-    this.noiseGateEnabled = false,
-    this.noiseGateThreshold = -60,
-    this.limiterEnabled = false,
-    this.limiterThreshold = -1,
-    this.exciterEnabled = false,
-    this.exciterAmount = 20,
-    this.exciterFrequency = 3000,
-    this.subBassEnabled = false,
-    this.subBassAmount = 30,
-    this.subBassFrequency = 120,
-    this.loFiEnabled = false,
-    this.loFiSampleRate = 8000,
-    this.loFiBitDepth = 8,
-    this.stereoWidenEnabled = false,
-    this.stereoWidenAmount = 1.5,
-    this.monoMerge = false,
-    this.channelSwap = false,
-    this.v4aEnabled = false,
     this.bypass = false,
-    this.audioBoost = 0,
   });
 
   final bool equalizerEnabled;
@@ -162,61 +108,7 @@ class EffectsSettings {
   final double spatialIntensity;
   final String virtualSurroundMode;
   final double virtualSurroundSpread;
-  final bool vocalRemoval;
-  final bool vibratoEnabled;
-  final double vibratoRate;
-  final double vibratoDepth;
-  final bool tremoloEnabled;
-  final double tremoloRate;
-  final double tremoloDepth;
-  final bool bassBoostEnabled;
-  final double bassBoostGain;
-  final bool bassBoostDynamic;
-  final bool trebleEnabled;
-  final double trebleGain;
-  final bool distortionEnabled;
-  final double distortionAmount;
-  final String distortionType;
-  final bool delayEnabled;
-  final double delayTime;
-  final double delayFeedback;
-  final double delayMix;
-  final String delayType;
-  final bool flangerEnabled;
-  final double flangerRate;
-  final double flangerDepth;
-  final double flangerFeedback;
-  final double flangerMix;
-  final bool phaserEnabled;
-  final double phaserRate;
-  final double phaserDepth;
-  final double phaserFeedback;
-  final double phaserMix;
-  final bool compressorEnabled;
-  final double compressorThreshold;
-  final double compressorRatio;
-  final double compressorAttack;
-  final double compressorRelease;
-  final bool noiseGateEnabled;
-  final double noiseGateThreshold;
-  final bool limiterEnabled;
-  final double limiterThreshold;
-  final bool exciterEnabled;
-  final double exciterAmount;
-  final double exciterFrequency;
-  final bool subBassEnabled;
-  final double subBassAmount;
-  final double subBassFrequency;
-  final bool loFiEnabled;
-  final double loFiSampleRate;
-  final double loFiBitDepth;
-  final bool stereoWidenEnabled;
-  final double stereoWidenAmount;
-  final bool monoMerge;
-  final bool channelSwap;
-  final bool v4aEnabled;
   final bool bypass;
-  final double audioBoost;
 
   EffectsSettings copyWith({
     bool? equalizerEnabled,
@@ -235,61 +127,7 @@ class EffectsSettings {
     double? spatialIntensity,
     String? virtualSurroundMode,
     double? virtualSurroundSpread,
-    bool? vocalRemoval,
-    bool? vibratoEnabled,
-    double? vibratoRate,
-    double? vibratoDepth,
-    bool? tremoloEnabled,
-    double? tremoloRate,
-    double? tremoloDepth,
-    bool? bassBoostEnabled,
-    double? bassBoostGain,
-    bool? bassBoostDynamic,
-    bool? trebleEnabled,
-    double? trebleGain,
-    bool? distortionEnabled,
-    double? distortionAmount,
-    String? distortionType,
-    bool? delayEnabled,
-    double? delayTime,
-    double? delayFeedback,
-    double? delayMix,
-    String? delayType,
-    bool? flangerEnabled,
-    double? flangerRate,
-    double? flangerDepth,
-    double? flangerFeedback,
-    double? flangerMix,
-    bool? phaserEnabled,
-    double? phaserRate,
-    double? phaserDepth,
-    double? phaserFeedback,
-    double? phaserMix,
-    bool? compressorEnabled,
-    double? compressorThreshold,
-    double? compressorRatio,
-    double? compressorAttack,
-    double? compressorRelease,
-    bool? noiseGateEnabled,
-    double? noiseGateThreshold,
-    bool? limiterEnabled,
-    double? limiterThreshold,
-    bool? exciterEnabled,
-    double? exciterAmount,
-    double? exciterFrequency,
-    bool? subBassEnabled,
-    double? subBassAmount,
-    double? subBassFrequency,
-    bool? loFiEnabled,
-    double? loFiSampleRate,
-    double? loFiBitDepth,
-    bool? stereoWidenEnabled,
-    double? stereoWidenAmount,
-    bool? monoMerge,
-    bool? channelSwap,
-    bool? v4aEnabled,
     bool? bypass,
-    double? audioBoost,
   }) => EffectsSettings(
     equalizerEnabled: equalizerEnabled ?? this.equalizerEnabled,
     preamp: preamp ?? this.preamp,
@@ -307,61 +145,7 @@ class EffectsSettings {
     spatialIntensity: spatialIntensity ?? this.spatialIntensity,
     virtualSurroundMode: virtualSurroundMode ?? this.virtualSurroundMode,
     virtualSurroundSpread: virtualSurroundSpread ?? this.virtualSurroundSpread,
-    vocalRemoval: vocalRemoval ?? this.vocalRemoval,
-    vibratoEnabled: vibratoEnabled ?? this.vibratoEnabled,
-    vibratoRate: vibratoRate ?? this.vibratoRate,
-    vibratoDepth: vibratoDepth ?? this.vibratoDepth,
-    tremoloEnabled: tremoloEnabled ?? this.tremoloEnabled,
-    tremoloRate: tremoloRate ?? this.tremoloRate,
-    tremoloDepth: tremoloDepth ?? this.tremoloDepth,
-    bassBoostEnabled: bassBoostEnabled ?? this.bassBoostEnabled,
-    bassBoostGain: bassBoostGain ?? this.bassBoostGain,
-    bassBoostDynamic: bassBoostDynamic ?? this.bassBoostDynamic,
-    trebleEnabled: trebleEnabled ?? this.trebleEnabled,
-    trebleGain: trebleGain ?? this.trebleGain,
-    distortionEnabled: distortionEnabled ?? this.distortionEnabled,
-    distortionAmount: distortionAmount ?? this.distortionAmount,
-    distortionType: distortionType ?? this.distortionType,
-    delayEnabled: delayEnabled ?? this.delayEnabled,
-    delayTime: delayTime ?? this.delayTime,
-    delayFeedback: delayFeedback ?? this.delayFeedback,
-    delayMix: delayMix ?? this.delayMix,
-    delayType: delayType ?? this.delayType,
-    flangerEnabled: flangerEnabled ?? this.flangerEnabled,
-    flangerRate: flangerRate ?? this.flangerRate,
-    flangerDepth: flangerDepth ?? this.flangerDepth,
-    flangerFeedback: flangerFeedback ?? this.flangerFeedback,
-    flangerMix: flangerMix ?? this.flangerMix,
-    phaserEnabled: phaserEnabled ?? this.phaserEnabled,
-    phaserRate: phaserRate ?? this.phaserRate,
-    phaserDepth: phaserDepth ?? this.phaserDepth,
-    phaserFeedback: phaserFeedback ?? this.phaserFeedback,
-    phaserMix: phaserMix ?? this.phaserMix,
-    compressorEnabled: compressorEnabled ?? this.compressorEnabled,
-    compressorThreshold: compressorThreshold ?? this.compressorThreshold,
-    compressorRatio: compressorRatio ?? this.compressorRatio,
-    compressorAttack: compressorAttack ?? this.compressorAttack,
-    compressorRelease: compressorRelease ?? this.compressorRelease,
-    noiseGateEnabled: noiseGateEnabled ?? this.noiseGateEnabled,
-    noiseGateThreshold: noiseGateThreshold ?? this.noiseGateThreshold,
-    limiterEnabled: limiterEnabled ?? this.limiterEnabled,
-    limiterThreshold: limiterThreshold ?? this.limiterThreshold,
-    exciterEnabled: exciterEnabled ?? this.exciterEnabled,
-    exciterAmount: exciterAmount ?? this.exciterAmount,
-    exciterFrequency: exciterFrequency ?? this.exciterFrequency,
-    subBassEnabled: subBassEnabled ?? this.subBassEnabled,
-    subBassAmount: subBassAmount ?? this.subBassAmount,
-    subBassFrequency: subBassFrequency ?? this.subBassFrequency,
-    loFiEnabled: loFiEnabled ?? this.loFiEnabled,
-    loFiSampleRate: loFiSampleRate ?? this.loFiSampleRate,
-    loFiBitDepth: loFiBitDepth ?? this.loFiBitDepth,
-    stereoWidenEnabled: stereoWidenEnabled ?? this.stereoWidenEnabled,
-    stereoWidenAmount: stereoWidenAmount ?? this.stereoWidenAmount,
-    monoMerge: monoMerge ?? this.monoMerge,
-    channelSwap: channelSwap ?? this.channelSwap,
-    v4aEnabled: v4aEnabled ?? this.v4aEnabled,
     bypass: bypass ?? this.bypass,
-    audioBoost: audioBoost ?? this.audioBoost,
   );
 
   Map<String, dynamic> toEqualizerRustJson() => {
@@ -384,91 +168,7 @@ class EffectsSettings {
         'spatialIntensity': spatialIntensity,
         'virtualSurroundMode': virtualSurroundMode,
         'virtualSurroundSpread': virtualSurroundSpread,
-        'vocalRemoval': vocalRemoval,
-        'vibrato': {
-          'enabled': vibratoEnabled,
-          'rate': vibratoRate,
-          'depth': vibratoDepth,
-        },
-        'tremolo': {
-          'enabled': tremoloEnabled,
-          'rate': tremoloRate,
-          'depth': tremoloDepth,
-        },
-        'bassBoost': {
-          'enabled': bassBoostEnabled,
-          'gain': bassBoostGain,
-          'dynamic': bassBoostDynamic,
-        },
-        'treble': {
-          'enabled': trebleEnabled,
-          'gain': trebleGain,
-        },
-        'distortion': {
-          'enabled': distortionEnabled,
-          'amount': distortionAmount,
-          'distortionType': distortionType,
-        },
-        'delay': {
-          'enabled': delayEnabled,
-          'timeMs': delayTime,
-          'feedback': delayFeedback,
-          'mix': delayMix,
-          'delayType': delayType,
-        },
-        'flanger': {
-          'enabled': flangerEnabled,
-          'rate': flangerRate,
-          'depth': flangerDepth,
-          'feedback': flangerFeedback,
-          'mix': flangerMix,
-        },
-        'phaser': {
-          'enabled': phaserEnabled,
-          'rate': phaserRate,
-          'depth': phaserDepth,
-          'feedback': phaserFeedback,
-          'mix': phaserMix,
-        },
-        'compressor': {
-          'enabled': compressorEnabled,
-          'threshold': compressorThreshold,
-          'ratio': compressorRatio,
-          'attack': compressorAttack,
-          'release': compressorRelease,
-        },
-        'noiseGate': {
-          'enabled': noiseGateEnabled,
-          'threshold': noiseGateThreshold,
-        },
-        'limiter': {
-          'enabled': limiterEnabled,
-          'threshold': limiterThreshold,
-        },
-        'exciter': {
-          'enabled': exciterEnabled,
-          'amount': exciterAmount,
-          'frequency': exciterFrequency,
-        },
-        'subBass': {
-          'enabled': subBassEnabled,
-          'amount': subBassAmount,
-          'frequency': subBassFrequency,
-        },
-        'loFi': {
-          'enabled': loFiEnabled,
-          'sampleRate': loFiSampleRate,
-          'bitDepth': loFiBitDepth,
-        },
-        'stereoWiden': {
-          'enabled': stereoWidenEnabled,
-          'amount': stereoWidenAmount,
-        },
-        'monoMerge': monoMerge,
-        'channelSwap': channelSwap,
-        'v4aEnabled': v4aEnabled,
         'bypass': bypass,
-        'audioBoost': audioBoost,
       };
 
   /// 是否有任一音效处于启用状态（bypass 属于旁路关闭，不计入）：
@@ -478,32 +178,20 @@ class EffectsSettings {
       pitchShift != 100 ||
       playbackRate != 100 ||
       reverbKind != 'none' ||
-      spatialMode != 'none' ||
-      vocalRemoval ||
-      vibratoEnabled ||
-      tremoloEnabled ||
-      bassBoostEnabled ||
-      trebleEnabled ||
-      distortionEnabled ||
-      delayEnabled ||
-      flangerEnabled ||
-      phaserEnabled ||
-      compressorEnabled ||
-      noiseGateEnabled ||
-      limiterEnabled ||
-      exciterEnabled ||
-      subBassEnabled ||
-      loFiEnabled ||
-      stereoWidenEnabled ||
-      monoMerge ||
-      channelSwap ||
-      v4aEnabled ||
-      audioBoost != 0;
+      spatialMode != 'none';
 
   Map<String, dynamic> toJson() => {
         ...toEqualizerRustJson(),
         ...toRustJson(),
       };
+
+  /// 干/湿声归一化到 0..1。旧版本混响预设曾把 0..100 的百分比直接存入，
+  /// 读取时对 >1 的值按百分比折算，避免历史存档把干湿比压成满值。
+  static double _normalizeReverbMix(num? raw) {
+    final v = raw?.toDouble() ?? 0;
+    if (v > 1) return (v / 100).clamp(0.0, 1.0);
+    return v.clamp(0.0, 1.0);
+  }
 
   factory EffectsSettings.fromJson(Map<String, dynamic> j) {
     final rawGains = (j['gains'] as List? ?? const [])
@@ -518,69 +206,15 @@ class EffectsSettings {
       preservesPitch: j['preservesPitch'] as bool? ?? true,
       reverbKind: j['reverbKind'] as String? ?? 'none',
       reverbPreset: j['reverbPreset'] as String? ?? '',
-      reverbDry: (j['reverbDry'] as num?)?.toDouble() ?? 0,
-      reverbWet: (j['reverbWet'] as num?)?.toDouble() ?? 0,
+      reverbDry: _normalizeReverbMix(j['reverbDry'] as num?),
+      reverbWet: _normalizeReverbMix(j['reverbWet'] as num?),
       spatialMode: j['spatialMode'] as String? ?? 'none',
       spatialSpeed: (j['spatialSpeed'] as num?)?.toDouble() ?? 10,
       spatialRadius: (j['spatialRadius'] as num?)?.toDouble() ?? 5,
       spatialIntensity: (j['spatialIntensity'] as num?)?.toDouble() ?? 9,
       virtualSurroundMode: j['virtualSurroundMode'] as String? ?? '7.1',
       virtualSurroundSpread: (j['virtualSurroundSpread'] as num?)?.toDouble() ?? 10,
-      vocalRemoval: j['vocalRemoval'] as bool? ?? false,
-      vibratoEnabled: j['vibratoEnabled'] as bool? ?? false,
-      vibratoRate: (j['vibratoRate'] as num?)?.toDouble() ?? 5,
-      vibratoDepth: (j['vibratoDepth'] as num?)?.toDouble() ?? 3,
-      tremoloEnabled: j['tremoloEnabled'] as bool? ?? false,
-      tremoloRate: (j['tremoloRate'] as num?)?.toDouble() ?? 6,
-      tremoloDepth: (j['tremoloDepth'] as num?)?.toDouble() ?? 30,
-      bassBoostEnabled: j['bassBoostEnabled'] as bool? ?? false,
-      bassBoostGain: (j['bassBoostGain'] as num?)?.toDouble() ?? 6,
-      bassBoostDynamic: j['bassBoostDynamic'] as bool? ?? true,
-      trebleEnabled: j['trebleEnabled'] as bool? ?? false,
-      trebleGain: (j['trebleGain'] as num?)?.toDouble() ?? 6,
-      distortionEnabled: j['distortionEnabled'] as bool? ?? false,
-      distortionAmount: (j['distortionAmount'] as num?)?.toDouble() ?? 10,
-      distortionType: j['distortionType'] as String? ?? 'soft',
-      delayEnabled: j['delayEnabled'] as bool? ?? false,
-      delayTime: (j['delayTime'] as num?)?.toDouble() ?? 300,
-      delayFeedback: (j['delayFeedback'] as num?)?.toDouble() ?? 40,
-      delayMix: (j['delayMix'] as num?)?.toDouble() ?? 30,
-      delayType: j['delayType'] as String? ?? 'single',
-      flangerEnabled: j['flangerEnabled'] as bool? ?? false,
-      flangerRate: (j['flangerRate'] as num?)?.toDouble() ?? 0.5,
-      flangerDepth: (j['flangerDepth'] as num?)?.toDouble() ?? 2,
-      flangerFeedback: (j['flangerFeedback'] as num?)?.toDouble() ?? 30,
-      flangerMix: (j['flangerMix'] as num?)?.toDouble() ?? 35,
-      phaserEnabled: j['phaserEnabled'] as bool? ?? false,
-      phaserRate: (j['phaserRate'] as num?)?.toDouble() ?? 0.5,
-      phaserDepth: (j['phaserDepth'] as num?)?.toDouble() ?? 1,
-      phaserFeedback: (j['phaserFeedback'] as num?)?.toDouble() ?? 30,
-      phaserMix: (j['phaserMix'] as num?)?.toDouble() ?? 50,
-      compressorEnabled: j['compressorEnabled'] as bool? ?? false,
-      compressorThreshold: (j['compressorThreshold'] as num?)?.toDouble() ?? -18,
-      compressorRatio: (j['compressorRatio'] as num?)?.toDouble() ?? 4,
-      compressorAttack: (j['compressorAttack'] as num?)?.toDouble() ?? 8,
-      compressorRelease: (j['compressorRelease'] as num?)?.toDouble() ?? 400,
-      noiseGateEnabled: j['noiseGateEnabled'] as bool? ?? false,
-      noiseGateThreshold: (j['noiseGateThreshold'] as num?)?.toDouble() ?? -60,
-      limiterEnabled: j['limiterEnabled'] as bool? ?? false,
-      limiterThreshold: (j['limiterThreshold'] as num?)?.toDouble() ?? -1,
-      exciterEnabled: j['exciterEnabled'] as bool? ?? false,
-      exciterAmount: (j['exciterAmount'] as num?)?.toDouble() ?? 20,
-      exciterFrequency: (j['exciterFrequency'] as num?)?.toDouble() ?? 3000,
-      subBassEnabled: j['subBassEnabled'] as bool? ?? false,
-      subBassAmount: (j['subBassAmount'] as num?)?.toDouble() ?? 30,
-      subBassFrequency: (j['subBassFrequency'] as num?)?.toDouble() ?? 120,
-      loFiEnabled: j['loFiEnabled'] as bool? ?? false,
-      loFiSampleRate: (j['loFiSampleRate'] as num?)?.toDouble() ?? 8000,
-      loFiBitDepth: (j['loFiBitDepth'] as num?)?.toDouble() ?? 8,
-      stereoWidenEnabled: j['stereoWidenEnabled'] as bool? ?? false,
-      stereoWidenAmount: (j['stereoWidenAmount'] as num?)?.toDouble() ?? 1.5,
-      monoMerge: j['monoMerge'] as bool? ?? false,
-      channelSwap: j['channelSwap'] as bool? ?? false,
-      v4aEnabled: j['v4aEnabled'] as bool? ?? false,
       bypass: j['bypass'] as bool? ?? false,
-      audioBoost: (j['audioBoost'] as num?)?.toDouble() ?? 0,
     );
   }
 }

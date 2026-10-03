@@ -2326,20 +2326,18 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
   }
 
   Future<String> _lyricsForDownload(QueueItem item) async {
-    var raw = item.lyricsRaw?.trim() ?? '';
-    if (raw.isEmpty || !looksLikeEncodedLyrics(raw)) return raw;
+    final raw = item.lyricsRaw?.trim() ?? '';
+    if (raw.isEmpty || !needsLyricNormalization(raw)) return raw;
 
-    // 先用 Rust 歌词解析器解码 QRC/KRC 等格式，再把展示行写成标准 LRC。
-    try {
-      final parsed = jsonDecode(await parseLyrics(rawLyrics: raw));
-      final decoded = displayLinesToLrc(parsed);
-      if (decoded.isNotEmpty) return decoded;
-    } catch (_) {
-      // 密文格式不完整时继续尝试向插件重新取一次歌词。
-    }
+    // 先用 Rust 歌词解析器解码 QRC/KRC 密文、QRC 容器 XML 与非标准词级
+    // 时间轴，再把展示行写成标准增强 LRC（`[行]<词起>词…<词束>`），
+    // 保证第三方播放器也能显示逐字。
+    final decoded = await convertLyricsToEnhancedLrc(raw);
+    if (decoded.isNotEmpty) return decoded;
 
     // 部分插件的搜索结果携带的是损坏的 lyric 字段，但 getLyrics 接口
-    // 会返回正常正文；重新请求一次可避免把密文写入文件。
+    // 会返回正常正文；重新请求一次并同样规范化，避免把密文或非标准
+    // 时间轴写入文件。
     final pluginId = item.pluginId?.trim() ?? '';
     final pluginData = item.pluginData;
     if (pluginId.isNotEmpty && pluginData != null) {
@@ -2354,8 +2352,10 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
                       .read(pluginRuntimeProvider)
                       .getLyrics(plugin, pluginData))
                   .trim();
-          if (retry.isNotEmpty && !looksLikeEncodedLyrics(retry)) {
-            raw = retry;
+          if (retry.isNotEmpty) {
+            final retryDecoded = await convertLyricsToEnhancedLrc(retry);
+            if (retryDecoded.isNotEmpty) return retryDecoded;
+            if (!isUnreadableLyrics(retry)) return retry;
           }
         }
       } catch (_) {
@@ -2363,7 +2363,7 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
       }
     }
     // 无法可靠解码时宁可不保存歌词，也不要生成用户无法阅读的乱码文件。
-    return looksLikeEncodedLyrics(raw) ? '' : raw;
+    return isUnreadableLyrics(raw) ? '' : raw;
   }
 
   Future<void> _downloadCurrent(QueueItem item) async {

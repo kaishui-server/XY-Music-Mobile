@@ -93,7 +93,14 @@ class _AnimatedBranchContainerState extends State<AnimatedBranchContainer>
       offstage: !visible,
       child: IgnorePointer(
         ignoring: !active,
-        child: _modeTransition(movement, active, widget.children[index]),
+        // 分支页圈成独立重绘边界，并放在过渡层内部：页面本体只光栅化
+        // 一次，动画每帧仅更新外层位移/缩放/不透明度；两个分支同时可见
+        // 时也不会各逐帧重绘整页，显著降低 Tab 切换掉帧。
+        child: _modeTransition(
+          movement,
+          active,
+          RepaintBoundary(child: widget.children[index]),
+        ),
       ),
     );
   }

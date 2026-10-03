@@ -930,7 +930,9 @@ class _RecommendationPlaylistTile extends StatelessWidget {
                       begin: const Offset(0, .035),
                       end: Offset.zero,
                     ).animate(eased),
-                    child: child,
+                    // 过渡期间页内容只光栅化一次，动画每帧只更新外层淡入
+                    // 与位移，避免整页（含封面列表）逐帧重绘导致切换掉帧。
+                    child: RepaintBoundary(child: child),
                   ),
                 );
               },

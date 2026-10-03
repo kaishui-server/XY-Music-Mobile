@@ -13,6 +13,8 @@ import android.provider.DocumentsContract
 import android.provider.Settings
 import android.view.KeyEvent
 import android.view.WindowManager
+import android.webkit.MimeTypeMap
+import android.media.AudioManager
 import android.media.MediaScannerConnection
 import java.io.File
 import java.io.FileOutputStream
@@ -77,6 +79,9 @@ class MainActivity : AudioServiceActivity() {
         super.onCreate(savedInstanceState)
         // 尽早安装，捕获进程内所有线程的未捕获异常并写入崩溃文件。
         CrashHandler.install(this)
+        // 久播卡死诊断：独立线程采集退出原因/主线程卡顿/内存趋势，
+        // 落盘 crash-freeze.txt（随「崩溃记录」一起导出）。
+        FreezeProbe.start(this)
         // 冷启动深链暂存：Flutter 引擎就绪后由 getInitialDeepLink 取走。
         pendingDeepLink = extractDeepLink(intent)
         // 通知栏单击冷启动：通知 Dart 打开迷你播放器悬浮窗（通道未就绪时
@@ -190,6 +195,229 @@ class MainActivity : AudioServiceActivity() {
         if (!scheme.equals("xymusic", ignoreCase = true)) return null
         val raw = data.toString()
         return raw.ifEmpty { null }
+    }
+
+    /// 把 SAF 写入用的 MIME 规范成具体类型。
+    ///
+    /// Dart 侧统一传 `audio/*` / `video/*` 这类通配 MIME，而
+    /// `DocumentsContract.createDocument` 需要具体类型：通配 MIME 会被部分
+    /// ROM（如鸿蒙）原样写进文档元数据，系统文件管理器据此解析不出可用的
+    /// 播放器，打开下载歌曲时提示「当前文件格式不支持」。这里按扩展名解析，
+    /// 解析不出来再按大类兜底给一个具体类型。
+    private fun resolveDocumentMimeType(fileName: String, requested: String): String {
+        val req = requested.trim()
+        if (req.isNotEmpty() && !req.contains('*')) return req
+        val ext = fileName.substringAfterLast('.', "").lowercase()
+        val byExtension = when (ext) {
+            "mp3" -> "audio/mpeg"
+            "flac" -> "audio/flac"
+            "m4a", "mp4a" -> "audio/mp4"
+            "aac" -> "audio/aac"
+            "ogg", "oga" -> "audio/ogg"
+            "opus" -> "audio/opus"
+            "wav" -> "audio/wav"
+            "ape" -> "audio/x-ape"
+            "wma" -> "audio/x-ms-wma"
+            "dsf" -> "audio/x-dsf"
+            "dff" -> "audio/x-dff"
+            "mp4" -> "video/mp4"
+            "mkv" -> "video/x-matroska"
+            "webm" -> "video/webm"
+            "mov" -> "video/quicktime"
+            "lrc", "txt" -> "text/plain"
+            else -> null
+        }
+        if (byExtension != null) return byExtension
+        val fromSystem = if (ext.isNotEmpty()) {
+            MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext)
+        } else {
+            null
+        }
+        if (!fromSystem.isNullOrEmpty()) return fromSystem
+        return when {
+            req.startsWith("video/") -> "video/mp4"
+            req.startsWith("image/") -> "image/jpeg"
+            req.startsWith("text/") -> "text/plain"
+            else -> "audio/mpeg"
+        }
+    }
+
+    /// 把本地文件写入 SAF 文档 URI，兼容鸿蒙的大文件限制。
+    ///
+    /// 鸿蒙（HarmonyOS）文件管理器提供的 SAF 通道对约 30MB 以上的大文件
+    /// （母带/高码率 FLAC 常见）会中途截断：本地写入计数、provider 上报的
+    /// 文件大小都看似完整，但落盘内容不完整，表现为下载后的母带在应用内
+    /// 与系统播放器里都无法识别（提示格式不支持）。因此优先解析出真实
+    /// 文件路径直接写盘（见 [writeFileByRealPath]），解析不到或没有按路径
+    /// 写权限时再退回 SAF 流式写入：用 `openFileDescriptor` 拿 PFD 后直接
+    /// 用 `FileOutputStream` 按 1MB 分块写入并 fsync，写入后校验字节数，
+    /// 不一致直接抛错，避免静默产出坏文件。
+    private fun writeFileToDocumentUri(uri: Uri, source: File) {
+        // 优先按真实文件路径直写：鸿蒙文件管理器经 SAF 暴露的输出流对约
+        // 30MB 以上的大文件（母带/高码率 FLAC 常见）会在中途放弃写入，
+        // 且本地写入计数与 provider 上报的大小都「看似完整」，最终落盘
+        // 文件在任意播放器里都识别不了。MusicFree、LX-X 等直接按路径写盘
+        // 的应用没有该限制。createDocument 已建好目标文件，能解析出
+        // primary 卷真实路径时直接写盘；解析不到（SD 卡/云盘等 provider）
+        // 或没有按路径写权限（未授予「所有文件访问」）时退回 SAF 流式写入。
+        val realPath = resolveRealPathForDocument(uri)
+        if (realPath != null) {
+            try {
+                writeFileByRealPath(File(realPath), source)
+                return
+            } catch (_: Exception) {
+                // 继续走 SAF 通道兜底。
+            }
+        }
+        val total = source.length()
+        var written = 0L
+
+        val pfd = try {
+            contentResolver.openFileDescriptor(uri, "rw")
+        } catch (_: Exception) {
+            null
+        }
+
+        if (pfd != null) {
+            try {
+                FileOutputStream(pfd.fileDescriptor).use { out ->
+                    source.inputStream().use { input ->
+                        val buffer = ByteArray(1 shl 20)
+                        while (true) {
+                            val read = input.read(buffer)
+                            if (read <= 0) break
+                            out.write(buffer, 0, read)
+                            written += read
+                        }
+                        out.flush()
+                        // 大文件关闭前落盘，避免部分 ROM 只在文件描述符关闭后
+                        // 才异步提交，导致系统侧看到的仍是「未落定」的文件。
+                        try {
+                            out.fd.sync()
+                        } catch (_: Exception) {
+                        }
+                    }
+                }
+            } finally {
+                try {
+                    pfd.close()
+                } catch (_: Exception) {
+                }
+            }
+        } else {
+            // 回退：部分 provider 不支持 openFileDescriptor。用 "wa"
+            // （write + append/create）而非 "w"，前者不会先截断，对大文件
+            // 更稳；仍拿不到再退回默认 "w"。
+            val output = contentResolver.openOutputStream(uri, "wa")
+                ?: contentResolver.openOutputStream(uri)
+                ?: throw IllegalStateException("系统无法打开目标文件")
+            output.use { out ->
+                source.inputStream().use { input ->
+                    val buffer = ByteArray(1 shl 20)
+                    while (true) {
+                        val read = input.read(buffer)
+                        if (read <= 0) break
+                        out.write(buffer, 0, read)
+                        written += read
+                    }
+                    out.flush()
+                }
+            }
+        }
+
+        // 落盘校验：写入字节数或实际文件大小不足原始大小都视为失败，直接
+        // 报错让 Dart 侧提示重试，而不是留下一个打不开的坏文件。
+        val onDisk = try {
+            contentResolver.openFileDescriptor(uri, "r")?.use { it.statSize }
+        } catch (_: Exception) {
+            null
+        }
+        if (written < total || (onDisk != null && onDisk >= 0 && onDisk < total)) {
+            throw IllegalStateException(
+                "目标文件写入不完整（预期 $total 字节，实际 $written 字节" +
+                    (if (onDisk != null && onDisk >= 0) "，落盘 $onDisk 字节" else "") + "）",
+            )
+        }
+    }
+
+    /// 按真实文件路径直写目标文件，绕开鸿蒙 SAF 通道的大文件截断限制。
+    ///
+    /// 先写同目录临时文件，校验字节数后再原子重命名到目标：既能写入任意
+    /// 大小（与 MusicFree、LX-X 的按路径写盘一致），失败时也不会留下半截
+    /// 坏文件——临时文件会被清理，目标仍是 createDocument 建好的空文件。
+    private fun writeFileByRealPath(target: File, source: File) {
+        val parent = target.parentFile
+            ?: throw IllegalStateException("目标文件没有父目录")
+        val total = source.length()
+        val temp = File(parent, ".${target.name}.xymusic.tmp")
+        try {
+            FileOutputStream(temp, false).use { out ->
+                source.inputStream().use { input ->
+                    val buffer = ByteArray(1 shl 20)
+                    while (true) {
+                        val read = input.read(buffer)
+                        if (read <= 0) break
+                        out.write(buffer, 0, read)
+                    }
+                    out.flush()
+                    try {
+                        out.fd.sync()
+                    } catch (_: Exception) {
+                    }
+                }
+            }
+            if (temp.length() < total) {
+                throw IllegalStateException(
+                    "按路径写入不完整（预期 $total 字节，实际 ${temp.length()} 字节）",
+                )
+            }
+            if (!temp.renameTo(target)) {
+                throw IllegalStateException("无法替换目标文件")
+            }
+        } catch (error: Exception) {
+            try {
+                temp.delete()
+            } catch (_: Exception) {
+            }
+            throw error
+        }
+    }
+
+    /// 把 SAF 文档（`primary:Download/XY Music/xxx.flac` 形式）映射回真实
+    /// 文件路径；非 ext4 类 provider 或解析失败时返回 null。
+    private fun resolveRealPathForDocument(documentUri: Uri): String? {
+        return try {
+            val documentId = DocumentsContract.getDocumentId(documentUri) ?: return null
+            val separator = documentId.indexOf(':')
+            if (separator <= 0) return null
+            val volume = documentId.substring(0, separator)
+            val relative = documentId.substring(separator + 1)
+            if (relative.isEmpty()) return null
+            val root = if (volume.equals("primary", ignoreCase = true)) {
+                Environment.getExternalStorageDirectory().absolutePath
+            } else {
+                "/storage/$volume"
+            }
+            val path = "$root/$relative"
+            if (File(path).isFile) path else null
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    /// 写入完成后主动登记系统媒体库。
+    ///
+    /// 母带/高码率 FLAC 等大文件（约 30MB 以上）经 SAF 通道写入后，部分
+    /// ROM（鸿蒙）不会自动把它登记进媒体库：文件内容完整、任意应用按路径
+    /// 都能读，但系统文件管理器解析不出类型，点击时提示「当前文件格式不
+    /// 支持」。这里在写入成功后补一次媒体扫描（MIME 传 null 让系统按内容
+    /// 嗅探），把文件与真实类型/大小登记进媒体库。
+    private fun notifyMediaScanner(documentUri: Uri) {
+        val path = resolveRealPathForDocument(documentUri) ?: return
+        try {
+            MediaScannerConnection.scanFile(this, arrayOf(path), null, null)
+        } catch (_: Exception) {
+        }
     }
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
@@ -558,14 +786,11 @@ class MainActivity : AudioServiceActivity() {
                         val targetUri = DocumentsContract.createDocument(
                             contentResolver,
                             parentDocumentUri,
-                            mimeType,
+                            resolveDocumentMimeType(safeName, mimeType),
                             safeName,
                         ) ?: throw IllegalStateException("系统无法创建目标文件")
-                        val output = contentResolver.openOutputStream(targetUri)
-                            ?: throw IllegalStateException("系统无法打开目标文件")
-                        source.inputStream().use { input ->
-                            output.use { out -> input.copyTo(out) }
-                        }
+                        writeFileToDocumentUri(targetUri, source)
+                        notifyMediaScanner(targetUri)
                         runOnUiThread { result.success(targetUri.toString()) }
                     } catch (error: Exception) {
                         val message = error.message ?: ""
@@ -594,6 +819,26 @@ class MainActivity : AudioServiceActivity() {
                 }
                 if (call.method == "probeAudioEffects") {
                     result.success(probeAudioEffects())
+                    return@setMethodCallHandler
+                }
+                // 久播卡死探针：上报系统音频输出层信号。Dart 侧据
+                // isMusicActive 区分「进度停滞但系统无音乐输出」的
+                // AudioTrack/AAudio 停摆，与媒体层停滞相互印证。
+                if (call.method == "audioProbe") {
+                    // 刷新 Dart 探针时间戳：据此推算 Dart 主 isolate 是否停摆。
+                    FreezeProbe.noteDartProbe()
+                    val payload = try {
+                        val am = getSystemService(AUDIO_SERVICE) as AudioManager
+                        mapOf(
+                            "isMusicActive" to am.isMusicActive,
+                            "musicVolume" to am.getStreamVolume(AudioManager.STREAM_MUSIC),
+                            "musicVolumeMax" to am.getStreamMaxVolume(AudioManager.STREAM_MUSIC),
+                            "mode" to am.mode,
+                        )
+                    } catch (_: Exception) {
+                        mapOf("isMusicActive" to null)
+                    }
+                    result.success(payload)
                     return@setMethodCallHandler
                 }
                 if (call.method != "getDeviceInfo") {

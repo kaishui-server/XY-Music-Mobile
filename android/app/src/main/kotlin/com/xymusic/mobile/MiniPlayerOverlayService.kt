@@ -109,6 +109,7 @@ class MiniPlayerOverlayService : Service() {
     private var playPauseView: ImageView? = null
     private var queueList: LinearLayout? = null
     private var queueScroll: ScrollView? = null
+    private var queueHeaderRow: View? = null
     private var queueItemViews: MutableList<QueueItemViews> = mutableListOf()
 
     private class QueueItemViews(
@@ -188,6 +189,7 @@ class MiniPlayerOverlayService : Service() {
         playPauseView = null
         queueList = null
         queueScroll = null
+        queueHeaderRow = null
         queueItemViews = mutableListOf()
         queueExpanded = false
         hasSong = false
@@ -447,6 +449,7 @@ class MiniPlayerOverlayService : Service() {
         playPauseView = playPause
         queueList = list
         queueScroll = scroll
+        queueHeaderRow = headerRow
         playerPane = player
         queuePane = queue
         emptyPane = empty
@@ -604,18 +607,33 @@ class MiniPlayerOverlayService : Service() {
 
     /** 摆放队列面板并约束其列表高度。
      *
-     * 竖屏：挂在播放面板下方（topMargin = 播放面板高度 + 间距）。
-     * 横屏：作为下拉菜单从卡片顶部覆盖（固定 topMargin），列表高度收紧，
-     * 使「下拉高度 + 列表高度」不超过播放面板高度，浮窗尺寸保持不变。 */
+     * 竖屏：挂在播放面板下方（topMargin = 播放面板高度 + 间距），全宽。
+     * 横屏：作为下拉菜单贴卡片左上角，宽度收窄（不再横跨整卡），列表高度按
+     * 进度条位置反算，保证下缘落在进度条之上、不遮挡时间与进度。 */
     private fun positionQueue(landscape: Boolean) {
         val scroll = queueScroll ?: return
         val queue = queuePane ?: return
         val scrollParams = scroll.layoutParams as? LinearLayout.LayoutParams
         val queueParams = queue.layoutParams as? FrameLayout.LayoutParams
         if (landscape) {
-            scrollParams?.height = dp(150f)
-            queueParams?.topMargin = dp(44f)
+            queueParams?.width = dp(204f)
+            queueParams?.gravity = Gravity.TOP or Gravity.START
+            queueParams?.topMargin = dp(6f)
+            val seekTop = (playerPane?.top ?: 0) + (seekBar?.top ?: 0)
+            val headerHeight = queueHeaderRow?.height ?: 0
+            if (seekTop <= 0 || headerHeight == 0) {
+                // 首次展开尚未完成测量：先给保守高度，布局完成后再精确钳制。
+                scrollParams?.height = dp(72f)
+                playerPane?.post { positionQueue(true) }
+            } else {
+                val dropdownTop = (playerPane?.top ?: 0) + dp(6f)
+                val available =
+                    seekTop - dp(8f) - dropdownTop - headerHeight - dp(6f)
+                scrollParams?.height = available.coerceIn(dp(56f), dp(200f))
+            }
         } else {
+            queueParams?.width = FrameLayout.LayoutParams.MATCH_PARENT
+            queueParams?.gravity = Gravity.TOP or Gravity.START
             scrollParams?.height = dp(232f)
             val playerHeight = playerPane?.height ?: 0
             queueParams?.topMargin = playerHeight + dp(10f)

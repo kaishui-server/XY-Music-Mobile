@@ -35,24 +35,29 @@ Widget xyPageTransition(
       final settled =
           animation.value >= 1 && secondaryAnimation.value <= 0;
       if (settled) return child!;
+      // 过渡期间把页面内容圈成独立重绘边界：页面本体（长列表、毛玻璃、
+      // 封面模糊、着色器）只需光栅化一次，动画每帧仅更新外层变换与不透明
+      // 度，避免整页在 300ms 过渡里逐帧重绘造成切换掉帧。落定后不保留该
+      // 边界（走上面的裸返回），不产生常驻图层。
+      final page = RepaintBoundary(child: child!);
       switch (xyPageTransitionMode) {
         case PageTransitionMode.slide:
           return _XySlidePageTransition(
             animation: animation,
             secondaryAnimation: secondaryAnimation,
-            child: child!,
+            child: page,
           );
         case PageTransitionMode.stack:
           return _XyStackPageTransition(
             animation: animation,
             secondaryAnimation: secondaryAnimation,
-            child: child!,
+            child: page,
           );
         case PageTransitionMode.fade:
           return _XyFadePageTransition(
             animation: animation,
             secondaryAnimation: secondaryAnimation,
-            child: child!,
+            child: page,
           );
       }
     },
