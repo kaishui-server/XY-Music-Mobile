@@ -1321,6 +1321,7 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
       isScrollControlled: true,
       builder: (sheetContext) => _PlayerMoreSheet(
         item: item,
+        initialOffsetTenths: _lyricsOffsetTenths,
         isLandscape: viewport.width > viewport.height,
         restorableSource: restorable,
         hasLyricsAssociation: associated != null,
@@ -3731,6 +3732,7 @@ class _QualitySelectorState extends State<_QualitySelector> {
 class _PlayerMoreSheet extends ConsumerStatefulWidget {
   const _PlayerMoreSheet({
     required this.item,
+    required this.initialOffsetTenths,
     required this.isLandscape,
     required this.restorableSource,
     required this.hasLyricsAssociation,
@@ -3753,6 +3755,9 @@ class _PlayerMoreSheet extends ConsumerStatefulWidget {
   });
 
   final QueueItem item;
+
+  /// 打开菜单时的歌词偏移快照（在线歌曲的「歌词偏移」行展示用）。
+  final int initialOffsetTenths;
 
   /// 打开菜单时的屏幕方向：决定沉浸式歌词开关读写哪个设置。
   final bool isLandscape;
@@ -4210,6 +4215,16 @@ class _PlayerMoreSheetState extends ConsumerState<_PlayerMoreSheet> {
                                     .setPortraitImmersiveLyrics(next);
                         },
                       ),
+                      // 本地歌曲的歌词偏移入口已移到上方快捷按钮位，
+                      // 此处仅在在线歌曲时保留设置行。
+                      if (!isLocal)
+                        _panelRow(
+                          context,
+                          icon: Icons.sync_alt_rounded,
+                          title: '歌词偏移',
+                          value: lyricsOffsetLabel(widget.initialOffsetTenths),
+                          onOpen: widget.onShowLyricsOffset,
+                        ),
                       _panelRow(
                         context,
                         icon: Icons.equalizer_rounded,

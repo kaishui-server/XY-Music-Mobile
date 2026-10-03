@@ -1086,9 +1086,15 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
           ),
           onTap: () => _pickQuality(context, ref, settings, isOnline: true),
         ),
-        _PlaybackFailurePolicyEditor(
-          settings: settings ?? const AppSettings(),
-          notifier: notifier,
+        _tile(
+          context,
+          icon: Icons.replay_rounded,
+          title: '播放失败策略',
+          trailing: Text(
+            '重试 ${settings?.playbackRetryCount ?? 0} · '
+            '换源 ${settings?.playbackSwitchSourceCount ?? 0}',
+          ),
+          onTap: () => _showPlaybackFailurePolicy(context),
         ),
         _switchTile(
           context,
@@ -1470,6 +1476,7 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
           context,
           icon: Icons.info_outline,
           title: '关于 XY Music',
+          titleStyle: const TextStyle(fontWeight: FontWeight.w700),
           // 原生通道读取实际版本（构建时来自 pubspec.yaml），避免
           // 硬编码版本号随版本升级过期。
           trailing: Text(
@@ -1495,6 +1502,17 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
       ],
       SettingsSection.feedback => const [],
     };
+  }
+
+  /// 播放失败策略弹层入口：重试次数、换源次数与策略优先级集中在弹层内编辑。
+  Future<void> _showPlaybackFailurePolicy(BuildContext context) {
+    return showModalBottomSheet<void>(
+      context: context,
+      useRootNavigator: true,
+      showDragHandle: true,
+      isScrollControlled: true,
+      builder: (_) => const _PlaybackFailurePolicySheet(),
+    );
   }
 
   /// 根页卡片流：入口型分类做独立卡片，普通分类标题写在大框上方、
@@ -1527,15 +1545,18 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
         subtitle: '安装、启用与管理音乐插件',
         route: '/settings/plugins',
       ),
-      _sectionCard(
+      _groupHeader(context, '个性化'),
+      _entryCard(
         context,
         title: '外观',
-        children: tiles(SettingsSection.appearance),
+        subtitle: '主题、颜色、字体、壁纸与封面样式',
+        route: '/settings/appearance',
       ),
-      _sectionCard(
+      _entryCard(
         context,
         title: '布局',
-        children: tiles(SettingsSection.layout),
+        subtitle: '顶栏位置与首页模块',
+        route: '/settings/layout',
       ),
       _entryCard(
         context,
@@ -1588,6 +1609,21 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
         route: '/settings/feedback',
       ),
     ];
+  }
+
+  /// 分组标题：把若干入口卡片归入同一大块（如「个性化」下的外观、布局）。
+  Widget _groupHeader(BuildContext context, String title) {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(20, 0, 20, 7),
+      child: Text(
+        title,
+        style: TextStyle(
+          fontSize: 14,
+          fontWeight: FontWeight.w700,
+          color: Theme.of(context).colorScheme.primary,
+        ),
+      ),
+    );
   }
 
   /// 入口卡片：需要独立页面的分类（无图标），点击进入。
@@ -1854,9 +1890,10 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
     required String title,
     required Widget trailing,
     VoidCallback? onTap,
+    TextStyle? titleStyle,
   }) {
     return ListTile(
-      title: Text(title),
+      title: Text(title, style: titleStyle),
       trailing: onTap == null
           ? trailing
           : Row(
@@ -3525,6 +3562,43 @@ class _PlaybackFailurePolicyEditor extends StatelessWidget {
             onTap: value < 5 ? () => onChanged(value + 1) : null,
           ),
         ],
+      ),
+    );
+  }
+}
+
+/// 播放失败策略弹层：宿主设置页只保留一个入口块，编辑内容集中在此。
+class _PlaybackFailurePolicySheet extends ConsumerWidget {
+  const _PlaybackFailurePolicySheet();
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final settings =
+        ref.watch(settingsProvider).valueOrNull ?? const AppSettings();
+    return SafeArea(
+      child: Padding(
+        padding: const EdgeInsets.only(bottom: 12),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            const Padding(
+              padding: EdgeInsets.fromLTRB(20, 0, 20, 4),
+              child: Text(
+                '播放失败策略',
+                style: TextStyle(fontSize: 16, fontWeight: FontWeight.w700),
+              ),
+            ),
+            Flexible(
+              child: SingleChildScrollView(
+                child: _PlaybackFailurePolicyEditor(
+                  settings: settings,
+                  notifier: ref.read(settingsProvider.notifier),
+                ),
+              ),
+            ),
+          ],
+        ),
       ),
     );
   }

@@ -318,11 +318,20 @@ Future<void> runBatchDownload(
   BuildContext context,
   WidgetRef ref, {
   required List<Song> songs,
+  String? qualityOverride,
 }) async {
   final settings = ref.read(settingsProvider).valueOrNull;
   final initialDirectory = await resolveMusicDownloadDirectory(settings);
   if (!context.mounted) return;
-  final options = settings?.askDownloadDetails ?? true
+  // 指定音质（通用批量面板已选档位）时跳过选项对话框：直接用已保存的
+  // 下载目录与该音质下载，不再重复询问。
+  final options = qualityOverride != null
+      ? BatchDownloadOptions(
+          directory: initialDirectory,
+          quality: qualityOverride,
+          writeMetadata: settings?.downloadWriteMetadata ?? true,
+        )
+      : settings?.askDownloadDetails ?? true
       ? await showDialog<BatchDownloadOptions>(
           context: context,
           useRootNavigator: true,

@@ -105,7 +105,8 @@ class MiniPlayerBar extends ConsumerWidget {
         if ((details.primaryVelocity ?? 0) < -180) context.push('/player');
       },
       child: ClipRRect(
-        borderRadius: BorderRadius.circular(XyRadii.large),
+        // 胶囊形：半径取栏高（64）的一半，左右两端为半圆。
+        borderRadius: BorderRadius.circular(32),
         child: BackdropFilter.grouped(
           // 小型底栏也会在页面滚动时参与合成，降低半径避免低端手机掉帧。
           filter: ui.ImageFilter.blur(sigmaX: 12, sigmaY: 12),
@@ -115,7 +116,7 @@ class MiniPlayerBar extends ConsumerWidget {
               color: theme.colorScheme.surface.withValues(
                 alpha: dark ? .34 : .48,
               ),
-              borderRadius: BorderRadius.circular(XyRadii.large),
+              borderRadius: BorderRadius.circular(32),
               border: Border.all(
                 color: dark ? XyColors.darkBorder : XyColors.lightBorder,
               ),
@@ -139,7 +140,7 @@ class MiniPlayerBar extends ConsumerWidget {
                         imageUrl: current.coverUrl,
                         width: 50,
                         height: 50,
-                        radius: 12,
+                        radius: 25,
                         icon: Icons.music_note_rounded,
                       ),
                     ),
@@ -202,16 +203,6 @@ class MiniPlayerBar extends ConsumerWidget {
                             }
                           }
                         : () => ref.read(playerProvider.notifier).toggle(),
-                  ),
-                  _PlayerButton(
-                    icon: Icons.skip_next_rounded,
-                    label: '下一首',
-                    onTap: () {
-                      if (video != null) {
-                        unawaited(VideoPlaybackSession.stopForTrackAction());
-                      }
-                      unawaited(ref.read(playerProvider.notifier).next());
-                    },
                   ),
                   _PlayerButton(
                     icon: Icons.queue_music_rounded,
