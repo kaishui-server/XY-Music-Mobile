@@ -1,7 +1,6 @@
 import 'dart:convert';
 import 'dart:io';
 
-import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:path/path.dart' as p;
@@ -11,262 +10,15 @@ import '../library/library_provider.dart';
 import '../player/android_storage.dart';
 import '../player/download_history_store.dart';
 import '../player/download_lyrics.dart';
-import '../plugins/plugin_runtime.dart' show qualityDisplayLabel;
+import '../plugins/plugin_runtime.dart'
+    show declaredQualityTokens, qualityDisplayLabel, qualityTierRank;
 import '../player/download_quality.dart';
 import '../player/downloaded_song_store.dart';
 import '../player/player_provider.dart';
 import '../rust/api.dart';
+import 'download_options_dialog.dart';
+import 'quality_fallback_dialog.dart';
 import 'top_notice.dart' show XyNotice, XyNoticeType;
-
-/// 批量下载选项（收藏页与歌单详情页共用）。
-class BatchDownloadOptions {
-  const BatchDownloadOptions({
-    required this.directory,
-    required this.quality,
-    this.dontAskAgain = false,
-    this.writeMetadata = true,
-  });
-  final String directory;
-  final String quality;
-  final bool dontAskAgain;
-
-  /// 下载后向音频文件写入元数据标签（标题/艺术家/专辑/歌词/封面）。
-  final bool writeMetadata;
-}
-
-/// 批量下载选项弹窗：选择下载位置与音质，可勾选“不再弹出”。
-class BatchDownloadOptionsDialog extends StatefulWidget {
-  const BatchDownloadOptionsDialog({
-    super.key,
-    required this.initialDirectory,
-    required this.initialQuality,
-    this.initialWriteMetadata = true,
-    this.title = '批量下载',
-  });
-  final String initialDirectory;
-  final String initialQuality;
-  final bool initialWriteMetadata;
-  final String title;
-
-  @override
-  State<BatchDownloadOptionsDialog> createState() =>
-      _BatchDownloadOptionsDialogState();
-}
-
-class _BatchDownloadOptionsDialogState
-    extends State<BatchDownloadOptionsDialog> {
-  late final TextEditingController _directoryController;
-  late String _directoryValue;
-  late String _quality;
-  bool _dontAskAgain = false;
-  String? _error;
-  bool _choosing = false;
-
-  /// 音质档位与设置页“下载音质”一致（低 → 高，共 12 档，最高为超清
-  /// 母带）；实际能否下载到该档位取决于插件支持，失败时自动降级。
-  static const _qualities = [
-    '96k',
-    '128k',
-    '192k',
-    '320k',
-    'flac',
-    'flac24bit',
-    'hires',
-    'vinyl',
-    'dolby',
-    'atmos',
-    'atmos_plus',
-    'master',
-  ];
-
-  @override
-  void initState() {
-    super.initState();
-    _directoryValue = widget.initialDirectory;
-    _directoryController = TextEditingController(
-      text: AndroidStorage.displayPath(widget.initialDirectory),
-    );
-    _quality = _normalize(widget.initialQuality);
-  }
-
-  @override
-  void dispose() {
-    _directoryController.dispose();
-    super.dispose();
-  }
-
-  Future<void> _chooseDirectory() async {
-    if (_choosing) return;
-    setState(() => _choosing = true);
-    try {
-      final selected = Platform.isAndroid
-          ? await AndroidStorage.pickDirectory()
-          : await FilePicker.platform.getDirectoryPath();
-      if (!mounted || selected == null) return;
-      _directoryValue = selected;
-      _directoryController.text = AndroidStorage.displayPath(selected);
-      setState(() => _error = null);
-    } catch (error) {
-      if (mounted) setState(() => _error = '选择文件夹失败：$error');
-    } finally {
-      if (mounted) setState(() => _choosing = false);
-    }
-  }
-
-  void _submit() {
-    final directory = _directoryValue.trim();
-    if (directory.isEmpty) {
-      setState(() => _error = '请输入或选择可访问的下载文件夹');
-      return;
-    }
-    Navigator.pop(
-      context,
-      BatchDownloadOptions(
-        directory: directory,
-        quality: _quality,
-        dontAskAgain: _dontAskAgain,
-        writeMetadata: widget.initialWriteMetadata,
-      ),
-    );
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return AlertDialog(
-      title: Text(widget.title),
-      content: SizedBox(
-        width: 360,
-        height: 276,
-        child: SingleChildScrollView(
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text(
-                '下载位置',
-                style: Theme.of(
-                  context,
-                ).textTheme.labelLarge?.copyWith(fontWeight: FontWeight.w600),
-              ),
-              const SizedBox(height: 6),
-              Row(
-                children: [
-                  Expanded(
-                    child: TextField(
-                      controller: _directoryController,
-                      maxLines: 1,
-                      style: const TextStyle(fontSize: 13),
-                      onChanged: (value) => _directoryValue = value,
-                      decoration: const InputDecoration(
-                        isDense: true,
-                        prefixIcon: Icon(Icons.folder_outlined, size: 19),
-                        prefixIconConstraints: BoxConstraints(minWidth: 38),
-                        hintText: '/storage/emulated/0/Music',
-                        contentPadding: EdgeInsets.symmetric(
-                          horizontal: 10,
-                          vertical: 11,
-                        ),
-                      ),
-                    ),
-                  ),
-                  const SizedBox(width: 8),
-                  SizedBox(
-                    height: 40,
-                    child: OutlinedButton.icon(
-                      style: OutlinedButton.styleFrom(
-                        visualDensity: VisualDensity.compact,
-                        padding: const EdgeInsets.symmetric(horizontal: 11),
-                      ),
-                      onPressed: _choosing ? null : _chooseDirectory,
-                      icon: _choosing
-                          ? const SizedBox.square(
-                              dimension: 14,
-                              child: CircularProgressIndicator(strokeWidth: 2),
-                            )
-                          : const Icon(Icons.folder_open_rounded, size: 18),
-                      label: Text(
-                        _choosing ? '选择中' : '选择',
-                        style: const TextStyle(fontSize: 13),
-                      ),
-                    ),
-                  ),
-                ],
-              ),
-              const SizedBox(height: 16),
-              Text(
-                '下载音质',
-                style: Theme.of(
-                  context,
-                ).textTheme.labelLarge?.copyWith(fontWeight: FontWeight.w600),
-              ),
-              const SizedBox(height: 6),
-              Wrap(
-                spacing: 6,
-                runSpacing: 5,
-                children: [
-                  for (final quality in _qualities)
-                    ChoiceChip(
-                      label: Text(
-                        _qualityLabel(quality),
-                        style: const TextStyle(fontSize: 12),
-                      ),
-                      visualDensity: VisualDensity.compact,
-                      materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
-                      padding: const EdgeInsets.symmetric(horizontal: 3),
-                      selected: _quality == quality,
-                      onSelected: (_) => setState(() => _quality = quality),
-                    ),
-                ],
-              ),
-              CheckboxListTile(
-                value: _dontAskAgain,
-                onChanged: (value) =>
-                    setState(() => _dontAskAgain = value == true),
-                contentPadding: EdgeInsets.zero,
-                visualDensity: VisualDensity.compact,
-                materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
-                controlAffinity: ListTileControlAffinity.leading,
-                title: const Text('不再弹出此窗口', style: TextStyle(fontSize: 13)),
-              ),
-              if (_error != null) ...[
-                const SizedBox(height: 10),
-                Text(
-                  _error!,
-                  style: TextStyle(color: Theme.of(context).colorScheme.error),
-                ),
-              ],
-            ],
-          ),
-        ),
-      ),
-      actions: [
-        TextButton(
-          onPressed: () => Navigator.pop(context),
-          child: const Text('取消'),
-        ),
-        FilledButton(onPressed: _submit, child: const Text('开始下载')),
-      ],
-    );
-  }
-
-  static String _normalize(String value) => switch (value.trim().toLowerCase()) {
-    '96k' => '96k',
-    '128k' || 'standard' => '128k',
-    '192k' => '192k',
-    '320k' || 'high' => '320k',
-    'flac' || 'lossless' || 'sq' => 'flac',
-    'flac24bit' => 'flac24bit',
-    'hires' || 'hi-res' => 'hires',
-    'vinyl' => 'vinyl',
-    'dolby' => 'dolby',
-    'atmos' => 'atmos',
-    'atmos_plus' => 'atmos_plus',
-    'master' => 'master',
-    _ => '320k',
-  };
-
-  static String _qualityLabel(String quality) =>
-      qualityDisplayLabel(quality);
-}
 
 /// 确保 SAF 下载目录仍可写：授权失效（重装应用/恢复备份/系统回收后
 /// 持久化授权丢失）时引导用户重新选择目录，并同步更新下载路径设置。
@@ -310,6 +62,65 @@ Future<String?> ensureSafDirectoryAccess(
   return trimmed;
 }
 
+/// 批量下载前检测哪些歌曲不支持目标音质。
+///
+/// 直接读取插件歌曲快照中声明的音质表（MusicFree 的 qualities、洛雪的
+/// _types 等），全程同步、不发起任何联网探测——逐首联网探测在大批量下
+/// 每首要数秒，19 首就要近一分钟，无法接受。没有音质声明的歌曲无法判定，
+/// 按支持处理，真实降级仍由下载后的音质校验兜底。
+///
+/// 返回 `歌曲路径 -> 该歌曲声明的音质列表（低 → 高）`。
+Map<String, List<String>> _detectUnsupportedQuality(
+  List<Song> songs, {
+  required String quality,
+}) {
+  final target = quality.trim();
+  if (target.isEmpty) return const {};
+  final targetLabel = qualityDisplayLabel(target);
+  final unsupported = <String, List<String>>{};
+  for (final song in songs) {
+    if (playbackSourceTypeFor(song.toQueueItem()) ==
+        PlaybackSourceType.localFile) {
+      continue;
+    }
+    final declared = declaredQualityTokens(song.pluginData);
+    if (declared.isEmpty) continue;
+    // 同档位别名（flac/lossless/sq 等）映射到同一显示名称，按名称判定。
+    if (declared.any((value) => qualityDisplayLabel(value) == targetLabel)) {
+      continue;
+    }
+    final sorted = [...declared]..sort((a, b) {
+      final rank = qualityTierRank(a).compareTo(qualityTierRank(b));
+      return rank != 0 ? rank : a.compareTo(b);
+    });
+    unsupported[song.path] = sorted;
+  }
+  return unsupported;
+}
+
+/// 探测单首歌曲在指定音质下的真实文件大小（字节），供下载弹窗右侧展示。
+/// 解析失败或无法确定时返回 null，由弹窗回退到估算值或显示“未知”。
+Future<int?> _probeSongDownloadSize(
+  WidgetRef ref,
+  Song song,
+  String quality,
+) async {
+  try {
+    final source = await ref
+        .read(playerProvider.notifier)
+        .resolveDownloadSourceFor(
+          song.toQueueItem(),
+          quality,
+          includeLyrics: false,
+        )
+        .timeout(const Duration(seconds: 20));
+    return await probeDirectFileSize(source.url, source.headers);
+  } catch (_) {
+    // 单档位探测失败：保留估算值或显示“未知”，不打断下载弹窗。
+  }
+  return null;
+}
+
 /// 批量下载选中的歌曲（收藏页与歌单详情页共用）。
 ///
 /// 逐首解析音源并下载，写入下载历史（下载管理页可见进度），
@@ -325,23 +136,42 @@ Future<void> runBatchDownload(
   if (!context.mounted) return;
   // 指定音质（通用批量面板已选档位）时跳过选项对话框：直接用已保存的
   // 下载目录与该音质下载，不再重复询问。
+  // 单曲下载时弹窗展示各档位文件大小（与播放详情页一致）；批量无意义。
+  final singleSong = songs.length == 1 ? songs.first : null;
   final options = qualityOverride != null
-      ? BatchDownloadOptions(
+      ? DownloadOptions(
           directory: initialDirectory,
           quality: qualityOverride,
           writeMetadata: settings?.downloadWriteMetadata ?? true,
         )
       : settings?.askDownloadDetails ?? true
-      ? await showDialog<BatchDownloadOptions>(
+      ? await showDialog<DownloadOptions>(
           context: context,
           useRootNavigator: true,
-          builder: (context) => BatchDownloadOptionsDialog(
+          builder: (context) => DownloadOptionsDialog(
+            title: singleSong != null ? '下载歌曲' : '批量下载',
             initialDirectory: initialDirectory,
             initialQuality: settings?.downloadQuality ?? '320k',
+            qualities: kDownloadQualityOptions,
             initialWriteMetadata: settings?.downloadWriteMetadata ?? true,
+            showSizes: singleSong != null,
+            estimateSize: singleSong == null
+                ? null
+                : (quality) {
+                    final bytes = estimateLossyDownloadSizeBytes(
+                      quality,
+                      singleSong.duration * 1000,
+                    );
+                    return bytes == null
+                        ? null
+                        : QualitySize(bytes, estimated: true);
+                  },
+            probeSize: singleSong == null
+                ? null
+                : (quality) => _probeSongDownloadSize(ref, singleSong, quality),
           ),
         )
-      : BatchDownloadOptions(
+      : DownloadOptions(
           directory: initialDirectory,
           quality: settings?.downloadQuality ?? '320k',
           writeMetadata: settings?.downloadWriteMetadata ?? true,
@@ -372,8 +202,47 @@ Future<void> runBatchDownload(
     }
     return;
   }
+  // 目标音质支持检测：批量下载时部分歌曲可能不支持所选音质，先列出
+  // 这些歌曲并让用户选择回退方式（最高 / 最低 / 不下载），再开始下载。
+  final qualityByPath = <String, String>{};
+  final qualitySkippedPaths = <String>{};
+  if (songs.length > 1 && context.mounted) {
+    // 检测为纯同步内存计算（读插件快照声明的音质表），瞬时完成，无需提示。
+    final unsupported = _detectUnsupportedQuality(
+      songs,
+      quality: options.quality,
+    );
+    if (!context.mounted) return;
+    if (unsupported.isNotEmpty) {
+      final unsupportedSongs = [
+        for (final song in songs)
+          if (unsupported.containsKey(song.path)) song,
+      ];
+      final decision = await showQualityFallbackDialog(
+        context,
+        songs: unsupportedSongs,
+        targetQuality: options.quality,
+      );
+      if (decision == null || !context.mounted) return;
+      for (final song in unsupportedSongs) {
+        final available = unsupported[song.path]!;
+        final include =
+            decision.action != QualityFallbackAction.skip &&
+            decision.selectedPaths.contains(song.path);
+        if (!include) {
+          qualitySkippedPaths.add(song.path);
+          continue;
+        }
+        qualityByPath[song.path] =
+            decision.action == QualityFallbackAction.lowest
+            ? available.first
+            : available.last;
+      }
+    }
+  }
   var success = 0;
   var skipped = 0;
+  var qualitySkipped = 0;
   var failed = 0;
   var completed = 0;
   final total = songs.length;
@@ -388,6 +257,11 @@ Future<void> runBatchDownload(
     final notifier = ref.read(playerProvider.notifier);
     final historyNotifier = ref.read(downloadHistoryProvider.notifier);
     for (final song in songs) {
+      // 用户选择「不下载」或取消勾选的不支持音质歌曲：直接跳过。
+      if (qualitySkippedPaths.contains(song.path)) {
+        qualitySkipped++;
+        continue;
+      }
       if (playbackSourceTypeFor(song.toQueueItem()) ==
           PlaybackSourceType.localFile) {
         skipped++;
@@ -398,12 +272,14 @@ Future<void> runBatchDownload(
         skipped++;
         continue;
       }
+      // 不支持目标音质的歌曲使用用户选定的回退音质（最高 / 最低）。
+      final songQuality = qualityByPath[song.path] ?? options.quality;
       final failedBefore = failed;
       final historyId = historyNotifier.begin(
         title: song.title,
         artist: song.artist,
         album: song.album,
-        quality: options.quality,
+        quality: songQuality,
         durationMs: song.duration * 1000,
         sourcePath: song.path,
         pluginId: song.pluginId,
@@ -413,7 +289,7 @@ Future<void> runBatchDownload(
       try {
         final source = await notifier.resolveDownloadSourceFor(
           song.toQueueItem(),
-          options.quality,
+          songQuality,
         );
         final destination = await resolveDownloadFullPath(
           directory: workDirectory,
@@ -421,7 +297,7 @@ Future<void> runBatchDownload(
           artist: song.artist,
           album: song.album,
           url: source.url,
-          quality: options.quality,
+          quality: songQuality,
           keepSourceFilename: false,
           fileNameStyle: 'artist-title',
           overwriteExisting: false,
@@ -441,7 +317,7 @@ Future<void> runBatchDownload(
         // 校验真实音质：magic bytes 检测实际格式，纠正扩展名并记录降级。
         final verified = await verifyDownloadedAudioQuality(
           savedPath: savedPath,
-          selectedQuality: options.quality,
+          selectedQuality: songQuality,
           durationSec: song.duration,
           songTitle: song.title,
         );
@@ -546,6 +422,7 @@ Future<void> runBatchDownload(
       final summary =
           '批量下载完成：成功 $success 首'
           '${skipped > 0 ? '，本地歌曲跳过 $skipped 首' : ''}'
+          '${qualitySkipped > 0 ? '，$qualitySkipped 首不支持所选音质未下载' : ''}'
           '${failed > 0 ? '，失败 $failed 首' : ''}'
           '${downgraded.isNotEmpty ? '，${downgraded.length} 首低于所选音质' : ''}';
       final details = <String>[
