@@ -1,13 +1,27 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../../src/favorites/favorites_provider.dart';
 import '../../src/library/library_provider.dart';
 import '../../src/player/player_provider.dart';
 import '../../src/playlists/playlists_provider.dart';
+import '../../src/plugins/plugin_runtime.dart';
+import '../../src/widgets/batch_action_sheet.dart';
+import '../../src/widgets/batch_download.dart';
 import '../../src/widgets/cover_image.dart';
 import '../../src/widgets/mini_player_bar.dart';
 import '../../src/widgets/song_list_view.dart';
+import '../../src/widgets/source_switch.dart';
 import '../../src/widgets/top_notice.dart';
+
+/// 在线歌单页右上角「更多」菜单项（与音乐库-歌单详情页同款）。
+enum _OnlinePlaylistMenuAction {
+  batchDownload,
+  batchSwitchSource,
+  batchSaveToPlaylist,
+  batchFavorite,
+  refresh,
+}
 
 /// 网络歌手、专辑、歌单详情页。
 ///
@@ -43,6 +57,11 @@ class _OnlineCatalogDetailPageState
   bool _loading = true;
   var _visibleSongCount = _pageSize;
   final ScrollController _songsController = ScrollController();
+
+  // 批量换源进度（右上角「更多」菜单触发）。
+  bool _switchingSource = false;
+  int _switchingDone = 0;
+  int _switchingTotal = 0;
 
   @override
   void initState() {
@@ -97,7 +116,46 @@ class _OnlineCatalogDetailPageState
     );
     return Scaffold(
       appBar: AppBar(
-        title: Text(isPlaylist ? widget.title : widget.categoryLabel),
+        // 歌单名称已由顶部信息卡展示，顶栏不再重复；换源时临时显示进度。
+        title: Text(
+          isPlaylist
+              ? (_switchingSource
+                    ? '换源中 $_switchingDone/$_switchingTotal'
+                    : '')
+              : widget.categoryLabel,
+        ),
+        // 歌单页复用音乐库-歌单详情页的「更多」菜单。
+        actions: isPlaylist
+            ? [
+                PopupMenuButton<_OnlinePlaylistMenuAction>(
+                  tooltip: '更多',
+                  icon: const Icon(Icons.more_vert_rounded),
+                  onSelected: _onMenuAction,
+                  itemBuilder: (context) => const [
+                    PopupMenuItem(
+                      value: _OnlinePlaylistMenuAction.batchDownload,
+                      child: Text('批量下载'),
+                    ),
+                    PopupMenuItem(
+                      value: _OnlinePlaylistMenuAction.batchSwitchSource,
+                      child: Text('批量换源'),
+                    ),
+                    PopupMenuItem(
+                      value: _OnlinePlaylistMenuAction.batchSaveToPlaylist,
+                      child: Text('批量保存到歌单'),
+                    ),
+                    PopupMenuItem(
+                      value: _OnlinePlaylistMenuAction.batchFavorite,
+                      child: Text('批量收藏'),
+                    ),
+                    PopupMenuItem(
+                      value: _OnlinePlaylistMenuAction.refresh,
+                      child: Text('刷新'),
+                    ),
+                  ],
+                ),
+              ]
+            : null,
       ),
       body: Stack(
         children: [
@@ -359,6 +417,163 @@ class _OnlineCatalogDetailPageState
     }
     if (mounted) {
       XyNotice.show(context, message: '已添加到歌单', type: XyNoticeType.success);
+    }
+  }
+
+  /// 右上角「更多」菜单：批量下载 / 批量换源 / 批量保存到歌单 / 批量收藏 /
+  /// 刷新（与音乐库-歌单详情页同款）。
+  Future<void> _onMenuAction(_OnlinePlaylistMenuAction action) async {
+    if (action != _OnlinePlaylistMenuAction.refresh && _songs.isEmpty) {
+      XyNotice.show(
+        context,
+        message: '暂无可操作的歌曲',
+        type: XyNoticeType.warning,
+        compact: true,
+      );
+      return;
+    }
+    switch (action) {
+      case _OnlinePlaylistMenuAction.batchDownload:
+        await showBatchActionSheet(
+          context,
+          kind: BatchActionKind.download,
+          songs: _songs,
+          onDownload: (selected, quality) => runBatchDownload(
+            context,
+            ref,
+            songs: selected,
+            qualityOverride: quality,
+          ),
+        );
+      case _OnlinePlaylistMenuAction.batchSwitchSource:
+        await showBatchActionSheet(
+          context,
+          kind: BatchActionKind.switchSource,
+          songs: _songs,
+          onSwitchSource: (selected, plugin, lxSource) =>
+              _switchSourceFor(selected, plugin, lxSource),
+        );
+      case _OnlinePlaylistMenuAction.batchSaveToPlaylist:
+        await showBatchActionSheet(
+          context,
+          kind: BatchActionKind.saveToPlaylist,
+          songs: _songs,
+          onSaveToPlaylist: (selected, playlistId) =>
+              _saveToPlaylist(selected, playlistId),
+        );
+      case _OnlinePlaylistMenuAction.batchFavorite:
+        await showBatchActionSheet(
+          context,
+          kind: BatchActionKind.favorite,
+          songs: _songs,
+          onFavorite: _favoriteSongs,
+        );
+      case _OnlinePlaylistMenuAction.refresh:
+        await _loadSongs();
+        if (mounted) {
+          XyNotice.show(
+            context,
+            message: '已刷新',
+            type: XyNoticeType.success,
+            compact: true,
+          );
+        }
+    }
+  }
+
+  /// 批量收藏：把所选歌曲添加到收藏，已在收藏中的自动跳过。
+  Future<void> _favoriteSongs(List<Song> selected) async {
+    if (selected.isEmpty) return;
+    final added = await ref
+        .read(favoritesProvider.notifier)
+        .addAll(selected.map(FavoriteSongSnapshot.fromSong));
+    if (!mounted) return;
+    final message = added > 0 ? '已收藏 $added 首歌曲' : '所选歌曲均已在收藏中';
+    XyNotice.show(
+      context,
+      message: message,
+      type: added > 0 ? XyNoticeType.success : XyNoticeType.warning,
+    );
+  }
+
+  /// 批量保存到歌单：把所选歌曲加入目标歌单，已存在的自动跳过。
+  Future<void> _saveToPlaylist(List<Song> selected, String playlistId) async {
+    if (selected.isEmpty) return;
+    final (added, exists) = await ref
+        .read(playlistsProvider.notifier)
+        .addQueueItems(playlistId, [
+          for (final song in selected) song.toQueueItem(),
+        ]);
+    if (!mounted) return;
+    final message = added > 0
+        ? '已添加 $added 首到歌单${exists > 0 ? '，$exists 首已存在' : ''}'
+        : '所选歌曲均已在歌单中';
+    XyNotice.show(
+      context,
+      message: message,
+      type: added > 0 ? XyNoticeType.success : XyNoticeType.warning,
+    );
+  }
+
+  /// 批量换源：逐首搜索同名歌曲，原位替换本页歌曲（在线歌单不落库，
+  /// 直接更新内存列表）。
+  Future<void> _switchSourceFor(
+    List<Song> selected,
+    EnabledMusicPlugin plugin,
+    String? lxSource,
+  ) async {
+    if (selected.isEmpty || _switchingSource) return;
+    setState(() {
+      _switchingSource = true;
+      _switchingDone = 0;
+      _switchingTotal = selected.length;
+    });
+    final replacements = <String, Song>{};
+    final missed = <String>[];
+    for (final song in selected) {
+      if (!mounted) return;
+      setState(() => _switchingDone++);
+      try {
+        final candidates = await searchReplacementCandidates(
+          ref,
+          plugin,
+          title: song.title,
+          artist: song.artist,
+          durationMs: song.duration * 1000,
+          lxSource: lxSource,
+        );
+        if (candidates.isEmpty) {
+          missed.add(song.title);
+          continue;
+        }
+        replacements[song.path] = replacementToSong(plugin, candidates.first);
+      } catch (_) {
+        missed.add(song.title);
+      }
+    }
+    if (!mounted) return;
+    setState(() {
+      _switchingSource = false;
+      _songs = [for (final song in _songs) replacements[song.path] ?? song];
+    });
+    if (replacements.isEmpty) {
+      XyNotice.show(
+        context,
+        message: '未找到可用的替换源',
+        type: XyNoticeType.warning,
+      );
+    } else if (missed.isEmpty) {
+      XyNotice.show(
+        context,
+        message: '已换源 ${replacements.length} 首',
+        type: XyNoticeType.success,
+      );
+    } else {
+      XyNotice.show(
+        context,
+        message: '已换源 ${replacements.length} 首，${missed.length} 首未找到',
+        type: XyNoticeType.warning,
+      );
     }
   }
 }

@@ -68,8 +68,8 @@ class ThirdPartyLicensesPage extends StatelessWidget {
               ),
             ),
             child: Text(
-              '本项目部分内容参考 坤音（UI）、落雪（部分功能实现代码+仓库地址）、'
-              '弦予（软件部分架构+仓库地址）、BakaMusic（仓库地址）等音乐软件，'
+              '本项目部分内容参考 坤音（UI）、落雪（部分功能实现代码）、'
+              '弦予（软件部分架构）、BakaMusic 等音乐软件，'
               '感谢他们的支持。',
               style: TextStyle(
                 fontSize: 14,

@@ -134,6 +134,8 @@ flutter:
     - assets/lx_plugin_runtime.js
     - assets/share_qq.png
     - assets/share_qzone.jpg
+    - assets/creators/kaishui.jpg
+    - assets/creators/qingci.jpg
 
   # To add assets to your application, add an assets section, like this:
   # assets:

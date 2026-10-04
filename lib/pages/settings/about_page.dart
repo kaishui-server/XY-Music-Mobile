@@ -120,6 +120,7 @@ class AboutPage extends ConsumerWidget {
             children: [
               _LinkRow(
                 icon: Icons.person_rounded,
+                avatarAsset: 'assets/creators/kaishui.jpg',
                 title: '狐狐不相信人类',
                 subtitle: 'github.com/kaishui-server',
                 onTap: () => _openUrl(context, kCreatorKaishuiUrl),
@@ -127,6 +128,7 @@ class AboutPage extends ConsumerWidget {
               const Divider(height: 1, indent: 66),
               _LinkRow(
                 icon: Icons.person_outline_rounded,
+                avatarAsset: 'assets/creators/qingci.jpg',
                 title: '青辞',
                 subtitle: 'github.com/3580351677',
                 onTap: () => _openUrl(context, kCreatorQingciUrl),
@@ -331,6 +333,7 @@ class _LinkRow extends StatelessWidget {
     required this.subtitle,
     required this.onTap,
     this.onLongPress,
+    this.avatarAsset,
   });
 
   final IconData icon;
@@ -338,6 +341,9 @@ class _LinkRow extends StatelessWidget {
   final String subtitle;
   final VoidCallback onTap;
   final VoidCallback? onLongPress;
+
+  /// 头像图片资源；提供时用圆形头像替代默认的图标方块。
+  final String? avatarAsset;
 
   @override
   Widget build(BuildContext context) {
@@ -349,15 +355,25 @@ class _LinkRow extends StatelessWidget {
         padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 13),
         child: Row(
           children: [
-            Container(
-              width: 40,
-              height: 40,
-              decoration: BoxDecoration(
-                color: const Color(0x20EC4141),
-                borderRadius: BorderRadius.circular(11),
+            if (avatarAsset != null)
+              ClipOval(
+                child: Image.asset(
+                  avatarAsset!,
+                  width: 40,
+                  height: 40,
+                  fit: BoxFit.cover,
+                ),
+              )
+            else
+              Container(
+                width: 40,
+                height: 40,
+                decoration: BoxDecoration(
+                  color: const Color(0x20EC4141),
+                  borderRadius: BorderRadius.circular(11),
+                ),
+                child: Icon(icon, color: const Color(0xFFEC4141), size: 21),
               ),
-              child: Icon(icon, color: const Color(0xFFEC4141), size: 21),
-            ),
             const SizedBox(width: 12),
             Expanded(
               child: Column(
