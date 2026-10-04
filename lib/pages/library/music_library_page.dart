@@ -104,6 +104,20 @@ class _MusicLibraryPageState extends ConsumerState<MusicLibraryPage>
   /// 按拼音排序；歌手 / 专辑子分页固定按拼音分组，不参与排序。
   SongSort _localSort = const SongSort(SongSortKey.custom);
 
+  /// 歌曲子分页排序结果缓存：曲库引用与排序方式均未变化时直接复用，
+  /// 避免切页重建时对整库重复做一遍拼音排序。
+  List<Song>? _localSortedCacheSongs;
+  SongSortKey? _localSortedCacheKey;
+  bool? _localSortedCacheDescending;
+  List<Song> _localSortedCache = const <Song>[];
+
+  /// 歌手 / 专辑分组结果缓存：曲库引用与分组类别（歌手/专辑）不变时复用，
+  /// 避免切页重建时对整库重复分组并拼音排序分组名。
+  List<Song>? _localGroupCacheSongs;
+  String? _localGroupCacheKind;
+  Map<String, List<Song>> _localGroupCache = const <String, List<Song>>{};
+  List<String> _localGroupCacheNames = const <String>[];
+
   /// 曲库重扫进行中（本地音乐 / 文件夹分页共用的刷新按钮状态）。
   bool _libraryScanning = false;
 
@@ -428,13 +442,17 @@ class _MusicLibraryPageState extends ConsumerState<MusicLibraryPage>
       body: XyPageBackground(
         child: TabBarView(
           controller: _tabController,
+          // 用 _DeferredTab 懒构建：TabBarView 会一次性索要全部子项的 Widget
+          // 实例，若在此直接调用六个分页的构建方法，每次切页都要把未显示
+          // 分页（尤其本地音乐分页的歌手/专辑分组与拼音排序）全部重算一遍，
+          // 这是切页卡顿的主因。改为让 PageView 只构建实际挂载的分页。
           children: [
-            _buildFavoritesTab(context),
-            _buildPlaylistsTab(context),
-            _buildLocalTab(context),
-            _buildFoldersTab(context),
-            _buildRecentTab(context),
-            _buildQueueTab(context),
+            _DeferredTab(_buildFavoritesTab),
+            _DeferredTab(_buildPlaylistsTab),
+            _DeferredTab(_buildLocalTab),
+            _DeferredTab(_buildFoldersTab),
+            _DeferredTab(_buildRecentTab),
+            _DeferredTab(_buildQueueTab),
           ],
         ),
       ),
@@ -1527,6 +1545,56 @@ class _MusicLibraryPageState extends ConsumerState<MusicLibraryPage>
     return groups;
   }
 
+  /// 歌曲子分页排序（带缓存）：排序方式为 custom 时直接用扫描序；
+  /// 否则按拼音排序，结果按「曲库引用 + 排序方式」缓存复用。
+  List<Song> _localSortedSongs(List<Song> songs) {
+    if (identical(songs, _localSortedCacheSongs) &&
+        _localSortedCacheKey == _localSort.key &&
+        _localSortedCacheDescending == _localSort.descending) {
+      return _localSortedCache;
+    }
+    final sorted = _localSort.key == SongSortKey.custom
+        ? songs
+        : [...songs]..sort((a, b) {
+            var result = compareSongsBySortKey(
+              _localSort.key,
+              a,
+              b,
+              _pinyinKey,
+            );
+            if (result == 0) {
+              result = _pinyinKey(a.title).compareTo(_pinyinKey(b.title));
+            }
+            return _localSort.descending ? -result : result;
+          });
+    _localSortedCacheSongs = songs;
+    _localSortedCacheKey = _localSort.key;
+    _localSortedCacheDescending = _localSort.descending;
+    _localSortedCache = sorted;
+    return sorted;
+  }
+
+  /// 歌手 / 专辑分组（带缓存）：曲库引用与分组类别不变时复用分组结果与
+  /// 已按拼音排好的分组名。
+  ({Map<String, List<Song>> groups, List<String> names}) _localGroupsCached(
+    List<Song> songs,
+    String Function(Song song) keyOf,
+    String unknownLabel,
+  ) {
+    if (identical(songs, _localGroupCacheSongs) &&
+        _localGroupCacheKind == unknownLabel) {
+      return (groups: _localGroupCache, names: _localGroupCacheNames);
+    }
+    final groups = _groupLocalSongs(songs, keyOf, unknownLabel);
+    final names = groups.keys.toList()
+      ..sort((a, b) => _pinyinKey(a).compareTo(_pinyinKey(b)));
+    _localGroupCacheSongs = songs;
+    _localGroupCacheKind = unknownLabel;
+    _localGroupCache = groups;
+    _localGroupCacheNames = names;
+    return (groups: groups, names: names);
+  }
+
   Widget _buildLocalTab(BuildContext context) {
     final songs = ref.watch(libraryProvider.select((s) => s.songs));
     if (songs.isEmpty) {
@@ -1552,25 +1620,31 @@ class _MusicLibraryPageState extends ConsumerState<MusicLibraryPage>
         Expanded(
           child: TabBarView(
             controller: _localTabController,
+            // 同样懒构建：默认只构建「歌曲」子分页，歌手 / 专辑分组视图
+            // （含整库分组与拼音排序）仅在切到该子分页时才计算。
             children: [
-              _buildLocalSongsTab(context, songs),
-              _buildLocalGroupsTab(
-                context,
-                songs,
-                keyOf: (song) => song.artist,
-                unknownLabel: '未知歌手',
-                emptyLabel: '暂无歌手信息',
-                icon: Icons.person_rounded,
-                unitLabel: '位歌手',
+              _DeferredTab((context) => _buildLocalSongsTab(context, songs)),
+              _DeferredTab(
+                (context) => _buildLocalGroupsTab(
+                  context,
+                  songs,
+                  keyOf: (song) => song.artist,
+                  unknownLabel: '未知歌手',
+                  emptyLabel: '暂无歌手信息',
+                  icon: Icons.person_rounded,
+                  unitLabel: '位歌手',
+                ),
               ),
-              _buildLocalGroupsTab(
-                context,
-                songs,
-                keyOf: (song) => song.album,
-                unknownLabel: '未知专辑',
-                emptyLabel: '暂无专辑信息',
-                icon: Icons.album_rounded,
-                unitLabel: '张专辑',
+              _DeferredTab(
+                (context) => _buildLocalGroupsTab(
+                  context,
+                  songs,
+                  keyOf: (song) => song.album,
+                  unknownLabel: '未知专辑',
+                  emptyLabel: '暂无专辑信息',
+                  icon: Icons.album_rounded,
+                  unitLabel: '张专辑',
+                ),
               ),
             ],
           ),
@@ -1581,20 +1655,7 @@ class _MusicLibraryPageState extends ConsumerState<MusicLibraryPage>
 
   Widget _buildLocalSongsTab(BuildContext context, List<Song> songs) {
     // 排序仅作用于歌曲子分页的展示与播放顺序；custom = 曲库扫描序。
-    final sortedSongs = _localSort.key == SongSortKey.custom
-        ? songs
-        : [...songs]..sort((a, b) {
-            var result = compareSongsBySortKey(
-              _localSort.key,
-              a,
-              b,
-              _pinyinKey,
-            );
-            if (result == 0) {
-              result = _pinyinKey(a.title).compareTo(_pinyinKey(b.title));
-            }
-            return _localSort.descending ? -result : result;
-          });
+    final sortedSongs = _localSortedSongs(songs);
     final allSelected = sortedSongs.isNotEmpty &&
         _localSelectedPaths.length == sortedSongs.length &&
         sortedSongs.every((song) => _localSelectedPaths.contains(song.path));
@@ -1673,9 +1734,9 @@ class _MusicLibraryPageState extends ConsumerState<MusicLibraryPage>
     required IconData icon,
     required String unitLabel,
   }) {
-    final groups = _groupLocalSongs(songs, keyOf, unknownLabel);
-    final names = groups.keys.toList()
-      ..sort((a, b) => _pinyinKey(a).compareTo(_pinyinKey(b)));
+    final cached = _localGroupsCached(songs, keyOf, unknownLabel);
+    final groups = cached.groups;
+    final names = cached.names;
     if (names.isEmpty) {
       return _EmptyHint(emptyLabel);
     }
@@ -2102,6 +2163,21 @@ class _MusicLibraryPageState extends ConsumerState<MusicLibraryPage>
     if (songs.isEmpty) return;
     await ref.read(libraryProvider.notifier).playAll(songs);
   }
+}
+
+/// 分页内容的懒构建壳：TabBarView（内部是 PageView）会一次性索要所有子项
+/// 的 Widget 实例，但只把当前页（滑动过场时加上相邻页）真正挂载到元素树。
+/// 若在索要时就直接调用各分页的构建方法，未显示的分页也会在每次父级
+/// setState 时全量重算——本地音乐分页的歌手/专辑分组与拼音排序尤其昂贵，
+/// 这正是分页切换卡顿的主因。本类把真正的构建推迟到该分页被挂载时，
+/// 观感与原有完全一致，只是不再做无用功。
+class _DeferredTab extends StatelessWidget {
+  const _DeferredTab(this.builder);
+
+  final WidgetBuilder builder;
+
+  @override
+  Widget build(BuildContext context) => builder(context);
 }
 
 /// 各分页顶部的「数量 + 操作按钮」行。
