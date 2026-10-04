@@ -278,6 +278,11 @@ const _qualityDiscoveryFallback = [
   'atmos',
 ];
 
+/// 同步读取插件歌曲快照中声明的音质标识（公开包装）。
+/// 供下载弹窗秒开时先填充音质列表，无需等待插件逐档联网探测。
+List<String> declaredQualityTokens(dynamic value) =>
+    _qualityTokensFromRaw(value);
+
 /// 从插件歌曲快照中提取插件声明的音质标识。不同 MusicFree/LX 插件
 /// 使用的字段并不统一，因此这里兼容 qualities、formats、_types 等常见
 /// 结构，同时保留插件自己的 token（例如 master、hires、24bit）。

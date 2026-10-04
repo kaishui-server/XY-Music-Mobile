@@ -79,6 +79,15 @@ class _DownloadOptions {
   final bool writeMetadata;
 }
 
+/// 音质对应的下载大小：有损档位按码率估算（estimated=true），
+/// 无损档位为直链实测值。
+class _QualitySize {
+  const _QualitySize(this.bytes, {this.estimated = false});
+
+  final int bytes;
+  final bool estimated;
+}
+
 String _formatSleepDuration(Duration duration) {
   final totalSeconds = duration.inSeconds;
   final hours = totalSeconds ~/ 3600;
@@ -113,6 +122,75 @@ String lyricsOffsetLabel(int offsetTenths) {
 
 /// 音质选项的展示标签（更多菜单与下载选项弹窗共用）。
 String _qualityLabel(String quality) => qualityDisplayLabel(quality);
+
+/// 文件大小展示：≥1MB 保留一位小数，其余按 KB 取整。
+String _formatFileSize(int bytes) {
+  if (bytes < 1024) return '$bytes B';
+  if (bytes < 1024 * 1024) return '${(bytes / 1024).toStringAsFixed(0)} KB';
+  return '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
+}
+
+const String _probeUserAgent =
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+    '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+
+/// 用 `Range: bytes=0-0` 请求探测直链的真实文件大小（字节）。
+/// 关键点：必须带上解析音源时拿到的请求头（Referer/Cookie 等），否则部分
+/// CDN 会返回错误页，导致 hi-res/杜比/母带这类直链的大小失真。同时排除
+/// HLS 播放列表与错误页等非音频响应；无法确定时返回 null（界面显示“未知”）。
+Future<int?> _probeDirectSize(
+  String url,
+  Map<String, String> headers,
+) async {
+  final uri = Uri.tryParse(url);
+  if (uri == null || (uri.scheme != 'http' && uri.scheme != 'https')) {
+    return null;
+  }
+  final client = http.Client();
+  try {
+    final request = http.Request('GET', uri);
+    // 直链自带的请求头优先（Referer/Cookie/UA 等），缺失时补默认值。
+    request.headers.addAll(headers);
+    request.headers.putIfAbsent('User-Agent', () => _probeUserAgent);
+    request.headers.putIfAbsent('Accept', () => 'audio/*,*/*;q=0.5');
+    // Range 与禁用压缩是探测准确性的关键，必须由我们覆盖。
+    request.headers['Range'] = 'bytes=0-0';
+    request.headers['Accept-Encoding'] = 'identity';
+    final response = await client
+        .send(request)
+        .timeout(const Duration(seconds: 10));
+    // 206 Partial Content：总大小在 Content-Range 的 `bytes 0-0/<total>` 尾部。
+    final contentRange = response.headers['content-range'];
+    if (contentRange != null) {
+      final total = int.tryParse(contentRange.split('/').last.trim());
+      if (total != null && total > 0) return total;
+    }
+    // 200：服务器忽略了 Range，Content-Length 即整文件大小；需排除播放列表
+    // 与错误页，避免把几 KB 的清单/HTML 当成音频大小。
+    if (response.statusCode == 200 &&
+        !_isNonAudioResponse(response.headers['content-type'], uri)) {
+      final length = response.contentLength;
+      if (length != null && length > 0) return length;
+    }
+    return null;
+  } catch (_) {
+    return null;
+  } finally {
+    client.close();
+  }
+}
+
+bool _isNonAudioResponse(String? contentType, Uri uri) {
+  final path = uri.path.toLowerCase();
+  if (path.endsWith('.m3u8') || path.endsWith('.m3u')) return true;
+  final ct = (contentType ?? '').toLowerCase();
+  if (ct.isEmpty) return false;
+  return ct.contains('mpegurl') ||
+      ct.contains('text/html') ||
+      ct.contains('text/plain') ||
+      ct.contains('application/json') ||
+      ct.contains('dash+xml');
+}
 
 /// 播放页封面样式的展示标签（样式切换按钮提示共用）。
 String coverStyleLabel(PlayerCoverStyle style) => switch (style) {
@@ -2077,6 +2155,45 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
     }
   }
 
+  /// 同步构造音质下拉框的初始列表：只取插件快照里声明的音质与当前音质，
+  /// 不发起任何网络请求，保证下载弹窗立即弹出；完整列表随后由
+  /// [_discoverQualityOptions] 在弹窗内异步补齐。
+  List<String> _declaredQualityOptions(QueueItem item, String preferred) {
+    final current = preferred.trim();
+    final tokens = <String>{
+      ...declaredQualityTokens(item.pluginData),
+      if (current.isNotEmpty) current,
+    };
+    if (tokens.isEmpty) tokens.add('320k');
+    final list = _dedupeQualityByLabel(tokens.toList(), current);
+    list.sort((a, b) {
+      final rank = qualityTierRank(a).compareTo(qualityTierRank(b));
+      return rank != 0 ? rank : a.compareTo(b);
+    });
+    return list;
+  }
+
+  /// 有损档位按码率×时长给出的即时估算值；无损/未知档位返回 null。
+  _QualitySize? _estimateDownloadSize(QueueItem item, String quality) {
+    final bytes = estimateLossyDownloadSizeBytes(quality, item.durationMs);
+    return bytes == null ? null : _QualitySize(bytes, estimated: true);
+  }
+
+  /// 解析该音质真实直链并探测其文件大小（字节）。解析失败或无法确定时
+  /// 返回 null，由弹窗回退到估算值或显示“未知”。
+  Future<int?> _probeDownloadSize(QueueItem item, String quality) async {
+    try {
+      final source = await ref
+          .read(playerProvider.notifier)
+          .resolveDownloadSourceFor(item, quality, includeLyrics: false)
+          .timeout(const Duration(seconds: 20));
+      return await _probeDirectSize(source.url, source.headers);
+    } catch (_) {
+      // 单档位探测失败：保留估算值或显示“未知”，不打断下载弹窗。
+    }
+    return null;
+  }
+
   Future<void> _linkLyrics(QueueItem item) async {
     final associated = await ref
         .read(playerProvider.notifier)
@@ -2430,20 +2547,22 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
     final shouldAsk = settings?.askDownloadDetails ?? true;
     _DownloadOptions? options;
     if (shouldAsk) {
-      XyNotice.show(context, message: '正在读取插件支持的下载音质…');
-      final qualities = await _discoverQualityOptions(
-        item,
-        preferred: playback.currentQuality,
-      );
-      if (!mounted) return;
+      // 秒开：先用插件快照声明的音质填充下拉框，完整音质列表与各档文件
+      // 大小都在弹窗内异步补齐，避免点击下载后长时间无响应。
       options = await showDialog<_DownloadOptions>(
         context: context,
         useRootNavigator: true,
         builder: (context) => _DownloadOptionsDialog(
           initialDirectory: initialDirectory,
           initialQuality: settings?.downloadQuality ?? playback.currentQuality,
-          qualities: qualities,
+          qualities: _declaredQualityOptions(item, playback.currentQuality),
           initialWriteMetadata: settings?.downloadWriteMetadata ?? true,
+          discoverQualities: () => _discoverQualityOptions(
+            item,
+            preferred: playback.currentQuality,
+          ),
+          estimateSize: (quality) => _estimateDownloadSize(item, quality),
+          probeSize: (quality) => _probeDownloadSize(item, quality),
         ),
       );
     } else {
@@ -3344,12 +3463,26 @@ class _DownloadOptionsDialog extends StatefulWidget {
     required this.initialQuality,
     required this.qualities,
     this.initialWriteMetadata = true,
+    this.discoverQualities,
+    this.estimateSize,
+    this.probeSize,
   });
 
   final String initialDirectory;
   final String initialQuality;
+
+  /// 秒开用的初始音质列表（插件声明的音质 + 当前音质），不含联网探测。
   final List<String> qualities;
   final bool initialWriteMetadata;
+
+  /// 异步补齐插件实际支持的完整音质列表；为 null 时不做补齐。
+  final Future<List<String>> Function()? discoverQualities;
+
+  /// 有损档位的即时估算大小（同步，可能为 null）；先显示、后由实测替换。
+  final _QualitySize? Function(String quality)? estimateSize;
+
+  /// 探测某音质的真实文件大小（字节），供下拉框右侧展示。
+  final Future<int?> Function(String quality)? probeSize;
 
   @override
   State<_DownloadOptionsDialog> createState() => _DownloadOptionsDialogState();
@@ -3358,11 +3491,17 @@ class _DownloadOptionsDialog extends StatefulWidget {
 class _DownloadOptionsDialogState extends State<_DownloadOptionsDialog> {
   late final TextEditingController _directoryController;
   late String _directoryValue;
-  late final List<String> _qualities;
+  late List<String> _qualities;
   late String _quality;
   bool _dontAskAgain = false;
   bool _choosingDirectory = false;
+  bool _discovering = false;
   String? _error;
+
+  /// 各音质当前展示的大小；null 表示暂无（探测中或失败）。
+  final Map<String, _QualitySize?> _qualitySizes = {};
+  final Set<String> _probingQualities = {};
+  final Set<String> _probedQualities = {};
 
   @override
   void initState() {
@@ -3371,10 +3510,85 @@ class _DownloadOptionsDialogState extends State<_DownloadOptionsDialog> {
     _directoryController = TextEditingController(
       text: AndroidStorage.displayPath(widget.initialDirectory),
     );
-    _qualities = widget.qualities.isEmpty
-        ? const ['320k']
-        : widget.qualities.toSet().toList();
+    _qualities = _dedupeQualities(
+      widget.qualities.isEmpty ? const ['320k'] : widget.qualities,
+    );
     _quality = _normalizeQuality(widget.initialQuality, _qualities);
+    // 先用估算值填位，保证下拉框一打开就有大小可看，随后实测替换。
+    for (final quality in _qualities) {
+      final estimate = widget.estimateSize?.call(quality);
+      if (estimate != null) _qualitySizes[quality] = estimate;
+    }
+    _probeSizesFor(_qualities);
+    unawaited(_startDiscovery());
+  }
+
+  /// 在弹窗内异步补齐完整音质列表：完成后合并去重、按档位排序，
+  /// 并只为新增档位补发大小探测。
+  Future<void> _startDiscovery() async {
+    final discover = widget.discoverQualities;
+    if (discover == null) return;
+    _discovering = true;
+    List<String> found;
+    try {
+      found = await discover();
+    } catch (_) {
+      if (mounted) setState(() => _discovering = false);
+      return;
+    }
+    if (!mounted) return;
+    final merged = _dedupeQualities([..._qualities, ...found])..sort((a, b) {
+      final rank = qualityTierRank(a).compareTo(qualityTierRank(b));
+      return rank != 0 ? rank : a.compareTo(b);
+    });
+    final added = merged.where((q) => !_qualities.contains(q)).toList();
+    for (final quality in added) {
+      final estimate = widget.estimateSize?.call(quality);
+      if (estimate != null) _qualitySizes[quality] = estimate;
+    }
+    setState(() {
+      _qualities = merged;
+      _quality = _normalizeQuality(_quality, merged);
+      _discovering = false;
+    });
+    _probeSizesFor(added);
+  }
+
+  /// 并行实测各音质大小：先展示估算值，实测成功后替换为准确值；实测失败
+  /// 时保留估算值，无估算则显示“未知”。不阻塞弹窗交互。
+  void _probeSizesFor(List<String> qualities) {
+    final probe = widget.probeSize;
+    if (probe == null) return;
+    for (final quality in qualities) {
+      if (_probedQualities.contains(quality) ||
+          _probingQualities.contains(quality)) {
+        continue;
+      }
+      _probingQualities.add(quality);
+      unawaited(
+        probe(quality).then((bytes) {
+          if (!mounted) return;
+          setState(() {
+            _probingQualities.remove(quality);
+            _probedQualities.add(quality);
+            if (bytes != null && bytes > 0) {
+              _qualitySizes[quality] = _QualitySize(bytes);
+            } else if (!_qualitySizes.containsKey(quality)) {
+              _qualitySizes[quality] = null;
+            }
+          });
+        }),
+      );
+    }
+  }
+
+  List<String> _dedupeQualities(List<String> input) {
+    final seenLabels = <String>{};
+    final result = <String>[];
+    for (final quality in input) {
+      if (seenLabels.add(_qualityLabel(quality))) result.add(quality);
+    }
+    return result;
   }
 
   @override
@@ -3495,18 +3709,25 @@ class _DownloadOptionsDialogState extends State<_DownloadOptionsDialog> {
                   ],
                 ),
                 const SizedBox(height: 16),
-                Text(
-                  '下载音质',
-                  style: Theme.of(
-                    context,
-                  ).textTheme.labelLarge?.copyWith(fontWeight: FontWeight.w600),
+                Row(
+                  children: [
+                    Text(
+                      '下载音质',
+                      style: Theme.of(context).textTheme.labelLarge?.copyWith(
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                    if (_discovering) ...[
+                      const SizedBox(width: 8),
+                      const SizedBox.square(
+                        dimension: 12,
+                        child: CircularProgressIndicator(strokeWidth: 1.6),
+                      ),
+                    ],
+                  ],
                 ),
                 const SizedBox(height: 6),
-                _QualitySelector(
-                  qualities: _qualities,
-                  selected: _quality,
-                  onSelected: (quality) => setState(() => _quality = quality),
-                ),
+                _buildQualityDropdown(context),
                 CheckboxListTile(
                   value: _dontAskAgain,
                   onChanged: (value) =>
@@ -3539,6 +3760,81 @@ class _DownloadOptionsDialogState extends State<_DownloadOptionsDialog> {
     );
   }
 
+  /// 音质下拉框：沿用全局 InputDecoration 主题（填充圆角），与上方
+  /// 「下载位置」输入框风格一致；左侧音质名称，右侧该音质文件大小。
+  Widget _buildQualityDropdown(BuildContext context) {
+    return DropdownButtonFormField<String>(
+      // 音质列表异步补齐后重建表单字段，避免内部选中值停留在旧列表。
+      key: ValueKey(_qualities.join('|')),
+      initialValue: _quality,
+      isDense: true,
+      isExpanded: true,
+      decoration: const InputDecoration(
+        isDense: true,
+        prefixIcon: Icon(Icons.graphic_eq_rounded, size: 19),
+        prefixIconConstraints: BoxConstraints(minWidth: 38),
+        contentPadding: EdgeInsets.symmetric(horizontal: 10, vertical: 11),
+      ),
+      style: Theme.of(context).textTheme.bodyMedium?.copyWith(fontSize: 13),
+      items: [
+        for (final quality in _qualities)
+          DropdownMenuItem<String>(
+            value: quality,
+            child: _buildQualityRow(quality),
+          ),
+      ],
+      onChanged: (value) {
+        if (value != null) setState(() => _quality = value);
+      },
+    );
+  }
+
+  Widget _buildQualityRow(String quality) {
+    return Row(
+      children: [
+        Expanded(
+          child: Text(
+            _qualityLabel(quality),
+            style: const TextStyle(fontSize: 13),
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+          ),
+        ),
+        const SizedBox(width: 12),
+        _buildSizeTrailing(quality),
+      ],
+    );
+  }
+
+  /// 右侧文件大小：已有估算/实测值直接显示（估算前缀 ≈）；尚无值时，
+  /// 探测中显示进度圈，探测结束仍无值则显示“未知”。
+  Widget _buildSizeTrailing(String quality) {
+    final size = _qualitySizes[quality];
+    if (size == null) {
+      if (_probingQualities.contains(quality)) {
+        return const SizedBox.square(
+          dimension: 12,
+          child: CircularProgressIndicator(strokeWidth: 1.6),
+        );
+      }
+      return Text(
+        '未知',
+        style: TextStyle(
+          fontSize: 12,
+          color: Theme.of(context).colorScheme.onSurfaceVariant,
+        ),
+      );
+    }
+    final text = '${size.estimated ? '≈' : ''}${_formatFileSize(size.bytes)}';
+    return Text(
+      text,
+      style: TextStyle(
+        fontSize: 12,
+        color: Theme.of(context).colorScheme.onSurfaceVariant,
+      ),
+    );
+  }
+
   static String _normalizeQuality(String quality, List<String> available) {
     final value = quality.trim();
     if (available.contains(value)) return value;
@@ -3550,178 +3846,6 @@ class _DownloadOptionsDialogState extends State<_DownloadOptionsDialog> {
     };
     if (available.contains(alias)) return alias;
     return available.first;
-  }
-}
-
-class _QualitySelector extends StatefulWidget {
-  const _QualitySelector({
-    required this.qualities,
-    required this.selected,
-    required this.onSelected,
-  });
-
-  final List<String> qualities;
-  final String selected;
-  final ValueChanged<String> onSelected;
-
-  @override
-  State<_QualitySelector> createState() => _QualitySelectorState();
-}
-
-class _QualitySelectorState extends State<_QualitySelector> {
-  static const double _spacing = 6;
-  static const double _runSpacing = 5;
-  static const int _maxRows = 2;
-
-  final GlobalKey _offstageWrapKey = GlobalKey();
-  final GlobalKey _expandButtonKey = GlobalKey();
-  final List<GlobalKey> _chipKeys = <GlobalKey>[];
-
-  bool _expanded = false;
-  bool _overflow = false;
-  int _visibleCount = 0;
-
-  @override
-  void initState() {
-    super.initState();
-    _visibleCount = widget.qualities.length;
-  }
-
-  List<GlobalKey> get _keys {
-    while (_chipKeys.length < widget.qualities.length) {
-      _chipKeys.add(GlobalKey());
-    }
-    return _chipKeys;
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    WidgetsBinding.instance.addPostFrameCallback((_) => _measure());
-    final chips = <Widget>[
-      for (final quality in widget.qualities) _buildChip(quality),
-    ];
-    final Widget visible;
-    if (!_overflow || _expanded) {
-      visible = Wrap(
-        spacing: _spacing,
-        runSpacing: _runSpacing,
-        children: [...chips, if (_overflow) _buildToggleChip(expanded: true)],
-      );
-    } else {
-      visible = Wrap(
-        spacing: _spacing,
-        runSpacing: _runSpacing,
-        children: [
-          ...chips.sublist(0, _visibleCount),
-          _buildToggleChip(expanded: false),
-        ],
-      );
-    }
-    return Column(
-      mainAxisSize: MainAxisSize.min,
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        visible,
-        Offstage(
-          child: Wrap(
-            key: _offstageWrapKey,
-            spacing: _spacing,
-            runSpacing: _runSpacing,
-            children: [
-              for (var i = 0; i < widget.qualities.length; i++)
-                _buildChip(widget.qualities[i], key: _keys[i]),
-              _buildToggleChip(expanded: false, key: _expandButtonKey),
-            ],
-          ),
-        ),
-      ],
-    );
-  }
-
-  Widget _buildChip(String quality, {Key? key}) {
-    return ChoiceChip(
-      key: key,
-      label: Text(_qualityLabel(quality), style: const TextStyle(fontSize: 12)),
-      visualDensity: VisualDensity.compact,
-      materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
-      padding: const EdgeInsets.symmetric(horizontal: 3),
-      selected: widget.selected == quality,
-      onSelected: (_) => widget.onSelected(quality),
-    );
-  }
-
-  Widget _buildToggleChip({required bool expanded, Key? key}) {
-    return ActionChip(
-      key: key,
-      avatar: Icon(
-        expanded ? Icons.expand_less_rounded : Icons.expand_more_rounded,
-        size: 16,
-      ),
-      label: Text(
-        expanded ? '收起' : '展开更多',
-        style: const TextStyle(fontSize: 12),
-      ),
-      visualDensity: VisualDensity.compact,
-      materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
-      padding: const EdgeInsets.symmetric(horizontal: 3),
-      onPressed: () => setState(() => _expanded = !expanded),
-    );
-  }
-
-  void _measure() {
-    if (!mounted) return;
-    final wrapObject = _offstageWrapKey.currentContext?.findRenderObject();
-    final buttonContext = _expandButtonKey.currentContext;
-    if (wrapObject is! RenderBox || buttonContext == null) return;
-    final buttonSize = buttonContext.size;
-    if (buttonSize == null) return;
-    final available = wrapObject.constraints.maxWidth;
-    if (!available.isFinite) return;
-
-    final widths = <double>[];
-    for (final key in _keys) {
-      final size = key.currentContext?.size;
-      if (size == null) return;
-      widths.add(size.width);
-    }
-    final buttonWidth = buttonSize.width;
-
-    final overflow = _rowsFor([...widths, buttonWidth], available) > _maxRows;
-    var visibleCount = widget.qualities.length;
-    if (overflow) {
-      visibleCount = 1;
-      for (var i = 0; i < widths.length; i++) {
-        final candidate = [...widths.sublist(0, i + 1), buttonWidth];
-        if (_rowsFor(candidate, available) <= _maxRows) {
-          visibleCount = i + 1;
-        } else {
-          break;
-        }
-      }
-    }
-    if (overflow != _overflow ||
-        (!_expanded && visibleCount != _visibleCount)) {
-      setState(() {
-        _overflow = overflow;
-        _visibleCount = visibleCount;
-      });
-    }
-  }
-
-  int _rowsFor(List<double> widths, double available) {
-    var rows = 1;
-    var used = 0.0;
-    for (final width in widths) {
-      if (used == 0) {
-        used = width;
-      } else if (used + _spacing + width <= available + 1) {
-        used += _spacing + width;
-      } else {
-        rows++;
-        used = width;
-      }
-    }
-    return rows;
   }
 }
 

@@ -32,6 +32,7 @@ class MainActivity : AudioServiceActivity() {
         private const val EVENTS = "com.xymusic.mobile/system_audio_capture/events"
         private const val DEVICE_INFO_CHANNEL = "com.xymusic.mobile/device_info"
         private const val APP_UPDATE_CHANNEL = "com.xymusic.mobile/app_update"
+        private const val EXTERNAL_LINK_CHANNEL = "com.xymusic.mobile/external_link"
         private const val DESKTOP_LYRICS_CHANNEL = "com.xymusic.mobile/desktop_lyrics"
         private const val SCREEN_AWAKE_CHANNEL = "com.xymusic.mobile/screen_awake"
         private const val DNS_LOOKUP_CHANNEL = "com.xymusic.mobile/dns_lookup"
@@ -994,6 +995,29 @@ class MainActivity : AudioServiceActivity() {
                     result.success(true)
                 } catch (error: Exception) {
                     result.error("INSTALL_FAILED", error.message ?: "无法打开安装程序", null)
+                }
+            }
+        // 外部链接：交给系统浏览器 / 已注册应用打开（关于页的仓库、创作者、
+        // 参考项目等链接）。
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, EXTERNAL_LINK_CHANNEL)
+            .setMethodCallHandler { call, result ->
+                if (call.method != "openUrl") {
+                    result.notImplemented()
+                    return@setMethodCallHandler
+                }
+                val url = call.argument<String>("url")?.trim().orEmpty()
+                if (url.isEmpty()) {
+                    result.error("INVALID_URL", "链接为空", null)
+                    return@setMethodCallHandler
+                }
+                try {
+                    val intent = Intent(Intent.ACTION_VIEW, Uri.parse(url)).apply {
+                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    }
+                    startActivity(intent)
+                    result.success(true)
+                } catch (error: Exception) {
+                    result.error("OPEN_FAILED", error.message ?: "无法打开链接", null)
                 }
             }
         val desktopLyricsChannel =

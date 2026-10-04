@@ -21,6 +21,7 @@ import '../../src/plugins/plugin_runtime.dart';
 import '../../src/recent/recent_provider.dart';
 import '../../src/rust/api.dart';
 import '../../src/ui/xy_surface.dart';
+import '../../src/widgets/batch_action_sheet.dart';
 import '../../src/widgets/batch_download.dart';
 import '../../src/widgets/cover_image.dart';
 import '../../src/widgets/frosted_search_field.dart';
@@ -29,6 +30,15 @@ import '../../src/widgets/song_list_view.dart';
 import '../../src/widgets/source_switch.dart';
 import '../../src/widgets/top_notice.dart';
 import 'folder_browser_page.dart';
+
+/// 收藏分页右上角「更多」菜单项。
+enum _FavoritesMenuAction {
+  batchDownload,
+  batchSwitchSource,
+  batchSaveToPlaylist,
+  batchUnfavorite,
+  refresh,
+}
 
 /// 音乐库：收藏 / 歌单 / 本地音乐 / 最近播放 / 播放列表 / 文件夹
 /// 的统一分页入口。单一 AppBar，右上角按钮随当前分页切换；
@@ -70,11 +80,7 @@ class _MusicLibraryPageState extends ConsumerState<MusicLibraryPage>
   int? _favSongsFutureKey;
   List<Song> _favSortedSongs = const <Song>[];
 
-  final Set<String> _favSelectedPaths = <String>{};
-  bool _favSelectionMode = false;
-  bool _favDeleting = false;
-  bool _favDownloading = false;
-  // 批量换源进度。
+  // 批量换源进度（收藏分页「更多」菜单触发）。
   bool _favSwitchingSource = false;
   int _favSwitchingDone = 0;
   int _favSwitchingTotal = 0;
@@ -83,13 +89,11 @@ class _MusicLibraryPageState extends ConsumerState<MusicLibraryPage>
   /// SharedPreferences 写入，进入收藏页时容易出现连续卡顿。
   final Set<String> _snapshotSyncQueued = <String>{};
 
-  /// 悬浮头部（搜索框 + 歌曲数行）与多选提示行的测量 Key 与实测高度：
-  /// 二者悬浮于列表上方，列表内容滚动时从毛玻璃下方穿过被模糊，
-  /// 列表顶部让出对应高度，避免第一行歌曲被盖住。
+  /// 悬浮头部（搜索框 + 歌曲数行）的测量 Key 与实测高度：头部悬浮于
+  /// 列表上方，列表内容滚动时从毛玻璃下方穿过被模糊，列表顶部让出
+  /// 对应高度，避免第一行歌曲被盖住。
   final GlobalKey _favFloatingHeaderKey = GlobalKey();
   double _favFloatingHeaderExtent = 104;
-  final GlobalKey _favSelectionBarKey = GlobalKey();
-  double _favSelectionBarExtent = 56;
 
   // ---- 歌单分页状态 ----
   bool _playlistSelectionMode = false;
@@ -204,9 +208,8 @@ class _MusicLibraryPageState extends ConsumerState<MusicLibraryPage>
   String get _appBarTitle {
     switch (_tabController.index) {
       case 0:
-        if (_favSelectionMode) {
-          if (_favSwitchingSource) return '换源中 $_favSwitchingDone/$_favSwitchingTotal';
-          return _favSelectedPaths.isEmpty ? '选择歌曲' : '已选 ${_favSelectedPaths.length} 首';
+        if (_favSwitchingSource) {
+          return '换源中 $_favSwitchingDone/$_favSwitchingTotal';
         }
       case 1:
         if (_playlistSelectionMode) return '已选 ${_playlistSelectedIds.length} 个歌单';
@@ -219,30 +222,14 @@ class _MusicLibraryPageState extends ConsumerState<MusicLibraryPage>
   List<Widget> _buildAppBarActions() {
     switch (_tabController.index) {
       case 0:
-        // 收藏：搜索 / 多选 / 排序（与歌单详情页同款）。
+        // 收藏：排序 / 搜索 / 更多（批量下载 / 换源 / 保存到歌单 /
+        // 取消收藏 / 刷新，与歌单详情页右上角「更多」同款）。
         if (_favSearchMode) {
           return [
             TextButton(onPressed: _exitFavSearch, child: const Text('取消')),
           ];
         }
-        if (_favSelectionMode) {
-          return [
-            IconButton(
-              tooltip: '取消多选',
-              onPressed: _favSwitchingSource || _favDownloading || _favDeleting
-                  ? null
-                  : _favExitSelection,
-              icon: const Icon(Icons.close_rounded),
-            ),
-          ];
-        }
-        final favEmpty = ref.read(favoritesProvider).isEmpty;
         return [
-          IconButton(
-            tooltip: '多选',
-            onPressed: favEmpty ? null : _enterFavSelection,
-            icon: const Icon(Icons.library_add_check_rounded),
-          ),
           if (_favDragEditMode)
             // 拖拽编辑模式：点击「完成」收起拖拽手柄。
             TextButton(
@@ -270,6 +257,33 @@ class _MusicLibraryPageState extends ConsumerState<MusicLibraryPage>
             tooltip: '搜索',
             onPressed: _enterFavSearch,
             icon: const Icon(Icons.search_rounded),
+          ),
+          PopupMenuButton<_FavoritesMenuAction>(
+            tooltip: '更多',
+            icon: const Icon(Icons.more_vert_rounded),
+            onSelected: _onFavMenuAction,
+            itemBuilder: (context) => const [
+              PopupMenuItem(
+                value: _FavoritesMenuAction.batchDownload,
+                child: Text('批量下载'),
+              ),
+              PopupMenuItem(
+                value: _FavoritesMenuAction.batchSwitchSource,
+                child: Text('批量换源'),
+              ),
+              PopupMenuItem(
+                value: _FavoritesMenuAction.batchSaveToPlaylist,
+                child: Text('批量保存到歌单'),
+              ),
+              PopupMenuItem(
+                value: _FavoritesMenuAction.batchUnfavorite,
+                child: Text('批量取消收藏'),
+              ),
+              PopupMenuItem(
+                value: _FavoritesMenuAction.refresh,
+                child: Text('刷新'),
+              ),
+            ],
           ),
         ];
       case 1:
@@ -460,8 +474,7 @@ class _MusicLibraryPageState extends ConsumerState<MusicLibraryPage>
   }
 
   // ==========================================================================
-  // 收藏分页（与歌单详情页同款的多选 / 排序 / 搜索，多选操作集中在
-  // 底部横排菜单）。
+  // 收藏分页（排序 / 搜索 / 右上角「更多」菜单批量操作，与歌单详情页同款）。
   // ==========================================================================
 
   void _enterFavSearch() {
@@ -480,49 +493,7 @@ class _MusicLibraryPageState extends ConsumerState<MusicLibraryPage>
     });
   }
 
-  void _enterFavSelection() {
-    setState(() {
-      _favSelectionMode = true;
-      // 多选与拖拽编辑互斥，进入多选时收起拖拽手柄。
-      _favDragEditMode = false;
-      // 进入多选时清掉搜索过滤，保证全选覆盖整个收藏。
-      _favSearchMode = false;
-      _favQuery = '';
-      _favSearchController.clear();
-      _favSearchFocus.unfocus();
-    });
-  }
-
-  void _favExitSelection() {
-    setState(() {
-      _favSelectionMode = false;
-      _favSelectedPaths.clear();
-    });
-  }
-
-  void _favToggleSelection(Song song) {
-    setState(() {
-      if (!_favSelectedPaths.add(song.path)) _favSelectedPaths.remove(song.path);
-    });
-  }
-
-  void _favToggleAll() {
-    final visible = _favSortedSongs;
-    setState(() {
-      final allSelected = visible.isNotEmpty &&
-          _favSelectedPaths.length == visible.length &&
-          visible.every((song) => _favSelectedPaths.contains(song.path));
-      if (allSelected) {
-        _favSelectedPaths.clear();
-      } else {
-        _favSelectedPaths
-          ..clear()
-          ..addAll(visible.map((song) => song.path));
-      }
-    });
-  }
-
-  /// 布局完成后用真实高度修正悬浮头部/提示行占位，字体缩放等场景自适应。
+  /// 布局完成后用真实高度修正悬浮头部占位，字体缩放等场景自适应。
   void _measureFavHeaders() {
     if (!mounted) return;
     final size = _favFloatingHeaderKey.currentContext?.size;
@@ -530,12 +501,6 @@ class _MusicLibraryPageState extends ConsumerState<MusicLibraryPage>
         size.height > 0 &&
         (size.height - _favFloatingHeaderExtent).abs() > 0.5) {
       setState(() => _favFloatingHeaderExtent = size.height);
-    }
-    final selectionSize = _favSelectionBarKey.currentContext?.size;
-    if (selectionSize != null &&
-        selectionSize.height > 0 &&
-        (selectionSize.height - _favSelectionBarExtent).abs() > 0.5) {
-      setState(() => _favSelectionBarExtent = selectionSize.height);
     }
   }
 
@@ -612,10 +577,54 @@ class _MusicLibraryPageState extends ConsumerState<MusicLibraryPage>
     }
   }
 
-  /// 多选取消收藏：仅取消收藏，音乐文件不会被删除。
-  Future<void> _favDeleteSelected() async {
-    if (_favDeleting || _favSelectedPaths.isEmpty) return;
-    final count = _favSelectedPaths.length;
+  /// 右上角「更多」菜单：批量下载 / 批量换源 / 批量保存到歌单 /
+  /// 批量取消收藏 / 刷新。
+  Future<void> _onFavMenuAction(_FavoritesMenuAction action) async {
+    switch (action) {
+      case _FavoritesMenuAction.batchDownload:
+        await showBatchActionSheet(
+          context,
+          kind: BatchActionKind.download,
+          songs: _favSortedSongs,
+          onDownload: (selected, quality) => runBatchDownload(
+            context,
+            ref,
+            songs: selected,
+            qualityOverride: quality,
+          ),
+        );
+      case _FavoritesMenuAction.batchSwitchSource:
+        await showBatchActionSheet(
+          context,
+          kind: BatchActionKind.switchSource,
+          songs: _favSortedSongs,
+          onSwitchSource: (selected, plugin, lxSource) =>
+              _favSwitchSourceFor(selected, plugin, lxSource),
+        );
+      case _FavoritesMenuAction.batchSaveToPlaylist:
+        await showBatchActionSheet(
+          context,
+          kind: BatchActionKind.saveToPlaylist,
+          songs: _favSortedSongs,
+          onSaveToPlaylist: (selected, playlistId) =>
+              _favSaveToPlaylist(selected, playlistId),
+        );
+      case _FavoritesMenuAction.batchUnfavorite:
+        await showBatchActionSheet(
+          context,
+          kind: BatchActionKind.unfavorite,
+          songs: _favSortedSongs,
+          onUnfavorite: _favUnfavoriteSongs,
+        );
+      case _FavoritesMenuAction.refresh:
+        _favRefresh();
+    }
+  }
+
+  /// 批量取消收藏：仅取消收藏，音乐文件不会被删除。
+  Future<void> _favUnfavoriteSongs(List<Song> selected) async {
+    if (selected.isEmpty) return;
+    final count = selected.length;
     final message = count == 1
         ? '确定取消收藏选中的 1 首歌曲吗？音乐文件不会被删除。'
         : '确定取消收藏选中的 $count 首歌曲吗？音乐文件不会被删除。';
@@ -640,89 +649,58 @@ class _MusicLibraryPageState extends ConsumerState<MusicLibraryPage>
       ),
     );
     if (ok != true) return;
-    setState(() => _favDeleting = true);
-    try {
-      final removed = await ref
-          .read(favoritesProvider.notifier)
-          .removeAll(_favSelectedPaths.toList());
-      if (!mounted) return;
-      _favExitSelection();
-      XyNotice.show(
-        context,
-        message: removed > 0 ? '已取消收藏 $removed 首' : '所选歌曲均不在收藏中',
-        type: XyNoticeType.success,
-      );
-    } finally {
-      if (mounted) setState(() => _favDeleting = false);
-    }
-  }
-
-  /// 多选批量下载：复用歌单页共享的批量下载组件（含音质/目录弹窗）。
-  Future<void> _favDownloadSelected() async {
-    if (_favDownloading || _favSelectedPaths.isEmpty) return;
-    final selected = _favSortedSongs
-        .where((song) => _favSelectedPaths.contains(song.path))
-        .toList();
-    if (selected.isEmpty) return;
-    setState(() => _favDownloading = true);
-    try {
-      await runBatchDownload(context, ref, songs: selected);
-      if (mounted) _favExitSelection();
-    } finally {
-      if (mounted) setState(() => _favDownloading = false);
-    }
-  }
-
-  /// 多选批量添加到歌单：选中歌曲加入已有歌单或新建歌单。
-  Future<void> _favAddSelectedToPlaylist() async {
-    if (_favSelectedPaths.isEmpty) return;
-    final selected = _favSortedSongs
-        .where((song) => _favSelectedPaths.contains(song.path))
-        .toList();
-    if (selected.isEmpty) return;
-    final result = await showPlaylistPicker(
-      context,
-      items: [for (final song in selected) song.toQueueItem()],
-    );
-    if (!mounted || result == null) return;
-    _favExitSelection();
-    final name = ref
-        .read(playlistsProvider)
-        .where((value) => value.id == result.playlistId)
-        .firstOrNull
-        ?.name;
-    final parts = <String>[
-      if (result.addedCount > 0) '已添加 ${result.addedCount} 首到歌单“$name”',
-      if (result.existsCount > 0) '${result.existsCount} 首已在歌单中',
-    ];
+    final removed = await ref
+        .read(favoritesProvider.notifier)
+        .removeAll([for (final song in selected) song.path]);
+    if (!mounted) return;
     XyNotice.show(
       context,
-      message: parts.isEmpty ? '所选歌曲均已在歌单中' : parts.join('，'),
-      type: result.addedCount > 0 ? XyNoticeType.success : XyNoticeType.warning,
+      message: removed > 0 ? '已取消收藏 $removed 首' : '所选歌曲均不在收藏中',
+      type: removed > 0 ? XyNoticeType.success : XyNoticeType.warning,
     );
   }
 
-  /// 多选批量换源：选择目标插件后逐首搜索同名歌曲，原位替换收藏
-  ///（对齐歌单管理的换源交互）。
-  Future<void> _favSwitchSourceSelected() async {
-    if (_favSelectedPaths.isEmpty || _favSwitchingSource) return;
-    final selected = _favSortedSongs
-        .where((song) => _favSelectedPaths.contains(song.path))
-        .toList();
+  /// 批量保存到歌单：把所选歌曲加入目标歌单，已存在的自动跳过。
+  Future<void> _favSaveToPlaylist(
+    List<Song> selected,
+    String playlistId,
+  ) async {
     if (selected.isEmpty) return;
-    final plugins = await ref.read(enabledMusicPluginsProvider.future);
+    final (added, exists) = await ref
+        .read(playlistsProvider.notifier)
+        .addQueueItems(playlistId, [
+          for (final song in selected) song.toQueueItem(),
+        ]);
     if (!mounted) return;
-    if (plugins.isEmpty) {
-      XyNotice.show(
-        context,
-        message: '请先在 设置 → 插件 中启用插件',
-        type: XyNoticeType.warning,
-      );
-      return;
-    }
-    final picked = await showSourcePluginPicker(context, plugins);
-    if (picked == null || !mounted) return;
-    final (plugin, lxSource) = picked;
+    final message = added > 0
+        ? '已添加 $added 首到歌单${exists > 0 ? '，$exists 首已存在' : ''}'
+        : '所选歌曲均已在歌单中';
+    XyNotice.show(
+      context,
+      message: message,
+      type: added > 0 ? XyNoticeType.success : XyNoticeType.warning,
+    );
+  }
+
+  /// 刷新收藏：丢弃歌曲加载缓存并重新读取（文件变动后可见最新内容）。
+  void _favRefresh() {
+    setState(() => _favSongsFuture = null);
+    XyNotice.show(
+      context,
+      message: '已刷新',
+      type: XyNoticeType.success,
+      compact: true,
+    );
+  }
+
+  /// 批量换源：逐首搜索同名歌曲，原位替换收藏中的歌曲（对齐歌单管理的
+  /// 换源交互）。
+  Future<void> _favSwitchSourceFor(
+    List<Song> selected,
+    EnabledMusicPlugin plugin,
+    String? lxSource,
+  ) async {
+    if (selected.isEmpty || _favSwitchingSource) return;
     setState(() {
       _favSwitchingSource = true;
       _favSwitchingDone = 0;
@@ -761,7 +739,6 @@ class _MusicLibraryPageState extends ConsumerState<MusicLibraryPage>
     }
     if (!mounted) return;
     setState(() => _favSwitchingSource = false);
-    _favExitSelection();
     if (missed.isEmpty) {
       XyNotice.show(
         context,
@@ -877,225 +854,105 @@ class _MusicLibraryPageState extends ConsumerState<MusicLibraryPage>
             : songs
                   .where((song) => _matchesSongQuery(song, query))
                   .toList();
-        // 供拖拽回调与多选操作读取当前展示顺序。
+        // 供拖拽回调与「更多」菜单操作读取当前展示顺序。
         _favSortedSongs = filteredSongs;
         // 布局完成后修正悬浮头部占位高度。
         WidgetsBinding.instance.addPostFrameCallback(
           (_) => _measureFavHeaders(),
         );
-        final favBusy =
-            _favDeleting || _favDownloading || _favSwitchingSource;
-        final allFavSelected = filteredSongs.isNotEmpty &&
-            _favSelectedPaths.length == filteredSongs.length &&
-            filteredSongs.every((s) => _favSelectedPaths.contains(s.path));
-        return Column(
+        return Stack(
           children: [
-            Expanded(
-              child: Stack(
-                children: [
-                  Positioned.fill(
-                    child: Padding(
-                      // 多选时列表顶部让出提示行高度，避免第一行歌曲
-                      // 被悬浮的「已选 N 首」提示行盖住。
-                      padding: EdgeInsets.only(
-                        top: _favSelectionMode
-                            ? _favSelectionBarExtent
-                            : _favFloatingHeaderExtent,
-                      ),
-                      child: filteredSongs.isEmpty
-                          ? Center(
-                              child: Text(
-                                '没有找到匹配的收藏歌曲',
-                                style: TextStyle(
-                                  color: Theme.of(
-                                    context,
-                                  ).colorScheme.onSurfaceVariant,
-                                ),
-                              ),
-                            )
-                          : SongsListView(
-                              songs: filteredSongs,
-                              padding: EdgeInsets.fromLTRB(
-                                10,
-                                0,
-                                10,
-                                _favSelectionMode
-                                    ? 12
-                                    : MediaQuery.paddingOf(context).bottom + 12,
-                              ),
-                              selectionMode: _favSelectionMode,
-                              isSelected: (song) =>
-                                  _favSelectedPaths.contains(song.path),
-                              onToggleSelection: _favToggleSelection,
-                              // 搜索过滤时下标与全量收藏不一致，禁止拖拽；
-                              // 拖拽手柄仅在自定义排序的编辑模式中显示。
-                              onReorder:
-                                  _favSort.key == SongSortKey.custom &&
-                                      _favDragEditMode &&
-                                      query.isEmpty
-                                  ? _favOnReorder
-                                  : null,
-                              onPlay: (list, i) => ref
-                                  .read(libraryProvider.notifier)
-                                  .playList(list, i),
-                            ),
-                    ),
-                  ),
-                  // 提示行必须 Positioned 定位：若作为非 Positioned 子项，
-                  // 松约束下 Stack 会 shrink-wrap 到提示行高度，
-                  // Positioned.fill 的列表随之被钳制，歌曲全部消失。
-                  if (_favSelectionMode)
-                    Positioned(
-                      top: 0,
-                      left: 0,
-                      right: 0,
-                      child: KeyedSubtree(
-                        key: _favSelectionBarKey,
-                        child: Padding(
-                          padding: const EdgeInsets.fromLTRB(16, 4, 16, 8),
-                          child: Row(
-                            children: [
-                              Expanded(
-                                child: Text(
-                                  _favSelectedPaths.isEmpty
-                                      ? '点击歌曲进行选择'
-                                      : '已选 ${_favSelectedPaths.length} 首',
-                                  style: const TextStyle(
-                                    fontWeight: FontWeight.w600,
-                                  ),
-                                ),
-                              ),
-                              TextButton(
-                                onPressed: filteredSongs.isEmpty
-                                    ? null
-                                    : _favToggleAll,
-                                child: Text(allFavSelected ? '取消全选' : '全选'),
-                              ),
-                            ],
+            Positioned.fill(
+              child: Padding(
+                padding: EdgeInsets.only(top: _favFloatingHeaderExtent),
+                child: filteredSongs.isEmpty
+                    ? Center(
+                        child: Text(
+                          '没有找到匹配的收藏歌曲',
+                          style: TextStyle(
+                            color: Theme.of(
+                              context,
+                            ).colorScheme.onSurfaceVariant,
                           ),
                         ),
-                      ),
-                    )
-                  else
-                    Positioned(
-                      top: 0,
-                      left: 0,
-                      right: 0,
-                      child: KeyedSubtree(
-                        key: _favFloatingHeaderKey,
-                        child: Column(
-                          children: [
-                            if (_favSearchMode)
-                              Padding(
-                                padding: const EdgeInsets.fromLTRB(16, 4, 16, 4),
-                                child: FrostedSearchField(
-                                  controller: _favSearchController,
-                                  focusNode: _favSearchFocus,
-                                  hintText: '搜索歌曲、歌手或专辑',
-                                  onChanged: (value) =>
-                                      setState(() => _favQuery = value),
-                                  showClearSuffix: true,
-                                  padding: EdgeInsets.zero,
-                                ),
-                              ),
-                            Padding(
-                              padding: const EdgeInsets.fromLTRB(16, 4, 16, 8),
-                              child: Row(
-                                children: [
-                                  Text(
-                                    query.isEmpty
-                                        ? '${filteredSongs.length} 首歌曲'
-                                        : '${filteredSongs.length} / ${songs.length} 首歌曲',
-                                    style: TextStyle(
-                                      color: Theme.of(
-                                        context,
-                                      ).colorScheme.onSurfaceVariant,
-                                    ),
-                                  ),
-                                  const Spacer(),
-                                  FilledButton.tonalIcon(
-                                    onPressed: filteredSongs.isEmpty
-                                        ? null
-                                        : () => ref
-                                              .read(libraryProvider.notifier)
-                                              .playAll(filteredSongs),
-                                    icon: const Icon(
-                                      Icons.play_arrow,
-                                      size: 20,
-                                    ),
-                                    label: const Text('播放全部'),
-                                  ),
-                                ],
-                              ),
-                            ),
-                          ],
+                      )
+                    : SongsListView(
+                        songs: filteredSongs,
+                        padding: EdgeInsets.fromLTRB(
+                          10,
+                          0,
+                          10,
+                          MediaQuery.paddingOf(context).bottom + 12,
                         ),
+                        // 搜索过滤时下标与全量收藏不一致，禁止拖拽；
+                        // 拖拽手柄仅在自定义排序的编辑模式中显示。
+                        onReorder:
+                            _favSort.key == SongSortKey.custom &&
+                                _favDragEditMode &&
+                                query.isEmpty
+                            ? _favOnReorder
+                            : null,
+                        onPlay: (list, i) => ref
+                            .read(libraryProvider.notifier)
+                            .playList(list, i),
                       ),
-                    ),
-                ],
               ),
             ),
-            // 多选底部横排菜单（与歌单详情页同款）：
-            // 全选 / 加歌单 / 下载 / 换源 / 取消收藏。
-            if (_favSelectionMode)
-              _SelectionBottomBar(
-                actions: [
-                  _SelectionAction(
-                    icon: Icon(
-                      allFavSelected
-                          ? Icons.deselect_rounded
-                          : Icons.select_all_rounded,
+            // 悬浮头部必须 Positioned 定位：若作为非 Positioned 子项，
+            // 松约束下 Stack 会 shrink-wrap 到头部高度，
+            // Positioned.fill 的列表随之被钳制，歌曲全部消失。
+            Positioned(
+              top: 0,
+              left: 0,
+              right: 0,
+              child: KeyedSubtree(
+                key: _favFloatingHeaderKey,
+                child: Column(
+                  children: [
+                    if (_favSearchMode)
+                      Padding(
+                        padding: const EdgeInsets.fromLTRB(16, 4, 16, 4),
+                        child: FrostedSearchField(
+                          controller: _favSearchController,
+                          focusNode: _favSearchFocus,
+                          hintText: '搜索歌曲、歌手或专辑',
+                          onChanged: (value) =>
+                              setState(() => _favQuery = value),
+                          showClearSuffix: true,
+                          padding: EdgeInsets.zero,
+                        ),
+                      ),
+                    Padding(
+                      padding: const EdgeInsets.fromLTRB(16, 4, 16, 8),
+                      child: Row(
+                        children: [
+                          Text(
+                            query.isEmpty
+                                ? '${filteredSongs.length} 首歌曲'
+                                : '${filteredSongs.length} / ${songs.length} 首歌曲',
+                            style: TextStyle(
+                              color: Theme.of(
+                                context,
+                              ).colorScheme.onSurfaceVariant,
+                            ),
+                          ),
+                          const Spacer(),
+                          FilledButton.tonalIcon(
+                            onPressed: filteredSongs.isEmpty
+                                ? null
+                                : () => ref
+                                      .read(libraryProvider.notifier)
+                                      .playAll(filteredSongs),
+                            icon: const Icon(Icons.play_arrow, size: 20),
+                            label: const Text('播放全部'),
+                          ),
+                        ],
+                      ),
                     ),
-                    label: allFavSelected ? '取消全选' : '全选',
-                    onTap: favBusy ? null : _favToggleAll,
-                  ),
-                  _SelectionAction(
-                    icon: const Icon(Icons.playlist_add_check_rounded),
-                    label: '加歌单',
-                    onTap: favBusy || _favSelectedPaths.isEmpty
-                        ? null
-                        : _favAddSelectedToPlaylist,
-                  ),
-                  _SelectionAction(
-                    icon: _favDownloading
-                        ? const SizedBox.square(
-                            dimension: 20,
-                            child: CircularProgressIndicator(strokeWidth: 2),
-                          )
-                        : const Icon(Icons.download_rounded),
-                    label: _favDownloading ? '下载中' : '下载',
-                    onTap: favBusy || _favSelectedPaths.isEmpty
-                        ? null
-                        : _favDownloadSelected,
-                  ),
-                  _SelectionAction(
-                    icon: _favSwitchingSource
-                        ? const SizedBox.square(
-                            dimension: 20,
-                            child: CircularProgressIndicator(strokeWidth: 2),
-                          )
-                        : const Icon(Icons.swap_horiz_rounded),
-                    label: _favSwitchingSource
-                        ? '$_favSwitchingDone/$_favSwitchingTotal'
-                        : '换源',
-                    onTap: favBusy || _favSelectedPaths.isEmpty
-                        ? null
-                        : _favSwitchSourceSelected,
-                  ),
-                  _SelectionAction(
-                    icon: _favDeleting
-                        ? const SizedBox.square(
-                            dimension: 20,
-                            child: CircularProgressIndicator(strokeWidth: 2),
-                          )
-                        : const Icon(Icons.favorite_border_rounded),
-                    label: '取消收藏',
-                    onTap: favBusy || _favSelectedPaths.isEmpty
-                        ? null
-                        : _favDeleteSelected,
-                  ),
-                ],
+                  ],
+                ),
               ),
+            ),
           ],
         );
       },

@@ -9,8 +9,15 @@ import '../playlists/playlists_provider.dart';
 import 'song_list_view.dart' show SongCover;
 
 /// 通用批量操作类型：批量下载 / 批量换源 / 批量保存到歌单 / 批量收藏 /
-/// 批量删除（删除仅对本地歌单开放）。
-enum BatchActionKind { download, switchSource, saveToPlaylist, favorite, delete }
+/// 批量取消收藏 / 批量删除（删除仅对本地歌单开放）。
+enum BatchActionKind {
+  download,
+  switchSource,
+  saveToPlaylist,
+  favorite,
+  unfavorite,
+  delete,
+}
 
 /// 下载音质档位（与设置页“下载音质”、批量下载对话框一致，低 → 高）。
 const List<String> kBatchDownloadQualities = [
@@ -53,6 +60,7 @@ Future<void> showBatchActionSheet(
   Future<void> Function(List<Song> selected, String playlistId)?
   onSaveToPlaylist,
   Future<void> Function(List<Song> selected)? onFavorite,
+  Future<void> Function(List<Song> selected)? onUnfavorite,
   Future<void> Function(List<Song> selected)? onDelete,
 }) {
   return showModalBottomSheet<void>(
@@ -67,6 +75,7 @@ Future<void> showBatchActionSheet(
       onSwitchSource: onSwitchSource,
       onSaveToPlaylist: onSaveToPlaylist,
       onFavorite: onFavorite,
+      onUnfavorite: onUnfavorite,
       onDelete: onDelete,
     ),
   );
@@ -80,6 +89,7 @@ class _BatchActionSheet extends ConsumerStatefulWidget {
     this.onSwitchSource,
     this.onSaveToPlaylist,
     this.onFavorite,
+    this.onUnfavorite,
     this.onDelete,
   });
 
@@ -95,6 +105,7 @@ class _BatchActionSheet extends ConsumerStatefulWidget {
   final Future<void> Function(List<Song> selected, String playlistId)?
   onSaveToPlaylist;
   final Future<void> Function(List<Song> selected)? onFavorite;
+  final Future<void> Function(List<Song> selected)? onUnfavorite;
   final Future<void> Function(List<Song> selected)? onDelete;
 
   @override
@@ -152,6 +163,7 @@ class _BatchActionSheetState extends ConsumerState<_BatchActionSheet> {
     BatchActionKind.switchSource => '批量换源',
     BatchActionKind.saveToPlaylist => '批量保存到歌单',
     BatchActionKind.favorite => '批量收藏',
+    BatchActionKind.unfavorite => '批量取消收藏',
     BatchActionKind.delete => '批量删除',
   };
 
@@ -160,12 +172,14 @@ class _BatchActionSheetState extends ConsumerState<_BatchActionSheet> {
     BatchActionKind.switchSource => '换源',
     BatchActionKind.saveToPlaylist => '添加到歌单',
     BatchActionKind.favorite => '收藏',
+    BatchActionKind.unfavorite => '取消收藏',
     BatchActionKind.delete => '删除',
   };
 
-  /// 收藏 / 删除无需顶部选择项，直接展示歌曲列表。
+  /// 收藏 / 取消收藏 / 删除无需顶部选择项，直接展示歌曲列表。
   bool get _hasSelector =>
       widget.kind != BatchActionKind.favorite &&
+      widget.kind != BatchActionKind.unfavorite &&
       widget.kind != BatchActionKind.delete;
 
   bool get _canSubmit {
@@ -175,6 +189,7 @@ class _BatchActionSheetState extends ConsumerState<_BatchActionSheet> {
       BatchActionKind.switchSource => _plugin != null,
       BatchActionKind.saveToPlaylist => _playlistId != null,
       BatchActionKind.favorite => true,
+      BatchActionKind.unfavorite => true,
       BatchActionKind.delete => true,
     };
   }
@@ -203,6 +218,8 @@ class _BatchActionSheetState extends ConsumerState<_BatchActionSheet> {
         }
       case BatchActionKind.favorite:
         await widget.onFavorite?.call(selected);
+      case BatchActionKind.unfavorite:
+        await widget.onUnfavorite?.call(selected);
       case BatchActionKind.delete:
         await widget.onDelete?.call(selected);
     }
@@ -303,7 +320,9 @@ class _BatchActionSheetState extends ConsumerState<_BatchActionSheet> {
         ),
         BatchActionKind.switchSource => _buildPluginSelector(context),
         BatchActionKind.saveToPlaylist => _buildPlaylistSelector(context),
-        BatchActionKind.favorite || BatchActionKind.delete =>
+        BatchActionKind.favorite ||
+        BatchActionKind.unfavorite ||
+        BatchActionKind.delete =>
           const SizedBox.shrink(),
       },
     );
@@ -471,14 +490,16 @@ class _BatchActionSheetState extends ConsumerState<_BatchActionSheet> {
 
   Widget _buildSubmitBar(BuildContext context) {
     final count = _selected.length;
-    final isDelete = widget.kind == BatchActionKind.delete;
+    final isDestructive =
+        widget.kind == BatchActionKind.delete ||
+        widget.kind == BatchActionKind.unfavorite;
     return Padding(
       padding: const EdgeInsets.fromLTRB(16, 10, 16, 10),
       child: SizedBox(
         height: 46,
         child: FilledButton(
           onPressed: _canSubmit ? _submit : null,
-          style: isDelete
+          style: isDestructive
               ? FilledButton.styleFrom(
                   backgroundColor: Theme.of(context).colorScheme.error,
                   foregroundColor: Theme.of(context).colorScheme.onError,

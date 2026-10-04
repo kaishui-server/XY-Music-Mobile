@@ -3,13 +3,21 @@ import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../src/auth/auth_provider.dart';
+import '../../src/ui/external_link.dart';
 import '../../src/update/app_update.dart';
+import '../../src/widgets/top_notice.dart' show XyNotice, XyNoticeType;
+import 'third_party_licenses_page.dart';
 
-final _serverReleaseProvider = FutureProvider.autoDispose<BackendRelease?>((
-  ref,
-) {
-  return ref.read(authProvider.notifier).fetchLatestRelease();
-});
+/// 项目主仓库地址。
+const String kProjectRepoUrl = 'https://github.com/kaishui-server/XY-Music-Mobile';
+
+/// 官方 QQ 交流群号。
+const String kQqGroupNumber = '656117919';
+
+/// 创作者 GitHub 主页（展示名与主页地址解耦，展示名以本人习惯称呼为准）。
+const String kCreatorKaishuiUrl = 'https://github.com/kaishui-server';
+const String kCreatorQingciUrl = 'https://github.com/3580351677';
+
 final _clientVersionProvider = FutureProvider.autoDispose<String>(
   (ref) => ref.read(authProvider.notifier).currentAppVersion(),
 );
@@ -20,22 +28,13 @@ class AboutPage extends ConsumerWidget {
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final scheme = Theme.of(context).colorScheme;
-    final release = ref.watch(_serverReleaseProvider);
     final clientVersion = ref.watch(_clientVersionProvider).valueOrNull ?? '0.0.0';
     return Scaffold(
-      appBar: AppBar(
-        title: const Text('关于'),
-        actions: [
-          IconButton(
-            tooltip: '检查服务器版本',
-            onPressed: () => ref.invalidate(_serverReleaseProvider),
-            icon: const Icon(Icons.refresh_rounded),
-          ),
-        ],
-      ),
+      appBar: AppBar(title: const Text('关于')),
       body: ListView(
         padding: const EdgeInsets.fromLTRB(20, 18, 20, 40),
         children: [
+          // 顶部品牌区：Logo + 名称 + 版本号。
           Center(
             child: Column(
               children: [
@@ -69,132 +68,82 @@ class AboutPage extends ConsumerWidget {
                   '移动端 $clientVersion',
                   style: TextStyle(color: scheme.onSurfaceVariant),
                 ),
-                const SizedBox(height: 9),
-                Container(
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: 12,
-                    vertical: 5,
-                  ),
-                  decoration: BoxDecoration(
-                    color: const Color(0x24EC4141),
-                    borderRadius: BorderRadius.circular(999),
-                  ),
-                  child: const Text(
-                    'Flutter + Rust',
-                    style: TextStyle(
-                      color: Color(0xFFEC4141),
-                      fontWeight: FontWeight.w700,
-                      fontSize: 12,
-                    ),
-                  ),
-                ),
               ],
             ),
           ),
-          const SizedBox(height: 30),
-          _AboutCard(
+          const SizedBox(height: 26),
+          // 左右两个操作按钮：检查更新 / 加入 Q 群。
+          Row(
             children: [
-              _row(
-                context,
-                Icons.favorite_outline,
-                '为热爱音乐的你打造',
-                '本地优先 · 无损播放 · 自由定制',
-              ),
-              const Divider(height: 1),
-              _row(
-                context,
-                Icons.memory,
-                '跨平台音频核心',
-                'Rust DSP、QMC2、云端音乐与音乐库',
-              ),
-              const Divider(height: 1),
-              _row(context, Icons.shield_outlined, '隐私与数据', '音乐库和听歌统计默认保存在本机'),
-            ],
-          ),
-          const SizedBox(height: 14),
-          _AboutCard(
-            children: [
-              release.when(
-                loading: () =>
-                    _row(context, Icons.cloud_sync_outlined, '服务器服务', '正在检查…'),
-                error: (_, _) => _row(
-                  context,
-                  Icons.cloud_off_outlined,
-                  '服务器服务',
-                  '连接失败，点击右上角重试',
+              Expanded(
+                child: _ActionButton(
+                  icon: Icons.system_update_rounded,
+                  label: '检查更新',
+                  onTap: () => _checkForUpdate(context, ref),
                 ),
-                data: (item) {
-                  final hasUpdate = item != null &&
-                      compareAppVersions(item.version, clientVersion) > 0 &&
-                      item.downloadUrl.trim().isNotEmpty;
-                  return Column(
-                    crossAxisAlignment: CrossAxisAlignment.stretch,
-                    children: [
-                      InkWell(
-                        borderRadius: BorderRadius.circular(11),
-                        onTap: item == null
-                            ? null
-                            : () => _showReleaseNotes(context, item),
-                        child: _row(
-                          context,
-                          Icons.cloud_done_outlined,
-                          '服务器服务',
-                          item == null
-                              ? '已连接 · 暂无服务端版本公告'
-                              : '最新版本 ${item.version}${item.content.isEmpty ? '' : ' · ${item.content}'}',
-                          trailing: item == null || item.content.isEmpty
-                              ? null
-                              : const Icon(
-                                  Icons.chevron_right_rounded,
-                                  color: Color(0xFFEC4141),
-                                ),
-                        ),
-                      ),
-                      if (hasUpdate)
-                        Padding(
-                          padding: const EdgeInsets.fromLTRB(66, 0, 14, 12),
-                          child: FilledButton.icon(
-                            onPressed: () => _downloadAndInstall(context, item),
-                            icon: const Icon(Icons.system_update_rounded),
-                            label: Text('发现新版本（当前 $clientVersion）'),
-                          ),
-                        ),
-                    ],
-                  );
-                },
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: _ActionButton(
+                  icon: Icons.groups_rounded,
+                  label: '加入Q群',
+                  onTap: () => _copyText(
+                    context,
+                    kQqGroupNumber,
+                    tip: '群号已复制：$kQqGroupNumber',
+                  ),
+                ),
               ),
             ],
           ),
-          const SizedBox(height: 14),
+          const SizedBox(height: 18),
+          // 项目仓库：点击跳转，长按复制。
           _AboutCard(
             children: [
-              _row(context, Icons.code, '开源许可', 'GNU AGPL-3.0-only'),
-              const Divider(height: 1),
-              _row(context, Icons.public, '项目仓库', 'XY Music 开源仓库'),
-              const Divider(height: 1),
-              _row(
-                context,
-                Icons.article_outlined,
-                '第三方许可',
-                'Flutter、Rust 及相关开源组件',
-              ),
-            ],
-          ),
-          const SizedBox(height: 14),
-          _AboutCard(
-            children: [
-              InkWell(
-                borderRadius: BorderRadius.circular(11),
-                onTap: () => _copyQqGroup(context),
-                child: _row(
+              _LinkRow(
+                icon: Icons.code_rounded,
+                title: '项目仓库',
+                subtitle: 'github.com/kaishui-server/XY-Music-Mobile',
+                onTap: () => _openUrl(context, kProjectRepoUrl),
+                onLongPress: () => _copyText(
                   context,
-                  Icons.groups_outlined,
-                  'QQ 交流群',
-                  '656117919 · 点击复制群号',
-                  trailing: const Icon(
-                    Icons.copy_rounded,
-                    size: 18,
-                    color: Color(0xFFEC4141),
+                  kProjectRepoUrl,
+                  tip: '仓库地址已复制',
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 18),
+          _SectionLabel('创作者'),
+          const SizedBox(height: 8),
+          _AboutCard(
+            children: [
+              _LinkRow(
+                icon: Icons.person_rounded,
+                title: '狐狐不相信人类',
+                subtitle: 'github.com/kaishui-server',
+                onTap: () => _openUrl(context, kCreatorKaishuiUrl),
+              ),
+              const Divider(height: 1, indent: 66),
+              _LinkRow(
+                icon: Icons.person_outline_rounded,
+                title: '青辞',
+                subtitle: 'github.com/3580351677',
+                onTap: () => _openUrl(context, kCreatorQingciUrl),
+              ),
+            ],
+          ),
+          const SizedBox(height: 18),
+          // 第三方许可：进入独立页面查看参考项目致谢。
+          _AboutCard(
+            children: [
+              _LinkRow(
+                icon: Icons.article_outlined,
+                title: '第三方许可',
+                subtitle: '开源组件与参考项目致谢',
+                onTap: () => Navigator.of(context).push(
+                  MaterialPageRoute<void>(
+                    builder: (_) => const ThirdPartyLicensesPage(),
                   ),
                 ),
               ),
@@ -214,102 +163,239 @@ class AboutPage extends ConsumerWidget {
     );
   }
 
-  Future<void> _downloadAndInstall(
-    BuildContext context,
-    BackendRelease release,
-  ) async {
-    await downloadAndInstallRelease(context, release);
+  /// 检查更新：拉取服务端最新版本公告，有新版本时弹出更新说明与下载入口。
+  Future<void> _checkForUpdate(BuildContext context, WidgetRef ref) async {
+    showDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      builder: (_) => const Center(child: CircularProgressIndicator()),
+    );
+    try {
+      final release = await ref.read(authProvider.notifier).fetchLatestRelease();
+      final clientVersion = await ref
+          .read(authProvider.notifier)
+          .currentAppVersion();
+      if (!context.mounted) return;
+      Navigator.of(context, rootNavigator: true).pop();
+      final hasUpdate = release != null &&
+          compareAppVersions(release.version, clientVersion) > 0 &&
+          release.downloadUrl.trim().isNotEmpty;
+      if (hasUpdate) {
+        await _showUpdateDialog(context, release);
+        return;
+      }
+      XyNotice.show(
+        context,
+        message: '已是最新版本（$clientVersion）',
+        type: XyNoticeType.success,
+      );
+    } catch (_) {
+      if (!context.mounted) return;
+      Navigator.of(context, rootNavigator: true).pop();
+      XyNotice.show(
+        context,
+        message: '检查更新失败，请稍后重试',
+        type: XyNoticeType.warning,
+      );
+    }
   }
 
-  /// 查看服务端版本更新公告的完整内容。
-  Future<void> _showReleaseNotes(
+  Future<void> _showUpdateDialog(
     BuildContext context,
     BackendRelease release,
   ) async {
     await showDialog<void>(
       context: context,
       builder: (dialogContext) => AlertDialog(
-        title: Text('${release.version} 更新公告'),
+        title: Text('发现新版本 ${release.version}'),
         content: SingleChildScrollView(
           child: Text(
-            release.content.trim().isEmpty ? '暂无公告内容' : release.content,
+            release.content.trim().isEmpty ? '暂无更新说明' : release.content.trim(),
             style: const TextStyle(fontSize: 14, height: 1.5),
           ),
         ),
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(dialogContext),
-            child: const Text('关闭'),
+            child: const Text('稍后'),
+          ),
+          FilledButton.icon(
+            onPressed: () {
+              Navigator.pop(dialogContext);
+              downloadAndInstallRelease(context, release);
+            },
+            icon: const Icon(Icons.system_update_rounded),
+            label: const Text('下载安装'),
           ),
         ],
       ),
     );
   }
 
-  /// 复制 QQ 群号，方便用户加群交流。
-  Future<void> _copyQqGroup(BuildContext context) async {
-    const groupNumber = '656117919';
-    await Clipboard.setData(const ClipboardData(text: groupNumber));
-    if (context.mounted) {
-      ScaffoldMessenger.of(context)
-        ..hideCurrentSnackBar()
-        ..showSnackBar(
-          SnackBar(
-            content: const Text('群号已复制：$groupNumber'),
-            behavior: SnackBarBehavior.floating,
-            duration: const Duration(seconds: 2),
-          ),
-        );
+  /// 打开外部链接；系统无法调起浏览器时回退为复制链接。
+  Future<void> _openUrl(BuildContext context, String url) async {
+    final opened = await openExternalUrl(url);
+    if (!opened && context.mounted) {
+      await _copyText(context, url, tip: '无法打开浏览器，链接已复制');
     }
   }
 
-  static Widget _row(
+  Future<void> _copyText(
     BuildContext context,
-    IconData icon,
-    String title,
-    String subtitle, {
-    Widget? trailing,
-  }) => Padding(
-    padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 13),
-    child: Row(
-      children: [
-        Container(
-          width: 40,
-          height: 40,
+    String text, {
+    required String tip,
+  }) async {
+    await Clipboard.setData(ClipboardData(text: text));
+    if (context.mounted) {
+      XyNotice.show(
+        context,
+        message: tip,
+        type: XyNoticeType.success,
+        compact: true,
+      );
+    }
+  }
+}
+
+/// 顶部操作按钮：图标 + 文案，等宽排布。
+class _ActionButton extends StatelessWidget {
+  const _ActionButton({
+    required this.icon,
+    required this.label,
+    required this.onTap,
+  });
+
+  final IconData icon;
+  final String label;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return Material(
+      color: scheme.surfaceContainer,
+      borderRadius: BorderRadius.circular(16),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(16),
+        onTap: onTap,
+        child: Container(
+          height: 54,
+          alignment: Alignment.center,
           decoration: BoxDecoration(
-            color: const Color(0x20EC4141),
-            borderRadius: BorderRadius.circular(11),
+            borderRadius: BorderRadius.circular(16),
+            border: Border.all(
+              color: scheme.outlineVariant.withValues(alpha: .3),
+            ),
           ),
-          child: Icon(icon, color: const Color(0xFFEC4141), size: 21),
-        ),
-        const SizedBox(width: 12),
-        Expanded(
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
+          child: Row(
+            mainAxisAlignment: MainAxisAlignment.center,
             children: [
-              Text(title, style: const TextStyle(fontWeight: FontWeight.w600)),
-              const SizedBox(height: 2),
+              Icon(icon, size: 20, color: const Color(0xFFEC4141)),
+              const SizedBox(width: 8),
               Text(
-                subtitle,
-                maxLines: 2,
-                overflow: TextOverflow.ellipsis,
-                style: TextStyle(
-                  fontSize: 12,
-                  color: Theme.of(context).colorScheme.onSurfaceVariant,
-                ),
+                label,
+                style: const TextStyle(fontWeight: FontWeight.w600),
               ),
             ],
           ),
         ),
-        ?trailing,
-      ],
+      ),
+    );
+  }
+}
+
+/// 分组小标题。
+class _SectionLabel extends StatelessWidget {
+  const _SectionLabel(this.text);
+  final String text;
+
+  @override
+  Widget build(BuildContext context) => Padding(
+    padding: const EdgeInsets.only(left: 4),
+    child: Text(
+      text,
+      style: TextStyle(
+        fontSize: 13,
+        fontWeight: FontWeight.w600,
+        color: Theme.of(context).colorScheme.onSurfaceVariant,
+      ),
     ),
   );
+}
+
+/// 可点击 / 可长按的链接行：左侧圆形图标，中部标题 + 副标题，右侧箭头。
+class _LinkRow extends StatelessWidget {
+  const _LinkRow({
+    required this.icon,
+    required this.title,
+    required this.subtitle,
+    required this.onTap,
+    this.onLongPress,
+  });
+
+  final IconData icon;
+  final String title;
+  final String subtitle;
+  final VoidCallback onTap;
+  final VoidCallback? onLongPress;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return InkWell(
+      onTap: onTap,
+      onLongPress: onLongPress,
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 13),
+        child: Row(
+          children: [
+            Container(
+              width: 40,
+              height: 40,
+              decoration: BoxDecoration(
+                color: const Color(0x20EC4141),
+                borderRadius: BorderRadius.circular(11),
+              ),
+              child: Icon(icon, color: const Color(0xFFEC4141), size: 21),
+            ),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    title,
+                    style: const TextStyle(fontWeight: FontWeight.w600),
+                  ),
+                  const SizedBox(height: 2),
+                  Text(
+                    subtitle,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                      fontSize: 12,
+                      color: scheme.onSurfaceVariant,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            Icon(
+              Icons.chevron_right_rounded,
+              size: 20,
+              color: scheme.onSurfaceVariant.withValues(alpha: .7),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
 }
 
 class _AboutCard extends StatelessWidget {
   const _AboutCard({required this.children});
   final List<Widget> children;
+
   @override
   Widget build(BuildContext context) => Container(
     decoration: BoxDecoration(

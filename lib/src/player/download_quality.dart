@@ -255,3 +255,30 @@ String _qualityDisplayName(String quality) => switch (quality) {
   'vinyl' => '黑胶转录',
   _ => quality,
 };
+
+/// 有损音质的标称码率（kbps）；无损/未知档位返回 null。
+int? _lossyBitrateKbps(String quality) {
+  switch (quality.trim().toLowerCase()) {
+    case 'low':
+    case '96k':
+      return 96;
+    case '128k':
+    case 'standard':
+      return 128;
+    case '192k':
+      return 192;
+    case '320k':
+    case 'high':
+      return 320;
+  }
+  return null;
+}
+
+/// 按标称码率与时长估算有损音质的下载大小（字节）。
+/// 无损/未知档位或时长未知时返回 null，由调用方改为探测真实直链大小。
+int? estimateLossyDownloadSizeBytes(String quality, int durationMs) {
+  if (durationMs <= 0) return null;
+  final kbps = _lossyBitrateKbps(quality);
+  if (kbps == null) return null;
+  return (kbps * 1000 / 8 * (durationMs / 1000)).round();
+}

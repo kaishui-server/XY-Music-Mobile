@@ -5162,8 +5162,9 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
   /// This is used by playlist batch downloads so downloading does not interrupt playback.
   Future<PlaybackDownloadSource> resolveDownloadSourceFor(
     QueueItem item,
-    String quality,
-  ) async {
+    String quality, {
+    bool includeLyrics = true,
+  }) async {
     final preferredQuality = quality.trim().isEmpty ? '320k' : quality.trim();
     switch (playbackSourceTypeFor(item)) {
       case PlaybackSourceType.plugin:
@@ -5182,8 +5183,9 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
         );
         // 列表歌曲在下载前通常没加载过歌词；音源解析没带歌词时
         // 主动请求一次 getLyric，保证「同时下载歌词」能落盘 .lrc。
-        var lyrics = source.lyrics;
-        if (lyrics.trim().isEmpty) {
+        // 仅探测文件大小时跳过，避免为无关的歌词请求阻塞。
+        var lyrics = includeLyrics ? source.lyrics : '';
+        if (includeLyrics && lyrics.trim().isEmpty) {
           try {
             lyrics = await runtime
                 .getLyrics(plugin, data)
