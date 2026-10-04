@@ -1472,6 +1472,7 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
           trailing: const Text(''),
           onTap: () => context.push('/settings/statistics'),
         ),
+        _batteryOptimizationTile(context),
         _tile(
           context,
           icon: Icons.info_outline,
@@ -1820,6 +1821,79 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
       trailing: Icon(Icons.chevron_right, color: scheme.outline),
       onTap: () => context.push(route),
     );
+  }
+
+  /// 后台播放保活引导（仅未豁免电池优化时展示）。
+  ///
+  /// 华为/荣耀等国内 ROM 的省电策略会在锁屏或切后台后限制甚至强杀正在
+  /// 播放的前台服务，导致音乐中断、进程被杀。检测到尚未豁免时展示入口，
+  /// 点击弹出系统路径说明并可直接拉起授权弹窗。
+  Widget _batteryOptimizationTile(BuildContext context) {
+    final ignored = ref.watch(batteryOptimizationIgnoredProvider);
+    // 加载中或已豁免（含非 Android）时不展示引导。
+    if (ignored.valueOrNull != false) return const SizedBox.shrink();
+    final scheme = Theme.of(context).colorScheme;
+    return ListTile(
+      minTileHeight: 64,
+      leading: Icon(Icons.battery_saver_outlined, color: scheme.primary),
+      title: const Text(
+        '后台播放保活',
+        style: TextStyle(fontWeight: FontWeight.w600),
+      ),
+      subtitle: const Text(
+        '华为/荣耀等机型的省电策略可能中断后台播放，建议加入白名单',
+        maxLines: 2,
+        overflow: TextOverflow.ellipsis,
+      ),
+      trailing: Icon(Icons.chevron_right, color: scheme.outline),
+      onTap: () => _showBatteryOptimizationGuide(context),
+    );
+  }
+
+  /// 后台保活引导弹窗：给出华为/荣耀的具体设置路径，并可直接拉起系统
+  /// 的「忽略电池优化」授权弹窗；返回后刷新状态，已豁免则入口自动隐藏。
+  Future<void> _showBatteryOptimizationGuide(BuildContext context) async {
+    final go = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('开启后台播放保活'),
+        content: const SingleChildScrollView(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text('系统默认的省电策略会在锁屏或切到后台时限制本应用，可能导致音乐中断甚至进程被杀。建议关闭对本应用的电池优化。'),
+              SizedBox(height: 12),
+              Text(
+                '华为 / 荣耀（EMUI · HarmonyOS）：',
+                style: TextStyle(fontWeight: FontWeight.w600),
+              ),
+              SizedBox(height: 4),
+              Text(
+                '设置 → 电池 → 启动管理 → 找到「XY Music」→ 关闭「自动管理」→ '
+                '手动管理中勾选「允许自启动」「允许关联启动」「允许后台活动」。',
+              ),
+              SizedBox(height: 12),
+              Text('也可点击下方「立即设置」，在系统弹窗中选择「允许」。'),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(dialogContext).pop(false),
+            child: const Text('稍后'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(dialogContext).pop(true),
+            child: const Text('立即设置'),
+          ),
+        ],
+      ),
+    );
+    if (go != true) return;
+    await requestIgnoreBatteryOptimizations();
+    // 用户可能已在系统弹窗中授权：重新探测，已豁免时入口自动隐藏。
+    ref.invalidate(batteryOptimizationIgnoredProvider);
   }
 
   /// 桌面歌词纵向位置（百分制）：0% = 屏幕最顶端、50% = 屏幕正中、

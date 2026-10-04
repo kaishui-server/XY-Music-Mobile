@@ -23,6 +23,9 @@
     <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS"/>
     <!-- 从后台下载并打开 APK 安装程序 -->
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES"/>
+    <!-- 后台播放保活引导：请求系统豁免电池优化，避免国内 ROM（华为等）
+         的省电策略结束后台播放服务 -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS"/>
     <application
         android:label="XY Music"
         android:name="${applicationName}"

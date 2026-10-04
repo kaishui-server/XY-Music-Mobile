@@ -123,19 +123,71 @@ object FreezeProbe {
     private fun memoryLine(context: Context, dartLag: Long): String {
         val am = context.getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager
         var pssKb = 0L
+        var detail = ""
         try {
-            pssKb = am?.getProcessMemoryInfo(intArrayOf(Process.myPid()))
-                ?.firstOrNull()?.totalPss?.toLong() ?: 0L
+            val memInfo = am?.getProcessMemoryInfo(intArrayOf(Process.myPid()))?.firstOrNull()
+            if (memInfo != null) {
+                pssKb = memInfo.totalPss.toLong()
+                // 分类 PSS：把总量拆到子系统，用来判断泄漏落在哪一类
+                // （dalvik=Java 堆、native=native heap/图形/位图像素、
+                //  other=代码段/栈/未分类）。公开 API 只有这三项。
+                detail = " dalvik=${memInfo.dalvikPss / 1024}MB" +
+                    " native=${memInfo.nativePss / 1024}MB" +
+                    " other=${memInfo.otherPss / 1024}MB"
+            }
         } catch (_: Throwable) {
         }
         val runtime = Runtime.getRuntime()
         val javaUsedMb = (runtime.totalMemory() - runtime.freeMemory()) / 1048576L
         val info = ActivityManager.MemoryInfo()
         am?.getMemoryInfo(info)
-        return "[${timeFormat.format(Date())}] mem pss=${pssKb / 1024}MB " +
+        // smaps_rollup / 线程数是判定 "other" 大类泄漏性质的关键：
+        // 私有脏页增长 = 匿名 mmap/malloc（原生分配未释放）；
+        // 共享/文件页增长 = mmap 的文件（如整包音频缓存）未释放；
+        // 线程数持续上涨 = 线程栈泄漏。三者处置方式完全不同。
+        val detailRollup = readSmapsRollup()
+        return "[${timeFormat.format(Date())}] mem pss=${pssKb / 1024}MB$detail " +
             "javaHeap=${javaUsedMb}MB " +
             "sysAvail=${info.availMem / 1048576L}MB low=${info.lowMemory} " +
+            "threads=${readThreadCount()}$detailRollup " +
             "mainLag=${lastMainLagMs}ms dartLag=${dartLag}ms"
+    }
+
+    /** 读取 /proc/self/smaps_rollup，把内存按私有/共享、匿名/文件页拆分（单位 MB）。 */
+    private fun readSmapsRollup(): String {
+        return try {
+            val labels = mapOf(
+                "Pss:" to "pss2",
+                "Shared_Clean:" to "shClean",
+                "Shared_Dirty:" to "shDirty",
+                "Private_Clean:" to "pvClean",
+                "Private_Dirty:" to "pvDirty",
+                "Anonymous:" to "anon",
+            )
+            val values = LinkedHashMap<String, Long>()
+            File("/proc/self/smaps_rollup").forEachLine { line ->
+                val label = labels[line.substringBefore(':').trim() + ":"] ?: return@forEachLine
+                val kb = line.substringAfter(':').trim().substringBefore(' ').toLongOrNull()
+                if (kb != null) values[label] = kb / 1024
+            }
+            if (values.isEmpty()) "" else " " + values.entries.joinToString(" ") {
+                "${it.key}=${it.value}MB"
+            }
+        } catch (_: Throwable) {
+            ""
+        }
+    }
+
+    /** 当前进程线程数（线程栈泄漏会表现为持续上涨）。 */
+    private fun readThreadCount(): Int {
+        return try {
+            File("/proc/self/status").useLines { lines ->
+                lines.firstOrNull { it.startsWith("Threads:") }
+                    ?.substringAfter(':')?.trim()?.toIntOrNull() ?: -1
+            }
+        } catch (_: Throwable) {
+            -1
+        }
     }
 
     /**

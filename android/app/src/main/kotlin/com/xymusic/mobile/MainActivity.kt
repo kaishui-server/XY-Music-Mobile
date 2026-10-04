@@ -8,6 +8,7 @@ import android.net.Uri
 import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.Environment
+import android.os.PowerManager
 import android.provider.MediaStore
 import android.provider.DocumentsContract
 import android.provider.Settings
@@ -164,20 +165,82 @@ class MainActivity : AudioServiceActivity() {
     /// （"Cannot initialize effect engine for type: 0bed4300-... Error: -3"）。
     /// just_audio 一旦被注入 AndroidEqualizer，就会在 audio session 建立
     /// （每次 load / 切歌）时构造 Equalizer；该异常发生在主线程且无人
-    /// 捕获，会直接把整个进程判为崩溃退出。这里用全局会话（0）试建一次
-    /// 得出能力结论，宿主据此决定是否向播放管线注入对应效果。
+    /// 捕获，会直接把整个进程判为崩溃退出。这里试建一次得出能力结论，
+    /// 宿主据此决定是否向播放管线注入对应效果。
+    ///
+    /// 探测分两档（缺一不可）：
+    /// 1. 全局会话（0）：判断本机音频 HAL 是否具备该效果；
+    /// 2. 真实播放会话：华为 MatePad SE 等机型全局会话 0 能建效果，但
+    ///    绑定到真实播放会话时构造抛 RuntimeException
+    ///    （"AudioEffect: set/get parameter error"）——just_audio 正是拿
+    ///    播放会话构造效果，异常在主线程无人捕获即崩溃。只看会话 0 会漏判，
+    ///    这里用临时 AudioTrack 取到与播放同类的真实会话再试一次。
     private fun probeAudioEffects(): Map<String, Boolean> {
         audioEffectsProbe?.let { return it }
+        val globalEqualizer = canCreateAudioEffect {
+            android.media.audiofx.Equalizer(0, 0).release()
+        }
+        val globalLoudness = canCreateAudioEffect {
+            android.media.audiofx.LoudnessEnhancer(0).release()
+        }
+        val realSession = probeAudioEffectsOnRealSession()
         val result = mapOf(
-            "equalizer" to canCreateAudioEffect {
-                android.media.audiofx.Equalizer(0, 0).release()
-            },
-            "loudnessEnhancer" to canCreateAudioEffect {
-                android.media.audiofx.LoudnessEnhancer(0).release()
-            },
+            "equalizer" to (globalEqualizer && realSession.first),
+            "loudnessEnhancer" to (globalLoudness && realSession.second),
         )
         audioEffectsProbe = result
         return result
+    }
+
+    /// 用临时 AudioTrack 拿到真实播放会话 id，并在该会话上试建效果。
+    ///
+    /// 返回 (equalizer, loudnessEnhancer)。拿不到真实会话（AudioTrack 构造
+    /// 失败或返回会话 0）时一律按「不支持」处理：宁可该机型降级没有系统
+    /// 音效，也不能让 just_audio 在真实会话上构造效果时崩溃。
+    private fun probeAudioEffectsOnRealSession(): Pair<Boolean, Boolean> {
+        var track: android.media.AudioTrack? = null
+        try {
+            val sampleRate = 44100
+            val minBuffer = android.media.AudioTrack.getMinBufferSize(
+                sampleRate,
+                android.media.AudioFormat.CHANNEL_OUT_STEREO,
+                android.media.AudioFormat.ENCODING_PCM_16BIT,
+            )
+            val bufferSize = if (minBuffer > 0) minBuffer else 8192
+            track = android.media.AudioTrack.Builder()
+                .setAudioAttributes(
+                    android.media.AudioAttributes.Builder()
+                        .setUsage(android.media.AudioAttributes.USAGE_MEDIA)
+                        .setContentType(android.media.AudioAttributes.CONTENT_TYPE_MUSIC)
+                        .build(),
+                )
+                .setAudioFormat(
+                    android.media.AudioFormat.Builder()
+                        .setEncoding(android.media.AudioFormat.ENCODING_PCM_16BIT)
+                        .setSampleRate(sampleRate)
+                        .setChannelMask(android.media.AudioFormat.CHANNEL_OUT_STEREO)
+                        .build(),
+                )
+                .setBufferSizeInBytes(bufferSize)
+                .setTransferMode(android.media.AudioTrack.MODE_STREAM)
+                .build()
+            val sessionId = track.audioSessionId
+            if (sessionId == 0) return false to false
+            val equalizer = canCreateAudioEffect {
+                android.media.audiofx.Equalizer(0, sessionId).release()
+            }
+            val loudness = canCreateAudioEffect {
+                android.media.audiofx.LoudnessEnhancer(sessionId).release()
+            }
+            return equalizer to loudness
+        } catch (_: Throwable) {
+            return false to false
+        } finally {
+            try {
+                track?.release()
+            } catch (_: Throwable) {
+            }
+        }
     }
 
     private inline fun canCreateAudioEffect(create: () -> Unit): Boolean =
@@ -187,6 +250,36 @@ class MainActivity : AudioServiceActivity() {
         } catch (_: Throwable) {
             false
         }
+
+    /// 是否已被系统豁免电池优化（后台保活状态）。
+    private fun isIgnoringBatteryOptimizations(): Boolean = try {
+        val pm = getSystemService(android.content.Context.POWER_SERVICE) as PowerManager
+        pm.isIgnoringBatteryOptimizations(packageName)
+    } catch (_: Throwable) {
+        false
+    }
+
+    /// 拉起系统「忽略电池优化」授权弹窗。部分 ROM 没有该弹窗或不允许直接
+    /// 跳转，此时回退到应用详情页。返回是否成功拉起。
+    private fun requestIgnoreBatteryOptimizations(): Boolean = try {
+        startActivity(
+            Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
+                data = Uri.parse("package:$packageName")
+            },
+        )
+        true
+    } catch (_: Throwable) {
+        try {
+            startActivity(
+                Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
+                    data = Uri.parse("package:$packageName")
+                },
+            )
+            true
+        } catch (_: Throwable) {
+            false
+        }
+    }
 
     /// 提取 xymusic:// 深链（分享落地页拉起播放）。
     private fun extractDeepLink(intent: Intent?): String? {
@@ -819,6 +912,16 @@ class MainActivity : AudioServiceActivity() {
                 }
                 if (call.method == "probeAudioEffects") {
                     result.success(probeAudioEffects())
+                    return@setMethodCallHandler
+                }
+                // 后台保活引导：查询/请求忽略电池优化。国内 ROM（华为等）的
+                // 省电策略会强杀前台服务，导致后台播放中断甚至进程被杀。
+                if (call.method == "isIgnoringBatteryOptimizations") {
+                    result.success(isIgnoringBatteryOptimizations())
+                    return@setMethodCallHandler
+                }
+                if (call.method == "requestIgnoreBatteryOptimizations") {
+                    result.success(requestIgnoreBatteryOptimizations())
                     return@setMethodCallHandler
                 }
                 // 久播卡死探针：上报系统音频输出层信号。Dart 侧据

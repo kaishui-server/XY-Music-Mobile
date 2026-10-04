@@ -22,3 +22,37 @@ final dynamicColorSupportedProvider = FutureProvider<bool>((ref) async {
     return false;
   }
 });
+
+/// 是否已被系统豁免电池优化（后台保活状态）。
+///
+/// 国内 ROM（华为 EMUI/HarmonyOS、小米 HyperOS 等）默认的省电策略会限制
+/// 甚至在锁屏后强杀正在播放的前台服务，表现为后台播放突然中断、进程被杀。
+/// 设置页据此展示「后台播放保活」引导入口；非 Android 或通道不可用时返回
+/// true（视为无需引导），避免在不支持的平台误报。
+final batteryOptimizationIgnoredProvider = FutureProvider<bool>((ref) async {
+  if (kIsWeb || !Platform.isAndroid) return true;
+  try {
+    final ignored = await const MethodChannel(
+      'com.xymusic.mobile/device_info',
+    ).invokeMethod<bool>('isIgnoringBatteryOptimizations');
+    return ignored ?? false;
+  } catch (_) {
+    // 通道不可用（旧宿主/测试环境）：不展示引导。
+    return true;
+  }
+});
+
+/// 请求系统豁免本应用的电池优化（拉起系统授权弹窗）。
+///
+/// 调用后用户可能立即授权，也可能跳去系统设置手动开启；调用方应在返回后
+/// 重新读取 [batteryOptimizationIgnoredProvider] 刷新状态。
+Future<void> requestIgnoreBatteryOptimizations() async {
+  if (kIsWeb || !Platform.isAndroid) return;
+  try {
+    await const MethodChannel(
+      'com.xymusic.mobile/device_info',
+    ).invokeMethod<bool>('requestIgnoreBatteryOptimizations');
+  } catch (_) {
+    // 部分 ROM 无该弹窗：静默失败，用户仍可照弹窗内的路径手动设置。
+  }
+}
