@@ -29,6 +29,7 @@ class PluginMetadata {
     this.isLx = false,
     this.isBaka = false,
     this.isAnimemusic = false,
+    this.availableMethods = const [],
   });
 
   final String? id;
@@ -51,8 +52,9 @@ class PluginMetadata {
   /// module.exports。规则与 plugin_runtime 的 _looksLikeLxPlugin 一致。
   final bool isLx;
 
-  /// BakaMusic 契约插件：getMvSource 方法或 animeSrc 歌曲来源标记
-  /// 是该契约区别于 MusicFree/LX 的独有特征。
+  /// BakaMusic 契约插件：靠官方作者签名（toskysun）、animeSrc 来源标记、
+  /// getMusicComments 评论接口或 supportedQualities 音质声明识别，是
+  /// 该契约区别于 MusicFree/LX 的独有特征（见 [_detectBaka]）。
   final bool isBaka;
 
   /// animemusic 后端插件：直连 animemusic.bzxhkj.com（惜梦 v3/v4、
@@ -60,12 +62,26 @@ class PluginMetadata {
   /// 分类时需先判 isBaka 再判本标记。
   final bool isAnimemusic;
 
+  /// 静态扫描出的 MusicFree 契约方法名（不执行脚本）。参照 XianYu 的
+  /// `_availableMethods`：未适配/精简插件只实现 search + getMediaSource，
+  /// 宿主调用其未实现的可选方法会抛错；据此在调用前判断方法是否存在，
+  /// 缺失时直接走回退链。压缩/混淆插件扫不出结果时为空集合，调用方
+  /// 据此不做门控（保持原来的「尝试调用并靠异常兜底」行为）。
+  final List<String> availableMethods;
+
   static PluginMetadata parse(String script) {
     final constants = _parseStringConstants(script);
     final header = _parseHeader(script);
     final exported = _parseExportedObject(script, constants);
     final json = _parseJsonObject(script);
     final constMeta = _parseConstMeta(script);
+    final author = _clean(
+      header['author'] ??
+          exported['author'] ??
+          json['author'] ??
+          constMeta['author'],
+    );
+    final methods = _parseExportedMethods(script);
 
     return PluginMetadata(
       id: _clean(header['id'] ?? exported['id'] ?? json['id']),
@@ -84,12 +100,7 @@ class PluginMetadata {
             json['version'] ??
             constMeta['version'],
       ),
-      author: _clean(
-        header['author'] ??
-            exported['author'] ??
-            json['author'] ??
-            constMeta['author'],
-      ),
+      author: author,
       remark: _clean(
         header['description'] ??
             header['desc'] ??
@@ -104,8 +115,9 @@ class PluginMetadata {
       userVariables: _parseUserVariables(script, constants),
       isStarSea: _detectStarSea(script),
       isLx: _detectLx(script),
-      isBaka: _detectBaka(script),
+      isBaka: _detectBaka(script, author: author, methods: methods),
       isAnimemusic: _detectAnimemusic(script),
+      availableMethods: methods,
     );
   }
 
@@ -227,18 +239,125 @@ class PluginMetadata {
         lower.contains('globalthis.lx') ||
         RegExp(r'''globalthis\s*\[\s*['"]lx['"]\s*\]''').hasMatch(lower) ||
         lower.contains('event_names.request') ||
-        lower.contains('server_script_config');
+        lower.contains('server_script_config') ||
+        // 以下为压缩/混淆变体特征，照搬 XianYu plugin_engine.isLxPluginScript
+        // （L93-109）：lx.on(...)/lx.send(...) 调用形式；仅同时出现
+        // globalThis 与 EVENT_NAMES（无 globalThis.lx 字面）；以及 \uXXXX
+        // 转义形态（\u006c\u0078 = "lx"、\u0053… = "SERVER_SCRIPT_CONFIG"）。
+        // 未专门适配过的洛雪插件常被压缩成这些形态，只认字面串会漏判。
+        RegExp(r'\blx\s*\.\s*(on|send)\s*\(').hasMatch(lower) ||
+        (lower.contains('globalthis') && lower.contains('event_names')) ||
+        lower.contains(
+          r'\u0053\u0043\u0052\u0049\u0050\u0054\u005f\u004d\u0044\u0035',
+        ) ||
+        (lower.contains(r'\u006c\u0078') &&
+            lower.contains(
+              r'\u0067\u006c\u006f\u0062\u0061\u006c\u0054\u0068\u0069\u0073',
+            ));
   }
 
-  /// BakaMusic 契约静态识别：以 `animeSrc` 歌曲来源标记为独有特征。
+  /// BakaMusic 契约静态识别（用于区分 MusicFree 与 BakaMusic）。
+  ///
+  /// 判定方法照搬 XianYu-Music-Mobile 的
+  /// `BakaPluginManager._detectBakaPlugin`，按信号强弱排序：
+  /// 1. author 命中官方作者签名 `toskysun` → 直接判 Baka（最强信号）；
+  /// 2. author 命中已知非 Baka 作者（[nonBakaAuthors]）→ 直接排除，
+  ///    这类 MusicFree 插件可能带 Baka 兼容特征，靠内容判会误判；
+  /// 3. 其余按 BakaMusic 独有契约特征判定：`animeSrc` 歌曲来源标记、
+  ///    `getMusicComments` 评论接口、`supportedQualities` 音质声明。
   ///
   /// 不再使用 `getMvSource`：MusicFree 通用插件为兼容 BakaMusic 也会
   /// 导出 getMvSource（实测万象 API/部分第三方插件均带），用它判 Baka
-  /// 会把 MusicFree 插件误分类到 Baka 分栏，这是本次误判的根因。
-  /// BakaMusic 与 MusicFree 脚本同构，内容层无法可靠区分，导入时以
-  /// 订阅来源类型（见 plugins_page 的订阅类型提示）兜底。
-  static bool _detectBaka(String script) {
-    return script.toLowerCase().contains('animesrc');
+  /// 会把 MusicFree 插件误分类到 Baka 分栏。
+  static bool _detectBaka(
+    String script, {
+    String? author,
+    List<String> methods = const [],
+  }) {
+    final authorLower = (author ?? '').toLowerCase();
+    if (authorLower.contains('toskysun')) return true;
+    for (final name in nonBakaAuthors) {
+      if (authorLower.contains(name.toLowerCase())) return false;
+    }
+    // BakaMusic 独有的歌曲来源标记。
+    if (script.toLowerCase().contains('animesrc')) return true;
+    // 评论接口：XianYu 按引擎解析出的方法清单精确匹配，不做裸串扫描，
+    // 避免插件正文里提及 getMusicComments 就被判为 Baka。
+    if (methods.contains('getMusicComments')) return true;
+    // 音质声明：仅当声明值确实含可识别档位（128k/flac/flac24bit 等）时
+    // 才判 Baka，避免 MusicFree 插件里空的/非音质的 supportedQualities
+    // 字段被误判。
+    return _declaresQualities(script);
+  }
+
+  /// 静态提取 `supportedQualities` 声明，判断其值是否含可识别音质档位
+  /// （对齐 XianYu 对 supportedQualities 逐项做 normalizeQualityKey 的校验）。
+  static bool _declaresQualities(String script) {
+    final match = RegExp(
+      r'''supportedQualities['"]?\s*[:=]\s*\[([^\]]*)\]''',
+      caseSensitive: false,
+    ).firstMatch(script);
+    if (match == null) return false;
+    final body = match.group(1) ?? '';
+    return RegExp(
+      r'96k|128k|192k|320k|flac24bit|flac|hires|hi-res|lossless|sq|ape|wav|vinyl|dolby|atmos|master|24bit',
+      caseSensitive: false,
+    ).hasMatch(body);
+  }
+
+  /// 已知的非 BakaMusic（MusicFree 系）作者白名单：其插件可能内嵌
+  /// BakaMusic 兼容特征（评论接口/音质声明），但不属于 BakaMusic 契约，
+  /// 需在特征判定前先排除。（同 XianYu 的 `nonBakaAuthors`。）
+  static const List<String> nonBakaAuthors = ['时迁酱'];
+
+  /// MusicFree 契约里宿主可能调用的方法名。只有这些方法参与
+  /// [availableMethods] 门控，避免把插件内无关的同名标识符误判为契约方法。
+  static const Set<String> knownContractMethods = {
+    'search',
+    'getMediaSource',
+    'getMusicInfo',
+    'getTopLists',
+    'getTopListDetail',
+    'getMusicSheetInfo',
+    'importMusicSheet',
+    'importMusicItem',
+    'importPlaylist',
+    'getArtistWorks',
+    'getArtistInfo',
+    'getAlbumInfo',
+    'getLyrics',
+    'getMusicComments',
+    'getMvSource',
+  };
+
+  /// 静态扫描插件实现了哪些 MusicFree 契约方法（不执行脚本）。
+  ///
+  /// 参照 XianYu 的 `_availableMethods`（其从加载后的引擎元数据读取）：
+  /// 未适配/精简插件可能只实现 search + getMediaSource，宿主调用缺失的
+  /// 可选方法会抛错。这里用「方法名以函数形式声明」的宽松匹配逐个探测。
+  ///
+  /// 刻意宽松（属性/简写方法/箭头函数/赋值式挂载都算命中）：漏判会让
+  /// 调用方误跳过插件其实实现了的方法，比多判（退化为原来的尝试调用）
+  /// 危险得多，因此宁可多判。
+  static List<String> _parseExportedMethods(String script) {
+    if (script.isEmpty) return const [];
+    final methods = <String>[];
+    for (final name in knownContractMethods) {
+      final escaped = RegExp.escape(name);
+      final body =
+          // 简写方法 `search(kw) {` 或箭头 `search: (kw) => `
+          r'(?:\([^)]*\)\s*(?:\{|=>)'
+          // 属性赋值函数 `search: function` / `search: async (kw) =>` / `search: kw =>`
+          r'|:\s*(?:async\s+)?(?:function\b|\(|\w+\s*=>)'
+          // 赋值式挂载 `p.search = function` / `= (kw) =>`
+          r'|=\s*(?:async\s+)?(?:function\b|\())';
+      final pattern = RegExp(
+        // 前缀排除 `.`/标识符字符，避免把 `this.search(` 这类调用当成声明。
+        '(?:^|[^\\w\\\$.])["\\\']?$escaped["\\\']?\\s*$body',
+      );
+      if (pattern.hasMatch(script)) methods.add(name);
+    }
+    return methods;
   }
 
   /// 订阅来源 URL 判定 BakaMusic 音源。

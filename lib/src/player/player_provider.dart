@@ -1591,6 +1591,12 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
   /// 单独挂接 position 流：前后台切换时仅重挂这一条订阅（见
   /// [_handleAppLifecycleChanged]），duration/playerState 订阅不受影响。
   void _attachPositionStream() {
+    // just_audio 的 createPositionStream 在被取消时不会取消内部 Timer 与
+    // playerEventStream 订阅（包在 pub 缓存不可改）。重挂前必须先取消旧
+    // 订阅，否则每次生命周期切换都会遗留一个仍在计时的 Timer 与一个播放器
+    // 事件订阅，在后台播放路径上持续累积。
+    _posSub?.cancel();
+    _posSub = null;
     final periods = _positionStreamPeriods();
     _posSub = _player
         .createPositionStream(

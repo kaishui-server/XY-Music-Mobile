@@ -50,6 +50,11 @@ class DesktopLyricsBridge {
   static Future<List<_DesktopLyricLine>>? _lyricsCacheFuture;
   static int _syncGeneration = 0;
 
+  /// 上次 trim/解析所用的原始歌词字符串实例。整首歌期间
+  /// [QueueItem.lyricsRaw] 恒为同一 String 实例（歌词只在换歌/换词时才
+  /// 更新），据此可跳过 10Hz 热循环里对整首歌词的重复 trim。
+  static String? _rawSourceRef;
+
   static void _resetSendState() {
     _lastContentSignature = null;
     _lastIsPlayingSent = null;
@@ -203,12 +208,19 @@ class DesktopLyricsBridge {
     String raw,
     double position,
   ) async {
-    final source = raw.trim();
-    if (source.isEmpty) return const DesktopLyric(text: '暂无歌词');
-    if (_lyricsCacheKey != source) {
+    // 桌面歌词同步在后台以 10Hz 热循环运行；整首歌期间 [raw] 都是同一个
+    // String 实例（歌词只在换歌/换词时更新）。按实例判断可把「整首歌词
+    // trim + 解析」从每 tick 一次收敛为每首歌一次：原始 LRC/QRC 常带首尾
+    // 空白，trim() 会整份复制歌词，10Hz 反复分配是后台 other 堆持续增长
+    // (~1MB/s) 的主要来源。
+    if (!identical(raw, _rawSourceRef)) {
+      _rawSourceRef = raw;
+      final source = raw.trim();
       _lyricsCacheKey = source;
-      _lyricsCacheFuture = _parseLyrics(source);
+      _lyricsCacheFuture = source.isEmpty ? null : _parseLyrics(source);
     }
+    final source = _lyricsCacheKey ?? '';
+    if (source.isEmpty) return const DesktopLyric(text: '暂无歌词');
     final lines = await (_lyricsCacheFuture ?? _parseLyrics(source));
     if (lines.isEmpty) return _fallbackCurrentLyric(source, position);
     var active = lines.lastIndexWhere((line) => line.time <= position);

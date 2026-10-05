@@ -34,6 +34,7 @@ class EnabledMusicPlugin {
     this.userVariables = const {},
     this.sourceUrl = '',
     this.sourceLabel,
+    this.availableMethods = const [],
   });
 
   final String id;
@@ -70,6 +71,17 @@ class EnabledMusicPlugin {
   /// `?source=` 对同一插件发放不同授权的脚本，名称相同、内容不同，换源
   /// 列表需要据此区分展示（同名音源各带一个来源标签）。
   final String? sourceLabel;
+
+  /// 静态扫描出的 MusicFree 契约方法名（见 PluginMetadata.availableMethods）。
+  /// 空集合表示未识别（压缩/混淆插件），此时不做方法门控。
+  final List<String> availableMethods;
+
+  /// 插件是否可能实现了 [method]（参照 XianYu 的 `_availableMethods`）。
+  /// 未识别方法集合时一律返回 true，保持「尝试调用并靠异常兜底」；
+  /// 识别出集合后，缺失的方法由调用方直接走回退链，省下无谓的跨
+  /// isolate 调用与错误日志。仅对 MusicFree 族插件有意义。
+  bool mayHaveMethod(String method) =>
+      availableMethods.isEmpty || availableMethods.contains(method);
 }
 
 class PluginSearchSong {
@@ -480,7 +492,7 @@ Future<List<EnabledMusicPlugin>> loadEnabledMusicPlugins(Ref ref) async {
         name: pluginName,
         path: file.path,
         isLx: isLx,
-        lxSources: isLx ? _detectLxSources(source) : const [],
+        lxSources: isLx ? _detectLxSources(source, name: pluginName) : const [],
         isBaka: isBaka,
         isAnimemusic: isAnimemusic,
         sourceLabel: sourceLabels[id],
@@ -509,6 +521,7 @@ Future<List<EnabledMusicPlugin>> loadEnabledMusicPlugins(Ref ref) async {
             : const ['128k', '192k', '320k', 'flac'],
         userVariables: savedVariables[id] ?? const {},
         sourceUrl: sourceUrls[id] ?? '',
+        availableMethods: metadata.availableMethods,
       ),
     );
   }
@@ -674,11 +687,33 @@ bool _looksLikeLxPlugin(String source) {
       // 点号形式，否则会被误判为 MusicFree 插件而无法加载。
       RegExp(r'''globalthis\s*\[\s*['"]lx['"]\s*\]''').hasMatch(lower) ||
       lower.contains('event_names.request') ||
-      lower.contains('server_script_config');
+      lower.contains('server_script_config') ||
+      // 与 PluginMetadata._detectLx 保持一致的混淆变体特征（照搬 XianYu
+      // plugin_engine.isLxPluginScript）：lx.on(...)/lx.send(...) 调用形式；
+      // 仅同时出现 globalThis 与 EVENT_NAMES；以及 \uXXXX 转义形态。
+      RegExp(r'\blx\s*\.\s*(on|send)\s*\(').hasMatch(lower) ||
+      (lower.contains('globalthis') && lower.contains('event_names')) ||
+      lower.contains(
+        r'\u0053\u0043\u0052\u0049\u0050\u0054\u005f\u004d\u0044\u0035',
+      ) ||
+      (lower.contains(r'\u006c\u0078') &&
+          lower.contains(
+            r'\u0067\u006c\u006f\u0062\u0061\u006c\u0054\u0068\u0069\u0073',
+          ));
 }
 
-List<String> _detectLxSources(String source) {
+List<String> _detectLxSources(String source, {String? name}) {
   const supported = ['kw', 'kg', 'tx', 'wy', 'mg'];
+  // 优先取插件自报的音源：LX 插件通过
+  // lx.send(lx.EVENT_NAMES.inited, { sources: { <音源>: {...} } }) 声明它
+  // 支持哪些音源。照搬 XianYu 读声明音源的做法（本软件不执行脚本，改为
+  // 静态提取）；未适配插件可能只支持五平台中的一部分，声明列表比「脚本
+  // 里出现过哪些平台名」更准。宿主内置搜索（Rust lxSearch）只认五平台，
+  // 故与五平台取交集，交集为空时退回后面的兜底。
+  final declared = _extractLxInitedSources(source)
+      .where(supported.contains)
+      .toList();
+  if (declared.isNotEmpty) return declared;
   final found = <String>[];
   for (final id in supported) {
     if (RegExp("(?:['\"])?$id(?:['\"])?\\s*[:=]").hasMatch(source) ||
@@ -686,7 +721,171 @@ List<String> _detectLxSources(String source) {
       found.add(id);
     }
   }
-  return found.isEmpty ? supported : found;
+  if (found.isNotEmpty) return found;
+  // 脚本里完全没有平台 key 时按插件名兜底推断（酷我/酷狗/QQ/网易/咪咕），
+  // 对齐 XianYu 的 lxPlatformCodeOf。
+  final byName = _lxPlatformCodeByName(name ?? '');
+  if (byName != null) return [byName];
+  return supported;
+}
+
+/// 按插件显示名推断 LX 平台码（XianYu `lxPlatformCodeOf` 的等价实现）。
+String? _lxPlatformCodeByName(String name) {
+  final lower = name.toLowerCase();
+  if (lower.contains('酷我') || lower.contains('kuwo')) return 'kw';
+  if (lower.contains('酷狗') || lower.contains('kugou')) return 'kg';
+  if (lower.contains('qq') || lower.contains('企鹅')) return 'tx';
+  if (lower.contains('网易') || lower.contains('netease')) return 'wy';
+  if (lower.contains('咪咕') || lower.contains('migu')) return 'mg';
+  return null;
+}
+
+/// 从 LX 插件脚本里静态提取 `sources: { ... }` 对象的顶层 key（音源名）。
+///
+/// 优先取 `inited` 之后的 `sources`（压缩脚本里可能先出现同名对象）；
+/// 按花括号配对只收集顶层 key，跳过字符串/注释与嵌套对象。
+List<String> _extractLxInitedSources(String source) {
+  bool isIdentStart(int c) =>
+      (c >= 0x41 && c <= 0x5A) ||
+      (c >= 0x61 && c <= 0x7A) ||
+      c == 0x5F ||
+      c == 0x24;
+  bool isIdentPart(int c) => isIdentStart(c) || (c >= 0x30 && c <= 0x39);
+
+  final pattern = RegExp(r"""['"]?sources['"]?\s*:\s*\{""");
+  final initedIndex = source.indexOf('inited');
+  RegExpMatch? chosen;
+  for (final match in pattern.allMatches(source)) {
+    if (initedIndex >= 0 && match.start < initedIndex) continue;
+    chosen = match;
+    break;
+  }
+  chosen ??= pattern.firstMatch(source);
+  if (chosen == null) return const [];
+
+  final n = source.length;
+  final keys = <String>[];
+  var depth = 0;
+  var i = chosen.end; // sources 对象的 '{' 之后
+  var expectKey = true;
+  while (i < n) {
+    final ch = source.codeUnitAt(i);
+    if (ch == 0x20 || ch == 0x09 || ch == 0x0A || ch == 0x0D) {
+      i++;
+      continue;
+    }
+    if (ch == 0x27 || ch == 0x22 || ch == 0x60) {
+      final quote = ch;
+      var j = i + 1;
+      while (j < n) {
+        final c = source.codeUnitAt(j);
+        if (c == 0x5C) {
+          j += 2;
+          continue;
+        }
+        if (c == quote) {
+          j++;
+          break;
+        }
+        j++;
+      }
+      if (depth == 0 && expectKey) {
+        var after = j;
+        while (after < n && source.codeUnitAt(after) <= 0x20) {
+          after++;
+        }
+        if (after < n && source.codeUnitAt(after) == 0x3A) {
+          keys.add(source.substring(i + 1, j - 1));
+          i = after + 1;
+          expectKey = false;
+          continue;
+        }
+      }
+      i = j;
+      expectKey = false;
+      continue;
+    }
+    if (ch == 0x2F && i + 1 < n) {
+      final next = source.codeUnitAt(i + 1);
+      if (next == 0x2F) {
+        while (i < n && source.codeUnitAt(i) != 0x0A) {
+          i++;
+        }
+        continue;
+      }
+      if (next == 0x2A) {
+        i += 2;
+        while (i + 1 < n &&
+            !(source.codeUnitAt(i) == 0x2A && source.codeUnitAt(i + 1) == 0x2F)) {
+          i++;
+        }
+        i += 2;
+        continue;
+      }
+    }
+    if (ch == 0x7B || ch == 0x5B) {
+      depth++;
+      i++;
+      expectKey = false;
+      continue;
+    }
+    if (ch == 0x7D || ch == 0x5D) {
+      if (ch == 0x7D && depth == 0) break; // sources 对象结束
+      depth--;
+      i++;
+      expectKey = false;
+      continue;
+    }
+    if (depth == 0 && expectKey && isIdentStart(ch)) {
+      var j = i;
+      while (j < n && isIdentPart(source.codeUnitAt(j))) {
+        j++;
+      }
+      var after = j;
+      while (after < n && source.codeUnitAt(after) <= 0x20) {
+        after++;
+      }
+      if (after < n && source.codeUnitAt(after) == 0x3A) {
+        keys.add(source.substring(i, j));
+        i = after + 1;
+        expectKey = false;
+        continue;
+      }
+      i = j;
+      expectKey = false;
+      continue;
+    }
+    if (ch == 0x2C && depth == 0) {
+      expectKey = true;
+      i++;
+      continue;
+    }
+    expectKey = false;
+    i++;
+  }
+
+  const blocked = {
+    'name',
+    'type',
+    'actions',
+    'qualitys',
+    'qualities',
+    'id',
+    'version',
+    'description',
+    'author',
+    'status',
+    'message',
+    'sources',
+  };
+  final result = <String>[];
+  for (final key in keys) {
+    final normalized = key.trim().toLowerCase();
+    if (normalized.isEmpty || blocked.contains(normalized)) continue;
+    if (!RegExp(r'^[a-z][a-z0-9_]*$').hasMatch(normalized)) continue;
+    if (!result.contains(normalized)) result.add(normalized);
+  }
+  return result;
 }
 
 /// animemusic/1 插件识别：脚本内 META.format 声明自有格式，本体是
@@ -1276,6 +1475,11 @@ class PluginRuntimeService {
       );
       if (songs.isNotEmpty) return songs;
     }
+    if (!plugin.mayHaveMethod('getArtistWorks')) {
+      // 未适配/精简插件只实现 search + getMediaSource，调用缺失的详情
+      // 方法会直接抛错；照 XianYu 逻辑改为按歌手名搜索回退。
+      return search(plugin, artist.title);
+    }
     try {
       Future<List<Map<String, dynamic>>> fetchPage(int page) async {
         final response = _runsPluginsInBackground
@@ -1429,6 +1633,10 @@ class PluginRuntimeService {
       );
       if (songs.isNotEmpty) return songs;
     }
+    if (!plugin.mayHaveMethod('getAlbumInfo')) {
+      // 未实现专辑详情接口时直接按专辑名搜索并过滤（照 XianYu 回退逻辑）。
+      return _searchAlbumFallback(plugin, album.title);
+    }
     try {
       // 听书类插件（如 one-酷我听书）一次只回一页章节，一本有声书
       // 可达数百集；按 isEnd 循环翻页取全量，id 去重 + 页数上限防死循环。
@@ -1472,8 +1680,16 @@ class PluginRuntimeService {
     } catch (_) {
       // 与桌面端一致：详情接口不可用时回退到普通歌曲搜索。
     }
-    final results = await search(plugin, album.title);
-    final target = album.title.trim().toLowerCase();
+    return _searchAlbumFallback(plugin, album.title);
+  }
+
+  /// 专辑详情接口缺失或不可用时，按专辑名搜索并过滤同名专辑曲目。
+  Future<List<PluginSearchSong>> _searchAlbumFallback(
+    EnabledMusicPlugin plugin,
+    String title,
+  ) async {
+    final results = await search(plugin, title);
+    final target = title.trim().toLowerCase();
     return results.where((song) {
       final value = song.album.trim().toLowerCase();
       return value == target ||
@@ -1709,19 +1925,25 @@ class PluginRuntimeService {
     if (plugin.isLx) return const [];
     // animemusic/1 单平台插件（如 qishui）：直连后端 music/toplist。
     if (plugin.isAnimemusic) return _getAnimemusicTopLists(plugin);
-    final response = _runsPluginsInBackground
-        ? await _runPluginOperation(plugin, 'getTopLists', null)
-        : await _callOnCurrentIsolate(plugin, 'getTopLists', []);
-    return _extractTopListItems(response)
-        .map(
-          (raw) => _toCatalogResult(
-            plugin.id,
-            _resetMediaItem(plugin, raw),
-            artist: false,
-          ),
-        )
-        .where((item) => item.title.isNotEmpty)
-        .toList();
+    if (!plugin.mayHaveMethod('getTopLists')) return const [];
+    try {
+      final response = _runsPluginsInBackground
+          ? await _runPluginOperation(plugin, 'getTopLists', null)
+          : await _callOnCurrentIsolate(plugin, 'getTopLists', []);
+      return _extractTopListItems(response)
+          .map(
+            (raw) => _toCatalogResult(
+              plugin.id,
+              _resetMediaItem(plugin, raw),
+              artist: false,
+            ),
+          )
+          .where((item) => item.title.isNotEmpty)
+          .toList();
+    } catch (_) {
+      // 目录接口容错：未实现/报错的插件返回空榜单，不阻断推荐页。
+      return const [];
+    }
   }
 
   /// 获取某个热门榜单内的歌曲，用于推荐页混入不依赖个人喜好的
@@ -1744,6 +1966,8 @@ class PluginRuntimeService {
         fetchAll: fetchAll,
       );
     }
+    // 未实现榜单详情接口的插件无榜单可拉，直接返回空。
+    if (!plugin.mayHaveMethod('getTopListDetail')) return const [];
     final songs = await _loadMusicFreePlaylistSongs(
       plugin,
       Map<String, dynamic>.from(chart.rawData),
@@ -3188,6 +3412,9 @@ class PluginRuntimeService {
       'top' => 'getTopListDetail',
       _ => 'getMusicSheetInfo',
     };
+    // 未实现该详情接口的插件无法拉取曲目：榜单无兜底直接返回空；
+    // 歌单/专辑的兜底（按标题搜索）由各自调用方负责。
+    if (kind == 'top' && !plugin.mayHaveMethod(method)) return const [];
     var songs = <Map<String, dynamic>>[];
     final seen = <String>{};
     // 分页拉取歌单全部曲目（对齐前身 XianYu-Music-mobile 的导入逻辑）。
@@ -4229,6 +4456,8 @@ class PluginRuntimeService {
           : _getAnimemusicLyrics(plugin, rawData);
     }
     if (plugin.isAnimemusic) return _getAnimemusicLyrics(plugin, rawData);
+    // 未实现歌词接口的插件直接返回空串，由调用方回退平台直连歌词。
+    if (!plugin.mayHaveMethod('getLyrics')) return '';
     if (_runsPluginsInBackground) {
       final response = await _runPluginOperation(plugin, 'getLyrics', rawData);
       return response?.toString() ?? '';
