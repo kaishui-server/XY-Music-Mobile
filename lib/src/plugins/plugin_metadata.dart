@@ -52,9 +52,11 @@ class PluginMetadata {
   /// module.exports。规则与 plugin_runtime 的 _looksLikeLxPlugin 一致。
   final bool isLx;
 
-  /// BakaMusic 契约插件：靠官方作者签名（toskysun）、animeSrc 来源标记、
-  /// getMusicComments 评论接口或 supportedQualities 音质声明识别，是
-  /// 该契约区别于 MusicFree/LX 的独有特征（见 [_detectBaka]）。
+  /// BakaMusic 契约插件：靠 `animeSrc` 来源标记，或
+  /// `getMvSource` + `supportedVideoQualities` MV 组合标记识别
+  /// （见 [_detectBaka]）。作者签名（toskysun）与 getMusicComments /
+  /// supportedQualities 单独出现都不是 Baka 独有特征，不能用。内容识别不
+  /// 中时再由订阅类型提示与 [isBakaSourceUrl] 兜底。
   final bool isBaka;
 
   /// animemusic 后端插件：直连 animemusic.bzxhkj.com（惜梦 v3/v4、
@@ -115,7 +117,7 @@ class PluginMetadata {
       userVariables: _parseUserVariables(script, constants),
       isStarSea: _detectStarSea(script),
       isLx: _detectLx(script),
-      isBaka: _detectBaka(script, author: author, methods: methods),
+      isBaka: _detectBaka(script, author: author),
       isAnimemusic: _detectAnimemusic(script),
       availableMethods: methods,
     );
@@ -258,57 +260,40 @@ class PluginMetadata {
 
   /// BakaMusic 契约静态识别（用于区分 MusicFree 与 BakaMusic）。
   ///
-  /// 判定方法照搬 XianYu-Music-Mobile 的
-  /// `BakaPluginManager._detectBakaPlugin`，按信号强弱排序：
-  /// 1. author 命中官方作者签名 `toskysun` → 直接判 Baka（最强信号）；
-  /// 2. author 命中已知非 Baka 作者（[nonBakaAuthors]）→ 直接排除，
-  ///    这类 MusicFree 插件可能带 Baka 兼容特征，靠内容判会误判；
-  /// 3. 其余按 BakaMusic 独有契约特征判定：`animeSrc` 歌曲来源标记、
-  ///    `getMusicComments` 评论接口、`supportedQualities` 音质声明。
+  /// [nonBakaAuthors] 命中的作者先排除，再按两条内容特征判定：
+  /// 1. `animeSrc` 歌曲来源标记；
+  /// 2. MV 组合标记 `getMvSource` + `supportedVideoQualities`。
   ///
-  /// 不再使用 `getMvSource`：MusicFree 通用插件为兼容 BakaMusic 也会
-  /// 导出 getMvSource（实测万象 API/部分第三方插件均带），用它判 Baka
-  /// 会把 MusicFree 插件误分类到 Baka 分栏。
-  static bool _detectBaka(
-    String script, {
-    String? author,
-    List<String> methods = const [],
-  }) {
+  /// 第 2 条用于覆盖只具备 BakaMusic 官方订阅特征、没有 `animeSrc` 的插件，
+  /// 实测命中：BakaMusic 官方订阅（animemusic.bzxhkj.com/baka）全部 6 个插件，
+  /// 以及 Toskysun 的 QQ音乐[L1]/[L2]（此前只认 animeSrc 时被误分到
+  /// MusicFree 分栏）。全量 95 个 MusicFree 订阅脚本中只有万象API 的 qq/bili
+  /// 两个脚本同时导出这两个标记，已由 [nonBakaAuthors] 排除。
+  ///
+  /// 刻意不用以下特征，它们都会把 MusicFree 插件误分类到 Baka 分栏：
+  /// - `author == toskysun`：MusicFree 源里的「GD音乐台」同样是 Toskysun 作品
+  ///   （实测无 getMvSource/supportedVideoQualities），仅按作者判会误伤；
+  /// - `getMusicComments`、`supportedQualities` 单独出现：万象API 等
+  ///   MusicFree 系插件同样声明，单独用会大面积误伤。
+  ///
+  /// 内容识别不中时，再由订阅类型提示（索引含 `yourinfo`、URL 含 `baka`）与
+  /// [isBakaSourceUrl] 兜底。
+  static bool _detectBaka(String script, {String? author}) {
     final authorLower = (author ?? '').toLowerCase();
-    if (authorLower.contains('toskysun')) return true;
     for (final name in nonBakaAuthors) {
       if (authorLower.contains(name.toLowerCase())) return false;
     }
-    // BakaMusic 独有的歌曲来源标记。
-    if (script.toLowerCase().contains('animesrc')) return true;
-    // 评论接口：XianYu 按引擎解析出的方法清单精确匹配，不做裸串扫描，
-    // 避免插件正文里提及 getMusicComments 就被判为 Baka。
-    if (methods.contains('getMusicComments')) return true;
-    // 音质声明：仅当声明值确实含可识别档位（128k/flac/flac24bit 等）时
-    // 才判 Baka，避免 MusicFree 插件里空的/非音质的 supportedQualities
-    // 字段被误判。
-    return _declaresQualities(script);
+    final lower = script.toLowerCase();
+    if (lower.contains('animesrc')) return true;
+    return lower.contains('getmvsource') &&
+        lower.contains('supportedvideoqualities');
   }
 
-  /// 静态提取 `supportedQualities` 声明，判断其值是否含可识别音质档位
-  /// （对齐 XianYu 对 supportedQualities 逐项做 normalizeQualityKey 的校验）。
-  static bool _declaresQualities(String script) {
-    final match = RegExp(
-      r'''supportedQualities['"]?\s*[:=]\s*\[([^\]]*)\]''',
-      caseSensitive: false,
-    ).firstMatch(script);
-    if (match == null) return false;
-    final body = match.group(1) ?? '';
-    return RegExp(
-      r'96k|128k|192k|320k|flac24bit|flac|hires|hi-res|lossless|sq|ape|wav|vinyl|dolby|atmos|master|24bit',
-      caseSensitive: false,
-    ).hasMatch(body);
-  }
-
-  /// 已知的非 BakaMusic（MusicFree 系）作者白名单：其插件可能内嵌
-  /// BakaMusic 兼容特征（评论接口/音质声明），但不属于 BakaMusic 契约，
-  /// 需在特征判定前先排除。（同 XianYu 的 `nonBakaAuthors`。）
-  static const List<String> nonBakaAuthors = ['时迁酱'];
+  /// 已知的非 BakaMusic（MusicFree 系）作者白名单：其插件内嵌 BakaMusic
+  /// 兼容标记（万象API 同时导出 getMvSource / supportedVideoQualities /
+  /// supportedQualities），但按 MusicFree 契约分发，需在内容判定前先排除。
+  /// （同 XianYu 的 `nonBakaAuthors`。）
+  static const List<String> nonBakaAuthors = ['时迁酱', '万象api'];
 
   /// MusicFree 契约里宿主可能调用的方法名。只有这些方法参与
   /// [availableMethods] 门控，避免把插件内无关的同名标识符误判为契约方法。

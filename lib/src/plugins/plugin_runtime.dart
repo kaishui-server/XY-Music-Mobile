@@ -469,19 +469,21 @@ Future<List<EnabledMusicPlugin>> loadEnabledMusicPlugins(Ref ref) async {
     final overrideName = displayNames[id]?.trim() ?? '';
     if (overrideName.isNotEmpty) pluginName = overrideName;
     // 分类优先级与插件管理页一致：LX > BakaMusic > animemusic。BakaMusic
-    // 只是兼容 MusicFree 协议（官方插件无 animeSrc、内容同构），靠订阅类型
-    // 提示与来源 URL 判定；提示是明确意图（导入分栏/订阅结构/手动改类），
-    // 优先于 URL，URL 仅在提示缺失时兜底——同 ID 插件被另一族覆盖时来源
-    // URL 会从旧插件继承，若 URL 优先会把 MusicFree 插件误标成 BakaMusic。
+    // 兼容 MusicFree 协议，先看内容证据（metadata.isBaka），不中时用订阅类型
+    // 提示，再兜底来源 URL——同 ID 插件被另一族覆盖时来源 URL 会从旧插件
+    // 继承，若 URL 优先会把 MusicFree 插件误标成 BakaMusic。
     var isBaka = !isLx && !isAnimemusic && metadata.isBaka;
     if (!isLx && !isAnimemusic) {
       final kindHint = kinds[id];
       if (kindHint == pluginKindBaka) {
         isBaka = true;
-      } else if (kindHint == pluginKindMusicFree ||
-          kindHint == pluginKindOther) {
+      } else if (kindHint == pluginKindOther) {
         // 手动归入「其他」的插件按 MusicFree 族处理，不强制 Baka 契约。
         isBaka = false;
+      } else if (kindHint == pluginKindMusicFree) {
+        // 内容已判定为 Baka 契约时不采纳 musicfree 提示（同插件管理页）：
+        // 该提示多半只是「导入时所在分栏」，压不住内容证据。
+        if (!metadata.isBaka) isBaka = false;
       } else if (PluginMetadata.isBakaSourceUrl(sourceUrls[id] ?? '')) {
         isBaka = true;
       }
