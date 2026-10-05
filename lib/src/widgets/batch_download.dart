@@ -9,6 +9,7 @@ import 'package:path/path.dart' as p;
 import '../core/settings.dart';
 import '../library/library_provider.dart';
 import '../player/android_storage.dart';
+import '../player/batch_task_store.dart';
 import '../player/download_history_store.dart';
 import '../player/download_lyrics.dart';
 import '../plugins/plugin_runtime.dart' show qualityDisplayLabel;
@@ -312,8 +313,9 @@ Future<String?> ensureSafDirectoryAccess(
 
 /// 批量下载选中的歌曲（收藏页与歌单详情页共用）。
 ///
-/// 逐首解析音源并下载，写入下载历史（下载管理页可见进度），
-/// 支持暂停信号（用户在下载管理中暂停/删除任务时跳过该首）。
+/// 歌曲数 ≥ 2 时先创建一条批量任务（任务管理页「批量任务」可见进度、
+/// 可暂停 / 提前结束），逐首解析音源并下载，进度写回批量任务而不进入
+/// 「单项任务」；歌曲数为 1 时按单项下载写入下载历史（「单项任务」）。
 Future<void> runBatchDownload(
   BuildContext context,
   WidgetRef ref, {
@@ -372,6 +374,24 @@ Future<void> runBatchDownload(
     }
     return;
   }
+  final batchNotifier = ref.read(batchTaskProvider.notifier);
+  final historyNotifier = ref.read(downloadHistoryProvider.notifier);
+  // 批量下载在开始执行时就创建任务（运行中），执行期间可见进度、可暂停 /
+  // 提前结束；歌曲数不足 2 首视为单项下载，只写入下载历史。
+  final batchTaskId = songs.length >= 2
+      ? batchNotifier.create(
+          kind: BatchTaskKind.download,
+          songs: [
+            for (final song in songs)
+              BatchTaskSong(
+                title: song.title,
+                artist: song.artist,
+                album: song.album,
+                status: BatchTaskSongStatus.pending,
+              ),
+          ],
+        )
+      : null;
   var success = 0;
   var skipped = 0;
   var failed = 0;
@@ -379,6 +399,16 @@ Future<void> runBatchDownload(
   final total = songs.length;
   final downgraded = <String>[];
   final failureReasons = <String>[];
+  var index = 0;
+  // 在 finish 清除取消标记前捕获，供收尾提示区分「提前结束 / 完成」。
+  var wasCancelled = false;
+  if (batchTaskId != null && context.mounted) {
+    XyNotice.show(
+      context,
+      message: '开始下载 $total 首…',
+      compact: true,
+    );
+  }
   try {
     final usesSafDirectory = AndroidStorage.isTreeUri(downloadDirectory);
     final workDirectory = usesSafDirectory
@@ -386,30 +416,58 @@ Future<void> runBatchDownload(
         : downloadDirectory;
     await Directory(workDirectory).create(recursive: true);
     final notifier = ref.read(playerProvider.notifier);
-    final historyNotifier = ref.read(downloadHistoryProvider.notifier);
-    for (final song in songs) {
+    while (index < songs.length) {
+      // 提前结束：不再开始后续歌曲。
+      if (batchTaskId != null && batchNotifier.isCancelled(batchTaskId)) break;
+      // 暂停：当前歌曲完成后挂起，恢复后再继续下一首。
+      if (batchTaskId != null &&
+          !await batchNotifier.waitWhilePaused(batchTaskId)) {
+        break;
+      }
+      final song = songs[index];
+      final failedBefore = failed;
       if (playbackSourceTypeFor(song.toQueueItem()) ==
           PlaybackSourceType.localFile) {
         skipped++;
+        completed++;
+        if (batchTaskId != null) {
+          batchNotifier.updateSong(
+            batchTaskId,
+            index,
+            status: BatchTaskSongStatus.skipped,
+            detail: '已是本地文件',
+          );
+        }
+        index++;
         continue;
       }
-      // 已有同歌曲下载中的任务时跳过，避免重复记录。
-      if (historyNotifier.hasActiveDownload(song.path)) {
+      // 同一音源已有单项下载进行中：跳过，避免重复下载。
+      if (batchTaskId == null && historyNotifier.hasActiveDownload(song.path)) {
         skipped++;
+        completed++;
+        index++;
         continue;
       }
-      final failedBefore = failed;
-      final historyId = historyNotifier.begin(
-        title: song.title,
-        artist: song.artist,
-        album: song.album,
-        quality: options.quality,
-        durationMs: song.duration * 1000,
-        sourcePath: song.path,
-        pluginId: song.pluginId,
-        pluginData: song.pluginData,
-        coverUrl: song.coverUrl,
-      );
+      String? historyId;
+      if (batchTaskId != null) {
+        batchNotifier.updateSong(
+          batchTaskId,
+          index,
+          status: BatchTaskSongStatus.processing,
+        );
+      } else {
+        historyId = historyNotifier.begin(
+          title: song.title,
+          artist: song.artist,
+          album: song.album,
+          quality: options.quality,
+          durationMs: song.duration * 1000,
+          sourcePath: song.path,
+          pluginId: song.pluginId,
+          pluginData: song.pluginData,
+          coverUrl: song.coverUrl,
+        );
+      }
       try {
         final source = await notifier.resolveDownloadSourceFor(
           song.toQueueItem(),
@@ -427,8 +485,9 @@ Future<void> runBatchDownload(
           overwriteExisting: false,
         );
         final savedPath = await trackDownloadProgress(
-          history: historyNotifier,
-          entryId: historyId,
+          sink: batchTaskId != null
+              ? batchNotifier.progressSink(batchTaskId, index)
+              : historyProgressSink(historyNotifier, historyId!),
           url: source.url,
           headers: source.headers,
           destPath: destination,
@@ -511,41 +570,87 @@ Future<void> runBatchDownload(
             lyricsRaw: lyrics.isEmpty ? null : lyrics,
           ),
         );
-        historyNotifier.complete(
-          historyId,
-          savedPath: finalPath,
-          actualQuality: verified.quality,
-        );
+        if (batchTaskId != null) {
+          batchNotifier.updateSong(
+            batchTaskId,
+            index,
+            status: BatchTaskSongStatus.success,
+            detail: verified.warning,
+            progress: 1,
+          );
+        } else {
+          historyNotifier.complete(
+            historyId!,
+            savedPath: finalPath,
+            actualQuality: verified.quality,
+          );
+        }
         success++;
       } catch (error) {
         if (error is DownloadPausedSignal) {
-          // 用户在下载管理中暂停/删除了该任务：计入跳过，不提示失败。
+          // 用户在任务管理页提前结束了批量任务：停止后续歌曲。
           skipped++;
+          if (batchTaskId != null) {
+            batchNotifier.updateSong(
+              batchTaskId,
+              index,
+              status: BatchTaskSongStatus.skipped,
+              detail: '已取消',
+            );
+            break;
+          }
         } else {
           failed++;
           failureReasons.add('${song.title}：$error');
-          historyNotifier.fail(historyId, error.toString());
+          if (batchTaskId != null) {
+            batchNotifier.updateSong(
+              batchTaskId,
+              index,
+              status: BatchTaskSongStatus.failed,
+              detail: error.toString(),
+            );
+          } else {
+            historyNotifier.fail(historyId!, error.toString());
+          }
         }
       }
       completed++;
-      if (context.mounted) {
+      // 逐首提示只用于单项下载；批量下载仅保留开始与全部完成提示，
+      // 避免连续弹窗干扰。
+      if (batchTaskId == null && context.mounted) {
         final reason = failed > failedBefore
             ? '：${failureReasons.last.split('：').skip(1).join('：')}'
             : '';
         XyNotice.show(
           context,
-          message: '${failed > failedBefore ? '歌曲《${song.title}》下载失败$reason' : '歌曲《${song.title}》下载完成'}（$completed/$total）',
+          message:
+              '${failed > failedBefore ? '歌曲《${song.title}》下载失败$reason' : '歌曲《${song.title}》下载完成'}（$completed/$total）',
           type: failed > failedBefore
               ? XyNoticeType.error
               : XyNoticeType.success,
           compact: true,
         );
       }
+      index++;
+    }
+    // 收尾：未处理的剩余歌曲标记为跳过（提前结束或页面销毁中断），
+    // 并把任务置为已完成，避免卡片停留在“进行中”。
+    if (batchTaskId != null) {
+      wasCancelled = batchNotifier.isCancelled(batchTaskId);
+      for (var rest = index; rest < songs.length; rest++) {
+        batchNotifier.updateSong(
+          batchTaskId,
+          rest,
+          status: BatchTaskSongStatus.skipped,
+          detail: wasCancelled ? '已取消' : '未完成',
+        );
+      }
+      batchNotifier.finish(batchTaskId);
     }
     if (context.mounted) {
       final summary =
-          '批量下载完成：成功 $success 首'
-          '${skipped > 0 ? '，本地歌曲跳过 $skipped 首' : ''}'
+          '${wasCancelled ? '批量下载已提前结束' : '批量下载完成'}：成功 $success 首'
+          '${skipped > 0 ? '，跳过 $skipped 首' : ''}'
           '${failed > 0 ? '，失败 $failed 首' : ''}'
           '${downgraded.isNotEmpty ? '，${downgraded.length} 首低于所选音质' : ''}';
       final details = <String>[
@@ -564,6 +669,7 @@ Future<void> runBatchDownload(
       );
     }
   } finally {
-    // 调用方负责自身的 downloading 状态复位；这里不再额外提示。
+    // 异常退出时兜底收尾，避免批量任务卡片停留在“进行中”。
+    if (batchTaskId != null) batchNotifier.finish(batchTaskId);
   }
 }

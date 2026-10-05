@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:lpinyin/lpinyin.dart';
@@ -11,6 +13,7 @@ import '../../src/playlists/playlists_provider.dart';
 import '../../src/navigation/sidebar_controller.dart';
 import '../../src/plugins/plugin_runtime.dart';
 import '../../src/widgets/batch_download.dart';
+import '../../src/widgets/batch_source_switch.dart';
 import '../../src/widgets/frosted_search_field.dart';
 import '../../src/widgets/song_list_view.dart';
 import '../../src/widgets/source_switch.dart';
@@ -230,89 +233,39 @@ class _FavoritesPageState extends ConsumerState<FavoritesPage> {
     final picked = await showSourcePluginPicker(context, plugins);
     if (picked == null || !mounted) return;
     final (plugin, lxSource) = picked;
+    final favorites = ref.read(favoritesProvider.notifier);
     setState(() {
       _switchingSource = true;
       _switchingDone = 0;
       _switchingTotal = selected.length;
     });
-    var replaced = 0;
-    final missed = <String>[];
-    for (final song in selected) {
-      if (!mounted) return;
-      setState(() => _switchingDone++);
-      try {
-        final candidates = await searchReplacementCandidates(
-          ref,
-          plugin,
-          title: song.title,
-          artist: song.artist,
-          durationMs: song.duration * 1000,
-          lxSource: lxSource,
-        );
-        if (candidates.isEmpty) {
-          missed.add(song.title);
-          continue;
-        }
-        await ref
-            .read(favoritesProvider.notifier)
-            .replacePath(
-              song.path,
-              FavoriteSongSnapshot.fromSong(
-                replacementToSong(plugin, candidates.first),
-              ),
-            );
-        replaced++;
-      } catch (_) {
-        missed.add(song.title);
-      }
-    }
-    if (!mounted) return;
-    setState(() => _switchingSource = false);
-    _exitSelection();
-    if (missed.isEmpty) {
-      XyNotice.show(
+    // 不 await：换源在后台进行，页面销毁后仍会继续，用户可继续听歌
+    // 或切换到其他页面。
+    unawaited(
+      runBatchSwitchSource(
         context,
-        message: '换源完成：$replaced 首已切换到 ${plugin.name}',
-        type: XyNoticeType.success,
-      );
-    } else {
-      await showDialog<void>(
-        context: context,
-        useRootNavigator: true,
-        builder: (dialogContext) => AlertDialog(
-          title: const Text('换源完成'),
-          content: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text('成功换源 $replaced 首，${missed.length} 首未找到匹配结果：'),
-              const SizedBox(height: 10),
-              ConstrainedBox(
-                constraints: const BoxConstraints(maxHeight: 240),
-                child: SingleChildScrollView(
-                  child: Text(
-                    missed.take(50).join('\n') +
-                        (missed.length > 50 ? '\n…' : ''),
-                    style: TextStyle(
-                      fontSize: 13,
-                      color: Theme.of(
-                        dialogContext,
-                      ).colorScheme.onSurfaceVariant,
-                    ),
-                  ),
-                ),
-              ),
-            ],
-          ),
-          actions: [
-            FilledButton(
-              onPressed: () => Navigator.pop(dialogContext),
-              child: const Text('确定'),
-            ),
-          ],
+        ref,
+        songs: selected,
+        plugin: plugin,
+        lxSource: lxSource,
+        replace: (original, replacement) => favorites.replacePath(
+          original.path,
+          FavoriteSongSnapshot.fromSong(replacement),
         ),
-      );
-    }
+        onProgress: (done, total) {
+          if (mounted) {
+            setState(() {
+              _switchingDone = done;
+              _switchingTotal = total;
+            });
+          }
+        },
+        onFinished: () {
+          if (mounted) setState(() => _switchingSource = false);
+        },
+      ),
+    );
+    _exitSelection();
   }
 
   List<Song> _sortedSongs = const <Song>[];

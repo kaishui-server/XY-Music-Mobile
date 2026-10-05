@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
@@ -10,10 +12,10 @@ import '../../src/playlists/playlist_sync.dart' show syncPlaylistWithNotice;
 import '../../src/plugins/plugin_runtime.dart';
 import '../../src/widgets/batch_action_sheet.dart';
 import '../../src/widgets/batch_download.dart';
+import '../../src/widgets/batch_source_switch.dart';
 import '../../src/widgets/cover_image.dart';
 import '../../src/widgets/frosted_search_field.dart';
 import '../../src/widgets/song_list_view.dart';
-import '../../src/widgets/source_switch.dart';
 import '../../src/widgets/top_notice.dart' show XyNotice, XyNoticeType;
 
 /// 歌单页右上角「更多」菜单项。
@@ -596,93 +598,47 @@ class _PlaylistDetailPageState extends ConsumerState<PlaylistDetailPage> {
     );
   }
 
-  /// 批量换源（通用面板与多选菜单共用）：逐首搜索同名歌曲，原位替换歌单
-  /// 歌曲，保持顺序与来源归属。
+  /// 批量换源（通用面板与多选菜单共用）：后台逐首搜索同名歌曲并原位替换
+  /// 歌单歌曲，保持顺序与来源归属。进度写入批量任务，用户可继续听歌或
+  /// 切换到其他页面，无需在前台等待。
   Future<void> _switchSourceFor(
     List<Song> selected,
     EnabledMusicPlugin plugin,
     String? lxSource,
   ) async {
     if (selected.isEmpty || _switchingSource) return;
+    final playlists = ref.read(playlistsProvider.notifier);
     setState(() {
       _switchingSource = true;
       _switchingDone = 0;
       _switchingTotal = selected.length;
     });
-    var replaced = 0;
-    final missed = <String>[];
-    for (final song in selected) {
-      if (!mounted) return;
-      setState(() => _switchingDone++);
-      try {
-        final candidates = await searchReplacementCandidates(
-          ref,
-          plugin,
-          title: song.title,
-          artist: song.artist,
-          durationMs: song.duration * 1000,
-          lxSource: lxSource,
-        );
-        if (candidates.isEmpty) {
-          missed.add(song.title);
-          continue;
-        }
-        await ref
-            .read(playlistsProvider.notifier)
-            .replaceSong(
-              widget.playlistId,
-              song.path,
-              replacementToSong(plugin, candidates.first),
-            );
-        replaced++;
-      } catch (_) {
-        missed.add(song.title);
-      }
-    }
-    if (!mounted) return;
-    setState(() => _switchingSource = false);
-    if (missed.isEmpty) {
-      XyNotice.show(
+    // 不 await：换源在后台进行，页面销毁后仍会继续。
+    unawaited(
+      runBatchSwitchSource(
         context,
-        message: '换源完成：$replaced 首已切换到 ${plugin.name}',
-        type: XyNoticeType.success,
-      );
-    } else {
-      await showDialog<void>(
-        context: context,
-        useRootNavigator: true,
-        builder: (dialogContext) => AlertDialog(
-          title: const Text('换源完成'),
-          content: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text('成功换源 $replaced 首，${missed.length} 首未找到匹配结果：'),
-              const SizedBox(height: 10),
-              ConstrainedBox(
-                constraints: const BoxConstraints(maxHeight: 240),
-                child: SingleChildScrollView(
-                  child: Text(
-                    missed.take(50).join('\n') +
-                        (missed.length > 50 ? '\n…' : ''),
-                    style: TextStyle(
-                      fontSize: 13,
-                      color: Theme.of(dialogContext).colorScheme.onSurfaceVariant,
-                    ),
-                  ),
-                ),
-              ),
-            ],
-          ),
-          actions: [
-            FilledButton(
-              onPressed: () => Navigator.pop(dialogContext),
-              child: const Text('确定'),
-            ),
-          ],
+        ref,
+        songs: selected,
+        plugin: plugin,
+        lxSource: lxSource,
+        replace: (original, replacement) => playlists.replaceSong(
+          widget.playlistId,
+          original.path,
+          replacement,
         ),
-      );
-    }
+        onProgress: (done, total) {
+          if (mounted) {
+            setState(() {
+              _switchingDone = done;
+              _switchingTotal = total;
+            });
+          }
+        },
+        onFinished: () {
+          if (mounted) setState(() => _switchingSource = false);
+        },
+      ),
+    );
   }
 
   Future<List<Song>> _loadSongs(WidgetRef ref, MobilePlaylist playlist) async {

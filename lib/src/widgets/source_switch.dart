@@ -196,6 +196,10 @@ Future<String?> _pickLxSource(
   );
 }
 
+/// 捕获插件运行时服务，供后台批量换源在页面之外调用（不依赖 WidgetRef）。
+PluginRuntimeService capturePluginRuntime(WidgetRef ref) =>
+    ref.read(pluginRuntimeProvider);
+
 /// 在目标插件上搜索替换候选，按匹配度降序返回（仅保留标题匹配的结果）。
 /// [lxSource]：洛雪插件限定子平台（kw/kg/tx/wy/mg），null 为全部平台。
 Future<List<PluginSearchSong>> searchReplacementCandidates(
@@ -205,18 +209,38 @@ Future<List<PluginSearchSong>> searchReplacementCandidates(
   required String artist,
   int durationMs = 0,
   String? lxSource,
-}) =>
-    searchReplacementCandidatesWithKeyword(
-      ref,
-      plugin,
-      keyword: artist.trim().isEmpty
-          ? title.trim()
-          : '${title.trim()} ${artist.trim()}',
-      title: title,
-      artist: artist,
-      durationMs: durationMs,
-      lxSource: lxSource,
-    );
+}) => searchReplacementCandidatesWithRuntime(
+  ref.read(pluginRuntimeProvider),
+  plugin,
+  title: title,
+  artist: artist,
+  durationMs: durationMs,
+  lxSource: lxSource,
+);
+
+/// 与 [searchReplacementCandidates] 相同，但直接接收插件运行时服务，
+/// 供后台换源使用（宿主页面销毁后仍可继续）。
+Future<List<PluginSearchSong>> searchReplacementCandidatesWithRuntime(
+  PluginRuntimeService runtime,
+  EnabledMusicPlugin plugin, {
+  required String title,
+  required String artist,
+  int durationMs = 0,
+  String? lxSource,
+}) {
+  final keyword = artist.trim().isEmpty
+      ? title.trim()
+      : '${title.trim()} ${artist.trim()}';
+  return searchReplacementCandidatesByRuntime(
+    runtime,
+    plugin,
+    keyword: keyword,
+    title: title,
+    artist: artist,
+    durationMs: durationMs,
+    lxSource: lxSource,
+  );
+}
 
 /// 按关键词在目标插件上搜索替换候选。默认关键词（歌名 + 歌手）时按
 /// `recognizedSongMatchScore` 过滤并排序；自定义关键词时保留插件原始
@@ -231,9 +255,28 @@ Future<List<PluginSearchSong>> searchReplacementCandidatesWithKeyword(
   int durationMs = 0,
   bool scoreFilter = true,
   String? lxSource,
+}) => searchReplacementCandidatesByRuntime(
+  ref.read(pluginRuntimeProvider),
+  plugin,
+  keyword: keyword,
+  title: title,
+  artist: artist,
+  durationMs: durationMs,
+  scoreFilter: scoreFilter,
+  lxSource: lxSource,
+);
+
+Future<List<PluginSearchSong>> searchReplacementCandidatesByRuntime(
+  PluginRuntimeService runtime,
+  EnabledMusicPlugin plugin, {
+  required String keyword,
+  required String title,
+  required String artist,
+  int durationMs = 0,
+  bool scoreFilter = true,
+  String? lxSource,
 }) async {
-  final results = await ref
-      .read(pluginRuntimeProvider)
+  final results = await runtime
       .search(plugin, keyword, lxSource: lxSource)
       .timeout(const Duration(seconds: 20), onTimeout: () => const []);
   if (!scoreFilter) return results.take(50).toList();
@@ -314,13 +357,17 @@ Future<void> syncReplacementToCollections(
 /// 单曲换源的一体化底部面板：顶部搜索框 + 音源 tab + 候选列表，
 /// 排版与「选择插件歌词」面板一致。打开即自动搜索，各音源结果独立
 /// 分组展示；点选候选返回 (插件, 歌曲)，取消返回 null。
+///
+/// 已换过源的歌曲会带上 [excludePath]（当前音源路径）：面板仍展示其
+/// 所在插件，从而可以搜索该插件提供的其他音源，只是过滤掉与原曲完全
+/// 相同的候选，避免换回同一个源。
 Future<(EnabledMusicPlugin, PluginSearchSong)?> showSourceSwitchSheet(
   BuildContext context,
   WidgetRef ref, {
   required String title,
   required String artist,
   int durationMs = 0,
-  String? excludePluginId,
+  String? excludePath,
 }) {
   return showModalBottomSheet<(EnabledMusicPlugin, PluginSearchSong)>(
     context: context,
@@ -331,7 +378,7 @@ Future<(EnabledMusicPlugin, PluginSearchSong)?> showSourceSwitchSheet(
       title: title,
       artist: artist,
       durationMs: durationMs,
-      excludePluginId: excludePluginId,
+      excludePath: excludePath,
     ),
   );
 }
@@ -341,13 +388,16 @@ class _SourceSwitchSheet extends ConsumerStatefulWidget {
     required this.title,
     required this.artist,
     required this.durationMs,
-    this.excludePluginId,
+    this.excludePath,
   });
 
   final String title;
   final String artist;
   final int durationMs;
-  final String? excludePluginId;
+
+  /// 当前音源路径：过滤掉与原曲完全相同的候选（不排除整个插件，便于
+  /// 在同一插件的多个平台之间换源）。
+  final String? excludePath;
 
   @override
   ConsumerState<_SourceSwitchSheet> createState() => _SourceSwitchSheetState();
@@ -387,11 +437,9 @@ class _SourceSwitchSheetState extends ConsumerState<_SourceSwitchSheet> {
     try {
       final plugins = await ref.read(enabledMusicPluginsProvider.future);
       if (!mounted) return;
+      // 保留当前音源所在插件：歌曲换源后仍可搜索该插件提供的其他音源。
       setState(() {
-        _plugins = [
-          for (final plugin in plugins)
-            if (plugin.id != widget.excludePluginId) plugin,
-        ];
+        _plugins = plugins;
         _loadingPlugins = false;
       });
     } catch (_) {
@@ -444,6 +492,14 @@ class _SourceSwitchSheetState extends ConsumerState<_SourceSwitchSheet> {
       );
     } catch (_) {
       songs = const [];
+    }
+    // 过滤掉与原曲完全相同的候选（同一插件的其他音源仍然保留）。
+    final excludePath = widget.excludePath;
+    if (excludePath != null) {
+      songs = [
+        for (final song in songs)
+          if (pluginSongPath(plugin, song) != excludePath) song,
+      ];
     }
     if (!mounted || requestId != _requestId) return;
     setState(() {

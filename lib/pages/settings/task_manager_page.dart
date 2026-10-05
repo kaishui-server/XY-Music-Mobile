@@ -3,10 +3,12 @@ import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:go_router/go_router.dart';
 import 'package:path/path.dart' as p;
 
 import '../../src/core/settings.dart';
 import '../../src/player/android_storage.dart';
+import '../../src/player/batch_task_store.dart';
 import '../../src/player/download_history_store.dart';
 import '../../src/player/download_quality.dart';
 import '../../src/player/downloaded_song_store.dart';
@@ -16,21 +18,28 @@ import '../../src/widgets/batch_download.dart';
 import '../../src/widgets/frosted_search_field.dart';
 import '../../src/widgets/top_notice.dart';
 
-/// 下载管理页：展示最近 500 条下载记录（分页每页 50 条），
-/// 支持搜索、实时进度/实际音质、暂停/继续、重新下载、失败详情、
-/// 单条与批量删除（可选同时删除本地音乐文件）。
-class DownloadManagerPage extends ConsumerStatefulWidget {
-  const DownloadManagerPage({super.key});
+/// 任务管理页：分「批量任务」与「单项任务」两个 Tab。
+///
+/// - 批量任务：记录用户发起的批量下载 / 批量换源操作，一次操作一张卡片，
+///   点击进入本次操作涉及的实际歌曲列表。
+/// - 单项任务：即原下载管理，展示最近 500 条下载记录（分页每页 50 条），
+///   支持搜索、实时进度/实际音质、暂停/继续、重新下载、失败详情、
+///   单条与批量删除（可选同时删除本地音乐文件）。
+class TaskManagerPage extends ConsumerStatefulWidget {
+  const TaskManagerPage({super.key});
 
   @override
-  ConsumerState<DownloadManagerPage> createState() =>
-      _DownloadManagerPageState();
+  ConsumerState<TaskManagerPage> createState() => _TaskManagerPageState();
 }
 
 /// 分页大小：一次只构建 50 条列表项，避免长列表卡顿。
 const _pageSize = 50;
 
-class _DownloadManagerPageState extends ConsumerState<DownloadManagerPage> {
+class _TaskManagerPageState extends ConsumerState<TaskManagerPage>
+    with SingleTickerProviderStateMixin {
+  late final TabController _tab;
+  int _lastTabIndex = 0;
+
   final TextEditingController _searchController = TextEditingController();
   String _query = '';
   int _page = 0;
@@ -41,16 +50,6 @@ class _DownloadManagerPageState extends ConsumerState<DownloadManagerPage> {
   /// 观感），列表顶部让出头部高度。
   final GlobalKey _floatingHeaderKey = GlobalKey();
   double _floatingHeaderExtent = 58;
-
-  /// 布局完成后用真实高度修正悬浮头部占位，字体缩放等场景自动适配。
-  void _measureFloatingHeader() {
-    if (!mounted) return;
-    final size = _floatingHeaderKey.currentContext?.size;
-    if (size == null || size.height <= 0) return;
-    if ((size.height - _floatingHeaderExtent).abs() > 0.5) {
-      setState(() => _floatingHeaderExtent = size.height);
-    }
-  }
 
   /// 多选删除模式：长按列表项进入。
   bool _selectionMode = false;
@@ -63,9 +62,40 @@ class _DownloadManagerPageState extends ConsumerState<DownloadManagerPage> {
   final Set<String> _fileSizeInFlight = {};
 
   @override
+  void initState() {
+    super.initState();
+    _tab = TabController(length: 2, vsync: this);
+    _tab.addListener(_handleTabChanged);
+  }
+
+  @override
   void dispose() {
+    _tab.removeListener(_handleTabChanged);
+    _tab.dispose();
     _searchController.dispose();
     super.dispose();
+  }
+
+  /// 切换 Tab 时重建 AppBar；离开「单项任务」时退出多选。
+  void _handleTabChanged() {
+    if (!mounted || _tab.index == _lastTabIndex) return;
+    _lastTabIndex = _tab.index;
+    setState(() {
+      if (_tab.index != 1) {
+        _selectionMode = false;
+        _selectedIds.clear();
+      }
+    });
+  }
+
+  /// 布局完成后用真实高度修正悬浮头部占位，字体缩放等场景自动适配。
+  void _measureFloatingHeader() {
+    if (!mounted) return;
+    final size = _floatingHeaderKey.currentContext?.size;
+    if (size == null || size.height <= 0) return;
+    if ((size.height - _floatingHeaderExtent).abs() > 0.5) {
+      setState(() => _floatingHeaderExtent = size.height);
+    }
   }
 
   void _onSearchChanged(String value) {
@@ -257,8 +287,7 @@ class _DownloadManagerPageState extends ConsumerState<DownloadManagerPage> {
         overwriteExisting: true,
       );
       final savedPath = await trackDownloadProgress(
-        history: historyNotifier,
-        entryId: historyId,
+        sink: historyProgressSink(historyNotifier, historyId),
         url: source.url,
         headers: source.headers,
         destPath: destination,
@@ -479,6 +508,36 @@ class _DownloadManagerPageState extends ConsumerState<DownloadManagerPage> {
     }
   }
 
+  /// 清空批量任务记录（带确认）。
+  Future<void> _confirmClearBatchTasks() async {
+    final tasks = ref.read(batchTaskProvider);
+    if (tasks.isEmpty) return;
+    final confirmed = await showDialog<bool>(
+      context: context,
+      useRootNavigator: true,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('清空批量任务'),
+        content: Text('确定清空全部 ${tasks.length} 条批量任务记录吗？'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext, false),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            style: FilledButton.styleFrom(
+              backgroundColor: Theme.of(dialogContext).colorScheme.error,
+            ),
+            onPressed: () => Navigator.pop(dialogContext, true),
+            child: const Text('清空'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed == true) {
+      ref.read(batchTaskProvider.notifier).clear();
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
@@ -487,12 +546,7 @@ class _DownloadManagerPageState extends ConsumerState<DownloadManagerPage> {
         .watch(downloadHistoryProvider)
         .where(_matchesQuery)
         .toList();
-    final totalPages = (entries.length / _pageSize).ceil();
-    final safePage = _page.clamp(0, totalPages > 0 ? totalPages - 1 : 0);
-    final pageEntries = entries
-        .skip(safePage * _pageSize)
-        .take(_pageSize)
-        .toList();
+    final batchTasks = ref.watch(batchTaskProvider);
 
     // 布局完成后修正悬浮头部占位高度。
     WidgetsBinding.instance.addPostFrameCallback(
@@ -500,7 +554,7 @@ class _DownloadManagerPageState extends ConsumerState<DownloadManagerPage> {
     );
     return Scaffold(
       appBar: AppBar(
-        title: Text(_selectionMode ? '已选择 ${_selectedIds.length} 项' : '下载管理'),
+        title: Text(_selectionMode ? '已选择 ${_selectedIds.length} 项' : '任务管理'),
         leading: _selectionMode
             ? IconButton(
                 tooltip: '退出多选',
@@ -508,165 +562,436 @@ class _DownloadManagerPageState extends ConsumerState<DownloadManagerPage> {
                 icon: const Icon(Icons.close_rounded),
               )
             : null,
-        actions: _selectionMode
-            ? [
-                IconButton(
-                  tooltip:
-                      _selectedIds.length >= entries.length &&
-                          entries.isNotEmpty
-                      ? '取消全选'
-                      : '全选',
-                  onPressed: entries.isEmpty
-                      ? null
-                      : () => setState(() {
-                          if (_selectedIds.length >= entries.length) {
-                            _selectedIds.clear();
-                          } else {
-                            _selectedIds
-                              ..clear()
-                              ..addAll(entries.map((e) => e.id));
-                          }
-                        }),
-                  icon: Icon(
-                    _selectedIds.length >= entries.length && entries.isNotEmpty
-                        ? Icons.deselect_rounded
-                        : Icons.select_all_rounded,
-                  ),
-                ),
-              ]
-            : [
-                // 一键清空：等价于全选+批量删除，复用同一确认弹窗
-                //（含「同时删除本地音乐文件」选项），不另起删除管线。
-                IconButton(
-                  tooltip: '清空下载记录',
-                  onPressed: entries.isEmpty
-                      ? null
-                      : () => _confirmDelete(List.of(entries)),
-                  icon: const Icon(Icons.delete_sweep_outlined),
-                ),
-              ],
+        actions: _buildAppBarActions(entries, batchTasks),
+        bottom: TabBar(
+          controller: _tab,
+          tabs: const [
+            Tab(text: '批量任务'),
+            Tab(text: '单项任务'),
+          ],
+        ),
       ),
-      // 搜索框悬浮于列表上方：列表内容滚动时从毛玻璃下方穿过被模糊，
-      // 与列表浮动按钮组观感一致。
-      body: Stack(
+      body: TabBarView(
+        controller: _tab,
         children: [
-          Positioned.fill(
-            child: Padding(
-              padding: EdgeInsets.only(
-                top: _selectionMode || entries.isEmpty
-                    ? 0
-                    : _floatingHeaderExtent,
-              ),
-              child: entries.isEmpty
-                  ? Center(
-                      child: Text(
-                        _query.isEmpty ? '暂无下载记录' : '未找到匹配的下载记录',
-                        style: TextStyle(color: theme.colorScheme.onSurfaceVariant),
-                      ),
-                    )
-                  : Column(
-                      children: [
-                        Expanded(
-                          child: ListView.builder(
-                            padding: const EdgeInsets.only(bottom: 12),
-                            itemCount: pageEntries.length,
-                            itemBuilder: (context, index) =>
-                                _buildTile(theme, pageEntries[index]),
-                          ),
-                        ),
-                        if (_selectionMode)
-                          SafeArea(
-                            top: false,
-                            child: Padding(
-                              padding: const EdgeInsets.fromLTRB(16, 4, 16, 10),
-                              child: Row(
-                                children: [
-                                  Text(
-                                    '已选 ${_selectedIds.length} 项',
-                                    style: TextStyle(
-                                      color: theme.colorScheme.onSurfaceVariant,
-                                    ),
-                                  ),
-                                  const Spacer(),
-                                  FilledButton.icon(
-                                    style: FilledButton.styleFrom(
-                                      backgroundColor: theme.colorScheme.error,
-                                    ),
-                                    onPressed: _selectedIds.isEmpty
-                                        ? null
-                                        : () => _confirmDelete(
-                                            entries
-                                                .where(
-                                                  (entry) => _selectedIds
-                                                      .contains(entry.id),
-                                                )
-                                                .toList(),
-                                          ),
-                                    icon: const Icon(
-                                      Icons.delete_sweep_outlined,
-                                      size: 20,
-                                    ),
-                                    label: const Text('批量删除'),
-                                  ),
-                                ],
-                              ),
-                            ),
-                          )
-                        else if (totalPages > 1)
-                          SafeArea(
-                            top: false,
-                            child: Padding(
-                              padding: const EdgeInsets.fromLTRB(16, 4, 16, 10),
-                              child: Row(
-                                mainAxisAlignment: MainAxisAlignment.center,
-                                children: [
-                                  IconButton(
-                                    tooltip: '上一页',
-                                    onPressed: safePage <= 0
-                                        ? null
-                                        : () => setState(
-                                            () => _page = safePage - 1,
-                                          ),
-                                    icon: const Icon(Icons.chevron_left_rounded),
-                                  ),
-                                  Text('${safePage + 1} / $totalPages'),
-                                  IconButton(
-                                    tooltip: '下一页',
-                                    onPressed: safePage >= totalPages - 1
-                                        ? null
-                                        : () => setState(
-                                            () => _page = safePage + 1,
-                                          ),
-                                    icon: const Icon(Icons.chevron_right_rounded),
-                                  ),
-                                ],
-                              ),
-                            ),
-                          ),
-                      ],
-                    ),
-            ),
-          ),
-          if (!_selectionMode)
-            Positioned(
-              top: 0,
-              left: 0,
-              right: 0,
-              child: KeyedSubtree(
-                key: _floatingHeaderKey,
-                child: Padding(
-                  padding: const EdgeInsets.fromLTRB(16, 0, 16, 10),
-                  child: FrostedSearchField(
-                    controller: _searchController,
-                    onChanged: _onSearchChanged,
-                    showClearSuffix: true,
-                    padding: EdgeInsets.zero,
-                  ),
-                ),
-              ),
-            ),
+          _buildBatchTasksTab(theme, batchTasks),
+          _buildSingleTasksTab(theme, entries),
         ],
       ),
+    );
+  }
+
+  List<Widget> _buildAppBarActions(
+    List<DownloadHistoryEntry> entries,
+    List<BatchTask> batchTasks,
+  ) {
+    if (_selectionMode) {
+      return [
+        IconButton(
+          tooltip: _selectedIds.length >= entries.length && entries.isNotEmpty
+              ? '取消全选'
+              : '全选',
+          onPressed: entries.isEmpty
+              ? null
+              : () => setState(() {
+                  if (_selectedIds.length >= entries.length) {
+                    _selectedIds.clear();
+                  } else {
+                    _selectedIds
+                      ..clear()
+                      ..addAll(entries.map((e) => e.id));
+                  }
+                }),
+          icon: Icon(
+            _selectedIds.length >= entries.length && entries.isNotEmpty
+                ? Icons.deselect_rounded
+                : Icons.select_all_rounded,
+          ),
+        ),
+      ];
+    }
+    if (_tab.index == 0) {
+      return [
+        IconButton(
+          tooltip: '清空批量任务',
+          onPressed: batchTasks.isEmpty ? null : _confirmClearBatchTasks,
+          icon: const Icon(Icons.delete_sweep_outlined),
+        ),
+      ];
+    }
+    // 一键清空：等价于全选+批量删除，复用同一确认弹窗
+    //（含「同时删除本地音乐文件」选项），不另起删除管线。
+    return [
+      IconButton(
+        tooltip: '清空下载记录',
+        onPressed: entries.isEmpty ? null : () => _confirmDelete(List.of(entries)),
+        icon: const Icon(Icons.delete_sweep_outlined),
+      ),
+    ];
+  }
+
+  /// 「批量任务」Tab：一次批量操作一张卡片，点击进入实际歌曲列表。
+  Widget _buildBatchTasksTab(ThemeData theme, List<BatchTask> tasks) {
+    if (tasks.isEmpty) {
+      return Center(
+        child: Text(
+          '暂无批量任务\n使用批量下载或批量换源后会记录在这里',
+          textAlign: TextAlign.center,
+          style: TextStyle(color: theme.colorScheme.onSurfaceVariant),
+        ),
+      );
+    }
+    return ListView.builder(
+      padding: EdgeInsets.fromLTRB(
+        12,
+        12,
+        12,
+        MediaQuery.paddingOf(context).bottom + 24,
+      ),
+      itemCount: tasks.length,
+      itemBuilder: (context, index) => _buildBatchCard(theme, tasks[index]),
+    );
+  }
+
+  Widget _buildBatchCard(ThemeData theme, BatchTask task) {
+    final scheme = theme.colorScheme;
+    final isDownload = task.kind == BatchTaskKind.download;
+    final notifier = ref.read(batchTaskProvider.notifier);
+    final summary = [
+      '共 ${task.total} 首',
+      if (task.successCount > 0) '成功 ${task.successCount}',
+      if (task.failedCount > 0) '失败 ${task.failedCount}',
+      if (task.skippedCount > 0) '跳过 ${task.skippedCount}',
+    ].join(' · ');
+    return Card(
+      margin: const EdgeInsets.only(bottom: 10),
+      clipBehavior: Clip.antiAlias,
+      child: InkWell(
+        onTap: () => context.push(
+          '/settings/tasks/batch/${Uri.encodeComponent(task.id)}',
+        ),
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(16, 12, 16, 10),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                children: [
+                  CircleAvatar(
+                    backgroundColor: scheme.primaryContainer,
+                    child: Icon(
+                      isDownload
+                          ? Icons.download_rounded
+                          : Icons.swap_horiz_rounded,
+                      color: scheme.onPrimaryContainer,
+                    ),
+                  ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Row(
+                          children: [
+                            Text(
+                              isDownload ? '批量下载' : '批量换源',
+                              style: const TextStyle(
+                                fontSize: 15,
+                                fontWeight: FontWeight.w600,
+                              ),
+                            ),
+                            const SizedBox(width: 6),
+                            _buildBatchStatusChip(theme, task.status),
+                          ],
+                        ),
+                        const SizedBox(height: 2),
+                        Text(
+                          '${_formatTime(task.createdAt)}\n$summary',
+                          style: TextStyle(
+                            fontSize: 12,
+                            color: scheme.onSurfaceVariant,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  IconButton(
+                    tooltip: '删除记录',
+                    visualDensity: VisualDensity.compact,
+                    onPressed: () => _confirmDeleteBatchTask(task),
+                    icon: const Icon(Icons.delete_outline_rounded, size: 21),
+                  ),
+                  const Icon(Icons.chevron_right_rounded),
+                ],
+              ),
+              if (task.isActive) ...[
+                const SizedBox(height: 10),
+                Row(
+                  children: [
+                    Expanded(
+                      child: LinearProgressIndicator(
+                        value: task.progress,
+                        minHeight: 4,
+                        borderRadius: BorderRadius.circular(2),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    Text(
+                      '${task.finishedCount}/${task.total}'
+                      ' · ${(task.progress * 100).toStringAsFixed(0)}%',
+                      style: TextStyle(
+                        fontSize: 11,
+                        color: scheme.onSurfaceVariant,
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 4),
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.end,
+                  children: [
+                    TextButton.icon(
+                      onPressed: () => task.isRunning
+                          ? notifier.pause(task.id)
+                          : notifier.resume(task.id),
+                      icon: Icon(
+                        task.isRunning
+                            ? Icons.pause_rounded
+                            : Icons.play_arrow_rounded,
+                        size: 20,
+                      ),
+                      label: Text(task.isRunning ? '暂停' : '继续'),
+                    ),
+                    TextButton.icon(
+                      onPressed: () => _confirmCancelBatchTask(task),
+                      icon: const Icon(Icons.stop_rounded, size: 20),
+                      label: const Text('提前结束'),
+                    ),
+                  ],
+                ),
+              ],
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// 批量任务状态标签：进行中 / 已暂停 / 已完成 / 已结束。
+  Widget _buildBatchStatusChip(ThemeData theme, BatchTaskStatus status) {
+    final scheme = theme.colorScheme;
+    final (String label, Color color) = switch (status) {
+      BatchTaskStatus.running => ('进行中', scheme.primary),
+      BatchTaskStatus.paused => ('已暂停', Colors.orange.shade700),
+      BatchTaskStatus.completed => ('已完成', scheme.onSurfaceVariant),
+      BatchTaskStatus.cancelled => ('已结束', scheme.error),
+    };
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 1),
+      decoration: BoxDecoration(
+        color: color.withValues(alpha: .12),
+        borderRadius: BorderRadius.circular(999),
+      ),
+      child: Text(
+        label,
+        style: TextStyle(fontSize: 11, color: color, fontWeight: FontWeight.w600),
+      ),
+    );
+  }
+
+  /// 提前结束批量任务（带确认）：正在处理的歌曲中断，未开始的歌曲不再执行。
+  Future<void> _confirmCancelBatchTask(BatchTask task) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      useRootNavigator: true,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('提前结束任务'),
+        content: Text(
+          '确定提前结束该${task.kind == BatchTaskKind.download ? '批量下载' : '批量换源'}任务吗？\n'
+          '正在处理的歌曲会中断，未开始的歌曲不再执行。',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext, false),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            style: FilledButton.styleFrom(
+              backgroundColor: Theme.of(dialogContext).colorScheme.error,
+            ),
+            onPressed: () => Navigator.pop(dialogContext, true),
+            child: const Text('结束'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed == true) {
+      ref.read(batchTaskProvider.notifier).cancel(task.id);
+    }
+  }
+
+  /// 删除一条批量任务记录（带确认）。运行中的任务会先被结束，后台循环
+  /// 随即停止处理剩余歌曲。
+  Future<void> _confirmDeleteBatchTask(BatchTask task) async {
+    final isDownload = task.kind == BatchTaskKind.download;
+    final confirmed = await showDialog<bool>(
+      context: context,
+      useRootNavigator: true,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('删除批量任务'),
+        content: Text(
+          task.isActive
+              ? '该${isDownload ? '批量下载' : '批量换源'}任务正在进行，删除后将立即结束并移除记录。'
+              : '确定删除这条${isDownload ? '批量下载' : '批量换源'}记录吗？',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext, false),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            style: FilledButton.styleFrom(
+              backgroundColor: Theme.of(dialogContext).colorScheme.error,
+            ),
+            onPressed: () => Navigator.pop(dialogContext, true),
+            child: const Text('删除'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed == true) {
+      ref.read(batchTaskProvider.notifier).remove(task.id);
+    }
+  }
+
+  /// 「单项任务」Tab：原下载记录列表（搜索 + 分页 + 多选删除）。
+  Widget _buildSingleTasksTab(
+    ThemeData theme,
+    List<DownloadHistoryEntry> entries,
+  ) {
+    final totalPages = (entries.length / _pageSize).ceil();
+    final safePage = _page.clamp(0, totalPages > 0 ? totalPages - 1 : 0);
+    final pageEntries = entries
+        .skip(safePage * _pageSize)
+        .take(_pageSize)
+        .toList();
+    return Stack(
+      children: [
+        Positioned.fill(
+          child: Padding(
+            padding: EdgeInsets.only(
+              top: _selectionMode || entries.isEmpty ? 0 : _floatingHeaderExtent,
+            ),
+            child: entries.isEmpty
+                ? Center(
+                    child: Text(
+                      _query.isEmpty ? '暂无下载记录' : '未找到匹配的下载记录',
+                      style: TextStyle(color: theme.colorScheme.onSurfaceVariant),
+                    ),
+                  )
+                : Column(
+                    children: [
+                      Expanded(
+                        child: ListView.builder(
+                          padding: const EdgeInsets.only(bottom: 12),
+                          itemCount: pageEntries.length,
+                          itemBuilder: (context, index) =>
+                              _buildTile(theme, pageEntries[index]),
+                        ),
+                      ),
+                      if (_selectionMode)
+                        SafeArea(
+                          top: false,
+                          child: Padding(
+                            padding: const EdgeInsets.fromLTRB(16, 4, 16, 10),
+                            child: Row(
+                              children: [
+                                Text(
+                                  '已选 ${_selectedIds.length} 项',
+                                  style: TextStyle(
+                                    color: theme.colorScheme.onSurfaceVariant,
+                                  ),
+                                ),
+                                const Spacer(),
+                                FilledButton.icon(
+                                  style: FilledButton.styleFrom(
+                                    backgroundColor: theme.colorScheme.error,
+                                  ),
+                                  onPressed: _selectedIds.isEmpty
+                                      ? null
+                                      : () => _confirmDelete(
+                                          entries
+                                              .where(
+                                                (entry) => _selectedIds.contains(
+                                                  entry.id,
+                                                ),
+                                              )
+                                              .toList(),
+                                        ),
+                                  icon: const Icon(
+                                    Icons.delete_sweep_outlined,
+                                    size: 20,
+                                  ),
+                                  label: const Text('批量删除'),
+                                ),
+                              ],
+                            ),
+                          ),
+                        )
+                      else if (totalPages > 1)
+                        SafeArea(
+                          top: false,
+                          child: Padding(
+                            padding: const EdgeInsets.fromLTRB(16, 4, 16, 10),
+                            child: Row(
+                              mainAxisAlignment: MainAxisAlignment.center,
+                              children: [
+                                IconButton(
+                                  tooltip: '上一页',
+                                  onPressed: safePage <= 0
+                                      ? null
+                                      : () => setState(
+                                          () => _page = safePage - 1,
+                                        ),
+                                  icon: const Icon(Icons.chevron_left_rounded),
+                                ),
+                                Text('${safePage + 1} / $totalPages'),
+                                IconButton(
+                                  tooltip: '下一页',
+                                  onPressed: safePage >= totalPages - 1
+                                      ? null
+                                      : () => setState(
+                                          () => _page = safePage + 1,
+                                        ),
+                                  icon: const Icon(Icons.chevron_right_rounded),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ),
+                    ],
+                  ),
+          ),
+        ),
+        if (!_selectionMode)
+          Positioned(
+            top: 0,
+            left: 0,
+            right: 0,
+            child: KeyedSubtree(
+              key: _floatingHeaderKey,
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(16, 0, 16, 10),
+                child: FrostedSearchField(
+                  controller: _searchController,
+                  onChanged: _onSearchChanged,
+                  showClearSuffix: true,
+                  padding: EdgeInsets.zero,
+                ),
+              ),
+            ),
+          ),
+      ],
     );
   }
 

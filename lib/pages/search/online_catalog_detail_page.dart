@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
@@ -8,10 +10,10 @@ import '../../src/playlists/playlists_provider.dart';
 import '../../src/plugins/plugin_runtime.dart';
 import '../../src/widgets/batch_action_sheet.dart';
 import '../../src/widgets/batch_download.dart';
+import '../../src/widgets/batch_source_switch.dart';
 import '../../src/widgets/cover_image.dart';
 import '../../src/widgets/mini_player_bar.dart';
 import '../../src/widgets/song_list_view.dart';
-import '../../src/widgets/source_switch.dart';
 import '../../src/widgets/top_notice.dart';
 
 /// 在线歌单页右上角「更多」菜单项（与音乐库-歌单详情页同款）。
@@ -515,8 +517,8 @@ class _OnlineCatalogDetailPageState
     );
   }
 
-  /// 批量换源：逐首搜索同名歌曲，原位替换本页歌曲（在线歌单不落库，
-  /// 直接更新内存列表）。
+  /// 批量换源：后台逐首搜索同名歌曲，原位替换本页歌曲（在线歌单不落库，
+  /// 直接更新内存列表）。用户可继续听歌或切换到其他页面，无需前台等待。
   Future<void> _switchSourceFor(
     List<Song> selected,
     EnabledMusicPlugin plugin,
@@ -528,53 +530,36 @@ class _OnlineCatalogDetailPageState
       _switchingDone = 0;
       _switchingTotal = selected.length;
     });
-    final replacements = <String, Song>{};
-    final missed = <String>[];
-    for (final song in selected) {
-      if (!mounted) return;
-      setState(() => _switchingDone++);
-      try {
-        final candidates = await searchReplacementCandidates(
-          ref,
-          plugin,
-          title: song.title,
-          artist: song.artist,
-          durationMs: song.duration * 1000,
-          lxSource: lxSource,
-        );
-        if (candidates.isEmpty) {
-          missed.add(song.title);
-          continue;
-        }
-        replacements[song.path] = replacementToSong(plugin, candidates.first);
-      } catch (_) {
-        missed.add(song.title);
-      }
-    }
-    if (!mounted) return;
-    setState(() {
-      _switchingSource = false;
-      _songs = [for (final song in _songs) replacements[song.path] ?? song];
-    });
-    if (replacements.isEmpty) {
-      XyNotice.show(
+    // 不 await：换源在后台进行，页面销毁后仍会继续。
+    unawaited(
+      runBatchSwitchSource(
         context,
-        message: '未找到可用的替换源',
-        type: XyNoticeType.warning,
-      );
-    } else if (missed.isEmpty) {
-      XyNotice.show(
-        context,
-        message: '已换源 ${replacements.length} 首',
-        type: XyNoticeType.success,
-      );
-    } else {
-      XyNotice.show(
-        context,
-        message: '已换源 ${replacements.length} 首，${missed.length} 首未找到',
-        type: XyNoticeType.warning,
-      );
-    }
+        ref,
+        songs: selected,
+        plugin: plugin,
+        lxSource: lxSource,
+        replace: (original, replacement) async {
+          if (!mounted) return;
+          setState(() {
+            _songs = [
+              for (final song in _songs)
+                song.path == original.path ? replacement : song,
+            ];
+          });
+        },
+        onProgress: (done, total) {
+          if (mounted) {
+            setState(() {
+              _switchingDone = done;
+              _switchingTotal = total;
+            });
+          }
+        },
+        onFinished: () {
+          if (mounted) setState(() => _switchingSource = false);
+        },
+      ),
+    );
   }
 }
 

@@ -6,8 +6,8 @@ import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 
-import '../playlists/playlists_provider.dart';
 import '../player/player_provider.dart';
+import '../player/batch_task_store.dart';
 import '../core/settings.dart';
 import '../ui/xy_theme.dart';
 import '../ui/xy_surface.dart';
@@ -15,10 +15,15 @@ import '../widgets/mini_player_bar.dart';
 import '../widgets/top_notice.dart';
 import 'sidebar_controller.dart';
 
-// 暂时从移动端侧栏隐藏，保留路由和组件，之后可直接恢复。
-const _showArtistAndAlbumShortcuts = false;
-const _showPlaylistSection = false;
 int? _activeRelinkProposalId;
+
+/// 是否存在进行中（运行 / 已暂停）的批量任务：侧栏「任务管理」据此显示
+/// 「进行中」角标。
+final _hasActiveBatchTaskProvider = Provider<bool>(
+  (ref) => ref.watch(
+    batchTaskProvider.select((tasks) => tasks.any((task) => task.isActive)),
+  ),
+);
 
 /// 侧边栏与自定义底栏共用的目的地映射（id → 名称/图标/路由）。
 const _sidebarDestinations = <String, _SidebarDestination>{
@@ -49,9 +54,9 @@ const _sidebarDestinations = <String, _SidebarDestination>{
     '/home/recognize',
   ),
   kSidebarDownloads: _SidebarDestination(
-    '下载管理',
-    Icons.download_rounded,
-    '/settings/downloads',
+    '任务管理',
+    Icons.checklist_rounded,
+    '/settings/tasks',
   ),
   kSidebarSettings: _SidebarDestination(
     '设置',
@@ -67,8 +72,8 @@ bool _destinationSelected(String currentPath, String path) {
   if (!(currentPath == normalized || currentPath.startsWith('$normalized/'))) {
     return false;
   }
-  // 子路由有独立入口时（如 /settings/downloads 相对 /settings）只高亮
-  // 更长前缀的那个入口，避免“下载管理”与“设置”同时点亮。
+  // 子路由有独立入口时（如 /settings/tasks 相对 /settings）只高亮
+  // 更长前缀的那个入口，避免“任务管理”与“设置”同时点亮。
   for (final destination in _sidebarDestinations.values) {
     final other = destination.path.split('?').first;
     if (other.length > normalized.length &&
@@ -511,35 +516,6 @@ class XyMobileSidebar extends ConsumerWidget {
   final String currentPath;
   final ValueChanged<String> onNavigate;
 
-  Future<void> _createPlaylist(BuildContext context, WidgetRef ref) async {
-    final controller = TextEditingController();
-    final name = await showDialog<String>(
-      context: context,
-      builder: (dialogContext) => AlertDialog(
-        title: const Text('新建歌单'),
-        content: TextField(
-          controller: controller,
-          autofocus: true,
-          maxLength: 40,
-          decoration: const InputDecoration(hintText: '输入歌单名称'),
-          onSubmitted: (value) => Navigator.pop(dialogContext, value),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(dialogContext),
-            child: const Text('取消'),
-          ),
-          FilledButton(
-            onPressed: () => Navigator.pop(dialogContext, controller.text),
-            child: const Text('创建'),
-          ),
-        ],
-      ),
-    );
-    controller.dispose();
-    if (name != null) await ref.read(playlistsProvider.notifier).create(name);
-  }
-
   bool _selected(String path) => _destinationSelected(currentPath, path);
 
   @override
@@ -547,8 +523,8 @@ class XyMobileSidebar extends ConsumerWidget {
     final theme = Theme.of(context);
     final dark = theme.brightness == Brightness.dark;
     final settings = ref.watch(settingsProvider).valueOrNull;
-    final playlists = ref.watch(playlistsProvider);
     final width = MediaQuery.sizeOf(context).width * 0.5;
+    final hasActiveTask = ref.watch(_hasActiveBatchTaskProvider);
 
     final hiddenItems =
         settings?.sidebarHiddenItems.toSet() ?? const <String>{};
@@ -567,12 +543,6 @@ class XyMobileSidebar extends ConsumerWidget {
             .map((id) => _sidebarDestinations[id])
             .whereType<_SidebarDestination>()
             .toList();
-    if (_showArtistAndAlbumShortcuts) {
-      primaryItems.addAll(const [
-        _SidebarDestination('歌手', Icons.person_outline_rounded, '/artists'),
-        _SidebarDestination('专辑', Icons.album_outlined, '/albums'),
-      ]);
-    }
 
     return Drawer(
       width: width,
@@ -649,79 +619,6 @@ class XyMobileSidebar extends ConsumerWidget {
                         selected: _selected(item.path),
                         onTap: () => onNavigate(item.path),
                       ),
-                    if (_showPlaylistSection) ...[
-                      const SizedBox(height: 17),
-                      Padding(
-                        padding: const EdgeInsets.fromLTRB(4, 0, 0, 6),
-                        child: Row(
-                          children: [
-                            const Icon(Icons.expand_more_rounded, size: 16),
-                            const SizedBox(width: 4),
-                            Expanded(
-                              child: Text(
-                                '歌单 (${playlists.length})',
-                                maxLines: 1,
-                                overflow: TextOverflow.ellipsis,
-                                style: const TextStyle(
-                                  fontSize: 12,
-                                  fontWeight: FontWeight.w800,
-                                ),
-                              ),
-                            ),
-                            IconButton(
-                              tooltip: '新建歌单',
-                              onPressed: () => _createPlaylist(context, ref),
-                              padding: EdgeInsets.zero,
-                              constraints: const BoxConstraints.tightFor(
-                                width: 32,
-                                height: 32,
-                              ),
-                              icon: const Icon(Icons.add_rounded, size: 19),
-                            ),
-                            IconButton(
-                              tooltip: '导入歌单',
-                              onPressed: () => onNavigate('/home/playlists'),
-                              padding: EdgeInsets.zero,
-                              constraints: const BoxConstraints.tightFor(
-                                width: 32,
-                                height: 32,
-                              ),
-                              icon: const Icon(
-                                Icons.download_rounded,
-                                size: 18,
-                              ),
-                            ),
-                          ],
-                        ),
-                      ),
-                      if (playlists.isEmpty)
-                        InkWell(
-                          onTap: () => onNavigate('/home/playlists'),
-                          borderRadius: BorderRadius.circular(XyRadii.medium),
-                          child: Padding(
-                            padding: const EdgeInsets.symmetric(
-                              horizontal: 13,
-                              vertical: 14,
-                            ),
-                            child: Text(
-                              '新建或导入第一个歌单',
-                              style: TextStyle(
-                                fontSize: 12,
-                                color: theme.colorScheme.onSurfaceVariant,
-                              ),
-                            ),
-                          ),
-                        )
-                      else
-                        for (final playlist in playlists)
-                          _PlaylistSidebarTile(
-                            playlist: playlist,
-                            selected:
-                                currentPath == '/home/playlists/${playlist.id}',
-                            onTap: () =>
-                                onNavigate('/home/playlists/${playlist.id}'),
-                          ),
-                    ],
                   ],
                 ),
               ),
@@ -735,8 +632,9 @@ class XyMobileSidebar extends ConsumerWidget {
                     padding: const EdgeInsets.fromLTRB(12, 7, 12, 0),
                     child: _SidebarTile(
                       destination: _sidebarDestinations[kSidebarDownloads]!,
-                      selected: currentPath == '/settings/downloads',
-                      onTap: () => onNavigate('/settings/downloads'),
+                      selected: currentPath == '/settings/tasks',
+                      showRunningBadge: hasActiveTask,
+                      onTap: () => onNavigate('/settings/tasks'),
                     ),
                   ),
                 if (showSettings)
@@ -770,11 +668,15 @@ class _SidebarTile extends StatelessWidget {
     required this.destination,
     required this.selected,
     required this.onTap,
+    this.showRunningBadge = false,
   });
 
   final _SidebarDestination destination;
   final bool selected;
   final VoidCallback onTap;
+
+  /// 在文案右上角显示「进行中」角标（仅任务管理且有活动任务时为 true）。
+  final bool showRunningBadge;
 
   @override
   Widget build(BuildContext context) {
@@ -811,12 +713,26 @@ class _SidebarTile extends StatelessWidget {
                       : theme.colorScheme.onSurfaceVariant,
                 ),
                 const SizedBox(width: 12),
-                Text(
-                  destination.label,
-                  style: TextStyle(
-                    fontSize: 15.5,
-                    fontWeight: selected ? FontWeight.w700 : FontWeight.w500,
-                  ),
+                Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Text(
+                      destination.label,
+                      style: TextStyle(
+                        fontSize: 15.5,
+                        fontWeight: selected
+                            ? FontWeight.w700
+                            : FontWeight.w500,
+                      ),
+                    ),
+                    if (showRunningBadge) ...[
+                      const SizedBox(width: 5),
+                      Transform.translate(
+                        offset: const Offset(0, -6),
+                        child: const _RunningBadge(),
+                      ),
+                    ],
+                  ],
                 ),
               ],
             ),
@@ -1031,6 +947,7 @@ class _XyLandscapeSidebarState extends ConsumerState<XyLandscapeSidebar> {
     final settings = ref.watch(settingsProvider).valueOrNull;
     final hiddenItems =
         settings?.sidebarHiddenItems.toSet() ?? const <String>{};
+    final hasActiveTask = ref.watch(_hasActiveBatchTaskProvider);
     final showSettings = !hiddenItems.contains(kSidebarSettings);
     final showDownloads = !hiddenItems.contains(kSidebarDownloads);
     final primaryItems =
@@ -1106,9 +1023,10 @@ class _XyLandscapeSidebarState extends ConsumerState<XyLandscapeSidebar> {
                       ),
                       child: _LandscapeSidebarTile(
                         destination: _sidebarDestinations[kSidebarDownloads]!,
-                        selected: _selected('/settings/downloads'),
-                        onTap: () => widget.onNavigate('/settings/downloads'),
+                        selected: _selected('/settings/tasks'),
+                        onTap: () => widget.onNavigate('/settings/tasks'),
                         iconOnly: iconOnly,
+                        showRunningBadge: hasActiveTask,
                       ),
                     ),
                   if (showSettings)
@@ -1147,6 +1065,32 @@ class _XyLandscapeSidebarState extends ConsumerState<XyLandscapeSidebar> {
   }
 }
 
+/// 「进行中」角标：任务管理入口文案右上角的小标签，有活动任务时显示。
+class _RunningBadge extends StatelessWidget {
+  const _RunningBadge();
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
+      decoration: BoxDecoration(
+        color: scheme.primary,
+        borderRadius: BorderRadius.circular(999),
+      ),
+      child: Text(
+        '进行中',
+        style: TextStyle(
+          fontSize: 9,
+          height: 1.1,
+          fontWeight: FontWeight.w700,
+          color: scheme.onPrimary,
+        ),
+      ),
+    );
+  }
+}
+
 /// 横屏侧栏条目：宽档与抽屉条目同款（文字可截断），窄档仅居中图标。
 class _LandscapeSidebarTile extends StatelessWidget {
   const _LandscapeSidebarTile({
@@ -1154,12 +1098,16 @@ class _LandscapeSidebarTile extends StatelessWidget {
     required this.selected,
     required this.onTap,
     required this.iconOnly,
+    this.showRunningBadge = false,
   });
 
   final _SidebarDestination destination;
   final bool selected;
   final bool iconOnly;
   final VoidCallback onTap;
+
+  /// 在文案右上角显示「进行中」角标（仅任务管理且有活动任务时为 true）。
+  final bool showRunningBadge;
 
   @override
   Widget build(BuildContext context) {
@@ -1228,90 +1176,33 @@ class _LandscapeSidebarTile extends StatelessWidget {
                 ),
                 const SizedBox(width: 12),
                 Expanded(
-                  child: Text(
-                    destination.label,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: TextStyle(
-                      fontSize: 15.5,
-                      fontWeight: selected ? FontWeight.w700 : FontWeight.w500,
-                    ),
+                  child: Row(
+                    children: [
+                      Flexible(
+                        child: Text(
+                          destination.label,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(
+                            fontSize: 15.5,
+                            fontWeight: selected
+                                ? FontWeight.w700
+                                : FontWeight.w500,
+                          ),
+                        ),
+                      ),
+                      if (showRunningBadge) ...[
+                        const SizedBox(width: 5),
+                        Transform.translate(
+                          offset: const Offset(0, -6),
+                          child: const _RunningBadge(),
+                        ),
+                      ],
+                    ],
                   ),
                 ),
               ],
             ),
-          ),
-        ),
-      ),
-    );
-  }
-}
-
-class _PlaylistSidebarTile extends StatelessWidget {
-  const _PlaylistSidebarTile({
-    required this.playlist,
-    required this.selected,
-    required this.onTap,
-  });
-
-  final MobilePlaylist playlist;
-  final bool selected;
-  final VoidCallback onTap;
-
-  @override
-  Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-    return Material(
-      color: selected
-          ? theme.colorScheme.onSurface.withValues(alpha: 0.09)
-          : Colors.transparent,
-      borderRadius: BorderRadius.circular(XyRadii.small),
-      child: InkWell(
-        onTap: onTap,
-        borderRadius: BorderRadius.circular(XyRadii.small),
-        child: Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
-          child: Row(
-            children: [
-              Container(
-                width: 36,
-                height: 36,
-                decoration: BoxDecoration(
-                  color: theme.colorScheme.primary.withValues(alpha: 0.13),
-                  borderRadius: BorderRadius.circular(9),
-                ),
-                child: Icon(
-                  Icons.music_note_rounded,
-                  size: 18,
-                  color: theme.colorScheme.primary,
-                ),
-              ),
-              const SizedBox(width: 10),
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(
-                      playlist.name,
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: const TextStyle(
-                        fontSize: 13,
-                        fontWeight: FontWeight.w600,
-                      ),
-                    ),
-                    const SizedBox(height: 2),
-                    Text(
-                      '${playlist.songPaths.length} 首',
-                      style: TextStyle(
-                        fontSize: 10,
-                        color: theme.colorScheme.onSurfaceVariant,
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-            ],
           ),
         ),
       ),

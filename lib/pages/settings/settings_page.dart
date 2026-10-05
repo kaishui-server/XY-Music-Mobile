@@ -254,6 +254,13 @@ const settingsSearchEntries = <SettingsSearchEntry>[
     keywords: '128k 192k 320k flac 无损',
   ),
   SettingsSearchEntry(
+    title: '播放歌曲时',
+    path: ['播放', '播放歌曲时'],
+    route: '/settings/playback',
+    icon: Icons.queue_music_outlined,
+    keywords: '入队 播放队列 整个列表 仅此歌曲 单曲',
+  ),
+  SettingsSearchEntry(
     title: '显示音质标识',
     path: ['播放', '显示音质标识'],
     route: '/settings/playback',
@@ -1085,6 +1092,44 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
             qualityDisplayLabel(settings?.onlineDefaultQuality ?? '320k'),
           ),
           onTap: () => _pickQuality(context, ref, settings, isOnline: true),
+        ),
+        _tile(
+          context,
+          icon: Icons.queue_music_rounded,
+          title: '播放歌曲时',
+          trailing: DropdownButtonHideUnderline(
+            child: DropdownButton<PlaySongQueueMode>(
+              value:
+                  settings?.playSongQueueMode ?? PlaySongQueueMode.wholeList,
+              isDense: true,
+              alignment: AlignmentDirectional.centerEnd,
+              // 折叠态用短标签，展开菜单用完整说明，避免长文案撑破行。
+              selectedItemBuilder: (context) => [
+                for (final mode in PlaySongQueueMode.values)
+                  Align(
+                    alignment: AlignmentDirectional.centerEnd,
+                    child: Text(_playSongQueueModeLabel(mode, short: true)),
+                  ),
+              ],
+              items: PlaySongQueueMode.values
+                  .map(
+                    (mode) => DropdownMenuItem<PlaySongQueueMode>(
+                      value: mode,
+                      child: Text(_playSongQueueModeLabel(mode)),
+                    ),
+                  )
+                  .toList(),
+              onChanged: (mode) {
+                if (mode != null) {
+                  unawaited(
+                    ref
+                        .read(settingsProvider.notifier)
+                        .setPlaySongQueueMode(mode),
+                  );
+                }
+              },
+            ),
+          ),
         ),
         _tile(
           context,
@@ -2098,6 +2143,17 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
     PageTransitionMode.slide => '平移',
     PageTransitionMode.stack => '层叠',
     PageTransitionMode.fade => '淡入淡出',
+  };
+
+  /// 「播放歌曲时」下拉标签：折叠态短标签（short），展开菜单用完整说明。
+  String _playSongQueueModeLabel(
+    PlaySongQueueMode mode, {
+    bool short = false,
+  }) => switch (mode) {
+    PlaySongQueueMode.wholeList =>
+      short ? '整个列表' : '将整个列表加入到播放队列',
+    PlaySongQueueMode.singleSong =>
+      short ? '仅此歌曲' : '仅将此歌曲加入到播放队列',
   };
 
   Future<void> _setPlayerDetailBackground(
@@ -3764,8 +3820,8 @@ class _SidebarLayoutEditor extends StatelessWidget {
         ),
         ListTile(
           key: const ValueKey('sidebar-layout-downloads-fixed'),
-          leading: const Icon(Icons.download_rounded),
-          title: const Text('下载管理'),
+          leading: const Icon(Icons.checklist_rounded),
+          title: const Text('任务管理'),
           subtitle: const Text('固定在侧边栏底部'),
           trailing: Switch(
             value: !hidden.contains(kSidebarDownloads),
@@ -3923,7 +3979,7 @@ String _sidebarLabel(String id) => switch (id) {
   kSidebarPlugins => '插件管理',
   kSidebarAccount => '账号',
   kSidebarRecognize => '听歌识曲',
-  kSidebarDownloads => '下载管理',
+  kSidebarDownloads => '任务管理',
   kSidebarSettings => '设置',
   _ => id,
 };
@@ -3935,7 +3991,7 @@ IconData _sidebarIcon(String id) => switch (id) {
   kSidebarPlugins => Icons.extension_outlined,
   kSidebarAccount => Icons.account_circle_outlined,
   kSidebarRecognize => Icons.mic_none_rounded,
-  kSidebarDownloads => Icons.download_rounded,
+  kSidebarDownloads => Icons.checklist_rounded,
   kSidebarSettings => Icons.settings_outlined,
   _ => Icons.circle_outlined,
 };

@@ -1,7 +1,6 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
-import 'package:file_picker/file_picker.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 
@@ -36,8 +35,6 @@ class _AccountPageState extends ConsumerState<AccountPage>
   final _codeCtrl = TextEditingController();
   bool _obscure = true;
   int _countdown = 0;
-  bool _avatarUploading = false;
-  String _avatarStatus = 'none';
   bool _cloudSyncing = false;
 
   @override
@@ -141,9 +138,8 @@ class _AccountPageState extends ConsumerState<AccountPage>
       );
       if (notice != null && mounted) _toast(notice);
     }
-    if (ref.read(authProvider).isLoggedIn) {
-      await _loadAvatarStatus();
-      if (isLogin) await _handleCloudSyncAfterLogin();
+    if (isLogin && ref.read(authProvider).isLoggedIn) {
+      await _handleCloudSyncAfterLogin();
     }
     // 错误已通过 authProvider.error 反映到内联错误条，无需再弹 SnackBar。
   }
@@ -269,120 +265,7 @@ class _AccountPageState extends ConsumerState<AccountPage>
     }
   }
 
-  Future<void> _editNickname() async {
-    final current = ref.read(authProvider).user;
-    if (current == null) return;
-    final controller = TextEditingController(text: current.nickname);
-    final nickname = await showDialog<String>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        title: const Text('修改昵称'),
-        content: TextField(
-          controller: controller,
-          autofocus: true,
-          maxLength: 20,
-          decoration: const InputDecoration(labelText: '新昵称'),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx),
-            child: const Text('取消'),
-          ),
-          FilledButton(
-            onPressed: () => Navigator.pop(ctx, controller.text.trim()),
-            child: const Text('提交'),
-          ),
-        ],
-      ),
-    );
-    controller.dispose();
-    if (nickname == null || nickname.isEmpty || !mounted) return;
-    try {
-      final message = await ref
-          .read(authProvider.notifier)
-          .updateNickname(nickname);
-      if (mounted) _toast(message);
-    } catch (error) {
-      if (mounted) _toast(error.toString());
-    }
-  }
-
-  Future<void> _changePassword() async {
-    final oldCtrl = TextEditingController();
-    final nextCtrl = TextEditingController();
-    final confirmCtrl = TextEditingController();
-    final values = await showDialog<List<String>>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        title: const Text('修改密码'),
-        content: SingleChildScrollView(
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              TextField(
-                controller: oldCtrl,
-                obscureText: true,
-                decoration: const InputDecoration(labelText: '原密码'),
-              ),
-              const SizedBox(height: 12),
-              TextField(
-                controller: nextCtrl,
-                obscureText: true,
-                decoration: const InputDecoration(labelText: '新密码（至少 6 位）'),
-              ),
-              const SizedBox(height: 12),
-              TextField(
-                controller: confirmCtrl,
-                obscureText: true,
-                decoration: const InputDecoration(labelText: '确认新密码'),
-              ),
-            ],
-          ),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx),
-            child: const Text('取消'),
-          ),
-          FilledButton(
-            onPressed: () => Navigator.pop(ctx, [
-              oldCtrl.text,
-              nextCtrl.text,
-              confirmCtrl.text,
-            ]),
-            child: const Text('确认修改'),
-          ),
-        ],
-      ),
-    );
-    oldCtrl.dispose();
-    nextCtrl.dispose();
-    confirmCtrl.dispose();
-    if (values == null || !mounted) return;
-    if (values[1] != values[2]) {
-      _toast('两次输入的新密码不一致');
-      return;
-    }
-    try {
-      final message = await ref
-          .read(authProvider.notifier)
-          .changePassword(oldPassword: values[0], newPassword: values[1]);
-      if (mounted) _toast(message);
-    } catch (error) {
-      if (mounted) _toast(error.toString());
-    }
-  }
-
-  Future<void> _refreshProfile() async {
-    try {
-      await _syncProfile();
-      if (mounted) _toast('资料已刷新');
-    } catch (error) {
-      if (mounted) _toast(error.toString());
-    }
-  }
-
-  /// 进入账号页和手动刷新时都从服务端拉取最新资料。
+  /// 进入账号页时从服务端拉取最新资料，并启动云同步自动上传。
   /// 头像人工审核通过后，旧的本地凭证不能继续作为唯一数据源。
   Future<void> _syncProfile() async {
     if (!ref.read(authProvider).isLoggedIn) return;
@@ -392,9 +275,8 @@ class _AccountPageState extends ConsumerState<AccountPage>
     try {
       await auth.refreshProfile();
     } catch (_) {
-      // 网络暂时不可用时保留本地资料，头像状态仍可单独查询。
+      // 网络暂时不可用时保留本地资料。
     }
-    await _loadAvatarStatus();
     if (!mounted) return;
     await AccountCloudSync.startAutoUpload(
       auth,
@@ -402,16 +284,6 @@ class _AccountPageState extends ConsumerState<AccountPage>
       container,
       favorites: ref.read(favoritesProvider.notifier),
     );
-  }
-
-  Future<void> _loadAvatarStatus() async {
-    if (!mounted || !ref.read(authProvider).isLoggedIn) return;
-    try {
-      final status = await ref.read(authProvider.notifier).fetchAvatarStatus();
-      if (mounted) setState(() => _avatarStatus = status);
-    } catch (_) {
-      // 状态查询失败不影响账号页面和头像显示。
-    }
   }
 
   Future<void> _handleCloudSyncAfterLogin() async {
@@ -485,42 +357,6 @@ class _AccountPageState extends ConsumerState<AccountPage>
     }
   }
 
-  Future<void> _pickAvatar() async {
-    if (_avatarUploading) return;
-    final result = await FilePicker.platform.pickFiles(
-      type: FileType.image,
-      withData: true,
-      // 禁用插件压缩：其原生实现写入公共 Pictures 目录，Android 10
-      // 分区存储下无权限会直接崩溃。
-      compressionQuality: 0,
-    );
-    if (result == null || result.files.isEmpty || !mounted) return;
-    final bytes = result.files.single.bytes;
-    if (bytes == null || bytes.isEmpty) {
-      _toast('无法读取图片，请重新选择');
-      return;
-    }
-    if (bytes.length > 5 * 1024 * 1024) {
-      _toast('头像不能超过 5MB');
-      return;
-    }
-    setState(() => _avatarUploading = true);
-    try {
-      final message = await ref.read(authProvider.notifier).uploadAvatar(bytes);
-      if (!mounted) return;
-      setState(
-        () => _avatarStatus = message.contains('等待') ? 'pending' : 'none',
-      );
-      _toast(message);
-    } catch (error) {
-      if (!mounted) return;
-      await _loadAvatarStatus();
-      _toast(error is AuthException ? error.message : '头像上传失败');
-    } finally {
-      if (mounted) setState(() => _avatarUploading = false);
-    }
-  }
-
   /// 弹出人机验证弹窗，返回验证通过的 payload；取消返回 null。
   Future<HumanCaptchaPayload?> _requestHumanCaptcha({
     required String title,
@@ -565,12 +401,7 @@ class _AccountPageState extends ConsumerState<AccountPage>
       body: auth.isLoggedIn
           ? _ProfileView(
               user: auth.user!,
-              onRefresh: _refreshProfile,
-              onEditAvatar: _pickAvatar,
-              avatarUploading: _avatarUploading,
-              avatarStatus: _avatarStatus,
-              onEditNickname: _editNickname,
-              onChangePassword: _changePassword,
+              onEditAccount: () => context.push('/account/edit'),
               onCloudSync: () => context.push('/account/cloud-sync'),
               cloudSyncing: _cloudSyncing,
               onLogout: () => _confirmLogout(context),
@@ -903,23 +734,13 @@ class _AccountPageState extends ConsumerState<AccountPage>
 class _ProfileView extends ConsumerWidget {
   const _ProfileView({
     required this.user,
-    required this.onRefresh,
-    required this.onEditAvatar,
-    required this.avatarUploading,
-    required this.avatarStatus,
-    required this.onEditNickname,
-    required this.onChangePassword,
+    required this.onEditAccount,
     required this.onCloudSync,
     required this.cloudSyncing,
     required this.onLogout,
   });
   final AuthUser user;
-  final VoidCallback onRefresh;
-  final VoidCallback onEditAvatar;
-  final bool avatarUploading;
-  final String avatarStatus;
-  final VoidCallback onEditNickname;
-  final VoidCallback onChangePassword;
+  final VoidCallback onEditAccount;
   final VoidCallback onCloudSync;
   final bool cloudSyncing;
   final VoidCallback onLogout;
@@ -940,13 +761,13 @@ class _ProfileView extends ConsumerWidget {
         MediaQuery.paddingOf(context).bottom + 24,
       ),
       children: [
-        // 头像区：点击头像或右下角按钮即可提交新头像审核。
+        // 头像区：点击头像或右下角按钮进入「编辑账号信息」页修改头像。
         Center(
           child: Stack(
             clipBehavior: Clip.none,
             children: [
               GestureDetector(
-                onTap: avatarUploading ? null : onEditAvatar,
+                onTap: onEditAccount,
                 child: _Avatar(user: user),
               ),
               Positioned(
@@ -956,24 +777,15 @@ class _ProfileView extends ConsumerWidget {
                   color: scheme.primary,
                   shape: const CircleBorder(),
                   child: InkWell(
-                    onTap: avatarUploading ? null : onEditAvatar,
+                    onTap: onEditAccount,
                     customBorder: const CircleBorder(),
                     child: Padding(
                       padding: const EdgeInsets.all(8),
-                      child: avatarUploading
-                          ? SizedBox(
-                              width: 16,
-                              height: 16,
-                              child: CircularProgressIndicator(
-                                strokeWidth: 2,
-                                color: scheme.onPrimary,
-                              ),
-                            )
-                          : Icon(
-                              Icons.edit_rounded,
-                              size: 16,
-                              color: scheme.onPrimary,
-                            ),
+                      child: Icon(
+                        Icons.edit_rounded,
+                        size: 16,
+                        color: scheme.onPrimary,
+                      ),
                     ),
                   ),
                 ),
@@ -1024,38 +836,16 @@ class _ProfileView extends ConsumerWidget {
         const SizedBox(height: 16),
         _InfoCard(
           children: [
-            ListTile(
-              leading: Icon(Icons.refresh_rounded, color: scheme.primary),
-              title: const Text('刷新账号资料'),
-              trailing: const Icon(Icons.chevron_right_rounded),
-              onTap: onRefresh,
-            ),
+            // 修改头像、昵称、密码与刷新资料统一并入此入口。
             ListTile(
               leading: Icon(
-                Icons.account_circle_outlined,
+                Icons.manage_accounts_outlined,
                 color: scheme.primary,
               ),
-              title: const Text('修改头像'),
-              subtitle: Text(switch (avatarStatus) {
-                'pending' => '头像审核中',
-                'rejected' => '上次头像审核未通过，可重新提交',
-                _ => '上传后将进入审核流程',
-              }),
+              title: const Text('编辑账号信息'),
+              subtitle: const Text('修改头像、昵称、密码，刷新账号资料'),
               trailing: const Icon(Icons.chevron_right_rounded),
-              onTap: avatarUploading ? null : onEditAvatar,
-            ),
-            ListTile(
-              leading: Icon(Icons.edit_outlined, color: scheme.primary),
-              title: const Text('修改昵称'),
-              subtitle: const Text('修改后可能需要审核'),
-              trailing: const Icon(Icons.chevron_right_rounded),
-              onTap: onEditNickname,
-            ),
-            ListTile(
-              leading: Icon(Icons.lock_outline_rounded, color: scheme.primary),
-              title: const Text('修改密码'),
-              trailing: const Icon(Icons.chevron_right_rounded),
-              onTap: onChangePassword,
+              onTap: onEditAccount,
             ),
             // 第三方音乐平台登录入口（单个选项）：点击进入登录与歌单
             // 导入页，位于「账号云同步」之前。

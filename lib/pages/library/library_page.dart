@@ -24,9 +24,7 @@ import 'song_list_page.dart';
 final librarySelectionProvider = StateProvider<bool>((ref) => false);
 
 class LibraryPage extends ConsumerStatefulWidget {
-  const LibraryPage({super.key, this.initialTab});
-
-  final int? initialTab;
+  const LibraryPage({super.key});
 
   @override
   ConsumerState<LibraryPage> createState() => _LibraryPageState();
@@ -64,7 +62,7 @@ class _LibraryPageState extends ConsumerState<LibraryPage>
   void initState() {
     super.initState();
     _tab = TabController(length: 4, vsync: this);
-    _tab.index = widget.initialTab ?? ref.read(libraryTabProvider);
+    _tab.index = ref.read(libraryTabProvider);
     _visibleTab = _tab.index;
     _tab.addListener(_handleTabChanged);
     // Riverpod 不允许在 initState 中同步修改 Provider。独立侧栏路由需要

@@ -420,9 +420,21 @@ class LibraryNotifier extends StateNotifier<LibraryState> {
     await _playList(songs, 0, randomizeStart: true);
   }
 
-  /// 播放任意歌曲列表。
+  /// 播放任意歌曲列表（点击单曲走这里）。
+  ///
+  /// 受“播放歌曲时”设置影响：默认把整个列表加入播放队列；选择
+  /// “仅将此歌曲加入播放队列”时只把点中的这一首入队。
   Future<void> playList(List<Song> songs, int index) async {
     if (songs.isEmpty) return;
+    final mode = _ref
+        .read(settingsProvider)
+        .valueOrNull
+        ?.playSongQueueMode;
+    if (mode == PlaySongQueueMode.singleSong) {
+      final i = index.clamp(0, songs.length - 1).toInt();
+      await _playList([songs[i]], 0);
+      return;
+    }
     await _playList(songs, index);
   }
 

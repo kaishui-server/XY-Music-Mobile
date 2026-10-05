@@ -656,7 +656,7 @@ class _SongsListViewState extends ConsumerState<SongsListView> {
       title: song.title,
       artist: song.artist,
       durationMs: song.duration * 1000,
-      excludePluginId: song.pluginId,
+      excludePath: song.path,
     );
     if (picked == null || !context.mounted) return;
     final (plugin, replacement) = picked;

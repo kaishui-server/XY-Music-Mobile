@@ -1261,8 +1261,7 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
         overwriteExisting: false,
       );
       final savedPath = await trackDownloadProgress(
-        history: historyNotifier,
-        entryId: historyId,
+        sink: historyProgressSink(historyNotifier, historyId),
         url: source.url,
         headers: source.headers,
         destPath: destination,
@@ -1577,7 +1576,7 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
       title: item.title,
       artist: item.artist,
       durationMs: item.durationMs,
-      excludePluginId: item.pluginId,
+      excludePath: item.path,
     );
     if (picked == null || !mounted) return;
     final (plugin, replacement) = picked;
@@ -2651,8 +2650,7 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
         overwriteExisting: reDownloading,
       );
       final savedPath = await trackDownloadProgress(
-        history: historyNotifier,
-        entryId: historyId,
+        sink: historyProgressSink(historyNotifier, historyId),
         url: source.url,
         headers: source.headers,
         destPath: destination,
@@ -8590,7 +8588,7 @@ class _GlassControlCard extends ConsumerWidget {
       title: item.title,
       artist: item.artist,
       durationMs: item.durationMs,
-      excludePluginId: item.pluginId,
+      excludePath: item.path,
     );
     if (picked == null || !context.mounted) return;
     final (plugin, song) = picked;

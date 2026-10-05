@@ -859,6 +859,14 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
       // 否则“软件内不显示桌面歌词”时浮窗会一直停留在“暂无歌词”。
       _desktopLyricsHiddenSent = false;
       _requestDesktopLyricsSync(immediate: true);
+      // 音量：设置页滑杆与音量键都只写 settings.volume，这里统一下发到
+      // 播放引擎。此前滑杆只写设置、播放器从不监听该字段，导致设置页
+      // 调节音量对正在播放的音频毫无效果。
+      final nextVolume = next.valueOrNull?.volume;
+      final prevVolume = previous?.valueOrNull?.volume;
+      if (nextVolume != null && nextVolume != prevVolume) {
+        unawaited(_applyAppVolume(nextVolume));
+      }
     });
     // 音效（均衡器/前级/变速变调）：音效页的全部修改都写入
     // effectsProvider，这里桥接到真实播放引擎——普通输出走系统原生
@@ -1074,13 +1082,20 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
     });
   }
 
-  /// 设置应用内音量（音量键通道使用）：写设置并立即应用到播放器。
-  /// MV 视频桥接期间播放器音量为 0（画面自带伴音），此时只保存设置，
-  /// 桥接结束恢复音量时会应用新值。
+  /// 设置应用内音量（音量键通道使用）：只写设置，真正的下发由
+  /// settingsProvider 监听统一完成——音量键与设置页滑杆因此走同一条
+  /// 路径，避免两处各自下发导致设置页调节无效。
   Future<void> setAppVolume(double v) async {
+    await _ref.read(settingsProvider.notifier).setVolume(v.clamp(0.0, 1.0));
+  }
+
+  /// 把应用内音量下发到播放引擎。
+  ///
+  /// - DSP 管线出声期间：真实音量由 Rust 管线下发，静音时钟保持 0；
+  /// - 视频桥接期间：播放器保持 0（画面自带伴音），桥接结束时恢复；
+  /// - 其余情况：直接设 just_audio 播放器音量。
+  Future<void> _applyAppVolume(double v) async {
     final clamped = v.clamp(0.0, 1.0);
-    await _ref.read(settingsProvider.notifier).setVolume(clamped);
-    // DSP 管线出声期间真实音量由管线应用，静音时钟保持 0。
     if (_dspPipelineActive) {
       try {
         await setUsbExclusiveVolume(volume: clamped);

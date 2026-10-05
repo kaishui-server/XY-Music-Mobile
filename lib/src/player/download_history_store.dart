@@ -475,7 +475,45 @@ final downloadHistoryProvider =
       (ref) => DownloadHistoryNotifier(),
     );
 
-/// 包装一次下载任务并轮询目标文件大小，更新下载历史中的实时进度。
+/// 下载进度回调：由进度轮询高频触发（约 3Hz），接收方应避免落盘。
+typedef DownloadProgressCallback =
+    void Function({
+      double? progress,
+      int? downloadedBytes,
+      int? totalBytes,
+      String? localPath,
+    });
+
+/// 下载进度接收器：单项下载写入下载历史，批量下载写入批量任务。
+class DownloadProgressSink {
+  const DownloadProgressSink({
+    required this.onProgress,
+    required this.isCancelled,
+  });
+
+  final DownloadProgressCallback onProgress;
+
+  /// 是否已请求中断（暂停 / 取消 / 提前结束）。
+  final bool Function() isCancelled;
+}
+
+/// 单项下载（写入下载历史）的进度接收器。
+DownloadProgressSink historyProgressSink(
+  DownloadHistoryNotifier history,
+  String entryId,
+) => DownloadProgressSink(
+  onProgress: ({progress, downloadedBytes, totalBytes, localPath}) =>
+      history.updateProgress(
+        entryId,
+        progress: progress,
+        downloadedBytes: downloadedBytes,
+        totalBytes: totalBytes,
+        localPath: localPath,
+      ),
+  isCancelled: () => history.isCancelRequested(entryId),
+);
+
+/// 包装一次下载任务并轮询目标文件大小，把实时进度写入 [sink]。
 ///
 /// Rust 下载接口不返回进度流，这里先通过 HEAD 请求取 Content-Length，
 /// 再以约 3Hz 轮询目标文件字节数估算进度；HEAD 失败或服务器不返回
@@ -485,16 +523,15 @@ final downloadHistoryProvider =
 /// 下载收尾（校验/入库/完成提示）被跳过；底层 HTTP 流无法中止，会
 /// 在后台静默写完（结果被丢弃）。
 Future<String> trackDownloadProgress({
-  required DownloadHistoryNotifier history,
-  required String entryId,
+  required DownloadProgressSink sink,
   required String url,
   required Map<String, String> headers,
   required String destPath,
   required Future<String> Function() download,
 }) async {
   // 记录本地目标路径：删除任务时可据此清理半成品文件。
-  history.updateProgress(entryId, localPath: destPath);
-  if (history.isCancelRequested(entryId)) {
+  sink.onProgress(localPath: destPath);
+  if (sink.isCancelled()) {
     throw const DownloadPausedSignal();
   }
 
@@ -520,7 +557,7 @@ Future<String> trackDownloadProgress({
   } catch (_) {
     // HEAD 失败不影响下载本身，进度退化为只显示字节数。
   }
-  if (history.isCancelRequested(entryId)) {
+  if (sink.isCancelled()) {
     throw const DownloadPausedSignal();
   }
 
@@ -529,13 +566,12 @@ Future<String> trackDownloadProgress({
   Timer? poller;
   try {
     poller = Timer.periodic(const Duration(milliseconds: 320), (_) {
-      if (history.isCancelRequested(entryId)) {
+      if (sink.isCancelled()) {
         if (!paused.isCompleted) paused.complete();
         return;
       }
       File(destPath).length().then((size) {
-        history.updateProgress(
-          entryId,
+        sink.onProgress(
           downloadedBytes: size,
           totalBytes: totalBytes,
           progress: totalBytes > 0
@@ -549,7 +585,7 @@ Future<String> trackDownloadProgress({
       paused.future.then((_) => throw const DownloadPausedSignal()),
     ]);
     // 下载已结束但暂停请求恰好插在最后一次轮询之后：同样视为暂停。
-    if (history.isCancelRequested(entryId)) {
+    if (sink.isCancelled()) {
       throw const DownloadPausedSignal();
     }
     return result;

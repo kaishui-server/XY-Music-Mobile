@@ -157,11 +157,15 @@ class AppLogStore {
   void install() {
     if (_installed) return;
     _installed = true;
-    final previousDebugPrint = debugPrint;
-    debugPrint = (message, {wrapWidth}) {
-      add(message ?? '');
-      previousDebugPrint(message, wrapWidth: wrapWidth);
-    };
+    // release 无控制台，debugPrint 内容用户看不到；接管它只会把高频日志
+    // 经 JSON + SharedPreferences 落盘，反而拖慢主 isolate。仅调试期接管。
+    if (!kReleaseMode) {
+      final previousDebugPrint = debugPrint;
+      debugPrint = (message, {wrapWidth}) {
+        add(message ?? '');
+        previousDebugPrint(message, wrapWidth: wrapWidth);
+      };
+    }
 
     final previousFlutterError = FlutterError.onError;
     FlutterError.onError = (details) {

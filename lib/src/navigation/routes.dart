@@ -10,9 +10,11 @@ import '../../pages/search/search_page.dart';
 import '../../pages/favorites/favorites_page.dart';
 import '../../pages/recent/recent_page.dart';
 import '../../pages/settings/settings_page.dart';
-import '../../pages/settings/download_manager_page.dart';
+import '../../pages/settings/task_manager_page.dart';
+import '../../pages/settings/batch_task_detail_page.dart';
 import '../../pages/player/player_page.dart';
 import '../../pages/account/account_page.dart';
+import '../../pages/account/account_edit_page.dart';
 import '../../pages/account/cloud_sync_page.dart';
 import '../../pages/account/cloud_data_page.dart';
 import '../../pages/account/cloud_data_playlists_page.dart';
@@ -159,26 +161,6 @@ final appRouter = GoRouter(
                 ),
               ],
             ),
-            GoRoute(
-              path: '/local-music',
-              pageBuilder: (context, state) =>
-                  _instantPage(state, const LibraryPage(initialTab: 0)),
-            ),
-            GoRoute(
-              path: '/artists',
-              pageBuilder: (context, state) =>
-                  _instantPage(state, const LibraryPage(initialTab: 1)),
-            ),
-            GoRoute(
-              path: '/albums',
-              pageBuilder: (context, state) =>
-                  _instantPage(state, const LibraryPage(initialTab: 2)),
-            ),
-            GoRoute(
-              path: '/folders',
-              pageBuilder: (context, state) =>
-                  _instantPage(state, const LibraryPage(initialTab: 3)),
-            ),
           ],
         ),
         StatefulShellBranch(
@@ -199,11 +181,25 @@ final appRouter = GoRouter(
               // 设置及其子页面统一隐藏迷你播放条。
               routes: [
                 GoRoute(
-                  path: 'downloads',
+                  path: 'tasks',
                   pageBuilder: (context, state) => _instantPage(
                     state,
-                    const DownloadManagerPage(),
+                    const TaskManagerPage(),
                   ),
+                  routes: [
+                    // 批量任务详情：展示本次批量操作的歌曲列表。
+                    GoRoute(
+                      path: 'batch/:id',
+                      pageBuilder: (context, state) => _instantPage(
+                        state,
+                        BatchTaskDetailPage(
+                          taskId: Uri.decodeComponent(
+                            state.pathParameters['id'] ?? '',
+                          ),
+                        ),
+                      ),
+                    ),
+                  ],
                 ),
                 GoRoute(
                   path: 'account-services',
@@ -365,6 +361,12 @@ final appRouter = GoRouter(
                 ),
               ),
               routes: [
+                // 编辑账号信息：修改头像/昵称/密码，刷新账号资料。
+                GoRoute(
+                  path: 'edit',
+                  pageBuilder: (context, state) =>
+                      _instantPage(state, const AccountEditPage()),
+                ),
                 GoRoute(
                   path: 'cloud-sync',
                   pageBuilder: (context, state) =>

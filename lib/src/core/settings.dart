@@ -120,6 +120,12 @@ enum PlaybackFailureAction { playNext, pause }
 /// 迁移到该优先级列表。
 enum PlaybackFailureStep { lowerQuality, switchSource, playNext, pause }
 
+/// 点击歌曲播放时的入队方式。
+///
+/// - [wholeList]：把点中歌曲所在的整个列表加入播放队列（默认，原有行为）；
+/// - [singleSong]：仅把点中的这一首加入播放队列。
+enum PlaySongQueueMode { wholeList, singleSong }
+
 const kDefaultPlaybackFailurePriority = <PlaybackFailureStep>[
   PlaybackFailureStep.lowerQuality,
   PlaybackFailureStep.switchSource,
@@ -192,6 +198,8 @@ class AppSettings {
     this.playbackRetryCount = 1,
     this.playbackSwitchSourceCount = 2,
     this.playbackFailurePriority = kDefaultPlaybackFailurePriority,
+    // 点击歌曲播放时：整列表入队（默认）或仅当前歌曲入队。
+    this.playSongQueueMode = PlaySongQueueMode.wholeList,
     this.playOtherAudioWithoutInterruption = false,
     this.lastTab = 0,
     this.keepScreenOn = true,
@@ -270,6 +278,9 @@ class AppSettings {
 
   /// 播放失败策略优先级（换源播放 → 跳下一首 → 暂停播放，可排序）。
   final List<PlaybackFailureStep> playbackFailurePriority;
+
+  /// 点击歌曲播放时的入队方式（整列表 / 仅当前歌曲）。
+  final PlaySongQueueMode playSongQueueMode;
   final bool playOtherAudioWithoutInterruption;
   final int lastTab;
   final bool keepScreenOn;
@@ -400,6 +411,7 @@ class AppSettings {
     int? playbackRetryCount,
     int? playbackSwitchSourceCount,
     List<PlaybackFailureStep>? playbackFailurePriority,
+    PlaySongQueueMode? playSongQueueMode,
     bool? playOtherAudioWithoutInterruption,
     int? lastTab,
     bool? keepScreenOn,
@@ -472,6 +484,7 @@ class AppSettings {
       playbackFailurePriority: playbackFailurePriority != null
           ? normalizePlaybackFailurePriority(playbackFailurePriority)
           : this.playbackFailurePriority,
+      playSongQueueMode: playSongQueueMode ?? this.playSongQueueMode,
       playOtherAudioWithoutInterruption:
           playOtherAudioWithoutInterruption ??
           this.playOtherAudioWithoutInterruption,
@@ -585,6 +598,9 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
       playbackSwitchSourceCount:
           (prefs.getInt('playbackSwitchSourceCount') ?? 2).clamp(0, 5),
       playbackFailurePriority: _playbackFailurePriorityFromPrefs(prefs),
+      playSongQueueMode: _playSongQueueModeFromInt(
+        prefs.getInt('playSongQueueMode') ?? 0,
+      ),
       playOtherAudioWithoutInterruption:
           prefs.getBool('playOtherAudioWithoutInterruption') ?? false,
       lastTab: prefs.getInt('lastTab') ?? 0,
@@ -752,6 +768,11 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
       ? PlaybackFailureAction.playNext
       : PlaybackFailureAction.pause;
 
+  PlaySongQueueMode _playSongQueueModeFromInt(int v) =>
+      v >= 0 && v < PlaySongQueueMode.values.length
+      ? PlaySongQueueMode.values[v]
+      : PlaySongQueueMode.wholeList;
+
   /// 读取播放失败策略优先级：新版存的是步骤名列表；旧版只有
   /// playbackFailureAction 两档（跳下一首/暂停），迁移为对应顺序。
   List<PlaybackFailureStep> _playbackFailurePriorityFromPrefs(
@@ -828,6 +849,7 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
         'playbackFailurePriority',
         [for (final step in next.playbackFailurePriority) step.name],
       ),
+      prefs.setInt('playSongQueueMode', next.playSongQueueMode.index),
       prefs.setBool(
         'playOtherAudioWithoutInterruption',
         next.playOtherAudioWithoutInterruption,
@@ -968,6 +990,11 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
       playbackRetryCount: retryCount?.clamp(0, 5),
       playbackSwitchSourceCount: switchSourceCount?.clamp(0, 5),
       playbackFailurePriority: priority,
+    ),
+  );
+  Future<void> setPlaySongQueueMode(PlaySongQueueMode mode) => _save(
+    (state.valueOrNull ?? const AppSettings()).copyWith(
+      playSongQueueMode: mode,
     ),
   );
   Future<void> setPlayOtherAudioWithoutInterruption(bool value) => _save(
