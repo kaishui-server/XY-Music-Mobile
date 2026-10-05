@@ -6,8 +6,7 @@ import '../library/library_provider.dart';
 import '../plugins/lx_playlist_import.dart' show kLxSourceIds, lxSourceLabel;
 import '../plugins/plugin_runtime.dart';
 import '../playlists/playlists_provider.dart';
-import 'batch_common.dart';
-import 'download_options_dialog.dart' show kDownloadQualityOptions;
+import 'song_list_view.dart' show SongCover;
 
 /// 通用批量操作类型：批量下载 / 批量换源 / 批量保存到歌单 / 批量收藏 /
 /// 批量取消收藏 / 批量删除（删除仅对本地歌单开放）。
@@ -19,6 +18,22 @@ enum BatchActionKind {
   unfavorite,
   delete,
 }
+
+/// 下载音质档位（与设置页“下载音质”、批量下载对话框一致，低 → 高）。
+const List<String> kBatchDownloadQualities = [
+  '96k',
+  '128k',
+  '192k',
+  '320k',
+  'flac',
+  'flac24bit',
+  'hires',
+  'vinyl',
+  'dolby',
+  'atmos',
+  'atmos_plus',
+  'master',
+];
 
 /// 「新建歌单」在目标歌单下拉框中的哨兵值。
 const String _kNewPlaylistValue = '__new_playlist__';
@@ -294,11 +309,11 @@ class _BatchActionSheetState extends ConsumerState<_BatchActionSheet> {
     return Padding(
       padding: const EdgeInsets.fromLTRB(20, 0, 20, 4),
       child: switch (widget.kind) {
-        BatchActionKind.download => CompactDropdownField<String>(
+        BatchActionKind.download => _DropdownField<String>(
           label: '下载音质',
           value: _quality,
           options: [
-            for (final quality in kDownloadQualityOptions)
+            for (final quality in kBatchDownloadQualities)
               (value: quality, label: qualityDisplayLabel(quality)),
           ],
           onChanged: (value) => setState(() => _quality = value),
@@ -329,7 +344,7 @@ class _BatchActionSheetState extends ConsumerState<_BatchActionSheet> {
         return Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
-            CompactDropdownField<String>(
+            _DropdownField<String>(
               label: '换源插件',
               value: plugin?.id,
               hint: '请选择插件',
@@ -344,7 +359,7 @@ class _BatchActionSheetState extends ConsumerState<_BatchActionSheet> {
             // 洛雪类插件内含多平台，追加一个子平台下拉框（默认全部平台）。
             if (plugin != null && plugin.isLx) ...[
               const SizedBox(height: 8),
-              CompactDropdownField<String>(
+              _DropdownField<String>(
                 label: '${plugin.name} · 平台',
                 value: _lxSource ?? _kAllPlatforms,
                 options: [
@@ -366,7 +381,7 @@ class _BatchActionSheetState extends ConsumerState<_BatchActionSheet> {
 
   Widget _buildPlaylistSelector(BuildContext context) {
     final playlists = ref.watch(playlistsProvider);
-    return CompactDropdownField<String>(
+    return _DropdownField<String>(
       label: '保存到歌单',
       value: _playlistId,
       hint: '请选择歌单',
@@ -416,10 +431,58 @@ class _BatchActionSheetState extends ConsumerState<_BatchActionSheet> {
       itemCount: widget.songs.length,
       itemBuilder: (context, index) {
         final song = widget.songs[index];
-        return BatchSongCheckTile(
-          song: song,
-          checked: _selected.contains(song.path),
-          onChanged: (_) => _toggle(song),
+        final checked = _selected.contains(song.path);
+        final subtitle = [song.artist, song.album]
+            .where((part) => part.trim().isNotEmpty)
+            .join(' · ');
+        return InkWell(
+          onTap: () => _toggle(song),
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(16, 6, 8, 6),
+            child: Row(
+              children: [
+                // 面板内始终加载封面（含网络封面），保证列表可见封面图。
+                SongCover(song: song, size: 42),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        song.title,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                          fontSize: 14,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                      if (subtitle.isNotEmpty) ...[
+                        const SizedBox(height: 3),
+                        Text(
+                          subtitle,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(
+                            fontSize: 12,
+                            color: Theme.of(
+                              context,
+                            ).colorScheme.onSurfaceVariant,
+                          ),
+                        ),
+                      ],
+                    ],
+                  ),
+                ),
+                const SizedBox(width: 8),
+                Checkbox(
+                  value: checked,
+                  onChanged: (_) => _toggle(song),
+                  visualDensity: VisualDensity.compact,
+                ),
+              ],
+            ),
+          ),
         );
       },
     );
@@ -443,6 +506,91 @@ class _BatchActionSheetState extends ConsumerState<_BatchActionSheet> {
                 )
               : null,
           child: Text('$_actionLabel($count 首)'),
+        ),
+      ),
+    );
+  }
+}
+
+/// 紧凑下拉选择框：单行高度（左侧标签 + 当前值 + 下拉箭头），点击后在
+/// 控件下方弹出菜单，选中项带勾选。相比原生 DropdownButton 更省空间，
+/// 也不会有沉重的输入框描边。
+class _DropdownField<T> extends StatelessWidget {
+  const _DropdownField({
+    required this.label,
+    required this.value,
+    required this.options,
+    required this.onChanged,
+    this.hint = '请选择',
+  });
+
+  final String label;
+  final T? value;
+  final List<({T value, String label})> options;
+  final ValueChanged<T> onChanged;
+  final String hint;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final matched = options.where((option) => option.value == value).toList();
+    final currentLabel = matched.isEmpty ? null : matched.first.label;
+    return MenuAnchor(
+      style: const MenuStyle(
+        maximumSize: WidgetStatePropertyAll<Size?>(Size(300, 340)),
+      ),
+      menuChildren: [
+        for (final option in options)
+          MenuItemButton(
+            onPressed: () => onChanged(option.value),
+            leadingIcon: Icon(
+              option.value == value ? Icons.check_rounded : null,
+              size: 18,
+              color: scheme.primary,
+            ),
+            child: Text(option.label, style: const TextStyle(fontSize: 13)),
+          ),
+      ],
+      builder: (context, controller, _) => InkWell(
+        borderRadius: BorderRadius.circular(10),
+        onTap: () =>
+            controller.isOpen ? controller.close() : controller.open(),
+        child: Container(
+          height: 40,
+          padding: const EdgeInsets.symmetric(horizontal: 12),
+          decoration: BoxDecoration(
+            color: scheme.surfaceContainerHighest.withValues(alpha: .55),
+            borderRadius: BorderRadius.circular(10),
+            border: Border.all(color: scheme.outlineVariant),
+          ),
+          child: Row(
+            children: [
+              Text(
+                label,
+                style: TextStyle(fontSize: 12, color: scheme.onSurfaceVariant),
+              ),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Text(
+                  currentLabel ?? hint,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    fontSize: 13,
+                    fontWeight: FontWeight.w600,
+                    color: currentLabel == null
+                        ? scheme.onSurfaceVariant
+                        : scheme.onSurface,
+                  ),
+                ),
+              ),
+              Icon(
+                Icons.arrow_drop_down_rounded,
+                size: 20,
+                color: scheme.onSurfaceVariant,
+              ),
+            ],
+          ),
         ),
       ),
     );
