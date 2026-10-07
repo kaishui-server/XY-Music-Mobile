@@ -43,7 +43,7 @@ class XyNotice {
         compact: compact,
         blur: blur,
         onDismissed: () {
-          if (entry.mounted) entry.remove();
+          handle.removeEntry();
           if (identical(_current, handle)) _current = null;
         },
       ),
@@ -57,10 +57,23 @@ class XyNotice {
 }
 
 class _NoticeHandle {
-  const _NoticeHandle({required this.entry, required this.key});
+  _NoticeHandle({required this.entry, required this.key});
 
   final OverlayEntry entry;
   final GlobalKey<_TopNoticeOverlayState> key;
+
+  /// 是否已从 Overlay 摘除。`OverlayEntry.remove()` 不可重复调用：第二次会
+  /// 因内部 `_overlay` 已被置空而抛「Null check operator used on a null
+  /// value」（该异常会被平台错误监听写进崩溃日志，而界面其实没有崩）。
+  /// 定时器自然退场与新提示挤掉旧提示可能并发触发移除，故用标记保证幂等。
+  bool _removed = false;
+
+  /// 从 Overlay 摘除提示条（幂等）。
+  void removeEntry() {
+    if (_removed || !entry.mounted) return;
+    _removed = true;
+    entry.remove();
+  }
 
   void dismiss({bool immediately = false}) {
     final state = key.currentState;
@@ -68,7 +81,7 @@ class _NoticeHandle {
       unawaited(state.dismiss());
       return;
     }
-    if (entry.mounted) entry.remove();
+    removeEntry();
   }
 }
 

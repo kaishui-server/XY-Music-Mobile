@@ -1188,11 +1188,53 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
     } catch (_) {}
   }
 
+  /// 后台启动 DSP 管线并在就绪后完成接管（不阻塞 play()）。
+  ///
+  /// 起播时静音时钟先以真实音量立即出声，管线在后台建流；就绪后把管线
+  /// 定位到时钟当前进度、恢复管线音量并静音时钟，既避免「从头重放」的
+  /// 错位，也避免两路同时出声。接管失败时保持原生输出。
+  Future<void> _takeOverDspInBackground(int requestId, String itemPath) async {
+    final ok = await _startDspPipeline(
+      itemPath: itemPath,
+      startAtSecs: state.position,
+      isPlaying: true,
+      // 建流即静音：时钟还在出声，等对齐进度后再恢复真实音量。
+      startMuted: true,
+    );
+    if (requestId != _playRequestId || state.current?.path != itemPath) {
+      // 请求已过期（用户已切歌）：若刚启动的管线仍属于这首旧曲则回收，
+      // 避免旧曲管线在新曲准备期间继续出声；已被新曲接管时不动它。
+      if (ok && _dspPipelineActive && _dspPipelinePath == itemPath) {
+        unawaited(_stopDspPipeline());
+      }
+      return;
+    }
+    if (!ok) {
+      // 接管失败：静音时钟已按真实音量出声，保持原生输出即可。
+      return;
+    }
+    // 管线建流耗时期间时钟已推进，先把管线对齐到当前进度，再恢复音量
+    // 并静音时钟。
+    try {
+      await seekUsbExclusive(
+        timeSecs: state.position,
+        isPlaying: state.isPlaying,
+      );
+    } catch (_) {}
+    try {
+      await setUsbExclusiveVolume(volume: _ref.read(volumeProvider));
+    } catch (_) {}
+    try {
+      await _player.setVolume(0);
+    } catch (_) {}
+  }
+
   /// 启动 Rust 共享模式 DSP 管线。返回是否成功接管。
   Future<bool> _startDspPipeline({
     required String itemPath,
     required double startAtSecs,
     required bool isPlaying,
+    bool startMuted = false,
   }) async {
     if (_dspFailUntil != null && DateTime.now().isBefore(_dspFailUntil!)) {
       return false;
@@ -1211,7 +1253,8 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
       final deviceName = await startUsbExclusivePlayback(
         path: streamUrl ?? localPath!,
         deviceId: -1,
-        volume: _ref.read(volumeProvider),
+        // 后台接管时以 0 音量建流，避免与仍在出声的静音时钟重叠。
+        volume: startMuted ? 0.0 : _ref.read(volumeProvider),
         startTimeSecs: startAtSecs,
         isPlaying: isPlaying,
         volumeBalanceGain: 1.0,
@@ -1466,6 +1509,11 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
   final Set<String> _switchAttemptedPluginIds = {};
   // “降低音质”步骤已尝试过的档位（防止同一档反复重解析死循环）。
   final Set<String> _qualityDropAttemptedTiers = {};
+  // 连续自动本地替换次数：在线音源失败后换成同名本地文件，若本地文件
+  // 仍失败又会再次触发替换，必须在有限次后停手，否则「失败→替换→再
+  // 失败」会把主 isolate 拖死并耗尽内存。起播成功时清零。
+  int _autoRelinkAttempts = 0;
+  static const int _maxAutoRelinkAttempts = 2;
   int _relinkProposalId = 0;
   int _noticeId = 0;
   DateTime _lastPosPersist = DateTime.fromMillisecondsSinceEpoch(0);
@@ -3191,6 +3239,13 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
   }) async {
     if (queueIndex < 0 || queueIndex >= state.queue.length) return;
     if (state.queue[queueIndex].path != original.path) return;
+    // 替换项与原始项是同一路径（自己替换自己）时毫无意义，且会形成
+    // 「播放失败→替换成自己→再播放失败」的死循环，必须直接拒绝。
+    if (replacement.path.trim() == original.path.trim()) return;
+    // 连续自动替换达到上限：本地文件同样播不了，继续替换只会在同名文件
+    // 之间来回打转，交给后续失败策略（重试/换源/下一首/暂停）处理。
+    if (_autoRelinkAttempts >= _maxAutoRelinkAttempts) return;
+    _autoRelinkAttempts += 1;
 
     await _saveAssociatedReplacement(
       original.path,
@@ -3227,6 +3282,7 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
 
   Future<QueueItem?> _findLocalReplacement(QueueItem original) async {
     final candidates = <({QueueItem item, bool downloaded})>[];
+    final originalPath = original.path.trim();
     try {
       final dbPath = await _ref.read(dbPathProvider.future);
       final raw = await searchLibrarySongs(
@@ -3240,7 +3296,10 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
           final item = _queueItemFromLibraryJson(
             Map<String, dynamic>.from(value),
           );
+          // 排除失败项自身：本地文件播放失败时按标题搜索会命中它自己，
+          // 若把它当作「替代音源」返回，就会自己替换自己形成死循环。
           if (item == null ||
+              item.path.trim() == originalPath ||
               !_sameReplacementTitle(original.title, item.title)) {
             continue;
           }
@@ -3256,7 +3315,8 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
     try {
       final snapshots = await loadDownloadedSongSnapshots();
       for (final snapshot in snapshots) {
-        if (!_sameReplacementTitle(original.title, snapshot.title) ||
+        if (snapshot.path.trim() == originalPath ||
+            !_sameReplacementTitle(original.title, snapshot.title) ||
             !await File(normalizeLocalAudioPath(snapshot.path)).exists()) {
           continue;
         }
@@ -3515,14 +3575,18 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
   }
 
   Future<QueueItem?> _loadAssociatedReplacement(String originalPath) async {
+    // 空路径不作为关联键：否则所有空路径歌曲会共用同一条替换记录，
+    // 表现为「点任何歌都用同一个替代音源」。
+    final key = originalPath.trim();
+    if (key.isEmpty) return null;
     try {
       final preferences = await SharedPreferences.getInstance();
       final raw = preferences.getString(_playbackSourceAssociationsKey);
       if (raw == null || raw.isEmpty) return null;
       final decoded = jsonDecode(raw);
-      if (decoded is! Map || decoded[originalPath] is! Map) return null;
+      if (decoded is! Map || decoded[key] is! Map) return null;
       return _queueItemFromAssociation(
-        Map<String, dynamic>.from(decoded[originalPath] as Map),
+        Map<String, dynamic>.from(decoded[key] as Map),
       );
     } catch (_) {
       return null;
@@ -3534,6 +3598,8 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
     QueueItem replacement, {
     QueueItem? original,
   }) async {
+    final key = originalPath.trim();
+    if (key.isEmpty) return;
     final preferences = await SharedPreferences.getInstance();
     final associations = <String, dynamic>{};
     try {
@@ -3548,7 +3614,7 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
     if (original != null) {
       entry['original'] = _queueItemToAssociation(original);
     }
-    associations[originalPath] = entry;
+    associations[key] = entry;
     await preferences.setString(
       _playbackSourceAssociationsKey,
       jsonEncode(associations, toEncodable: (value) => value.toString()),
@@ -4390,9 +4456,24 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
       itemPath: itemPath,
     );
     // 高级音效接管：Rust 共享管线出声 + just_audio 转静音时钟。
-    // 在 play() 之前启动（流缓存需最小缓冲就绪才出声），两侧起点一致
-    // 才能保证进度/曲终对齐；失败回退原生输出（音量恢复）。
-    await _ensureDspPipeline(requestId, itemPath);
+    // 不再在 play() 之前等待管线启动：在线流的最小缓冲等待与本地文件的
+    // 解码器/AAudio 建流都可能耗时数秒（Rust 侧最坏 15s），阻塞在 play()
+    // 之前会让用户看到「转圈十几秒才出声」。改为静音时钟先以真实音量立即
+    // 出声，管线后台启动、就绪后对齐进度并静音时钟完成接管；接管失败或
+    // 无需接管（视频桥接/无直读源）时保持原生输出。
+    if (_dspWanted(itemPath)) {
+      if (_dspPipelineActive &&
+          _dspPipelinePath == itemPath &&
+          await isUsbExclusiveActive()) {
+        // 同一首歌的恢复播放：管线仍在出声，时钟保持静音，只校正漂移。
+        await _ensureDspPipeline(requestId, itemPath);
+      } else {
+        try {
+          await _player.setVolume(_ref.read(volumeProvider));
+        } catch (_) {}
+        unawaited(_takeOverDspInBackground(requestId, itemPath));
+      }
+    }
     if (requestId != _playRequestId || state.current?.path != itemPath) {
       return;
     }
@@ -4743,15 +4824,21 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
     QueueItem? failedItem;
     if (queueIndex < state.queue.length) {
       failedItem = state.queue[queueIndex];
-      final localReplacement = await _findLocalReplacement(failedItem);
-      if (requestId != _playRequestId) return;
-      if (localReplacement != null) {
-        await _autoRelinkToLocal(
-          queueIndex: queueIndex,
-          original: failedItem,
-          replacement: localReplacement,
-        );
-        return;
+      // 仅对在线音源（插件/洛雪/网络直链）做本地替代。失败项本身已是本地
+      // 文件时不再替换：本地文件播不了再换成另一个同名本地文件同样播不了，
+      // 只会形成「失败→替换→再失败」的死循环，拖死主 isolate 并耗尽内存。
+      // 本地文件失败直接落到后续策略（重试/换源/下一首/暂停）。
+      if (playbackSourceTypeFor(failedItem) != PlaybackSourceType.localFile) {
+        final localReplacement = await _findLocalReplacement(failedItem);
+        if (requestId != _playRequestId) return;
+        if (localReplacement != null) {
+          await _autoRelinkToLocal(
+            queueIndex: queueIndex,
+            original: failedItem,
+            replacement: localReplacement,
+          );
+          return;
+        }
       }
     }
     final settings = _ref.read(settingsProvider).valueOrNull;
@@ -4866,6 +4953,7 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
     _playbackSwitchAttempts = 0;
     _switchAttemptedPluginIds.clear();
     _qualityDropAttemptedTiers.clear();
+    _autoRelinkAttempts = 0;
   }
 
   /// “降低音质”步骤：从当前档位往下（qualityTierRank）找第一个尚未

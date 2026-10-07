@@ -3980,6 +3980,7 @@ String _sidebarLabel(String id) => switch (id) {
   kSidebarAccount => '账号',
   kSidebarRecognize => '听歌识曲',
   kSidebarDownloads => '任务管理',
+  kSidebarTestPage => '测试页面',
   kSidebarSettings => '设置',
   _ => id,
 };
@@ -3992,6 +3993,7 @@ IconData _sidebarIcon(String id) => switch (id) {
   kSidebarAccount => Icons.account_circle_outlined,
   kSidebarRecognize => Icons.mic_none_rounded,
   kSidebarDownloads => Icons.checklist_rounded,
+  kSidebarTestPage => Icons.science_outlined,
   kSidebarSettings => Icons.settings_outlined,
   _ => Icons.circle_outlined,
 };

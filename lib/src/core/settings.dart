@@ -68,6 +68,7 @@ const kSidebarPlugins = 'plugins';
 const kSidebarAccount = 'account';
 const kSidebarRecognize = 'recognize';
 const kSidebarDownloads = 'downloads';
+const kSidebarTestPage = 'testPage';
 const kSidebarSettings = 'settings';
 
 const kDefaultSidebarItemOrder = <String>[
@@ -78,6 +79,7 @@ const kDefaultSidebarItemOrder = <String>[
   kSidebarAccount,
   kSidebarRecognize,
   kSidebarDownloads,
+  kSidebarTestPage,
   kSidebarSettings,
 ];
 

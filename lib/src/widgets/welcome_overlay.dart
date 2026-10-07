@@ -555,6 +555,7 @@ class _BottomBarPreview extends StatelessWidget {
     kSidebarAccount: ('账号', Icons.account_circle_outlined),
     kSidebarRecognize: ('听歌识曲', Icons.mic_none_rounded),
     kSidebarDownloads: ('任务管理', Icons.checklist_rounded),
+    kSidebarTestPage: ('测试页面', Icons.science_outlined),
     kSidebarSettings: ('设置', Icons.settings_outlined),
   };
 

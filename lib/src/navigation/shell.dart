@@ -58,6 +58,11 @@ const _sidebarDestinations = <String, _SidebarDestination>{
     Icons.checklist_rounded,
     '/settings/tasks',
   ),
+  kSidebarTestPage: _SidebarDestination(
+    '测试页面',
+    Icons.science_outlined,
+    '/settings/test-page',
+  ),
   kSidebarSettings: _SidebarDestination(
     '设置',
     Icons.settings_outlined,

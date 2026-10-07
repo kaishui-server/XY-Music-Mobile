@@ -295,6 +295,18 @@ class PluginMetadata {
   /// （同 XianYu 的 `nonBakaAuthors`。）
   static const List<String> nonBakaAuthors = ['时迁酱', '万象api'];
 
+  /// 歌词接口的方法别名，按宿主尝试顺序排列。LX 系插件（酷狗等）导出的是
+  /// 单数 `getLyric`，部分 MusicFree 插件用 `getLrc`/`getSongLyric`/
+  /// `getMusicLyric`；静态扫描与运行时门控必须共用这一份清单，只认
+  /// `getLyrics` 会把这类插件误判成「无歌词能力」而直接跳过。
+  static const List<String> lyricMethodNames = [
+    'getLyric',
+    'getLyrics',
+    'getLrc',
+    'getSongLyric',
+    'getMusicLyric',
+  ];
+
   /// MusicFree 契约里宿主可能调用的方法名。只有这些方法参与
   /// [availableMethods] 门控，避免把插件内无关的同名标识符误判为契约方法。
   static const Set<String> knownContractMethods = {
@@ -310,9 +322,9 @@ class PluginMetadata {
     'getArtistWorks',
     'getArtistInfo',
     'getAlbumInfo',
-    'getLyrics',
     'getMusicComments',
     'getMvSource',
+    ...lyricMethodNames,
   };
 
   /// 静态扫描插件实现了哪些 MusicFree 契约方法（不执行脚本）。

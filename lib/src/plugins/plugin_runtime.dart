@@ -4459,10 +4459,25 @@ class PluginRuntimeService {
     }
     if (plugin.isAnimemusic) return _getAnimemusicLyrics(plugin, rawData);
     // 未实现歌词接口的插件直接返回空串，由调用方回退平台直连歌词。
-    if (!plugin.mayHaveMethod('getLyrics')) return '';
+    // 歌词方法有多个别名（酷狗等 LX 插件导出单数 getLyric），只判
+    // getLyrics 会把这类插件误判成「无歌词能力」，连内嵌歌词一并跳过。
+    if (!PluginMetadata.lyricMethodNames.any(plugin.mayHaveMethod)) {
+      return '';
+    }
     if (_runsPluginsInBackground) {
-      final response = await _runPluginOperation(plugin, 'getLyrics', rawData);
-      return response?.toString() ?? '';
+      // worker 按方法名精确取函数，插件未实现时抛「未提供 X() 方法」；
+      // 歌词方法有多个别名，逐个尝试而不是写死 getLyrics，否则导出单数
+      // getLyric 的插件（酷狗等）永远拿不到歌词。
+      for (final method in PluginMetadata.lyricMethodNames) {
+        try {
+          final response = await _runPluginOperation(plugin, method, rawData);
+          final lyrics = await _resolveLyricsResponse(response);
+          if (lyrics.isNotEmpty) return lyrics;
+        } catch (_) {
+          // 该方法未实现或返回异常，继续尝试下一个别名。
+        }
+      }
+      return '';
     }
     return _getLyricsOnCurrentIsolate(plugin, rawData);
   }
@@ -5336,13 +5351,7 @@ class PluginRuntimeService {
         rawData['songmid'] ??
         rawData['mid'];
     pluginLyrics:
-    for (final method in const [
-      'getLyric',
-      'getLyrics',
-      'getLrc',
-      'getSongLyric',
-      'getMusicLyric',
-    ]) {
+    for (final method in PluginMetadata.lyricMethodNames) {
       final arguments = <List<dynamic>>[
         [rawData],
         if (songId != null) [songId],
