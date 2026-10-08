@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:isolate';
 import 'dart:math';
 
 import 'package:audio_service/audio_service.dart' as audio_service;
@@ -20,6 +21,7 @@ import '../core/db_path.dart';
 import '../core/settings.dart';
 import '../effects/effects_provider.dart';
 import '../favorites/favorites_provider.dart';
+import '../logging/app_log_store.dart';
 import '../playlists/playlists_provider.dart';
 import '../plugins/plugin_runtime.dart';
 import '../recent/recent_store.dart';
@@ -31,6 +33,17 @@ import 'desktop_lyrics.dart';
 import 'lx_lyrics_builder.dart';
 import 'playback_probe.dart';
 import 'video_playback_session.dart';
+
+/// 播放链路诊断日志：同时写控制台与应用日志库。
+///
+/// `debugPrint` 不会被 AppLogStore 捕获，用户导出的日志里只有 [PROBE]
+/// 心跳；起播各阶段的分段计时（音源解析/setUrl/DNS 预热）必须写入日志
+/// 库，导出后才能定位「点歌到出声」的耗时分布。进度事件类高频日志
+/// 仍走 debugPrint，避免刷掉日志库容量内的关键计时。
+void playbackChainLog(String message) {
+  debugPrint(message);
+  AppLogStore.instance.add(message);
+}
 
 /// 播放中的单曲信息（小而美：仅保留 UI 需要的最小字段）。
 class QueueItem {
@@ -1130,6 +1143,17 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
     // 改为默认接管后，全音效链始终生效；接管失败由 [_startDspPipeline]
     // 记 60s 冷却并回退原生输出（静音时钟音量恢复），不影响正常播放。
     // content:// 等无直读地址的源由 [_startDspPipeline] 内部兜底为原生输出。
+    //
+    // 在线流除外：Rust 共享管线启动时会对同一 URL 另开一路
+    // start_streaming_download（512KB 最小缓冲、8s 超时），与 ExoPlayer
+    // 的首次缓冲互相抢带宽——未缓存的歌起播被拖到十几秒；接管成功瞬间
+    // 时钟静音（setVolume(0)）后管线 seek 对齐进度，而流缓存刚从 0 字节
+    // 开始下载、尚未追上播放位置，弱网下静音窗口长达数十秒甚至彻底无声
+    //（现场日志：playing=true 进度停滞 + isMusicActive=false + dsp 全程
+    // false）。本地文件无此问题（直读本地缓存/文件，建流即就绪），保持
+    // 默认接管；在线歌保持原生 ExoPlayer 输出（EQ/响度/变速变调原生路径
+    // 已覆盖），播放速度优先。
+    if (_dspStreamUrl != null) return false;
     return true;
   }
 
@@ -1149,6 +1173,34 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
       // 默认接管：只要播放中且管线不在出声（含失败冷却过期后的重试），
       // 就重新接管一次，避免一次失败后整段播放都退回无音效的原生输出。
       unawaited(_ensureDspPipeline(_playRequestId, path));
+    });
+  }
+
+  /// 起播后延迟接管 DSP 管线：just_audio 首次 ready（起播已拿到最小缓冲）
+  /// 后再启动 Rust 管线，避免其流缓存下载与 ExoPlayer 的首次缓冲争抢带宽
+  /// （见 [_startPlayback] 中登记待办处）。
+  void _scheduleDeferredDspTakeover() {
+    final pending = _pendingDspTakeover;
+    if (pending == null) return;
+    _pendingDspTakeover = null;
+    if (pending.requestId != _playRequestId ||
+        state.current?.path != pending.itemPath ||
+        !_dspWanted(pending.itemPath) ||
+        _dspPipelineActive) {
+      return;
+    }
+    // 再等一小段：ready 只是刚够最小缓冲，让 ExoPlayer 把缓冲拉出领先量，
+    // 接管下载才不会一上来就把带宽分走、导致起播后立刻卡一下。
+    _dspDeferredTakeoverTimer?.cancel();
+    _dspDeferredTakeoverTimer = Timer(const Duration(milliseconds: 1200), () {
+      _dspDeferredTakeoverTimer = null;
+      if (pending.requestId != _playRequestId ||
+          state.current?.path != pending.itemPath ||
+          _dspPipelineActive ||
+          !state.isPlaying) {
+        return;
+      }
+      unawaited(_takeOverDspInBackground(pending.requestId, pending.itemPath));
     });
   }
 
@@ -1546,6 +1598,11 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
   Timer? _dspWatchdogTimer;
   // 播放中开启高级音效时的接管防抖定时器（见 [_scheduleDspTakeover]）。
   Timer? _dspTakeoverTimer;
+  // 起播后延迟接管的待办：just_audio 首次 ready（已拿到最小缓冲）后再启动
+  // Rust 管线，避免其流缓存下载与 ExoPlayer 首次缓冲从 0 字节开始抢带宽
+  // （见 [_startPlayback] / [_scheduleDeferredDspTakeover]）。
+  ({int requestId, String itemPath})? _pendingDspTakeover;
+  Timer? _dspDeferredTakeoverTimer;
 
   /// MV 播放前歌曲自身的进度/时长（见 [enableVideoMediaBridge]）。
   /// 桥接期间静音音频被 seek 到视频时间线，关闭视频时用这里记录的值
@@ -1746,8 +1803,17 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
       // 播放态转发给真正出声的 Rust 管线（通知栏/蓝牙/车机控制的
       // 是 just_audio 静音时钟）。
       if (ps.processingState == ProcessingState.idle) {
+        // 切歌/停止/换源：释放管线，并丢弃尚未执行的延迟接管待办。
+        _pendingDspTakeover = null;
+        _dspDeferredTakeoverTimer?.cancel();
+        _dspDeferredTakeoverTimer = null;
         unawaited(_stopDspPipeline());
       } else {
+        // 首次 ready 且已起播：此时 ExoPlayer 已拿到最小缓冲，可以安全
+        // 启动 Rust 管线（见 [_scheduleDeferredDspTakeover]）。
+        if (playing && ps.processingState == ProcessingState.ready) {
+          _scheduleDeferredDspTakeover();
+        }
         unawaited(_syncDspPipelinePlaying(playing));
       }
       if (completed ||
@@ -2243,6 +2309,15 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
     try {
       final dbPath = await _ref.read(dbPathProvider.future);
       final jsonStr = await loadPlaybackSession(dbPath: dbPath);
+      // 旧版本会把整个队列（含完整歌词与插件原始数据）写进会话，体积可达
+      // 数百 MB；直接 jsonDecode 会生成比字符串本身更大的对象图，启动即把
+      // 内存打满。这类遗留会话直接放弃恢复，并用最小会话覆盖使其自愈
+      // （队列仅丢失这一次，之后按新预算写入，不会再膨胀）。
+      if (jsonStr.length > _sessionMaxRestoreChars) {
+        debugPrint('[会话] 丢弃超大遗留会话：${jsonStr.length} 字符');
+        await savePlaybackSession(dbPath: dbPath, sessionJson: '{}');
+        return;
+      }
       final j = jsonDecode(jsonStr) as Map<String, dynamic>;
       final paths = (j['playQueuePaths'] as List? ?? const []).cast<String>();
       if (paths.isEmpty) return;
@@ -2680,6 +2755,12 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
       }
     } catch (error, stackTrace) {
       if (requestId != _playRequestId) return;
+      // 真·播放失败必须进日志库（debugPrint 在 release 不可见）：与解析
+      // 中间的换档/换源轨迹（INFO）区分，用户导出日志时只看到真错误。
+      AppLogStore.instance.add(
+        '歌曲播放失败：${_friendlyPlaybackError(error)}',
+        level: AppLogLevel.error,
+      );
       debugPrint('歌曲播放失败：$error');
       debugPrintStack(stackTrace: stackTrace);
       if (error is _PluginUnavailableException) {
@@ -2799,7 +2880,7 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
               .read(settingsProvider.notifier)
               .setOnlineDefaultQuality('320k');
         }
-        debugPrint(
+        playbackChainLog(
           '[播放链路] ${item.path} 音源解析 ${resolveStopwatch.elapsedMilliseconds}ms',
         );
         final setUrlStopwatch = Stopwatch()..start();
@@ -2836,7 +2917,7 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
           );
           await submitUrl(source);
         }
-        debugPrint(
+        playbackChainLog(
           '[播放链路] ${item.path} setUrl ${setUrlStopwatch.elapsedMilliseconds}ms',
         );
         // 歌曲开始准备播放后立即后台探测当前插件支持的音质，结果由运行时
@@ -2873,7 +2954,7 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
           plugins,
           preferredQuality: preferredQuality,
         );
-        debugPrint(
+        playbackChainLog(
           '[播放链路] ${item.path} lx 音源解析 ${resolveStopwatch.elapsedMilliseconds}ms',
         );
         if (owned != null) {
@@ -2901,7 +2982,7 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
             owned = fresh;
             await submitOwnedUrl(owned);
           }
-          debugPrint(
+          playbackChainLog(
             '[播放链路] ${item.path} setUrl ${setUrlStopwatch.elapsedMilliseconds}ms',
           );
           if (!(state.current?.lyricsAttempted ?? false)) {
@@ -3026,7 +3107,7 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
       ).invokeMethod<Map<dynamic, dynamic>>('lookup', {
         'host': host,
       }).timeout(const Duration(seconds: 4));
-      debugPrint(
+      playbackChainLog(
         '[播放链路] DNS预热 $host ${result?['elapsedMs']}ms '
         '${result?['error'] ?? result?['addresses']}',
       );
@@ -3049,12 +3130,13 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
         _dspStreamUrl = url;
         _dspStreamHeaders = headers;
         _dspLocalPath = null;
-        // 预解析域名填充系统 DNS 缓存；headers 走向也记入日志，
-        // 下份日志可据此区分「本地代理慢」与「DNS/网络慢」。
-        await _warmUpPlaybackDns(url);
         if (requestId != null && requestId != _playRequestId) return;
+        // DNS 预热不再串行挡在 setUrl 前：冷域名解析实测可达数秒，串行会让
+        // 起播白等这段时间。改为与 ExoPlayer 自身解析并发（netd 对同一 host
+        // 的并发查询会去重），既保留预热效果又不占用起播关键路径。
+        unawaited(_warmUpPlaybackDns(url));
         final host = Uri.tryParse(url)?.host ?? '';
-        debugPrint(
+        playbackChainLog(
           '[播放链路] setUrl 开始 $host '
           '(${headers == null ? '直连' : '本地代理 ${headers.length} 头'})',
         );
@@ -3067,7 +3149,7 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
             .setUrl(url, headers: headers, tag: tag)
             .timeout(const Duration(seconds: 15));
       } on TimeoutException {
-        debugPrint('[播放链路] setUrl 超时 15s，主动中断并上报错误');
+        playbackChainLog('[播放链路] setUrl 超时 15s，主动中断并上报错误');
         rethrow;
       }
     });
@@ -4455,6 +4537,12 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
     // 之前会让用户看到「转圈十几秒才出声」。改为静音时钟先以真实音量立即
     // 出声，管线后台启动、就绪后对齐进度并静音时钟完成接管；接管失败或
     // 无需接管（视频桥接/无直读源）时保持原生输出。
+    // 起播前无条件校正时钟音量：上一曲接管成功时时钟被静音（setVolume(0)），
+    // 切到不接管的源（在线流/视频桥接）后没人恢复音量会完全无声；接管路径
+    // 同样需要先以真实音量出声、就绪后再静音。
+    try {
+      await _player.setVolume(_ref.read(volumeProvider));
+    } catch (_) {}
     if (_dspWanted(itemPath)) {
       if (_dspPipelineActive &&
           _dspPipelinePath == itemPath &&
@@ -4462,10 +4550,13 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
         // 同一首歌的恢复播放：管线仍在出声，时钟保持静音，只校正漂移。
         await _ensureDspPipeline(requestId, itemPath);
       } else {
-        try {
-          await _player.setVolume(_ref.read(volumeProvider));
-        } catch (_) {}
-        unawaited(_takeOverDspInBackground(requestId, itemPath));
+        // 不在 play() 之前立刻接管：Rust 共享管线启动时会用
+        // start_streaming_download 另开一路下载同一个在线流并等最小缓冲，
+        // 与 ExoPlayer 的首次缓冲都从 0 字节开始，两路互相抢带宽——既把
+        // 起播拖到十几秒，又让管线自身 8s 缓冲超时失败（日志里 dsp 始终
+        // 为 false 就是这么来的）。改为登记待办，等 just_audio 首次 ready
+        // （起播已拿到最小缓冲）后再接管，起播走满带宽、接管下载落在其后。
+        _pendingDspTakeover = (requestId: requestId, itemPath: itemPath);
       }
     }
     if (requestId != _playRequestId || state.current?.path != itemPath) {
@@ -4478,7 +4569,7 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
     // （实际≈0）还是事件流被污染（实际正常但事件脏）。
     unawaited(
       playback.then(
-        (_) => debugPrint(
+        (_) => playbackChainLog(
           '[播放链路] 恢复播放完成：预期 $expectedMs ms，'
           '实际 ${_player.position.inMilliseconds} ms',
         ),
@@ -4531,6 +4622,12 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
       if (requestId != _playRequestId || state.current?.path != itemPath) {
         return;
       }
+      // 同 _playAt 的失败记录：起播后引擎中途报错（解码失败/流断开）也
+      // 属于真·播放失败，写入日志库便于导出诊断。
+      AppLogStore.instance.add(
+        '歌曲播放失败：${_friendlyPlaybackError(error)}',
+        level: AppLogLevel.error,
+      );
       debugPrint('歌曲播放失败：$error');
       debugPrintStack(stackTrace: stackTrace);
       await _handlePlaybackFailure(
@@ -5711,13 +5808,15 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
       final dbPath = await _ref.read(dbPathProvider.future);
       final settings = _ref.read(settingsProvider).valueOrNull;
       if (state.current == null) return;
-      final sessionJson = jsonEncode(
-        buildPlaybackSessionPayload(
-          state: state,
-          volume: settings?.volume ?? 1.0,
-          updatedAt: DateTime.now().millisecondsSinceEpoch,
-        ),
+      final payload = buildPlaybackSessionPayload(
+        state: state,
+        volume: settings?.volume ?? 1.0,
+        updatedAt: DateTime.now().millisecondsSinceEpoch,
       );
+      // jsonEncode 在主 isolate 编码大队列元数据（预算内可达 16MB）会卡顿
+      // 数百毫秒到数秒（历史实测 dartLag 15.8s），移到后台 isolate 编码。
+      // payload 是纯 JSON 兼容结构，可直接跨 isolate 拷贝。
+      final sessionJson = await Isolate.run(() => jsonEncode(payload));
       await savePlaybackSession(dbPath: dbPath, sessionJson: sessionJson);
     } catch (_) {
       // 会话保存失败不能中断或结束正在播放的歌曲。
@@ -5747,6 +5846,7 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
     _durSub?.cancel();
     _stateSub?.cancel();
     _dspTakeoverTimer?.cancel();
+    _dspDeferredTakeoverTimer?.cancel();
     _playbackProbe.stop();
     unawaited(_stopDspPipeline());
     _player.dispose();
@@ -5763,27 +5863,121 @@ class _LocalPlaybackException implements Exception {
   String toString() => message;
 }
 
+/// 会话队列元数据的体积预算（按字符粗估）。
+///
+/// 会话 JSON 原先会把整个播放队列逐首写入插件原始数据与完整歌词，体积随
+/// 队列线性膨胀：设备日志实测会话可达数百 MB，`_persistSession` 在主 isolate
+/// 上一次 `jsonEncode` 会把界面卡住十几秒（`dartLag` 15.8s / 主线程卡顿
+/// 12.2s），匿名内存尖峰逼近 2GB（`pvDirty` 1.9GB），进程随后被系统按
+/// `LOW_MEMORY` 击杀。这里给元数据总量设上限：超出预算的队列项不再写入
+/// 元数据，恢复时本地歌按路径回查曲库补齐、在线歌退回重新解析，从而把
+/// 会话体积与队列长度解耦。
+const int _sessionQueueMetaBudgetChars = 16 * 1024 * 1024;
+
+/// 恢复会话时允许解析的最大字符数。超过即视为旧版本遗留的超大会话，
+/// 直接放弃恢复（见 [_restoreSession]）。
+const int _sessionMaxRestoreChars = 32 * 1024 * 1024;
+
+/// 插件原始数据里可能内嵌的歌词字段。这些只是歌词缓存，播放时会按需重新
+/// 抓取；单首逐字歌词（QRC/YRC）可达数百 KB，是队列元数据里最大的单项，
+/// 且与 `lyricsRaw` 重复，没必要随会话落盘。
+const List<String> _embeddedLyricKeys = <String>[
+  'yrc',
+  'qrc',
+  'eslrc',
+  'lxlyric',
+  'lyric',
+  'rawLrc',
+  'lrc',
+  'lyrics',
+];
+
+/// 复制插件原始数据并剥掉内嵌歌词字段（缓存，播放时会重新抓取）。
+Map<String, dynamic>? _slimPluginData(Map<String, dynamic>? data) {
+  if (data == null || data.isEmpty) return data;
+  final slim = <String, dynamic>{};
+  for (final entry in data.entries) {
+    if (_embeddedLyricKeys.contains(entry.key)) continue;
+    slim[entry.key] = entry.value;
+  }
+  return slim;
+}
+
+/// 粗略估算一段 JSON 值的文本体积（只做遍历，不分配字符串，避免为估算
+/// 再编码一次）。
+int _approximateJsonChars(Object? value) {
+  if (value == null) return 4;
+  if (value is String) return value.length + 2;
+  if (value is num || value is bool) return 8;
+  if (value is Map) {
+    var total = 2;
+    for (final entry in value.entries) {
+      total += (entry.key is String ? (entry.key as String).length : 8) + 4;
+      total += _approximateJsonChars(entry.value);
+    }
+    return total;
+  }
+  if (value is Iterable) {
+    var total = 2;
+    for (final element in value) {
+      total += _approximateJsonChars(element) + 1;
+    }
+    return total;
+  }
+  return 16;
+}
+
 Map<String, dynamic> buildPlaybackSessionPayload({
   required PlaybackState state,
   required double volume,
   required int updatedAt,
 }) {
   final item = state.current;
-  final queueMeta = <String, dynamic>{
-    for (final queueItem in state.queue)
-      if (playbackSourceTypeFor(queueItem) != PlaybackSourceType.localFile)
-        queueItem.path: {
-          'title': queueItem.title,
-          'artist': queueItem.artist,
-          'album': queueItem.album,
-          'durationMs': queueItem.durationMs,
-          'pluginId': queueItem.pluginId,
-          'pluginData': queueItem.pluginData,
-          'coverUrl': queueItem.coverUrl,
-          'lyricsRaw': queueItem.lyricsRaw,
-          'lyricsAttempted': queueItem.lyricsAttempted,
-        },
-  };
+  final queueMeta = <String, dynamic>{};
+  var budget = _sessionQueueMetaBudgetChars;
+
+  /// 写入一首在线歌的元数据。[keepLyrics] 仅对当前歌为 true：其余歌曲的
+  /// 歌词不进会话（见 [_embeddedLyricKeys]），恢复后按需重新抓取。
+  void addMeta(QueueItem queueItem, {bool keepLyrics = false}) {
+    // 本地歌（含网盘挂载）只存路径，恢复时按路径回查曲库补齐元数据。
+    if (playbackSourceTypeFor(queueItem) == PlaybackSourceType.localFile) {
+      return;
+    }
+    if (queueMeta.containsKey(queueItem.path)) return;
+    final entry = <String, dynamic>{
+      'title': queueItem.title,
+      'artist': queueItem.artist,
+      'album': queueItem.album,
+      'durationMs': queueItem.durationMs,
+      'pluginId': queueItem.pluginId,
+      'pluginData': _slimPluginData(queueItem.pluginData),
+      'coverUrl': queueItem.coverUrl,
+      'lyricsRaw': keepLyrics ? queueItem.lyricsRaw : null,
+      // 未随会话保留歌词时必须复位探测标记，否则恢复后播放链会认为
+      // “歌词已探测过”而跳过重新抓取，表现为一直无歌词。
+      'lyricsAttempted': keepLyrics && queueItem.lyricsAttempted,
+    };
+    final cost = _approximateJsonChars(entry);
+    if (cost > budget) return;
+    budget -= cost;
+    queueMeta[queueItem.path] = entry;
+  }
+
+  // 当前歌优先（歌词一并保留），再以它为中心向两侧扩散：无论队列多大，
+  // 恢复后正在播放的这首与就近切歌都必须完整可用；预算耗尽后更远的项
+  // 不再写入元数据。
+  if (item != null) addMeta(item, keepLyrics: true);
+  if (state.queue.isNotEmpty) {
+    final center = state.queueIndex.clamp(0, state.queue.length - 1);
+    for (var step = 1; step < state.queue.length; step++) {
+      if (budget <= 0) break;
+      final ahead = center + step;
+      final behind = center - step;
+      if (ahead < state.queue.length) addMeta(state.queue[ahead]);
+      if (behind >= 0) addMeta(state.queue[behind]);
+    }
+  }
+
   return {
     'currentSongPath': item?.path,
     'playQueuePaths': state.queue.map((q) => q.path).toList(),

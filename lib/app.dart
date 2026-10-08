@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 import 'dart:ui' as ui;
 
@@ -13,6 +14,7 @@ import 'src/deeplink/deep_link_handler.dart';
 import 'src/core/settings.dart';
 import 'src/navigation/animated_page_route.dart';
 import 'src/library/library_provider.dart';
+import 'src/plugins/plugin_runtime.dart';
 import 'src/player/mini_player_overlay.dart';
 import 'src/player/player_provider.dart';
 import 'src/navigation/routes.dart';
@@ -90,6 +92,7 @@ class _XyMusicAppState extends ConsumerState<XyMusicApp>
   /// （浅色背景下表现为“白色遮挡”）。检测到视口高度明显缩水即说明原生侧
   /// 已经 resize，将上报给子树的 insets 归零，避免双重计算。
   Size? _viewportWithoutKeyboard;
+  Timer? _pluginRuntimeWarmupTimer;
 
   @override
   void initState() {
@@ -104,6 +107,14 @@ class _XyMusicAppState extends ConsumerState<XyMusicApp>
     // 每次进入软件即触发本地音乐后台重扫（LibraryNotifier 构造时执行），
     // 不等用户打开本地音乐页。
     Future.microtask(() => ref.read(libraryProvider.notifier));
+    // 预热插件 QuickJS 运行时（约 800KB 引导 JS）：放在启动 5 秒后的
+    // 空闲期，避免冷启动开销叠加在用户第一次点歌的音源解析路径上。
+    _pluginRuntimeWarmupTimer = Timer(
+      const Duration(seconds: 5),
+      () => unawaited(
+        ref.read(pluginRuntimeProvider).warmupRuntime(),
+      ),
+    );
     // 分享深链（xymusic://song?...）：注册原生回调 + 取回冷启动深链。
     Future.microtask(() => XyDeepLink.init(ref, appRouter));
     // 迷你播放器悬浮窗桥：接收原生按钮/进度条操作与通知栏单击回调。
@@ -113,6 +124,7 @@ class _XyMusicAppState extends ConsumerState<XyMusicApp>
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+    _pluginRuntimeWarmupTimer?.cancel();
     _decodedBackgroundImage?.dispose();
     super.dispose();
   }

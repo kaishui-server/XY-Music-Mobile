@@ -14,6 +14,7 @@ import 'package:quickjs_engine/extensions/xhr.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../core/db_path.dart';
+import '../logging/app_log_store.dart';
 import '../rust/api.dart';
 import '../player/lx_lyrics_builder.dart';
 import 'plugin_metadata.dart';
@@ -1055,6 +1056,53 @@ class PluginRuntimeService {
   final Map<String, _NeteaseTrackMeta> _neteaseTrackMetaCache = {};
   final Map<String, Future<List<String>>> _qualityDiscoveryCache = {};
 
+  /// 已完成的音质探测结果（同步可读）：正式解析音质链时用它裁剪候选档位，
+  /// 避免对探测确认不支持的高档位逐一发起完整网络解析（每档失败在插件内部
+  /// 还要多接口重试，是未缓存歌起播 10s+ 的主要来源）。
+  final Map<String, List<String>> _qualityDiscoveryDone = {};
+
+  /// 正在进行的起播解析数量：音质探测（preloadQualities）逐档调用 musicUrl
+  /// 与起播解析共用同一个 QuickJS 引擎与 fetch 桥，必须让位于起播——
+  /// 用户在探测进行中切歌时，新歌的解析不再排在探测队列后面。
+  int _activeResolves = 0;
+
+  /// 每插件的 LX 调用串行队列尾：LX 桥用全局 globalThis.lx 切换当前插件
+  /// （见 assets/lx_plugin_runtime.js），并发调用会互踩全局状态，按插件
+  /// 排队执行，行为可预测且不引入额外时延（QuickJS 引擎本身单线程）。
+  final Map<String, Future<void>> _lxCallQueue = {};
+
+  /// LX 插件连接级失败熔断：音源服务器不可达（明文 HTTP 被拦、域名失效、
+  /// 服务器宕机）时每档解析都在插件内部走完整超时重试（实测单首歌 12s+，
+  /// 期间其他 LX 插件被串行队列阻塞在后面）。连续失败达到阈值后短时冷却，
+  /// 冷却期内直接跳过该插件，让 fallback 链立即换下一个源。仅对连接级
+  /// 错误计数：无版权/需要会员等业务失败与服务器无关，不计入。
+  final Map<String, int> _lxConnectivityFailures = {};
+  final Map<String, DateTime> _lxCircuitCooldownUntil = {};
+  // 连接级错误（服务器不可达）与歌曲无关：一次失败即熔断，不用等第二首
+  // 再白撞一遍（每首歌数秒）。业务失败（无版权/需要会员）不计数。
+  static const int _lxCircuitThreshold = 1;
+  static const Duration _lxCircuitCooldown = Duration(minutes: 5);
+
+  /// 判断 LX 解析错误是否为连接级（服务器不可达/超时），用于熔断计数。
+  bool _isLxConnectivityError(String message) {
+    final m = message.toLowerCase();
+    return m.contains('无法连接') ||
+        m.contains('网络请求失败') ||
+        m.contains('服务器不可达') ||
+        m.contains('timed out') ||
+        m.contains('timeoutexception') ||
+        m.contains('socketexception') ||
+        m.contains('connection refused') ||
+        m.contains('connection reset') ||
+        m.contains('failed host lookup') ||
+        m.contains('unreachable');
+  }
+
+  bool _lxCircuitOpen(EnabledMusicPlugin plugin) {
+    final until = _lxCircuitCooldownUntil[plugin.id];
+    return until != null && DateTime.now().isBefore(until);
+  }
+
   /// 上述两张表都按歌曲/插件维度常驻，长时间在线播放会持续累积；
   /// 加硬上限并按插入顺序淘汰最旧条目，避免常驻内存随播放时长攀升。
   static const int _neteaseTrackMetaCacheLimit = 256;
@@ -1184,10 +1232,37 @@ class PluginRuntimeService {
   Future<dynamic> _callLxOnCurrentIsolate(
     EnabledMusicPlugin plugin,
     Map<String, dynamic> request,
+  ) {
+    // 按 plugin.id 排队：LX 桥通过全局 globalThis.lx 切换当前插件，并发
+    // 调用互踩全局状态（观测到第二首解析原样等待第一首 ~13.5s）；队列
+    // 只把既有的隐式排队显式化，同时保证不同 LX 插件调用不交叉执行。
+    final previous = _lxCallQueue[plugin.id] ?? Future<void>.value();
+    final task = previous.then(
+      (_) => _callLxOnCurrentIsolateLocked(plugin, request),
+    );
+    _lxCallQueue[plugin.id] = task.then(
+      (_) {},
+      onError: (_) {},
+    );
+    return task;
+  }
+
+  Future<dynamic> _callLxOnCurrentIsolateLocked(
+    EnabledMusicPlugin plugin,
+    Map<String, dynamic> request,
   ) async {
     _activeRuntimeOperations++;
+    final stopwatch = Stopwatch()..start();
+    final action = request['action']?.toString() ?? '';
     try {
+      final ensureStopwatch = Stopwatch()..start();
       await _ensureLxPlugin(plugin);
+      if (ensureStopwatch.elapsedMilliseconds > 500) {
+        AppLogStore.instance.add(
+          '[播放链路] LX插件加载 ${plugin.name} '
+          '${ensureStopwatch.elapsedMilliseconds}ms',
+        );
+      }
       final expression =
           '__xyCallLxPlugin(${jsonEncode(plugin.id)},'
           '${jsonEncode(request)})';
@@ -1201,6 +1276,12 @@ class PluginRuntimeService {
       );
       if (result.isError) {
         throw Exception(_friendlyError(result.stringResult));
+      }
+      if (stopwatch.elapsedMilliseconds > 3000) {
+        AppLogStore.instance.add(
+          '[播放链路] LX调用 ${plugin.name} $action '
+          '${stopwatch.elapsedMilliseconds}ms（>3s）',
+        );
       }
       return _decodeResult(result.stringResult);
     } finally {
@@ -3952,47 +4033,23 @@ class PluginRuntimeService {
       }
     }
     Future<PluginMediaSource> resolve(String? quality) async {
-      if (plugin.isLx) {
-        return _resolveLxMediaSource(
-          plugin,
-          rawData,
-          preferredQuality: quality,
-        );
-      }
-      if (plugin.isAnimemusic) {
-        return _resolveAnimemusicMediaSource(plugin, rawData, quality);
-      }
-      if (_runsPluginsInBackground) {
-        try {
-          final response = await _runPluginOperation(
-            plugin,
-            'resolveMediaSource',
-            {'rawData': rawData, 'preferredQuality': quality},
-          );
-          final source = _toMediaSource(response);
-          if (source == null) throw Exception('插件没有返回可播放地址');
-          return source;
-        } catch (error) {
-          // 惜梦系插件播放兜底：baka 版脚本的 FALLBACK_BASE（站点根）
-          // 部署上没有 API 路由，插件解析必然失败，由宿主直连后端
-          // music/url 补齐。
-          if (plugin.animemusicApi.trim().isNotEmpty) {
-            return _resolveAnimemusicMediaSource(plugin, rawData, quality);
-          }
-          rethrow;
-        }
-      }
+      _activeResolves++;
+      final resolveStopwatch = Stopwatch()..start();
       try {
-        return await _resolveMediaSourceOnCurrentIsolate(
+        final source = await _resolveMediaSourceUncached(
           plugin,
           rawData,
-          preferredQuality: quality,
+          quality,
         );
-      } catch (error) {
-        if (plugin.animemusicApi.trim().isNotEmpty) {
-          return _resolveAnimemusicMediaSource(plugin, rawData, quality);
+        if (resolveStopwatch.elapsedMilliseconds > 3000) {
+          AppLogStore.instance.add(
+            '[播放链路] 音源解析 ${plugin.name} '
+            '音质${quality ?? ''} ${resolveStopwatch.elapsedMilliseconds}ms（>3s）',
+          );
         }
-        rethrow;
+        return source;
+      } finally {
+        _activeResolves--;
       }
     }
 
@@ -4016,6 +4073,10 @@ class PluginRuntimeService {
       if (identical(_mediaSourceCache[cacheKey], entry)) {
         _mediaSourceCache.remove(cacheKey);
       }
+      // 连接级错误（LX 音源服务器不可达）与音质无关：用 320k 兜底重试
+      // 只会对同一台不可达服务器把整条音质链再撞一遍（多花数秒），直接
+      // 上抛，交给 fallback 链换源与熔断处理。
+      if (plugin.isLx && _isLxConnectivityError(error.toString())) rethrow;
       // 音质偏好是跨歌曲保存的，但插件支持的档位是逐首歌曲变化的。
       // 某些插件遇到不支持的 super/母带档位会直接抛错，导致原本可播
       // 的歌曲也被判定为播放失败；失败时用最兼容的 320k 再解析一次。
@@ -4037,6 +4098,55 @@ class PluginRuntimeService {
     String? quality,
   }) {
     _mediaSourceCache.remove(_mediaSourceCacheKey(plugin, rawData, quality));
+  }
+
+  Future<PluginMediaSource> _resolveMediaSourceUncached(
+    EnabledMusicPlugin plugin,
+    Map<String, dynamic> rawData,
+    String? quality,
+  ) async {
+    if (plugin.isLx) {
+      return _resolveLxMediaSource(
+        plugin,
+        rawData,
+        preferredQuality: quality,
+      );
+    }
+    if (plugin.isAnimemusic) {
+      return _resolveAnimemusicMediaSource(plugin, rawData, quality);
+    }
+    if (_runsPluginsInBackground) {
+      try {
+        final response = await _runPluginOperation(
+          plugin,
+          'resolveMediaSource',
+          {'rawData': rawData, 'preferredQuality': quality},
+        );
+        final source = _toMediaSource(response);
+        if (source == null) throw Exception('插件没有返回可播放地址');
+        return source;
+      } catch (error) {
+        // 惜梦系插件播放兜底：baka 版脚本的 FALLBACK_BASE（站点根）
+        // 部署上没有 API 路由，插件解析必然失败，由宿主直连后端
+        // music/url 补齐。
+        if (plugin.animemusicApi.trim().isNotEmpty) {
+          return _resolveAnimemusicMediaSource(plugin, rawData, quality);
+        }
+        rethrow;
+      }
+    }
+    try {
+      return await _resolveMediaSourceOnCurrentIsolate(
+        plugin,
+        rawData,
+        preferredQuality: quality,
+      );
+    } catch (error) {
+      if (plugin.animemusicApi.trim().isNotEmpty) {
+        return _resolveAnimemusicMediaSource(plugin, rawData, quality);
+      }
+      rethrow;
+    }
   }
 
   String _mediaSourceCacheKey(
@@ -4100,7 +4210,9 @@ class PluginRuntimeService {
       () => _discoverQualitiesUncached(plugin, rawData),
     );
     while (_qualityDiscoveryCache.length > _qualityDiscoveryCacheLimit) {
-      _qualityDiscoveryCache.remove(_qualityDiscoveryCache.keys.first);
+      final evicted = _qualityDiscoveryCache.keys.first;
+      _qualityDiscoveryCache.remove(evicted);
+      _qualityDiscoveryDone.remove(evicted);
     }
     return future.then((qualities) {
       final preferred = preferredQuality?.trim() ?? '';
@@ -4127,6 +4239,10 @@ class PluginRuntimeService {
     Map<String, dynamic> rawData, {
     String? preferredQuality,
   }) {
+    // 探测逐档调用 musicUrl（每档一次完整网络解析）且与起播解析共用
+    // QuickJS 引擎；正在解析播放源时让位，等下一次起播后再补——
+    // 探测结果有缓存，晚一轮不影响音质选择器。
+    if (_activeResolves > 0) return;
     unawaited(
       discoverQualities(
         plugin,
@@ -4161,6 +4277,7 @@ class PluginRuntimeService {
       // REST 后端逐档实测：music/url 返回有效地址才展示给用户。
       final supported = <String>[];
       for (final quality in plugin.animemusicQualities) {
+        if (_activeResolves > 0) break;
         try {
           final source = await _resolveAnimemusicMediaSource(
             plugin,
@@ -4172,7 +4289,11 @@ class PluginRuntimeService {
           // 单一音质探测失败不应阻断整个选择器。
         }
       }
-      if (supported.isNotEmpty) return supported;
+      if (supported.isNotEmpty) {
+        _qualityDiscoveryDone[_qualityCacheKey(plugin, rawData)] =
+            List<String>.from(supported);
+        return supported;
+      }
       return plugin.animemusicQualities;
     }
     final candidates = <String>{
@@ -4202,7 +4323,12 @@ class PluginRuntimeService {
       }
     }
     final supported = <String>[];
+    final probeStopwatch = Stopwatch()..start();
     for (final quality in candidates) {
+      // 探测让位于起播解析：逐档探测是每档一次完整 musicUrl 网络解析
+      //（串行，一首歌最多十几秒），用户在探测进行中点歌/切歌时提前
+      // 返回已探到的部分，剩余档位留给下一轮探测补齐。
+      if (_activeResolves > 0) break;
       try {
         final ok = plugin.isLx
             ? await _probeLxQuality(plugin, rawData, quality)
@@ -4211,6 +4337,20 @@ class PluginRuntimeService {
       } catch (_) {
         // 单一音质探测失败不应阻断整个选择器。
       }
+    }
+    // 同步落一份探测结果：正式解析音质链据此裁剪候选档位（见
+    // _resolveLxMediaSource）。中途让位时 supported 为部分结果，只有
+    // 非空才落盘，避免用「探测被让位」覆盖掉已有的完整结果。
+    if (supported.isNotEmpty) {
+      _qualityDiscoveryDone[_qualityCacheKey(plugin, rawData)] =
+          List<String>.from(supported);
+    }
+    if (probeStopwatch.elapsedMilliseconds > 5000) {
+      AppLogStore.instance.add(
+        '[播放链路] 音质探测 ${plugin.name} '
+        '${supported.length}/${candidates.length}档 '
+        '${probeStopwatch.elapsedMilliseconds}ms',
+      );
     }
     if (supported.isNotEmpty) return supported;
     // 某些插件只在真正解析时返回地址，保留声明值让用户仍可选择；
@@ -4246,6 +4386,8 @@ class PluginRuntimeService {
   ) async {
     final value = rawData['lx'];
     if (value is! Map) return false;
+    // 熔断中的插件跳过探测：服务器不可达时每档 5s 超时×8 档是纯后台负载。
+    if (_lxCircuitOpen(plugin)) return false;
     final songInfo = Map<String, dynamic>.from(value);
     try {
       final response = await _callLxOnCurrentIsolate(plugin, {
@@ -4378,11 +4520,35 @@ class PluginRuntimeService {
     final value = rawData['lx'];
     if (value is! Map) throw Exception('LX 歌曲缺少音源元数据');
     final songInfo = Map<String, dynamic>.from(value);
+    if (_lxCircuitOpen(plugin)) {
+      throw Exception(
+        '音源「${plugin.name}」近期连接失败，已临时跳过（约 5 分钟后自动重试）',
+      );
+    }
     Object? lastError;
-    final qualities = pluginQualityCandidates(preferredQuality);
+    var qualities = pluginQualityCandidates(preferredQuality);
+    // 已完成的音质探测（discoverQualities）记录了该插件+歌曲真实可解析
+    // 的档位；盲试 8 档时每个不支持的高档位都要在插件内部走一遍多接口
+    // 重试超时（每档数秒，未缓存歌起播 10s+ 的主要来源）。有探测结果时
+    // 只试「首选档（若被探测支持）+ 探测确认的最高档」，其余档位仅在
+    // 探测列表为空（从未探测成功）时才兜底尝试。
+    final discovered = _qualityDiscoveryDone[_qualityCacheKey(plugin, rawData)];
+    if (discovered != null && discovered.isNotEmpty) {
+      final preferred = preferredQuality?.trim() ?? '';
+      final supported = discovered
+          .where((q) => q != preferred)
+          .toList()
+        ..sort((a, b) => qualityTierRank(b).compareTo(qualityTierRank(a)));
+      final trimmed = <String>[
+        if (discovered.contains(preferred)) preferred,
+        if (supported.isNotEmpty) supported.first,
+      ];
+      if (trimmed.isNotEmpty) qualities = trimmed;
+    }
     // 先完整尝试插件自己的接口。自定义 LX 音源通常只支持部分音质，
     // 不能因为第一档音质失败就立刻等待公共接口超时。
     for (final quality in qualities) {
+      final attemptStopwatch = Stopwatch()..start();
       try {
         final response = await _callLxOnCurrentIsolate(plugin, {
           'action': 'musicUrl',
@@ -4392,15 +4558,40 @@ class PluginRuntimeService {
         final pluginUrl = response?.toString().trim() ?? '';
         if (pluginUrl.startsWith('http://') ||
             pluginUrl.startsWith('https://')) {
+          _lxConnectivityFailures.remove(plugin.id);
+          if (attemptStopwatch.elapsedMilliseconds > 3000) {
+            AppLogStore.instance.add(
+              '[播放链路] LX解析成功 ${plugin.name} 音质$quality '
+              '${attemptStopwatch.elapsedMilliseconds}ms（>3s）',
+            );
+          }
           return PluginMediaSource(url: _normalizeMediaUrl(pluginUrl));
         }
+        AppLogStore.instance.add(
+          '[播放链路] LX解析未返回URL ${plugin.name} 音质$quality '
+          '${attemptStopwatch.elapsedMilliseconds}ms',
+          level: AppLogLevel.info,
+        );
       } catch (error) {
         lastError = error;
+        AppLogStore.instance.add(
+          '[播放链路] LX解析失败 ${plugin.name} 音质$quality '
+          '${attemptStopwatch.elapsedMilliseconds}ms '
+          '${_friendlyError(error.toString())}',
+          // 中间过程失败（该档音质无链接/接口无权限）不是错误：fallback
+          // 会自动换档或换源，最终正常出声时这只是诊断轨迹。只有整条链
+          // 走完仍失败（播放真的报错）才由上层以 ERROR 记录。
+          level: AppLogLevel.info,
+        );
       }
     }
     // Older LX plugins may only expose the public resolver; keep it as a
     // compatibility fallback after the custom handler has been exhausted.
+    // 连接级错误连续 2 档即放弃公共解析：公共 API 与插件服务器一样不可达
+    // 时，逐档等待超时只会把解析时间拉长数倍（每档最多 15s 超时）。
+    var publicConnErrors = 0;
     for (final quality in qualities) {
+      final attemptStopwatch = Stopwatch()..start();
       try {
         final response = await lxResolveUrl(
           songInfoJson: jsonEncode(songInfo),
@@ -4411,10 +4602,42 @@ class PluginRuntimeService {
             ? decoded['url']?.toString().trim() ?? ''
             : '';
         if (url.isNotEmpty) {
+          _lxConnectivityFailures.remove(plugin.id);
+          if (attemptStopwatch.elapsedMilliseconds > 3000) {
+            AppLogStore.instance.add(
+              '[播放链路] LX公共解析成功 ${plugin.name} 音质$quality '
+              '${attemptStopwatch.elapsedMilliseconds}ms（>3s）',
+            );
+          }
           return PluginMediaSource(url: _normalizeMediaUrl(url));
         }
       } catch (error) {
         lastError = error;
+        final friendly = _friendlyError(error.toString());
+        final isConnError = _isLxConnectivityError(error.toString());
+        if (isConnError) publicConnErrors++;
+        AppLogStore.instance.add(
+          '[播放链路] LX公共解析失败 ${plugin.name} 音质$quality '
+          '${attemptStopwatch.elapsedMilliseconds}ms $friendly',
+          level: AppLogLevel.info,
+        );
+        if (publicConnErrors >= 2) break;
+      }
+    }
+    // 连接级失败计入熔断：音源服务器不可达与歌曲无关，每次解析都白撞
+    // 整条音质链（实测 12s+）；达到阈值后冷却期内直接跳过该插件。
+    if (lastError != null && _isLxConnectivityError(lastError.toString())) {
+      final failures = (_lxConnectivityFailures[plugin.id] ?? 0) + 1;
+      _lxConnectivityFailures[plugin.id] = failures;
+      if (failures >= _lxCircuitThreshold) {
+        _lxCircuitCooldownUntil[plugin.id] =
+            DateTime.now().add(_lxCircuitCooldown);
+        _lxConnectivityFailures[plugin.id] = 0;
+        AppLogStore.instance.add(
+          '[播放链路] 音源「${plugin.name}」连续连接失败，'
+          '已临时熔断 ${_lxCircuitCooldown.inMinutes} 分钟',
+          level: AppLogLevel.warning,
+        );
       }
     }
     throw Exception(lastError ?? 'LX 没有返回可播放地址');
@@ -7121,9 +7344,25 @@ class PluginRuntimeService {
     _disposeRequested = false;
     _loaded.clear();
     _loadedLx.clear();
+    _loadTasks.clear();
+    _lxCallQueue.clear();
     _pluginSourceTasks.clear();
     _neteaseTrackMetaCache.clear();
     _qualityDiscoveryCache.clear();
+    _qualityDiscoveryDone.clear();
+    _mediaSourceCache.clear();
+    _lxConnectivityFailures.clear();
+    _lxCircuitCooldownUntil.clear();
+  }
+
+  /// 预热插件运行时：冷启动要创建 QuickJS 引擎并 evaluate 约 800KB 的
+  /// 运行时 JS（assets/plugin_runtime.js），若发生在用户第一次点歌的
+  /// 解析路径上，会叠加数秒起播延迟；提前到启动空闲期完成，首次解析
+  /// 只剩纯网络时间。失败静默：首次使用时还会按原路径重试。
+  Future<void> warmupRuntime() async {
+    try {
+      await _ensureRuntime();
+    } catch (_) {}
   }
 }
 

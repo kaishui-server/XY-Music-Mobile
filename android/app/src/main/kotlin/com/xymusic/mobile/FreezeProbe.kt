@@ -35,10 +35,16 @@ import java.util.Locale
  * 采集全部在独立 HandlerThread 完成，不占用主线程与 Flutter isolate。
  *
  * 落盘策略：正常运行时采样只留在内存环形缓冲里，**不写文件**；只有真正
- * 命中异常（主线程长时间卡顿 / Dart isolate 停摆 / 内存或线程数暴涨）才把
+ * 命中异常（主线程长时间卡顿 / Dart isolate 停摆 / 内存或线程数持续暴涨）才把
  * 最近一段现场一次性写入 <filesDir>/xy_music/crash/crash-freeze.txt。这样
  * 「软件没崩溃却总有一份崩溃记录」的误报消失，而真卡死时仍能拿到卡死前
  * 的现场。文件名以 crash- 开头，会被「日志-崩溃记录」导出自动收录。
+ *
+ * 防误报：内存/线程两类指标极易被瞬时尖峰误导——启动初始化会把线程数顶到
+ * ~160，zram 换入换出会让 pvDirty/pss2 在 10s 内在 3GB 与 200MB 间跳变。
+ * 因此这两类要求「启动静默期之外 + 连续多次命中」，而 ActivityManager 的
+ * totalPss 在部分 MIUI/ColorOS 机型上被缓存成常量，直接弃用（只看 smaps_rollup
+ * 实测的 pss2，并要求系统可用内存同步见底）。
  */
 object FreezeProbe {
     /** 采样间隔。 */
@@ -50,11 +56,26 @@ object FreezeProbe {
     /** Dart 探针超过该值未刷新即判定 Dart 主 isolate 停摆。 */
     private const val DART_LAG_EVENT_MS = 20_000L
 
-    /** 进程 PSS 超过该值即判定内存异常（正常播放约 150~400MB）。 */
-    private const val MEMORY_EVENT_MB = 1024L
+    /** 进程 PSS 超过该值、且系统可用内存见底，才判定内存异常。 */
+    private const val MEMORY_EVENT_MB = 2048L
 
-    /** 线程数超过该值即判定线程泄漏（正常约 80）。 */
-    private const val THREAD_EVENT_COUNT = 150
+    /** 系统可用内存低于该值视为内存压力（与 MEMORY_EVENT_MB 同时满足才算异常）。 */
+    private const val MEMORY_SYS_FLOOR_MB = 1024L
+
+    /** 线程数超过该值即判定线程泄漏（正常播放约 80，启动初始化瞬时约 160）。 */
+    private const val THREAD_EVENT_COUNT = 200
+
+    /**
+     * 进程启动后的静默期：Flutter 引擎/音频/Rust 初始化会瞬时抬高线程数与内存，
+     * 这段时间只采样、不判定内存/线程异常，避免「一启动就有一份崩溃记录」。
+     */
+    private const val STARTUP_GRACE_MS = 120_000L
+
+    /**
+     * 内存/线程异常需「连续命中」的采样次数（10s 一次，即持续 30s）才落盘。
+     * 启动尖峰、zram 换入换出都只让单次采样瞬时冲高，持续异常才是真问题。
+     */
+    private const val ANOMALY_STREAK = 3
 
     /** 冻结日志最多保留的行数（约 50 分钟历史）。 */
     private const val MAX_LINES = 320
@@ -89,6 +110,13 @@ object FreezeProbe {
     /** 采样次数，用于控制「最大区域明细」的落盘频率（解析整份 smaps 较贵）。 */
     private var sampleCount = 0L
 
+    /** 探针启动时刻（≈ 进程启动），用于启动静默期判定。 */
+    private var startedAtMs = 0L
+
+    /** 内存/线程异常连续命中计数（掉出阈值即清零）。 */
+    private var memoryStreak = 0
+    private var threadStreak = 0
+
     /** 首次判定停摆时是否已落盘线程状态快照（只落一次，避免刷屏）。 */
     private var threadDumpDone = false
 
@@ -100,8 +128,16 @@ object FreezeProbe {
     fun start(context: Context) {
         if (started) return
         started = true
+        startedAtMs = SystemClock.uptimeMillis()
         val app = context.applicationContext
         logFile = File(CrashHandler.crashDir(app), FILE_NAME)
+        // 上一次进程若是「正常退出」（用户划掉/系统常规回收/升级安装），说明
+        // 现有的 crash-freeze.txt 是运行期误报——真卡死/被低内存击杀才会留下
+        // 有价值的现场。此时直接清掉，避免用户反复看到一份「没崩溃却有崩溃
+        // 记录」的旧文件；上一次是异常退出则保留，供事后分析。
+        logFile?.let { file ->
+            if (file.exists() && !lastExitAbnormal(app)) file.delete()
+        }
         // 头部信息只暂存内存，等真正出现异常时随现场一起落盘。
         headerLines = buildList {
             add("===== XY Music 冻结探针 =====")
@@ -134,6 +170,7 @@ object FreezeProbe {
 
     private fun sample(context: Context) {
         val postedAt = SystemClock.uptimeMillis()
+        val inGrace = postedAt - startedAtMs < STARTUP_GRACE_MS
         // 主线程调度延迟：从投递到真正执行的时间差。
         mainHandler.post {
             val lag = SystemClock.uptimeMillis() - postedAt
@@ -154,8 +191,15 @@ object FreezeProbe {
             }
         }
         // 内存/线程数暴涨同样视为异常：整包缓存或线程栈泄漏会让进程被系统
-        // 击杀且不产生崩溃文件，需要留下现场。
-        val anomaly = dartStalled || memoryAnomaly(line)
+        // 击杀且不产生崩溃文件，需要留下现场。但启动初始化（线程数瞬时冲到
+        // ~160）与 zram 换入换出都会让单次采样虚高，故要求「启动静默期之外 +
+        // 连续多次命中」，持续异常才落盘。
+        val memHigh = memoryHot(line)
+        val threadHigh = intField(line, "threads") >= THREAD_EVENT_COUNT
+        memoryStreak = if (!inGrace && memHigh) memoryStreak + 1 else 0
+        threadStreak = if (!inGrace && threadHigh) threadStreak + 1 else 0
+        val sustained = memoryStreak >= ANOMALY_STREAK || threadStreak >= ANOMALY_STREAK
+        val anomaly = dartStalled || sustained
         record(line, force = anomaly)
         // 区域归属明细要解析整份 smaps（较贵），只在异常路径上按 60s 节流记录：
         // 用来在内存异常时锁定究竟是哪一块映射吃掉了几个 G，以及这块到底是
@@ -169,18 +213,29 @@ object FreezeProbe {
         }
     }
 
-    /** 采样行是否命中内存异常（PSS 过高 / 线程数过多）。 */
-    private fun memoryAnomaly(line: String): Boolean {
-        // ActivityManager 的 totalPss 在部分 MIUI 机型上会被缓存成常量（不可信），
-        // 因此同时看 smaps_rollup 实时算出的 pss2，取两者较大者判定。
-        val pss = maxOf(mbField(line, "pss"), mbField(line, "pss2"))
-        val threads = Regex("threads=(\\d+)").find(line)?.groupValues?.get(1)?.toIntOrNull() ?: 0
-        return pss >= MEMORY_EVENT_MB || threads >= THREAD_EVENT_COUNT
+    /**
+     * 采样行是否命中内存异常。
+     *
+     * 只信 smaps_rollup 实测的 pss2：ActivityManager 的 totalPss 在部分
+     * MIUI/ColorOS 机型上会被缓存成常量（实测常驻 2~3GB 纹丝不动），单独看它
+     * 必然误报。同时要求系统可用内存见底（或系统已报 lowMemory）——只看 PSS 会
+     * 被 zram 换入换出造成的瞬时虚高误导（实测 pvDirty 10s 内可在 3GB 与
+     * 200MB 之间跳变）。
+     */
+    private fun memoryHot(line: String): Boolean {
+        if (line.contains("low=true")) return true
+        val pss2 = mbField(line, "pss2")
+        val sysAvail = mbField(line, "sysAvail")
+        return pss2 >= MEMORY_EVENT_MB && sysAvail <= MEMORY_SYS_FLOOR_MB
     }
 
     /** 取采样行里「<key>=1234MB」的数值（pss 与 pss2 前缀不同，分别精确匹配）。 */
     private fun mbField(line: String, key: String): Long =
         Regex("$key=(\\d+)MB").find(line)?.groupValues?.get(1)?.toLongOrNull() ?: 0L
+
+    /** 取采样行里「<key>=1234」的整数值（如 threads=157）。 */
+    private fun intField(line: String, key: String): Int =
+        Regex("$key=(\\d+)").find(line)?.groupValues?.get(1)?.toIntOrNull() ?: 0
 
     private fun memoryLine(context: Context, dartLag: Long): String {
         val am = context.getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager
@@ -316,6 +371,24 @@ object FreezeProbe {
             }
         } catch (error: Throwable) {
             listOf("上次退出原因：读取失败 ${error.message}")
+        }
+    }
+
+    /**
+     * 上一次进程退出是否属于异常（被低内存击杀 / 原生或 Java 崩溃 / ANR / 信号）。
+     * 只有异常退出才说明 crash-freeze.txt 里的现场有分析价值；正常退出
+     * （用户划掉、系统常规回收、安装升级）时那份文件只是运行期误报。
+     */
+    private fun lastExitAbnormal(context: Context): Boolean {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return false
+        return try {
+            val am = context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+            val reason = am.getHistoricalProcessExitReasons(context.packageName, 0, 1)
+                .firstOrNull()?.reason
+            // 2=SIGNALED 3=LOW_MEMORY 4=CRASH 5=CRASH_NATIVE 6=ANR
+            reason == 2 || reason == 3 || reason == 4 || reason == 5 || reason == 6
+        } catch (_: Throwable) {
+            false
         }
     }
 
