@@ -208,6 +208,33 @@ class _XyFadePageTransition extends StatelessWidget {
   }
 }
 
+/// 播放详情页专属转场：全屏覆盖页从底部向上滑入、关闭时向下收回底部，
+/// 与全局页面切换模式设置无关（底部弹出语义与迷你播放条「上滑打开」
+/// 手势一致）。落定后裸返回页面本体，性能策略与 [xyPageTransition] 相同。
+Widget xyPlayerSheetTransition(
+  BuildContext context,
+  Animation<double> animation,
+  Animation<double> secondaryAnimation,
+  Widget child,
+) {
+  return AnimatedBuilder(
+    animation: Listenable.merge([animation, secondaryAnimation]),
+    child: child,
+    builder: (context, child) {
+      final settled =
+          animation.value >= 1 && secondaryAnimation.value <= 0;
+      if (settled) return child!;
+      return SlideTransition(
+        position: Tween<Offset>(
+          begin: const Offset(0, 1),
+          end: Offset.zero,
+        ).animate(_xyCurve(animation)),
+        child: RepaintBoundary(child: child!),
+      );
+    },
+  );
+}
+
 class XyAnimatedPageRoute<T> extends PageRouteBuilder<T> {
   XyAnimatedPageRoute({required WidgetBuilder builder, super.settings})
     : super(

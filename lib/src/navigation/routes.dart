@@ -50,6 +50,17 @@ Page<void> _instantPage(GoRouterState state, Widget child) =>
       child: child,
     );
 
+/// 播放详情页专属页面工厂：固定底部滑入/收回转场（见
+/// [xyPlayerSheetTransition]），不受全局页面切换模式设置影响。
+Page<void> _playerSheetPage(GoRouterState state, Widget child) =>
+    CustomTransitionPage<void>(
+      key: state.pageKey,
+      transitionDuration: xyPageTransitionDuration,
+      reverseTransitionDuration: xyPageReverseTransitionDuration,
+      transitionsBuilder: xyPlayerSheetTransition,
+      child: child,
+    );
+
 /// 主路由：使用 StatefulShellRoute 保持各一级页面状态。
 final appRouter = GoRouter(
   initialLocation: '/home',
@@ -456,10 +467,11 @@ final appRouter = GoRouter(
         ),
       ],
     ),
-    // 播放页为全屏覆盖。
+    // 播放页为全屏覆盖：底部滑入/收回（不随全局切换模式变化）。
     GoRoute(
       path: '/player',
-      pageBuilder: (context, state) => _instantPage(state, const PlayerPage()),
+      pageBuilder: (context, state) =>
+          _playerSheetPage(state, const PlayerPage()),
     ),
     // 完整音效页全屏覆盖：从播放页（shell 外路由）push shell 内 branch
     // 会导致空白页，这里注册独立全屏路由供播放页跳转，返回即回播放页。
