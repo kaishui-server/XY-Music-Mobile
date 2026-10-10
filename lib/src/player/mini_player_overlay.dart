@@ -84,6 +84,10 @@ class MiniPlayerOverlayBridge {
         unawaited(player.seek(value / 1000.0));
       case 'playIndex':
         unawaited(player.playIndex(value.round()));
+      case 'setAppVolume':
+        // 悬浮窗音量条在「音量键调节应用内音量」开启时回传 0..1，写
+        // settings.volume，由设置监听统一下发播放引擎（与音量键同路径）。
+        unawaited(player.setAppVolume(value));
     }
   }
 
@@ -239,6 +243,7 @@ class MiniPlayerOverlayBridge {
     final item = state.current;
     final coverPath = await _resolveCoverPath(item);
     if (generation != _syncGeneration) return;
+    final appVolume = ref.read(settingsProvider).valueOrNull?.volume ?? 1.0;
 
     _updateQueue(state.queue);
     final positionMs = state.position.isFinite && state.position > 0
@@ -258,6 +263,8 @@ class MiniPlayerOverlayBridge {
       coverPath,
       state.queueIndex,
       _queueRevision,
+      appVolume,
+      appVolumeMode,
     ].join('\u0000');
     final now = DateTime.now();
     final positionDelta = (positionMs - _lastSentPositionMs).abs();
@@ -284,6 +291,8 @@ class MiniPlayerOverlayBridge {
         'coverPath': coverPath,
         'queueJson': _queueJson,
         'queueIndex': state.queueIndex,
+        'appVolume': appVolume,
+        'appVolumeMode': appVolumeMode,
       });
     } on PlatformException {
       // 浮窗属于附加能力，系统回收或引擎销毁时不影响正常播放。

@@ -528,6 +528,8 @@ class MainActivity : AudioServiceActivity() {
             channel.setMethodCallHandler { call, result ->
                 if (call.method == "setCaptureEnabled") {
                     volumeKeyCaptureEnabled = call.argument<Boolean>("enabled") == true
+                    // 悬浮窗音量条跟随同一开关：开启只调应用内音量，关闭调系统音量。
+                    MiniPlayerOverlayService.appVolumeMode = volumeKeyCaptureEnabled
                     result.success(true)
                 } else {
                     result.notImplemented()

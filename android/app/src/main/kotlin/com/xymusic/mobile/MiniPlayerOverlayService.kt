@@ -33,6 +33,7 @@ import android.widget.TextView
 import androidx.core.graphics.drawable.RoundedBitmapDrawableFactory
 import org.json.JSONArray
 import kotlin.math.abs
+import kotlin.math.roundToInt
 
 /** 迷你播放器悬浮窗单次更新参数。MainActivity 通过
  * [MiniPlayerOverlayService.instance] 直连调用 applyUpdate，避免高频进度
@@ -51,6 +52,12 @@ class MiniPlayerUpdateParams(
     /** 播放队列（JSON 数组，元素含 title/artist），仅变化时下发。 */
     val queueJson: String,
     val queueIndex: Int,
+    /** 应用内音量 0..1（settings.volume），音量条按「音量键调节应用内音量」
+     * 开关决定用它还是系统媒体音量。 */
+    val appVolume: Float = 1.0f,
+    /** 「音量键调节应用内音量」开关（settings.volumeKeyControlsAppVolume）。
+     * 悬浮窗音量条据此分流：开启调应用内音量，关闭调系统媒体音量。 */
+    val appVolumeMode: Boolean = false,
 )
 
 /** 系统级迷你播放器悬浮窗：封面/标题/歌手/可拖动进度条/五个按钮
@@ -70,6 +77,14 @@ class MiniPlayerOverlayService : Service() {
         const val ACTION_CYCLE_MODE = "cyclePlayMode"
         const val ACTION_SEEK = "seek"
         const val ACTION_PLAY_INDEX = "playIndex"
+        const val ACTION_SET_APP_VOLUME = "setAppVolume"
+
+        /** 「音量键调节应用内音量」开关状态：开启时悬浮窗音量条也只调应用
+         * 内音量（回传 Dart 走 settings.volume 统一下发），关闭时调系统
+         * 媒体音量。由 MainActivity（setCaptureEnabled）与 Dart update
+         * 双路同步。 */
+        @Volatile
+        var appVolumeMode = false
 
         /** 运行中的服务实例，供 MainActivity 直连分发 update。 */
         @Volatile
@@ -107,10 +122,22 @@ class MiniPlayerOverlayService : Service() {
     private var totalTimeView: TextView? = null
     private var modeView: ImageView? = null
     private var playPauseView: ImageView? = null
+    private var volumeButton: ImageView? = null
+    private var volumeRow: View? = null
+    private var volumeSeekBar: SeekBar? = null
     private var queueList: LinearLayout? = null
     private var queueScroll: ScrollView? = null
     private var queueHeaderRow: View? = null
     private var queueItemViews: MutableList<QueueItemViews> = mutableListOf()
+
+    private val audioManager: AudioManager by lazy {
+        getSystemService(Context.AUDIO_SERVICE) as AudioManager
+    }
+
+    /** 音量调节行是否展开。跨 update 保持，否则进度同步会把它收回。 */
+    private var volumeExpanded = false
+    /** 最近同步的应用内音量 0..1（由 Dart update 携带）。 */
+    private var appVolume: Float = 1.0f
 
     private class QueueItemViews(
         val index: TextView,
@@ -192,6 +219,7 @@ class MiniPlayerOverlayService : Service() {
         queueHeaderRow = null
         queueItemViews = mutableListOf()
         queueExpanded = false
+        volumeExpanded = false
         hasSong = false
         super.onDestroy()
     }
@@ -230,6 +258,8 @@ class MiniPlayerOverlayService : Service() {
         coverPath = intent.getStringExtra("coverPath").orEmpty(),
         queueJson = intent.getStringExtra("queueJson").orEmpty(),
         queueIndex = intent.getIntExtra("queueIndex", -1),
+        appVolume = intent.getFloatExtra("appVolume", 1.0f),
+        appVolumeMode = intent.getBooleanExtra("appVolumeMode", false),
     )
 
     // ---------------------------------------------------------------- 视图搭建
@@ -310,15 +340,42 @@ class MiniPlayerOverlayService : Service() {
         val next = iconButton(R.drawable.xy_ic_next, TEXT_PRIMARY) {
             reportAction(ACTION_NEXT, 0.0)
         }
+        val volume = iconButton(R.drawable.xy_ic_volume, TEXT_PRIMARY) {
+            toggleVolumeRow()
+        }
         val queueButton = iconButton(R.drawable.xy_ic_queue, TEXT_PRIMARY) {
             showQueuePane(true)
         }
         val buttonRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            for (button in listOf(mode, prev, playPause, next, queueButton)) {
+            for (button in listOf(mode, prev, playPause, next, volume, queueButton)) {
                 addView(button, LinearLayout.LayoutParams(0, dp(42f), 1f))
             }
+        }
+
+        // 音量调节行：点击音量图标展开，拖动 SeekBar 直接调系统媒体音量。
+        val volumeIconSmall = ImageView(this).apply {
+            setImageResource(R.drawable.xy_ic_volume)
+            setColorFilter(TEXT_SECONDARY, PorterDuff.Mode.SRC_IN)
+            scaleType = ImageView.ScaleType.CENTER
+        }
+        val volumeSeek = SeekBar(this).apply {
+            max = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
+            progress = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)
+            progressDrawable?.setColorFilter(ACCENT, PorterDuff.Mode.SRC_IN)
+            thumb?.setColorFilter(ACCENT, PorterDuff.Mode.SRC_IN)
+            splitTrack = false
+        }
+        val volumeRowView = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            visibility = View.GONE
+            addView(volumeIconSmall, LinearLayout.LayoutParams(dp(26f), dp(26f)))
+            addView(
+                volumeSeek,
+                LinearLayout.LayoutParams(0, -2, 1f).apply { leftMargin = dp(8f) },
+            )
         }
 
         val player = LinearLayout(this).apply {
@@ -447,6 +504,9 @@ class MiniPlayerOverlayService : Service() {
         totalTimeView = totalTime
         modeView = mode
         playPauseView = playPause
+        volumeButton = volume
+        volumeRow = volumeRowView
+        volumeSeekBar = volumeSeek
         queueList = list
         queueScroll = scroll
         queueHeaderRow = headerRow
@@ -457,6 +517,7 @@ class MiniPlayerOverlayService : Service() {
         root = rootView
 
         wireSeekBar(seek)
+        wireVolumeSeek(volumeSeek)
         wireDrag(rootView, cardView)
 
         val type = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -532,6 +593,60 @@ class MiniPlayerOverlayService : Service() {
                 uiHandler.postDelayed(progressTicker, 500)
             }
         })
+    }
+
+    /** 音量 SeekBar：按「音量键调节应用内音量」开关分流——开启时拖动只调
+     * 应用内音量（回传 Dart 走 settings.volume 统一下发），关闭时调系统
+     * 媒体音量；图标随静音状态切换。 */
+    private fun wireVolumeSeek(seek: SeekBar) {
+        seek.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(bar: SeekBar?, progress: Int, fromUser: Boolean) {
+                if (!fromUser) return
+                if (appVolumeMode) {
+                    appVolume = progress / 1000f
+                    reportAction(ACTION_SET_APP_VOLUME, appVolume.toDouble())
+                    updateVolumeIcon(progress)
+                } else {
+                    audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, progress, 0)
+                    updateVolumeIcon(progress)
+                }
+            }
+
+            override fun onStartTrackingTouch(bar: SeekBar?) = Unit
+
+            override fun onStopTrackingTouch(bar: SeekBar?) = Unit
+        })
+    }
+
+    /** 展开/收起音量调节行；展开时刷新为当前分流模式下的音量。 */
+    private fun toggleVolumeRow() {
+        volumeExpanded = !volumeExpanded
+        volumeRow?.visibility = if (volumeExpanded) View.VISIBLE else View.GONE
+        volumeButton?.setColorFilter(
+            if (volumeExpanded) ACCENT else TEXT_PRIMARY,
+            PorterDuff.Mode.SRC_IN,
+        )
+        if (volumeExpanded) refreshVolumeUi()
+    }
+
+    /** 把音量条同步为当前分流模式下的音量（应用内音量 0..1000 或系统媒体
+     * 音量刻度），外部按键调节后保持显示一致。 */
+    private fun refreshVolumeUi() {
+        val current = if (appVolumeMode) (appVolume * 1000f).roundToInt()
+        else audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)
+        volumeSeekBar?.max = 1000
+        if (volumeSeekBar?.progress != current) {
+            volumeSeekBar?.progress = current
+        }
+        updateVolumeIcon(current)
+    }
+
+    private fun updateVolumeIcon(volume: Int) {
+        val silent = volume <= 0
+        volumeButton?.setColorFilter(
+            if (silent) TEXT_SECONDARY else TEXT_PRIMARY,
+            PorterDuff.Mode.SRC_IN,
+        )
     }
 
     /** 卡片空白区域可拖动整窗；子 View（按钮/滑块）自行消费触摸，
@@ -683,6 +798,17 @@ class MiniPlayerOverlayService : Service() {
             lastArtist = p.artist
             artistView?.text = p.artist
             artistView?.visibility = if (p.artist.isBlank()) View.GONE else View.VISIBLE
+        }
+        // 应用内音量变化：行已展开时立即刷新，否则下次展开时再同步。
+        if (appVolume != p.appVolume) {
+            appVolume = p.appVolume
+            if (volumeExpanded) refreshVolumeUi()
+        }
+        // 音量键开关变化（设置页切换/首次加载）：同步音量条分流模式，
+        // 行已展开时按新模式立即刷新。
+        if (appVolumeMode != p.appVolumeMode) {
+            appVolumeMode = p.appVolumeMode
+            if (volumeExpanded) refreshVolumeUi()
         }
         applyCover(p.coverPath)
 

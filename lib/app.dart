@@ -263,7 +263,12 @@ class _XyMusicAppState extends ConsumerState<XyMusicApp>
       settingsProvider.select(
         (s) => s.valueOrNull?.volumeKeyControlsAppVolume ?? true,
       ),
-      (_, enabled) => _syncVolumeKeyCapture(enabled),
+      (_, enabled) {
+        _syncVolumeKeyCapture(enabled);
+        // 开关切换也会改变悬浮窗音量条的分流模式，触发一次同步让原生
+        // 按新模式刷新（首次加载默认值不变时由 update 全量携带兜底）。
+        MiniPlayerOverlayBridge.requestSync();
+      },
     );
     // 音量键调节应用内音量的 OSD 反馈：音量键被拦截时系统音量面板
     // 不会出现，由根节点提示当前应用音量。
@@ -283,6 +288,12 @@ class _XyMusicAppState extends ConsumerState<XyMusicApp>
         (s) => s.valueOrNull?.miniPlayerOverlayEnabled ?? false,
       ),
       (_, _) => MiniPlayerOverlayBridge.requestSync(immediate: true),
+    );
+    // 应用内音量变化（设置页滑杆/音量键/悬浮窗自身）也同步到悬浮窗，
+    // 保证其音量条在「音量键调节应用内音量」开启时回显一致。
+    ref.listen<double?>(
+      settingsProvider.select((s) => s.valueOrNull?.volume),
+      (_, _) => MiniPlayerOverlayBridge.requestSync(),
     );
     ref.listen<PlaybackState>(
       playerProvider,
