@@ -163,6 +163,45 @@ void main() {
     expect((lx['_types'] as Map).containsKey('320k'), isTrue);
   });
 
+  test('QQ 插件分支保留数字 songId 供 getLyric 请求 QRC 逐字歌词', () {
+    // 回归：备份 QQ 歌 id 是数字 songId、songmid 是字符串 mid，二者
+    // 不同。插件协议 musicItem.id 必须保留数字 songId，否则 getLyric
+    // 的 songID 参数被 songmid 覆盖后 QQ 接口返回 10006，插件降级老
+    // 接口只剩普通 LRC，逐字时间轴丢失。
+    final plugin = const EnabledMusicPlugin(
+      id: 'qq-l1',
+      name: 'QQ音乐 L1',
+      path: '/plugins/qq-l1.js',
+    );
+    final result = parseMusicFreeBackup(
+      jsonEncode({
+        'musicSheets': [
+          {
+            'title': '我喜欢',
+            'musicList': [
+              {
+                'id': 575785845,
+                'songmid': '0006A93H2qAQu2',
+                'title': '恋落花',
+                'singer': '陈语淇',
+                'albumName': '恋落花',
+                'platform': 'QQ音乐[L1]',
+                'qualities': {'320k': {'size': 7218953}},
+              },
+            ],
+          },
+        ],
+      }),
+      plugins: [plugin],
+    );
+
+    final song = result.playlists.single.songs.single;
+    expect(song.pluginId, plugin.id);
+    expect(song.pluginData?['id'], 575785845);
+    expect(song.pluginData?['songmid'], '0006A93H2qAQu2');
+    expect(song.path, 'plugin://qq-l1/575785845');
+  });
+
   test('酷狗歌曲无 hash 字段时回退 id 并构建音质表', () {
     // mf 原版导出的酷狗歌把 hash 放在 id 字段，lx.hash 需回退 id，
     // interval 格式化为 "MM:SS"、qualities 转成 _types。

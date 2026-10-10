@@ -263,17 +263,26 @@ Song? _toSong(
   }
 
   final pluginData = Map<String, dynamic>.from(raw);
-  // MusicFree 插件通常使用 id；旧备份可能只保留 musicId/songmid。
-  // BakaMusic 的 QQ 歌 id 是数字 songId，可播放 mid 在 songmid，统一
-  // 用修正后的 id 回填（保留原始类型），避免回放时拿错字段。
-  pluginData['id'] = idValue;
+  // MusicFree 插件协议以 musicItem.id 为平台歌曲 id：QQ 插件的
+  // getLyric 用 songID=musicItem.id 请求 QRC 逐字歌词（crypt:1 +
+  // qrc:1），getMediaSource 用 songmid 取流。BakaMusic 备份中 QQ 歌的
+  // id 是数字 songId、songmid 是字符串 mid，而 _pickPlayableId 对
+  // songmid != id 的歌会优先返回 songmid——直接用它会覆盖插件协议里
+  // 的 id，歌词接口 songID 参数被替换成 songmid 后返回 10006，插件
+  // 静默降级老接口只剩普通 LRC，逐字时间轴丢失（表现为能播放但无逐字
+  // 歌词）。因此插件分支保留原始 id（数字 songId）；仅当备份缺少
+  // id 类字段（旧备份只有 songmid/mid/hash）时才回填可播放 id。
+  final rawId =
+      raw['id'] ?? raw['musicId'] ?? raw['songId'] ?? raw['songid'];
+  final pluginSongId = rawId ?? idValue;
+  pluginData['id'] = pluginSongId;
   pluginData['title'] ??= title;
   pluginData['artist'] ??= artist;
   pluginData['album'] ??= album;
   pluginData['platform'] ??= platform;
   return Song(
-    path:
-        'plugin://${Uri.encodeComponent(plugin.id)}/${Uri.encodeComponent(id)}',
+    path: 'plugin://${Uri.encodeComponent(plugin.id)}/'
+        '${Uri.encodeComponent('$pluginSongId')}',
     title: title,
     artist: artist,
     album: album,
