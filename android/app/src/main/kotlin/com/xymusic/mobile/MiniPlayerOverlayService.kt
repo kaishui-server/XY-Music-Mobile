@@ -11,6 +11,7 @@ import android.graphics.PixelFormat
 import android.graphics.PorterDuff
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
+import android.media.AudioManager
 import android.os.Build
 import android.os.Handler
 import android.os.IBinder
