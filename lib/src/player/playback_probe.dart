@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:io';
 
+import 'package:flutter/scheduler.dart';
 import 'package:flutter/services.dart';
 
 import '../logging/app_log_store.dart';
@@ -13,7 +14,8 @@ import '../logging/app_log_store.dart';
 /// 以及是否为「主 isolate 冻结」（采样定时器自身长时间不触发）。
 ///
 /// 采集策略：默认只记录异常，避免污染日志；
-/// - 每 5 分钟一条紧凑心跳，保证永久卡死时日志里有卡死前最近的现场；
+/// - 每 1 分钟一条健康心跳（含 RSS/掉帧/isolate 延迟/缓冲提前量），
+///   用于观察「播放半小时后开始卡顿」这类随时间恶化的问题的趋势；
 /// - 命中异常时把内存里最近 12 次采样（约 1 分钟）整段落盘，还原过程。
 class PlaybackProbe {
   PlaybackProbe({required this.sample, this.interval = const Duration(seconds: 5)});
@@ -27,7 +29,7 @@ class PlaybackProbe {
   static const _channel = MethodChannel('com.xymusic.mobile/device_info');
   static const _ringSize = 12;
   static const _stallSamples = 3; // 连续 3 次（约 15s）未推进判为停滞
-  static const _heartbeatTicks = 60; // 每 60 次采样（约 5 分钟）打一条心跳
+  static const _heartbeatTicks = 12; // 每 12 次采样（约 1 分钟）打一条心跳
   static const _anomalyCooldown = Duration(minutes: 2);
 
   Timer? _timer;
@@ -39,15 +41,40 @@ class PlaybackProbe {
   DateTime _lastTickWall = DateTime.now();
   int _seq = 0;
 
+  // ---- 心跳窗口统计（每条心跳输出后清零）----
+  /// 本窗口内采样定时器的最大调度间隙：主 isolate 阻塞的最长一次。
+  int _maxGapMs = 0;
+  /// 本窗口内 ≥16ms 的掉帧行数与 ≥100ms 的严重掉帧行数。
+  int _jankFrames = 0;
+  int _severeJankFrames = 0;
+  /// 本窗口内最差一帧的总耗时。
+  int _worstFrameMs = 0;
+  /// 本窗口内缓冲提前量（buffered - position）的最小/最大值，-1 表示无样本。
+  int _minAheadMs = -1;
+  int _maxAheadMs = -1;
+
   void start() {
     _timer?.cancel();
     _lastTickWall = DateTime.now();
     _timer = Timer.periodic(interval, (_) => unawaited(_tick()));
+    // 帧耗时统计：UI 掉帧是「卡顿」的另一形态（媒体层正常但界面卡），
+    // 与媒体层重缓冲（由 player_provider 的状态流记录）互相印证。
+    SchedulerBinding.instance.addTimingsCallback(_onFrameTimings);
   }
 
   void stop() {
     _timer?.cancel();
     _timer = null;
+    SchedulerBinding.instance.removeTimingsCallback(_onFrameTimings);
+  }
+
+  void _onFrameTimings(List<FrameTiming> timings) {
+    for (final t in timings) {
+      final ms = t.totalSpan.inMilliseconds;
+      if (ms > _worstFrameMs) _worstFrameMs = ms;
+      if (ms >= 100) _severeJankFrames++;
+      if (ms >= 16) _jankFrames++;
+    }
   }
 
   Future<void> _tick() async {
@@ -56,6 +83,7 @@ class PlaybackProbe {
     // （UI 冻结类卡死）。先记录冻结事实，再继续正常采样。
     final gapMs = now.difference(_lastTickWall).inMilliseconds;
     _lastTickWall = now;
+    if (gapMs > _maxGapMs) _maxGapMs = gapMs;
     final expectedMs = interval.inMilliseconds;
     if (gapMs > expectedMs * 2 + 1500) {
       _log(
@@ -75,6 +103,13 @@ class PlaybackProbe {
     _ring.add(current);
     if (_ring.length > _ringSize) _ring.removeAt(0);
 
+    // 缓冲提前量窗口统计：持续收窄说明网络供给跟不上消耗（重缓冲前兆）。
+    final aheadMs = current.bufferedMs - current.positionMs;
+    if (aheadMs >= 0) {
+      if (_minAheadMs < 0 || aheadMs < _minAheadMs) _minAheadMs = aheadMs;
+      if (aheadMs > _maxAheadMs) _maxAheadMs = aheadMs;
+    }
+
     // 进度停滞判定：playing 且位置较上次推进不足 300ms。
     final prev = _last;
     if (current.playing && prev != null && current.positionMs - prev.positionMs < 300) {
@@ -88,7 +123,24 @@ class PlaybackProbe {
     if (_stallStreak >= _stallSamples) {
       _reportStall(current, native, gapMs);
     } else if (_ticks % _heartbeatTicks == 0) {
-      _log('[PROBE] 心跳 #$_seq $current $native');
+      // 健康心跳：每分钟一条趋势快照。随时间恶化的问题（内存爬升、
+      // isolate 延迟变大、缓冲提前量收窄、掉帧增多）会在这条线的
+      // 纵向对比中显形，与单点异常日志互补。
+      final rssMb = (ProcessInfo.currentRss / 1024 / 1024).toStringAsFixed(0);
+      final ahead = _minAheadMs < 0
+          ? 'n/a'
+          : '${_minAheadMs}~${_maxAheadMs}ms';
+      _log(
+        '[PROBE] 心跳 #$_seq $current $native | rss=${rssMb}MB '
+        'isolate延迟=${_maxGapMs}ms 掉帧16ms+=$_jankFrames/100ms+=$_severeJankFrames '
+        '最差帧=${_worstFrameMs}ms 缓冲提前量=$ahead',
+      );
+      _maxGapMs = 0;
+      _jankFrames = 0;
+      _severeJankFrames = 0;
+      _worstFrameMs = 0;
+      _minAheadMs = -1;
+      _maxAheadMs = -1;
     }
     _ticks++;
   }

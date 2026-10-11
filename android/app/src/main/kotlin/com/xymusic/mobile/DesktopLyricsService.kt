@@ -108,7 +108,7 @@ class DesktopLyricsService : Service() {
     private var startY = 0
 
     // ---- 位置与字体状态 ----
-    /** 浮窗当前纵向位置（px，自屏幕底边起算），由 [appliedPercent] 换算而来。 */
+    /** 浮窗当前纵向位置（px，自屏幕顶边起算），由 [appliedPercent] 换算而来。 */
     private var baseY = 0
     /** 已应用到浮窗的纵向位置（百分制）：0 = 顶端、50 = 居中、100 = 底端。
      * 作为位置唯一真源，浮窗高度/整屏高度变化后都据此重算，不会漂移。 */
@@ -319,7 +319,13 @@ class DesktopLyricsService : Service() {
                 WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
             PixelFormat.TRANSLUCENT,
         ).apply {
-            gravity = Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
+            // 纵向锚定在顶边：y 自屏幕顶边起算。行数变化（如翻译行显隐、
+            // 长句换行）导致浮窗高度变化时，系统按 gravity 锚定的一侧先
+            // 布局、addOnLayoutChangeListener 再修正 y。锚定底边时浮窗
+            // 「向上长」，顶边先冲出屏幕再被拉回，浮窗在顶部时表现为一次
+            // 可见的跳动；锚定顶边则顶边天然不动、内容向下扩展，顶部
+            // （percent=0）时 y 恒为 0 无需修正，完全无跳动。
+            gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
             val prefs = getSharedPreferences("desktop_lyrics", MODE_PRIVATE)
             x = prefs.getInt("x", 0)
             // 恢复已应用的纵向位置：服务被回收重建时 Dart 会把当前滑块值
@@ -357,7 +363,8 @@ class DesktopLyricsService : Service() {
                     params.x = startX + (event.rawX - downX).toInt()
                     // 拖动直接写浮窗位置；拖动结束后再换算回百分制回传。
                     // 按整屏（含状态栏）高度钳制，允许一直拖到屏幕最顶端。
-                    baseY = clampY(startY - (event.rawY - downY).toInt())
+                    // y 自顶边起算，与屏幕方向一致：手指上移 → y 减小。
+                    baseY = clampY(startY + (event.rawY - downY).toInt())
                     params.y = baseY
                     try {
                         windowManager?.updateViewLayout(root, params)
@@ -697,22 +704,22 @@ class DesktopLyricsService : Service() {
         return (screenHeightPx() - panelHeight).coerceAtLeast(0)
     }
 
-    /// 浮窗 y 钳制：y 自屏幕底边起算，上限取「整屏高 - 浮窗高」，
-    /// 保证浮窗完整可见且能一直贴到屏幕最顶端（可覆盖状态栏）。
+    /** 浮窗 y 钳制：y 自屏幕顶边起算，上限取「整屏高 - 浮窗高」，
+     * 保证浮窗完整可见且能一直贴到屏幕最顶端（可覆盖状态栏）。 */
     private fun clampY(value: Int): Int = value.coerceIn(0, availableHeightPx())
 
-    /** 百分制纵向位置 → 浮窗 y（px，自屏幕底边起算）。
-     * 0 = 屏幕最顶端（y 取最大值，浮窗顶边贴屏顶）；100 = 屏幕最底端。 */
+    /** 百分制纵向位置 → 浮窗 y（px，自屏幕顶边起算）。
+     * 0 = 屏幕最顶端（y=0，浮窗顶边贴屏顶）；100 = 屏幕最底端。 */
     private fun percentToY(percent: Float): Int {
         val available = availableHeightPx()
-        return (available * (1f - percent.coerceIn(0f, 100f) / 100f)).toInt()
+        return (available * (percent.coerceIn(0f, 100f) / 100f)).toInt()
     }
 
-    /** 浮窗 y（px）→ 百分制纵向位置，与 [percentToY] 互为反算。 */
+    /** 浮窗 y（px，自顶边起算）→ 百分制纵向位置，与 [percentToY] 互为反算。 */
     private fun yToPercent(y: Int): Float {
         val available = availableHeightPx()
         if (available <= 0) return appliedPercent
-        return ((1f - y.toFloat() / available) * 100f).coerceIn(0f, 100f)
+        return ((y.toFloat() / available) * 100f).coerceIn(0f, 100f)
     }
 
     /** 浮窗高度变化后重新按当前百分制位置摆放（可移动范围依赖浮窗高度）。

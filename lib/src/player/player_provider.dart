@@ -1638,6 +1638,13 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
     sample: _probeSample,
   );
 
+  // ---- 播放中重缓冲（卡顿）事件记录 ----
+  /// 上一次 playerStateStream 事件的处理状态：识别「ready→buffering」跌落。
+  ProcessingState? _lastStreamProcessingState;
+  /// 当前曲的重缓冲次数与本次进入时间（null 表示当前不在缓冲中）。
+  int _rebufferCount = 0;
+  DateTime? _rebufferEnteredAt;
+
   /// 探针采样：无歌曲时返回 null（不采样）；有歌曲时给出进度、缓冲、
   /// 解码状态与 DSP 管线占用情况。
   PlaybackProbeSample? _probeSample() {
@@ -1798,6 +1805,41 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
     _stateSub = _player.playerStateStream.listen((ps) {
       final playing = ps.playing;
       final completed = ps.processingState == ProcessingState.completed;
+      // 播放中重缓冲（卡顿）事件：从 ready 跌回 buffering 是媒体层
+      // 供流不足的直接证据。起播/换歌加载阶段的 buffering 不算
+      // （前一状态不是 ready，天然被挡掉）。
+      final prevStreamState = _lastStreamProcessingState;
+      _lastStreamProcessingState = ps.processingState;
+      if (playing &&
+          prevStreamState == ProcessingState.ready &&
+          ps.processingState == ProcessingState.buffering &&
+          !state.isLoading) {
+        _rebufferCount++;
+        _rebufferEnteredAt = DateTime.now();
+        // 防刷屏：每首歌前 6 次逐条记录，之后每 6 次留一条汇总线索。
+        if (_rebufferCount <= 6 || _rebufferCount % 6 == 0) {
+          final posMs = _player.position.inMilliseconds;
+          final aheadMs = _player.bufferedPosition.inMilliseconds - posMs;
+          AppLogStore.instance.add(
+            '[卡顿] 进入重缓冲 #$_rebufferCount '
+            'pos=${posMs}ms 提前量=${aheadMs}ms',
+            level: AppLogLevel.warning,
+          );
+        }
+      } else if (_rebufferEnteredAt != null &&
+          ps.processingState != ProcessingState.buffering) {
+        final tookMs =
+            DateTime.now().difference(_rebufferEnteredAt!).inMilliseconds;
+        _rebufferEnteredAt = null;
+        if (_rebufferCount <= 6 || _rebufferCount % 6 == 0) {
+          final posMs = _player.position.inMilliseconds;
+          final aheadMs = _player.bufferedPosition.inMilliseconds - posMs;
+          AppLogStore.instance.add(
+            '[卡顿] 缓冲恢复 耗时${tookMs}ms pos=${posMs}ms 提前量=${aheadMs}ms',
+            level: AppLogLevel.warning,
+          );
+        }
+      }
       // DSP 管线同步：idle（_playAt 切歌先 stop()、重建播放器、手动停止）
       // 时释放管线，杜绝旧曲管线在新曲准备期间继续出声；其余状态把
       // 播放态转发给真正出声的 Rust 管线（通知栏/蓝牙/车机控制的
@@ -1807,6 +1849,9 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
         _pendingDspTakeover = null;
         _dspDeferredTakeoverTimer?.cancel();
         _dspDeferredTakeoverTimer = null;
+        // 重缓冲计数随新歌清零：防刷屏的「前 6 次逐条」窗口对新歌重新生效。
+        _rebufferCount = 0;
+        _rebufferEnteredAt = null;
         unawaited(_stopDspPipeline());
       } else {
         // 首次 ready 且已起播：此时 ExoPlayer 已拿到最小缓冲，可以安全
@@ -1867,7 +1912,7 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
       // 防抖写入，退出瞬间最后一段进度会丢；进程被系统回收时更是整段丢失，
       // 表现为重进后“记不住上次播放位置”。
       _syncPositionFromEngine();
-      unawaited(_persistSession());
+      _schedulePersistSession();
     }
     // 前后台切换时重挂 position 流，按当前生命周期选择采样周期
     // （后台降频，降低后台 CPU 占用）；尚未挂接时忽略。
@@ -2471,7 +2516,7 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
               _loadPluginLyrics(idx, plugin, state.current ?? items[idx]),
             );
           }
-          unawaited(_persistSession());
+          _schedulePersistSession();
         } catch (error, stackTrace) {
           debugPrint('播放会话预加载失败：$error');
           debugPrintStack(stackTrace: stackTrace);
@@ -2778,7 +2823,7 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
         queueIndex: index,
       );
     }
-    unawaited(_persistSession());
+    _schedulePersistSession();
   }
 
   /// 起播成功后预解析队列中下一首歌曲的播放地址（写入运行时短时
@@ -3211,7 +3256,7 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
       errorMessage: message,
     );
     _publishNotice(message);
-    unawaited(_persistSession());
+    _schedulePersistSession();
   }
 
   void _publishRelinkProposal({
@@ -3271,7 +3316,7 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
           : state.duration,
       errorMessage: null,
     );
-    unawaited(_persistSession());
+    _schedulePersistSession();
     await _playAt(index);
   }
 
@@ -3299,7 +3344,7 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
           : state.duration,
       errorMessage: null,
     );
-    unawaited(_persistSession());
+    _schedulePersistSession();
     if (index == state.queueIndex) {
       await _playAt(index);
     }
@@ -3340,7 +3385,7 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
           : state.duration,
       errorMessage: null,
     );
-    unawaited(_persistSession());
+    _schedulePersistSession();
     _publishNotice('在线音源不可用，已自动切换为本地文件播放');
     await _playAt(queueIndex);
   }
@@ -3766,7 +3811,7 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
             ? original.durationMs / 1000.0
             : state.duration,
       );
-      unawaited(_persistSession());
+      _schedulePersistSession();
       if (index == state.queueIndex) {
         await _playAt(index);
       }
@@ -3774,41 +3819,94 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
     return true;
   }
 
+  // ---- 记忆歌词内存缓存 ----
+  // SharedPreferences 把整份歌词表存成单个 JSON 字符串（上限 100 首 ×
+  // 300KB ≈ 30MB）。旧实现每次起播都把整张表在主 isolate 上 jsonDecode
+  // 一遍（只为读一首歌），重用户实测单次卡主 isolate 数秒、每次切歌
+  // 分配 60MB+，是「听半小时后卡顿」（RSS 爬到 2.4GB、每分钟一次 6s
+  // 冻结）的直接原因。改为：懒加载一次进内存，后续读 O(1)；写只改
+  // 内存并延迟在后台 isolate 编码落盘。
+  Map<String, String>? _rememberedLyricsCache;
+  Future<Map<String, String>?>? _rememberedLyricsLoadTask;
+  Timer? _rememberedLyricsSaveTimer;
+
+  Future<Map<String, String>?> _ensureRememberedLyricsCache() {
+    return _rememberedLyricsLoadTask ??= () async {
+      try {
+        final preferences = await SharedPreferences.getInstance();
+        final raw = preferences.getString(_rememberedLyricsKey);
+        if (raw == null || raw.isEmpty) {
+          _rememberedLyricsCache = <String, String>{};
+          return _rememberedLyricsCache;
+        }
+        // 30MB 级 jsonDecode 放后台 isolate：String 跨 isolate 传递是
+        // 整块字节拷贝，代价远小于主 isolate 上的解析本身。
+        final decoded = await Isolate.run(() => jsonDecode(raw));
+        if (decoded is Map) {
+          _rememberedLyricsCache = <String, String>{
+            for (final entry in decoded.entries)
+              entry.key.toString(): entry.value?.toString() ?? '',
+          };
+        } else {
+          _rememberedLyricsCache = <String, String>{};
+        }
+      } catch (_) {
+        _rememberedLyricsCache = <String, String>{};
+      }
+      return _rememberedLyricsCache;
+    }();
+  }
+
+  /// 延迟把内存中的歌词表编码落盘：多次保存合并为一次写，编码在后台
+  /// isolate 完成，不再阻塞主 isolate。
+  void _scheduleRememberedLyricsSave() {
+    _rememberedLyricsSaveTimer?.cancel();
+    _rememberedLyricsSaveTimer = Timer(const Duration(seconds: 3), () {
+      _rememberedLyricsSaveTimer = null;
+      unawaited(_flushRememberedLyrics());
+    });
+  }
+
+  Future<void> _flushRememberedLyrics() async {
+    final cache = _rememberedLyricsCache;
+    if (cache == null) return;
+    try {
+      final snapshot = Map<String, String>.of(cache);
+      final encoded = await Isolate.run(() => jsonEncode(snapshot));
+      final preferences = await SharedPreferences.getInstance();
+      await preferences.setString(_rememberedLyricsKey, encoded);
+    } catch (_) {
+      // 落盘失败不影响内存表（下次保存会再试）。
+    }
+  }
+
+  /// 启动空闲期预加载记忆歌词表（解码在后台 isolate）：把冷启动后的
+  /// 首次解码从第一次点歌挪到启动 5 秒后的空闲期（见 app.dart）。
+  Future<void> prewarmRememberedLyrics() async {
+    await _ensureRememberedLyricsCache();
+  }
+
   Future<String?> _loadRememberedLyrics(String path) async {
     final key = path.trim();
     if (key.isEmpty) return null;
-    try {
-      final preferences = await SharedPreferences.getInstance();
-      final raw = preferences.getString(_rememberedLyricsKey);
-      if (raw == null || raw.isEmpty) return null;
-      final decoded = jsonDecode(raw);
-      if (decoded is! Map) return null;
-      final lyrics = decoded[key]?.toString().trim() ?? '';
-      return lyrics.isEmpty ? null : lyrics;
-    } catch (_) {
-      return null;
-    }
+    final cache = await _ensureRememberedLyricsCache();
+    if (cache == null) return null;
+    final lyrics = cache[key]?.trim() ?? '';
+    return lyrics.isEmpty ? null : lyrics;
   }
 
   Future<void> _saveRememberedLyrics(String path, String lyrics) async {
     final key = path.trim();
     final value = lyrics.trim();
     if (key.isEmpty || value.isEmpty || value.length > 300 * 1024) return;
-    try {
-      final preferences = await SharedPreferences.getInstance();
-      final remembered = <String, dynamic>{};
-      final raw = preferences.getString(_rememberedLyricsKey);
-      final decoded = raw == null ? null : jsonDecode(raw);
-      if (decoded is Map) {
-        remembered.addAll(Map<String, dynamic>.from(decoded));
-      }
-      remembered[key] = value;
-      // 歌词文本可能较大，限制数量避免长期使用后占满偏好设置。
-      while (remembered.length > 100) {
-        remembered.remove(remembered.keys.first);
-      }
-      await preferences.setString(_rememberedLyricsKey, jsonEncode(remembered));
-    } catch (_) {}
+    final cache = await _ensureRememberedLyricsCache();
+    if (cache == null) return;
+    cache[key] = value;
+    // 歌词文本可能较大，限制数量避免长期使用后占满偏好设置。
+    while (cache.length > 100) {
+      cache.remove(cache.keys.first);
+    }
+    _scheduleRememberedLyricsSave();
   }
 
   Future<void> _saveRememberedLyricsAssociation(
@@ -3902,14 +4000,11 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
           ? Map<String, dynamic>.from(decodedAssociations)
           : <String, dynamic>{};
       associations.remove(key);
-      final rawLyrics = preferences.getString(_rememberedLyricsKey);
-      final decodedLyrics = rawLyrics == null || rawLyrics.isEmpty
-          ? null
-          : jsonDecode(rawLyrics);
-      final lyrics = decodedLyrics is Map
-          ? Map<String, dynamic>.from(decodedLyrics)
-          : <String, dynamic>{};
-      lyrics.remove(key);
+      // 歌词表经内存缓存维护：直接读写 SharedPreferences 会与缓存失去
+      // 同步（缓存延迟落盘时会把已删除的条目原样写回）。
+      await _ensureRememberedLyricsCache();
+      _rememberedLyricsCache?.remove(key);
+      _scheduleRememberedLyricsSave();
       await Future.wait([
         associations.isEmpty
             ? preferences.remove(_rememberedLyricsAssociationKey)
@@ -3923,9 +4018,6 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
                 _rememberedLyricsOriginalKey,
                 jsonEncode(originals),
               ),
-        lyrics.isEmpty
-            ? preferences.remove(_rememberedLyricsKey)
-            : preferences.setString(_rememberedLyricsKey, jsonEncode(lyrics)),
       ]);
       return original;
     } catch (_) {
@@ -4378,7 +4470,7 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
       queue: queue,
       current: index == state.queueIndex ? queue[index] : state.current,
     );
-    unawaited(_persistSession());
+    _schedulePersistSession();
   }
 
   Future<void> _loadRecognizedPluginLyrics(
@@ -4402,13 +4494,13 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
       } else {
         _markLyricsAttempted(index);
       }
-      unawaited(_persistSession());
+      _schedulePersistSession();
     } catch (_) {
       if (index >= 0 &&
           index < state.queue.length &&
           state.queue[index].path == path) {
         _markLyricsAttempted(index);
-        unawaited(_persistSession());
+        _schedulePersistSession();
       }
     }
   }
@@ -4680,7 +4772,7 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
         queue: queue,
         current: index == state.queueIndex ? queue[index] : state.current,
       );
-      unawaited(_persistSession());
+      _schedulePersistSession();
       // 补拉结果回写持久化快照：收藏/歌单/最近播放里这些歌曲仍是空
       // 封面，导出备份迁移到其他设备（如 PC 桌面版）后封面与手机上
       // 实际显示的不一致（另一端走 pluginData 兜底拿到的是另一张图）。
@@ -4722,14 +4814,14 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
         } else {
           _markLyricsAttempted(index);
         }
-        unawaited(_persistSession());
+        _schedulePersistSession();
       }
     } catch (_) {
       if (index >= 0 &&
           index < state.queue.length &&
           state.queue[index].path == item.path) {
         _markLyricsAttempted(index);
-        unawaited(_persistSession());
+        _schedulePersistSession();
       }
     }
   }
@@ -4767,7 +4859,7 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
           index < state.queue.length &&
           state.queue[index].path == path) {
         _updateQueueLyrics(index, lyrics);
-        unawaited(_persistSession());
+        _schedulePersistSession();
       }
     } catch (_) {
       // LX 歌词属于附加能力，失败时不影响已经开始的音频播放。
@@ -4789,7 +4881,7 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
       } else {
         _markLyricsAttempted(index);
       }
-      unawaited(_persistSession());
+      _schedulePersistSession();
     } catch (_) {
       _markLyricsAttemptedForPath(index, path);
     }
@@ -4845,7 +4937,7 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
       return;
     }
     _markLyricsAttempted(index);
-    unawaited(_persistSession());
+    _schedulePersistSession();
   }
 
   void _markLyricsAttempted(int index) {
@@ -5347,7 +5439,7 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
         errorMessage: _friendlyPlaybackError(error),
       );
     }
-    unawaited(_persistSession());
+    _schedulePersistSession();
   }
 
   Future<PlaybackDownloadSource> resolveCurrentDownloadSource(
@@ -5760,7 +5852,7 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
     }
     await _player.setLoopMode(audioLoopModeForPlayMode(next));
     await _ref.read(settingsProvider.notifier).setPlayMode(next);
-    unawaited(_persistSession());
+    _schedulePersistSession();
     // 通知栏「播放模式」按钮图标随新模式刷新（列表循环/单曲循环/随机）。
     _refreshNotificationCustomControls();
   }
@@ -5803,6 +5895,20 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
     return (state.queueIndex + 1) % n; // 顺序：列表循环环绕
   }
 
+  /// 会话写回防抖：一次切歌会接连触发多次 _persistSession（队列更新、
+  /// 歌词写回、起播完成……），每次都要在主 isolate 构建载荷并深拷贝给编码
+  /// isolate，短窗口内合并成一次写，降低主 isolate 负载。暂停/停止等
+  /// 需要立即落盘的路径仍直接 await _persistSession()。
+  Timer? _sessionPersistDebounce;
+
+  void _schedulePersistSession() {
+    _sessionPersistDebounce?.cancel();
+    _sessionPersistDebounce = Timer(const Duration(seconds: 4), () {
+      _sessionPersistDebounce = null;
+      unawaited(_persistSession());
+    });
+  }
+
   Future<void> _persistSession() async {
     try {
       final dbPath = await _ref.read(dbPathProvider.future);
@@ -5827,9 +5933,13 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
   void dispose() {
     _flushCurrentPlaybackStats();
     // 销毁前尽力落库一次（Provider 容器销毁等路径）。_persistSession 内部
-    // 已吞掉 ref 已失效的异常，失败不影响后续释放流程。
+    // 已吞掉 ref 已失效的异常，失败不影响后续释放流程。防抖待办的写回
+    // 改为立即执行：dispose 后定时器不会再跑。
     _syncPositionFromEngine();
+    _sessionPersistDebounce?.cancel();
     unawaited(_persistSession());
+    _rememberedLyricsSaveTimer?.cancel();
+    unawaited(_flushRememberedLyrics());
     WidgetsBinding.instance.removeObserver(this);
     _bridgeInstallTimer?.cancel();
     VideoPlaybackSession.progressRevision.removeListener(

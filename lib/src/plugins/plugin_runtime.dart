@@ -1251,6 +1251,14 @@ class PluginRuntimeService {
     EnabledMusicPlugin plugin,
     Map<String, dynamic> request,
   ) async {
+    // 出队后真正执行前复查熔断：排队期间同插件前一个调用已失败并建立
+    // 熔断时（观测到第二个调用排队 13s 后又白等 20s 超时），这里直接
+    // 抛错让上层立即换源，不再白撞死服务器。
+    if (_lxCircuitOpen(plugin)) {
+      throw Exception(
+        '音源「${plugin.name}」近期连接失败，已临时跳过（约 5 分钟后自动重试）',
+      );
+    }
     _activeRuntimeOperations++;
     final stopwatch = Stopwatch()..start();
     final action = request['action']?.toString() ?? '';
@@ -1272,7 +1280,10 @@ class PluginRuntimeService {
       }
       final result = await _runtime!.handlePromise(
         promise,
-        timeout: const Duration(seconds: 30),
+        // 12s：单次 LX 调用的硬上限。插件 JS 自身的网络经 8s HTTP 客户端
+        // 掐断，但一次调用可能串多个请求，12s 兜底；再长只会让整条
+        // 解析链（多插件×多音质）把起播拖到分钟级。
+        timeout: const Duration(seconds: 12),
       );
       if (result.isError) {
         throw Exception(_friendlyError(result.stringResult));
@@ -4547,6 +4558,11 @@ class PluginRuntimeService {
     }
     // 先完整尝试插件自己的接口。自定义 LX 音源通常只支持部分音质，
     // 不能因为第一档音质失败就立刻等待公共接口超时。
+    // 连续同因失败快速放弃：插件返回与音质无关的错误（如 unknow error、
+    // 无权限）时，换档重试只是把同一错误再撞 N 次（实测 8 档 × 两路
+    // 解析白等 20s+），连续 3 档同一错误立即换下一个源。
+    var sameErrorStreak = 0;
+    String? lastErrorMessage;
     for (final quality in qualities) {
       final attemptStopwatch = Stopwatch()..start();
       try {
@@ -4567,6 +4583,8 @@ class PluginRuntimeService {
           }
           return PluginMediaSource(url: _normalizeMediaUrl(pluginUrl));
         }
+        sameErrorStreak = 0;
+        lastErrorMessage = null;
         AppLogStore.instance.add(
           '[播放链路] LX解析未返回URL ${plugin.name} 音质$quality '
           '${attemptStopwatch.elapsedMilliseconds}ms',
@@ -4574,15 +4592,32 @@ class PluginRuntimeService {
         );
       } catch (error) {
         lastError = error;
+        final friendly = _friendlyError(error.toString());
+        // 与上一次错误相同才累计：错误不同（如逐档报「不支持该音质」）
+        // 说明换档有意义，继续试；完全相同则视为源级故障。
+        if (lastErrorMessage != null && lastErrorMessage == friendly) {
+          sameErrorStreak++;
+        } else {
+          sameErrorStreak = 1;
+          lastErrorMessage = friendly;
+        }
         AppLogStore.instance.add(
           '[播放链路] LX解析失败 ${plugin.name} 音质$quality '
           '${attemptStopwatch.elapsedMilliseconds}ms '
-          '${_friendlyError(error.toString())}',
+          '$friendly',
           // 中间过程失败（该档音质无链接/接口无权限）不是错误：fallback
           // 会自动换档或换源，最终正常出声时这只是诊断轨迹。只有整条链
           // 走完仍失败（播放真的报错）才由上层以 ERROR 记录。
           level: AppLogLevel.info,
         );
+        if (sameErrorStreak >= 3) {
+          AppLogStore.instance.add(
+            '[播放链路] 音源「${plugin.name}」连续 3 档报同一错误，'
+            '提前换下一个源',
+            level: AppLogLevel.warning,
+          );
+          break;
+        }
       }
     }
     // Older LX plugins may only expose the public resolver; keep it as a
@@ -4596,7 +4631,7 @@ class PluginRuntimeService {
         final response = await lxResolveUrl(
           songInfoJson: jsonEncode(songInfo),
           quality: quality,
-        ).timeout(const Duration(seconds: 15));
+        ).timeout(const Duration(seconds: 8));
         final decoded = jsonDecode(response);
         final url = decoded is Map
             ? decoded['url']?.toString().trim() ?? ''
@@ -7798,7 +7833,11 @@ class _PluginProxyHttpClient extends http.BaseClient {
         url: url,
         headersJson: headersJson,
         body: body,
-        timeout: BigInt.from(20),
+        // 8s：正常音源 1~3s 返回；死源（明文被拦/服务器挂）等待越久，
+        // 起播和它后面的 fallback 源被拖得越久（实测 20s×拦截重试使单
+        // 次解析达 40s+，用户全程转圈）。8s 足以覆盖慢速接口，死源由
+        // 连接级熔断在首次失败后直接跳过。
+        timeout: BigInt.from(8),
         follow: 10,
       );
       return jsonDecode(responseJson) as Map<String, dynamic>;

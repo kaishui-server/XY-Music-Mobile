@@ -109,11 +109,16 @@ class _XyMusicAppState extends ConsumerState<XyMusicApp>
     Future.microtask(() => ref.read(libraryProvider.notifier));
     // 预热插件 QuickJS 运行时（约 800KB 引导 JS）：放在启动 5 秒后的
     // 空闲期，避免冷启动开销叠加在用户第一次点歌的音源解析路径上。
+    // 同批预加载记忆歌词表：30MB 级 JSON 解码在后台 isolate 进行，
+    // 不预热的话会叠加到重启后第一次点歌的起播耗时上。
     _pluginRuntimeWarmupTimer = Timer(
       const Duration(seconds: 5),
-      () => unawaited(
-        ref.read(pluginRuntimeProvider).warmupRuntime(),
-      ),
+      () {
+        unawaited(ref.read(pluginRuntimeProvider).warmupRuntime());
+        unawaited(
+          ref.read(playerProvider.notifier).prewarmRememberedLyrics(),
+        );
+      },
     );
     // 分享深链（xymusic://song?...）：注册原生回调 + 取回冷启动深链。
     Future.microtask(() => XyDeepLink.init(ref, appRouter));
