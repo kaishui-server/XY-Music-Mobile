@@ -244,6 +244,8 @@ class MiniPlayerOverlayBridge {
     final coverPath = await _resolveCoverPath(item);
     if (generation != _syncGeneration) return;
     final appVolume = ref.read(settingsProvider).valueOrNull?.volume ?? 1.0;
+    final appVolumeMode =
+        ref.read(settingsProvider).valueOrNull?.volumeKeyControlsAppVolume ?? true;
 
     _updateQueue(state.queue);
     final positionMs = state.position.isFinite && state.position > 0
