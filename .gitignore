@@ -75,3 +75,11 @@ package-lock.json
 
 # 本地调试产物：一次调试会话的网易云接口加密参数（含会话信息）
 tool/netease_params.txt
+
+# 探针/调试脚本与构建日志（本地临时产物，不入库）
+/temp/
+/temp_probe.dart
+/probe_*.py
+/build_rb*.txt
+/build_rb*.err
+/cargo_*.log

@@ -396,6 +396,12 @@ class MiniPlayerOverlayService : Service() {
                 buttonRow,
                 LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(2f) },
             )
+            // 音量调节行：点击音量图标展开，拖动 SeekBar 直接调系统媒体音量。
+            // 此前音量条从未加入 player 布局，导致悬浮窗只有图标、无实际可调音量条。
+            addView(
+                volumeRowView,
+                LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(4f) },
+            )
         }
 
         // 播放列表页：就地展开队列，点选任意一首直接切歌。
@@ -633,9 +639,17 @@ class MiniPlayerOverlayService : Service() {
     /** 把音量条同步为当前分流模式下的音量（应用内音量 0..1000 或系统媒体
      * 音量刻度），外部按键调节后保持显示一致。 */
     private fun refreshVolumeUi() {
-        val current = if (appVolumeMode) (appVolume * 1000f).roundToInt()
-        else audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)
-        volumeSeekBar?.max = 1000
+        val current: Int
+        if (appVolumeMode) {
+            // 应用内音量：0..1000 归一化刻度。
+            volumeSeekBar?.max = 1000
+            current = (appVolume * 1000f).roundToInt()
+        } else {
+            // 系统媒体音量：跟随系统实际最大刻度，避免进度值超出系统音量范围。
+            val maxVol = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
+            volumeSeekBar?.max = maxVol
+            current = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)
+        }
         if (volumeSeekBar?.progress != current) {
             volumeSeekBar?.progress = current
         }

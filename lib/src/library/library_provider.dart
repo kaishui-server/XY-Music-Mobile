@@ -423,7 +423,9 @@ class LibraryNotifier extends StateNotifier<LibraryState> {
   /// 播放任意歌曲列表（点击单曲走这里）。
   ///
   /// 受“播放歌曲时”设置影响：默认把整个列表加入播放队列；选择
-  /// “仅将此歌曲加入播放队列”时只把点中的这一首入队。
+  /// “仅将此歌曲加入播放队列”时只把用户点播过的歌曲加入播放列表，
+  /// 未点播过的歌曲不混入队列。已点播过的歌曲会保留在列表里，重复
+  /// 点击同一首直接切歌、不重复入队。
   Future<void> playList(List<Song> songs, int index) async {
     if (songs.isEmpty) return;
     final mode = _ref
@@ -432,7 +434,24 @@ class LibraryNotifier extends StateNotifier<LibraryState> {
         ?.playSongQueueMode;
     if (mode == PlaySongQueueMode.singleSong) {
       final i = index.clamp(0, songs.length - 1).toInt();
-      await _playList([songs[i]], 0);
+      final clicked = songs[i];
+      final notifier = _ref.read(playerProvider.notifier);
+      final queue = _ref.read(playerProvider).queue;
+      final existing = queue.indexWhere((q) => q.path == clicked.path);
+      if (existing >= 0) {
+        // 这首歌之前点播过，仍在播放列表中：直接切到该曲，避免重复入队。
+        await notifier.playIndex(existing);
+        return;
+      }
+      if (queue.isEmpty) {
+        // 尚未播放任何歌曲：以点中的这首为唯一队列项。
+        await _playList([clicked], 0);
+        return;
+      }
+      // 已有点播历史：把点中的歌曲追加到队列末尾并立即播放，
+      // 保留之前点播过的歌曲，未点播的歌曲不进入列表。
+      await notifier.addToQueue(clicked.toQueueItem());
+      await notifier.playIndex(queue.length);
       return;
     }
     await _playList(songs, index);

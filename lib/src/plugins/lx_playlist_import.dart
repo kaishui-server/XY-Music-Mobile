@@ -284,6 +284,13 @@ Future<LxPlaylistImportResult> _importKw(http.Client client, String input) async
       final title = _text(item['name']);
       if (songmid.isEmpty || title.isEmpty) continue;
       if (!seen.add('kw/$songmid')) continue;
+      // 酷我 nplserver 歌单级 pic 常为空，用首首歌封面回退歌单封面，
+      // 保证歌单导入后详情页有封面展示。
+      if (cover.isEmpty) {
+        cover = _normalizeCover(
+          _text(item['albumpic'] ?? item['musicPic'] ?? item['artistPic']),
+        );
+      }
       final durationSec = _toInt(item['duration']);
       songs.add(
         _lxSong(
@@ -294,6 +301,10 @@ Future<LxPlaylistImportResult> _importKw(http.Client client, String input) async
           album: _text(item['album']),
           albumId: _text(item['albumid']),
           durationSec: durationSec,
+          // 歌曲级封面：albumpic 优先，musicPic/artistPic 兜底。
+          img: _normalizeCover(
+            _text(item['albumpic'] ?? item['musicPic'] ?? item['artistPic']),
+          ),
           types: _kwTypes(_text(item['N_MINFO'])),
         ),
       );

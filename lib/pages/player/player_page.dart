@@ -2052,29 +2052,104 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
     XyNotice.show(context, message: '正在读取插件支持的音质…');
     final qualities = await _discoverQualityOptions(item, preferred: current);
     if (!mounted) return;
+    // 音质菜单右侧文件大小：有损档位先用码率×时长估算占位，无损/未知
+    // 档位随后异步探测真实直链大小（成功无 ≈ 前缀，探测中显示进度圈）。
+    final qualitySizes = <String, _QualitySize?>{};
+    final probing = <String>{};
+    for (final value in qualities) {
+      final bytes = estimateLossyDownloadSizeBytes(value, item.durationMs);
+      if (bytes != null) {
+        qualitySizes[value] = _QualitySize(bytes, estimated: true);
+      }
+    }
+    var probingStarted = false;
+    Widget sizeTrailing(
+      BuildContext sheetContext,
+      String value,
+    ) {
+      final size = qualitySizes[value];
+      if (size == null) {
+        if (probing.contains(value)) {
+          return const SizedBox.square(
+            dimension: 12,
+            child: CircularProgressIndicator(strokeWidth: 1.6),
+          );
+        }
+        return Text(
+          '未知',
+          style: TextStyle(
+            fontSize: 12,
+            color: Theme.of(sheetContext).colorScheme.onSurfaceVariant,
+          ),
+        );
+      }
+      final text = '${size.estimated ? '≈' : ''}${_formatFileSize(size.bytes)}';
+      return Text(
+        text,
+        style: TextStyle(
+          fontSize: 12,
+          color: Theme.of(sheetContext).colorScheme.onSurfaceVariant,
+        ),
+      );
+    }
+
+    Future<void> startProbing(
+      BuildContext sheetContext,
+      StateSetter setSheetState,
+    ) async {
+      for (final value in qualities) {
+        if (qualitySizes.containsKey(value)) continue;
+        probing.add(value);
+        unawaited(_probeDownloadSize(item, value).then((bytes) {
+          if (!sheetContext.mounted) return;
+          setSheetState(() {
+            probing.remove(value);
+            qualitySizes[value] =
+                bytes != null && bytes > 0 ? _QualitySize(bytes) : null;
+          });
+        }));
+      }
+    }
+
     final quality = await showModalBottomSheet<String>(
       context: context,
       useRootNavigator: true,
       showDragHandle: true,
-      builder: (context) => SafeArea(
-        child: SingleChildScrollView(
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              for (final value in qualities)
-                ListTile(
-                  title: Text(_qualityLabel(value)),
-                  trailing: value == current
-                      ? Icon(
-                          Icons.check_rounded,
-                          color: Theme.of(context).colorScheme.primary,
-                        )
-                      : null,
-                  onTap: () => Navigator.pop(context, value),
-                ),
-            ],
-          ),
-        ),
+      builder: (context) => StatefulBuilder(
+        builder: (sheetContext, setSheetState) {
+          if (!probingStarted) {
+            probingStarted = true;
+            unawaited(startProbing(sheetContext, setSheetState));
+          }
+          return SafeArea(
+            child: SingleChildScrollView(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  for (final value in qualities)
+                    ListTile(
+                      title: Text(_qualityLabel(value)),
+                      trailing: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          if (value == current)
+                            Icon(
+                              Icons.check_rounded,
+                              size: 20,
+                              color:
+                                  Theme.of(sheetContext).colorScheme.primary,
+                            ),
+                          if (value == current) const SizedBox(width: 6),
+                          sizeTrailing(sheetContext, value),
+                        ],
+                      ),
+                      onTap: () => Navigator.pop(sheetContext, value),
+                    ),
+                ],
+              ),
+            ),
+          );
+        },
       ),
     );
     if (!mounted || quality == null || quality == current) return;
@@ -2142,11 +2217,12 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
           );
       final result = <String>{...discovered, ...fallback};
       final list = result.isEmpty ? const ['320k'] : result.toList();
-      // 去重后再按档位（低 → 高）排序：兜底追加的当前音质 token 会落在
-      // 列表末尾，且超时/异常路径直接返回未排序列表，统一排一次保证
-      // 选择器始终“低清在上、超清母带在最下”。
+      // 去重后再按档位（高 → 低）排序：与播放详情页音质菜单期望顺序一致
+      // （Master → Atmos 2.0 → Atmos → Dolby → Vinyl → Hires → FLAC Hires
+      // → FLAC → 320K → 192K → 128K → 96K），超时/异常路径返回未排序
+      // 列表，统一排一次保证选择器始终“高清在上、流畅在最下”。
       return _dedupeQualityByLabel(list, current)..sort((a, b) {
-        final rank = qualityTierRank(a).compareTo(qualityTierRank(b));
+        final rank = qualityTierRank(b).compareTo(qualityTierRank(a));
         return rank != 0 ? rank : a.compareTo(b);
       });
     } catch (_) {
@@ -2165,8 +2241,9 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
     };
     if (tokens.isEmpty) tokens.add('320k');
     final list = _dedupeQualityByLabel(tokens.toList(), current);
+    // 与 [_discoverQualityOptions] 一致：按档位高 → 低排序。
     list.sort((a, b) {
-      final rank = qualityTierRank(a).compareTo(qualityTierRank(b));
+      final rank = qualityTierRank(b).compareTo(qualityTierRank(a));
       return rank != 0 ? rank : a.compareTo(b);
     });
     return list;

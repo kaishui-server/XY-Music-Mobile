@@ -263,6 +263,8 @@ int qualityTierRank(String quality) {
     'flac24bit': 5,
     'hires': 6,
     'hi-res': 6,
+    'dts': 7,
+    'dtshd': 7,
     'vinyl': 7,
     'dolby': 8,
     'atmos': 9,
@@ -2517,6 +2519,30 @@ class PluginRuntimeService {
         if (imported != null) return imported;
       } catch (error) {
         lastError = error;
+      }
+      // 纯数字 ID 但插件的 importMusicSheet 不认（如酷狗 kg.js 只支持
+      // 酷狗码，搜索歌单返回的 specialid 走它会返回空）：按 ID 构造
+      // sheet 对象走 getMusicSheetInfo 详情分页，酷狗等已实现该方法的
+      // 插件可直接拉回曲目，避免误报「该插件不支持歌单导入」。
+      try {
+        final numericSheet = <String, dynamic>{
+          'id': effective,
+          'title': effective,
+        };
+        final detailSongs = await _loadMusicFreePlaylistSongs(
+          plugin,
+          numericSheet,
+          kind: 'sheet',
+        );
+        if (detailSongs.isNotEmpty) {
+          return {
+            'name': effective,
+            'coverUrl': '',
+            'songs': detailSongs,
+          };
+        }
+      } catch (error) {
+        lastError ??= error;
       }
     }
 
