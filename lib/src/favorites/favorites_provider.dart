@@ -103,6 +103,24 @@ class FavoriteSongSnapshot {
     lyricsRaw: lyricsRaw,
   );
 
+  /// 回填插件元数据（播放后补齐）。format 一并按插件歌曲语义修正，
+  /// 与 fromQueueItem 的判定保持一致。
+  FavoriteSongSnapshot withPluginMeta(
+    String newPluginId,
+    Map<String, dynamic>? newPluginData,
+  ) => FavoriteSongSnapshot(
+    path: path,
+    title: title,
+    artist: artist,
+    album: album,
+    duration: duration,
+    format: newPluginId.isEmpty ? format : '插件',
+    coverUrl: coverUrl,
+    pluginId: newPluginId,
+    pluginData: newPluginData ?? pluginData,
+    lyricsRaw: lyricsRaw,
+  );
+
   Song toSong() {
     final savedCover = coverUrl?.trim() ?? '';
     final recoveredCover = pluginData == null
@@ -212,6 +230,26 @@ class FavoritesNotifier extends StateNotifier<Set<String>> {
       return;
     }
     _songSnapshots[path] = snapshot.withCover(trimmed);
+    await _persist();
+  }
+
+  /// 播放后回填插件元数据：识曲页收藏的歌曲 pluginId 为空，回退解析
+  /// 成功后补齐，收藏列表右侧才能显示插件名标签。仅更新持久化快照，
+  /// 不触发收藏集合变更；已有插件 ID 的快照直接跳过。
+  Future<void> backfillPluginMeta(
+    String path,
+    String pluginId,
+    Map<String, dynamic>? pluginData,
+  ) async {
+    await _loaded;
+    final id = pluginId.trim();
+    final snapshot = _songSnapshots[path];
+    if (id.isEmpty ||
+        snapshot == null ||
+        snapshot.pluginId?.trim().isNotEmpty == true) {
+      return;
+    }
+    _songSnapshots[path] = snapshot.withPluginMeta(id, pluginData);
     await _persist();
   }
 

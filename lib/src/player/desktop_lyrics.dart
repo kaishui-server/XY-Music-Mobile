@@ -49,6 +49,8 @@ class DesktopLyricsBridge {
   static String? _lyricsCacheKey;
   static Future<List<_DesktopLyricLine>>? _lyricsCacheFuture;
   static int _syncGeneration = 0;
+  static String? _lastWordsKey;
+  static String _lastWordsJson = '[]';
 
   static void _resetSendState() {
     _lastContentSignature = null;
@@ -131,13 +133,24 @@ class DesktopLyricsBridge {
     // 晚于新任务完成；必须丢弃它，否则刚切到下一句又会被上一句覆盖。
     if (generation != _syncGeneration) return;
     final lyric = current.text;
-    final wordsJson = jsonEncode(
-      current.words
-          .map(
-            (word) => {'text': word.text, 'start': word.start, 'end': word.end},
-          )
-          .toList(),
-    );
+    // 逐字数据按行缓存：同一行内 words 不变，进度回调（后台 250ms 一次）
+    // 不再每次重新 jsonEncode，避免后台久置的持续字符串分配。
+    final wordsKey = '$lyric\u0000${current.translation}';
+    if (wordsKey != _lastWordsKey) {
+      _lastWordsKey = wordsKey;
+      _lastWordsJson = jsonEncode(
+        current.words
+            .map(
+              (word) => {
+                'text': word.text,
+                'start': word.start,
+                'end': word.end,
+              },
+            )
+            .toList(),
+      );
+    }
+    final wordsJson = _lastWordsJson;
     // 内容签名：除播放位置与播放态外的全部字段。签名不变说明只是进度
     // 漂移，走低频校正；变化（换行/换样式/换锁定）立即推送。
     final contentSignature = <Object?>[

@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 
 import '../library/library_provider.dart';
+import '../plugins/plugin_runtime.dart';
 import '../rust/api.dart';
 
 const recognizeMaxSeconds = 10;
@@ -22,12 +23,17 @@ class RecognizeMatch {
   final Map<String, dynamic> raw;
 }
 
-Future<List<RecognizeMatch>> recognizePcm(List<int> pcm) async {
+/// 识别音频并映射为歌曲。`lxPlugins` 用于把结果关联到支持其平台的洛雪
+/// 插件（识别歌曲走 `lx://` 虚拟路径，见 [parseRecognizePayload]）。
+Future<List<RecognizeMatch>> recognizePcm(
+  List<int> pcm, {
+  List<EnabledMusicPlugin> lxPlugins = const [],
+}) async {
   try {
     final payload = await recognizeWithPcm(
       pcm: pcm,
     ).timeout(recognizeRequestTimeout);
-    return parseRecognizePayload(payload);
+    return parseRecognizePayload(payload, lxPlugins: lxPlugins);
   } on TimeoutException {
     await cancelRecognizeSystemAudio();
     throw TimeoutException('识别超时，请检查网络后重试');
@@ -149,7 +155,17 @@ List<int> _stripWaveHeader(List<int> input) {
   return input.sublist(44);
 }
 
-List<RecognizeMatch> parseRecognizePayload(String payload) {
+/// 把识别响应映射为歌曲列表。
+///
+/// 识别结果统一映射为酷狗（kg）洛雪条目并走 `lx://` 虚拟路径播放。为让
+/// 歌曲信息面板能显示真实平台名（而非「本地音乐」）且作者行可点进作品，
+/// 需按平台把结果关联到已启用的洛雪插件：优先匹配 `lxSources` 含该平台的
+/// 插件，回退第一个洛雪插件（与洛雪歌单导入的关联策略一致）。无洛雪插件
+/// 时保持 `pluginId` 为空，播放仍可由公共解析器完成。
+List<RecognizeMatch> parseRecognizePayload(
+  String payload, {
+  List<EnabledMusicPlugin> lxPlugins = const [],
+}) {
   final envelope = jsonDecode(payload);
   if (envelope is! Map) throw const FormatException('识别响应格式错误');
   final response = Map<String, dynamic>.from(envelope);
@@ -170,14 +186,34 @@ List<RecognizeMatch> parseRecognizePayload(String payload) {
   for (final value in data) {
     if (value is! Map) continue;
     final raw = Map<String, dynamic>.from(value);
-    final match = _mapRecognizeMatch(raw);
+    final match = _mapRecognizeMatch(raw, lxPlugins);
     if (match != null) matches.add(match);
   }
   matches.sort((a, b) => b.confidence.compareTo(a.confidence));
   return matches;
 }
 
-RecognizeMatch? _mapRecognizeMatch(Map<String, dynamic> raw) {
+/// 按识别出的平台（[source]）挑选洛雪插件：优先 `lxSources` 命中，回退
+/// 第一个洛雪插件；无洛雪插件时返回 null（保持 pluginId 为空）。
+EnabledMusicPlugin? _lxPluginForSource(
+  List<EnabledMusicPlugin> lxPlugins,
+  String source,
+) {
+  if (lxPlugins.isEmpty) return null;
+  for (final plugin in lxPlugins) {
+    if (source.isNotEmpty &&
+        plugin.lxSources.isNotEmpty &&
+        plugin.lxSources.contains(source)) {
+      return plugin;
+    }
+  }
+  return lxPlugins.first;
+}
+
+RecognizeMatch? _mapRecognizeMatch(
+  Map<String, dynamic> raw,
+  List<EnabledMusicPlugin> lxPlugins,
+) {
   final title = _pickString([
     raw['songname'],
     raw['filename'],
@@ -264,6 +300,9 @@ RecognizeMatch? _mapRecognizeMatch(Map<String, dynamic> raw) {
     duration: duration,
     format: '网络',
     coverUrl: coverUrl.isEmpty ? null : coverUrl,
+    // 关联到支持酷狗的洛雪插件：歌曲信息面板据此显示平台名并允许点作者
+    // 查看作品；缺失时会被当作「本地音乐」且作者不可点。
+    pluginId: _lxPluginForSource(lxPlugins, 'kg')?.id,
     pluginData: {'lx': lxSongInfo},
   );
   return RecognizeMatch(song: song, confidence: confidence, raw: raw);

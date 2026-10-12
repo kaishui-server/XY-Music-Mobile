@@ -92,6 +92,25 @@ class PlaylistSongSnapshot {
     lyricsRaw: lyricsRaw,
   );
 
+  /// 回填插件元数据（播放后补齐）。format 一并按插件歌曲语义修正，
+  /// 与收藏快照 fromQueueItem 的判定保持一致。
+  PlaylistSongSnapshot withPluginMeta(
+    String newPluginId,
+    Map<String, dynamic>? newPluginData,
+  ) => PlaylistSongSnapshot(
+    path: path,
+    title: title,
+    artist: artist,
+    album: album,
+    duration: duration,
+    format: newPluginId.isEmpty ? format : '插件',
+    coverThumbPath: coverThumbPath,
+    coverUrl: coverUrl,
+    pluginId: newPluginId,
+    pluginData: newPluginData ?? pluginData,
+    lyricsRaw: lyricsRaw,
+  );
+
   Song toSong() => Song(
     path: path,
     title: title,
@@ -336,6 +355,40 @@ class PlaylistsNotifier extends StateNotifier<List<MobilePlaylist>> {
           songSnapshots: {
             ...playlist.songSnapshots,
             path: snapshot.withCover(trimmed),
+          },
+        ),
+      );
+    }
+    if (!changed) return;
+    state = next;
+    await _save();
+  }
+
+  /// 播放后回填插件元数据：识曲歌曲加入歌单时 pluginId 可能为空，
+  /// 回退解析成功后补齐，歌单列表右侧才能显示插件名标签。一首歌
+  /// 可能同时存在于多个歌单，全部回填；已有插件 ID 的快照直接跳过。
+  Future<void> backfillSongPluginMeta(
+    String path,
+    String pluginId,
+    Map<String, dynamic>? pluginData,
+  ) async {
+    await _loaded;
+    final id = pluginId.trim();
+    if (id.isEmpty) return;
+    var changed = false;
+    final next = <MobilePlaylist>[];
+    for (final playlist in state) {
+      final snapshot = playlist.songSnapshots[path];
+      if (snapshot == null || snapshot.pluginId?.trim().isNotEmpty == true) {
+        next.add(playlist);
+        continue;
+      }
+      changed = true;
+      next.add(
+        playlist.copyWith(
+          songSnapshots: {
+            ...playlist.songSnapshots,
+            path: snapshot.withPluginMeta(id, pluginData),
           },
         ),
       );

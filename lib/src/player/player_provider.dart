@@ -157,6 +157,17 @@ class _PluginUnavailableException implements Exception {
 enum PlaybackSourceType { plugin, lx, networkUrl, localFile }
 
 const _recognizedPluginCacheKey = '_recognizedPluginFallback';
+
+/// 识曲歌曲的队列项 [QueueItem.pluginId] 为空时（无洛雪插件可关联，
+/// 或旧版本恢复的会话），读取播放回退链缓存的实际解析插件 ID，供歌曲
+/// 信息面板还原来源标识与歌手「查看作品」入口。
+String? recognizedFallbackPluginId(QueueItem item) {
+  final cache = item.pluginData?[_recognizedPluginCacheKey];
+  if (cache is! Map) return null;
+  final id = cache['pluginId']?.toString().trim() ?? '';
+  return id.isEmpty ? null : id;
+}
+
 const _playbackSourceAssociationsKey = 'playbackSourceAssociationsV1';
 const _rememberedLyricsKey = 'rememberedLyricsV1';
 const _rememberedLyricsAssociationKey = 'rememberedLyricsAssociationV1';
@@ -2781,7 +2792,11 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
       }
       // 最近播放是“开始播放”即记录，与桌面端行为一致。统计写入失败不应
       // 阻断音频播放，因此放到独立异步任务中执行。
-      unawaited(_addToRecentHistory(item));
+      // 注意读 state.current 而非局部变量 item：识曲歌曲的 pluginId 要等
+      // _prepareAudioSource 内的回退解析成功后才回写进队列项（见
+      // _cacheRecognizedPluginSource），item 仍是起播前的旧值；用旧值记录
+      // 会让最近播放快照丢失插件 ID，列表右侧就显示不出插件名标签。
+      unawaited(_addToRecentHistory(state.current ?? item));
       _manualPause = false;
       unawaited(_startPlayback(requestId, item.path));
       if (requestId != _playRequestId) return;
@@ -3819,94 +3834,145 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
     return true;
   }
 
-  // ---- 记忆歌词内存缓存 ----
-  // SharedPreferences 把整份歌词表存成单个 JSON 字符串（上限 100 首 ×
-  // 300KB ≈ 30MB）。旧实现每次起播都把整张表在主 isolate 上 jsonDecode
-  // 一遍（只为读一首歌），重用户实测单次卡主 isolate 数秒、每次切歌
-  // 分配 60MB+，是「听半小时后卡顿」（RSS 爬到 2.4GB、每分钟一次 6s
-  // 冻结）的直接原因。改为：懒加载一次进内存，后续读 O(1)；写只改
-  // 内存并延迟在后台 isolate 编码落盘。
-  Map<String, String>? _rememberedLyricsCache;
-  Future<Map<String, String>?>? _rememberedLyricsLoadTask;
-  Timer? _rememberedLyricsSaveTimer;
+  // ---- 记忆歌词分条存储 ----
+  // 旧版把整份歌词表存成单个 JSON 字符串（上限 100 首 × 300KB ≈ 30MB）：
+  // 读一条要整表解码、写一条要整表编码；即使解码/编码挪到后台 isolate，
+  // 30MB 结构的跨 isolate 深拷贝仍全部落在主 isolate 上（实测心跳 isolate
+  // 延迟 5s）。改为每条歌词一个独立 key（rememberedLyricsV2:<path>），
+  // 读写都是单条操作（≤300KB，毫秒级），彻底消除整表读写与拷贝；LRU
+  // 顺序由一个小索引 key 维护；旧整表 key 首次访问时一次性迁移后删除。
+  static const _rememberedLyricsPrefix = 'rememberedLyricsV2:';
+  static const _rememberedLyricsIndexKey = 'rememberedLyricsV2Index';
+  List<String>? _rememberedLyricsIndex;
+  bool _rememberedLyricsMigrated = false;
+  Timer? _rememberedLyricsIndexTimer;
 
-  Future<Map<String, String>?> _ensureRememberedLyricsCache() {
-    return _rememberedLyricsLoadTask ??= () async {
-      try {
-        final preferences = await SharedPreferences.getInstance();
-        final raw = preferences.getString(_rememberedLyricsKey);
-        if (raw == null || raw.isEmpty) {
-          _rememberedLyricsCache = <String, String>{};
-          return _rememberedLyricsCache;
-        }
-        // 30MB 级 jsonDecode 放后台 isolate：String 跨 isolate 传递是
-        // 整块字节拷贝，代价远小于主 isolate 上的解析本身。
-        final decoded = await Isolate.run(() => jsonDecode(raw));
-        if (decoded is Map) {
-          _rememberedLyricsCache = <String, String>{
-            for (final entry in decoded.entries)
-              entry.key.toString(): entry.value?.toString() ?? '',
-          };
-        } else {
-          _rememberedLyricsCache = <String, String>{};
-        }
-      } catch (_) {
-        _rememberedLyricsCache = <String, String>{};
-      }
-      return _rememberedLyricsCache;
-    }();
-  }
-
-  /// 延迟把内存中的歌词表编码落盘：多次保存合并为一次写，编码在后台
-  /// isolate 完成，不再阻塞主 isolate。
-  void _scheduleRememberedLyricsSave() {
-    _rememberedLyricsSaveTimer?.cancel();
-    _rememberedLyricsSaveTimer = Timer(const Duration(seconds: 3), () {
-      _rememberedLyricsSaveTimer = null;
-      unawaited(_flushRememberedLyrics());
-    });
-  }
-
-  Future<void> _flushRememberedLyrics() async {
-    final cache = _rememberedLyricsCache;
-    if (cache == null) return;
+  /// 旧整表格式（rememberedLyricsV1）一次性迁移到分条 key，完成后删除
+  /// 旧 key。30MB 级解码在后台 isolate 进行，仅首次执行。
+  Future<void> _ensureRememberedLyricsMigrated() async {
+    if (_rememberedLyricsMigrated) return;
+    _rememberedLyricsMigrated = true;
     try {
-      final snapshot = Map<String, String>.of(cache);
-      final encoded = await Isolate.run(() => jsonEncode(snapshot));
       final preferences = await SharedPreferences.getInstance();
-      await preferences.setString(_rememberedLyricsKey, encoded);
+      final raw = preferences.getString(_rememberedLyricsKey);
+      if (raw == null || raw.isEmpty) return;
+      final decoded = await Isolate.run(() => jsonDecode(raw));
+      if (decoded is Map) {
+        final index = _ensureRememberedLyricsIndexLoaded(preferences);
+        for (final entry in decoded.entries) {
+          final key = entry.key.toString().trim();
+          final value = entry.value?.toString() ?? '';
+          if (key.isEmpty || value.isEmpty) continue;
+          await preferences.setString('$_rememberedLyricsPrefix$key', value);
+          index
+            ..remove(key)
+            ..add(key);
+        }
+        await _writeRememberedLyricsIndex(preferences, index);
+      }
+      await preferences.remove(_rememberedLyricsKey);
     } catch (_) {
-      // 落盘失败不影响内存表（下次保存会再试）。
+      // 迁移失败时旧 key 保留，下次启动重试。
+      _rememberedLyricsMigrated = false;
     }
   }
 
-  /// 启动空闲期预加载记忆歌词表（解码在后台 isolate）：把冷启动后的
-  /// 首次解码从第一次点歌挪到启动 5 秒后的空闲期（见 app.dart）。
+  List<String> _ensureRememberedLyricsIndexLoaded(
+    SharedPreferences preferences,
+  ) {
+    return _rememberedLyricsIndex ??= () {
+      try {
+        final raw = preferences.getString(_rememberedLyricsIndexKey);
+        final decoded = raw == null || raw.isEmpty ? null : jsonDecode(raw);
+        return decoded is List
+            ? decoded
+                  .map((e) => e.toString())
+                  .where((k) => k.isNotEmpty)
+                  .toList()
+            : <String>[];
+      } catch (_) {
+        return <String>[];
+      }
+    }();
+  }
+
+  Future<void> _writeRememberedLyricsIndex(
+    SharedPreferences preferences,
+    List<String> index,
+  ) async {
+    try {
+      await preferences.setString(_rememberedLyricsIndexKey, jsonEncode(index));
+    } catch (_) {}
+  }
+
+  /// 把 [key] 标记为最近使用（LRU 末尾）并把索引落盘（3 秒防抖合并，
+  /// 索引只是几百字节的小 JSON）。超限淘汰的最老条目连同其分条 key
+  /// 一并删除，避免偏好设置中累积死数据。
+  void _touchRememberedLyricsIndex(String key) {
+    final index = _rememberedLyricsIndex;
+    if (index == null) return;
+    index
+      ..remove(key)
+      ..add(key);
+    if (index.length > 100) {
+      final evicted = index.sublist(0, index.length - 100).toList();
+      index.removeRange(0, index.length - 100);
+      unawaited(() async {
+        try {
+          final preferences = await SharedPreferences.getInstance();
+          for (final k in evicted) {
+            await preferences.remove('$_rememberedLyricsPrefix$k');
+          }
+        } catch (_) {}
+      }());
+    }
+    _rememberedLyricsIndexTimer?.cancel();
+    _rememberedLyricsIndexTimer = Timer(const Duration(seconds: 3), () {
+      _rememberedLyricsIndexTimer = null;
+      final snapshot = List<String>.of(index);
+      unawaited(() async {
+        try {
+          final preferences = await SharedPreferences.getInstance();
+          await _writeRememberedLyricsIndex(preferences, snapshot);
+        } catch (_) {}
+      }());
+    });
+  }
+
+  /// 启动空闲期触发旧表迁移检查（见 app.dart 预热）：把可能的 30MB 级
+  /// 迁移从第一次点歌挪到启动 5 秒后的空闲期。
   Future<void> prewarmRememberedLyrics() async {
-    await _ensureRememberedLyricsCache();
+    await _ensureRememberedLyricsMigrated();
   }
 
   Future<String?> _loadRememberedLyrics(String path) async {
     final key = path.trim();
     if (key.isEmpty) return null;
-    final cache = await _ensureRememberedLyricsCache();
-    if (cache == null) return null;
-    final lyrics = cache[key]?.trim() ?? '';
-    return lyrics.isEmpty ? null : lyrics;
+    await _ensureRememberedLyricsMigrated();
+    try {
+      final preferences = await SharedPreferences.getInstance();
+      final lyrics =
+          preferences.getString('$_rememberedLyricsPrefix$key')?.trim() ?? '';
+      if (lyrics.isEmpty) return null;
+      final index = _ensureRememberedLyricsIndexLoaded(preferences);
+      _touchRememberedLyricsIndex(key);
+      return lyrics;
+    } catch (_) {
+      return null;
+    }
   }
 
   Future<void> _saveRememberedLyrics(String path, String lyrics) async {
     final key = path.trim();
     final value = lyrics.trim();
     if (key.isEmpty || value.isEmpty || value.length > 300 * 1024) return;
-    final cache = await _ensureRememberedLyricsCache();
-    if (cache == null) return;
-    cache[key] = value;
-    // 歌词文本可能较大，限制数量避免长期使用后占满偏好设置。
-    while (cache.length > 100) {
-      cache.remove(cache.keys.first);
-    }
-    _scheduleRememberedLyricsSave();
+    await _ensureRememberedLyricsMigrated();
+    try {
+      final preferences = await SharedPreferences.getInstance();
+      await preferences.setString('$_rememberedLyricsPrefix$key', value);
+      final index = _ensureRememberedLyricsIndexLoaded(preferences);
+      _touchRememberedLyricsIndex(key);
+    } catch (_) {}
   }
 
   Future<void> _saveRememberedLyricsAssociation(
@@ -4000,11 +4066,11 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
           ? Map<String, dynamic>.from(decodedAssociations)
           : <String, dynamic>{};
       associations.remove(key);
-      // 歌词表经内存缓存维护：直接读写 SharedPreferences 会与缓存失去
-      // 同步（缓存延迟落盘时会把已删除的条目原样写回）。
-      await _ensureRememberedLyricsCache();
-      _rememberedLyricsCache?.remove(key);
-      _scheduleRememberedLyricsSave();
+      // 分条存储下取消关联直接删对应条目，无整表操作。
+      await _ensureRememberedLyricsMigrated();
+      await preferences.remove('$_rememberedLyricsPrefix$key');
+      final index = _ensureRememberedLyricsIndexLoaded(preferences);
+      index.remove(key);
       await Future.wait([
         associations.isEmpty
             ? preferences.remove(_rememberedLyricsAssociationKey)
@@ -4018,6 +4084,7 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
                 _rememberedLyricsOriginalKey,
                 jsonEncode(originals),
               ),
+        _writeRememberedLyricsIndex(preferences, index),
       ]);
       return original;
     } catch (_) {
@@ -4450,6 +4517,13 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
   ) {
     if (index < 0 || index >= state.queue.length) return;
     final old = state.queue[index];
+    // 识曲结果未关联洛雪插件（pluginId 为空）时，把实际解析成功的插件
+    // 回写到队列项：歌曲信息面板据此显示插件平台名而不是「本地音乐」，
+    // 歌手行也才能提供「查看作品」入口。播放类型判定与洛雪自有解析均
+    // 以 lx:// 路径和洛雪插件为准，回退插件 ID 不会改变播放行为。
+    final pluginId = (old.pluginId ?? '').trim().isEmpty
+        ? plugin.id
+        : old.pluginId;
     final queue = [...state.queue];
     queue[index] = QueueItem(
       path: old.path,
@@ -4457,7 +4531,7 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
       artist: old.artist,
       album: old.album,
       durationMs: old.durationMs,
-      pluginId: old.pluginId,
+      pluginId: pluginId,
       pluginData: {
         ...?old.pluginData,
         _recognizedPluginCacheKey: {'pluginId': plugin.id, 'rawData': rawData},
@@ -4470,6 +4544,23 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
       queue: queue,
       current: index == state.queueIndex ? queue[index] : state.current,
     );
+    if (old.pluginId?.trim().isNotEmpty != true) {
+      // 识曲歌曲收藏或加入歌单时 pluginId 为空，收藏/歌单快照里存的
+      // 插件 ID 也就是空的，列表右侧显示不出插件名标签。这里把回写
+      // 结果同步回填到两类快照；已有插件 ID 的快照会被跳过，普通
+      // 插件歌曲不经过该分支，不受影响。
+      final backfillData = queue[index].pluginData;
+      unawaited(
+        _ref
+            .read(favoritesProvider.notifier)
+            .backfillPluginMeta(old.path, plugin.id, backfillData),
+      );
+      unawaited(
+        _ref
+            .read(playlistsProvider.notifier)
+            .backfillSongPluginMeta(old.path, plugin.id, backfillData),
+      );
+    }
     _schedulePersistSession();
   }
 
@@ -5910,24 +6001,48 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
   }
 
   Future<void> _persistSession() async {
+    final startedAt = Stopwatch();
+    var buildMicros = 0;
+    var encodeMicros = 0;
+    var saveMicros = 0;
     try {
       final dbPath = await _ref.read(dbPathProvider.future);
       final settings = _ref.read(settingsProvider).valueOrNull;
       if (state.current == null) return;
+      startedAt.start();
       final payload = buildPlaybackSessionPayload(
         state: state,
         volume: settings?.volume ?? 1.0,
         updatedAt: DateTime.now().millisecondsSinceEpoch,
       );
-      // jsonEncode 在主 isolate 编码大队列元数据（预算内可达 16MB）会卡顿
-      // 数百毫秒到数秒（历史实测 dartLag 15.8s），移到后台 isolate 编码。
-      // payload 是纯 JSON 兼容结构，可直接跨 isolate 拷贝。
+      buildMicros = startedAt.elapsedMicroseconds;
+      // jsonEncode 在主 isolate 编码大队列元数据会卡顿数百毫秒到数秒
+      // （历史实测 dartLag 15.8s），移到后台 isolate 编码。注意闭包捕获
+      // 的 payload 仍会在主 isolate 上深拷贝进 isolate 消息，故预算上限
+      // 已收紧到 2MB（见 _sessionQueueMetaBudgetChars 注释）。
       final sessionJson = await Isolate.run(() => jsonEncode(payload));
+      encodeMicros = startedAt.elapsedMicroseconds;
       await savePlaybackSession(dbPath: dbPath, sessionJson: sessionJson);
+      saveMicros = startedAt.elapsedMicroseconds;
     } catch (_) {
       // 会话保存失败不能中断或结束正在播放的歌曲。
     }
+    // 分段计时（>100ms 才记）：构建与消息拷贝发生在主 isolate，是卡顿
+    // 嫌疑；编码在后台 isolate。若下轮日志仍见「构建/拷贝」数百 ms 以上，
+    // 说明队列元数据仍超预期，需进一步收紧预算。
+    if (startedAt.isRunning &&
+        startedAt.elapsedMicroseconds > 100 * 1000 &&
+        saveMicros > 0) {
+      playbackChainLog(
+        '[会话写回] 总${_fmtMicros(saveMicros)} 构建${_fmtMicros(buildMicros)} '
+        '编码+拷贝${_fmtMicros(encodeMicros - buildMicros)} '
+        '落盘${_fmtMicros(saveMicros - encodeMicros)}',
+      );
+    }
   }
+
+  static String _fmtMicros(int micros) =>
+      micros <= 0 ? '0ms' : '${(micros / 1000).toStringAsFixed(0)}ms';
 
   @override
   void dispose() {
@@ -5938,8 +6053,18 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
     _syncPositionFromEngine();
     _sessionPersistDebounce?.cancel();
     unawaited(_persistSession());
-    _rememberedLyricsSaveTimer?.cancel();
-    unawaited(_flushRememberedLyrics());
+    // 分条存储下无整表 flush：只把挂起的 LRU 索引写盘防抖提前到此刻执行。
+    _rememberedLyricsIndexTimer?.cancel();
+    final rememberedIndex = _rememberedLyricsIndex;
+    if (rememberedIndex != null && rememberedIndex.isNotEmpty) {
+      final snapshot = List<String>.of(rememberedIndex);
+      unawaited(() async {
+        try {
+          final preferences = await SharedPreferences.getInstance();
+          await _writeRememberedLyricsIndex(preferences, snapshot);
+        } catch (_) {}
+      }());
+    }
     WidgetsBinding.instance.removeObserver(this);
     _bridgeInstallTimer?.cancel();
     VideoPlaybackSession.progressRevision.removeListener(
@@ -5982,7 +6107,18 @@ class _LocalPlaybackException implements Exception {
 /// `LOW_MEMORY` 击杀。这里给元数据总量设上限：超出预算的队列项不再写入
 /// 元数据，恢复时本地歌按路径回查曲库补齐、在线歌退回重新解析，从而把
 /// 会话体积与队列长度解耦。
-const int _sessionQueueMetaBudgetChars = 16 * 1024 * 1024;
+///
+/// 预算从 16MB 收紧到 2MB：后台 isolate 编码省了主 isolate 的 CPU，但
+/// `Isolate.run` 的闭包捕获仍要在主 isolate 上把整个 payload 逐字节深
+/// 拷贝进 isolate 消息（Dart 不共享堆），16MB 结构在低端机上拷贝秒级
+/// （实测心跳 isolate 延迟 5.1~5.3s）。2MB 内拷贝降到几十毫秒；超出
+/// 预算的远端队列项本来就是恢复时重新解析的，体验无损。
+const int _sessionQueueMetaBudgetChars = 2 * 1024 * 1024;
+
+/// 队列元数据里单个插件数据字段的体积上限（字符粗估）。
+/// 插件原始数据除歌词外仍可能携带 MB 级快照字段；超限整字段丢弃，
+/// 恢复时在线歌重新解析，无功能损失。
+const int _sessionPluginDataFieldBudgetChars = 64 * 1024;
 
 /// 恢复会话时允许解析的最大字符数。超过即视为旧版本遗留的超大会话，
 /// 直接放弃恢复（见 [_restoreSession]）。
@@ -6002,12 +6138,18 @@ const List<String> _embeddedLyricKeys = <String>[
   'lyrics',
 ];
 
-/// 复制插件原始数据并剥掉内嵌歌词字段（缓存，播放时会重新抓取）。
+/// 复制插件原始数据并剥掉内嵌歌词字段（缓存，播放时会重新抓取）；
+/// 超过 [_sessionPluginDataFieldBudgetChars] 的非歌词字段一并丢弃，
+/// 防止单项快照把会话预算占满。
 Map<String, dynamic>? _slimPluginData(Map<String, dynamic>? data) {
   if (data == null || data.isEmpty) return data;
   final slim = <String, dynamic>{};
   for (final entry in data.entries) {
     if (_embeddedLyricKeys.contains(entry.key)) continue;
+    if (_approximateJsonChars(entry.value) >
+        _sessionPluginDataFieldBudgetChars) {
+      continue;
+    }
     slim[entry.key] = entry.value;
   }
   return slim;

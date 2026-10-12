@@ -1432,7 +1432,12 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
   /// 歌曲信息面板：展示平台、歌曲 ID/MID 与作者信息（作者可点进
   /// 作品列表页）。数据取自当前队列项的插件元数据。
   Future<void> _showSongInfoSheet(QueueItem item) async {
-    final pluginId = item.pluginId;
+    // 识曲歌曲未关联洛雪插件时 pluginId 为空：用播放回退链缓存的
+    // 解析插件兜底，否则来源会误显示为「本地音乐」且歌手行不可点。
+    var pluginId = item.pluginId;
+    if (pluginId == null || pluginId.isEmpty) {
+      pluginId = recognizedFallbackPluginId(item);
+    }
     String? platform;
     if (pluginId != null && pluginId.isNotEmpty) {
       final plugins = await ref.read(enabledMusicPluginsProvider.future);
@@ -1466,7 +1471,12 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
     QueueItem item,
     _SongArtistInfo artist,
   ) async {
-    final pluginId = item.pluginId;
+    // 与 _showSongInfoSheet 一致：识曲歌曲用回退解析插件兜底，保证
+    // 「作品」入口打开后仍能定位到实际解析该歌的插件。
+    var pluginId = item.pluginId;
+    if (pluginId == null || pluginId.isEmpty) {
+      pluginId = recognizedFallbackPluginId(item);
+    }
     if (pluginId == null || pluginId.isEmpty) return;
     final plugins = await ref.read(enabledMusicPluginsProvider.future);
     final plugin = plugins
@@ -7508,10 +7518,6 @@ class _MiniLyrics extends ConsumerWidget {
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
-    final position = applyLyricsOffset(
-      ref.watch(playerProvider.select((state) => state.position)),
-      offsetTenths,
-    );
     final fontSize = ref.watch(
       settingsProvider.select(
         (value) => value.valueOrNull?.miniLyricFontSize ?? 14.0,
@@ -7520,8 +7526,8 @@ class _MiniLyrics extends ConsumerWidget {
     final embedded = item.lyricsRaw?.trim() ?? '';
     if (embedded.isNotEmpty) {
       return _buildAsync(
+        ref,
         ref.watch(embeddedLyricsProvider(embedded)),
-        position,
         fontSize,
       );
     }
@@ -7532,15 +7538,15 @@ class _MiniLyrics extends ConsumerWidget {
       return _message('暂无歌词', fontSize);
     }
     return _buildAsync(
+      ref,
       ref.watch(songLyricsProvider(item.path)),
-      position,
       fontSize,
     );
   }
 
   Widget _buildAsync(
+    WidgetRef ref,
     AsyncValue<List<LyricLine>> lyrics,
-    double position,
     double fontSize,
   ) {
     return lyrics.when(
@@ -7548,8 +7554,16 @@ class _MiniLyrics extends ConsumerWidget {
       error: (_, _) => _message('暂无歌词', fontSize),
       data: (lines) {
         if (lines.isEmpty) return _message('暂无歌词', fontSize);
-        var active = lines.lastIndexWhere((line) => line.time <= position);
-        if (active < 0) active = 0;
+        // 与歌词页同策略：select 活动行索引，position 10Hz 更新只在
+        // 换行时触发本组件重建。
+        final raw = ref.watch(
+          playerProvider.select(
+            (state) => lines.lastIndexWhere(
+              (line) => line.time <= applyLyricsOffset(state.position, offsetTenths),
+            ),
+          ),
+        );
+        final active = raw < 0 ? 0 : raw;
         final rows = _collectRows(lines, active, fontSize);
         if (rows.isEmpty) return _message('暂无歌词', fontSize);
         return _surface(
@@ -7779,13 +7793,24 @@ class _LyricsViewState extends ConsumerState<_LyricsView>
     super.dispose();
   }
 
+  /// 活动行索引（select 派生）：position 流 10Hz 更新，但索引只在歌词
+  /// 行切换时变化，因此整个歌词页只在换行时重建（约数秒一次），而不是
+  /// 每个进度 tick 全量重建。O(n) 的行查找每 tick 一次，几百行的代价
+  /// 在微秒级，可忽略。
+  int _activeIndex(List<LyricLine> lines) {
+    final raw = ref.watch(
+      playerProvider.select(
+        (state) => lines.lastIndexWhere(
+          (line) => line.time <= applyLyricsOffset(state.position, widget.offsetTenths),
+        ),
+      ),
+    );
+    return raw < 0 ? 0 : raw;
+  }
+
   @override
   Widget build(BuildContext context) {
     super.build(context);
-    final position = applyLyricsOffset(
-      ref.watch(playerProvider.select((state) => state.position)),
-      widget.offsetTenths,
-    );
     final effectMode =
         ref.watch(settingsProvider).valueOrNull?.lyricWordEffectMode ??
         LyricWordEffectMode.progressive;
@@ -7812,7 +7837,6 @@ class _LyricsViewState extends ConsumerState<_LyricsView>
         error: (_, _) => _lyricsEmpty(context, '歌词解析失败'),
         data: (lines) => _buildLines(
           lines,
-          position,
           effectMode,
           textAlign,
           baseFontSize,
@@ -7836,7 +7860,6 @@ class _LyricsViewState extends ConsumerState<_LyricsView>
             _lyricsEmpty(context, '暂无歌词', onLinkLyrics: widget.onLinkLyrics),
         data: (lines) => _buildLines(
           lines,
-          position,
           effectMode,
           textAlign,
           baseFontSize,
@@ -7850,7 +7873,6 @@ class _LyricsViewState extends ConsumerState<_LyricsView>
 
   Widget _buildLines(
     List<LyricLine> lines,
-    double position,
     LyricWordEffectMode effectMode,
     TextAlign textAlign,
     double baseFontSize,
@@ -7861,8 +7883,7 @@ class _LyricsViewState extends ConsumerState<_LyricsView>
       return _lyricsEmpty(context, '暂无歌词', onLinkLyrics: widget.onLinkLyrics);
     }
     _latestLines = lines;
-    var active = lines.lastIndexWhere((line) => line.time <= position);
-    if (active < 0) active = 0;
+    final active = _activeIndex(lines);
     _syncScroll(active, lines);
     final size = MediaQuery.sizeOf(context);
     final compactVertical = size.width > size.height;
@@ -7955,7 +7976,7 @@ class _LyricsViewState extends ConsumerState<_LyricsView>
                               children: [
                                 _TimedLyricText(
                                   line: line,
-                                  position: position,
+                                  offsetTenths: widget.offsetTenths,
                                   selected: selected,
                                   effectMode: effectMode,
                                   textAlign: textAlign,
@@ -8356,10 +8377,10 @@ class _LyricFontSizeSheetState extends State<_LyricFontSizeSheet> {
   }
 }
 
-class _TimedLyricText extends StatelessWidget {
+class _TimedLyricText extends ConsumerWidget {
   const _TimedLyricText({
     required this.line,
-    required this.position,
+    required this.offsetTenths,
     required this.selected,
     required this.effectMode,
     required this.textAlign,
@@ -8367,7 +8388,9 @@ class _TimedLyricText extends StatelessWidget {
   });
 
   final LyricLine line;
-  final double position;
+
+  /// 歌词偏移（十分秒）：仅活动行订阅 position 后计算逐字进度时使用。
+  final int offsetTenths;
   final bool selected;
   final LyricWordEffectMode effectMode;
   final TextAlign textAlign;
@@ -8376,7 +8399,7 @@ class _TimedLyricText extends StatelessWidget {
   final double baseFontSize;
 
   @override
-  Widget build(BuildContext context) {
+  Widget build(BuildContext context, WidgetRef ref) {
     // 当前播放行不再叠加阴影，逐字/逐词高亮也不再发光，保持纯色渲染。
     final baseStyle = TextStyle(
       color: Colors.white,
@@ -8387,17 +8410,25 @@ class _TimedLyricText extends StatelessWidget {
     if (!selected ||
         line.words.isEmpty ||
         effectMode == LyricWordEffectMode.none) {
+      // 非活动行是静态文本，不订阅 position：避免整页每个进度 tick
+      // 重建全部行（10Hz × 视口行数曾把 Dart 堆撑到 GB 级，老年代
+      // GC 单次数秒，是久播卡顿的根因）。
       return Text(line.text, textAlign: textAlign, style: baseStyle);
     }
 
+    // 活动行才订阅进度（约 10Hz），重建范围缩小到本行的 TextSpan 树。
+    final position = applyLyricsOffset(
+      ref.watch(playerProvider.select((state) => state.position)),
+      offsetTenths,
+    );
     if (effectMode == LyricWordEffectMode.progressive) {
-      return _buildProgressiveText(baseStyle);
+      return _buildProgressiveText(baseStyle, position);
     }
 
-    return _buildWordByWordText(baseStyle);
+    return _buildWordByWordText(baseStyle, position);
   }
 
-  Widget _buildWordByWordText(TextStyle baseStyle) {
+  Widget _buildWordByWordText(TextStyle baseStyle, double position) {
     // 与未播放行（白字 + 整行 55% 透明度）保持同一灰度，避免当前行
     // 未播区呈现更深的灰。
     final dimColor = Colors.white.withValues(alpha: .55);
@@ -8408,7 +8439,11 @@ class _TimedLyricText extends StatelessWidget {
             TextSpan(
               text: word.text,
               style: baseStyle.copyWith(
-                color: Color.lerp(dimColor, Colors.white, _wordProgress(word)),
+                color: Color.lerp(
+                  dimColor,
+                  Colors.white,
+                  _wordProgress(word, position),
+                ),
               ),
             ),
         ],
@@ -8418,7 +8453,7 @@ class _TimedLyricText extends StatelessWidget {
     );
   }
 
-  Widget _buildProgressiveText(TextStyle baseStyle) {
+  Widget _buildProgressiveText(TextStyle baseStyle, double position) {
     return Text.rich(
       TextSpan(
         children: [
@@ -8429,7 +8464,7 @@ class _TimedLyricText extends StatelessWidget {
               child: _ProgressiveLyricWord(
                 text: word.text,
                 style: baseStyle,
-                progress: _wordProgress(word),
+                progress: _wordProgress(word, position),
               ),
             ),
         ],
@@ -8439,7 +8474,7 @@ class _TimedLyricText extends StatelessWidget {
     );
   }
 
-  double _wordProgress(LyricWord word) {
+  double _wordProgress(LyricWord word, double position) {
     if (position <= word.start) return 0;
     if (position >= word.end || word.end <= word.start) return 1;
     return ((position - word.start) / (word.end - word.start)).clamp(0, 1);
