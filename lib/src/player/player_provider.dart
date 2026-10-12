@@ -25,6 +25,7 @@ import '../logging/app_log_store.dart';
 import '../playlists/playlists_provider.dart';
 import '../plugins/plugin_runtime.dart';
 import '../recent/recent_store.dart';
+import '../recognize/recognize_source.dart';
 import '../rust/api.dart';
 import '../rust/music/types.dart';
 import '../widgets/cover_image.dart';
@@ -166,6 +167,28 @@ String? recognizedFallbackPluginId(QueueItem item) {
   if (cache is! Map) return null;
   final id = cache['pluginId']?.toString().trim() ?? '';
   return id.isEmpty ? null : id;
+}
+
+/// 识曲歌曲在信息面板 / 歌手「查看作品」入口 / 列表来源标签中的
+/// 完整插件 ID 回退链（仅显示层兜底，不改播放语义）：
+/// 1) 队列项自带 [QueueItem.pluginId]（识曲时已关联洛雪插件）；
+/// 2) 播放回退缓存 [_recognizedPluginCacheKey]（上一轮修复写入）；
+/// 3) 按 `lx://` 路径前缀 / `pluginData['lx']['source']` 从已启用洛雪
+///    插件推断（修复前已持久化的存量旧数据：会话恢复、最近播放、
+///    收藏、歌单快照、播放回退关联等 pluginId 为空且无缓存）。
+String? recognizedPluginIdForDisplay(
+  QueueItem item,
+  List<EnabledMusicPlugin> lxPlugins,
+) {
+  final own = item.pluginId?.trim() ?? '';
+  if (own.isNotEmpty) return own;
+  final cached = recognizedFallbackPluginId(item);
+  if (cached != null) return cached;
+  return inferRecognizedLxPluginId(
+    path: item.path,
+    pluginData: item.pluginData,
+    lxPlugins: lxPlugins,
+  );
 }
 
 const _playbackSourceAssociationsKey = 'playbackSourceAssociationsV1';
@@ -2729,12 +2752,17 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
     var item = state.queue[index];
     final associated = await _loadAssociatedReplacement(item.path);
     if (requestId != _playRequestId) return;
-    if (associated != null) {
+    if (associated != null && !associated.autoLocal) {
+      // 手动换源/接受提案保存的关联：维持原有行为，直接替换为替代音源。
       final queue = [...state.queue];
-      queue[index] = associated;
-      item = associated;
+      queue[index] = associated.item;
+      item = associated.item;
       state = state.copyWith(queue: queue);
     }
+    // 音源失败自动回退产生的关联（autoLocal）不在此替换：先按原音源
+    // 正常起播，原音源已恢复时自然走回音源；仍失败则由失败处理链
+    // （_handlePlaybackFailure → _autoRelinkToLocal）再次回退本地，
+    // 且重复回退不会再次弹提示。
     // 关联歌词同时适用于插件歌曲、普通网络歌曲和本地歌曲。
     // 以稳定的歌曲路径（插件 ID + 歌曲 ID）作为键，覆盖搜索结果自带的默认歌词。
     final rememberedLyrics = await _loadRememberedLyrics(item.path);
@@ -3367,7 +3395,9 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
   }
 
   /// 无网络/在线音源失败时直接切换到本地替代并续播，不弹提案询问：
-  /// 替换会像手动接受提案一样持久保存关联，下次播放同一首自动用本地。
+  /// 替换会像手动接受提案一样持久保存关联（带 autoLocal 标记），下次
+  /// 播放同一首时先重试原音源，仍失败才再次回退本地，且回退提示只弹
+  /// 第一次。
   Future<void> _autoRelinkToLocal({
     required int queueIndex,
     required QueueItem original,
@@ -3383,10 +3413,15 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
     if (_autoRelinkAttempts >= _maxAutoRelinkAttempts) return;
     _autoRelinkAttempts += 1;
 
+    // 该首歌此前已自动回退过（关联已带 autoLocal 标记）：回退提示只弹
+    // 第一次，后续回退保持安静，避免反复打扰。
+    final previous = await _loadAssociatedReplacement(original.path);
+    final isRepeatAutoFallback = previous?.autoLocal == true;
     await _saveAssociatedReplacement(
       original.path,
       replacement,
       original: original,
+      autoLocal: true,
     );
     final queue = [...state.queue];
     queue[queueIndex] = replacement;
@@ -3401,7 +3436,9 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
       errorMessage: null,
     );
     _schedulePersistSession();
-    _publishNotice('在线音源不可用，已自动切换为本地文件播放');
+    if (!isRepeatAutoFallback) {
+      _publishNotice('在线音源不可用，已自动切换为本地文件播放');
+    }
     await _playAt(queueIndex);
   }
 
@@ -3710,7 +3747,12 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
     }
   }
 
-  Future<QueueItem?> _loadAssociatedReplacement(String originalPath) async {
+  /// 读取原音源 [originalPath] 的持久化关联。返回的 autoLocal 表示该
+  /// 关联是「音源失败自动回退本地」产生的：重新播放同一首时应优先重试
+  /// 原音源，而非永久绑定本地文件。
+  Future<({QueueItem item, bool autoLocal})?> _loadAssociatedReplacement(
+    String originalPath,
+  ) async {
     // 空路径不作为关联键：否则所有空路径歌曲会共用同一条替换记录，
     // 表现为「点任何歌都用同一个替代音源」。
     final key = originalPath.trim();
@@ -3721,18 +3763,32 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
       if (raw == null || raw.isEmpty) return null;
       final decoded = jsonDecode(raw);
       if (decoded is! Map || decoded[key] is! Map) return null;
-      return _queueItemFromAssociation(
-        Map<String, dynamic>.from(decoded[key] as Map),
-      );
+      final entry = Map<String, dynamic>.from(decoded[key] as Map);
+      final item = _queueItemFromAssociation(entry);
+      if (item == null) return null;
+      return (item: item, autoLocal: entry['autoLocal'] == true);
     } catch (_) {
       return null;
     }
+  }
+
+  /// 读取音源失败自动回退时保存的本地替代项，文件仍存在才返回。
+  /// 手动换源产生的关联（autoLocal 为假）不是本地回退，不参与复用。
+  Future<QueueItem?> _loadAutoLocalReplacement(String originalPath) async {
+    final associated = await _loadAssociatedReplacement(originalPath);
+    if (associated == null || !associated.autoLocal) return null;
+    if (playbackSourceTypeFor(associated.item) != PlaybackSourceType.localFile) {
+      return null;
+    }
+    if (!await _localItemExists(associated.item)) return null;
+    return associated.item;
   }
 
   Future<void> _saveAssociatedReplacement(
     String originalPath,
     QueueItem replacement, {
     QueueItem? original,
+    bool autoLocal = false,
   }) async {
     final key = originalPath.trim();
     if (key.isEmpty) return;
@@ -3749,6 +3805,11 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
     // 记录换源前的原始音源，供「还原」功能恢复。
     if (original != null) {
       entry['original'] = _queueItemToAssociation(original);
+    }
+    // 标记为「音源失败自动回退本地」的关联：重新播放同一首时优先重试
+    // 原音源，恢复可用即走回音源；仍失败才再次回退本地（提示只弹首次）。
+    if (autoLocal) {
+      entry['autoLocal'] = true;
     }
     associations[key] = entry;
     await preferences.setString(
@@ -5103,7 +5164,11 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
       // 只会形成「失败→替换→再失败」的死循环，拖死主 isolate 并耗尽内存。
       // 本地文件失败直接落到后续策略（重试/换源/下一首/暂停）。
       if (playbackSourceTypeFor(failedItem) != PlaybackSourceType.localFile) {
-        final localReplacement = await _findLocalReplacement(failedItem);
+        // 优先复用此前自动回退保存的本地替代（文件仍在时生效），免去
+        // 每次重新搜索本地曲库；没有可复用记录时再现场搜索。
+        var localReplacement = await _loadAutoLocalReplacement(failedItem.path);
+        if (requestId != _playRequestId) return;
+        localReplacement ??= await _findLocalReplacement(failedItem);
         if (requestId != _playRequestId) return;
         if (localReplacement != null) {
           await _autoRelinkToLocal(

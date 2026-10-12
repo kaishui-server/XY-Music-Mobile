@@ -1432,15 +1432,14 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
   /// 歌曲信息面板：展示平台、歌曲 ID/MID 与作者信息（作者可点进
   /// 作品列表页）。数据取自当前队列项的插件元数据。
   Future<void> _showSongInfoSheet(QueueItem item) async {
-    // 识曲歌曲未关联洛雪插件时 pluginId 为空：用播放回退链缓存的
-    // 解析插件兜底，否则来源会误显示为「本地音乐」且歌手行不可点。
-    var pluginId = item.pluginId;
-    if (pluginId == null || pluginId.isEmpty) {
-      pluginId = recognizedFallbackPluginId(item);
-    }
+    // 识曲歌曲未关联洛雪插件时 pluginId 为空：按「自带 pluginId →
+    // 播放回退缓存 → lx:// 路径/pluginData 推断」完整回退链兜底，
+    // 否则来源会误显示为「本地音乐」且歌手行不可点（兼容修复前已
+    // 持久化、无回退缓存的存量旧数据）。
+    final plugins = await ref.read(enabledMusicPluginsProvider.future);
+    final pluginId = recognizedPluginIdForDisplay(item, plugins);
     String? platform;
     if (pluginId != null && pluginId.isNotEmpty) {
-      final plugins = await ref.read(enabledMusicPluginsProvider.future);
       platform = plugins
           .where((plugin) => plugin.id == pluginId)
           .firstOrNull
@@ -1471,14 +1470,11 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
     QueueItem item,
     _SongArtistInfo artist,
   ) async {
-    // 与 _showSongInfoSheet 一致：识曲歌曲用回退解析插件兜底，保证
+    // 与 _showSongInfoSheet 一致：识曲歌曲按完整回退链兜底，保证
     // 「作品」入口打开后仍能定位到实际解析该歌的插件。
-    var pluginId = item.pluginId;
-    if (pluginId == null || pluginId.isEmpty) {
-      pluginId = recognizedFallbackPluginId(item);
-    }
-    if (pluginId == null || pluginId.isEmpty) return;
     final plugins = await ref.read(enabledMusicPluginsProvider.future);
+    final pluginId = recognizedPluginIdForDisplay(item, plugins);
+    if (pluginId == null || pluginId.isEmpty) return;
     final plugin = plugins
         .where((plugin) => plugin.id == pluginId)
         .firstOrNull;
