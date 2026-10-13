@@ -11,6 +11,7 @@ import '../player/player_provider.dart';
 import '../playlists/playlist_picker_sheet.dart';
 import '../playlists/playlists_provider.dart';
 import '../plugins/plugin_runtime.dart';
+import '../recognize/recognize_source.dart';
 import '../ui/xy_surface.dart';
 import 'batch_download.dart';
 import 'cover_image.dart';
@@ -158,11 +159,10 @@ class _SongsListViewState extends ConsumerState<SongsListView> {
     }
     final favorites = ref.watch(favoritesProvider);
     // 插件歌曲在副标题中显示来源插件名（如歌单中的网络音源歌曲）。
+    final lxPlugins = ref.watch(enabledMusicPluginsProvider).valueOrNull ??
+        const <EnabledMusicPlugin>[];
     final pluginNames = <String, String>{
-      for (final plugin
-          in ref.watch(enabledMusicPluginsProvider).valueOrNull ??
-              const <EnabledMusicPlugin>[])
-        plugin.id: plugin.name,
+      for (final plugin in lxPlugins) plugin.id: plugin.name,
     };
     final hasCurrentSong = ref.watch(
       playerProvider.select((state) => state.current != null),
@@ -200,6 +200,7 @@ class _SongsListViewState extends ConsumerState<SongsListView> {
               i,
               favorites: favorites,
               pluginNames: pluginNames,
+              lxPlugins: lxPlugins,
               playingPath: playingPath,
               dragIndex: i < widget.songs.length && !widget.selectionMode
                   ? i
@@ -217,6 +218,7 @@ class _SongsListViewState extends ConsumerState<SongsListView> {
               i,
               favorites: favorites,
               pluginNames: pluginNames,
+              lxPlugins: lxPlugins,
               playingPath: playingPath,
               dragIndex: -1,
               loadNetworkCover: loadNetworkCovers,
@@ -241,6 +243,7 @@ class _SongsListViewState extends ConsumerState<SongsListView> {
     int i, {
     required Set<String> favorites,
     required Map<String, String> pluginNames,
+    required List<EnabledMusicPlugin> lxPlugins,
     required String? playingPath,
     required int dragIndex,
     required bool loadNetworkCover,
@@ -257,7 +260,7 @@ class _SongsListViewState extends ConsumerState<SongsListView> {
     // 正在播放的歌曲歌名以主题色显示，便于在各歌单中快速辨认。
     final isPlaying = playingPath != null && playingPath == s.path;
     // 来源插件名（与导入的插件名一致），以标签形式展示在歌名旁。
-    final sourceTag = _sourceTagLabel(s, pluginNames);
+    final sourceTag = _sourceTagLabel(s, pluginNames, lxPlugins);
     // RepaintBoundary 把每行圈成独立重绘范围：多选勾选或收藏状态
     // 变化时只重绘对应行，避免整个列表跟着重绘造成卡顿。
     return RepaintBoundary(
@@ -413,12 +416,24 @@ class _SongsListViewState extends ConsumerState<SongsListView> {
     return parts.isEmpty ? '未知艺术家' : parts.join(' · ');
   }
 
-  /// 来源插件名标签文本：优先显示导入时解析的插件名（与插件管理一致），
-  /// 插件已卸载时回退显示插件 ID，便于用户辨认歌曲来源。
-  String? _sourceTagLabel(Song song, Map<String, String> pluginNames) {
+  /// 来源插件名标签文本：优先显示歌曲自带的插件名（与插件管理一致），
+  /// 插件已卸载时回退显示插件 ID；存量识曲/洛雪歌曲 pluginId 为空时，
+  /// 按 `lx://` 路径 / `pluginData['lx']` 从已启用洛雪插件推断来源，
+  /// 还原插件名标签（修复前持久化的旧数据）。推断不到才不显示标签。
+  String? _sourceTagLabel(
+    Song song,
+    Map<String, String> pluginNames,
+    List<EnabledMusicPlugin> lxPlugins,
+  ) {
     final id = song.pluginId?.trim() ?? '';
-    if (id.isEmpty) return null;
-    return pluginNames[id] ?? id;
+    if (id.isNotEmpty) return pluginNames[id] ?? id;
+    final inferred = inferRecognizedLxPluginId(
+      path: song.path,
+      pluginData: song.pluginData,
+      lxPlugins: lxPlugins,
+    );
+    if (inferred == null) return null;
+    return pluginNames[inferred] ?? inferred;
   }
 
   Future<void> _showSongActions(
@@ -430,11 +445,13 @@ class _SongsListViewState extends ConsumerState<SongsListView> {
     final isFavorite = ref.read(favoritesProvider).contains(song.path);
     // 操作面板头部副标题与列表行保持一致，同样显示来源插件名。
     var pluginNames = const <String, String>{};
+    var lxPlugins = const <EnabledMusicPlugin>[];
     try {
       final plugins = await ref.read(enabledMusicPluginsProvider.future);
       pluginNames = {for (final plugin in plugins) plugin.id: plugin.name};
+      lxPlugins = plugins;
     } catch (_) {}
-    final sourceTag = _sourceTagLabel(song, pluginNames);
+    final sourceTag = _sourceTagLabel(song, pluginNames, lxPlugins);
     // 网络歌曲才提供下载与换源；本地文件没有插件音源可切换，
     // 批量下载流程本身也会跳过本地文件。
     final isNetworkSong = song.pluginId?.trim().isNotEmpty == true;

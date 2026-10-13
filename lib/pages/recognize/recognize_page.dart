@@ -11,6 +11,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import '../../src/favorites/favorites_provider.dart';
 import '../../src/library/library_provider.dart';
 import '../../src/navigation/sidebar_controller.dart';
+import '../../src/plugins/plugin_runtime.dart';
 import '../../src/recognize/recognize_service.dart';
 import '../../src/recognize/system_audio_capture.dart';
 import '../../src/rust/api.dart';
@@ -196,7 +197,12 @@ class _RecognizePageState extends ConsumerState<RecognizePage>
       if (pcm16Peak(pcm) < 96) {
         throw Exception('没有检测到可识别的声音，请调高音量后重试');
       }
-      final matches = await recognizePcm(pcm);
+      // 识别结果走 `lx://` 虚拟路径，需要关联已启用的洛雪插件，歌曲信息
+      // 面板才能显示真实平台名并允许点作者查看作品（否则显示「本地音乐」
+      // 且作者行不可点）。
+      final plugins = await ref.read(enabledMusicPluginsProvider.future);
+      final lxPlugins = plugins.where((plugin) => plugin.isLx).toList();
+      final matches = await recognizePcm(pcm, lxPlugins: lxPlugins);
       if (!mounted || operationId != _operationId) return;
       setState(() {
         _matches = matches;
