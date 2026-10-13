@@ -53,6 +53,12 @@ class Mobile139Provider extends CloudProvider {
     if (cookie.isEmpty) {
       throw const CloudException('未捕获到登录凭据，请重新登录');
     }
+    // 会话有效性二次校验：捕获到 authorization Cookie 并不代表会话
+    // 有效（可能过期/伪凭据）。校验失败则拒绝绑定，停留在登录页，
+    // 确保「实际登录成功（Cookie/会话可验证）后才跳转持久化」。
+    if (!await validate({'cookie': cookie})) {
+      throw const CloudException('登录态校验失败，请确认已完成登录后重试');
+    }
     return CloudAccount(
       provider: id,
       accountId: md5Hex(cookie).substring(0, 12),
