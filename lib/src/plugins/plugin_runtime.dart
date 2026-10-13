@@ -2189,7 +2189,9 @@ class PluginRuntimeService {
       id: id.isEmpty ? title : id,
       title: title,
       subtitle: subtitle,
-      coverUrl: _extractCover(raw),
+      // 歌手/作者场景优先按头像键提取（网易云 img1v1Url 等），
+      // 未命中再回退通用封面提取，避免歌手头像漏显示。
+      coverUrl: artist ? _extractAvatar(raw) : _extractCover(raw),
       rawData: raw,
     );
   }
@@ -5067,9 +5069,11 @@ class PluginRuntimeService {
           id: id,
           title: title,
           subtitle: artist ? '' : entry['artist']?.toString() ?? '',
-          // 后端 artwork 可能是 http://（tx 歌手头像）或 // 开头地址：
-          // Android 禁明文 HTTP、渲染层要求完整 URL，统一过规范化。
-          coverUrl: _normalizeImageUrl(entry['artwork']?.toString() ?? ''),
+          // 歌手场景走头像多字段回退（artwork/avatar/img1v1Url 等，
+          // 含默认占位过滤与归一化）；专辑场景保持 artwork 单字段。
+          coverUrl: artist
+              ? _extractAvatar(entry)
+              : _normalizeImageUrl(entry['artwork']?.toString() ?? ''),
           rawData: {
             ...entry,
             'animeSrc': platform,
@@ -7073,6 +7077,47 @@ class PluginRuntimeService {
   static String extractCoverForTest(Map<String, dynamic> raw) =>
       _extractCover(raw);
 
+  /// 提取歌手/作者头像，对齐弦予 _extractAvatar 的候选键序。
+  /// 网易云 weapi/search type=100 返回的歌手对象主头像字段为 img1v1Url，
+  /// 与歌曲封面的 artwork/cover 等键不同，需独立优先遍历头像键；
+  /// 全部未命中时回退通用封面提取（_extractCover，含嵌套与 picId 兜底）。
+  static String _extractAvatar(Map<String, dynamic> raw) {
+    for (final node in _nestedTrackNodes(raw)) {
+      for (final key in const [
+        'avatarUrl',
+        'avatar',
+        'avatar_url',
+        'picUrl',
+        'pic_url',
+        'pic',
+        'img1v1Url',
+        'headUrl',
+        'face',
+        'artistPic',
+        'coverUrl',
+        'img',
+        // Bilibili 用户搜索结果常用 upic/face。
+        'upic',
+        'userFace',
+        'user_face',
+      ]) {
+        final value = node[key];
+        if (value is String) {
+          final normalized = _normalizeImageUrl(value);
+          if (normalized.isEmpty) continue;
+          if (_isNeteaseDefaultAvatar(normalized)) continue;
+          return normalized;
+        }
+      }
+    }
+    return _extractCover(raw);
+  }
+
+  /// 仅供回归测试验证歌手头像提取。
+  @visibleForTesting
+  static String extractAvatarForTest(Map<String, dynamic> raw) =>
+      _extractAvatar(raw);
+
   static String _extractCoverFromNode(Map<String, dynamic> node) {
     for (final key in const [
       'artwork',
@@ -7083,6 +7128,7 @@ class PluginRuntimeService {
       'coverImgUrl',
       'picUrl',
       'picurl',
+      'pic_url',
       'pic',
       'img',
       'imgUrl',
@@ -7093,6 +7139,10 @@ class PluginRuntimeService {
       'avatar',
       'avatarUrl',
       'avatar_url',
+      // 网易云歌手搜索主头像字段（weapi/search type=100 返回 img1v1Url），
+      // 对齐弦予 _extractAvatar 候选键，避免漏取歌手头像。
+      'img1v1Url',
+      'artistPic',
       // Bilibili 用户搜索结果常用 upic/face。
       'upic',
       'face',
@@ -7104,7 +7154,12 @@ class PluginRuntimeService {
       final value = node[key];
       if (value is String) {
         final normalized = _normalizeImageUrl(value);
-        if (normalized.isNotEmpty) return normalized;
+        if (normalized.isEmpty) continue;
+        // 网易云默认头像占位图（5639395138885805 token / default）不是
+        // 有效封面，跳过并继续尝试 picUrl/pic/picId_str 等后续候选，
+        // 避免歌手搜索结果把默认灰色人像当成真实头像。
+        if (_isNeteaseDefaultAvatar(normalized)) continue;
+        return normalized;
       }
     }
 
@@ -7115,6 +7170,21 @@ class PluginRuntimeService {
       return _neteasePicIdToUrl(picId);
     }
     return '';
+  }
+
+  /// 判断是否为网易云默认头像占位图 URL。
+  /// 网易云无头像用户会返回带固定 token 5639395138885805 或含 default
+  /// 的 CDN 地址（通常形如 …/5639395138885805.jpg 或 …/default.jpg），
+  /// 仅对 music.126.net 域名生效，避免误伤其它图床。
+  static bool _isNeteaseDefaultAvatar(String url) {
+    final uri = Uri.tryParse(url);
+    if (uri == null) return false;
+    final host = uri.host.toLowerCase();
+    if (host != 'music.126.net' && !host.endsWith('.music.126.net')) {
+      return false;
+    }
+    final lower = url.toLowerCase();
+    return lower.contains('5639395138885805') || lower.contains('default');
   }
 
   /// 按电脑端的字段范围遍历插件数据。限制三层嵌套并做身份去重，

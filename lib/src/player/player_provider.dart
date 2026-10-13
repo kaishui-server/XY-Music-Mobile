@@ -19,6 +19,10 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import '../core/db_path.dart';
 import '../core/settings.dart';
+import '../cloud/cloud_credentials_store.dart';
+import '../cloud/cloud_registry.dart';
+import '../cloud/cloud_types.dart';
+import '../cloud/direct_link_cache.dart';
 import '../effects/effects_provider.dart';
 import '../favorites/favorites_provider.dart';
 import '../logging/app_log_store.dart';
@@ -30,6 +34,9 @@ import '../rust/music/types.dart';
 import '../widgets/cover_image.dart';
 import 'downloaded_song_store.dart';
 import 'desktop_lyrics.dart';
+import 'bluetooth_lyrics.dart';
+import 'notification_lyrics.dart';
+import 'cloud_play_context.dart';
 import 'lx_lyrics_builder.dart';
 import 'playback_probe.dart';
 import 'video_playback_session.dart';
@@ -57,6 +64,8 @@ class QueueItem {
   final String? coverUrl;
   final String? lyricsRaw;
   final bool lyricsAttempted;
+  final String? source;
+  final String? cloudInfoJson;
   const QueueItem({
     required this.path,
     required this.title,
@@ -68,6 +77,8 @@ class QueueItem {
     this.coverUrl,
     this.lyricsRaw,
     this.lyricsAttempted = false,
+    this.source,
+    this.cloudInfoJson,
   });
 
   QueueItem copyWith({
@@ -86,6 +97,8 @@ class QueueItem {
     coverUrl: coverUrl ?? this.coverUrl,
     lyricsRaw: clearLyricsRaw ? null : lyricsRaw ?? this.lyricsRaw,
     lyricsAttempted: lyricsAttempted ?? this.lyricsAttempted,
+    source: source,
+    cloudInfoJson: cloudInfoJson,
   );
 }
 
@@ -2018,6 +2031,55 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
     );
   }
 
+  Future<void> _syncBluetoothLyrics() async {
+    final settings = _ref.read(settingsProvider).valueOrNull;
+    final item = state.current;
+    if (settings == null || item == null) {
+      await BluetoothLyricsBridge.sync(
+        enabled: false,
+        title: '',
+        artist: '',
+        lyrics: '',
+        position: 0,
+        isPlaying: false,
+        duration: 0,
+      );
+      return;
+    }
+    await BluetoothLyricsBridge.sync(
+      enabled: settings.bluetoothLyricsEnabled,
+      title: item.title,
+      artist: item.artist,
+      lyrics: item.lyricsRaw ?? '',
+      position: state.position,
+      isPlaying: state.isPlaying,
+      duration: state.duration,
+    );
+  }
+
+  /// 通知栏&锁屏实时歌词（任务A）：与蓝牙歌词共用同一份歌词解析与进度
+  /// 同步链路，开关跟随 settings.bluetoothLyricsEnabled——开启蓝牙歌词即
+  /// 在通知栏/锁屏显示滚动歌词，不新增设置项。Bridge 内部节流：切歌/
+  /// 播放态变化立即推送，播放中仅 ≥500ms 低频校准锚点，行滚动由原生
+  /// 侧按墙钟推进。
+  Future<void> _syncNotificationLyrics() async {
+    final settings = _ref.read(settingsProvider).valueOrNull;
+    final item = state.current;
+    if (settings == null || item == null) {
+      await NotificationLyricsBridge.disable();
+      return;
+    }
+    await NotificationLyricsBridge.sync(
+      enabled: settings.bluetoothLyricsEnabled,
+      title: item.title,
+      artist: item.artist,
+      lyrics: item.lyricsRaw ?? '',
+      position: state.position,
+      isPlaying: state.isPlaying,
+      duration: state.duration,
+    );
+  }
+
   /// B站视频播放时 just_audio 处于暂停状态，普通进度流不会再更新。
   /// 将视频控制器的状态镜像到播放状态，桌面歌词即可继续按视频进度刷新。
   void _syncVideoPlaybackState() {
@@ -2062,6 +2124,8 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
   /// 关闭桌面歌词时只发送一次隐藏消息；开启时最多每 100ms 同步一次，
   /// 并且不会让旧的异步同步任务和新的任务同时堆积。
   void _requestDesktopLyricsSync({bool immediate = false}) {
+    unawaited(_syncBluetoothLyrics());
+    unawaited(_syncNotificationLyrics());
     final settings = _ref.read(settingsProvider).valueOrNull;
     final shouldShow =
         settings?.desktopLyricsEnabled == true &&
@@ -3119,7 +3183,12 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
         await _setPlayerUrl(item.path, tag: mediaItem, requestId: requestId);
         return null;
       case PlaybackSourceType.localFile:
-        await _setLocalAudioSource(item.path, mediaItem, requestId: requestId);
+        await _setLocalAudioSource(
+          item.path,
+          mediaItem,
+          cloudInfoJson: item.cloudInfoJson,
+          requestId: requestId,
+        );
         return null;
     }
   }
@@ -4057,16 +4126,86 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
     );
   }
 
+  /// 网盘曲目播放：直链缓存 → getDirectLink/getShareDirectLink → 在线管线。
+  ///
+  /// 上下文优先取 queue 条目携带的 cloudInfoJson，缺失时从 cloud:// path
+  /// 反解（兼容旧队列/外部唤起）。直链起播失败清缓存重取一次。
+  Future<void> _setCloudAudioSource(
+    String rawPath,
+    MediaItem mediaItem, {
+    String? cloudInfoJson,
+    int? requestId,
+  }) async {
+    var ctx = CloudPlayContext.tryParse(cloudInfoJson) ??
+        CloudPlayContext.tryParsePath(rawPath);
+    if (ctx == null) {
+      throw const _LocalPlaybackException('网盘歌曲信息缺失，请重新添加');
+    }
+    final provider = cloudProviderById(ctx.provider);
+    if (provider == null) {
+      throw const _LocalPlaybackException('该网盘暂未支持');
+    }
+
+    // 凭据：先按绑定的 accountId 精确取，再退该盘单账号便捷读取。
+    var cred = ctx.accountId == '_' || ctx.accountId.isEmpty
+        ? null
+        : await CloudCredentialsStore.instance
+              .credFor(provider.id, ctx.accountId);
+    cred ??= await CloudCredentialsStore.instance.soleCredFor(provider.id);
+
+    final fromShare = ctx.share != null && ctx.share!.directPlayable;
+    if (cred == null && !fromShare) {
+      throw const _LocalPlaybackException('网盘账号未绑定或已失效');
+    }
+
+    Future<CloudDirectLink> resolve() => fromShare
+        ? provider.getShareDirectLink(cred, ctx.share!, ctx.file)
+        : provider.getDirectLink(cred ?? const <String, String>{}, ctx.file);
+
+    final key = rawPath;
+    var link = await DirectLinkCache.instance.get(key, provider.directLinkTtl);
+    if (link == null) {
+      link = await resolve();
+      DirectLinkCache.instance.put(key, link);
+    }
+
+    try {
+      await _setPlayerUrl(
+        link.url,
+        headers: link.headers.isEmpty ? null : link.headers,
+        tag: mediaItem,
+        requestId: requestId,
+      );
+    } catch (e) {
+      // 直链可能已过期：清缓存重取一次；仍失败交上层按播放失败处理。
+      debugPrint('[cloud] 网盘直链起播失败，重取一次: $e');
+      DirectLinkCache.instance.invalidate(key);
+      final fresh = await resolve();
+      DirectLinkCache.instance.put(key, fresh);
+      await _setPlayerUrl(
+        fresh.url,
+        headers: fresh.headers.isEmpty ? null : fresh.headers,
+        tag: mediaItem,
+        requestId: requestId,
+      );
+    }
+  }
+
   Future<void> _setLocalAudioSource(
     String rawPath,
     MediaItem mediaItem, {
+    String? cloudInfoJson,
     int? requestId,
   }) async {
     final trimmed = rawPath.trim();
-    // 网盘挂载歌曲（remote:// URI）：先解析播放来源，命中缓存播本地
-    // 缓存文件，未缓存则流式播放 Alist/OpenList 直链。
-    if (trimmed.startsWith('remote://')) {
-      await _setRemoteAudioSource(trimmed, mediaItem, requestId: requestId);
+    // 网盘曲目（cloud:// URI）：解析直链后走在线播放管线。
+    if (trimmed.startsWith('cloud://')) {
+      await _setCloudAudioSource(
+        trimmed,
+        mediaItem,
+        cloudInfoJson: cloudInfoJson,
+        requestId: requestId,
+      );
       return;
     }
     if (trimmed.startsWith('content://')) {
@@ -4119,78 +4258,6 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
     if ((await Permission.audio.request()).isGranted) return;
     if ((await Permission.storage.request()).isGranted) return;
     await Permission.manageExternalStorage.request();
-  }
-
-  /// 远程挂载歌曲的播放解析：已缓存返回本地路径直接播；未缓存则解析
-  /// Alist/OpenList 直链并附带防盗链 headers 流式播放。
-  Future<void> _setRemoteAudioSource(
-    String remoteUri,
-    MediaItem mediaItem, {
-    int? requestId,
-  }) async {
-    String planJson;
-    try {
-      final dbPath = await _ref.read(dbPathProvider.future);
-      planJson = await remotePlaybackSource(
-        dbPath: dbPath,
-        remoteUri: remoteUri,
-      );
-    } catch (error) {
-      throw _LocalPlaybackException('网盘歌曲解析失败：$error');
-    }
-    final plan = jsonDecode(planJson) as Map<String, dynamic>;
-    final kind = plan['kind'] as String? ?? '';
-    if (kind == 'cached') {
-      final cachedPath = plan['path'] as String? ?? '';
-      try {
-        await _enqueueSourceOperation(() async {
-          if (requestId != null && requestId != _playRequestId) return;
-          // DSP 源记录：网盘缓存命中，本地文件直读。
-          _dspStreamUrl = null;
-          _dspStreamHeaders = null;
-          _dspLocalPath = cachedPath;
-          await _player.setFilePath(cachedPath, tag: mediaItem);
-        });
-      } catch (_) {
-        throw const _LocalPlaybackException('网盘缓存文件无法播放，请清理缓存后重试');
-      }
-      return;
-    }
-
-    final url = plan['url'] as String? ?? '';
-    if (url.isEmpty) {
-      throw const _LocalPlaybackException('网盘歌曲缺少播放地址');
-    }
-    // Alist/OpenList 播放计划：优先使用服务端返回的防盗链 headers
-    // （raw_url 直链的 UA/Referer/Cookie 等），叠加 Basic 认证兜底。
-    final headers = <String, String>{
-      if (plan['headers'] case final Map<String, dynamic> extraHeaders)
-        for (final entry in extraHeaders.entries)
-          if (entry.value != null) entry.key: entry.value.toString(),
-      if (plan['userAgent'] case final String userAgent?
-          when userAgent.isNotEmpty)
-        'User-Agent': userAgent,
-      if (plan['referer'] case final String referer? when referer.isNotEmpty)
-        'Referer': referer,
-    };
-    final username = plan['username'] as String?;
-    final password = plan['password'] as String?;
-    if (username != null &&
-        username.isNotEmpty &&
-        !headers.containsKey('Authorization')) {
-      final token = base64Encode(utf8.encode('$username:${password ?? ''}'));
-      headers['Authorization'] = 'Basic $token';
-    }
-    try {
-      await _setPlayerUrl(
-        url,
-        headers: headers.isEmpty ? null : headers,
-        tag: mediaItem,
-        requestId: requestId,
-      );
-    } catch (_) {
-      throw const _LocalPlaybackException('网盘歌曲无法播放，请检查网络或账号密码');
-    }
   }
 
   /// 洛雪插件自有歌曲的解析（对齐 BakaMusic 的命名空间隔离：洛雪音源
@@ -5354,8 +5421,7 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
     );
     state = state.copyWith(queue: queue, current: queue[index]);
     if (playbackSourceTypeFor(item) == PlaybackSourceType.localFile &&
-        !item.path.startsWith('content://') &&
-        !item.path.startsWith('remote://')) {
+        !item.path.startsWith('content://')) {
       try {
         final sidecarPath = p.setExtension(item.path, '.lrc');
         if (restoredLyrics.isEmpty) {

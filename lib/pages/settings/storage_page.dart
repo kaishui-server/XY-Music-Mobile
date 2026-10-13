@@ -13,18 +13,16 @@ import '../../src/widgets/top_notice.dart';
 class _StorageUsage {
   const _StorageUsage({
     required this.coverBytes,
-    required this.remoteBytes,
     required this.stagingBytes,
     required this.tempBytes,
   });
 
   final int coverBytes;
-  final int remoteBytes;
   final int stagingBytes;
   final int tempBytes;
 
   int get totalBytes =>
-      coverBytes + remoteBytes + stagingBytes + tempBytes;
+      coverBytes + stagingBytes + tempBytes;
 }
 
 /// 递归统计目录占用（目录不存在按 0 处理）。
@@ -70,15 +68,13 @@ final _storageUsageProvider =
       final tempDir = await getTemporaryDirectory();
       final results = await Future.wait([
         _dirSize(p.join(dataDir, 'covers')),
-        _dirSize(p.join(dataDir, 'remote-cache')),
         _dirSize(p.join(supportDir.path, 'download_staging')),
         _dirSize(tempDir.path),
       ]);
       return _StorageUsage(
         coverBytes: results[0],
-        remoteBytes: results[1],
-        stagingBytes: results[2],
-        tempBytes: results[3],
+        stagingBytes: results[1],
+        tempBytes: results[2],
       );
     });
 
@@ -162,7 +158,7 @@ class StoragePage extends ConsumerWidget {
                     ),
                     const SizedBox(height: 4),
                     Text(
-                      '含封面、云音乐播放缓存、下载中转与临时文件',
+                      '含封面、下载中转与临时文件',
                       style: TextStyle(
                         fontSize: 12,
                         color: scheme.onSurfaceVariant,
@@ -187,13 +183,6 @@ class StoragePage extends ConsumerWidget {
               bytes: usageData.coverBytes,
               onClear: (context, ref) =>
                   _clearCovers(context, ref),
-            ),
-            _CacheTile(
-              icon: Icons.cloud_outlined,
-              title: '云音乐播放缓存',
-              description: '网盘歌曲播放时缓存的音频数据',
-              bytes: usageData.remoteBytes,
-              onClear: (context, ref) => _clearRemote(context, ref),
             ),
             _CacheTile(
               icon: Icons.download_outlined,
@@ -290,32 +279,6 @@ class StoragePage extends ConsumerWidget {
     await _refresh(ref);
   }
 
-  Future<void> _clearRemote(BuildContext context, WidgetRef ref) async {
-    if (!await _confirm(
-      context,
-      title: '清理播放缓存？',
-      message: '网盘歌曲的本地缓存将被删除，再次播放时会重新从网盘加载。',
-    )) {
-      return;
-    }
-    try {
-      final dataDir = await ref.read(appDataDirProvider.future);
-      await clearRemoteCache(cacheRoot: p.join(dataDir, 'remote-cache'));
-      if (context.mounted) {
-        XyNotice.show(context, message: '播放缓存已清理');
-      }
-    } catch (error) {
-      if (context.mounted) {
-        XyNotice.show(
-          context,
-          message: '清理失败：$error',
-          type: XyNoticeType.error,
-        );
-      }
-    }
-    await _refresh(ref);
-  }
-
   Future<void> _clearStaging(BuildContext context, WidgetRef ref) async {
     if (!await _confirm(
       context,
@@ -374,7 +337,7 @@ class StoragePage extends ConsumerWidget {
     if (!await _confirm(
       context,
       title: '一键清理全部缓存？',
-      message: '将清理封面、播放缓存、下载中转、临时文件与内存缓存，'
+      message: '将清理封面、下载中转、临时文件与内存缓存，'
           '不影响歌单、收藏、插件与已下载的歌曲。',
       confirmLabel: '全部清理',
     )) {
@@ -388,12 +351,6 @@ class StoragePage extends ConsumerWidget {
       try {
         await clearCoverCache(cacheRoot: dataDir);
         cleared += usage.coverBytes;
-      } catch (_) {}
-      try {
-        await clearRemoteCache(
-          cacheRoot: p.join(dataDir, 'remote-cache'),
-        );
-        cleared += usage.remoteBytes;
       } catch (_) {}
       await _clearDirectory(
         p.join(supportDir.path, 'download_staging'),

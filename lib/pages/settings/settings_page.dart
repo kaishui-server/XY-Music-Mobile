@@ -18,6 +18,7 @@ import '../../src/backup/backup_service.dart';
 import '../../src/favorites/favorites_provider.dart';
 import '../../src/navigation/sidebar_controller.dart';
 import '../../src/player/desktop_lyrics.dart';
+import '../../src/player/bluetooth_lyrics.dart';
 import '../../src/player/mini_player_overlay.dart';
 import '../../src/playlists/playlists_provider.dart';
 import '../../src/plugins/plugin_runtime.dart';
@@ -38,6 +39,7 @@ enum SettingsSection {
   playbackDetail,
   lyrics,
   desktopLyrics,
+  bluetoothLyrics,
   library,
   download,
   backup,
@@ -106,13 +108,6 @@ const settingsSearchEntries = <SettingsSearchEntry>[
     route: '/settings/plugins',
     icon: Icons.extension_outlined,
     keywords: '插件 安装 启用 卸载 更新',
-  ),
-  SettingsSearchEntry(
-    title: '云端音乐',
-    path: ['云端音乐'],
-    route: '/cloud-music',
-    icon: Icons.cloud_outlined,
-    keywords: '网盘 Alist OpenList 挂载 云端 同步 远程',
   ),
   SettingsSearchEntry(
     title: '音乐库',
@@ -398,18 +393,11 @@ const settingsSearchEntries = <SettingsSearchEntry>[
     keywords: 'js 文件 插件',
   ),
   SettingsSearchEntry(
-    title: '挂载网盘源',
-    path: ['云端音乐', '挂载网盘源'],
-    route: '/cloud-music',
-    icon: Icons.dns_outlined,
-    keywords: 'TVBox Alist OpenList 网盘 服务器 挂载',
-  ),
-  SettingsSearchEntry(
-    title: '播放缓存',
-    path: ['云端音乐', '播放缓存'],
-    route: '/cloud-music',
-    icon: Icons.cached_outlined,
-    keywords: '清理缓存',
+    title: '网盘账号绑定',
+    path: ['账号', '网盘账号绑定'],
+    route: '/cloud-bind',
+    icon: Icons.cloud_outlined,
+    keywords: '百度网盘 阿里云盘 夸克 UC 天翼 移动 迅雷 123 PikPak 绑定 登录',
   ),
 ];
 
@@ -1401,6 +1389,15 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
         ),
         _desktopLyricsPreview(context, settings),
       ],
+      SettingsSection.bluetoothLyrics => [
+        _switchTile(
+          context,
+          icon: Icons.bluetooth_audio,
+          title: '蓝牙歌词',
+          value: settings?.bluetoothLyricsEnabled ?? false,
+          onChanged: (value) => _setBluetoothLyrics(context, ref, value),
+        ),
+      ],
       SettingsSection.library => [
         _tile(
           context,
@@ -1628,6 +1625,11 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
       ),
       _sectionCard(
         context,
+        title: '蓝牙歌词',
+        children: tiles(SettingsSection.bluetoothLyrics),
+      ),
+      _sectionCard(
+        context,
         title: '下载',
         children: tiles(SettingsSection.download),
       ),
@@ -1844,6 +1846,7 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
     SettingsSection.playbackDetail => '歌词',
     SettingsSection.lyrics => '播放详情页歌词',
     SettingsSection.desktopLyrics => '桌面歌词',
+    SettingsSection.bluetoothLyrics => '蓝牙歌词',
     SettingsSection.library => '音乐库',
     SettingsSection.download => '下载',
     SettingsSection.backup => '备份与恢复',
@@ -2284,6 +2287,28 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
       await DesktopLyricsBridge.setEnabled(false);
     }
     await notifier.setDesktopLyricsEnabled(enabled);
+  }
+
+  Future<void> _setBluetoothLyrics(
+    BuildContext context,
+    WidgetRef ref,
+    bool enabled,
+  ) async {
+    final notifier = ref.read(settingsProvider.notifier);
+    if (enabled) {
+      final started = await BluetoothLyricsBridge.setEnabled(true);
+      if (!started) {
+        if (context.mounted) {
+          ScaffoldMessenger.of(
+            context,
+          ).showSnackBar(const SnackBar(content: Text('请授予蓝牙权限后再开启蓝牙歌词')));
+        }
+        return;
+      }
+    } else {
+      await BluetoothLyricsBridge.setEnabled(false);
+    }
+    await notifier.setBluetoothLyricsEnabled(enabled);
   }
 
   /// 迷你播放器浮窗开关：开启前先让原生校验悬浮窗权限（未授权会拉起授权
@@ -3980,7 +4005,6 @@ String _sidebarLabel(String id) => switch (id) {
   kSidebarAccount => '账号',
   kSidebarRecognize => '听歌识曲',
   kSidebarDownloads => '任务管理',
-  kSidebarTestPage => '测试页面',
   kSidebarSettings => '设置',
   _ => id,
 };
@@ -3993,7 +4017,6 @@ IconData _sidebarIcon(String id) => switch (id) {
   kSidebarAccount => Icons.account_circle_outlined,
   kSidebarRecognize => Icons.mic_none_rounded,
   kSidebarDownloads => Icons.checklist_rounded,
-  kSidebarTestPage => Icons.science_outlined,
   kSidebarSettings => Icons.settings_outlined,
   _ => Icons.circle_outlined,
 };

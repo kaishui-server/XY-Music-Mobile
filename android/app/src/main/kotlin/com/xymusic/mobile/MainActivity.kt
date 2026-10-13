@@ -34,6 +34,9 @@ class MainActivity : AudioServiceActivity() {
         private const val APP_UPDATE_CHANNEL = "com.xymusic.mobile/app_update"
         private const val EXTERNAL_LINK_CHANNEL = "com.xymusic.mobile/external_link"
         private const val DESKTOP_LYRICS_CHANNEL = "com.xymusic.mobile/desktop_lyrics"
+        private const val BLUETOOTH_LYRICS_CHANNEL = "com.xymusic.mobile/bluetooth_lyrics"
+        private const val NOTIFICATION_LYRICS_CHANNEL =
+            "com.xymusic.mobile/notification_lyrics"
         private const val SCREEN_AWAKE_CHANNEL = "com.xymusic.mobile/screen_awake"
         private const val DNS_LOOKUP_CHANNEL = "com.xymusic.mobile/dns_lookup"
         private const val GALLERY_CHANNEL = "com.xymusic.mobile/gallery"
@@ -517,6 +520,43 @@ class MainActivity : AudioServiceActivity() {
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
         StoragePermissionBridge.register(this, flutterEngine)
+        BluetoothLyricsLink.register(flutterEngine.dartExecutor.binaryMessenger, this)
+        // 通知栏&锁屏实时歌词：Flutter 推送元数据+LRC+进度锚点+播放态，
+        // 原生侧按墙钟推进当前行并更新 RemoteViews（华为防越权：不申请
+        // 额外权限、仅标准字段与静态布局、全部路径 try/catch 兜底）。
+        MethodChannel(
+            flutterEngine.dartExecutor.binaryMessenger,
+            NOTIFICATION_LYRICS_CHANNEL,
+        ).setMethodCallHandler { call, result ->
+            when (call.method) {
+                "setEnabled" -> {
+                    val enabled = call.argument<Boolean>("enabled") == true
+                    try {
+                        if (enabled) {
+                            NotificationLyricsManager.enable(this)
+                        } else {
+                            NotificationLyricsManager.disable(this)
+                        }
+                        result.success(true)
+                    } catch (_: Exception) {
+                        result.success(false)
+                    }
+                }
+                "update" -> {
+                    NotificationLyricsManager.update(
+                        this,
+                        call.argument<String>("title") ?: "",
+                        call.argument<String>("artist") ?: "",
+                        call.argument<String>("lyrics") ?: "",
+                        (call.argument<Number>("positionMs")?.toLong() ?: 0L),
+                        call.argument<Boolean>("isPlaying") == true,
+                        (call.argument<Number>("durationMs")?.toLong() ?: 0L),
+                    )
+                    result.success(true)
+                }
+                else -> result.notImplemented()
+            }
+        }
         mediaButtonChannel = MethodChannel(
             flutterEngine.dartExecutor.binaryMessenger,
             MEDIA_BUTTON_CHANNEL,
@@ -1239,6 +1279,7 @@ class MainActivity : AudioServiceActivity() {
     ) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
         StoragePermissionBridge.onRequestPermissionsResult(requestCode, grantResults)
+        BluetoothLyricsLink.onPermissionResult(requestCode, grantResults)
     }
 
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {

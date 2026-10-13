@@ -26,13 +26,16 @@ import '../../pages/music_platform/platform_playlists_page.dart';
 import '../../pages/statistics/statistics_page.dart';
 import '../../pages/settings/about_page.dart';
 import '../../pages/settings/storage_page.dart';
-import '../../pages/cloud/cloud_music_page.dart';
-import '../../pages/cloud/cloud_browser_page.dart';
+import '../../pages/cloud/cloud_bind_page.dart';
+import '../../pages/cloud/cloud_pan_browser_page.dart';
+import '../../pages/cloud/cloud_link_import_page.dart';
+import '../../pages/cloud/cloud_password_login_page.dart';
+import '../../pages/cloud/cloud_qrcode_login_page.dart';
+import '../../pages/cloud/cloud_webview_login_page.dart';
 import '../../pages/settings/plugins_page.dart';
 import '../../pages/settings/scan_folders_page.dart';
 import '../../pages/settings/logs_page.dart';
 import '../../pages/settings/feedback_page.dart';
-import '../../pages/test/test_page.dart';
 import '../../pages/playlists/playlists_page.dart';
 import '../../pages/playlists/playlist_detail_page.dart';
 import '../../pages/recognize/recognize_page.dart';
@@ -158,16 +161,51 @@ final appRouter = GoRouter(
                   _instantPage(state, const MusicLibraryPage()),
             ),
             GoRoute(
-              path: '/cloud-music',
+              path: '/cloud-bind',
               pageBuilder: (context, state) =>
-                  _instantPage(state, const CloudMusicPage()),
+                  _instantPage(state, const CloudBindPage()),
               routes: [
                 GoRoute(
-                  path: 'browse/:sourceId',
+                  path: 'browser/:providerId/:accountId',
                   pageBuilder: (context, state) => _instantPage(
                     state,
-                    CloudBrowserPage(
-                      sourceId: state.pathParameters['sourceId']!,
+                    CloudPanBrowserPage(
+                      providerId: state.pathParameters['providerId']!,
+                      accountId: state.pathParameters['accountId'],
+                      selectRoot:
+                          state.uri.queryParameters['selectRoot'] == '1',
+                    ),
+                  ),
+                ),
+                GoRoute(
+                  path: 'link-import',
+                  pageBuilder: (context, state) =>
+                      _instantPage(state, const CloudLinkImportPage()),
+                ),
+                GoRoute(
+                  path: 'password/:providerId',
+                  pageBuilder: (context, state) => _instantPage(
+                    state,
+                    CloudPasswordLoginPage(
+                      providerId: state.pathParameters['providerId']!,
+                    ),
+                  ),
+                ),
+                GoRoute(
+                  path: 'qrcode/:providerId',
+                  pageBuilder: (context, state) => _instantPage(
+                    state,
+                    CloudQrcodeLoginPage(
+                      providerId: state.pathParameters['providerId']!,
+                    ),
+                  ),
+                ),
+                GoRoute(
+                  path: 'webview/:providerId',
+                  pageBuilder: (context, state) => _instantPage(
+                    state,
+                    CloudWebviewLoginPage(
+                      providerId: state.pathParameters['providerId']!,
                     ),
                   ),
                 ),
@@ -212,12 +250,6 @@ final appRouter = GoRouter(
                       ),
                     ),
                   ],
-                ),
-                // 测试页面：侧边栏入口，展示今日听歌问候或当前播放卡片。
-                GoRoute(
-                  path: 'test-page',
-                  pageBuilder: (context, state) =>
-                      _instantPage(state, const TestPage()),
                 ),
                 GoRoute(
                   path: 'account-services',
@@ -345,10 +377,6 @@ final appRouter = GoRouter(
                   path: 'about',
                   pageBuilder: (context, state) =>
                       _instantPage(state, const AboutPage()),
-                ),
-                GoRoute(
-                  path: 'remote-library',
-                  redirect: (context, state) => '/cloud-music',
                 ),
                 GoRoute(
                   path: 'scan-folders',

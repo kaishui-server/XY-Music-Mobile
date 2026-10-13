@@ -2360,9 +2360,7 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
     // 在线歌词也要像本地上传歌词一样写入本地 sidecar。
     // 这样下次从本地音乐再次播放时，会自动读取上次关联的歌词，
     // 不需要用户重新搜索并选择插件结果。
-    // 网盘歌曲（remote://）没有本地 sidecar 可写，由记忆歌词负责持久化。
-    if (playbackSourceTypeFor(item) == PlaybackSourceType.localFile &&
-        !item.path.startsWith('remote://')) {
+    if (playbackSourceTypeFor(item) == PlaybackSourceType.localFile) {
       try {
         await saveSongLyrics(
           path: item.path,
@@ -2411,9 +2409,7 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
     try {
       final lyrics = await readLyricsFile(path: path);
       if (lyrics.trim().isEmpty) throw Exception('歌词文件内容为空');
-      // 网盘歌曲没有本地 sidecar，跳过写盘，仅依靠记忆歌词持久化。
-      if (playbackSourceTypeFor(item) == PlaybackSourceType.localFile &&
-          !item.path.startsWith('remote://')) {
+      if (playbackSourceTypeFor(item) == PlaybackSourceType.localFile) {
         await saveSongLyrics(
           path: item.path,
           lyrics: lyrics,

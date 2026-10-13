@@ -1,0 +1,7 @@
+Running Gradle task 'assembleRelease'...                        
+[stub] injected android.support.v4.app.Fragment stub into tencent_kit
+Expected to find fonts for (packages/cupertino_icons/CupertinoIcons, MaterialIcons), but found (MaterialIcons). This usually means you are referring to font families in an IconData class but not including them in the assets section of your pubspec.yaml, are missing the package that would include them, or are missing "uses-material-design: true".
+Font asset "MaterialIcons-Regular.otf" was tree-shaken, reducing it from 1645184 to 38252 bytes (97.7% reduction). Tree-shaking can be disabled by providing the --no-tree-shake-icons flag when building your app.
+Running Gradle task 'assembleRelease'...                          351.1s
+√ Built build\app\outputs\flutter-apk\app-arm64-v8a-release.apk (19.7MB)
+√ Built build\app\outputs\flutter-apk\app-armeabi-v7a-release.apk (18.7MB)

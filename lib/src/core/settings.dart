@@ -68,7 +68,6 @@ const kSidebarPlugins = 'plugins';
 const kSidebarAccount = 'account';
 const kSidebarRecognize = 'recognize';
 const kSidebarDownloads = 'downloads';
-const kSidebarTestPage = 'testPage';
 const kSidebarSettings = 'settings';
 
 const kDefaultSidebarItemOrder = <String>[
@@ -79,7 +78,6 @@ const kDefaultSidebarItemOrder = <String>[
   kSidebarAccount,
   kSidebarRecognize,
   kSidebarDownloads,
-  kSidebarTestPage,
   kSidebarSettings,
 ];
 
@@ -244,6 +242,7 @@ class AppSettings {
     this.lyricFontSize = 22.0,
     this.miniLyricFontSize = 14.0,
     this.desktopLyricsEnabled = false,
+    this.bluetoothLyricsEnabled = false,
     this.desktopLyricsHideInApp = true,
     this.desktopLyricsShowWordEffect = true,
     this.desktopLyricsLocked = false,
@@ -363,6 +362,7 @@ class AppSettings {
   /// 播放页封面下方迷你歌词的主行字号；超过单行阈值时自动只显示主行。
   final double miniLyricFontSize;
   final bool desktopLyricsEnabled;
+  final bool bluetoothLyricsEnabled;
   final bool desktopLyricsHideInApp;
   final bool desktopLyricsShowWordEffect;
   final bool desktopLyricsLocked;
@@ -452,6 +452,7 @@ class AppSettings {
     double? lyricFontSize,
     double? miniLyricFontSize,
     bool? desktopLyricsEnabled,
+    bool? bluetoothLyricsEnabled,
     bool? desktopLyricsHideInApp,
     bool? desktopLyricsShowWordEffect,
     bool? desktopLyricsLocked,
@@ -538,6 +539,8 @@ class AppSettings {
       lyricFontSize: lyricFontSize ?? this.lyricFontSize,
       miniLyricFontSize: miniLyricFontSize ?? this.miniLyricFontSize,
       desktopLyricsEnabled: desktopLyricsEnabled ?? this.desktopLyricsEnabled,
+      bluetoothLyricsEnabled:
+          bluetoothLyricsEnabled ?? this.bluetoothLyricsEnabled,
       desktopLyricsHideInApp:
           desktopLyricsHideInApp ?? this.desktopLyricsHideInApp,
       desktopLyricsShowWordEffect:
@@ -676,6 +679,7 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
               .clamp(10.0, 24.0)
               .toDouble(),
       desktopLyricsEnabled: prefs.getBool('desktopLyricsEnabled') ?? false,
+      bluetoothLyricsEnabled: prefs.getBool('bluetoothLyricsEnabled') ?? false,
       desktopLyricsHideInApp: prefs.getBool('desktopLyricsHideInApp') ?? true,
       desktopLyricsShowWordEffect:
           prefs.getBool('desktopLyricsShowWordEffect') ?? true,
@@ -911,6 +915,7 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
       prefs.setDouble('lyricFontSize', next.lyricFontSize),
       prefs.setDouble('miniLyricFontSize', next.miniLyricFontSize),
       prefs.setBool('desktopLyricsEnabled', next.desktopLyricsEnabled),
+      prefs.setBool('bluetoothLyricsEnabled', next.bluetoothLyricsEnabled),
       prefs.setBool('desktopLyricsHideInApp', next.desktopLyricsHideInApp),
       prefs.setBool(
         'desktopLyricsShowWordEffect',
@@ -1217,6 +1222,11 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
   Future<void> setDesktopLyricsEnabled(bool value) => _save(
     (state.valueOrNull ?? const AppSettings()).copyWith(
       desktopLyricsEnabled: value,
+    ),
+  );
+  Future<void> setBluetoothLyricsEnabled(bool value) => _save(
+    (state.valueOrNull ?? const AppSettings()).copyWith(
+      bluetoothLyricsEnabled: value,
     ),
   );
   Future<void> setMiniPlayerOverlayEnabled(bool value) => _save(

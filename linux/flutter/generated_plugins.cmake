@@ -4,6 +4,7 @@
 
 list(APPEND FLUTTER_PLUGIN_LIST
   dynamic_color
+  flutter_secure_storage_linux
   quickjs_engine
   record_linux
 )

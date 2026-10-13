@@ -19,6 +19,12 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
     <!-- 桌面歌词悬浮窗 -->
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW"/>
+    <!-- 蓝牙歌词：RFCOMM SPP 服务端向外部设备（手表/车机等）推送歌词帧。
+         参考弦予 watch_link：Android 12+ 需运行时权限 BLUETOOTH_CONNECT；
+         旧版（<=11）清单声明即授予。SCAN 仅作配对设备枚举兜底，neverForLocation。 -->
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT"/>
+    <uses-permission android:name="android.permission.BLUETOOTH_SCAN" android:usesPermissionFlags="neverForLocation"/>
+    <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30"/>
     <!-- 均衡器/响度增益等系统音频效果：AudioEffect 需要该权限才能挂到音频会话 -->
     <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS"/>
     <!-- 从后台下载并打开 APK 安装程序 -->

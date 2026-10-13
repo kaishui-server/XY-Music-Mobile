@@ -58,11 +58,6 @@ const _sidebarDestinations = <String, _SidebarDestination>{
     Icons.checklist_rounded,
     '/settings/tasks',
   ),
-  kSidebarTestPage: _SidebarDestination(
-    '测试页面',
-    Icons.science_outlined,
-    '/settings/test-page',
-  ),
   kSidebarSettings: _SidebarDestination(
     '设置',
     Icons.settings_outlined,
@@ -194,7 +189,8 @@ class AppShell extends ConsumerWidget {
         shellSettings?.bottomBarItemIds ?? const <String>[];
     final bottomBarVisible =
         (shellSettings?.bottomBarEnabled ?? false) &&
-        bottomBarItemIds.length >= 2;
+        bottomBarItemIds.length >= 2 &&
+        !currentPath.startsWith('/cloud-');
     // 悬浮元素（底栏+迷你播放栏）在系统安全区之上占用的总高度，注入
     // MediaQuery.padding.bottom：页面 SafeArea 或显式读取该值即可让
     // 底部内容不被悬浮元素遮挡（修复插件管理/本地音乐等页面被盖住）。
@@ -316,7 +312,7 @@ class AppShell extends ConsumerWidget {
     // 系统返回键：仅在「当前分支已无返回栈、根导航也无全屏覆盖页」时
     // 才会落到这里（go_router 的分支内子页弹出、播放页/搜索页等覆盖
     // 页的弹出均在此之前已被处理）。此时不再直接退出软件：侧边栏
-    // 一级页面（设置/本地音乐/云端音乐/账号等）先回到首页，
+    // 一级页面（设置/本地音乐/账号等）先回到首页，
     // 已在首页时按返回才退出软件。
     return PopScope(
       canPop: false,
@@ -508,7 +504,10 @@ Future<void> _showPlaybackRelinkDialog(
 }
 
 bool shouldShowMiniPlayerForPath(String path) =>
-    path != '/account' && path != '/settings' && !path.startsWith('/settings/');
+    path != '/account' &&
+    path != '/settings' &&
+    !path.startsWith('/settings/') &&
+    !path.startsWith('/cloud-');
 
 /// 与电脑端 Sidebar 相同的信息层级，手机端使用抽屉承载。
 class XyMobileSidebar extends ConsumerWidget {

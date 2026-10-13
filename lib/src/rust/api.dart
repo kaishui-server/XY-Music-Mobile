@@ -157,51 +157,6 @@ Future<String> readAudioMetadata({required String filePath}) =>
 Future<void> writeAudioMetadata({required String requestJson}) =>
     RustLib.instance.api.crateApiWriteAudioMetadata(requestJson: requestJson);
 
-/// 测试 Alist/OpenList 网盘源连接（登录并浏览根目录）。
-///
-/// - `source_json`：源凭据（camelCase，含 `baseUrl`/`username`/`password`/`rootPath`）
-Future<void> alistTestConnection({required String sourceJson}) =>
-    RustLib.instance.api.crateApiAlistTestConnection(sourceJson: sourceJson);
-
-/// 列出 Alist/OpenList 网盘目录内容（浏览远端文件夹）。
-///
-/// - `path`：远程目录路径（如 `/` 或 `/专辑`）
-///
-/// 返回 [`RemoteFileEntry`] 数组的 JSON（camelCase，含 `remotePath`/`name`/`size`/`isDir`）。
-Future<String> alistListDirectory({
-  required String sourceJson,
-  required String path,
-}) => RustLib.instance.api.crateApiAlistListDirectory(
-  sourceJson: sourceJson,
-  path: path,
-);
-
-/// 拉取并解析 TVBox 接口配置，识别可挂载的网盘站点。
-///
-/// 返回 `TvboxSubscription` JSON（camelCase：`sites[]`（含 `likelyAlist`/
-/// `baseUrl`）、`rootIsAlist`、`rootUrl`）。TVBox 配置含 `sites` 时返回站点
-/// 列表；地址本身是 Alist/OpenList 服务器时 `rootIsAlist=true` 可直接挂载。
-Future<String> tvboxFetchSites({required String configUrl}) =>
-    RustLib.instance.api.crateApiTvboxFetchSites(configUrl: configUrl);
-
-/// 按数据库中保存的凭据浏览远程网盘目录（云端音乐文件浏览器）。
-///
-/// - `source_id`：已保存的远程源 id
-/// - `path`：相对源根目录的路径（如 `/`）
-///
-/// 与 [`alist_list_directory`] 不同，本接口从数据库读取源凭据（含密码），
-/// 无需调用方回传密码。返回 [`RemoteFileEntry`] 数组 JSON（camelCase，
-/// 含 `remotePath`/`name`/`size`/`isDir`）。
-Future<String> remoteBrowseDirectory({
-  required String dbPath,
-  required String sourceId,
-  required String path,
-}) => RustLib.instance.api.crateApiRemoteBrowseDirectory(
-  dbPath: dbPath,
-  sourceId: sourceId,
-  path: path,
-);
-
 /// 提取音频文件内置的 ReplayGain 标签。
 ///
 /// 返回 JSON `{"gainDb": <f32>, "peakDb": <f32>|null}`；无标签返回 `"null"`。
@@ -483,73 +438,6 @@ Future<String?> scanFolderTree({
   maxDepth: maxDepth,
 );
 
-/// 列出全部远程源（返回 [`RemoteSource`] 数组 JSON）。
-Future<String> listRemoteSources({required String dbPath}) =>
-    RustLib.instance.api.crateApiListRemoteSources(dbPath: dbPath);
-
-/// 新增或更新远程源（按 `RemoteSourceInput` JSON，缺 id 则新增）。
-Future<String> saveRemoteSource({
-  required String dbPath,
-  required String sourceJson,
-}) => RustLib.instance.api.crateApiSaveRemoteSource(
-  dbPath: dbPath,
-  sourceJson: sourceJson,
-);
-
-/// 删除远程源及其关联歌曲。
-Future<void> removeRemoteSource({
-  required String dbPath,
-  required String sourceId,
-}) => RustLib.instance.api.crateApiRemoveRemoteSource(
-  dbPath: dbPath,
-  sourceId: sourceId,
-);
-
-/// 同步远程源：扫描远程目录、增量解析并写入音乐库。
-///
-/// - `cache_root`：远程音频缓存根目录（调用方传入 app 缓存目录）
-/// - `source_id`：远程源 id
-///
-/// 返回 [`RemoteSyncResult`] JSON。
-Future<String> syncRemoteSource({
-  required String dbPath,
-  required String cacheRoot,
-  required String sourceId,
-}) => RustLib.instance.api.crateApiSyncRemoteSource(
-  dbPath: dbPath,
-  cacheRoot: cacheRoot,
-  sourceId: sourceId,
-);
-
-/// 查询远程音频缓存占用（返回 [`RemoteCacheUsage`] JSON）。
-Future<String> getRemoteCacheUsage({required String cacheRoot}) =>
-    RustLib.instance.api.crateApiGetRemoteCacheUsage(cacheRoot: cacheRoot);
-
-/// 清空远程音频缓存（返回清空后 [`RemoteCacheUsage`] JSON）。
-Future<String> clearRemoteCache({required String cacheRoot}) =>
-    RustLib.instance.api.crateApiClearRemoteCache(cacheRoot: cacheRoot);
-
-/// 解析远程音乐播放来源：已缓存返回本地路径，未缓存返回 Alist 直链流。
-///
-/// 返回 `{"kind":"cached","path":...}` 或 `{"kind":"stream","url":...,...}` JSON。
-Future<String> remotePlaybackSource({
-  required String dbPath,
-  required String remoteUri,
-}) => RustLib.instance.api.crateApiRemotePlaybackSource(
-  dbPath: dbPath,
-  remoteUri: remoteUri,
-);
-
-/// 预下载远程文件到缓存并回写 `songs.cache_path`。
-Future<void> precacheRemoteSong({
-  required String dbPath,
-  required String cacheRoot,
-  required String remoteUri,
-}) => RustLib.instance.api.crateApiPrecacheRemoteSong(
-  dbPath: dbPath,
-  cacheRoot: cacheRoot,
-  remoteUri: remoteUri,
-);
 
 /// 从封面提取主色调调色板（返回 `["hsl(...)"]` 数组 JSON）。
 ///

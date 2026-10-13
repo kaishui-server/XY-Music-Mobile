@@ -847,8 +847,17 @@ class _ProfileView extends ConsumerWidget {
               trailing: const Icon(Icons.chevron_right_rounded),
               onTap: onEditAccount,
             ),
+            // 网盘账号绑定入口：绑定网盘账号后浏览并播放网盘音乐，
+            // 位于「第三方平台登录」之前。
+            ListTile(
+              leading: Icon(Icons.cloud_outlined, color: scheme.primary),
+              title: const Text('网盘账号绑定'),
+              subtitle: const Text('百度网盘、阿里云盘、夸克等'),
+              trailing: const Icon(Icons.chevron_right_rounded),
+              onTap: () => context.push('/cloud-bind'),
+            ),
             // 第三方音乐平台登录入口（单个选项）：点击进入登录与歌单
-            // 导入页，位于「账号云同步」之前。
+            // 导入页，位于「网盘账号绑定」与「账号云同步」之间。
             _PlatformLoginTile(
               accounts: platformAccounts,
               onTap: () => context.push('/account/music-platform'),
