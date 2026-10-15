@@ -8541,9 +8541,10 @@ class _ProgressiveLyricWordState extends State<_ProgressiveLyricWord> {
   Widget build(BuildContext context) {
     final value = widget.progress.clamp(0.0, 1.0);
     // 前景画笔方案：child（暗色整词）走普通 Text 渲染路径，与未扫光
-    // 的词完全一致；白色字形由 TextPainter 按相同 style 绘制并水平裁剪。
-    // 不引入 saveLayer/混合模式，WidgetSpan 内字形底部（下降部）不会
-    // 再被图层擦除裁掉。进度采样 80ms 一次，硬边裁剪在视觉上足够平滑。
+    // 的词完全一致；白色字形由 TextPainter 按相同 style 绘制，并以横向
+    // 渐变色带区分已唱/未唱。saveLayer 仅用于单个词的扫光过渡阶段，
+    // 字形底部（下降部）在渐变带内保持完整，进度采样 80ms 一次，
+    // 渐变过渡让扫光边界在视觉上更加平滑。
     // 暗色与未播放行（55% 透明度）灰度一致。
     //
     // WidgetSpan 内的 Text 会与 DefaultTextStyle 合并（字体族等来自
@@ -8567,9 +8568,10 @@ class _ProgressiveLyricWordState extends State<_ProgressiveLyricWord> {
   }
 }
 
-/// 逐字扫光前景画笔：在暗色整词之上，按进度水平裁剪绘制白色字形。
+/// 逐字扫光前景画笔：在暗色整词之上，按进度绘制白色字形，并为已唱/未唱
+/// 界限加平滑渐变过渡（横向渐变色带）。
 ///
-/// 画笔只负责裁剪绘制，字形由 [_ProgressiveLyricWordState] 预排版并复用，
+/// 画笔只负责绘制，字形由 [_ProgressiveLyricWordState] 预排版并复用，
 /// 因此每次 paint 不再触发 TextPainter.layout；画笔本身不持有/释放
 /// TextPainter（原生 Paragraph 由 State 在其 dispose 时统一释放）。
 class _SweepWordPainter extends CustomPainter {
@@ -8584,9 +8586,41 @@ class _SweepWordPainter extends CustomPainter {
     if (tp == null || progress <= 0) return;
     final clipWidth = tp.width * progress.clamp(0.0, 1.0);
     if (clipWidth <= 0) return;
-    canvas.save();
-    canvas.clipRect(Rect.fromLTWH(0, 0, clipWidth, size.height));
+
+    // 渐变过渡方案：不再用硬边 clipRect，而是先整词绘制白色字形到图层，
+    // 再用横向 LinearGradient 的 alpha 以 dstIn 合成做遮罩：已唱区纯白、
+    // 界限处一段渐变色带（4~24px 自适应）、未唱区完全透明，扫光边界平滑。
+    final w = size.width > 0 ? size.width : tp.width;
+    if (w <= 0) return;
+    // 渐变带宽度随字宽自适应，居中于当前扫光边界两侧。
+    final band = math.max(4.0, math.min(24.0, w * 0.3));
+    final start = (clipWidth - band / 2).clamp(0.0, w);
+    final end = (clipWidth + band / 2).clamp(0.0, w);
+    if (end <= start) {
+      // 边界贴近字宽两端、渐变带被压缩为 0 的极端情况：退化回硬边裁剪。
+      canvas.save();
+      canvas.clipRect(Rect.fromLTWH(0, 0, clipWidth, size.height));
+      tp.paint(canvas, Offset.zero);
+      canvas.restore();
+      return;
+    }
+    final bounds = Rect.fromLTWH(0, 0, size.width, size.height);
+    canvas.saveLayer(bounds, Paint());
+    // 先画整词白色字形作为目标层。
     tp.paint(canvas, Offset.zero);
+    // dstIn：结果 = 字形层 × 渐变 alpha。渐变颜色 RGB 恒为白色、仅 alpha
+    // 渐变，保证合成后字形颜色不偏色；shader 默认 clamp 平铺，渐变范围外
+    // 自然取端点色（已唱区白、未唱区透明）。
+    canvas.drawRect(
+      bounds,
+      Paint()
+        ..blendMode = BlendMode.dstIn
+        ..shader = ui.Gradient.linear(
+          Offset(start, 0),
+          Offset(end, 0),
+          [Colors.white, Colors.white.withValues(alpha: 0)],
+        ),
+    );
     canvas.restore();
   }
 
