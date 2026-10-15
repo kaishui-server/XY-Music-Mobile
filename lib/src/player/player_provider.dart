@@ -652,6 +652,20 @@ class _MediaSessionBridge extends audio_service.CompositeAudioHandler {
   final BehaviorSubject<List<audio_service.MediaItem>> _bridgeQueue =
       BehaviorSubject<List<audio_service.MediaItem>>.seeded(const []);
 
+  /// 当前曲目的媒体项（通知栏/锁屏的标题封面来源）。切歌时由宿主调用
+  /// [syncMediaItem] 单曲增量更新，避免每次状态广播都整表重建队列——
+  /// 队列（蓝牙/车机可跳转的 now-playing 列表）只在应用队列真正变化时
+  /// 才通过 [_syncQueueIfNeeded] 整表推送。
+  final BehaviorSubject<audio_service.MediaItem?> _currentMediaItem =
+      BehaviorSubject<audio_service.MediaItem?>.seeded(null);
+
+  /// 单曲增量同步：把当前曲目推给媒体会话（标题/艺术家/封面/时长），
+  /// 供通知栏与锁屏即时刷新；不触发整表队列重建。
+  void syncMediaItem(QueueItem item) {
+    if (_currentMediaItem.isClosed) return;
+    _currentMediaItem.add(_toMediaItem(item));
+  }
+
   /// 上次同步过的应用队列引用（identical 检测，避免每次状态广播
   /// 都重复整表序列化推送）。
   List<QueueItem>? _lastQueueSourceRef;
@@ -713,9 +727,10 @@ class _MediaSessionBridge extends audio_service.CompositeAudioHandler {
 
   /// 应用队列同步到媒体会话的条数上限：队列经 Binder 传给
   /// mediaSession.setQueue，事务上限约 1MB，超大歌单（数千首）整表
-  /// 推送会触发 TransactionTooLargeException；蓝牙 AVRCP 的
-  /// now-playing 列表通常也只展示前几百条，截断到 500 条足够。
-  static const int _maxSyncQueueLength = 500;
+  /// 推送会触发 TransactionTooLargeException。切歌已改单曲增量
+  /// [syncMediaItem]，整表推送仅剩“应用队列本身变化”的场景，且蓝牙
+  /// AVRCP 的 now-playing 列表通常只展示前几十条，截断到 50 条足够。
+  static const int _maxSyncQueueLength = 50;
 
   /// 应用队列引用变化时把队列转换并推送到媒体会话。内部 handler
   /// 每次点播（customLoad）都会把自身队列重置为单曲，但媒体会话
@@ -756,6 +771,9 @@ class _MediaSessionBridge extends audio_service.CompositeAudioHandler {
 
   @override
   ValueStream<List<audio_service.MediaItem>> get queue => _bridgeQueue;
+
+  @override
+  ValueStream<audio_service.MediaItem?> get mediaItem => _currentMediaItem;
 
   void _publish(audio_service.PlaybackState state) {
     _lastInnerState = state;
@@ -905,7 +923,13 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
         _ref.read(settingsProvider.notifier).setDesktopLyricsEnabled(false),
       );
     };
+    // 统计周期刷写：后台静默化——退后台后暂停刷写（避免后台持续写盘
+    // 唤醒），回前台由生命周期回调补刷一次累积时长。
     _statsFlushTimer = Timer.periodic(const Duration(seconds: 15), (_) {
+      final lifecycle = WidgetsBinding.instance.lifecycleState;
+      final inBackground =
+          lifecycle != null && lifecycle != AppLifecycleState.resumed;
+      if (inBackground) return;
       if (state.current != null && state.isPlaying) {
         _flushCurrentPlaybackStats();
       }
@@ -1448,6 +1472,102 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
     }
   }
 
+  /// 主线程楔死自愈探针：播放中周期性 ping 原生主线程（复用设备信息
+  /// 通道的 audioProbe，走主线程响应），2s 无响应判定主线程响应异常，
+  /// 重建 just_audio 播放器以恢复链路（参考 XianYu-Music-Mobile 的
+  /// _probeAndRebuild，本地复用现有通道，不新增原生代码）。
+  Future<void> _probeAndRebuild(String reason) async {
+    if (_rebuildingPlayer) return;
+    final current = state.current;
+    if (current == null || !state.isPlaying) return;
+    try {
+      await _diagChannel
+          .invokeMethod<Object?>('audioProbe')
+          .timeout(const Duration(seconds: 2));
+      // 主线程正常响应，无需处理。
+      return;
+    } on TimeoutException {
+      playbackChainLog('[自愈] $reason（主线程 2s 未响应），重建播放器');
+    } on PlatformException {
+      // 通道不可用环境（非 Android 调试机等）不做楔死探测。
+      return;
+    } on MissingPluginException {
+      return;
+    }
+    await _rebuildPlayer(reason);
+  }
+
+  /// 重建 just_audio 播放器实例：先释放旧实例与全部事件订阅，再创建
+  /// 新实例并重挂流；若重建时正在播放，按当前进度重新加载音源并续播，
+  /// 避免用户只听到静音。DSP/Rust 出声管线不在此重建（重建的是
+  /// 供 UI/媒体会话使用的静音时钟），其状态由 [_syncDspPipelinePlaying]
+  /// 等继续维持。
+  Future<void> _rebuildPlayer(String reason) async {
+    if (_rebuildingPlayer) return;
+    _rebuildingPlayer = true;
+    playbackChainLog('[自愈] 重建播放器：$reason');
+    try {
+      // 取消旧实例全部订阅，避免重建期间旧流回调污染状态。
+      _posSub?.cancel();
+      _posSub = null;
+      _durSub?.cancel();
+      _durSub = null;
+      _stateSub?.cancel();
+      _stateSub = null;
+      _audioInterruptionSub?.cancel();
+      _audioInterruptionSub = null;
+      _becomingNoisySub?.cancel();
+      _becomingNoisySub = null;
+      final old = _player;
+      try {
+        await old.dispose().timeout(const Duration(seconds: 3));
+      } catch (_) {
+        // dispose 卡死/超时也继续重建：旧实例交由 GC 回收。
+      }
+      _player = AudioPlayer(handleInterruptions: false);
+      _attachPlayerStreams();
+      try {
+        await _player.setVolume(_effectiveClockVolume());
+      } catch (_) {
+        // 新实例刚创建，音量恢复失败仅影响当前曲音量，下次设置会修正。
+      }
+      final item = state.current;
+      if (item != null && state.isPlaying) {
+        final requestId = _playRequestId;
+        try {
+          await _prepareAudioSource(item, queueIndex: state.queueIndex);
+          if (requestId != _playRequestId ||
+              state.current?.path != item.path) {
+            return;
+          }
+          _preparedSourceRequestId = requestId;
+          final posMs = (state.position * 1000).round();
+          if (posMs > 0) {
+            await _player.seek(Duration(milliseconds: posMs));
+          }
+          unawaited(_player.play());
+        } catch (error, stackTrace) {
+          playbackChainLog('[自愈] 重建后恢复播放失败：$error');
+          debugPrintStack(stackTrace: stackTrace);
+        }
+      }
+    } finally {
+      _rebuildingPlayer = false;
+    }
+  }
+
+  /// 播放心跳：播放中每 20s 探测一次主线程响应。正常时开销极小
+  /// （一次 MethodChannel 往返），仅响应超时才触发重建。
+  void _startPlayerHeartbeat() {
+    _playerHeartbeatTimer?.cancel();
+    _playerHeartbeatTimer = Timer.periodic(const Duration(seconds: 20), (_) {
+      if (_rebuildingPlayer) return;
+      final current = state.current;
+      if (current == null || !state.isPlaying) return;
+      unawaited(_probeAndRebuild('播放心跳探测超时（主线程疑似楔死）'));
+    });
+  }
+
   /// 把 just_audio 的播放态同步给 DSP 管线（playerStateStream 触发）。
   /// 通知栏/蓝牙/车机的播放暂停命令作用于 just_audio（静音时钟），
   /// 此处反向转发给真正出声的管线，两端状态保持一致。
@@ -1571,7 +1691,16 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
   // 均衡器（fork 注入）；不能挂入本播放器管线：经 just_audio_background
   // 代理的激活发生在首次 load 前，Java 侧均衡器尚未随 audio session
   // 创建，空指针会中断 setPlatform 使播放卡死。
-  late final AudioPlayer _player = AudioPlayer(handleInterruptions: false);
+  // 非 final：主线程楔死自愈会重建播放器实例（见 [_rebuildPlayer]），
+  // 新实例同样以 handleInterruptions:false 创建，行为与原实例一致。
+  late AudioPlayer _player = AudioPlayer(handleInterruptions: false);
+  /// 正在重建播放器（防止 probe 重入）。
+  bool _rebuildingPlayer = false;
+  /// 主线程心跳探测定时器（见 [_startPlayerHeartbeat]）。
+  Timer? _playerHeartbeatTimer;
+  /// 楔死探测复用设备信息通道的 audioProbe（原生主线程处理，2s 超时即
+  /// 视为主线程响应异常；无需新增原生通道）。
+  static const _diagChannel = MethodChannel('com.xymusic.mobile/device_info');
   final Random _rand = Random();
   StreamSubscription<Duration?>? _posSub;
   StreamSubscription<Duration?>? _durSub;
@@ -1729,24 +1858,27 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
     }
     _attachPlayerStreams();
     _playbackProbe.start();
+    _startPlayerHeartbeat();
     await _restoreSession();
   }
 
-  /// position 采样周期随前后台自适应：
+  /// position 采样周期随前后台自适应（内存卡顿修复放宽后）：
   /// - 前台逐字歌词需要比默认 200ms 更细的进度采样，但 40ms 会让全局播放
   ///   状态在手机上以 25fps 重建，首页、底栏和歌词页会同时承受不必要的
-  ///   开销；80~120ms 足够逐词/渐进效果使用，也能明显降低主 isolate 负担。
+  ///   开销；200~250ms 已足够逐词/渐进效果使用，能明显降低主 isolate 的
+  ///   重建频率与逐字 saveLayer 重绘负担（长期播放时内存与 CPU 双降）。
   /// - 退到后台后界面不再刷新，高频广播只会持续唤醒渲染引擎（后台 CPU
-  ///   高占用的主因）。降频到 1s 已足够进度持久化/睡眠定时器使用。
-  /// - 桌面歌词开启时仍需较平滑的进度驱动原生歌词窗，折中 250ms。
+  ///   高占用的主因）。无桌面歌词时放宽到 2~3s，仅够进度持久化/睡眠
+  ///   定时器使用；开启桌面歌词才保留 250~300ms（原生浮窗需平滑驱动，
+  ///   且歌词内容本身已做增量推送，低频位置校正不会拖累主 isolate）。
   ({Duration min, Duration max}) _positionStreamPeriods() {
     final lifecycle = WidgetsBinding.instance.lifecycleState;
     final inForeground =
         lifecycle == null || lifecycle == AppLifecycleState.resumed;
     if (inForeground) {
       return (
-        min: const Duration(milliseconds: 80),
-        max: const Duration(milliseconds: 120),
+        min: const Duration(milliseconds: 200),
+        max: const Duration(milliseconds: 250),
       );
     }
     final desktopLyrics =
@@ -1758,8 +1890,8 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
       );
     }
     return (
-      min: const Duration(seconds: 1),
-      max: const Duration(milliseconds: 1100),
+      min: const Duration(seconds: 2),
+      max: const Duration(milliseconds: 2100),
     );
   }
 
@@ -1961,6 +2093,10 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
       // 表现为重进后“记不住上次播放位置”。
       _syncPositionFromEngine();
       _schedulePersistSession();
+    } else {
+      // 回前台：统计周期刷写后台暂停期间累积的时长一次补齐（见
+      // _statsFlushTimer 的后台静默分支）。
+      _flushCurrentPlaybackStats();
     }
     // 前后台切换时重挂 position 流，按当前生命周期选择采样周期
     // （后台降频，降低后台 CPU 占用）；尚未挂接时忽略。
@@ -2938,6 +3074,10 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
       errorMessage: null,
       currentQuality: playbackQuality,
     );
+    // 媒体会话单曲增量同步：切歌只推当前曲目（标题/艺术家/封面/时长），
+    // 不再整表重建媒体会话队列（蓝牙/车机首屏队列仍由 _syncQueueIfNeeded
+    // 在队列引用变化时推送）。
+    _mediaSessionBridge?.syncMediaItem(item);
     try {
       await _player.stop();
       final plugin = await _prepareAudioSource(
@@ -6303,6 +6443,7 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
     _dspDeferredTakeoverTimer?.cancel();
     _playbackProbe.stop();
     unawaited(_stopDspPipeline());
+    _playerHeartbeatTimer?.cancel();
     _player.dispose();
     super.dispose();
   }

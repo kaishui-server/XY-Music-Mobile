@@ -37,6 +37,34 @@ fn full_cover_semaphore() -> &'static tokio::sync::Semaphore {
     })
 }
 
+/// 封面解码/缩放的有界线程池（全局共享，常驻 2 个工作线程）。
+///
+/// 原先每次调用 `std::thread::spawn(...).join()` 都会新建一个线程，列表
+/// 滚动/切歌高频触发时造成线程抖动与调度开销（内存卡顿修复 R5 的一部分）。
+/// 改为池化后任务自然排队，线程数固定；内存占用仍由上面的并发信号量
+/// 兜底，不会因池化而放大。
+fn cover_worker_pool() -> &'static rayon::ThreadPool {
+    static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
+    POOL.get_or_init(|| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .thread_name(|idx| format!("cover-worker-{idx}"))
+            .build()
+            .expect("cover worker pool build failed")
+    })
+}
+
+/// 在封面线程池中执行阻塞的解码/缩放任务并等待结果（池满时排队）。
+fn run_cover_task<T: Send + 'static>(
+    task: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, String> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    cover_worker_pool().spawn(move || {
+        let _ = tx.send(task());
+    });
+    rx.recv().map_err(|_| "封面线程池任务失败".to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -427,9 +455,7 @@ pub async fn get_song_cover_thumbnail(
     let p = Path::new(&source_path);
     let p_buf = p.to_path_buf();
 
-    let result = std::thread::spawn(move || get_or_create_thumbnail(&p_buf, &cache_dir))
-        .join()
-        .map_err(|_| "缩略图生成线程异常".to_string())?;
+    let result = run_cover_task(move || get_or_create_thumbnail(&p_buf, &cache_dir))?;
 
     if let Some(cache_path_str) = result {
         if !cache_path_str.is_empty() {
@@ -465,9 +491,7 @@ pub async fn get_song_cover(
     let p = Path::new(&source_path);
     let p_buf = p.to_path_buf();
 
-    let result = std::thread::spawn(move || get_or_create_full_cover(&p_buf, &cache_dir))
-        .join()
-        .map_err(|_| "高清封面生成线程异常".to_string())?;
+    let result = run_cover_task(move || get_or_create_full_cover(&p_buf, &cache_dir))?;
 
     if let Some(cache_path_str) = result {
         return Ok(cache_path_str);

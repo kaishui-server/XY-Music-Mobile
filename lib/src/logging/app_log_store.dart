@@ -5,6 +5,7 @@ import 'dart:isolate';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter/widgets.dart';
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -415,10 +416,30 @@ class AppLogStore {
         .toList(growable: false);
   }
 
+  /// 批量落盘调度（内存卡顿修复降频）：错误日志 500ms 内尽快落盘
+  /// （进程随时可能被杀）；普通日志批量降频——前台 2s 合并一次、
+  /// 后台 30s 一次，避免播放过程中高频 add 反复触发全量
+  /// jsonEncode + SharedPreferences 写盘（长期播放时的持续磁盘唤醒
+  /// 与主 isolate 负担）。时间线以最后一次 add 为基准重新计时，
+  /// 空闲时不会空转写盘。
   void _schedulePersist() {
     if (!_initialized) return;
     _persistTimer?.cancel();
-    _persistTimer = Timer(const Duration(milliseconds: 500), () {
+    final hasError = _entries.isNotEmpty && _entries.last.isError;
+    AppLifecycleState? lifecycle;
+    try {
+      lifecycle = WidgetsBinding.instance.lifecycleState;
+    } catch (_) {
+      // Binding 尚未初始化（main 早期安装日志时）：按前台批量处理。
+    }
+    final inBackground =
+        lifecycle != null && lifecycle != AppLifecycleState.resumed;
+    final delay = hasError
+        ? const Duration(milliseconds: 500)
+        : (inBackground
+              ? const Duration(seconds: 30)
+              : const Duration(seconds: 2));
+    _persistTimer = Timer(delay, () {
       unawaited(_persistNow());
     });
   }
