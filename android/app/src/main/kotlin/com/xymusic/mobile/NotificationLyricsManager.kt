@@ -58,6 +58,9 @@ object NotificationLyricsManager {
     private var title = ""
     private var artist = ""
 
+    /** Flutter 侧歌词状态：loading=正在加载 / loaded=已加载 / none=确认无歌词。 */
+    private var lyricsStatus = "loading"
+
     // ---- 进度锚点（原生按墙钟推进，Flutter 低频校准）----
     private var anchorPositionMs = 0L
     private var anchorRealtimeMs = 0L
@@ -128,6 +131,7 @@ object NotificationLyricsManager {
         positionMs: Long,
         isPlaying: Boolean,
         newDurationMs: Long,
+        lyricsStatus: String,
     ) {
         val appCtx = ctx.applicationContext
         val mgr = appCtx.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
@@ -143,7 +147,23 @@ object NotificationLyricsManager {
         }
         if (newDurationMs > 0) durationMs = newDurationMs
 
+        // 采纳 Flutter 的歌词状态。切歌且新歌词尚未加载时保持 loading，
+        // 避免在歌词异步加载完成前误显示「暂无歌词」。
+        if (lyricsStatus == "loaded" ||
+            lyricsStatus == "none" ||
+            lyricsStatus == "loading"
+        ) {
+            if (titleChanged && lyricRaw.isBlank() && lyricsStatus == "loading") {
+                // 新歌未带歌词：占位加载中。
+                lines = emptyList()
+                currentIndex = -1
+            }
+            this.lyricsStatus = lyricsStatus
+        }
+
         // 切歌/首次/歌词变更：重新解析行数组并立即跳到新歌当前行。
+        // 歌词已加载（loaded）时即使解析不到标准行也要做纯文本兜底，
+        // 保证「有歌词的歌曲」不会显示「暂无歌词」。
         if (titleChanged || lyricRaw.isNotEmpty()) {
             val parsed = parseLyrics(lyricRaw)
             if (parsed != lines) {
@@ -171,6 +191,13 @@ object NotificationLyricsManager {
         }
     }
 
+    /** 是否为 XML 声明 / DOCTYPE 元信息行（非歌词正文，禁止透传到通知栏）。 */
+    private fun isXmlDeclaration(text: String): Boolean {
+        val t = text.trim()
+        return (t.startsWith("<?xml") && t.endsWith(">")) ||
+            (t.startsWith("<!DOCTYPE") && t.endsWith(">"))
+    }
+
     /** 解析 LRC：取时间标签与正文，按时间排序，丢弃纯元数据行。 */
     private fun parseLyrics(raw: String): List<LyricLine> {
         val out = mutableListOf<LyricLine>()
@@ -178,7 +205,7 @@ object NotificationLyricsManager {
         val tagPattern = Regex("""\[(\d{1,3}):(\d{2})(?:[.:](\d{1,3}))?]""")
         for (rawLine in raw.split(Regex("""\r?\n"""))) {
             val line = rawLine.trim()
-            if (line.isEmpty()) continue
+            if (line.isEmpty() || isXmlDeclaration(line)) continue
             val tags = tagPattern.findAll(line).toList()
             if (tags.isEmpty()) continue
             val text = line.replace(tagPattern, "").replace(Regex("""[\u0000-\u001F]"""), "").trim()
@@ -200,6 +227,23 @@ object NotificationLyricsManager {
             }
         }
         if (out.size > 1) out.sortBy { it.timeMs }
+        if (out.isEmpty()) {
+            // 兜底：标准 LRC 解析不到行（纯文本歌词/无时间标签/解析失败）时，
+            // 取首个非空正文行显示，保证「有歌词的歌曲」不会显示「暂无歌词」。
+            val metaPattern = Regex(
+                """^\[(ar|ti|al|by|offset|length|re|ve|au|la|language):.*]$""",
+                RegexOption.IGNORE_CASE,
+            )
+            for (rawLine in raw.split(Regex("""\r?\n"""))) {
+                val text = rawLine
+                    .replace(tagPattern, "")
+                    .replace(Regex("""[\u0000-\u001F]"""), "")
+                    .trim()
+                if (text.isEmpty() || isXmlDeclaration(text) || metaPattern.matches(text)) continue
+                out.add(LyricLine(0L, text))
+                break
+            }
+        }
         return out
     }
 
@@ -266,7 +310,14 @@ object NotificationLyricsManager {
 
     /** 当前歌词行文本；无歌词时返回占位。 */
     private fun currentLyricText(): String {
-        if (lines.isEmpty()) return "暂无歌词"
+        if (lines.isEmpty()) {
+            // 无歌词时按歌词状态区分文案：正在加载显示占位，
+            // 只有确认无歌词（none）才显示「暂无歌词」。
+            return when (lyricsStatus) {
+                "loading" -> "歌词加载中"
+                else -> "暂无歌词"
+            }
+        }
         val idx = if (currentIndex < 0) 0 else currentIndex
         val text = lines[idx].text
         return if (text.isBlank()) "暂无歌词" else text

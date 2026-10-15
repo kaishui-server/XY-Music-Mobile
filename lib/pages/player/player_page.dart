@@ -671,7 +671,7 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
         await controller.dispose();
         return;
       }
-      await _attachVideoController(controller, notifier);
+      await _attachVideoController(controller);
     } catch (error) {
       if (!mounted || _videoSongPath != item.path) return;
       // 失败不再退回音频播放页：保留 MV 覆盖层进入错误态，面板上可
@@ -819,12 +819,9 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
     throw lastError ?? Exception('视频地址无法播放');
   }
 
-  /// 控制器初始化成功后的收尾：恢复倍速、绑定监听与共享会话、起播并
-  /// 接入系统媒体桥接。首次启动与错误面板重新加载共用。
-  Future<void> _attachVideoController(
-    VideoPlayerController controller,
-    PlayerNotifier notifier,
-  ) async {
+  /// 控制器初始化成功后的收尾：恢复倍速、绑定监听与共享会话并起播。
+  /// 首次启动与错误面板重新加载共用。
+  Future<void> _attachVideoController(VideoPlayerController controller) async {
     // MV/视频默认从头播放：不再同步音频播放进度（用户此前反馈
     // 同步进度导致 MV 起始位置随机），仅保留倍速跟随。
     final playbackSpeed = ref.read(playerProvider).playbackSpeed;
@@ -843,9 +840,9 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
       });
     }
     await controller.play();
-    // video_player 不会自动接入 Android MediaSession。启动静音音频桥接，
-    // 让通知栏/锁屏/灵动岛进度与播放暂停按钮同步控制当前视频。
-    await notifier.enableVideoMediaBridge();
+    // MV/视频播放期间歌曲保持 pauseForVideo 的暂停态（不再静音起播做
+    // 系统媒体时钟），关闭视频时由 _closeBilibiliVideo 调用
+    // resumeAfterVideo 从歌曲自身位置无缝续播。
   }
 
   /// 视频加载/起播失败：保留 MV 覆盖层进入错误态（不退回音频播放页、
@@ -922,10 +919,7 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
         await controller.dispose();
         return;
       }
-      await _attachVideoController(
-        controller,
-        ref.read(playerProvider.notifier),
-      );
+      await _attachVideoController(controller);
     } catch (error) {
       if (!mounted || _videoSongPath != item.path) return;
       _enterVideoErrorState(error);

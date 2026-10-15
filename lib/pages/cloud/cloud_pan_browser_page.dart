@@ -153,7 +153,9 @@ class _CloudBrowserPageState extends ConsumerState<CloudPanBrowserPage> {
       });
       showXianYuToast(
         context,
-        e is CloudException ? e.message : cloudT('目录加载失败'),
+        // 非 CloudException 多为解析期异常；透出原始信息，避免只看到兜底文案
+        // 而无法定位（记忆约定：错误提示要带详细信息）。
+        e is CloudException ? e.message : '${cloudT('目录加载失败')}（$e）',
       );
     }
   }

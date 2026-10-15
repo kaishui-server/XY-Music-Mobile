@@ -551,6 +551,7 @@ class MainActivity : AudioServiceActivity() {
                         (call.argument<Number>("positionMs")?.toLong() ?: 0L),
                         call.argument<Boolean>("isPlaying") == true,
                         (call.argument<Number>("durationMs")?.toLong() ?: 0L),
+                        call.argument<String>("lyricsStatus") ?: "loading",
                     )
                     result.success(true)
                 }

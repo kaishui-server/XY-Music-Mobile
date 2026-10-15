@@ -25,13 +25,26 @@ class QuarkProvider extends QuarkUcBase {
   @override
   String get uaBrand => 'quark-cloud-drive';
 
+  // passport.quark.cn 域名已不可解析（ERR_NAME_NOT_RESOLVED），登录
+  // 改为 pan.quark.cn 同域登录入口（实测可达）。
   @override
-  String get webviewLoginUrl => 'https://passport.quark.cn/login';
+  String get webviewLoginUrl => 'https://pan.quark.cn/login';
 
   @override
   CloudCaptureRule? get captureRule => const CloudCaptureRule(
-        cookieNames: ['kps', 'sign'],
-        cookieDomains: ['pan.quark.cn', 'passport.quark.cn'],
+        // 网页版登录态分散在 __pus/__puus/_UP_A4A_11_/__kp/__kps 等
+        // Cookie（kps/sign 是移动端 URL 参数，网页端未必种 cookie），
+        // 任一命中即视为会话凭据齐备，再由 completeLogin 二次校验。
+        cookieNamesAny: [
+          '__pus',
+          '__puus',
+          '_UP_A4A_11_',
+          '__kp',
+          '__kps',
+          'kps',
+          'sign',
+        ],
+        cookieDomains: ['pan.quark.cn'],
         pollIntervalMs: 500,
       );
 

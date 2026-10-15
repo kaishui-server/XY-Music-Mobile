@@ -1295,6 +1295,26 @@ fn strip_qrc_container(raw: &str) -> String {
     parts.join("\n")
 }
 
+/// 剥离独立成行的 XML 声明 / DOCTYPE（`<?xml version="1.0" encoding="utf-8"?>`、
+/// `<!DOCTYPE ...>` 等）。这些是文档元信息而非歌词正文，若歌词源是纯 XML
+/// 声明文本，会整段落空被上层当作"无时间标签歌词"取首行正文透传到通知栏。
+/// 仅整行匹配（允许首尾空白），避免误伤正文中的 `<?` 或 `<`。
+fn strip_xml_declaration_lines(raw: &str) -> String {
+    raw.lines()
+        .map(|line| {
+            let t = line.trim();
+            if (t.starts_with("<?xml") && t.ends_with('>'))
+                || (t.starts_with("<!DOCTYPE") && t.ends_with('>'))
+            {
+                ""
+            } else {
+                line
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// 反转义 QRC 容器属性里的 XML 实体（`&amp;` 必须最后处理，避免二次反转义）。
 fn unescape_xml_entities(input: &str) -> String {
     if !input.contains('&') {
@@ -1321,6 +1341,11 @@ fn parse_raw_lyrics(raw: &str) -> Vec<ParsedLine> {
     // 逐行解析器只认 `[start,duration]` 正文行，会把整段容器判成无歌词。
     // 先抽取 LyricContent（含 XML 实体反转义）再走常规格式分派。
     let normalized = strip_qrc_container(&normalized);
+    // 剥离独立成行的 XML 声明 / DOCTYPE（`<?xml version="1.0"?>` 等），
+    // 防止非歌词的声明文本被当作正文行透传（通知栏蓝牙歌词曾直接显示
+    // XML 声明代码而非歌词）。TTML/QRC 容器内的声明行同样剔除，不影响
+    // 容器解析（容器标签保留）。
+    let normalized = strip_xml_declaration_lines(&normalized);
 
     let mut candidates = Vec::new();
 

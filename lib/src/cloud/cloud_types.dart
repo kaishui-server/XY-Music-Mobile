@@ -27,14 +27,21 @@ enum CloudLoginKind {
 class CloudCaptureRule {
   const CloudCaptureRule({
     this.cookieNames = const [],
+    this.cookieNamesAny = const [],
     this.cookieDomains = const [],
     this.doneUrlPattern,
     this.pollScript,
     this.pollIntervalMs = 500,
+    this.injectJs,
+    this.userScript,
   });
 
-  /// 需要捕获的 Cookie 名（webviewCookie 范式）。
+  /// 需要捕获的 Cookie 名（webviewCookie 范式，全部命中才算齐备）。
   final List<String> cookieNames;
+
+  /// 登录态 Cookie 候选名：任一命中即认为会话凭据齐备
+  /// （夸克/UC 网页登录态分散在多个 Cookie，无法枚举全部）。
+  final List<String> cookieNamesAny;
 
   /// Cookie 所在域（Cloudflare/WKWebView 按域隔离，逐域读取）。
   final List<String> cookieDomains;
@@ -49,6 +56,15 @@ class CloudCaptureRule {
 
   /// JS 轮询间隔毫秒数。
   final int pollIntervalMs;
+
+  /// 页面每次加载完成后注入的辅助 JS（best-effort：勾选协议、
+  /// 启用被 disabled 的按钮等），失败不影响登录流程。
+  final String? injectJs;
+
+  /// 文档开始（任何页面脚本执行前）注入的 JS：用于安装必须先于页面
+  /// 逻辑运行的前提钩子（如采集页面真实请求头）。仅 webviewToken 范式
+  /// 需要，普通 Cookie 捕获留空。
+  final String? userScript;
 }
 
 /// WebView 登录捕获结果。

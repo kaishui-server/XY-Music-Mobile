@@ -141,6 +141,30 @@ String joinQuery(Map<String, String?> params) {
 String cookieHeader(Map<String, String> pairs) =>
     pairs.entries.map((e) => '${e.key}=${e.value}').join('; ');
 
+/// 从接口响应里提炼可读的错误摘要（HTTP 状态 + 业务 code/message）。
+///
+/// 登录/会话校验失败时把服务端真实返回透出到 toast，便于定位「捕获到
+/// 凭据但校验不过」这类问题（如 UC 的 31001 require login）。
+String respErrorDetail(CloudHttpResponse resp) {
+  final parts = <String>['HTTP ${resp.status}'];
+  try {
+    final v = jsonDecode(resp.body);
+    if (v is Map) {
+      final code = v['code'] ?? v['errorCode'] ?? v['errno'] ?? v['error'];
+      final msg = v['message'] ??
+          v['msg'] ??
+          v['error_description'] ??
+          v['errorMessage'] ??
+          v['error_msg'];
+      if (code != null) parts.add('code=$code');
+      if (msg != null && '$msg'.trim().isNotEmpty) parts.add('$msg'.trim());
+    }
+  } catch (_) {
+    // 非 JSON 响应体：只透出 HTTP 状态。
+  }
+  return parts.join(' ');
+}
+
 /// 跟随重定向归一到最终 URL（直链注册代理前用；只读 redirects，
 /// 不消费响应体）。失败原样返回。
 Future<String> resolveFinalUrl(String url, {Map<String, String>? headers}) async {

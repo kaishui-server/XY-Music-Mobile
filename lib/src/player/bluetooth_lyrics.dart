@@ -39,6 +39,7 @@ class BluetoothLyricsBridge {
   static bool _started = false;
   static bool _connected = true; // 由 onConnection 回调更新；原生 send 对无连接快速空回调
   static String _lastMetaKey = '';
+  static String _lastLyricKey = '';
   static bool _lastIsPlaying = false;
   static Timer? _timer;
   static bool _pending = false;
@@ -93,9 +94,12 @@ class BluetoothLyricsBridge {
     final durationMs = (duration * 1000).round();
     final isPlayingChanged = _lastIsPlaying != isPlaying;
 
-    // 切歌：推送元数据 + 整首 LRC（参考弦予 _maybePushLyric 推整首 payload）
-    if (metaKey != _lastMetaKey) {
+    // 切歌：推送元数据 + 整首 LRC（参考弦予 _maybePushLyric 推整首 payload）。
+    // 异步歌词加载完成后 lyric 内容变化：即使 metaKey 相同也补推一次整首 LRC，
+    // 避免蓝牙端一直停留在占位文本/「暂无歌词」。
+    if (metaKey != _lastMetaKey || lyrics != _lastLyricKey) {
       _lastMetaKey = metaKey;
+      _lastLyricKey = lyrics;
       _lastIsPlaying = isPlaying;
       final id = title.isEmpty ? '' : '$title|$artist';
       await _sendMessage(

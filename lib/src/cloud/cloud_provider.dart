@@ -23,6 +23,14 @@ abstract class CloudProvider {
   /// WebView 捕获规则（webview 组；非 WebView 登录盘为 null）。
   CloudCaptureRule? get captureRule => null;
 
+  /// WebView 登录页使用的 User-Agent（空串 = 系统默认，即 Android WebView
+  /// 的移动 UA）。
+  ///
+  /// 个别网盘的网页端按 UA 判定平台：移动 UA 打开登录页会被重定向回首页
+  /// 营销页（只剩轮播图、没有任何登录入口），只有桌面 UA 才会停留在登录页
+  /// 并内嵌官方登录 iframe。此类网盘在此显式声明桌面 UA。
+  String get webviewLoginUserAgent => '';
+
   /// 账密/短信表单字段（httpPassword/smsPassword）。
   List<CloudLoginField> get loginFields => const [];
 

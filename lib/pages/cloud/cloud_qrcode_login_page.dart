@@ -147,6 +147,21 @@ class _CloudQrcodeLoginPageState extends ConsumerState<CloudQrcodeLoginPage> {
                           color: scheme.onSurfaceVariant.withValues(alpha: 0.75),
                         ),
                       ),
+                    if (_provider.loginFields.isNotEmpty) ...[
+                      const SizedBox(height: 24),
+                      TextButton(
+                        onPressed: () =>
+                            context.push('/cloud-bind/password/${_provider.id}'),
+                        child: Text(
+                          cloudT('无法扫码？使用账号密码登录'),
+                          style: TextStyle(
+                            fontSize: 13,
+                            color: scheme.primary,
+                            fontWeight: FontWeight.w500,
+                          ),
+                        ),
+                      ),
+                    ],
                   ],
                 ),
               ),

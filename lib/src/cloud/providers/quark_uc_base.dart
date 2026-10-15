@@ -55,29 +55,42 @@ abstract class QuarkUcBase extends CloudProvider {
   @override
   Future<CloudAccount> completeLogin(CloudCaptureResult captured) async {
     final cookies = captured.cookies;
-    if (cookies['kps']?.isEmpty ?? true) {
-      throw const CloudException('未捕获到登录凭据，请重新登录');
+    if (cookies.isEmpty) {
+      throw const CloudException('未捕获到登录信息，请先完成登录');
+    }
+    // 会话有效性二次校验：捕获到 Cookie 不代表登录成功（登录页在登录前
+    // 也会种下游客态 Cookie），必须用真实接口验证凭据有效才允许绑定。
+    //
+    // 校验失败时把服务端真实返回（HTTP 状态 + code/message，UC 未登录为
+    // 401 code 31001 require login）透出到提示，避免只报「校验失败」而
+    // 无法区分是 Cookie 未齐备还是参数/网关不符。
+    CloudHttpResponse resp;
+    try {
+      resp = await cloudGet(
+        'https://$apiHost/1/clouddrive/member?$commonQuery'
+        '&fetch_subscribe=true&fetch_identity=true',
+        headers: authHeaders(cookies),
+      );
+    } on CloudException catch (e) {
+      throw CloudException('登录状态校验失败（${e.message}），请确认已成功登录后重试');
+    }
+    if (resp.status != 200) {
+      throw CloudException(
+          '登录状态校验失败（${respErrorDetail(resp)}），请确认已成功登录后重试');
     }
     final cookieStr = cookieHeader(cookies);
     var accountId = md5Hex(cookieStr).substring(0, 12);
     var nickname = displayName;
     // member 接口拿昵称/用户 id（防御式：拿不到就用指纹兜底）。
     try {
-      final resp = await cloudGet(
-        'https://$apiHost/1/clouddrive/member?$commonQuery'
-        '&fetch_subscribe=true&fetch_identity=true',
-        headers: authHeaders(cookies),
-      );
-      if (resp.isOk) {
-        final data = resp.json['data'];
-        if (data is Map<String, dynamic>) {
-          final member = data['member'];
-          if (member is Map<String, dynamic>) {
-            final uid = (member['user_id'] ?? data['user_id'])?.toString();
-            final nick = member['nickname']?.toString();
-            if (uid != null && uid.isNotEmpty) accountId = uid;
-            if (nick != null && nick.isNotEmpty) nickname = nick;
-          }
+      final data = resp.json['data'];
+      if (data is Map<String, dynamic>) {
+        final member = data['member'];
+        if (member is Map<String, dynamic>) {
+          final uid = (member['user_id'] ?? data['user_id'])?.toString();
+          final nick = member['nickname']?.toString();
+          if (uid != null && uid.isNotEmpty) accountId = uid;
+          if (nick != null && nick.isNotEmpty) nickname = nick;
         }
       }
     } catch (_) {}

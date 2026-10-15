@@ -34,6 +34,7 @@ import '../rust/api.dart';
 import '../rust/music/types.dart';
 import '../widgets/cover_image.dart';
 import 'downloaded_song_store.dart';
+import 'download_lyrics.dart';
 import 'desktop_lyrics.dart';
 import 'bluetooth_lyrics.dart';
 import 'notification_lyrics.dart';
@@ -2080,15 +2081,76 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
       );
       return;
     }
+    // 蓝牙链路无歌词状态概念（对端仅在 lyric payload 为空时显示「暂无歌词」）。
+    // 歌词仍在异步加载时推空串会被对端误报为「暂无歌词」，用占位文本区分；
+    // 只有确认无歌词（探测完成）才推空串，此时显示「暂无歌词」语义正确。
+    final rawLyrics = item.lyricsRaw ?? '';
+    final stillLoading =
+        rawLyrics.trim().isEmpty && item.lyricsAttempted != true;
     await BluetoothLyricsBridge.sync(
       enabled: settings.bluetoothLyricsEnabled,
       title: item.title,
       artist: item.artist,
-      lyrics: item.lyricsRaw ?? '',
+      lyrics: stillLoading ? '歌词加载中…' : await _bridgeLyricsText(rawLyrics),
       position: state.position,
       isPlaying: state.isPlaying,
       duration: state.duration,
     );
+  }
+
+  /// 蓝牙/通知栏歌词推送前的规整：QQ 的 QRC 容器 XML（`<QrcInfos>…`）、
+  /// QRC/KRC/YRC 裸毫秒词级行、hex 密文等非标准原文，桌面歌词链路经
+  /// Rust parseLyrics 解析正常，但蓝牙/通知栏链路此前直接推送
+  /// item.lyricsRaw 原文 —— 对端（原生 parseLyrics）解析不出 `[mm:ss]`
+  /// 行级标签，回退「取首个非空正文行」时就显示成 `<QrcInfos>` 之类的
+  /// 容器标签或乱码。此处统一经 Rust 解析器重组为标准 LRC 再推送；
+  /// 标准 LRC 原样透传。同一原文只转换一次（缓存）。
+  static String? _bridgeLyricsCacheRaw;
+  static String? _bridgeLyricsCacheText;
+
+  Future<String> _bridgeLyricsText(String raw) async {
+    if (raw.trim().isEmpty) return raw;
+    if (_bridgeLyricsCacheRaw == raw) {
+      return _bridgeLyricsCacheText ?? raw;
+    }
+    var result = raw;
+    if (needsLyricNormalization(raw)) {
+      result = await _normalizeBridgeLyrics(raw);
+    }
+    _bridgeLyricsCacheRaw = raw;
+    _bridgeLyricsCacheText = result;
+    return result;
+  }
+
+  /// 经 Rust parseLyrics 解析（剥离 QRC 容器并反义 XML 实体 / 解密 hex /
+  /// 展开词级时间轴），将 displayLines 重组为行级明文 LRC；解析失败或无
+  /// 展示行时回退原文，避免推送空串。
+  static Future<String> _normalizeBridgeLyrics(String raw) async {
+    try {
+      final payloadJson = await parseLyrics(rawLyrics: raw);
+      final decoded = jsonDecode(payloadJson);
+      final lines = (decoded is Map ? decoded['displayLines'] : null);
+      if (lines is! List || lines.isEmpty) return raw;
+      final sb = StringBuffer();
+      for (final line in lines) {
+        if (line is! Map) continue;
+        final time = (line['time'] as num?)?.toDouble() ?? 0;
+        var text = (line['text'] as String?)?.trim() ?? '';
+        if (text.isEmpty) {
+          text = (line['translation'] as String?)?.trim() ?? '';
+        }
+        if (text.isEmpty) continue;
+        final mm = time ~/ 60;
+        final ss = (time % 60).floor();
+        final frac = ((time - time.floor()) * 100).round();
+        sb.writeln(
+            '[${mm.toString().padLeft(2, '0')}:${ss.toString().padLeft(2, '0')}.${frac.toString().padLeft(2, '0')}]$text');
+      }
+      final rebuilt = sb.toString().trim();
+      return rebuilt.isNotEmpty ? rebuilt : raw;
+    } catch (_) {
+      return raw;
+    }
   }
 
   /// 通知栏&锁屏实时歌词（任务A）：与蓝牙歌词共用同一份歌词解析与进度
@@ -2103,11 +2165,19 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
       await NotificationLyricsBridge.disable();
       return;
     }
+    // 歌词状态：已加载 / 探测完成确认为无歌词 / 仍在异步加载。
+    // 有歌词的歌曲在加载完成前以 loading 占位（原生显示「歌词加载中」），
+    // 加载完成后 status 变 loaded 且 lyrics 非空，内容签名变化必补推，
+    // 通知栏自动切换为滚动歌词；只有确认无歌词才显示「暂无歌词」。
+    final lyricsStatus = item.lyricsRaw?.trim().isNotEmpty == true
+        ? 'loaded'
+        : (item.lyricsAttempted == true ? 'none' : 'loading');
     await NotificationLyricsBridge.sync(
       enabled: settings.bluetoothLyricsEnabled,
       title: item.title,
       artist: item.artist,
-      lyrics: item.lyricsRaw ?? '',
+      lyrics: await _bridgeLyricsText(item.lyricsRaw ?? ''),
+      lyricsStatus: lyricsStatus,
       position: state.position,
       isPlaying: state.isPlaying,
       duration: state.duration,
@@ -2125,7 +2195,20 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
       }
       if (_lastVideoPath != null && state.current?.path == _lastVideoPath) {
         _lastVideoPath = null;
-        state = state.copyWith(isPlaying: false, isLoading: false);
+        // MV 播放期间 state.position/duration 由视频时钟覆盖，关闭视频后
+        // 必须立即切回音频真源：歌曲在 MV 期间保持 pauseForVideo 的暂停态，
+        // 音频 position 流一直上报同一位置、不会产生「严格递增」事件，
+        // 进度流的回跳过滤不会放行修正 —— 不显式复位，进度条会一直保留
+        // MV 进度。
+        final audioPositionMs = _player.position.inMilliseconds;
+        final audioDurationMs = _player.duration?.inMilliseconds ?? 0;
+        state = state.copyWith(
+          position: audioPositionMs / 1000.0,
+          duration:
+              audioDurationMs > 0 ? audioDurationMs / 1000.0 : state.duration,
+          isPlaying: false,
+          isLoading: false,
+        );
         _requestDesktopLyricsSync(immediate: true);
       }
       return;
@@ -5167,6 +5250,11 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
       queue: queue,
       current: index == state.queueIndex ? queue[index] : state.current,
     );
+    // 歌词探测完成（确认无歌词）需要把歌词状态补推给通知栏/蓝牙歌词，
+    // 否则通知栏会一直停留在「歌词加载中」占位而不会切换到「暂无歌词」。
+    if (index == state.queueIndex) {
+      _requestDesktopLyricsSync(immediate: true);
+    }
   }
 
   String _friendlyPlaybackError(Object error) {

@@ -984,7 +984,12 @@ class _MusicLibraryPageState extends ConsumerState<MusicLibraryPage>
         ),
         Expanded(
           child: ListView.builder(
-            padding: const EdgeInsets.fromLTRB(16, 2, 16, 24),
+            padding: EdgeInsets.fromLTRB(
+              16,
+              2,
+              16,
+              MediaQuery.paddingOf(context).bottom + 12,
+            ),
             itemCount: playlists.length,
             itemBuilder: (context, index) =>
                 _buildPlaylistTile(context, playlists[index]),
@@ -1556,7 +1561,12 @@ class _MusicLibraryPageState extends ConsumerState<MusicLibraryPage>
         ),
         Expanded(
           child: ListView.builder(
-            padding: const EdgeInsets.fromLTRB(16, 2, 16, 24),
+            padding: EdgeInsets.fromLTRB(
+              16,
+              2,
+              16,
+              MediaQuery.paddingOf(context).bottom + 12,
+            ),
             itemCount: names.length,
             itemBuilder: (context, index) {
               final name = names[index];
@@ -1767,7 +1777,9 @@ class _MusicLibraryPageState extends ConsumerState<MusicLibraryPage>
             itemExtent: _queueItemExtent,
             // 拖拽只从右侧把手发起，与整行点按切歌的手势互不冲突。
             buildDefaultDragHandles: false,
-            padding: const EdgeInsets.only(bottom: 16),
+            padding: EdgeInsets.only(
+              bottom: MediaQuery.paddingOf(context).bottom + 12,
+            ),
             itemCount: queue.length,
             onReorderItem: (oldIndex, newIndex) {
               ref
@@ -1908,7 +1920,12 @@ class _MusicLibraryPageState extends ConsumerState<MusicLibraryPage>
           child: nodes.isEmpty
               ? const Center(child: Text('未找到匹配的文件夹'))
               : ListView.builder(
-                  padding: const EdgeInsets.fromLTRB(16, 2, 16, 24),
+                  padding: EdgeInsets.fromLTRB(
+              16,
+              2,
+              16,
+              MediaQuery.paddingOf(context).bottom + 12,
+            ),
                   itemCount: nodes.length,
                   itemBuilder: (context, index) {
                     final node = nodes[index];

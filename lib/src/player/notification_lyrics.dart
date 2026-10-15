@@ -25,11 +25,19 @@ class NotificationLyricsBridge {
   static DateTime _lastSendTime = DateTime.fromMillisecondsSinceEpoch(0);
 
   /// 播放器进度流调用：按需推送歌词/锚点。
+  ///
+  /// [lyricsStatus] 取值：
+  /// - `loading`：歌词正在异步加载，尚未得到结果（原生显示「歌词加载中」占位）；
+  /// - `loaded`：歌词已加载完成并写入 lyrics（原生解析显示滚动歌词）；
+  /// - `none`：歌词探测完成、确认为无歌词（原生显示「暂无歌词」）。
+  /// 歌词从 loading 变为 loaded 时内容签名变化，桥接层必定补推一次，
+  /// 保证歌词异步加载完成后通知栏自动切换为滚动歌词。
   static Future<void> sync({
     required bool enabled,
     required String title,
     required String artist,
     required String lyrics,
+    required String lyricsStatus,
     required double position,
     required bool isPlaying,
     required double duration,
@@ -39,7 +47,8 @@ class NotificationLyricsBridge {
     final enabledChanged = _lastEnabled != enabled;
     _lastEnabled = enabled;
 
-    final contentSignature = <Object?>[title, artist, lyrics].join('\u0000');
+    final contentSignature =
+        <Object?>[title, artist, lyrics, lyricsStatus].join('\u0000');
     final contentChanged = contentSignature != _lastContentSignature;
     _lastContentSignature = contentSignature;
 
@@ -74,6 +83,7 @@ class NotificationLyricsBridge {
         'title': title,
         'artist': artist,
         'lyrics': lyrics,
+        'lyricsStatus': lyricsStatus,
         'positionMs': posMs,
         'isPlaying': isPlaying,
         'durationMs': durationMs,

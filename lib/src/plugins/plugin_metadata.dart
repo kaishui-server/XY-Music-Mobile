@@ -374,6 +374,18 @@ class PluginMetadata {
     ).hasMatch(lower);
   }
 
+  /// 已知 MusicFree 系源域名白名单：这些域名托管 MusicFree 官方/社区订阅
+  /// 索引（如 source.shiqianjiang.cn 的 mf.json），其响应可能带 `yourinfo`
+  /// 等 Baka 特征字段，但整批插件应归 MusicFree 分栏。与 [isBakaSourceUrl]
+  /// 对称，供订阅索引类型提示优先判定使用。
+  static bool isKnownMusicFreeSourceUrl(String url) {
+    final lower = url.trim().toLowerCase();
+    if (lower.isEmpty) return false;
+    return RegExp(
+      r'^https?://source\.shiqianjiang\.cn',
+    ).hasMatch(lower);
+  }
+
   /// animemusic（惜梦动画音乐）插件识别：
   /// - 老站点域名 `animemusic.bzxhkj.com`；
   /// - 新插件（如 qishui，API 域名为 `anime.bzxhkj.com`）不再包含老域名，

@@ -45,11 +45,16 @@ class AliyunProvider extends CloudProvider {
   @override
   Duration get directLinkTtl => const Duration(hours: 4);
 
+  // 走 auth.aliyundrive.com 的 oauth 授权页（`#/login` 路由）：该页提供
+  // 账密 / 短信验证码登录入口。已实测直接打开 www.alipan.com 主页**没有
+  // 任何登录输入框**（游客态直接进网盘壳），用户无法完成登录。
+  // 授权成功后页面会 redirect 到 www.aliyundrive.com/sign/callback?code=…，
+  // 由网盘前端换码并把鉴权对象（含 refresh_token）写入**本站域**
+  // localStorage，captureRule 的轮询脚本在跳转后的页面上下文里读它。
   @override
   String get webviewLoginUrl =>
       'https://auth.aliyundrive.com/v2/oauth/authorize?login_type=custom'
       '&response_type=code'
-      '&redirect_uri=${Uri.encodeQueryComponent('https://www.aliyundrive.com/sign/callback')}'
       '&client_id=$_clientId'
       '&state=${Uri.encodeQueryComponent('{"origin":"*"}')}#/login';
 
@@ -133,8 +138,11 @@ class AliyunProvider extends CloudProvider {
   Future<bool> validate(Map<String, String> cred) async {
     try {
       final at = await _accessToken(cred, persist: false);
+      // 用户信息路由是 /adrive/v2/user/get；旧写法 /adrive/v2/user/getInfo
+      // 实测返回 404「uri(/v2/user/getInfo) not exist」，导致账号校验与目录
+      // 浏览恒失败。
       final resp = await cloudPostJson(
-        'https://api.alipan.com/adrive/v2/user/getInfo',
+        'https://api.alipan.com/adrive/v2/user/get',
         body: const {},
         headers: _h(at),
       );
@@ -395,7 +403,7 @@ class AliyunProvider extends CloudProvider {
     final cached = _driveIdCache[cred['userId']];
     if (cached != null) return cached;
     final resp = await cloudPostJson(
-      'https://api.alipan.com/adrive/v2/user/getInfo',
+      'https://api.alipan.com/adrive/v2/user/get',
       body: const {},
       headers: _h(at),
     );

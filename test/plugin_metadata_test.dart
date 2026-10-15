@@ -219,6 +219,31 @@ module.exports = { platform: "示例音乐" };
     expect(mfMeta.isAnimemusic, isFalse);
   });
 
+  test('MusicFree 源域名白名单：shiqianjiang.cn 判 MusicFree 源', () {
+    expect(
+      PluginMetadata.isKnownMusicFreeSourceUrl(
+        'https://source.shiqianjiang.cn/api/script/mf.json?key=CERU_KEY-x.json',
+      ),
+      isTrue,
+    );
+    // 同域脚本托管地址也应命中（订阅与脚本同域分发）。
+    expect(
+      PluginMetadata.isKnownMusicFreeSourceUrl(
+        'https://source.shiqianjiang.cn/api/script/mf/qq.js',
+      ),
+      isTrue,
+    );
+    // Baka 域名不应被误判为 MusicFree 源。
+    expect(
+      PluginMetadata.isKnownMusicFreeSourceUrl(
+        'https://animemusic.bzxhkj.com/baka/subscription.json',
+      ),
+      isFalse,
+    );
+    // 空串/非法输入不误判。
+    expect(PluginMetadata.isKnownMusicFreeSourceUrl(''), isFalse);
+  });
+
   test('插件 ID 归一化：惜梦 v4 与 baka 不再折叠成同一 ID', () {
     // 回归：剥离中文会让「animemusic聚合」与「animemusic」都归一化成
     // animemusic，批量安装时互相覆盖（提示装了 6 个、列表只剩 3 个）。

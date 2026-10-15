@@ -564,6 +564,15 @@ class _PluginsNotifier extends AsyncNotifier<List<_PluginInfo>> {
   /// 结构判定；无法判定时归 MusicFree（默认家族）。
   String _subscriptionKindHint(String url, Object? decoded) {
     final lower = url.toLowerCase();
+    // MusicFree 索引特征优先：`mf.json` 文件名、`musicfree` 字样、或命中
+    // 已知 MusicFree 源域名。时迁酱等 MusicFree 源（如 source.shiqianjiang.cn
+    // 的 mf.json）响应同样带 yourinfo（{ip,ua}）字段，不能再仅凭该字段
+    // 判 Baka——否则整批 MusicFree 插件会被误分进 BakaMusic 分栏。
+    if (lower.contains('mf.json') ||
+        lower.contains('musicfree') ||
+        PluginMetadata.isKnownMusicFreeSourceUrl(url)) {
+      return pluginKindMusicFree;
+    }
     if (lower.contains('baka') || lower.contains('subscription.json')) {
       return pluginKindBaka;
     }
@@ -573,6 +582,7 @@ class _PluginsNotifier extends AsyncNotifier<List<_PluginInfo>> {
     if (PluginMetadata.isBakaSourceUrl(url)) {
       return pluginKindBaka;
     }
+    // URL 无明确 MusicFree 特征时的辅助兜底：保留对 BakaMusic 订阅的兼容。
     if (decoded is Map && decoded.containsKey('yourinfo')) {
       return pluginKindBaka;
     }
