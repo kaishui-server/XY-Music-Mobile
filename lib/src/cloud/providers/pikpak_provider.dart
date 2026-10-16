@@ -1,4 +1,4 @@
-﻿// PikPak provider（httpPassword：signin 账密接口，password 传 md5）。
+// PikPak provider（httpPassword：signin 账密接口，password 传 md5）。
 //
 // XCloud 架构（与迅雷同构）：files/share/restore 接口形状一致。
 
@@ -296,7 +296,9 @@ class PikpakProvider extends CloudProvider {
       'https://api-drive.mypikpak.com/drive/v1/files/${Uri.encodeQueryComponent(file.id)}',
       headers: _h(at),
     ));
-    if (!resp.isOk) throw const CloudException('直链获取失败');
+    if (!resp.isOk) {
+      throw CloudException('直链获取失败（${respErrorDetail(resp)}）');
+    }
     var url = (resp.json['web_content_link'] ?? '').toString();
     if (url.isEmpty) {
       final medias = (resp.json['medias'] as List?) ?? const [];
@@ -310,7 +312,10 @@ class PikpakProvider extends CloudProvider {
         }
       }
     }
-    if (url.isEmpty) throw const CloudException('直链获取失败');
+    if (url.isEmpty) {
+      throw CloudException(
+          '直链获取失败（响应未含可用链接，${respErrorDetail(resp)}）');
+    }
     return CloudDirectLink(
       url: url,
       headers: {'User-Agent': _ua},

@@ -1,4 +1,4 @@
-﻿// 微云 provider（webviewToken 混合：openid 走 pollScript，会话走
+// 微云 provider（webviewToken 混合：openid 走 pollScript，会话走
 // Cookie）。
 //
 // goapi 接口字段防御式解析（接口形状不确定度高）；失败文案简短。
@@ -268,10 +268,15 @@ class WeiyunProvider extends CloudProvider {
       },
       headers: _h(cred),
     );
-    if (!resp.isOk) throw const CloudException('直链获取失败');
+    if (!resp.isOk) {
+      throw CloudException('直链获取失败（${respErrorDetail(resp)}）');
+    }
     final body = (resp.json['resp_body'] as Map<String, dynamic>?) ?? const {};
     final url = (body['download_url'] ?? '').toString();
-    if (url.isEmpty) throw const CloudException('直链获取失败');
+    if (url.isEmpty) {
+      throw CloudException(
+          '直链获取失败（响应未含下载地址，${respErrorDetail(resp)}）');
+    }
     return CloudDirectLink(
       url: url,
       headers: {'User-Agent': _ua, 'Cookie': cred['cookie'] ?? ''},

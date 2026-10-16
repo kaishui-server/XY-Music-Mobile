@@ -1714,6 +1714,10 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
   bool _manualPause = false;
   bool _wasInterrupted = false;
   bool _handlingTrackEnd = false;
+  // 自定义播放区间的尾部跳过防重复触发标记：播放进度到达「总时长 -
+  // 跳过尾部秒数」时置位并只触发一次切歌/循环；每次起播（_playAt）复位，
+  // 单曲循环重播后进度回落到区间内时也会自动复位。
+  bool _skipTailHandled = false;
   bool _notificationPermissionChecked = false;
   int _playRequestId = 0;
   // 标识当前 just_audio 音频源属于哪一次切歌请求。切歌时网络音源解析和
@@ -1963,6 +1967,7 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
           state = state.copyWith(position: positionMs / 1000.0);
           _persistPositionDebounced();
           _requestDesktopLyricsSync();
+          _checkSkipTail();
         });
   }
 
@@ -2266,11 +2271,18 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
       final payloadJson = await parseLyrics(rawLyrics: raw);
       final decoded = jsonDecode(payloadJson);
       final lines = (decoded is Map ? decoded['displayLines'] : null);
-      if (lines is! List || lines.isEmpty) return raw;
+      if (lines is! List || lines.isEmpty) {
+        // Rust 解析器未识别洛雪逐字标签时（版本落后/异常），Dart 兜底
+        // 直接剥标签重组为行级 LRC，保证蓝牙/通知栏不再透传原始标签。
+        return hasLxWordTiming(raw) ? _stripLxTagsToLineLrc(raw) : raw;
+      }
       final sb = StringBuffer();
       for (final line in lines) {
         if (line is! Map) continue;
         final time = (line['time'] as num?)?.toDouble() ?? 0;
+        // 原文优先、翻译兜底：洛雪逐字解析后 text 是原文（如
+        // "A Little Love"），translation 仅在原文为空时才使用，
+        // 避免外文歌蓝牙歌词只显示中文翻译。
         var text = (line['text'] as String?)?.trim() ?? '';
         if (text.isEmpty) {
           text = (line['translation'] as String?)?.trim() ?? '';
@@ -2285,8 +2297,41 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
       final rebuilt = sb.toString().trim();
       return rebuilt.isNotEmpty ? rebuilt : raw;
     } catch (_) {
-      return raw;
+      return hasLxWordTiming(raw) ? _stripLxTagsToLineLrc(raw) : raw;
     }
+  }
+
+  /// 洛雪 `<mm:ss.mmm>词…` 逐字标签行的 Dart 兜底清洗：每行取首个标签
+  /// 时间作为行时间戳，正文剥掉全部时间标签并折叠空白，重组为行级明文
+  /// LRC（`[mm:ss.xx]原文`）。仅当 Rust parseLyrics 未能解析时启用。
+  static final RegExp _lxTagPattern =
+      RegExp(r'<(\d{1,3}):(\d{2})\.(\d{3})>');
+  static final RegExp _spaceCollapse = RegExp(r'\s+');
+
+  static String _stripLxTagsToLineLrc(String raw) {
+    final out = <String>[];
+    for (final rawLine in raw.split('\n')) {
+      final line = rawLine.trim();
+      if (line.isEmpty) continue;
+      final match = _lxTagPattern.firstMatch(line);
+      if (match != null) {
+        final mins = int.parse(match.group(1)!);
+        final secs = int.parse(match.group(2)!);
+        final millis = int.parse(match.group(3)!);
+        final text = line
+            .replaceAll(_lxTagPattern, ' ')
+            .replaceAll(_spaceCollapse, ' ')
+            .trim();
+        if (text.isEmpty) continue;
+        final stamp = '[${mins.toString().padLeft(2, '0')}:'
+            '${secs.toString().padLeft(2, '0')}.'
+            '${(millis / 10).round().toString().padLeft(2, '0')}]';
+        out.add('$stamp$text');
+      } else {
+        out.add(line);
+      }
+    }
+    return out.join('\n');
   }
 
   /// 通知栏&锁屏实时歌词（任务A）：与蓝牙歌词共用同一份歌词解析与进度
@@ -3056,9 +3101,17 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
       state = state.copyWith(queue: queue);
     }
     final resumeSecs = max(0.0, startPositionSecs ?? 0.0);
+    // 自定义播放区间·跳过头部：起播定位取「续播位置」与「跳过头部秒数」
+    // 的较大值——有续播记忆时继续用户上次进度，没有时直接从头部噪音之后
+    // 开始；两个值都为 0 时与原有行为完全一致（不产生额外 seek）。
+    final skipHead =
+        _ref.read(settingsProvider).valueOrNull?.skipHeadSeconds ?? 0.0;
+    final startSecs = skipHead > 0 ? max(resumeSecs, skipHead) : resumeSecs;
+    // 新曲起播复位尾部跳过标记（单曲循环由 _checkSkipTail 自动复位）。
+    _skipTailHandled = false;
     final previous = state;
     _flushPlaybackStats(previous);
-    _beginStatsSession(item, initialPositionMs: (resumeSecs * 1000).round());
+    _beginStatsSession(item, initialPositionMs: (startSecs * 1000).round());
     // stop() 会发出 playing=false；切换音源期间先抑制自动下一首，真正
     // 开始新歌曲前再复位，否则手动点开的歌曲播放结束后永远不会循环。
     _manualPause = true;
@@ -3068,7 +3121,7 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
       queueIndex: index,
       current: item,
       isPlaying: false,
-      position: resumeSecs,
+      position: startSecs,
       duration: item.durationMs / 1000.0,
       isLoading: true,
       errorMessage: null,
@@ -3100,9 +3153,9 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
       }
       // 恢复会话后重试起播：先把播放器定位到记录的进度再起播，否则会从
       // 0 开始，用户感受为“记不住上次播放位置”。普通切歌 resumeSecs 为 0，
-      // 不会多一次 seek。
-      if (resumeSecs > 0) {
-        await seek(resumeSecs);
+      // 但开启自定义播放区间（跳过头部）时 startSecs 会定位到头部之后。
+      if (startSecs > 0) {
+        await seek(startSecs);
         if (requestId != _playRequestId) return;
       }
       // 最近播放是“开始播放”即记录，与桌面端行为一致。统计写入失败不应
@@ -6248,12 +6301,13 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
       final videoPosition = video.value.position.inMilliseconds / 1000.0;
       if (max(state.position, videoPosition) > 3) {
         _flushCurrentPlaybackStats();
-        await video.seekTo(Duration.zero);
-        await _player.seek(Duration.zero);
+        final restartSecs = _restartSeekSeconds();
+        await video.seekTo(Duration(seconds: restartSecs.round()));
+        await _player.seek(Duration(seconds: restartSecs.round()));
         if (_statsSessionPath == state.current?.path) {
-          _statsRecordedPositionMs = 0;
+          _statsRecordedPositionMs = (restartSecs * 1000).round();
         }
-        state = state.copyWith(position: 0);
+        state = state.copyWith(position: restartSecs);
         VideoPlaybackSession.progressChanged();
         return;
       }
@@ -6266,9 +6320,11 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
     final playerPosition = _player.position.inMilliseconds / 1000.0;
     final position = max(state.position, playerPosition);
     if (position > 3) {
-      await seek(0);
+      // 自定义播放区间开启时重播落回头部起播点（skipHead）而非 0。
+      final restartSecs = _restartSeekSeconds();
+      await seek(restartSecs);
       // 立即同步状态，避免用户快速再次点击时仍被旧进度判定为重播。
-      state = state.copyWith(position: 0);
+      state = state.copyWith(position: restartSecs);
       return;
     }
     final n = state.queue.length;
@@ -6307,6 +6363,41 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
     _refreshNotificationCustomControls();
   }
 
+  /// 重播当前曲的起播点：开启「跳过头部」时从 skipHead 开始，否则从 0
+  /// 开始，与 _playAt 起播语义（startSecs = max(resumeSecs, skipHead)）
+  /// 保持一致。供单曲循环与「上一首回到本曲开头」路径复用。
+  double _restartSeekSeconds() {
+    final skipHead =
+        _ref.read(settingsProvider).valueOrNull?.skipHeadSeconds ?? 0.0;
+    return skipHead > 0 ? skipHead : 0.0;
+  }
+
+  /// 自定义播放区间·尾部跳过：播放进度到达「总时长 - 跳过尾部秒数」时，
+  /// 按本曲播放完成处理并复用 [_handleTrackEndOnce]（自动下一首/单曲循环/
+  /// 队列环绕等既有逻辑，不另写一套切歌）。
+  ///
+  /// 不生效的情况：跳过尾部为 0、时长未知（duration <= 0，含直播类源）、
+  /// 或「跳过头部 + 跳过尾部 >= 总时长」（区间非法）。每曲只触发一次：
+  /// 达到阈值后由 [_skipTailHandled] 挡住重复事件，进度回落到区间内
+  /// （例如单曲循环 seek(0) 重播）时自动复位。
+  void _checkSkipTail() {
+    final settings = _ref.read(settingsProvider).valueOrNull;
+    if (settings == null) return;
+    final skipTail = settings.skipTailSeconds;
+    if (skipTail <= 0) return;
+    final duration = state.duration;
+    if (duration <= 0) return;
+    if (settings.skipHeadSeconds + skipTail >= duration) return;
+    if (state.position < duration - skipTail) {
+      // 尚未进入尾部区间（含单曲循环重播回落）：复位标记，允许下轮触发。
+      _skipTailHandled = false;
+      return;
+    }
+    if (_skipTailHandled) return;
+    _skipTailHandled = true;
+    unawaited(_handleTrackEndOnce());
+  }
+
   Future<void> _handleTrackEndOnce() async {
     if (_handlingTrackEnd) return;
     _handlingTrackEnd = true;
@@ -6319,8 +6410,9 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
 
   Future<void> _onTrackEnd() async {
     if (normalizePlayMode(state.playMode) == 1) {
-      // 单曲循环：重播当前曲。
-      await seek(0);
+      // 单曲循环：重播当前曲。自定义播放区间开启时落回头部起播点
+      // （skipHead），而不是 0——与 _playAt 起播语义保持一致。
+      await seek(_restartSeekSeconds());
       _statsPlayEventRecorded = false;
       final current = state.current;
       if (current != null) {

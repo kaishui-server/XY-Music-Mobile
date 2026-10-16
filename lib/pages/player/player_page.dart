@@ -5,7 +5,8 @@ import 'dart:math' as math;
 import 'dart:ui' as ui;
 
 import 'package:file_picker/file_picker.dart';
-import 'package:flutter/foundation.dart' show listEquals;
+import 'package:flutter/foundation.dart'
+    show ValueListenable, ValueNotifier, listEquals;
 import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart';
 import 'package:flutter/services.dart';
@@ -1419,8 +1420,44 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
         ),
         onPickSleepTimer: () => unawaited(_pickSleepTimer()),
         onShowSongInfo: () => unawaited(_showSongInfoSheet(item)),
+        onShowSkipRange: () => unawaited(_showSkipRangeDialog()),
       ),
     );
+  }
+
+  /// 更多菜单「自定义播放区间」：按当前曲目时长弹出双滑块区间设置
+  /// （左滑块=起始位置、右滑块=结束位置），确定后写回全局跳过头部/尾部秒数。
+  Future<void> _showSkipRangeDialog() async {
+    final durationSecs = ref.read(playerProvider).duration.round();
+    if (durationSecs <= 0) {
+      XyNotice.show(
+        context,
+        message: '请先开始播放再设置播放区间',
+        type: XyNoticeType.warning,
+      );
+      return;
+    }
+    final settings = ref.read(settingsProvider).valueOrNull;
+    final maxSec = durationSecs.toDouble();
+    var head = settings?.skipHeadSeconds ?? 0.0;
+    var end = maxSec - (settings?.skipTailSeconds ?? 0.0);
+    // 初值越界/非法（如跳过时长超过曲长、尾部大于头部）时回退到整段区间。
+    if (head < 0 || head > maxSec || end < head || end > maxSec) {
+      head = 0.0;
+      end = maxSec;
+    }
+    final result = await showDialog<(double, double)>(
+      context: context,
+      builder: (_) => _SkipRangeDialog(
+        maxSeconds: durationSecs,
+        initialHeadSeconds: head,
+        initialEndSeconds: end,
+      ),
+    );
+    if (result == null) return;
+    await ref
+        .read(settingsProvider.notifier)
+        .setSkipHeadTail(headSeconds: result.$1, tailSeconds: result.$2);
   }
 
   /// 歌曲信息面板：展示平台、歌曲 ID/MID 与作者信息（作者可点进
@@ -3947,6 +3984,7 @@ class _PlayerMoreSheet extends ConsumerStatefulWidget {
     required this.onShowComments,
     required this.onPickSleepTimer,
     required this.onShowSongInfo,
+    required this.onShowSkipRange,
   });
 
   final QueueItem item;
@@ -3981,6 +4019,9 @@ class _PlayerMoreSheet extends ConsumerStatefulWidget {
 
   /// 打开歌曲信息面板（顶栏信息卡点击）。
   final VoidCallback onShowSongInfo;
+
+  /// 打开自定义播放区间（跳过头部/尾部）设置弹窗。
+  final VoidCallback onShowSkipRange;
 
   @override
   ConsumerState<_PlayerMoreSheet> createState() => _PlayerMoreSheetState();
@@ -4446,6 +4487,13 @@ class _PlayerMoreSheetState extends ConsumerState<_PlayerMoreSheet> {
                         title: '定时关闭',
                         value: _sleepTimerLabel(sleepTimerEndsAt),
                         onOpen: widget.onPickSleepTimer,
+                      ),
+                      _panelRow(
+                        context,
+                        icon: Icons.content_cut_rounded,
+                        title: '自定义播放区间',
+                        value: '跳过头部/尾部',
+                        onOpen: widget.onShowSkipRange,
                       ),
                     ],
                   ),
@@ -5178,6 +5226,88 @@ class _CustomSleepTimerDialogState extends State<_CustomSleepTimerDialog> {
         if (_error != null) setState(() => _error = null);
       },
       onSubmitted: onSubmitted,
+    );
+  }
+}
+
+/// 自定义播放区间弹窗：双滑块选择起始/结束位置（步进 1 秒），实时显示
+/// 跳过头部、跳过尾部的秒数与剩余区间时长。确定时通过 Navigator 返回
+/// `(跳过头部秒数, 跳过尾部秒数)`。
+class _SkipRangeDialog extends StatefulWidget {
+  const _SkipRangeDialog({
+    required this.maxSeconds,
+    required this.initialHeadSeconds,
+    required this.initialEndSeconds,
+  });
+
+  /// 滑块上限：当前曲目时长（秒，取整）。
+  final int maxSeconds;
+  final double initialHeadSeconds;
+  final double initialEndSeconds;
+
+  @override
+  State<_SkipRangeDialog> createState() => _SkipRangeDialogState();
+}
+
+class _SkipRangeDialogState extends State<_SkipRangeDialog> {
+  late RangeValues _values = RangeValues(
+    widget.initialHeadSeconds,
+    widget.initialEndSeconds,
+  );
+
+  static String _format(int seconds) {
+    final m = (seconds ~/ 60).toString().padLeft(2, '0');
+    final s = (seconds % 60).toString().padLeft(2, '0');
+    return '$m:$s';
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final maxSec = widget.maxSeconds.toDouble();
+    final head = _values.start.round();
+    final tail = widget.maxSeconds - _values.end.round();
+    final span = (_values.end - _values.start).round();
+    return AlertDialog(
+      title: const Text('自定义播放区间'),
+      content: SizedBox(
+        width: 320,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Text(
+              '跳过头部 ${head}s · 跳过尾部 ${tail}s · '
+              '区间 ${_format(span)}',
+              style: const TextStyle(fontSize: 13),
+            ),
+            const SizedBox(height: 8),
+            RangeSlider(
+              min: 0,
+              max: maxSec,
+              divisions: widget.maxSeconds,
+              values: _values,
+              labels: RangeLabels(
+                _format(_values.start.round()),
+                _format(_values.end.round()),
+              ),
+              onChanged: (next) => setState(() => _values = next),
+            ),
+          ],
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(context),
+          child: const Text('取消'),
+        ),
+        FilledButton(
+          onPressed: () => Navigator.pop(
+            context,
+            (_values.start, maxSec - _values.end),
+          ),
+          child: const Text('确定'),
+        ),
+      ],
     );
   }
 }
@@ -8363,7 +8493,7 @@ class _LyricFontSizeSheetState extends State<_LyricFontSizeSheet> {
   }
 }
 
-class _TimedLyricText extends ConsumerWidget {
+class _TimedLyricText extends ConsumerStatefulWidget {
   const _TimedLyricText({
     required this.line,
     required this.offsetTenths,
@@ -8385,32 +8515,65 @@ class _TimedLyricText extends ConsumerWidget {
   final double baseFontSize;
 
   @override
-  Widget build(BuildContext context, WidgetRef ref) {
+  ConsumerState<_TimedLyricText> createState() => _TimedLyricTextState();
+}
+
+class _TimedLyricTextState extends ConsumerState<_TimedLyricText> {
+  /// 活动行共享的播放进度（已应用歌词偏移）。扫光模式下 position 每个
+  /// tick 只写入这个 ValueNotifier，由各词的 [_ProgressiveLyricWordState]
+  /// 做局部更新（painter repaint / 阶段切换 setState），本行 TextSpan 树
+  /// 与 RenderParagraph 不再每个进度 tick 重建/重排版。
+  final ValueNotifier<double> _positionNotifier = ValueNotifier<double>(0);
+
+  @override
+  void dispose() {
+    _positionNotifier.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final line = widget.line;
+    final textAlign = widget.textAlign;
     // 当前播放行不再叠加阴影，逐字/逐词高亮也不再发光，保持纯色渲染。
     final baseStyle = TextStyle(
       color: Colors.white,
-      fontSize: baseFontSize,
+      fontSize: widget.baseFontSize,
       height: 1.3,
       fontWeight: FontWeight.w600,
     );
-    if (!selected ||
+    if (!widget.selected ||
         line.words.isEmpty ||
-        effectMode == LyricWordEffectMode.none) {
+        widget.effectMode == LyricWordEffectMode.none) {
       // 非活动行是静态文本，不订阅 position：避免整页每个进度 tick
       // 重建全部行（10Hz × 视口行数曾把 Dart 堆撑到 GB 级，老年代
       // GC 单次数秒，是久播卡顿的根因）。
       return Text(line.text, textAlign: textAlign, style: baseStyle);
     }
 
-    // 活动行才订阅进度（约 10Hz），重建范围缩小到本行的 TextSpan 树。
-    final position = applyLyricsOffset(
-      ref.watch(playerProvider.select((state) => state.position)),
-      offsetTenths,
-    );
-    if (effectMode == LyricWordEffectMode.progressive) {
-      return _buildProgressiveText(baseStyle, position);
+    // 扫光模式：活动行不 watch position（避免每个进度 tick 重建整行
+    // TextSpan 树、触发 RenderParagraph 整行重新排版 + 全部词 element
+    // 重建）；改用 listen 把进度写入共享 ValueNotifier，由每个词自身
+    // 做最小范围更新，视觉与交互完全不变。
+    if (widget.effectMode == LyricWordEffectMode.progressive) {
+      ref.listen(
+        playerProvider.select((state) => state.position),
+        (_, next) {
+          _positionNotifier.value = applyLyricsOffset(
+            next,
+            widget.offsetTenths,
+          );
+        },
+      );
+      return _buildProgressiveText(baseStyle);
     }
 
+    // 逐词模式：保持原有每 tick 整行 TextSpan 重建（无 WidgetSpan /
+    // CustomPaint / saveLayer，成本远低于扫光模式）。
+    final position = applyLyricsOffset(
+      ref.watch(playerProvider.select((state) => state.position)),
+      widget.offsetTenths,
+    );
     return _buildWordByWordText(baseStyle, position);
   }
 
@@ -8421,7 +8584,7 @@ class _TimedLyricText extends ConsumerWidget {
     return Text.rich(
       TextSpan(
         children: [
-          for (final word in line.words)
+          for (final word in widget.line.words)
             TextSpan(
               text: word.text,
               style: baseStyle.copyWith(
@@ -8434,28 +8597,30 @@ class _TimedLyricText extends ConsumerWidget {
             ),
         ],
       ),
-      textAlign: textAlign,
+      textAlign: widget.textAlign,
       style: baseStyle,
     );
   }
 
-  Widget _buildProgressiveText(TextStyle baseStyle, double position) {
+  Widget _buildProgressiveText(TextStyle baseStyle) {
     return Text.rich(
       TextSpan(
         children: [
-          for (final word in line.words)
+          for (final word in widget.line.words)
             WidgetSpan(
               alignment: PlaceholderAlignment.baseline,
               baseline: TextBaseline.alphabetic,
               child: _ProgressiveLyricWord(
                 text: word.text,
                 style: baseStyle,
-                progress: _wordProgress(word, position),
+                position: _positionNotifier,
+                start: word.start,
+                end: word.end,
               ),
             ),
         ],
       ),
-      textAlign: textAlign,
+      textAlign: widget.textAlign,
       style: baseStyle,
     );
   }
@@ -8471,12 +8636,19 @@ class _ProgressiveLyricWord extends StatefulWidget {
   const _ProgressiveLyricWord({
     required this.text,
     required this.style,
-    required this.progress,
+    required this.position,
+    required this.start,
+    required this.end,
   });
 
   final String text;
   final TextStyle style;
-  final double progress;
+
+  /// 行级共享进度（已应用歌词偏移）。词只监听这个 ValueListenable 做
+  /// 局部更新，不参与整行 TextSpan 树重建。
+  final ValueListenable<double> position;
+  final double start;
+  final double end;
 
   @override
   State<_ProgressiveLyricWord> createState() => _ProgressiveLyricWordState();
@@ -8489,6 +8661,24 @@ class _ProgressiveLyricWordState extends State<_ProgressiveLyricWord> {
   TextStyle? _resolved;
   String? _layoutText;
 
+  /// 扫光前景画笔：由宿主持有，进度每 tick 更新并触发 repaint，期间
+  /// 不重建 CustomPaint/Text（保持 RenderParagraph 文本流结构稳定）。
+  _SweepWordPainter? _sweepPainter;
+  final ValueNotifier<double> _repaintSignal = ValueNotifier<double>(0);
+
+  /// 阶段：0=未唱（纯暗静态）、1=扫光过渡（CustomPaint）、2=已唱（纯白
+  /// 静态）。同阶段内进度变化只重绘画笔；跨阶段才 setState 切换结构。
+  int _stage = 0;
+  double _value = 0;
+
+  @override
+  void initState() {
+    super.initState();
+    _value = _computeValue();
+    _stage = _stageFor(_value);
+    widget.position.addListener(_onPositionChanged);
+  }
+
   @override
   void didChangeDependencies() {
     super.didChangeDependencies();
@@ -8500,6 +8690,56 @@ class _ProgressiveLyricWordState extends State<_ProgressiveLyricWord> {
     super.didUpdateWidget(oldWidget);
     if (oldWidget.text != widget.text || oldWidget.style != widget.style) {
       _ensurePainter();
+    }
+    if (oldWidget.position != widget.position) {
+      oldWidget.position.removeListener(_onPositionChanged);
+      widget.position.addListener(_onPositionChanged);
+    }
+    if (oldWidget.start != widget.start || oldWidget.end != widget.end) {
+      // 换行 / 偏移变化：立即按新时间轴重算阶段，避免沿用旧阶段渲染。
+      final next = _computeValue();
+      final nextStage = _stageFor(next);
+      if (nextStage != _stage) {
+        setState(() {
+          _value = next;
+          _stage = nextStage;
+        });
+      } else {
+        _value = next;
+        _sweepPainter?.progress = next;
+      }
+    }
+  }
+
+  double _computeValue() {
+    final pos = widget.position.value;
+    if (pos <= widget.start) return 0;
+    if (pos >= widget.end || widget.end <= widget.start) return 1;
+    return ((pos - widget.start) / (widget.end - widget.start)).clamp(0, 1);
+  }
+
+  int _stageFor(double value) {
+    if (value <= 0) return 0;
+    if (value >= 1) return 2;
+    return 1;
+  }
+
+  void _onPositionChanged() {
+    if (!mounted) return;
+    final next = _computeValue();
+    final nextStage = _stageFor(next);
+    if (nextStage != _stage) {
+      setState(() {
+        _value = next;
+        _stage = nextStage;
+      });
+      return;
+    }
+    _value = next;
+    if (_stage == 1 && _sweepPainter != null) {
+      // 扫光过渡中：只更新画笔进度并触发该词重绘，不重建 widget 树。
+      _sweepPainter!.progress = next;
+      _repaintSignal.value = next;
     }
   }
 
@@ -8523,17 +8763,19 @@ class _ProgressiveLyricWordState extends State<_ProgressiveLyricWord> {
       textDirection: TextDirection.ltr,
       textScaler: scaler,
     )..layout();
+    _sweepPainter?.painter = _painter;
   }
 
   @override
   void dispose() {
+    widget.position.removeListener(_onPositionChanged);
+    _repaintSignal.dispose();
     _painter?.dispose();
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
-    final value = widget.progress.clamp(0.0, 1.0);
     // 前景画笔方案：child（暗色整词）走普通 Text 渲染路径，与未扫光
     // 的词完全一致；白色字形由 TextPainter 按相同 style 绘制，并以横向
     // 渐变色带区分已唱/未唱。saveLayer 仅用于单个词的扫光过渡阶段，
@@ -8546,17 +8788,19 @@ class _ProgressiveLyricWordState extends State<_ProgressiveLyricWord> {
     // 用两套字体渲染出大小不一的重影。
     final resolved = _resolved ?? widget.style;
     final dim = Colors.white.withValues(alpha: .55);
-    if (value <= 0) {
+    if (_stage == 0) {
       return Text(widget.text, style: resolved.copyWith(color: dim));
     }
-    if (value >= 1) {
+    if (_stage == 2) {
       return Text(widget.text, style: resolved.copyWith(color: Colors.white));
     }
+    final sweep = _sweepPainter ??= _SweepWordPainter(
+      painter: _painter,
+      progress: _value,
+      repaint: _repaintSignal,
+    );
     return CustomPaint(
-      foregroundPainter: _SweepWordPainter(
-        painter: _painter,
-        progress: value,
-      ),
+      foregroundPainter: sweep,
       child: Text(widget.text, style: resolved.copyWith(color: dim)),
     );
   }
@@ -8568,11 +8812,18 @@ class _ProgressiveLyricWordState extends State<_ProgressiveLyricWord> {
 /// 画笔只负责绘制，字形由 [_ProgressiveLyricWordState] 预排版并复用，
 /// 因此每次 paint 不再触发 TextPainter.layout；画笔本身不持有/释放
 /// TextPainter（原生 Paragraph 由 State 在其 dispose 时统一释放）。
+///
+/// [painter] / [progress] 由宿主 State 持有并在进度 tick 时更新：
+/// [progress] 更新后宿主触发 [repaint] 信号，本画笔只重绘不重建。
 class _SweepWordPainter extends CustomPainter {
-  _SweepWordPainter({required this.painter, required this.progress});
+  _SweepWordPainter({
+    required this.painter,
+    required this.progress,
+    super.repaint,
+  });
 
-  final TextPainter? painter;
-  final double progress;
+  TextPainter? painter;
+  double progress;
 
   @override
   void paint(Canvas canvas, Size size) {
@@ -9090,6 +9341,23 @@ class _ProgressBarState extends ConsumerState<_ProgressBar> {
     final position = hasDuration && rawPosition.isFinite
         ? rawPosition.clamp(0.0, dur)
         : 0.0;
+    // 自定义播放区间（跳过头部/跳过尾部）：把滑块可拖动范围映射到
+    // [skipHead, 总时长 - skipTail]，避免把用户拖到将被跳过的头部噪音区
+    // 或尾部片尾区；拖动后 seek 的目标值就是滑块所在秒数（Slider 的
+    // min/max 已映射，无需反变换）。与 _checkSkipTail 的非法区间判定
+    // 保持一致：head + tail >= 总时长时不映射，保持全区间。
+    final settings = ref.read(settingsProvider).valueOrNull;
+    final head = hasDuration && settings != null
+        ? (settings.skipHeadSeconds > 0 ? settings.skipHeadSeconds : 0.0)
+        : 0.0;
+    final tailStart = hasDuration && settings != null &&
+            settings.skipTailSeconds > 0
+        ? dur - settings.skipTailSeconds
+        : dur;
+    final useRange = hasDuration && (head > 0 || tailStart < dur) && head < tailStart;
+    final lo = useRange ? head : 0.0;
+    final hi = useRange ? tailStart : dur;
+    final sliderPosition = useRange ? position.clamp(lo, hi) : position;
     return Column(
       children: [
         SliderTheme(
@@ -9103,8 +9371,9 @@ class _ProgressBarState extends ConsumerState<_ProgressBar> {
             overlayShape: const RoundSliderOverlayShape(overlayRadius: 16),
           ),
           child: Slider(
-            value: position,
-            max: dur,
+            value: sliderPosition,
+            min: lo,
+            max: hi,
             onChanged: onChanged,
             onChangeEnd: onChangeEnd,
           ),
@@ -9115,7 +9384,7 @@ class _ProgressBarState extends ConsumerState<_ProgressBar> {
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
               Text(
-                _fmt(position),
+                _fmt(sliderPosition),
                 style: TextStyle(
                   fontSize: 12.5,
                   color: Colors.white.withValues(alpha: .52),

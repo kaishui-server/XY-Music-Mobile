@@ -312,6 +312,14 @@ class Pan123Provider extends CloudProvider {
         isDir: _asInt(e['Type'] ?? e['type']) == 1,
         size: _asInt(e['Size'] ?? e['size']),
         parentId: (e['ParentFileId'] ?? path).toString(),
+        // download_info 需要 Size/Key/etag/type/fileName 才能出直链；
+        // S3KeyFlag 与 Etag 只在列表返回，随条目带到直链请求。
+        extra: {
+          if ((e['S3KeyFlag'] ?? '').toString().isNotEmpty)
+            'Key': (e['S3KeyFlag'] ?? '').toString(),
+          if ((e['Etag'] ?? e['etag'] ?? '').toString().isNotEmpty)
+            'etag': (e['Etag'] ?? e['etag'] ?? '').toString(),
+        },
       ));
     }
     final hasNext = files.length >= 100;
@@ -426,16 +434,34 @@ class Pan123Provider extends CloudProvider {
   @override
   Future<CloudDirectLink> getDirectLink(
       Map<String, String> cred, CloudFile file) async {
+    // download_info 必需字段：driveId / fileId / Size（字节）/ Key（列表
+    // 返回的 S3KeyFlag）/ type（文件=0）/ etag / fileName；此前漏传 Size
+    // 导致服务端报「code=400 请输入Size」，Key/etag 缺失同样会被拒绝。
     final resp = await cloudPostJson(
       '$_apiBase/file/download_info',
-      body: {'driveId': 0, 'fileId': file.id},
+      body: {
+        'driveId': 0,
+        'fileId': file.id,
+        'Size': file.size,
+        'type': 0,
+        'fileName': file.name,
+        if (file.extra?['Key'] != null) 'Key': file.extra!['Key'],
+        if (file.extra?['etag'] != null) 'etag': file.extra!['etag'],
+      },
       headers: _h(cred['token'] ?? ''),
     );
-    if (!resp.isOk) throw const CloudException('直链获取失败');
-    final code = (resp.json['code'] as num?)?.toInt() ?? -1;
-    if (code != 0) throw const CloudException('直链获取失败');
+    if (!resp.isOk) {
+      throw CloudException('直链获取失败（${respErrorDetail(resp)}）');
+    }
+    final code = resp.json['code'] == null ? -1 : _asInt(resp.json['code']);
+    if (code != 0) {
+      throw CloudException('直链获取失败（${respErrorDetail(resp)}）');
+    }
     final url = _extractDownloadUrl(resp.json['data']);
-    if (url.isEmpty) throw const CloudException('直链获取失败');
+    if (url.isEmpty) {
+      throw CloudException(
+          '直链获取失败（响应未含下载地址，${respErrorDetail(resp)}）');
+    }
     return CloudDirectLink(
       url: url,
       headers: {'User-Agent': _ua},
@@ -457,6 +483,16 @@ class Pan123Provider extends CloudProvider {
       }
     }
     if (data is Map<String, dynamic>) {
+      // 新网关 v2 多线路分发结构：dispatchList[].prefix + downloadPath。
+      final dispatch = data['dispatchList'];
+      if (dispatch is List && dispatch.isNotEmpty) {
+        final prefix =
+            (dispatch.first as Map<String, dynamic>?)?['prefix']?.toString();
+        final path = data['downloadPath']?.toString();
+        if ((prefix ?? '').isNotEmpty && (path ?? '').isNotEmpty) {
+          return '$prefix$path';
+        }
+      }
       for (final key in ['DownloadUrl', 'downloadUrl', 'download_url']) {
         final v = data[key];
         if (v is String && v.startsWith('http')) return v;

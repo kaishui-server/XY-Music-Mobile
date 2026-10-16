@@ -227,7 +227,9 @@ abstract class QuarkUcBase extends CloudProvider {
       },
       headers: authHeaders(cred ?? const {}),
     );
-    if (!resp.isOk) throw const CloudException('分享直链获取失败');
+    if (!resp.isOk) {
+      throw CloudException('分享直链获取失败（${respErrorDetail(resp)}）');
+    }
     final data = resp.json['data'];
     String? url;
     if (data is List && data.isNotEmpty) {
@@ -235,10 +237,17 @@ abstract class QuarkUcBase extends CloudProvider {
     } else if (data is Map<String, dynamic>) {
       url = data['download_url']?.toString();
     }
-    if (url == null || url.isEmpty) throw const CloudException('分享直链获取失败');
+    if (url == null || url.isEmpty) {
+      throw CloudException(
+          '分享直链获取失败（响应未含 download_url，${respErrorDetail(resp)}）');
+    }
     return CloudDirectLink(
       url: url,
-      headers: {'User-Agent': desktopUa, 'Referer': 'https://$webHost/'},
+      headers: {
+        'User-Agent': desktopUa,
+        'Referer': 'https://$webHost/',
+        if (cred != null && cred.isNotEmpty) 'Cookie': cookieHeader(cred),
+      },
       fileName: file.name,
       size: file.size,
       expireAt: DateTime.now().add(const Duration(hours: 2)),
@@ -324,7 +333,9 @@ abstract class QuarkUcBase extends CloudProvider {
       },
       headers: authHeaders(cred),
     );
-    if (!resp.isOk) throw const CloudException('直链获取失败');
+    if (!resp.isOk) {
+      throw CloudException('直链获取失败（${respErrorDetail(resp)}）');
+    }
     final data = resp.json['data'];
     String? url;
     if (data is List && data.isNotEmpty) {
@@ -332,10 +343,20 @@ abstract class QuarkUcBase extends CloudProvider {
     } else if (data is Map<String, dynamic>) {
       url = data['download_url']?.toString();
     }
-    if (url == null || url.isEmpty) throw const CloudException('直链获取失败');
+    if (url == null || url.isEmpty) {
+      throw CloudException(
+          '直链获取失败（响应未含 download_url，${respErrorDetail(resp)}）');
+    }
     return CloudDirectLink(
       url: url,
-      headers: {'User-Agent': desktopUa, 'Referer': 'https://$webHost/'},
+      // download_url 为带签名的防盗链地址，播放器直接 GET 时必须携带
+      // 登录 Cookie（__pus/__puus 等）+ Referer + UA，缺 Cookie 会 403，
+      // 播放层报「音频地址无法播放或已经失效」。
+      headers: {
+        'User-Agent': desktopUa,
+        'Referer': 'https://$webHost/',
+        'Cookie': cookieHeader(cred),
+      },
       fileName: file.name,
       size: file.size,
       expireAt: DateTime.now().add(const Duration(hours: 2)),

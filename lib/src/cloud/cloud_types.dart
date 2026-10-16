@@ -190,6 +190,7 @@ class CloudFile {
     this.parentId,
     this.path,
     this.token,
+    this.extra,
   });
 
   final String id;
@@ -201,6 +202,10 @@ class CloudFile {
 
   /// 各盘侧带令牌（转存/直链用），跨页传递；无则 null。
   final String? token;
+
+  /// 各盘侧带元数据（如 123 云盘直链所需的 S3KeyFlag/Etag），跨页传递；
+  /// 无则 null。
+  final Map<String, String>? extra;
 
   /// 常见音频扩展名（浏览页识别可播条目用）。
   static const audioExts = {
@@ -223,6 +228,7 @@ class CloudFile {
         if (parentId != null) 'parentId': parentId,
         if (path != null) 'path': path,
         if (token != null) 'token': token,
+        if (extra != null) 'extra': extra,
       };
 
   static CloudFile fromJson(Map<String, dynamic> j) => CloudFile(
@@ -233,6 +239,9 @@ class CloudFile {
         parentId: j['parentId']?.toString(),
         path: j['path']?.toString(),
         token: j['token']?.toString(),
+        extra: j['extra'] is Map
+            ? Map<String, String>.from(j['extra'] as Map)
+            : null,
       );
 }
 

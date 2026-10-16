@@ -290,14 +290,31 @@ class BaiduProvider extends CloudProvider {
       'https://pan.baidu.com/rest/2.0/xpan/multimedia?method=filemetas'
       '&dlink=1&fsids=${Uri.encodeQueryComponent('[${file.id}]')}'
       '&clienttype=0&app_id=$_appId&web=1',
-      headers: _h(cred),
+      // filemetas/dlink 下发要求 pan.baidu.com UA（Chrome UA 会被服务端
+      // 判定会话不被接口认可，返回 code=9019 且无 filemetas 列表）。
+      headers: {..._h(cred), 'User-Agent': 'pan.baidu.com'},
     );
-    if (!metaResp.isOk) throw const CloudException('直链获取失败');
+    if (!metaResp.isOk) {
+      throw CloudException('直链获取失败（${respErrorDetail(metaResp)}）');
+    }
+    final errno = (metaResp.json['errno'] as num?)?.toInt() ?? -1;
+    if (errno == 9019) {
+      // 9019 在社区与工具链（alist/网盘直链助手）中统一判定为鉴权会话
+      // 不被接口认可（令牌/会话失效或被风控），需重新登录换新凭据。
+      throw CloudException(
+          '直链获取失败（百度会话不被认可 code=9019，请重新登录百度网盘后重试）');
+    }
     final list = (metaResp.json['list'] as List?) ?? const [];
-    if (list.isEmpty) throw const CloudException('直链获取失败');
+    if (list.isEmpty) {
+      throw CloudException(
+          '直链获取失败（响应未含 filemetas 列表，${respErrorDetail(metaResp)}）');
+    }
     var dlink =
         ((list.first as Map<String, dynamic>)['dlink'] ?? '').toString();
-    if (dlink.isEmpty) throw const CloudException('直链获取失败');
+    if (dlink.isEmpty) {
+      throw CloudException(
+          '直链获取失败（响应未含 dlink，${respErrorDetail(metaResp)}）');
+    }
     dlink = await resolveFinalUrl(dlink, headers: {'User-Agent': 'netdisk'});
     final host = Uri.tryParse(dlink)?.host ?? '';
     if (host.contains('d2-ant') || host.contains('speed-limited')) {

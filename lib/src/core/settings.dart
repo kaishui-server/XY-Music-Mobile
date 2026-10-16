@@ -254,6 +254,8 @@ class AppSettings {
     this.desktopLyricsBackgroundColor = 0xFF18181C,
     this.desktopLyricsBackgroundOpacity = .85,
     this.desktopLyricsVerticalPercent = 90.0,
+    this.skipHeadSeconds = 0.0,
+    this.skipTailSeconds = 0.0,
     this.miniPlayerOverlayEnabled = false,
     this.downloadPath = '',
     this.downloadQuality = '320k',
@@ -379,6 +381,12 @@ class AppSettings {
   /// 拖动手势也会把结果换算回百分制回传。
   final double desktopLyricsVerticalPercent;
 
+  /// 播放跳过头部秒数：起播时直接定位到该秒（自定义播放起止区间）。
+  final double skipHeadSeconds;
+
+  /// 播放跳过尾部秒数：播放到「总时长 - 该秒」时视为播放完成并切歌。
+  final double skipTailSeconds;
+
   /// 迷你播放器悬浮窗：开启后通知栏单击媒体卡片会弹出系统级浮窗，浮窗内的
   /// 封面/标题/进度条与切歌按钮均可直接操作，无需切回应用。默认关闭。
   final bool miniPlayerOverlayEnabled;
@@ -464,6 +472,8 @@ class AppSettings {
     int? desktopLyricsBackgroundColor,
     double? desktopLyricsBackgroundOpacity,
     double? desktopLyricsVerticalPercent,
+    double? skipHeadSeconds,
+    double? skipTailSeconds,
     bool? miniPlayerOverlayEnabled,
     String? downloadPath,
     String? downloadQuality,
@@ -563,6 +573,8 @@ class AppSettings {
           desktopLyricsBackgroundOpacity ?? this.desktopLyricsBackgroundOpacity,
       desktopLyricsVerticalPercent:
           desktopLyricsVerticalPercent ?? this.desktopLyricsVerticalPercent,
+      skipHeadSeconds: skipHeadSeconds ?? this.skipHeadSeconds,
+      skipTailSeconds: skipTailSeconds ?? this.skipTailSeconds,
       miniPlayerOverlayEnabled:
           miniPlayerOverlayEnabled ?? this.miniPlayerOverlayEnabled,
       downloadPath: downloadPath ?? this.downloadPath,
@@ -706,6 +718,10 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
           (prefs.getDouble('desktopLyricsVerticalPercent') ?? 90.0)
               .clamp(0.0, 100.0)
               .toDouble(),
+      skipHeadSeconds:
+          (prefs.getDouble('skipHeadSeconds') ?? 0.0).clamp(0.0, 3600.0).toDouble(),
+      skipTailSeconds:
+          (prefs.getDouble('skipTailSeconds') ?? 0.0).clamp(0.0, 3600.0).toDouble(),
       miniPlayerOverlayEnabled:
           prefs.getBool('miniPlayerOverlayEnabled') ?? false,
       downloadPath: prefs.getString('downloadPath') ?? '',
@@ -951,6 +967,8 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
         'desktopLyricsVerticalPercent',
         next.desktopLyricsVerticalPercent,
       ),
+      prefs.setDouble('skipHeadSeconds', next.skipHeadSeconds),
+      prefs.setDouble('skipTailSeconds', next.skipTailSeconds),
       prefs.setBool(
         'miniPlayerOverlayEnabled',
         next.miniPlayerOverlayEnabled,
@@ -1303,6 +1321,17 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
     (state.valueOrNull ?? const AppSettings()).copyWith(
       // 百分制纵向位置：0 = 屏幕最顶端、50 = 屏幕正中、100 = 屏幕最底端。
       desktopLyricsVerticalPercent: value.clamp(0.0, 100.0).toDouble(),
+    ),
+  );
+
+  /// 设置播放跳过头部/尾部秒数（全局生效，播放时按此区间起播与结束）。
+  Future<void> setSkipHeadTail({
+    required double headSeconds,
+    required double tailSeconds,
+  }) => _save(
+    (state.valueOrNull ?? const AppSettings()).copyWith(
+      skipHeadSeconds: headSeconds.clamp(0.0, 3600.0).toDouble(),
+      skipTailSeconds: tailSeconds.clamp(0.0, 3600.0).toDouble(),
     ),
   );
 

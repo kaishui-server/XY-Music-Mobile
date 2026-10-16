@@ -45,6 +45,21 @@ bool hasNonStandardWordTiming(String raw) {
   return RegExp(r'^\[\d+,\d+\]', multiLine: true).hasMatch(text);
 }
 
+/// 是否为洛雪音源逐字标签歌词：整行（或大部分行）由 `<mm:ss.mmm>词…`
+/// 毫秒词级标签序列组成，无行首 `[mm:ss]` 时间戳。这不是标准增强 LRC
+/// （后者要求行首时间戳），也不是普通 LRC；蓝牙/通知栏链路原样透传时
+/// 对端会把整串 `<mm:ss.mmm>` 标签当正文显示。需要经 Rust parseLyrics
+/// （新增洛雪逐字行解析）或 Dart 兜底清洗重组为行级明文后再推送/落盘。
+bool hasLxWordTiming(String raw) {
+  final text = raw.trim();
+  if (text.isEmpty) return false;
+  // 至少两行出现 `<数字:数字.三位毫秒>` 词级标签，且行首即以标签开头
+  // （纯洛雪逐字正文），避免误判普通含尖括号文本。
+  final tag = RegExp(r'^\s*<\d{1,3}:\d{2}\.\d{3}>', multiLine: true);
+  final tagCount = tag.allMatches(text).length;
+  return tagCount >= 2 && tagCount >= text.split('\n').length ~/ 2;
+}
+
 /// 直接落盘会产生乱码、必须转换成功的歌词（hex 密文、QRC 容器 XML）。
 /// QRC/KRC 等非标准词级格式与普通 LRC 都是可读文本，解析失败时宁可原样
 /// 保留，也不该整段丢弃。
@@ -52,9 +67,11 @@ bool isUnreadableLyrics(String raw) =>
     looksLikeEncodedLyrics(raw) || looksLikeQrcContainerXml(raw);
 
 /// 下载落盘前是否需要先经 Rust 歌词解析器转换：QRC/KRC 密文、QRC 容器 XML，
-/// 或带非标准词级时间轴（QRC/KRC/YRC）的歌词。
+/// 带非标准词级时间轴（QRC/KRC/YRC），或洛雪 `<mm:ss.mmm>` 逐字标签。
 bool needsLyricNormalization(String raw) =>
-    isUnreadableLyrics(raw) || hasNonStandardWordTiming(raw);
+    isUnreadableLyrics(raw) ||
+    hasNonStandardWordTiming(raw) ||
+    hasLxWordTiming(raw);
 
 /// 秒 → LRC 时钟串 `mm:ss.xxx`（不含方括号）。
 String _formatLrcClock(double seconds) {

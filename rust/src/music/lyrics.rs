@@ -988,6 +988,71 @@ fn parse_enhanced_lrc_line(line: &str, source_index: usize) -> Option<ParsedLine
     })
 }
 
+/// 洛雪逐字标签行：`<00:00.000>A<00:00.255>Little<00:01.020>Love` 这种
+/// 纯词级时间标签（毫秒精度、无行首 `[mm:ss]`）不是标准增强 LRC（后者
+/// 要求行首时间戳），也不是普通 LRC。蓝牙/通知栏链路此前原样透传，
+/// 对端解析不出行级标签后把整串 `<mm:ss.mmm>` 当正文显示。这里解析为
+/// 带 words 的 EnhancedLrc 行，text 由词拼接（保留词间空格），使
+/// parseLyrics 的 displayLines 能产出行级明文，供蓝牙/通知栏/下载链路
+/// 重组为标准 LRC。
+fn parse_lx_word_timed_line(line: &str, source_index: usize) -> Option<ParsedLine> {
+    let trimmed = line.trim();
+    // 洛雪逐字行没有行首时间戳，整行以 `<mm:ss.mmm>` 词级标签开头。
+    // 标准增强 LRC（`[mm:ss]…`）由 parse_enhanced_lrc_line 处理，不会误入。
+    if !trimmed.starts_with('<') {
+        return None;
+    }
+    let markers = collect_markers(trimmed, '<', '>');
+    if markers.len() < 2 {
+        return None;
+    }
+    // 行首到第一个标签之间不允许残留非空白（整行必须就是标签序列）。
+    if !trimmed[..markers[0].0].trim().is_empty() {
+        return None;
+    }
+    let mut words = Vec::new();
+    let mut raw_text = String::new();
+    for window in markers.windows(2) {
+        let (_, current_end, current_start_ms) = window[0];
+        let (next_start, _, next_start_ms) = window[1];
+        let segment = &trimmed[current_end..next_start];
+        // 原样拼接保留词间空格（洛雪词标签间常出现普通空格）。
+        raw_text.push_str(segment);
+        let word_text = sanitize_word_text(segment);
+        if word_text.trim().is_empty() {
+            continue;
+        }
+        words.push(ParsedWord {
+            text: word_text.trim().to_string(),
+            start_ms: current_start_ms,
+            end_ms: next_start_ms.max(current_start_ms),
+            roman_text: None,
+        });
+    }
+    if words.is_empty() {
+        return None;
+    }
+    let text = sanitize_line_text(&raw_text);
+    if text.is_empty() {
+        return None;
+    }
+    let (explicit_role, normalized_text) = detect_explicit_role(&text);
+    let first_start = markers[0].2;
+    let last_end = markers.last()?.2;
+
+    Some(ParsedLine {
+        start_ms: first_start,
+        end_ms: last_end.max(first_start),
+        text: normalized_text,
+        words: Some(words),
+        translated_text: None,
+        roman_text: None,
+        source_format: ParsedLineSourceFormat::EnhancedLrc,
+        source_index: source_index as f64,
+        explicit_role,
+    })
+}
+
 fn parse_plain_lrc_line(line: &str, source_index: usize) -> Vec<ParsedLine> {
     let markers = collect_markers(line, '[', ']');
     if markers.is_empty() {
@@ -1157,6 +1222,13 @@ fn parse_manual_lrc_like(raw: &str) -> Vec<ParsedLine> {
     for (index, line) in raw.lines().enumerate() {
         let trimmed = line.trim();
         if trimmed.is_empty() {
+            continue;
+        }
+
+        // 洛雪逐字标签行（`<mm:ss.mmm>词…`，无行首时间戳）优先于标准增强
+        // LRC / 普通 LRC 识别；行首是 `[` 的标准 LRC 不会被误吞。
+        if let Some(parsed) = parse_lx_word_timed_line(trimmed, index) {
+            lines.push(parsed);
             continue;
         }
 
@@ -3868,6 +3940,29 @@ mod tests {
 
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].text, "如果当时 - 许嵩");
+    }
+
+    /// 洛雪音源逐字标签行（`<mm:ss.mmm>词…`，无行首 `[mm:ss]`）此前
+    /// 蓝牙/通知栏链路原样透传（截图显示 `<00:00.000>A<00:00.255>Little…`
+    /// 标签正文）。断言能解析出行级明文 + 词级时间，且词间空格保留。
+    #[test]
+    fn parses_lx_word_timed_lines_into_plain_text() {
+        let parsed = parse_raw_lyrics(
+            concat!(
+                "<00:00.000>A<00:00.255> Little<00:00.510> ",
+                "<00:01.020>Love<00:01.530>\n",
+                "<00:02.040>Little<00:02.300> Love<00:02.800>\n",
+                "[00:04.000]小小爱（翻译行不受影响）",
+            ),
+        );
+
+        assert_eq!(parsed.len(), 3, "逐字行 2 条 + 普通翻译行 1 条");
+        assert_eq!(parsed[0].text, "A Little Love");
+        assert_eq!(parsed[0].source_format, ParsedLineSourceFormat::EnhancedLrc);
+        let words = parsed[0].words.as_ref().expect("应有词级时间");
+        assert_eq!(words.len(), 3, "A / Little / Love 三个词");
+        assert_eq!(parsed[1].text, "Little Love");
+        assert_eq!(parsed[2].text, "小小爱（翻译行不受影响）");
     }
 
     #[test]

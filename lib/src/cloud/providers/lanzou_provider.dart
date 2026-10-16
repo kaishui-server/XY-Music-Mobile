@@ -241,7 +241,7 @@ class LanzouProvider extends CloudProvider {
     if (link.startsWith('http')) {
       return _directFromSharePage(link, file.name, file.size);
     }
-    throw const CloudException('直链获取失败');
+    throw const CloudException('直链获取失败（该条目未携带分享页地址）');
   }
 
   // ── 内部 ──────────────────────────────────────────────

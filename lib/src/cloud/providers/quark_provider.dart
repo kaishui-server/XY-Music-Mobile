@@ -64,7 +64,9 @@ class QuarkProvider extends QuarkUcBase {
                   ?['dl_token'] ??
               '')
           .toString();
-      if (dlToken.isEmpty) throw const CloudException('直链获取失败');
+      if (dlToken.isEmpty) {
+        throw CloudException('直链获取失败（${respErrorDetail(tokResp)}）');
+      }
       final resp = await cloudPostJson(
         'https://$apiHost/1/clouddrive/file/download?$commonQuery'
         '&dl_token=${Uri.encodeQueryComponent(dlToken)}',
@@ -81,18 +83,26 @@ class QuarkProvider extends QuarkUcBase {
       } else if (data is Map<String, dynamic>) {
         url = data['download_url']?.toString();
       }
-      if (url == null || url.isEmpty) throw const CloudException('直链获取失败');
+      if (url == null || url.isEmpty) {
+        throw CloudException(
+            '直链获取失败（响应未含 download_url，${respErrorDetail(resp)}）');
+      }
       return CloudDirectLink(
         url: url,
-        headers: {'User-Agent': desktopUa, 'Referer': 'https://$webHost/'},
+        // 与 route1 一致：带签名直链需 Cookie + Referer + UA 才能播放。
+        headers: {
+          'User-Agent': desktopUa,
+          'Referer': 'https://$webHost/',
+          'Cookie': cookieHeader(cred),
+        },
         fileName: file.name,
         size: file.size,
         expireAt: DateTime.now().add(const Duration(hours: 2)),
       );
     } on CloudException {
       rethrow;
-    } catch (_) {
-      throw const CloudException('直链获取失败');
+    } catch (e) {
+      throw CloudException('直链获取失败（$e）');
     }
   }
 }

@@ -435,11 +435,16 @@ class Ecloud189Provider extends CloudProvider {
       '?fileId=${Uri.encodeQueryComponent(file.id)}',
       headers: _h(cred['cookie'] ?? ''),
     );
-    if (!resp.isOk) throw const CloudException('直链获取失败');
+    if (!resp.isOk) {
+      throw CloudException('直链获取失败（${respErrorDetail(resp)}）');
+    }
     final url =
         ((resp.json['data'] as Map<String, dynamic>)['fileDownloadUrl'] ?? '')
             .toString();
-    if (url.isEmpty) throw const CloudException('直链获取失败');
+    if (url.isEmpty) {
+      throw CloudException(
+          '直链获取失败（响应未含 fileDownloadUrl，${respErrorDetail(resp)}）');
+    }
     final finalUrl = await resolveFinalUrl(url, headers: {'User-Agent': _ua});
     return CloudDirectLink(
       url: finalUrl,
