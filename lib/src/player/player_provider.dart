@@ -34,7 +34,6 @@ import '../rust/api.dart';
 import '../rust/music/types.dart';
 import '../widgets/cover_image.dart';
 import 'downloaded_song_store.dart';
-import 'download_lyrics.dart';
 import 'desktop_lyrics.dart';
 import 'bluetooth_lyrics.dart';
 import 'notification_lyrics.dart';
@@ -2261,8 +2260,16 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
       return _bridgeLyricsCacheText ?? raw;
     }
     var result = raw;
-    if (needsLyricNormalization(raw)) {
+    // 无条件经规整链：needsLyricNormalization 的「过半行含词级标签」
+    // 判定对部分洛雪形态会漏判（行级+字级标签混排、翻译行稀释词级标签
+    // 占比），原始 `<mm:ss.mmm>` 标签直接透传到蓝牙端（一加媒体控制中心
+    // 实测：显示 `<00:09.580>Written<00:09.963>…`），同刻度去重也被跳过
+    // 导致部分歌显示翻译。规整链对标准 LRC 是等价重组（纯文本行级 LRC），
+    // 不会破坏普通歌词。
+    try {
       result = await _normalizeBridgeLyrics(raw);
+    } catch (_) {
+      result = _stripLxTagsToLineLrc(raw);
     }
     _bridgeLyricsCacheRaw = raw;
     _bridgeLyricsCacheText = result;
@@ -2280,7 +2287,9 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
       if (lines is! List || lines.isEmpty) {
         // Rust 解析器未识别洛雪逐字标签时（版本落后/异常），Dart 兜底
         // 直接剥标签重组为行级 LRC，保证蓝牙/通知栏不再透传原始标签。
-        return hasLxWordTiming(raw) ? _stripLxTagsToLineLrc(raw) : raw;
+        // 不再用 hasLxWordTiming 做前置判定（漏判会原样透传标签）——
+        // _stripLxTagsToLineLrc 对普通 LRC 行等价保留。
+        return _stripLxTagsToLineLrc(raw);
       }
       final sb = StringBuffer();
       for (final line in lines) {
@@ -2310,9 +2319,9 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
             '[${mm.toString().padLeft(2, '0')}:${ss.toString().padLeft(2, '0')}.${frac.toString().padLeft(2, '0')}]$text');
       }
       final rebuilt = _dedupeSameStampLines(sb.toString().trim());
-      return rebuilt.isNotEmpty ? rebuilt : raw;
+      return rebuilt.isNotEmpty ? rebuilt : _stripLxTagsToLineLrc(raw);
     } catch (_) {
-      return hasLxWordTiming(raw) ? _stripLxTagsToLineLrc(raw) : raw;
+      return _stripLxTagsToLineLrc(raw);
     }
   }
 
