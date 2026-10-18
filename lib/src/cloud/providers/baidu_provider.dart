@@ -1,4 +1,4 @@
-﻿// 百度网盘 provider（webviewCookie：BDUSS/STOKEN）。
+// 百度网盘 provider（webviewCookie：BDUSS/STOKEN）。
 //
 // 注意：分享列表/转存接口必须带登录态（BDUSS），故 parseShareLink 内
 // 直接读本地绑定凭据；转存的 sekey 是 verify 换来的 randsk（BDCLND），
@@ -246,20 +246,23 @@ class BaiduProvider extends CloudProvider {
     return out;
   }
 
-  /// 确保转存目标目录存在并返回 bdstoken。
-  Future<String> _ensureDir(Map<String, String> cred) async {
+  /// 取当前会话的 bdstoken（web 接口防 CSRF 令牌）。filemetas 直链接口
+  /// 在部分风控策略下缺失 bdstoken 会返回 errno 9019「会话不被认可」，
+  /// 必须在查询串上附带；获取失败时降级为空串继续尝试。
+  Future<String> _fetchBdstoken(Map<String, String> cred) async {
     final tplResp = await cloudGet(
       'https://pan.baidu.com/api/gettemplatevariable?clienttype=0'
       '&app_id=$_appId&web=1&fields=["bdstoken"]',
       headers: _h(cred),
     );
-    var bdstoken = '';
-    if (tplResp.isOk) {
-      bdstoken = ((tplResp.json['result'] as Map<String, dynamic>?)
-                  ?['bdstoken'] ??
-              '')
-          .toString();
-    }
+    if (!tplResp.isOk) return '';
+    return ((tplResp.json['result'] as Map<String, dynamic>?)?['bdstoken'] ?? '')
+        .toString();
+  }
+
+  /// 确保转存目标目录存在并返回 bdstoken。
+  Future<String> _ensureDir(Map<String, String> cred) async {
+    final bdstoken = await _fetchBdstoken(cred);
     final createResp = await cloudPostForm(
       'https://pan.baidu.com/api/create?a=commit&channel=chunlei&web=1'
       '&app_id=$_appId&clienttype=0',
@@ -286,45 +289,126 @@ class BaiduProvider extends CloudProvider {
   @override
   Future<CloudDirectLink> getDirectLink(
       Map<String, String> cred, CloudFile file) async {
+    // 多路由降级（对齐惜梦解析与 OpenList 社区实现）：
+    // ① web /api/filemetas：cookie 态按 target 路径取 dlink（OpenList
+    //    crack 同款参数 web=5&origin=dlna；UA 必须为 netdisk）；
+    // ② xpan multimedia filemetas：cookie + bdstoken 按 fsid 取 dlink，
+    //    部分账号会被风控拒绝（errno=9019「会话不被认可」）。
+    final bdstoken = await _fetchBdstoken(cred);
+    final errors = <String>[];
+    if ((file.path ?? '').isNotEmpty) {
+      try {
+        return await _directLinkWebFilemetas(cred, file, bdstoken);
+      } on CloudException catch (e) {
+        errors.add('web filemetas：${e.message}');
+      }
+    }
+    try {
+      return await _directLinkXpanFilemetas(cred, file, bdstoken);
+    } on CloudException catch (e) {
+      errors.add('xpan filemetas：${e.message}');
+    }
+    throw CloudException('直链获取失败（${errors.join('；')}）');
+  }
+
+  /// 路由①：web 文件元信息接口，响应字段是 info[].dlink（与 xpan 的
+  /// list[].dlink 不同）。UA 用 netdisk 时浏览器 UA 会被服务端拒绝。
+  Future<CloudDirectLink> _directLinkWebFilemetas(
+    Map<String, String> cred,
+    CloudFile file,
+    String bdstoken,
+  ) async {
+    final resp = await cloudGet(
+      'https://pan.baidu.com/api/filemetas?target='
+      '${Uri.encodeQueryComponent(jsonEncode([file.path!]))}'
+      '&dlink=1&web=5&origin=dlna&app_id=$_appId'
+      '${bdstoken.isEmpty ? '' : '&bdstoken=${Uri.encodeQueryComponent(bdstoken)}'}',
+      headers: {'User-Agent': 'netdisk', 'Cookie': cookieHeader(cred)},
+    );
+    if (!resp.isOk) throw CloudException('HTTP ${resp.status}');
+    final errno = (resp.json['errno'] as num?)?.toInt() ?? -1;
+    if (errno != 0) {
+      throw CloudException('errno=$errno ${respErrorDetail(resp)}');
+    }
+    final dlink = _dlinkFromMetasResp(resp.json);
+    if (dlink.isEmpty) {
+      throw CloudException('响应未含 dlink ${respErrorDetail(resp)}');
+    }
+    return _finishBaiduLink(dlink, file, 'netdisk', cred);
+  }
+
+  /// 路由②：xpan multimedia filemetas（fsids 检索）。dlink 下发与下载均
+  /// 要求 UA 为 pan.baidu.com（Chrome UA 会被判定会话不被接口认可返回
+  /// code=9019 且无 filemetas 列表）；同时附带 bdstoken（web 接口 CSRF
+  /// 令牌），部分风控策略缺它也返回 9019。
+  Future<CloudDirectLink> _directLinkXpanFilemetas(
+    Map<String, String> cred,
+    CloudFile file,
+    String bdstoken,
+  ) async {
     final metaResp = await cloudGet(
       'https://pan.baidu.com/rest/2.0/xpan/multimedia?method=filemetas'
       '&dlink=1&fsids=${Uri.encodeQueryComponent('[${file.id}]')}'
-      '&clienttype=0&app_id=$_appId&web=1',
-      // filemetas/dlink 下发要求 pan.baidu.com UA（Chrome UA 会被服务端
-      // 判定会话不被接口认可，返回 code=9019 且无 filemetas 列表）。
+      '&clienttype=0&app_id=$_appId&web=1'
+      '${bdstoken.isEmpty ? '' : '&bdstoken=${Uri.encodeQueryComponent(bdstoken)}'}',
       headers: {..._h(cred), 'User-Agent': 'pan.baidu.com'},
     );
     if (!metaResp.isOk) {
-      throw CloudException('直链获取失败（${respErrorDetail(metaResp)}）');
+      throw CloudException('HTTP ${metaResp.status} ${respErrorDetail(metaResp)}');
     }
     final errno = (metaResp.json['errno'] as num?)?.toInt() ?? -1;
-    if (errno == 9019) {
-      // 9019 在社区与工具链（alist/网盘直链助手）中统一判定为鉴权会话
-      // 不被接口认可（令牌/会话失效或被风控），需重新登录换新凭据。
-      throw CloudException(
-          '直链获取失败（百度会话不被认可 code=9019，请重新登录百度网盘后重试）');
+    if (errno != 0) {
+      if (errno == 9019) {
+        throw CloudException(
+            'errno=9019 百度会话不被该接口认可（cookie 态被风控拦截）');
+      }
+      throw CloudException('errno=$errno ${respErrorDetail(metaResp)}');
     }
-    final list = (metaResp.json['list'] as List?) ?? const [];
-    if (list.isEmpty) {
-      throw CloudException(
-          '直链获取失败（响应未含 filemetas 列表，${respErrorDetail(metaResp)}）');
-    }
-    var dlink =
-        ((list.first as Map<String, dynamic>)['dlink'] ?? '').toString();
+    final dlink = _dlinkFromMetasResp(metaResp.json);
     if (dlink.isEmpty) {
-      throw CloudException(
-          '直链获取失败（响应未含 dlink，${respErrorDetail(metaResp)}）');
+      throw CloudException('响应未含 dlink ${respErrorDetail(metaResp)}');
     }
-    dlink = await resolveFinalUrl(dlink, headers: {'User-Agent': 'netdisk'});
-    final host = Uri.tryParse(dlink)?.host ?? '';
+    return _finishBaiduLink(dlink, file, 'pan.baidu.com', cred);
+  }
+
+  /// filemetas 响应兼容两种字段形态：web 接口 info[].dlink /
+  /// xpan 接口 list[].dlink，取第一个非空 dlink。
+  static String _dlinkFromMetasResp(Map<String, dynamic> json) {
+    for (final key in const ['info', 'list']) {
+      final list = json[key];
+      if (list is List && list.isNotEmpty) {
+        final v = ((list.first as Map<String, dynamic>)['dlink'] ?? '').toString();
+        if (v.isNotEmpty) return v;
+      }
+    }
+    return '';
+  }
+
+  /// dlink 归一：跟随 302 确认真实 CDN 域名，命中限速域名黑名单即拒。
+  ///
+  /// 5508 日志定位：dlink 请求带 Cookie 仍 403 且无重定向——`netdisk`
+  /// UA 是 OpenList access_token 流程的下载头，cookie 态下不被 d.pcs
+  /// 接受。改为完全模拟网页端下载请求头：浏览器 UA + pan.baidu.com
+  /// Referer + 登录 Cookie（探测与播放统一，避免特征不一致）。
+  Future<CloudDirectLink> _finishBaiduLink(
+    String dlink,
+    CloudFile file,
+    String ua,
+    Map<String, String> cred,
+  ) async {
+    final headers = {
+      'User-Agent': _ua,
+      'Referer': 'https://pan.baidu.com/disk/main',
+      'Cookie': cookieHeader(cred),
+    };
+    final resolved = await resolveFinalUrl(dlink, headers: headers);
+    final host = Uri.tryParse(resolved)?.host ?? '';
     if (host.contains('d2-ant') || host.contains('speed-limited')) {
       throw const CloudException('该文件被限速，暂无法播放');
     }
     return CloudDirectLink(
-      url: dlink,
-      headers: const {
-        'User-Agent': 'netdisk;P2SP;2.2.91.136;android-android',
-      },
+      url: resolved,
+      headers: headers,
       fileName: file.name,
       size: file.size,
       expireAt: DateTime.now().add(const Duration(hours: 8)),

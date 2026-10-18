@@ -51,8 +51,9 @@ opt-level = 1
 opt-level = 3
 
 [profile.release]
-# 保持音频/DSP 热路径的优化级别，同时通过跨 crate 优化和符号裁剪缩小 Android 动态库。
+# 保持音频/DSP 热路径的优化级别，同时通过跨 crate 优化和符号裁剪缩小
+# Android 动态库。fat LTO 比 thin 能进一步削减跨 crate 冗余代码。
 opt-level = 3
-lto = "thin"
+lto = "fat"
 codegen-units = 1
 strip = "symbols"

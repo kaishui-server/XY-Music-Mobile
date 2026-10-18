@@ -11,8 +11,10 @@ import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
+import android.view.KeyEvent
 import android.widget.RemoteViews
 import androidx.core.app.NotificationCompat
+import com.ryanheise.audioservice.MediaButtonReceiver
 
 /**
  * 通知栏&锁屏实时歌词（任务A：蓝牙歌词补强）。
@@ -108,6 +110,8 @@ object NotificationLyricsManager {
         stopTicker()
         val mgr = ctx.applicationContext.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
         runCatching { mgr?.cancel(NOTIFICATION_ID) }
+        // 关闭蓝牙歌词：媒体通知（AudioService 媒体卡片）第二行恢复纯歌手。
+        syncAudioServiceSecondLine(null)
         lines = emptyList()
         currentIndex = -1
         title = ""
@@ -323,46 +327,42 @@ object NotificationLyricsManager {
         return if (text.isBlank()) "暂无歌词" else text
     }
 
-    /** 组装并发布/更新通知。全部路径 try/catch，任何 ROM 异常不闪退。 */
+    /** 反射调用 AudioService.setMediaSecondLine，避免 app 模块编译期解析
+     *  audio_service 的 androidx.media 类型层级（MediaBrowserServiceCompat）。 */
+    private fun syncAudioServiceSecondLine(value: String?) {
+        runCatching {
+            val m = Class.forName("com.ryanheise.audioservice.AudioService")
+                .getMethod("setMediaSecondLine", String::class.java)
+            m.invoke(null, value)
+        }.onFailure {
+            // 反射失败（如 R8 裁剪方法）原先被静默吞掉，歌词注入失效无从
+            // 定位；透出 logcat 便于真机排查。
+            android.util.Log.w("NotificationLyrics", "setMediaSecondLine 反射调用失败", it)
+        }
+    }
+
+    /** 同步 AudioService 媒体通知第二行的叠加歌词行（歌手位）。 */
+    private fun syncMediaSecondLine() {
+        val lyric = currentLyricText()
+        if (lyric.isBlank() || lyric == "暂无歌词" || lyric == "歌词加载中") {
+            syncAudioServiceSecondLine(null)
+        } else {
+            syncAudioServiceSecondLine(lyric)
+        }
+    }
+
+    /**
+     * 同步媒体卡片第二行歌词（双卡片修复后的唯一出口）。
+     *
+     * 不再独立发布自定义歌词通知（NOTIFICATION_ID=0x6C01 发布路径已停用）：
+     * 华为/HarmonyOS 通知栏同一时刻只保留 AudioService 构建的系统
+     * MediaStyle 原生媒体卡片，逐行歌词通过 setMediaSecondLine 叠加到该
+     * 卡片歌手位（蓝牙歌词开启时），避免同一时刻出现两张 XY Music 媒体
+     * 卡片。蓝牙歌词关闭时由 [disable] 调用 syncAudioServiceSecondLine(null)
+     * 恢复纯歌手名。全链路 try/catch（见 syncMediaSecondLine 内），
+     * 任何 ROM 异常只丢该次同步，不影响播放进程。
+     */
     private fun publish() {
-        val appCtx = context ?: return
-        val mgr = manager ?: return
-        // Android 13+ 未授予通知权限时降级：不发布，仅维护内部状态。
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
-            !androidx.core.app.NotificationManagerCompat.from(appCtx).areNotificationsEnabled()
-        ) {
-            return
-        }
-        try {
-            val views = RemoteViews(appCtx.packageName, R.layout.lyrics_notification)
-            views.setTextViewText(R.id.lyrics_title, title.ifBlank { "XY Music" })
-            views.setTextViewText(R.id.lyrics_artist, artist.ifBlank { "正在播放" })
-            views.setTextViewText(R.id.lyrics_line, currentLyricText())
-
-            val clickIntent = appCtx.packageManager.getLaunchIntentForPackage(appCtx.packageName)
-                ?: Intent(appCtx, MainActivity::class.java)
-            val pending = PendingIntent.getActivity(
-                appCtx,
-                0,
-                clickIntent,
-                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
-            )
-
-            val builder = NotificationCompat.Builder(appCtx, CHANNEL_ID)
-                .setSmallIcon(R.mipmap.ic_launcher)
-                .setContentTitle(title.ifBlank { "XY Music" })
-                .setContentText(currentLyricText())
-                .setStyle(NotificationCompat.DecoratedCustomViewStyle())
-                .setCustomContentView(views)
-                .setContentIntent(pending)
-                .setOngoing(true)
-                .setOnlyAlertOnce(true)
-                .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
-                .setColor(Color.parseColor("#1C1C1E"))
-                .setCategory(NotificationCompat.CATEGORY_TRANSPORT)
-            mgr.notify(NOTIFICATION_ID, builder.build())
-        } catch (_: Throwable) {
-            // 华为/ROM 特有问题：丢弃本次更新，绝不抛给播放进程。
-        }
+        syncMediaSecondLine()
     }
 }

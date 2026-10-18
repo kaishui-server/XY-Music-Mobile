@@ -1,4 +1,4 @@
-﻿// 123 云盘 provider（qrCode 主通道 + 账密兜底；分享免转存直链
+// 123 云盘 provider（qrCode 主通道 + 账密兜底；分享免转存直链
 // directPlayable=true）。
 //
 // DownloadUrl 字段实测可能是 JSON 串（{url:...}）或纯 URL，统一防御解析。
@@ -8,6 +8,7 @@ import 'dart:convert';
 import '../cloud_http.dart';
 import '../cloud_provider.dart';
 import '../cloud_types.dart';
+import '../../logging/app_log_store.dart';
 import '../share_link_parser.dart';
 import 'http_login_support.dart';
 
@@ -255,6 +256,17 @@ class Pan123Provider extends CloudProvider {
     return int.tryParse('$v') ?? 0;
   }
 
+  /// 兼容 123 网关多种大小写变体的字段读取：列表返回的 S3KeyFlag/Etag
+  /// 在不同接口版本里可能是 `S3KeyFlag` / `S3keyFlag` / `s3KeyFlag`，
+  /// 取第一个非空值，保证直链请求的 Key/S3keyFlag 参数不缺。
+  static String _pick(dynamic e, List<String> names) {
+    for (final n in names) {
+      final v = (e[n] ?? '').toString();
+      if (v.isNotEmpty) return v;
+    }
+    return '';
+  }
+
   static bool _codeOk(CloudHttpResponse r) {
     if (!r.isOk) return false;
     try {
@@ -302,6 +314,11 @@ class Pan123Provider extends CloudProvider {
     final files = <CloudFile>[];
     for (final e in list) {
       if (e is! Map<String, dynamic>) continue;
+      // download_info 需要 Size/Key/etag/type/fileName 才能出直链；
+      // S3KeyFlag 与 Etag 只在列表返回，随条目带到直链请求。
+      // 网关字段名大小写不统一（S3KeyFlag/S3keyFlag/s3KeyFlag），兼容读取。
+      final s3Key = _pick(e, const ['S3KeyFlag', 'S3keyFlag', 's3KeyFlag', 'Key', 'key']);
+      final etag = _pick(e, const ['Etag', 'etag', 'ETag']);
       files.add(CloudFile(
         // 字段名对齐 123 生产前端 app.js 对 `data.InfoList` 的访问：一律
         // PascalCase（FileId / FileName / Type / Size / ParentFileId，
@@ -312,13 +329,9 @@ class Pan123Provider extends CloudProvider {
         isDir: _asInt(e['Type'] ?? e['type']) == 1,
         size: _asInt(e['Size'] ?? e['size']),
         parentId: (e['ParentFileId'] ?? path).toString(),
-        // download_info 需要 Size/Key/etag/type/fileName 才能出直链；
-        // S3KeyFlag 与 Etag 只在列表返回，随条目带到直链请求。
         extra: {
-          if ((e['S3KeyFlag'] ?? '').toString().isNotEmpty)
-            'Key': (e['S3KeyFlag'] ?? '').toString(),
-          if ((e['Etag'] ?? e['etag'] ?? '').toString().isNotEmpty)
-            'etag': (e['Etag'] ?? e['etag'] ?? '').toString(),
+          if (s3Key.isNotEmpty) 'Key': s3Key,
+          if (etag.isNotEmpty) 'etag': etag,
         },
       ));
     }
@@ -356,11 +369,18 @@ class Pan123Provider extends CloudProvider {
     final files = <CloudFile>[];
     for (final e in list) {
       if (e is! Map<String, dynamic>) continue;
+      // 分享列表同样带回 S3KeyFlag/Etag，供分享直链 download/info 使用。
+      final s3Key = _pick(e, const ['S3KeyFlag', 'S3keyFlag', 's3KeyFlag', 'Key', 'key']);
+      final etag = _pick(e, const ['Etag', 'etag', 'ETag']);
       files.add(CloudFile(
         id: (e['FileId'] ?? e['fileId'] ?? '').toString(),
         name: (e['FileName'] ?? e['filename'] ?? '').toString(),
         isDir: _asInt(e['Type']) == 1,
         size: _asInt(e['Size']),
+        extra: {
+          if (s3Key.isNotEmpty) 'Key': s3Key,
+          if (etag.isNotEmpty) 'etag': etag,
+        },
       ));
     }
     return CloudShareParse(
@@ -380,7 +400,10 @@ class Pan123Provider extends CloudProvider {
     String shareKey,
     String pwd,
     String fileId,
+    CloudFile file,
   ) async {
+    final key = file.extra?['Key'];
+    final etag = file.extra?['etag'];
     final resp = await cloudPostJson(
       '$_apiBase/share/download/info',
       body: {
@@ -389,6 +412,11 @@ class Pan123Provider extends CloudProvider {
         'fileIds': [
           {'FileId': fileId}
         ],
+        // 分享直链同样需要 S3keyFlag（Key）/etag，否则网关拒绝出直链。
+        'Key': ?key,
+        'S3keyFlag': ?key,
+        'S3KeyFlag': ?key,
+        'etag': ?etag,
       },
       headers: {'User-Agent': _ua},
     );
@@ -407,17 +435,11 @@ class Pan123Provider extends CloudProvider {
   ) async {
     final pwd = share.passcode ?? share.shareToken ?? '';
     final shareKey = share.shareId ?? '';
-    final resp = await _shareDownloadInfo(shareKey, pwd, file.id);
+    final resp = await _shareDownloadInfo(shareKey, pwd, file.id, file);
     if (resp == null) throw const CloudException('分享直链获取失败');
     final url = _extractDownloadUrl(resp);
     if (url.isEmpty) throw const CloudException('分享直链获取失败');
-    return CloudDirectLink(
-      url: url,
-      headers: {'User-Agent': _ua},
-      fileName: file.name,
-      size: file.size,
-      expireAt: DateTime.now().add(const Duration(hours: 1)),
-    );
+    return _build123DirectLink(url, fileName: file.name, size: file.size);
   }
 
   // directPlayable=true，不支持转存。
@@ -437,6 +459,10 @@ class Pan123Provider extends CloudProvider {
     // download_info 必需字段：driveId / fileId / Size（字节）/ Key（列表
     // 返回的 S3KeyFlag）/ type（文件=0）/ etag / fileName；此前漏传 Size
     // 导致服务端报「code=400 请输入Size」，Key/etag 缺失同样会被拒绝。
+    // 网关对 S3KeyFlag 的字段名大小写不统一（错误文案为「请输入S3keyFlag」），
+    // 同时发送 Key / S3keyFlag / S3KeyFlag 三种命名，兼容新旧网关。
+    final key = file.extra?['Key'];
+    final etag = file.extra?['etag'];
     final resp = await cloudPostJson(
       '$_apiBase/file/download_info',
       body: {
@@ -445,8 +471,10 @@ class Pan123Provider extends CloudProvider {
         'Size': file.size,
         'type': 0,
         'fileName': file.name,
-        if (file.extra?['Key'] != null) 'Key': file.extra!['Key'],
-        if (file.extra?['etag'] != null) 'etag': file.extra!['etag'],
+        'Key': ?key,
+        'S3keyFlag': ?key,
+        'S3KeyFlag': ?key,
+        'etag': ?etag,
       },
       headers: _h(cred['token'] ?? ''),
     );
@@ -462,13 +490,75 @@ class Pan123Provider extends CloudProvider {
       throw CloudException(
           '直链获取失败（响应未含下载地址，${respErrorDetail(resp)}）');
     }
+    return _build123DirectLink(url, fileName: file.name, size: file.size);
+  }
+
+  /// 123 直链落地三步（对齐 OpenList 123pan 驱动的 Link 实现）：
+  /// 1. DownloadUrl 可能带 `?params=<base64>` 包装（真实地址在 base64 里）；
+  /// 2. 以官方 Referer 发一次 Range 探测，解析 302 拿到真实 CDN 地址
+  ///    （下发的中转地址直连播放会被防盗链拦下，播放层报
+  ///    「音频地址无法播放或已经失效」）；
+  /// 3. 播放请求必须携带原始下发域名的 Referer，否则 CDN 返回 403。
+  Future<CloudDirectLink> _build123DirectLink(
+    String rawUrl, {
+    required String fileName,
+    required int size,
+  }) async {
+    var url = rawUrl;
+    final wrapped = Uri.tryParse(rawUrl)?.queryParameters['params'] ?? '';
+    if (wrapped.isNotEmpty) {
+      final decoded = _tryBase64Decode(wrapped);
+      if (decoded != null && decoded.startsWith('http')) url = decoded;
+    }
+    var playUrl = url;
+    try {
+      final probe = await cloudGet(
+        url,
+        headers: {
+          'User-Agent': _ua,
+          'Referer': 'https://yun.123pan.com/',
+          'Range': 'bytes=0-1',
+        },
+      );
+      if (probe.finalUrl.isNotEmpty) {
+        playUrl = probe.finalUrl;
+        AppLogStore.instance.add(
+          '[直链探测] 123 落地 → ${Uri.tryParse(playUrl)?.host ?? '?'}',
+        );
+      }
+    } on CloudException catch (e) {
+      // 探测失败不打断：按下发地址直播（播放器自行跟随 302），但必须
+      // 留痕——探测失败说明 Dart 栈连下发地址都不可达。
+      AppLogStore.instance.add('[直链探测] 123 落地失败: ${e.message}');
+    }
+    final origin = Uri.tryParse(rawUrl);
+    final referer = (origin != null && origin.host.isNotEmpty)
+        ? '${origin.scheme}://${origin.host}/'
+        : null;
     return CloudDirectLink(
-      url: url,
-      headers: {'User-Agent': _ua},
-      fileName: file.name,
-      size: file.size,
+      url: playUrl,
+      headers: {
+        'User-Agent': _ua,
+        'Referer': ?referer,
+      },
+      fileName: fileName,
+      size: size,
       expireAt: DateTime.now().add(const Duration(hours: 1)),
     );
+  }
+
+  /// 宽松 base64 解码（std/url-safe、自动补齐 padding），失败返回 null。
+  static String? _tryBase64Decode(String s) {
+    var normalized = s.trim().replaceAll(' ', '+');
+    if (normalized.contains('-') || normalized.contains('_')) {
+      normalized = normalized.replaceAll('-', '+').replaceAll('_', '/');
+    }
+    final padded = normalized.padRight((normalized.length + 3) ~/ 4 * 4, '=');
+    try {
+      return utf8.decode(base64.decode(padded), allowMalformed: true);
+    } catch (_) {
+      return null;
+    }
   }
 
   /// DownloadUrl 可能是纯 URL、JSON 串或嵌套 data，统一防御解析。
@@ -483,17 +573,14 @@ class Pan123Provider extends CloudProvider {
       }
     }
     if (data is Map<String, dynamic>) {
-      // 新网关 v2 多线路分发结构：dispatchList[].prefix + downloadPath。
-      final dispatch = data['dispatchList'];
-      if (dispatch is List && dispatch.isNotEmpty) {
-        final prefix =
-            (dispatch.first as Map<String, dynamic>?)?['prefix']?.toString();
-        final path = data['downloadPath']?.toString();
-        if ((prefix ?? '').isNotEmpty && (path ?? '').isNotEmpty) {
-          return '$prefix$path';
-        }
-      }
-      for (final key in ['DownloadUrl', 'downloadUrl', 'download_url']) {
+      // DownloadUrl 系字段优先（OpenList 同款路径）；dispatchList 多线路
+      // 分发结构仅作兜底。
+      for (final key in const [
+        'DownloadUrl',
+        'downloadUrl',
+        'download_url',
+        'url',
+      ]) {
         final v = data[key];
         if (v is String && v.startsWith('http')) return v;
         if (v is String && v.isNotEmpty) {
@@ -504,6 +591,15 @@ class Pan123Provider extends CloudProvider {
       final backup = data['backup_download_url'] ?? data['BackupDownloadUrl'];
       if (backup is String && backup.startsWith('http')) {
         return backup;
+      }
+      final dispatch = data['dispatchList'];
+      if (dispatch is List && dispatch.isNotEmpty) {
+        final prefix =
+            (dispatch.first as Map<String, dynamic>?)?['prefix']?.toString();
+        final path = data['downloadPath']?.toString();
+        if ((prefix ?? '').isNotEmpty && (path ?? '').isNotEmpty) {
+          return '$prefix$path';
+        }
       }
     }
     return '';

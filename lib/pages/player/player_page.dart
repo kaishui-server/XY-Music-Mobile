@@ -9,6 +9,7 @@ import 'package:flutter/foundation.dart'
     show ValueListenable, ValueNotifier, listEquals;
 import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart';
+import 'package:flutter/scheduler.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
@@ -5230,9 +5231,9 @@ class _CustomSleepTimerDialogState extends State<_CustomSleepTimerDialog> {
   }
 }
 
-/// 自定义播放区间弹窗：双滑块选择起始/结束位置（步进 1 秒），实时显示
-/// 跳过头部、跳过尾部的秒数与剩余区间时长。确定时通过 Navigator 返回
-/// `(跳过头部秒数, 跳过尾部秒数)`。
+/// 跳过头尾弹窗：头部/尾部两个点状刻度滑块（参考弦予样式，每秒一个
+/// 刻度点、把手上方气泡显示秒数），实时显示跳过秒数与剩余区间时长。
+/// 确定时通过 Navigator 返回 `(跳过头部秒数, 跳过尾部秒数)`。
 class _SkipRangeDialog extends StatefulWidget {
   const _SkipRangeDialog({
     required this.maxSeconds,
@@ -5250,10 +5251,23 @@ class _SkipRangeDialog extends StatefulWidget {
 }
 
 class _SkipRangeDialogState extends State<_SkipRangeDialog> {
-  late RangeValues _values = RangeValues(
-    widget.initialHeadSeconds,
-    widget.initialEndSeconds,
-  );
+  /// 头/尾滑块的上限秒数：每秒一个刻度点、共 60 格；短曲不超过
+  /// 半曲长，且至少留 5 格保证可拖动。
+  late final int _sliderMax = () {
+    final half = widget.maxSeconds ~/ 2;
+    if (half < 5) return half < 1 ? 1 : half;
+    return half > 60 ? 60 : half;
+  }();
+
+  late int _head = widget.initialHeadSeconds
+      .round()
+      .clamp(0, _sliderMax);
+  late int _tail =
+      (widget.maxSeconds - widget.initialEndSeconds).round().clamp(0, _sliderMax);
+
+  // 头尾之和不能超过曲长：拖动时把另一侧夹回允许范围。
+  int get _headMax => (_sliderMax - _tail).clamp(0, _sliderMax);
+  int get _tailMax => (_sliderMax - _head).clamp(0, _sliderMax);
 
   static String _format(int seconds) {
     final m = (seconds ~/ 60).toString().padLeft(2, '0');
@@ -5263,34 +5277,35 @@ class _SkipRangeDialogState extends State<_SkipRangeDialog> {
 
   @override
   Widget build(BuildContext context) {
-    final maxSec = widget.maxSeconds.toDouble();
-    final head = _values.start.round();
-    final tail = widget.maxSeconds - _values.end.round();
-    final span = (_values.end - _values.start).round();
+    final span = widget.maxSeconds - _head - _tail;
     return AlertDialog(
-      title: const Text('自定义播放区间'),
+      title: const Text('跳过头尾'),
       content: SizedBox(
         width: 320,
         child: Column(
           mainAxisSize: MainAxisSize.min,
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
-            Text(
-              '跳过头部 ${head}s · 跳过尾部 ${tail}s · '
-              '区间 ${_format(span)}',
-              style: const TextStyle(fontSize: 13),
+            const Text('头部', style: TextStyle(fontSize: 13)),
+            _DottedSlider(
+              value: _head,
+              max: _sliderMax,
+              maxEffective: _headMax,
+              onChanged: (v) => setState(() => _head = v),
             ),
-            const SizedBox(height: 8),
-            RangeSlider(
-              min: 0,
-              max: maxSec,
-              divisions: widget.maxSeconds,
-              values: _values,
-              labels: RangeLabels(
-                _format(_values.start.round()),
-                _format(_values.end.round()),
-              ),
-              onChanged: (next) => setState(() => _values = next),
+            const SizedBox(height: 10),
+            const Text('尾部', style: TextStyle(fontSize: 13)),
+            _DottedSlider(
+              value: _tail,
+              max: _sliderMax,
+              maxEffective: _tailMax,
+              onChanged: (v) => setState(() => _tail = v),
+            ),
+            const SizedBox(height: 6),
+            Text(
+              '跳过头部 ${_head}s · 跳过尾部 ${_tail}s · '
+              '剩余区间 ${_format(span)}',
+              style: const TextStyle(fontSize: 12, color: Colors.white70),
             ),
           ],
         ),
@@ -5301,15 +5316,160 @@ class _SkipRangeDialogState extends State<_SkipRangeDialog> {
           child: const Text('取消'),
         ),
         FilledButton(
-          onPressed: () => Navigator.pop(
-            context,
-            (_values.start, maxSec - _values.end),
-          ),
+          onPressed: () => Navigator.pop(context, (_head.toDouble(), _tail.toDouble())),
           child: const Text('确定'),
         ),
       ],
     );
   }
+}
+
+/// 参考弦予「跳过头尾」的点状刻度滑块：每秒一个小圆点（已选段蓝色、
+/// 未选段灰蓝），把手为蓝色竖线，正上方白色圆形气泡显示当前秒数。
+/// 整条轨道可按下/拖动（把手跟随落点吸附到最近刻度）。
+class _DottedSlider extends StatelessWidget {
+  const _DottedSlider({
+    required this.value,
+    required this.max,
+    required this.maxEffective,
+    required this.onChanged,
+  });
+
+  /// 当前值与刻度上限（秒）。
+  final int value;
+  final int max;
+
+  /// 受另一侧滑块约束的实际可用上限（头尾之和不超过曲长）。
+  final int maxEffective;
+  final ValueChanged<int> onChanged;
+
+  static const _trackHeight = 64.0;
+  static const _hPadding = 8.0;
+
+  void _handleOffset(double localDx, double width) {
+    final usable = width - _hPadding * 2;
+    if (usable <= 0) return;
+    final ratio = ((localDx - _hPadding) / usable).clamp(0.0, 1.0);
+    final next = (ratio * maxEffective).round().clamp(0, maxEffective);
+    if (next != value) onChanged(next);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    // 滑块配色跟随主题：已选刻度/把手用 colorScheme.primary，未选刻度
+    // 取同色低透明度，气泡保持白底黑字（参考样式）。
+    final primary = Theme.of(context).colorScheme.primary;
+    final activeDot = primary;
+    final inactiveDot = primary.withValues(alpha: 0.28);
+    return LayoutBuilder(
+      builder: (context, box) {
+        final width = box.maxWidth;
+        return GestureDetector(
+          behavior: HitTestBehavior.opaque,
+          onHorizontalDragStart: (d) => _handleOffset(d.localPosition.dx, width),
+          onHorizontalDragUpdate: (d) =>
+              _handleOffset(d.localPosition.dx, width),
+          child: SizedBox(
+            height: _trackHeight,
+            width: width,
+            child: CustomPaint(
+              painter: _DottedSliderPainter(
+                value: value,
+                max: max,
+                activeDot: activeDot,
+                inactiveDot: inactiveDot,
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+}
+
+/// 点状刻度滑块的绘制：顶行白色圆形气泡（当前秒数）、中部蓝色竖线
+/// 把手、底部刻度点轨道（value 段内蓝点、其余灰点），三者在把手
+/// 位置对齐。
+class _DottedSliderPainter extends CustomPainter {
+  _DottedSliderPainter({
+    required this.value,
+    required this.max,
+    required this.activeDot,
+    required this.inactiveDot,
+  });
+
+  final int value;
+  final int max;
+  final Color activeDot;
+  final Color inactiveDot;
+
+  static const _hPadding = 8.0;
+  static const _bubbleCy = 15.0;
+  static const _thumbTop = 31.0;
+  static const _thumbBottom = 57.0;
+
+  double _xFor(int seconds, double usableWidth) =>
+      _hPadding + (max <= 0 ? 0 : usableWidth * seconds / max);
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final usableWidth = size.width - _hPadding * 2;
+    final thumbX = _xFor(value, usableWidth);
+
+    // 刻度点轨道（每秒一个点）。
+    final dotPaint = Paint();
+    for (var i = 0; i <= max; i++) {
+      dotPaint.color = i <= value ? activeDot : inactiveDot;
+      canvas.drawCircle(
+        Offset(_xFor(i, usableWidth), 44),
+        2.4,
+        dotPaint,
+      );
+    }
+
+    // 竖线把手（白色描边增强与刻度点的对比）。
+    canvas.drawRRect(
+      RRect.fromRectAndRadius(
+        Rect.fromLTRB(thumbX - 2.2, _thumbTop, thumbX + 2.2, _thumbBottom),
+        const Radius.circular(2.2),
+      ),
+      Paint()..color = activeDot,
+    );
+    canvas.drawRRect(
+      RRect.fromRectAndRadius(
+        Rect.fromLTRB(thumbX - 3.2, _thumbTop - 1, thumbX + 3.2, _thumbBottom + 1),
+        const Radius.circular(3.2),
+      ),
+      Paint()
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 1.4
+        ..color = Colors.white70,
+    );
+
+    // 白色圆形气泡（数字随把手，边缘处向内收防溢出）。
+    final bubbleX = thumbX.clamp(18.0, size.width - 18.0);
+    canvas.drawCircle(
+      Offset(bubbleX, _bubbleCy),
+      13,
+      Paint()..color = Colors.white,
+    );
+    final tp = TextPainter(
+      text: TextSpan(
+        text: '$value',
+        style: const TextStyle(
+          color: Colors.black,
+          fontSize: 12,
+          fontWeight: FontWeight.w600,
+        ),
+      ),
+      textDirection: TextDirection.ltr,
+    )..layout();
+    tp.paint(canvas, Offset(bubbleX - tp.width / 2, _bubbleCy - tp.height / 2));
+  }
+
+  @override
+  bool shouldRepaint(_DottedSliderPainter old) =>
+      old.value != value || old.max != max;
 }
 
 class _AssociatedLyricsCard extends StatelessWidget {
@@ -8518,17 +8678,65 @@ class _TimedLyricText extends ConsumerStatefulWidget {
   ConsumerState<_TimedLyricText> createState() => _TimedLyricTextState();
 }
 
-class _TimedLyricTextState extends ConsumerState<_TimedLyricText> {
-  /// 活动行共享的播放进度（已应用歌词偏移）。扫光模式下 position 每个
-  /// tick 只写入这个 ValueNotifier，由各词的 [_ProgressiveLyricWordState]
-  /// 做局部更新（painter repaint / 阶段切换 setState），本行 TextSpan 树
-  /// 与 RenderParagraph 不再每个进度 tick 重建/重排版。
+class _TimedLyricTextState extends ConsumerState<_TimedLyricText>
+    with SingleTickerProviderStateMixin {
+  /// 活动行共享的播放进度（已应用歌词偏移）。逐字淡入模式下 position
+  /// 每个 tick 只写入这个 ValueNotifier，由各词的 [_ProgressiveLyricWordState]
+  /// 做局部更新（阶段切换/淡入中 setState），本行 TextSpan 树与
+  /// RenderParagraph 不再每个进度 tick 重建/重排版。
   final ValueNotifier<double> _positionNotifier = ValueNotifier<double>(0);
+
+  /// 帧间插值（对齐桌面版 XianYuMusic 的 rAF 推进）：position 源通常
+  /// 10Hz 采样，直接喂给词级淡入会出现 100ms 一跳的顿挫。Ticker 以
+  /// 60fps 在两个采样点间本地推算进度（基于播放中时钟匀速前进，每次
+  /// position 广播校准基准），淡入过渡平滑且只在活动行生效。
+  late final Ticker _ticker = createTicker(_onTick);
+  double _basePositionMs = 0;
+  Duration _baseClock = Duration.zero;
+  Duration _lastElapsed = Duration.zero;
+  // 已用 position 快照初始化过基准（防首帧从 0 秒起算闪跳）。
+  bool _calibratedOnce = false;
+  bool _tickerStarted = false;
 
   @override
   void dispose() {
     _positionNotifier.dispose();
+    _ticker.dispose();
     super.dispose();
+  }
+
+  void _ensureTicker() {
+    if (_tickerStarted) return;
+    _tickerStarted = true;
+    _ticker.start();
+  }
+
+  /// 每帧推进：非活动行 / 非逐字效果模式 / 暂停态直接早退（成本趋近 0）。
+  /// 播放中按「基准 position + 本帧流逝时长」估算进度写入共享 notifier。
+  ///
+  /// 时间源语义对齐 BakaMusic（AMLL）timeline：帧间推进是「当前播放
+  /// 时刻」的纯函数，暂停冻结、seek 由校准瞬间回正。**单位一律为秒**
+  /// （playerProvider.position 是秒；此前推算写毫秒、校准写秒，两源
+  /// 混写导致播放时词进度计算全错——暂停时 Ticker 停写只剩校准值，
+  /// 反而正常，即「播放看不出逐字、暂停能看到」的根因）。
+  void _onTick(Duration elapsed) {
+    _lastElapsed = elapsed;
+    if (!widget.selected ||
+        (widget.effectMode != LyricWordEffectMode.progressive &&
+            widget.effectMode != LyricWordEffectMode.wordByWord)) {
+      return;
+    }
+    if (!ref.read(playerProvider).isPlaying) {
+      // 暂停：基准时钟跟随帧时钟，恢复播放后从暂停点继续推进。
+      _baseClock = elapsed;
+      return;
+    }
+    final estimateMs =
+        _basePositionMs + (elapsed - _baseClock).inMilliseconds;
+    final next = applyLyricsOffset(estimateMs / 1000.0, widget.offsetTenths);
+    if ((next - _positionNotifier.value).abs() > 0.01) {
+      _positionNotifier.value = next;
+    }
   }
 
   @override
@@ -8551,55 +8759,57 @@ class _TimedLyricTextState extends ConsumerState<_TimedLyricText> {
       return Text(line.text, textAlign: textAlign, style: baseStyle);
     }
 
-    // 扫光模式：活动行不 watch position（避免每个进度 tick 重建整行
-    // TextSpan 树、触发 RenderParagraph 整行重新排版 + 全部词 element
-    // 重建）；改用 listen 把进度写入共享 ValueNotifier，由每个词自身
-    // 做最小范围更新，视觉与交互完全不变。
-    if (widget.effectMode == LyricWordEffectMode.progressive) {
+    // 逐字/逐词效果模式：活动行不 watch position（避免每个进度 tick 重建
+    // 整行 TextSpan 树、触发 RenderParagraph 整行重新排版 + 全部词 element
+    // 重建）；改用 listen 把进度写入共享 ValueNotifier，由每个词自身做最
+    // 小范围更新。逐字=字符依次淡入，逐词=渐进填充+扫光带（_buildSweepText）。
+    if (widget.effectMode == LyricWordEffectMode.progressive ||
+        widget.effectMode == LyricWordEffectMode.wordByWord) {
       ref.listen(
         playerProvider.select((state) => state.position),
         (_, next) {
-          _positionNotifier.value = applyLyricsOffset(
-            next,
-            widget.offsetTenths,
-          );
+          // position 采样（前台 200~250ms 一跳）只用于校准 Ticker 推算
+          // 基准，且不能每次都硬拉回：采样点的引擎位置相对当下时刻天然
+          // 滞后（采样误差 ±100ms），硬校准会让扫光每 200ms 锯齿回跳。
+          // 对齐 BakaMusic（AMLL）timeline 的校准语义：seek/恢复播放等
+          // 大跳变瞬间回正（commitPlayerTimeState 的 seeking 分支），
+          // 普通漂移按 30% 平滑收敛，推算保持单调推进。
+          // 基准单位统一毫秒（_baseClock 相对系），对外 notifier 写秒。
+          final estimateMs =
+              _basePositionMs + (_lastElapsed - _baseClock).inMilliseconds;
+          final driftSec = next - estimateMs / 1000.0;
+          _baseClock = _lastElapsed;
+          if (driftSec.abs() > 0.5) {
+            _basePositionMs = next * 1000.0;
+            _positionNotifier.value = applyLyricsOffset(
+              next,
+              widget.offsetTenths,
+            );
+          } else {
+            _basePositionMs = estimateMs + driftSec * 300.0;
+          }
         },
       );
+      if (!_calibratedOnce) {
+        // 首帧基准：不等下一次 position 采样（200ms 后才到），直接用
+        // 当前快照初始化，避免挂载瞬间从 0 秒起算造成扫光闪跳。
+        _basePositionMs =
+            ref.read(playerProvider).position * 1000.0;
+        _calibratedOnce = true;
+      }
+      _ensureTicker();
+      // 两种效果模式自此分道：逐字=整字依次淡入（无字内过渡）；逐词=
+      // 渐进填充 + 填充前沿一道渐变扫光带（字内可见填充过程）。此前两者
+      // 共用同一字符淡入渲染，切换模式观感完全相同（用户反馈「区别不大」
+      // 的根因）。
+      if (widget.effectMode == LyricWordEffectMode.wordByWord) {
+        return _buildSweepText(baseStyle);
+      }
       return _buildProgressiveText(baseStyle);
     }
 
-    // 逐词模式：保持原有每 tick 整行 TextSpan 重建（无 WidgetSpan /
-    // CustomPaint / saveLayer，成本远低于扫光模式）。
-    final position = applyLyricsOffset(
-      ref.watch(playerProvider.select((state) => state.position)),
-      widget.offsetTenths,
-    );
-    return _buildWordByWordText(baseStyle, position);
-  }
-
-  Widget _buildWordByWordText(TextStyle baseStyle, double position) {
-    // 与未播放行（白字 + 整行 55% 透明度）保持同一灰度，避免当前行
-    // 未播区呈现更深的灰。
-    final dimColor = Colors.white.withValues(alpha: .55);
-    return Text.rich(
-      TextSpan(
-        children: [
-          for (final word in widget.line.words)
-            TextSpan(
-              text: word.text,
-              style: baseStyle.copyWith(
-                color: Color.lerp(
-                  dimColor,
-                  Colors.white,
-                  _wordProgress(word, position),
-                ),
-              ),
-            ),
-        ],
-      ),
-      textAlign: widget.textAlign,
-      style: baseStyle,
-    );
+    // effectMode == none 已在上方短路返回，此处不可达。
+    return Text(line.text, textAlign: textAlign, style: baseStyle);
   }
 
   Widget _buildProgressiveText(TextStyle baseStyle) {
@@ -8610,12 +8820,18 @@ class _TimedLyricTextState extends ConsumerState<_TimedLyricText> {
             WidgetSpan(
               alignment: PlaceholderAlignment.baseline,
               baseline: TextBaseline.alphabetic,
-              child: _ProgressiveLyricWord(
-                text: word.text,
-                style: baseStyle,
-                position: _positionNotifier,
-                start: word.start,
-                end: word.end,
+              // 词级 RepaintBoundary：逐字淡入每帧重绘被隔离在单个词的
+              // layer 内，不再沿渲染树传播到整页（整页含全屏高斯模糊
+              // 背景重算，是低端机掉帧/换行跟不上的主因）。
+              child: RepaintBoundary(
+                child: _ProgressiveLyricWord(
+                  text: word.text,
+                  style: baseStyle,
+                  position: _positionNotifier,
+                  start: word.start,
+                  end: word.end,
+                  effectMode: LyricWordEffectMode.progressive,
+                ),
               ),
             ),
         ],
@@ -8625,10 +8841,32 @@ class _TimedLyricTextState extends ConsumerState<_TimedLyricText> {
     );
   }
 
-  double _wordProgress(LyricWord word, double position) {
-    if (position <= word.start) return 0;
-    if (position >= word.end || word.end <= word.start) return 1;
-    return ((position - word.start) / (word.end - word.start)).clamp(0, 1);
+  /// 逐词模式（渐进填充 + 扫光带）：结构同逐字，但词的 stage1 渲染走
+  /// 字内扫光 Painter（_SweepWordPainter）。
+  Widget _buildSweepText(TextStyle baseStyle) {
+    return Text.rich(
+      TextSpan(
+        children: [
+          for (final word in widget.line.words)
+            WidgetSpan(
+              alignment: PlaceholderAlignment.baseline,
+              baseline: TextBaseline.alphabetic,
+              child: RepaintBoundary(
+                child: _ProgressiveLyricWord(
+                  text: word.text,
+                  style: baseStyle,
+                  position: _positionNotifier,
+                  start: word.start,
+                  end: word.end,
+                  effectMode: LyricWordEffectMode.wordByWord,
+                ),
+              ),
+            ),
+        ],
+      ),
+      textAlign: widget.textAlign,
+      style: baseStyle,
+    );
   }
 }
 
@@ -8639,10 +8877,14 @@ class _ProgressiveLyricWord extends StatefulWidget {
     required this.position,
     required this.start,
     required this.end,
+    required this.effectMode,
   });
 
   final String text;
   final TextStyle style;
+
+  /// 效果模式：progressive=整字依次淡入；wordByWord=渐进填充+扫光带。
+  final LyricWordEffectMode effectMode;
 
   /// 行级共享进度（已应用歌词偏移）。词只监听这个 ValueListenable 做
   /// 局部更新，不参与整行 TextSpan 树重建。
@@ -8655,223 +8897,201 @@ class _ProgressiveLyricWord extends StatefulWidget {
 }
 
 class _ProgressiveLyricWordState extends State<_ProgressiveLyricWord> {
-  /// 已排版的白色字形画笔。文本/样式/缩放未变时跨帧复用以消除逐帧
-  /// TextPainter.layout（字形排版是逐字扫光的主要开销）。
-  TextPainter? _painter;
+  /// 未唱暗色与未播放行灰度一致（55%）。
+  static const double _dimAlpha = 0.55;
+
+  /// 逐词扫光档位（wordByWord）：填充前沿带内多档中间灰度从亮到暗渐进
+  /// 收尾（末档与暗色衔接），观感为柔和渐变带而非 5502 的硬边分界。
+  /// 3 档阶梯段间跳变可见（用户反馈「边界模糊不明显」），改为 5 档：
+  /// 亮→暗六级阶梯，每级差 ~0.08，视觉近似连续渐变；每帧仍最多 5 次
+  /// clip draw（零离屏），成本不变。
+  static const List<double> _stopAlphas = [1.0, 0.92, 0.84, 0.74, 0.64];
+
+  /// 扫光渐变档排版缓存（跨帧复用；文本/样式变化才重排，每帧仅
+  /// clipRect+paint 5 次 draw call，零离屏零重复排版）。
+  List<TextPainter>? _tpStops;
+  String? _tpKey;
+
+  /// 扫光总时长：两种模式都跟随词的演唱时长（词唱多久填多久；快字下限
+  /// 0.15s 防一闪而过，长词上限 0.45s 防迟迟填不满）。区别在过渡带宽度
+  /// ——渐进=宽带柔和（连续渐变带淡入轻扫光）；逐词=窄带干脆（不加淡入）。
+  double get _sweepDur => (widget.end - widget.start).clamp(0.15, 0.45);
+
+  /// 扫光带右缘到达词尾的时刻。
+  double get _sweepEnd => widget.start + _sweepDur;
+
+  void _invalidateSweepPainters() {
+    _tpStops?.forEach((tp) => tp.dispose());
+    _tpStops = null;
+    _tpKey = null;
+  }
+
+  void _ensureSweepPainters() {
+    final style = _resolved ?? widget.style;
+    final key = '${widget.text}|${style.hashCode}';
+    if (_tpKey == key && _tpStops != null) return;
+    _invalidateSweepPainters();
+    _tpStops = [
+      for (final a in _stopAlphas)
+        TextPainter(
+          text: TextSpan(
+            text: widget.text,
+            style: style.copyWith(color: Colors.white.withValues(alpha: a)),
+          ),
+          textDirection: TextDirection.ltr,
+        )..layout(),
+    ];
+    _tpKey = key;
+  }
+
+  /// DefaultTextStyle 合并后的最终渲染样式（一次合并跨帧复用）。
   TextStyle? _resolved;
-  String? _layoutText;
 
-  /// 扫光前景画笔：由宿主持有，进度每 tick 更新并触发 repaint，期间
-  /// 不重建 CustomPaint/Text（保持 RenderParagraph 文本流结构稳定）。
-  _SweepWordPainter? _sweepPainter;
-  final ValueNotifier<double> _repaintSignal = ValueNotifier<double>(0);
-
-  /// 阶段：0=未唱（纯暗静态）、1=扫光过渡（CustomPaint）、2=已唱（纯白
-  /// 静态）。同阶段内进度变化只重绘画笔；跨阶段才 setState 切换结构。
+  /// 阶段：0=未唱（纯暗静态）、1=扫光填充过渡（Painter 叠画）、2=已唱
+  /// （纯白静态）。同阶段内只有填充中的词按帧 setState，其余零成本。
   int _stage = 0;
-  double _value = 0;
 
   @override
   void initState() {
     super.initState();
-    _value = _computeValue();
-    _stage = _stageFor(_value);
+    _stage = _stageFor(widget.position.value);
     widget.position.addListener(_onPositionChanged);
   }
 
   @override
   void didChangeDependencies() {
     super.didChangeDependencies();
-    _ensurePainter();
+    _resolveStyle();
   }
 
   @override
   void didUpdateWidget(_ProgressiveLyricWord oldWidget) {
     super.didUpdateWidget(oldWidget);
-    if (oldWidget.text != widget.text || oldWidget.style != widget.style) {
-      _ensurePainter();
+    if (oldWidget.text != widget.text ||
+        oldWidget.start != widget.start ||
+        oldWidget.end != widget.end) {
+      // 换行 / 偏移变化：按新时间轴重算阶段，避免沿用旧阶段。
+      _invalidateSweepPainters();
+      final nextStage = _stageFor(widget.position.value);
+      if (nextStage != _stage) {
+        setState(() => _stage = nextStage);
+      }
+    }
+    if (oldWidget.style != widget.style ||
+        oldWidget.effectMode != widget.effectMode) {
+      _resolveStyle();
+      _invalidateSweepPainters();
+      final nextStage = _stageFor(widget.position.value);
+      if (nextStage != _stage) {
+        setState(() => _stage = nextStage);
+      }
     }
     if (oldWidget.position != widget.position) {
       oldWidget.position.removeListener(_onPositionChanged);
       widget.position.addListener(_onPositionChanged);
     }
-    if (oldWidget.start != widget.start || oldWidget.end != widget.end) {
-      // 换行 / 偏移变化：立即按新时间轴重算阶段，避免沿用旧阶段渲染。
-      final next = _computeValue();
-      final nextStage = _stageFor(next);
-      if (nextStage != _stage) {
-        setState(() {
-          _value = next;
-          _stage = nextStage;
-        });
-      } else {
-        _value = next;
-        _sweepPainter?.progress = next;
-      }
-    }
   }
 
-  double _computeValue() {
-    final pos = widget.position.value;
+  void _resolveStyle() {
+    _resolved = DefaultTextStyle.of(context).style.merge(widget.style);
+  }
+
+  int _stageFor(double pos) {
     if (pos <= widget.start) return 0;
-    if (pos >= widget.end || widget.end <= widget.start) return 1;
-    return ((pos - widget.start) / (widget.end - widget.start)).clamp(0, 1);
-  }
-
-  int _stageFor(double value) {
-    if (value <= 0) return 0;
-    if (value >= 1) return 2;
+    if (pos >= _sweepEnd || widget.end <= widget.start) return 2;
     return 1;
   }
 
   void _onPositionChanged() {
     if (!mounted) return;
-    final next = _computeValue();
-    final nextStage = _stageFor(next);
+    final nextStage = _stageFor(widget.position.value);
     if (nextStage != _stage) {
-      setState(() {
-        _value = next;
-        _stage = nextStage;
-      });
+      setState(() => _stage = nextStage);
       return;
     }
-    _value = next;
-    if (_stage == 1 && _sweepPainter != null) {
-      // 扫光过渡中：只更新画笔进度并触发该词重绘，不重建 widget 树。
-      _sweepPainter!.progress = next;
-      _repaintSignal.value = next;
+    // 淡入中的词每帧 setState（RichText 字符 alpha 插值）；未唱/已唱
+    // 静态阶段不触发任何重建。
+    if (nextStage == 1) {
+      setState(() {});
     }
-  }
-
-  /// 合并 DefaultTextStyle 与主题缩放后按需重排；输入不变则直接复用。
-  void _ensurePainter() {
-    final resolved = DefaultTextStyle.of(context).style.merge(widget.style);
-    final scaler = MediaQuery.textScalerOf(context);
-    if (_painter != null &&
-        _layoutText == widget.text &&
-        _resolved == resolved) {
-      return;
-    }
-    _painter?.dispose();
-    _layoutText = widget.text;
-    _resolved = resolved;
-    _painter = TextPainter(
-      text: TextSpan(
-        text: widget.text,
-        style: resolved.copyWith(color: Colors.white),
-      ),
-      textDirection: TextDirection.ltr,
-      textScaler: scaler,
-    )..layout();
-    _sweepPainter?.painter = _painter;
   }
 
   @override
   void dispose() {
     widget.position.removeListener(_onPositionChanged);
-    _repaintSignal.dispose();
-    _painter?.dispose();
+    _invalidateSweepPainters();
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
-    // 前景画笔方案：child（暗色整词）走普通 Text 渲染路径，与未扫光
-    // 的词完全一致；白色字形由 TextPainter 按相同 style 绘制，并以横向
-    // 渐变色带区分已唱/未唱。saveLayer 仅用于单个词的扫光过渡阶段，
-    // 字形底部（下降部）在渐变带内保持完整，进度采样 80ms 一次，
-    // 渐变过渡让扫光边界在视觉上更加平滑。
-    // 暗色与未播放行（55% 透明度）灰度一致。
-    //
-    // WidgetSpan 内的 Text 会与 DefaultTextStyle 合并（字体族等来自
-    // 主题）；画笔必须用同一份合并后的样式布局，否则 child 与画笔
-    // 用两套字体渲染出大小不一的重影。
     final resolved = _resolved ?? widget.style;
-    final dim = Colors.white.withValues(alpha: .55);
+    final dimColor = Colors.white.withValues(alpha: _dimAlpha);
     if (_stage == 0) {
-      return Text(widget.text, style: resolved.copyWith(color: dim));
+      return Text(widget.text, style: resolved.copyWith(color: dimColor));
     }
     if (_stage == 2) {
       return Text(widget.text, style: resolved.copyWith(color: Colors.white));
     }
-    final sweep = _sweepPainter ??= _SweepWordPainter(
-      painter: _painter,
-      progress: _value,
-      repaint: _repaintSignal,
-    );
+    // 扫光填充（两种效果模式共用，参数不同）：底为暗色静态 Text（提供
+    // 尺寸与基线），亮档与带内两档灰度由 foregroundPainter 按填充前沿
+    // clipRect 叠画——零离屏、Paragraph 跨帧缓存复用，每帧仅 3 次 clip
+    // draw call，重绘被词级 RepaintBoundary 圈在词内。
     return CustomPaint(
-      foregroundPainter: sweep,
-      child: Text(widget.text, style: resolved.copyWith(color: dim)),
+      foregroundPainter: _SweepWordPainter(this),
+      child: Text(widget.text, style: resolved.copyWith(color: dimColor)),
     );
   }
 }
 
-/// 逐字扫光前景画笔：在暗色整词之上，按进度绘制白色字形，并为已唱/未唱
-/// 界限加平滑渐变过渡（横向渐变色带）。
+/// 词级扫光 Painter（渐进/逐词两种效果模式的填充过渡渲染）。
 ///
-/// 画笔只负责绘制，字形由 [_ProgressiveLyricWordState] 预排版并复用，
-/// 因此每次 paint 不再触发 TextPainter.layout；画笔本身不持有/释放
-/// TextPainter（原生 Paragraph 由 State 在其 dispose 时统一释放）。
-///
-/// [painter] / [progress] 由宿主 State 持有并在进度 tick 时更新：
-/// [progress] 更新后宿主触发 [repaint] 信号，本画笔只重绘不重建。
+/// 底层是暗色静态 Text（WidgetSpan 的基线/尺寸由它提供），Painter 只叠
+/// 画「亮档 + 带内两档灰度」：填充前沿 front 从词首推进到词尾，前沿后
+/// 全亮、前沿处一道渐变过渡带（0.87→0.70 两档近似渐变，非 5502 硬边）、
+/// 前沿前保持暗色。渐进模式短窗快闪+窄带（轻扫光），逐词模式跟词时长
+/// 填充+宽带（卡拉OK跟速）。零离屏、零每帧排版，重绘被词级
+/// RepaintBoundary 圈在词内，不传播到整页。
 class _SweepWordPainter extends CustomPainter {
-  _SweepWordPainter({
-    required this.painter,
-    required this.progress,
-    super.repaint,
-  });
-
-  TextPainter? painter;
-  double progress;
+  _SweepWordPainter(this.state);
+  final _ProgressiveLyricWordState state;
 
   @override
   void paint(Canvas canvas, Size size) {
-    final tp = painter;
-    if (tp == null || progress <= 0) return;
-    final clipWidth = tp.width * progress.clamp(0.0, 1.0);
-    if (clipWidth <= 0) return;
-
-    // 渐变过渡方案：不再用硬边 clipRect，而是先整词绘制白色字形到图层，
-    // 再用横向 LinearGradient 的 alpha 以 dstIn 合成做遮罩：已唱区纯白、
-    // 界限处一段渐变色带（4~24px 自适应）、未唱区完全透明，扫光边界平滑。
-    final w = size.width > 0 ? size.width : tp.width;
-    if (w <= 0) return;
-    // 渐变带宽度随字宽自适应，居中于当前扫光边界两侧。
-    final band = math.max(4.0, math.min(24.0, w * 0.3));
-    final start = (clipWidth - band / 2).clamp(0.0, w);
-    final end = (clipWidth + band / 2).clamp(0.0, w);
-    if (end <= start) {
-      // 边界贴近字宽两端、渐变带被压缩为 0 的极端情况：退化回硬边裁剪。
+    state._ensureSweepPainters();
+    final w = state.widget;
+    final pos = w.position.value;
+    // 渐进=宽带（词宽 50%，clamp 14~30px）：连续渐变带淡入轻扫光，观感
+    // 柔和；逐词=窄带（词宽 18%，clamp 5~12px）：过渡几乎瞬时，填充前沿
+    // 干脆利落（不加淡入）。
+    final progressive = w.effectMode == LyricWordEffectMode.progressive;
+    final band = (size.width * (progressive ? 0.50 : 0.18))
+        .clamp(progressive ? 14.0 : 5.0, progressive ? 30.0 : 12.0);
+    final front =
+        ((pos - w.start) / state._sweepDur).clamp(0.0, 1.0) * (size.width + band);
+    final stops = state._tpStops!;
+    final n = stops.length;
+    void seg(double x0, double x1, TextPainter tp) {
+      if (x1 <= 0 || x1 <= x0) return;
       canvas.save();
-      canvas.clipRect(Rect.fromLTWH(0, 0, clipWidth, size.height));
+      canvas.clipRect(Rect.fromLTWH(x0, 0, x1 - x0, size.height));
       tp.paint(canvas, Offset.zero);
       canvas.restore();
-      return;
     }
-    final bounds = Rect.fromLTWH(0, 0, size.width, size.height);
-    canvas.saveLayer(bounds, Paint());
-    // 先画整词白色字形作为目标层。
-    tp.paint(canvas, Offset.zero);
-    // dstIn：结果 = 字形层 × 渐变 alpha。渐变颜色 RGB 恒为白色、仅 alpha
-    // 渐变，保证合成后字形颜色不偏色；shader 默认 clamp 平铺，渐变范围外
-    // 自然取端点色（已唱区白、未唱区透明）。
-    canvas.drawRect(
-      bounds,
-      Paint()
-        ..blendMode = BlendMode.dstIn
-        ..shader = ui.Gradient.linear(
-          Offset(start, 0),
-          Offset(end, 0),
-          [Colors.white, Colors.white.withValues(alpha: 0)],
-        ),
-    );
-    canvas.restore();
+
+    // 亮档（前沿带之后到词头）+ 带内 n-1 档灰度阶梯（末档后接暗底）。
+    seg(0, math.min(front - band, size.width), stops[0]);
+    for (var i = 1; i < n; i++) {
+      seg(
+        front - band + band * (i - 1) / (n - 1),
+        math.min(front - band + band * i / (n - 1), size.width),
+        stops[i],
+      );
+    }
   }
 
   @override
-  bool shouldRepaint(_SweepWordPainter old) =>
-      old.progress != progress || old.painter != painter;
+  bool shouldRepaint(_SweepWordPainter oldDelegate) => true;
 }
 
 /// 毛玻璃控制卡：标题 + 进度 + 播放控制。

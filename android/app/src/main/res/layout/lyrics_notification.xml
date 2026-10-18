@@ -1,11 +1,20 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-  通知栏&锁屏实时歌词自定义布局（RemoteViews 静态布局）。
+  通知栏&锁屏实时歌词自定义布局（RemoteViews 静态布局，三行组合卡片）。
+
+  三行语义：
+  - 第一行：歌名（lyrics_title）
+  - 第二行：歌手 + 逐句歌词（lyrics_artist_line；蓝牙歌词关闭/无歌词时
+    只显示歌手，文本由 NotificationLyricsManager 动态拼接）
+  - 第三行：控件组（上一曲/播放暂停/下一曲）——不由 RemoteViews 承载，
+    由 MediaStyle 原生 action 渲染（系统安全绘制，华为/HarmonyOS 上
+    避免自定义可点击 RemoteViews 触发 SecurityException 越权闪退）。
 
   设计约束（华为/HarmonyOS 防越权闪退）：
   - 仅用系统标准 TextView，无自定义 View / 无动态加载外部内容；
   - 背景写死在布局里，不依赖运行时 inflate 网络资源；
-  - 更新只走 RemoteViews.setTextViewText，不触碰任何非法字段。
+  - 更新只走 RemoteViews.setTextViewText，不设置任何 onClick 点击
+    PendingIntent（按钮全部交给 MediaStyle action 系统渲染）。
 -->
 <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
     android:id="@+id/lyrics_notification_root"
@@ -23,32 +32,22 @@
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:textColor="#FFFFFFFF"
-        android:textSize="12sp"
+        android:textSize="13sp"
         android:textStyle="bold"
         android:ellipsize="end"
         android:singleLine="true"
         android:text=""/>
 
     <TextView
-        android:id="@+id/lyrics_artist"
+        android:id="@+id/lyrics_artist_line"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:textColor="#B3FFFFFF"
-        android:textSize="10sp"
+        android:textSize="11sp"
         android:ellipsize="end"
         android:singleLine="true"
         android:layout_marginTop="2dp"
         android:text=""/>
 
-    <TextView
-        android:id="@+id/lyrics_line"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:textColor="#FFFFFFFF"
-        android:textSize="16sp"
-        android:maxLines="2"
-        android:ellipsize="end"
-        android:layout_marginTop="6dp"
-        android:text="暂无歌词"/>
-
 </LinearLayout>
+

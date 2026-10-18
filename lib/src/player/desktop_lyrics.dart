@@ -106,6 +106,7 @@ class DesktopLyricsBridge {
     required String lyrics,
     required double position,
     required bool isPlaying,
+    required bool hideOnPause,
     required bool noBackground,
     required int lyricColor,
     required int translationColor,
@@ -168,6 +169,7 @@ class DesktopLyricsBridge {
       backgroundOpacity,
       wordEffectMode,
       locked,
+      hideOnPause,
       verticalPercent,
       lyricFontPath,
     ].join('\u0000');
@@ -193,6 +195,7 @@ class DesktopLyricsBridge {
         'wordsJson': wordsJson,
         'position': position,
         'isPlaying': isPlaying,
+        'hideOnPause': hideOnPause,
         'wordEffectMode': wordEffectMode,
         'locked': locked,
         'noBackground': noBackground,

@@ -9,6 +9,14 @@
 # 应用自身的原生桥（MainActivity / StoragePermissionBridge / QQ 分享回调）
 -keep class com.xymusic.mobile.** { *; }
 
+# audio_service 框架：NotificationLyricsManager 通过
+# Class.forName + getMethod("setMediaSecondLine") 字符串反射调用
+# AudioService 静态方法，R8 静态分析看不到该引用，会把方法当死代码
+# 删除导致反射失败（媒体卡片歌手行歌词注入失效）；框架内媒体按钮
+# PendingIntent / PlaybackState 回调链（灵动岛/蓝牙切歌依赖）也一并
+# keep 成员，排除混淆裁剪导致的切歌失效。
+-keep class com.ryanheise.audioservice.** { *; }
+
 # QQ OpenSDK 回调依赖的 support 兼容 shim（manifest FileProvider 已 keep，
 # 这里兜底防止参数签名被裁剪）
 -keep class android.support.v4.content.** { *; }

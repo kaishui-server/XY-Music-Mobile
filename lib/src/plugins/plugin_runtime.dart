@@ -2069,11 +2069,126 @@ class PluginRuntimeService {
       Map<String, dynamic>.from(chart.rawData),
       kind: 'top',
     );
+    // 酷我榜单封面兜底：手机网络下插件内 pic.web 明文链路不可靠，
+    // 由宿主直连 H5 接口补齐（详见 _patchKuwoTopListArtwork）。
+    if (_isKuwoPlugin(plugin)) {
+      await _patchKuwoTopListArtwork(songs);
+    }
     final limited = fetchAll ? songs : songs.take(limit);
     return limited
         .map((raw) => _toSearchSong(plugin.id, _resetMediaItem(plugin, raw)))
         .where((item) => item.title.trim().isNotEmpty)
         .toList();
+  }
+
+  /// 酷我 rid → 封面 URL 内存缓存（只存成功结果）。
+  static final Map<String, String> _kuwoCoverCache = {};
+
+  /// 插件是否为酷我平台（订阅插件名/来源标识写法不一：酷我音乐、
+  /// KW、kuwo 等，任一命中即可）。
+  static bool _isKuwoPlugin(EnabledMusicPlugin plugin) {
+    const markers = ['酷我', 'kuwo', 'kw'];
+    bool hit(String? s) {
+      if (s == null || s.isEmpty) return false;
+      final lower = s.toLowerCase();
+      return markers.any((m) => lower.contains(m));
+    }
+
+    return hit(plugin.name) || hit(plugin.id) || hit(plugin.sourceLabel);
+  }
+
+  /// 酷我榜单封面兜底补齐（手机网络环境下插件内 pic.web 明文链路不可靠）。
+  ///
+  /// 复现结论（Windows 宽带）：插件 getPicByRid 用的
+  /// artistpicserver.kuwo.cn/pic.web 80 首全成功，瞬时并发并非根因；
+  /// 但移动网络下该老域名明文 HTTP 大面积失败（劫持/风控），且 ksong.s
+  /// 榜单数据已不返回 albumpic 等兜底字段，手机端封面集体占位。改由
+  /// 宿主直连酷我移动端 H5 接口（HTTPS、JSON、风控宽松）：
+  /// `m.kuwo.cn/newh5/singles/songinfoandlrc?musicId=<rid>`。
+  /// 注意三点：musicId 只认纯数字（MUSIC_ 前缀返回 301，需剥离）；
+  /// 返回的封面 URL 保持 http（img*.kwcdn.kuwo.cn 的 HTTPS 证书链
+  /// 不可信，不能改写升级，app 内明文图片加载不受影响）；插件返回的
+  /// artwork 不直接信任——移动网络下 pic.web 可能返回劫持页里的
+  /// 广告 URL（非酷我 host），必须校验 host 才采信。
+  Future<void> _patchKuwoTopListArtwork(
+    List<Map<String, dynamic>> songs,
+  ) async {
+    final pending = <MapEntry<Map<String, dynamic>, String>>[];
+    var trusted = 0;
+    for (final raw in songs) {
+      final cover = (raw['artwork'] ?? '').toString().trim();
+      final host = Uri.tryParse(cover)?.host.toLowerCase() ?? '';
+      if (host.contains('kwcdn') || host.contains('kuwo')) {
+        trusted++;
+        continue;
+      }
+      final rid = (raw['id'] ?? '').toString().replaceAll('MUSIC_', '');
+      if (rid.isEmpty || !RegExp(r'^\d+$').hasMatch(rid)) continue;
+      final cached = _kuwoCoverCache[rid];
+      if (cached != null) {
+        raw['artwork'] = cached;
+        continue;
+      }
+      pending.add(MapEntry(raw, rid));
+    }
+    debugPrint(
+      '[插件榜单] 酷我封面补齐：总数 ${songs.length}，插件封面可信 $trusted，'
+      '待补 ${pending.length}，缓存命中 ${songs.length - trusted - pending.length}',
+    );
+    if (pending.isEmpty) return;
+    var idx = 0;
+    var ok = 0;
+    var fail = 0;
+    Future<void> worker() async {
+      while (idx < pending.length) {
+        final my = idx++;
+        final entry = pending[my];
+        try {
+          final resp = await http
+              .get(
+                Uri.parse(
+                  'https://m.kuwo.cn/newh5/singles/songinfoandlrc'
+                  '?musicId=${entry.value}',
+                ),
+                headers: const {
+                  'user-agent':
+                      'Mozilla/5.0 (Linux; Android 14; Pixel 8) '
+                          'AppleWebKit/537.36 (KHTML, like Gecko) '
+                          'Chrome/120.0.0.0 Mobile Safari/537.36',
+                },
+              )
+              .timeout(const Duration(seconds: 10));
+          if (resp.statusCode == 200) {
+            final json = jsonDecode(utf8.decode(resp.bodyBytes));
+            final pic = ((json['data'] as Map?)?['songinfo'] as Map?)?['pic']
+                ?.toString() ??
+                '';
+            if (pic.startsWith('http')) {
+              _kuwoCoverCache[entry.value] = pic;
+              entry.key['artwork'] = pic;
+              ok++;
+              continue;
+            }
+          }
+          fail++;
+        } catch (_) {
+          fail++;
+        }
+      }
+    }
+
+    // 8 并发 + 整体 15s 上限：超时后放弃等待（已写入的封面仍生效），
+    // 不阻塞榜单返回。
+    await Future.wait([
+      for (var i = 0; i < 8 && i < pending.length; i++) worker(),
+    ]).timeout(const Duration(seconds: 15), onTimeout: () {
+      debugPrint('[插件榜单] 酷我封面补齐超时放弃（已写入 $ok）');
+      return const <Future<void>>[];
+    });
+    debugPrint(
+      '[插件榜单] 酷我封面补齐完成：成功 $ok，失败 $fail（失败不缓存，'
+      '下次拉取重试）',
+    );
   }
 
   Future<List<Map<String, dynamic>>> _searchMusicFreeType(
@@ -3600,6 +3715,13 @@ class PluginRuntimeService {
           songs.add(song);
           added++;
         }
+      }
+      // 榜单详情接口（kind: 'top'）在曲目总数未知且单页返回大结果
+      // （≥50 首）时视为全量返回：酷我等插件的 getTopListDetail 固定
+      // rn=80 且不支持翻页参数，继续翻页只会原样重拉全榜（80 首 × 2
+      // 个封面/音质请求 × 2 轮），白白翻倍请求量。
+      if (kind == 'top' && total == 0 && page == 1 && pageSongs.length >= 50) {
+        break;
       }
       // 全是重复曲目：插件忽略 page 参数每页返回同一批，视为结束。
       if (added == 0) break;
@@ -6828,10 +6950,9 @@ class PluginRuntimeService {
     return normalized;
   }
 
-  /// 封面地址规范化：Android 禁止加载明文 HTTP 远程图片，而酷狗等音源
-  /// 仍返回 http:// 封面（imge.kugou.com 已支持 HTTPS），统一升级到
-  /// HTTPS；本机地址保留原协议。写入 rawData 的同时也会随收藏/歌单持久
-  /// 化，避免旧数据反复出现失效的明文地址。
+  /// 封面地址规范化：酷狗等音源仍返回 http:// 封面（imge.kugou.com 已
+  /// 支持 HTTPS），统一升级到 HTTPS；本机地址保留原协议。写入 rawData
+  /// 的同时也会随收藏/歌单持久化，避免旧数据反复出现失效的明文地址。
   static String _normalizeImageUrl(String value) {
     var normalized = value.trim();
     if (normalized.startsWith('//')) normalized = 'https:$normalized';
@@ -6839,7 +6960,16 @@ class PluginRuntimeService {
     final host = uri?.host.toLowerCase() ?? '';
     final isLocalHost =
         host == 'localhost' || host == '127.0.0.1' || host == '[::1]';
-    if (normalized.startsWith('http://') && !isLocalHost) {
+    // http→https 升级排除酷我图片 CDN（kwcdn.kuwo.cn）：该域不提供
+    // 可信 HTTPS（证书链不可信，TLS 握手直接失败），官方端也走明文
+    // http 下发。此前无差别升级导致酷我榜单/搜索/歌手封面在 app 内
+    // 全部加载失败显示占位（接口层拿到的 URL 一切正常，属加载层必挂）。
+    // app 的 AndroidManifest 已配置 cleartextTrafficPermitted，明文
+    // 图片可正常加载。
+    const keepPlainHttpHosts = ['kwcdn.kuwo.cn'];
+    final keepPlain =
+        keepPlainHttpHosts.any((suffix) => host.endsWith(suffix));
+    if (normalized.startsWith('http://') && !isLocalHost && !keepPlain) {
       normalized = 'https://${normalized.substring(7)}';
     }
     if (!_isHttpUrl(normalized)) return '';
@@ -7751,6 +7881,17 @@ class _PluginBackgroundHttpClient extends http.BaseClient {
 
   @override
   Future<http.StreamedResponse> send(http.BaseRequest request) async {
+    await _PluginHostThrottle.acquire(request.url.host);
+    try {
+      return await _sendThrottled(request);
+    } finally {
+      _PluginHostThrottle.release(request.url.host);
+    }
+  }
+
+  Future<http.StreamedResponse> _sendThrottled(
+    http.BaseRequest request,
+  ) async {
     request.headers.putIfAbsent('user-agent', () => _desktopUserAgent);
     // 该客户端由常驻 worker isolate 长期持有，默认复用 keep-alive 连接。
     // 手机在 Wi-Fi/蜂窝间切换或 CDN 静默断开空闲连接后，复用旧 socket 会
@@ -7848,9 +7989,59 @@ class _PluginBackgroundHttpClient extends http.BaseClient {
   void close() => _client.close();
 }
 
+/// 插件 XHR 请求的同 host 并发限流器。
+///
+/// 酷我 getTopListDetail 会一次并发 80 首 × 2（封面 pic.web + 音质
+/// search）= 160 个请求，瞬时并发过高会被酷我等老接口限流（连接重置/
+/// 空响应），封面大面积拿不到。同 host 限制少量在飞请求，其余在 Dart
+/// 侧排队，让瞬时压力落在服务端限流阈值之下。
+class _PluginHostThrottle {
+  static const perHostConcurrency = 8;
+
+  static final Map<String, int> _inFlight = {};
+  static final Map<String, List<Completer<void>>> _hostQueues = {};
+
+  static Future<void> acquire(String host) {
+    final running = _inFlight[host] ?? 0;
+    if (running < perHostConcurrency) {
+      _inFlight[host] = running + 1;
+      return Future.value();
+    }
+    final completer = Completer<void>();
+    (_hostQueues[host] ??= []).add(completer);
+    return completer.future;
+  }
+
+  static void release(String host) {
+    final queue = _hostQueues[host];
+    if (queue != null && queue.isNotEmpty) {
+      queue.removeAt(0).complete();
+      return;
+    }
+    final running = (_inFlight[host] ?? 1) - 1;
+    if (running <= 0) {
+      _inFlight.remove(host);
+      _hostQueues.remove(host);
+    } else {
+      _inFlight[host] = running;
+    }
+  }
+}
+
 class _PluginProxyHttpClient extends http.BaseClient {
   @override
   Future<http.StreamedResponse> send(http.BaseRequest request) async {
+    await _PluginHostThrottle.acquire(request.url.host);
+    try {
+      return await _sendWithRetry(request);
+    } finally {
+      _PluginHostThrottle.release(request.url.host);
+    }
+  }
+
+  Future<http.StreamedResponse> _sendWithRetry(
+    http.BaseRequest request,
+  ) async {
     final bodyBytes = await request.finalize().toBytes();
     final url = request.url.toString();
     final bodyText = bodyBytes.isEmpty

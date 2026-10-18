@@ -1124,6 +1124,7 @@ class MainActivity : AudioServiceActivity() {
                             wordsJson = call.argument<String>("wordsJson") ?: "[]",
                             position = call.argument<Number>("position")?.toDouble() ?: 0.0,
                             isPlaying = call.argument<Boolean>("isPlaying") == true,
+                            hideOnPause = call.argument<Boolean>("hideOnPause") == true,
                             effectMode = call.argument<Number>("wordEffectMode")?.toInt() ?: 2,
                             locked = call.argument<Boolean>("locked") == true,
                             noBackground = call.argument<Boolean>("noBackground") != false,
@@ -1164,6 +1165,7 @@ class MainActivity : AudioServiceActivity() {
                                     putExtra("wordsJson", params.wordsJson)
                                     putExtra("position", params.position)
                                     putExtra("isPlaying", params.isPlaying)
+                                    putExtra("hideOnPause", params.hideOnPause)
                                     putExtra("wordEffectMode", params.effectMode)
                                     putExtra("locked", params.locked)
                                     putExtra("noBackground", params.noBackground)

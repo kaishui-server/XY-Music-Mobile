@@ -76,6 +76,13 @@ flutter {
     source = "../.."
 }
 
+dependencies {
+    // NotificationLyricsManager 反射调用 AudioService（其父类
+    // MediaBrowserServiceCompat 位于 androidx.media）时，需要该库在
+    // 编译 classpath 上可解析；MediaStyle 亦依赖 androidx.media 类型层级。
+    implementation("androidx.media:media:1.7.0")
+}
+
 // 禁用 lint 关键检查 task（避免构建时从 dl.google.com 下载 lint 依赖超时）
 tasks.configureEach {
     if (name.startsWith("lintVital")) {

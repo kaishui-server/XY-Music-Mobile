@@ -244,6 +244,8 @@ class AppSettings {
     this.desktopLyricsEnabled = false,
     this.bluetoothLyricsEnabled = false,
     this.desktopLyricsHideInApp = true,
+    // 暂停时隐藏桌面歌词（悬浮窗歌词内容隐藏，恢复播放重新显示）。
+    this.desktopLyricsHideOnPause = false,
     this.desktopLyricsShowWordEffect = true,
     this.desktopLyricsLocked = false,
     this.desktopLyricsNoBackground = true,
@@ -366,6 +368,10 @@ class AppSettings {
   final bool desktopLyricsEnabled;
   final bool bluetoothLyricsEnabled;
   final bool desktopLyricsHideInApp;
+
+  /// 暂停时隐藏桌面歌词：开启后播放器暂停（未结束）时悬浮窗歌词内容
+  /// 隐藏，恢复播放后重新显示。
+  final bool desktopLyricsHideOnPause;
   final bool desktopLyricsShowWordEffect;
   final bool desktopLyricsLocked;
   final bool desktopLyricsNoBackground;
@@ -462,6 +468,7 @@ class AppSettings {
     bool? desktopLyricsEnabled,
     bool? bluetoothLyricsEnabled,
     bool? desktopLyricsHideInApp,
+    bool? desktopLyricsHideOnPause,
     bool? desktopLyricsShowWordEffect,
     bool? desktopLyricsLocked,
     bool? desktopLyricsNoBackground,
@@ -553,6 +560,8 @@ class AppSettings {
           bluetoothLyricsEnabled ?? this.bluetoothLyricsEnabled,
       desktopLyricsHideInApp:
           desktopLyricsHideInApp ?? this.desktopLyricsHideInApp,
+      desktopLyricsHideOnPause:
+          desktopLyricsHideOnPause ?? this.desktopLyricsHideOnPause,
       desktopLyricsShowWordEffect:
           desktopLyricsShowWordEffect ?? this.desktopLyricsShowWordEffect,
       desktopLyricsLocked: desktopLyricsLocked ?? this.desktopLyricsLocked,
@@ -693,6 +702,8 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
       desktopLyricsEnabled: prefs.getBool('desktopLyricsEnabled') ?? false,
       bluetoothLyricsEnabled: prefs.getBool('bluetoothLyricsEnabled') ?? false,
       desktopLyricsHideInApp: prefs.getBool('desktopLyricsHideInApp') ?? true,
+      desktopLyricsHideOnPause:
+          prefs.getBool('desktopLyricsHideOnPause') ?? false,
       desktopLyricsShowWordEffect:
           prefs.getBool('desktopLyricsShowWordEffect') ?? true,
       desktopLyricsLocked: prefs.getBool('desktopLyricsLocked') ?? false,
@@ -933,6 +944,10 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
       prefs.setBool('desktopLyricsEnabled', next.desktopLyricsEnabled),
       prefs.setBool('bluetoothLyricsEnabled', next.bluetoothLyricsEnabled),
       prefs.setBool('desktopLyricsHideInApp', next.desktopLyricsHideInApp),
+      prefs.setBool(
+        'desktopLyricsHideOnPause',
+        next.desktopLyricsHideOnPause,
+      ),
       prefs.setBool(
         'desktopLyricsShowWordEffect',
         next.desktopLyricsShowWordEffect,
@@ -1270,6 +1285,14 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
   Future<void> setDesktopLyricsHideInApp(bool value) => _save(
     (state.valueOrNull ?? const AppSettings()).copyWith(
       desktopLyricsHideInApp: value,
+    ),
+  );
+
+  /// 暂停时隐藏桌面歌词：开启后播放器暂停时悬浮窗歌词内容隐藏，
+  /// 恢复播放后重新显示。
+  Future<void> setDesktopLyricsHideOnPause(bool value) => _save(
+    (state.valueOrNull ?? const AppSettings()).copyWith(
+      desktopLyricsHideOnPause: value,
     ),
   );
   Future<void> setDesktopLyricsShowWordEffect(bool value) => _save(

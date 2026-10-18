@@ -1279,6 +1279,14 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
         ),
         _switchTile(
           context,
+          icon: Icons.pause_circle_outline,
+          title: '暂停时隐藏歌词',
+          subtitle: '播放暂停时隐藏桌面歌词内容，恢复播放后重新显示',
+          value: settings?.desktopLyricsHideOnPause ?? false,
+          onChanged: (value) => notifier.setDesktopLyricsHideOnPause(value),
+        ),
+        _switchTile(
+          context,
           icon: Icons.auto_awesome,
           title: '显示逐字歌词效果',
           value: settings?.desktopLyricsShowWordEffect ?? true,

@@ -45,19 +45,25 @@ bool hasNonStandardWordTiming(String raw) {
   return RegExp(r'^\[\d+,\d+\]', multiLine: true).hasMatch(text);
 }
 
-/// 是否为洛雪音源逐字标签歌词：整行（或大部分行）由 `<mm:ss.mmm>词…`
-/// 毫秒词级标签序列组成，无行首 `[mm:ss]` 时间戳。这不是标准增强 LRC
-/// （后者要求行首时间戳），也不是普通 LRC；蓝牙/通知栏链路原样透传时
-/// 对端会把整串 `<mm:ss.mmm>` 标签当正文显示。需要经 Rust parseLyrics
-/// （新增洛雪逐字行解析）或 Dart 兜底清洗重组为行级明文后再推送/落盘。
+/// 是否为洛雪音源逐字标签歌词：行由 `<mm:ss.mmm>词…` 毫秒词级标签序列组
+/// 成。两种形态都算——纯逐字行（行首即标签），以及混合增强行（行首是
+/// `[mm:ss]` 行级时间戳、后跟字级标签）。后者此前漏判：会被当标准 LRC
+/// 原样透传，蓝牙/通知栏对端把整串 `<mm:ss.mmm>` 标签当正文显示。
+/// 命中后需经 Rust parseLyrics 或 Dart 兜底清洗重组为行级明文再推送/落盘。
 bool hasLxWordTiming(String raw) {
   final text = raw.trim();
   if (text.isEmpty) return false;
-  // 至少两行出现 `<数字:数字.三位毫秒>` 词级标签，且行首即以标签开头
-  // （纯洛雪逐字正文），避免误判普通含尖括号文本。
-  final tag = RegExp(r'^\s*<\d{1,3}:\d{2}\.\d{3}>', multiLine: true);
-  final tagCount = tag.allMatches(text).length;
-  return tagCount >= 2 && tagCount >= text.split('\n').length ~/ 2;
+  // 词级标签：`<数字:数字.数字>`（2~3 位百分/毫秒均兼容）。该模式足够
+  // 特定，普通含尖括号的歌词文本不会命中。
+  final tag = RegExp(r'<\d{1,3}:\d{2}\.\d{2,3}>');
+  final lines = text.split('\n').where((l) => l.trim().isNotEmpty).toList();
+  if (lines.isEmpty) return false;
+  var taggedLines = 0;
+  for (final line in lines) {
+    if (tag.hasMatch(line)) taggedLines++;
+  }
+  // 至少两行含词级标签，且过半行含标签（避免个别行误伤）。
+  return taggedLines >= 2 && taggedLines * 2 >= lines.length;
 }
 
 /// 直接落盘会产生乱码、必须转换成功的歌词（hex 密文、QRC 容器 XML）。

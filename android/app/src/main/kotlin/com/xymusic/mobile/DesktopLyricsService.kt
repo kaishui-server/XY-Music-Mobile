@@ -36,6 +36,8 @@ class DesktopLyricsUpdateParams(
     val wordsJson: String,
     val position: Double,
     val isPlaying: Boolean,
+    /** 暂停时隐藏歌词：开启且未在播放时隐藏歌词内容，恢复播放重新显示。 */
+    val hideOnPause: Boolean,
     val effectMode: Int,
     val locked: Boolean,
     val noBackground: Boolean,
@@ -155,6 +157,9 @@ class DesktopLyricsService : Service() {
     private var lastLyricColor = Color.WHITE
     private var lastTranslationColor = Color.argb(190, 225, 225, 230)
 
+    /** 上次已应用的「暂停时隐藏歌词」状态（true 表示歌词内容处于隐藏态）。 */
+    private var lastHideLyrics = false
+
     private val frameCallback = object : Choreographer.FrameCallback {
         override fun doFrame(frameTimeNanos: Long) {
             frameCallbackPosted = false
@@ -202,6 +207,7 @@ class DesktopLyricsService : Service() {
         wordsJson = intent.getStringExtra("wordsJson").orEmpty(),
         position = intent.getDoubleExtra("position", 0.0),
         isPlaying = intent.getBooleanExtra("isPlaying", false),
+        hideOnPause = intent.getBooleanExtra("hideOnPause", false),
         effectMode = intent.getIntExtra("wordEffectMode", EFFECT_NONE),
         locked = intent.getBooleanExtra("locked", false),
         noBackground = intent.getBooleanExtra("noBackground", true),
@@ -430,6 +436,15 @@ class DesktopLyricsService : Service() {
         ensurePanel()
         val lyric = p.lyric.ifBlank { "暂无歌词" }
 
+        // 暂停时隐藏歌词：开启且未在播放时隐藏歌词/翻译内容（浮窗背景保留），
+        // 恢复播放或关闭该选项后重新显示。
+        val hideLyrics = p.hideOnPause && !p.isPlaying
+        if (hideLyrics != lastHideLyrics) {
+            lastHideLyrics = hideLyrics
+            // 隐藏/恢复与播放态由同一 push 到达，可见性跟随设置值与播放态，
+            // 仅在状态翻转时刷新视图（避免每次进度同步重复 setVisibility）。
+        }
+
         // 位置/字体类参数：纵向位置百分制、自定义字体。这些参数变化频率
         // 极低（仅用户调节时推送），每次更新时幂等应用即可。
         applyPercent(p.verticalPercent)
@@ -504,7 +519,8 @@ class DesktopLyricsService : Service() {
             }
             // 无翻译且无罗马音的歌曲不显示副行：空文本的 TextView 仍会
             // 占一行高度，副行残留为空白行，因此按内容显隐整个视图。
-            val translationVisible = p.translation.isNotBlank()
+            // 「暂停时隐藏歌词」开启且未播放时，主行/副行一起隐藏。
+            val translationVisible = p.translation.isNotBlank() && !hideLyrics
             val desiredVisibility =
                 if (translationVisible) View.VISIBLE else View.GONE
             if (view.visibility != desiredVisibility) {
@@ -525,6 +541,11 @@ class DesktopLyricsService : Service() {
         }
         val lyricFontSize = p.lyricFontSize.coerceIn(16f, 40f)
         lyricView?.let { view ->
+            // 暂停时隐藏歌词：主行与副行一同隐藏（背景保留，浮窗仍可拖动）。
+            val desiredVisibility = if (hideLyrics) View.GONE else View.VISIBLE
+            if (view.visibility != desiredVisibility) {
+                view.visibility = desiredVisibility
+            }
             if (abs(
                     view.textSize -
                         lyricFontSize * resources.displayMetrics.scaledDensity,

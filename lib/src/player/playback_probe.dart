@@ -83,8 +83,11 @@ class PlaybackProbe {
     // （UI 冻结类卡死）。先记录冻结事实，再继续正常采样。
     final gapMs = now.difference(_lastTickWall).inMilliseconds;
     _lastTickWall = now;
-    if (gapMs > _maxGapMs) _maxGapMs = gapMs;
     final expectedMs = interval.inMilliseconds;
+    // 只记录超出采样间隔的部分：gap≈interval 属定时器常态（此前恒显
+    // 5000ms 造成误读「isolate 常态阻塞」），真阻塞时该值才会放大。
+    final gapOverMs = gapMs - expectedMs;
+    if (gapOverMs > _maxGapMs) _maxGapMs = gapOverMs;
     if (gapMs > expectedMs * 2 + 1500) {
       _log(
         '[PROBE] 主线程冻结 ${gapMs}ms（采样间隔应为 ${expectedMs}ms）',

@@ -1,4 +1,10 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!-- audio_service 经 getIdentifier() 按名字符串动态解析图标，资源收缩器
+     看不到这类引用，必须在 tools:keep 里逐个登记，否则 release 构建
+     （isShrinkResources=true）会把未静态引用的图标全部删除——图标被删
+     后 getIdentifier 返回 0，收藏/播放模式等 CustomAction 在华为等
+     ROM 的媒体控制中心会被判定为无效注入直接丢弃（只显示标准三键）。
+     新增 MediaControl.custom 图标后必须同步登记到这里。 -->
 <resources xmlns:tools="http://schemas.android.com/tools"
     tools:keep="@drawable/ic_stat_xy_music,
         @drawable/audio_service_play_arrow,
@@ -7,4 +13,10 @@
         @drawable/audio_service_skip_previous,
         @drawable/audio_service_fast_forward,
         @drawable/audio_service_fast_rewind,
-        @drawable/audio_service_stop" />
+        @drawable/audio_service_stop,
+        @drawable/audio_service_favorite,
+        @drawable/audio_service_favorite_filled,
+        @drawable/audio_service_repeat,
+        @drawable/audio_service_repeat_one,
+        @drawable/audio_service_shuffle,
+        @drawable/audio_service_desktop_lyrics" />

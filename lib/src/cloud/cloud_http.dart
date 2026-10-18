@@ -1,4 +1,4 @@
-﻿// 网盘引擎统一 HTTP 出口。
+// 网盘引擎统一 HTTP 出口。
 //
 // 全部走 [appRequest] 收口（逐跳 SSRF 校验 + 手动重定向），在其上封装
 // 网盘 API 最常用的三种形态：GET/POST-JSON/POST-FORM，附统一超时与
@@ -8,10 +8,12 @@ import 'dart:async';
 import 'dart:convert';
 
 import '../core/app_http.dart';
+import '../logging/app_log_store.dart';
 import 'cloud_types.dart';
 
 class CloudHttpResponse {
-  CloudHttpResponse._(this.status, this.headers, this.body, this.setCookies);
+  CloudHttpResponse._(
+      this.status, this.headers, this.body, this.setCookies, this.finalUrl);
 
   final int status;
   final Map<String, String> headers;
@@ -19,6 +21,9 @@ class CloudHttpResponse {
 
   /// 原始 Set-Cookie 列表（dart:io HttpHeaders.forEach 保证逐条分开）。
   final List<String> setCookies;
+
+  /// 重定向链终点 URL（无重定向时等于请求 URL；123 直链 302 探测要用）。
+  final String finalUrl;
 
   bool get isOk => status >= 200 && status < 300;
 
@@ -92,7 +97,14 @@ Future<CloudHttpResponse> cloudRequest(
       }
     });
     final respBody = await utf8.decodeStream(resp);
-    return CloudHttpResponse._(resp.statusCode, headerMap, respBody, setCookies);
+    // appRequest 手动跟随重定向，resp.redirects 记录每跳 Location（可能
+    // 是相对地址），逐跳 resolve 得到最终落点。
+    var finalUri = Uri.parse(url);
+    for (final r in resp.redirects) {
+      finalUri = finalUri.resolve(r.location.toString());
+    }
+    return CloudHttpResponse._(
+        resp.statusCode, headerMap, respBody, setCookies, finalUri.toString());
   } on CloudException {
     rethrow;
   } on TimeoutException {
@@ -166,16 +178,41 @@ String respErrorDetail(CloudHttpResponse resp) {
 }
 
 /// 跟随重定向归一到最终 URL（直链注册代理前用；只读 redirects，
-/// 不消费响应体）。失败原样返回。
+/// 不消费响应体）。失败原样返回并留痕——此前静默吞错，导致「探测成功」
+/// 从未被日志佐证，直链 403 时无法判断探测环节是否可用。
 Future<String> resolveFinalUrl(String url, {Map<String, String>? headers}) async {
+  final host = Uri.tryParse(url)?.host ?? '?';
   try {
-    final resp =
-        await appRequest('GET', Uri.parse(url), headers: headers, body: '');
+    final resp = await appRequest(
+      'GET',
+      Uri.parse(url),
+      // Range 限 1 字节：终点响应若直接是文件体（下发的已是最终地址），
+      // 不带 Range 会把整个文件拖进内存再丢弃。
+      headers: {...?headers, 'Range': 'bytes=0-1'},
+      body: '',
+    );
     final redirects = resp.redirects;
     await resp.drain<void>();
-    if (redirects.isEmpty) return url;
-    return redirects.last.location.toString();
-  } catch (_) {
+    if (redirects.isEmpty) {
+      AppLogStore.instance.add(
+        '[直链探测] $host 无重定向 status=${resp.statusCode}（直连落地）',
+      );
+      return url;
+    }
+    var finalUri = Uri.parse(url);
+    for (final r in redirects) {
+      finalUri = finalUri.resolve(r.location.toString());
+    }
+    AppLogStore.instance.add(
+      '[直链探测] $host ${resp.statusCode} 重定向${redirects.length}跳 '
+      '→ ${finalUri.host}',
+    );
+    return finalUri.toString();
+  } catch (e) {
+    // 失败原样返回（调用方仍会拿原 URL 注册播放），但必须留痕：
+    // 探测失败 = 「Dart 栈可访问该直链」的假设不成立，是播放 403/
+    // Source error 排查的关键线索。
+    AppLogStore.instance.add('[直链探测] $host 失败: $e（回退原URL）');
     return url;
   }
 }

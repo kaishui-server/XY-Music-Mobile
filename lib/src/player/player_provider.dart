@@ -39,20 +39,14 @@ import 'desktop_lyrics.dart';
 import 'bluetooth_lyrics.dart';
 import 'notification_lyrics.dart';
 import 'cloud_play_context.dart';
+import 'cloud_proxy.dart';
 import 'lx_lyrics_builder.dart';
+import 'playback_chain_log.dart';
 import 'playback_probe.dart';
 import 'video_playback_session.dart';
 
-/// 播放链路诊断日志：同时写控制台与应用日志库。
-///
-/// `debugPrint` 不会被 AppLogStore 捕获，用户导出的日志里只有 [PROBE]
-/// 心跳；起播各阶段的分段计时（音源解析/setUrl/DNS 预热）必须写入日志
-/// 库，导出后才能定位「点歌到出声」的耗时分布。进度事件类高频日志
-/// 仍走 debugPrint，避免刷掉日志库容量内的关键计时。
-void playbackChainLog(String message) {
-  debugPrint(message);
-  AppLogStore.instance.add(message);
-}
+// playbackChainLog 已抽至独立文件 playback_chain_log.dart（cloud_proxy
+// 需共用，避免循环 import）。
 
 /// 播放中的单曲信息（小而美：仅保留 UI 需要的最小字段）。
 class QueueItem {
@@ -1060,6 +1054,16 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
       bridge.attach();
       handler.inner = bridge;
       _mediaSessionBridge = bridge;
+      // 安装完成后立即补推当前曲目与控件状态：桥接安装时序可能晚于
+      // 首次起播（just_audio_background 初始化），若此前 syncMediaItem /
+      // _publish 已执行但随后被裸 handler 覆盖，这里重推一次，确保
+      // PlaybackState.controls / mediaItem / seekBar 完整及时送达
+      // （修复鸿蒙/澎湃首次起播媒体卡片缺按钮、封面、进度条）。
+      final playingItem = state.current;
+      if (playingItem != null) {
+        bridge.syncMediaItem(playingItem);
+      }
+      bridge.notifyCustomControlsChanged();
     } catch (_) {
       // 媒体服务初始化失败时保持未安装，播放时重试。
     }
@@ -2167,6 +2171,7 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
         lyrics: '',
         position: 0,
         isPlaying: false,
+        hideOnPause: false,
         noBackground: true,
         lyricColor: 0xFFFFFFFF,
         translationColor: 0xFFE1E1E6,
@@ -2191,6 +2196,7 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
       lyrics: item.lyricsRaw ?? '',
       position: state.position,
       isPlaying: state.isPlaying,
+      hideOnPause: settings.desktopLyricsHideOnPause,
       noBackground: settings.desktopLyricsNoBackground,
       lyricColor: settings.desktopLyricsLyricColor,
       translationColor: settings.desktopLyricsTranslationColor,
@@ -2288,25 +2294,65 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
           text = (line['translation'] as String?)?.trim() ?? '';
         }
         if (text.isEmpty) continue;
+        // Rust 解析产物可能仍携带字级时间标签（洛雪混合增强形态：行首
+        // `[mm:ss]` 行级时间戳 + 字级 `<mm:ss.mmm>`，Rust 按普通 LRC 行
+        // 处理时词级标签留在正文里），重组前统一剥净，保证蓝牙/通知栏
+        // 只收到纯文本。
+        text = text
+            .replaceAll(_lxTagPattern, ' ')
+            .replaceAll(_spaceCollapse, ' ')
+            .trim();
+        if (text.isEmpty) continue;
         final mm = time ~/ 60;
         final ss = (time % 60).floor();
         final frac = ((time - time.floor()) * 100).round();
         sb.writeln(
             '[${mm.toString().padLeft(2, '0')}:${ss.toString().padLeft(2, '0')}.${frac.toString().padLeft(2, '0')}]$text');
       }
-      final rebuilt = sb.toString().trim();
+      final rebuilt = _dedupeSameStampLines(sb.toString().trim());
       return rebuilt.isNotEmpty ? rebuilt : raw;
     } catch (_) {
       return hasLxWordTiming(raw) ? _stripLxTagsToLineLrc(raw) : raw;
     }
   }
 
+  /// 同刻度行去重（保留首行）。
+  ///
+  /// lyricsRaw 是「原文 LRC + \n + 翻译 LRC」整段拼接形态（插件翻译透传，
+  /// 见 plugin_runtime _extractLyricsWithTranslation），翻译行与原文行同
+  /// 时间轴并存；Rust 解析后两者都成为独立 displayLine（text=各自内容），
+  /// 上方「原文优先」取 text 不会落到 translation 字段——翻译行原样进
+  /// 输出。蓝牙/通知栏端按时间滚行只显示单行，同刻度命中后一行（翻译），
+  /// 外文歌蓝牙歌词只显示中文翻译（一加媒体控制中心实测）。按行首时间戳
+  /// （百分秒）去重，保留首行即原文。
+  static String _dedupeSameStampLines(String lrc) {
+    final seen = <String>{};
+    final out = <String>[];
+    for (final line in lrc.split('\n')) {
+      final m = _lrcStampKey.firstMatch(line);
+      if (m == null) {
+        out.add(line);
+        continue;
+      }
+      final key =
+          '${m.group(1)!.padLeft(3, '0')}:${m.group(2)}.${m.group(3)}';
+      if (!seen.add(key)) continue;
+      out.add(line);
+    }
+    return out.join('\n');
+  }
+
+  static final RegExp _lrcStampKey = RegExp(r'^\[(\d{1,3}):(\d{2})\.(\d{2})\]');
+
   /// 洛雪 `<mm:ss.mmm>词…` 逐字标签行的 Dart 兜底清洗：每行取首个标签
   /// 时间作为行时间戳，正文剥掉全部时间标签并折叠空白，重组为行级明文
   /// LRC（`[mm:ss.xx]原文`）。仅当 Rust parseLyrics 未能解析时启用。
   static final RegExp _lxTagPattern =
-      RegExp(r'<(\d{1,3}):(\d{2})\.(\d{3})>');
+      RegExp(r'<(\d{1,3}):(\d{2})\.(\d{2,3})>');
   static final RegExp _spaceCollapse = RegExp(r'\s+');
+  // 混合增强行行首的行级时间戳（`[00:08.69]`），重组时随字级标签一并剥掉。
+  static final RegExp _lrcLineStamp =
+      RegExp(r'^\[(\d{1,3}):(\d{2})(?:\.(\d{1,3}))?\]');
 
   static String _stripLxTagsToLineLrc(String raw) {
     final out = <String>[];
@@ -2317,8 +2363,10 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
       if (match != null) {
         final mins = int.parse(match.group(1)!);
         final secs = int.parse(match.group(2)!);
-        final millis = int.parse(match.group(3)!);
+        // 毫秒可能是 2 位（百分秒）或 3 位，统一补齐 3 位再取百分位。
+        final millis = int.parse(match.group(3)!.padRight(3, '0'));
         final text = line
+            .replaceFirst(_lrcLineStamp, ' ')
             .replaceAll(_lxTagPattern, ' ')
             .replaceAll(_spaceCollapse, ' ')
             .trim();
@@ -2331,7 +2379,9 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
         out.add(line);
       }
     }
-    return out.join('\n');
+    // 兜底链路同样做同刻度去重：拼接双语 LRC 的翻译行在这里同样会与
+    // 原文行同时间轴并存（见 _dedupeSameStampLines 注释）。
+    return _dedupeSameStampLines(out.join('\n'));
   }
 
   /// 通知栏&锁屏实时歌词（任务A）：与蓝牙歌词共用同一份歌词解析与进度
@@ -3564,14 +3614,15 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
         _dspStreamHeaders = headers;
         _dspLocalPath = null;
         if (requestId != null && requestId != _playRequestId) return;
-        // DNS 预热不再串行挡在 setUrl 前：冷域名解析实测可达数秒，串行会让
-        // 起播白等这段时间。改为与 ExoPlayer 自身解析并发（netd 对同一 host
-        // 的并发查询会去重），既保留预热效果又不占用起播关键路径。
-        unawaited(_warmUpPlaybackDns(url));
         final host = Uri.tryParse(url)?.host ?? '';
+        final viaProxy = host == '127.0.0.1' || host == 'localhost';
+        // DNS 预热只对真实域名有意义；回环代理地址跳过。
+        if (!viaProxy) {
+          unawaited(_warmUpPlaybackDns(url));
+        }
         playbackChainLog(
-          '[播放链路] setUrl 开始 $host '
-          '(${headers == null ? '直连' : '本地代理 ${headers.length} 头'})',
+          '[播放链路] setUrl 开始 ${viaProxy ? '本地代理通道' : host} '
+          '(${headers == null ? (viaProxy ? '头由代理注入' : '无头直连') : '直连 ${headers.length} 头'})',
         );
       }
       // setUrl 加超时保护：部分机型上 ExoPlayer 加载特定 URL 可能卡死
@@ -4573,25 +4624,40 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
       DirectLinkCache.instance.put(key, link);
     }
 
-    try {
+    // 网盘直链一律走本地代理转发（CloudPlaybackProxy）：部分网盘 CDN
+    // （百度 d.pcs / 123 自建 CDN）对 ExoPlayer 的 Conscrypt TLS 栈存在
+    // 握手/特征兼容问题——同一 URL Dart HttpClient 探测成功、ExoPlayer
+    // 直连报 (0) Source error。播放器只连 127.0.0.1，真实 CDN 请求由
+    // Dart 网络栈发起（headers 由代理注入，转发层异常打进播放链路日志）。
+    Future<void> startWith(CloudDirectLink direct) async {
+      final proxyUrl = await CloudPlaybackProxy.instance.register(
+        direct.url,
+        direct.headers,
+        Uri.tryParse(direct.url)?.host ?? '直链',
+      );
       await _setPlayerUrl(
-        link.url,
-        headers: link.headers.isEmpty ? null : link.headers,
+        proxyUrl,
+        headers: null,
         tag: mediaItem,
         requestId: requestId,
       );
+    }
+
+    try {
+      await startWith(link);
     } catch (e) {
       // 直链可能已过期：清缓存重取一次；仍失败交上层按播放失败处理。
       debugPrint('[cloud] 网盘直链起播失败，重取一次: $e');
       DirectLinkCache.instance.invalidate(key);
       final fresh = await resolve();
       DirectLinkCache.instance.put(key, fresh);
-      await _setPlayerUrl(
-        fresh.url,
-        headers: fresh.headers.isEmpty ? null : fresh.headers,
-        tag: mediaItem,
-        requestId: requestId,
+      // 诊断日志：重取后的落地域名 / 撺带的请求头 / 首次起播错误详情，
+      // 定位 403 防盗链 / 域名劫持 / 过期直链等真实原因。
+      playbackChainLog(
+        '[播放链路] 网盘直链重取 host=${Uri.tryParse(fresh.url)?.host} '
+        'headers=${fresh.headers.keys.toList()} 首次错误=$e',
       );
+      await startWith(fresh);
     }
   }
 
@@ -5455,7 +5521,13 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
     var message = error.toString().replaceFirst('Exception: ', '').trim();
     if (message.contains('Source error') ||
         message.contains('PlayerException')) {
-      message = '音频地址无法播放或已经失效';
+      // 保留底层错误关键详情（错误码 / HTTP 状态 / host），不再整体吞掉：
+      // 网盘直链播放失败的根因（403 防盗链 / 404 过期 / 证书 / 超时）
+      // 只有从这里才能定位（用户要求透出详细失败信息）。
+      final compact = message.replaceAll(RegExp(r'\s+'), ' ');
+      final detail =
+          compact.length > 180 ? '${compact.substring(0, 180)}…' : compact;
+      message = '音频地址无法播放或已经失效（$detail）';
     }
     return message.isEmpty ? '歌曲播放失败，请重试' : message;
   }

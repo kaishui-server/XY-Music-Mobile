@@ -272,9 +272,12 @@ bool needsCoverImageProxy(String imageUrl) {
 }
 
 /// 兼容旧插件和旧播放会话保存的 HTTP / 协议省略封面地址。
-/// Android 的网络安全配置只允许本机音频代理使用明文 HTTP，远程封面必须
-/// HTTPS；酷狗等音源仍返回 http:// 封面，主流音乐图床均已支持 HTTPS，
-/// 统一升级，否则这类封面在 Android 上一律显示占位图。
+/// 主流音乐图床均已支持 HTTPS，http:// 封面统一升级；唯一例外是酷我
+/// 图片 CDN（kwcdn.kuwo.cn）：该域不提供可信 HTTPS（TLS 握手直接失败，
+/// 官方端也走明文 http 下发），必须保持明文——app 网络安全配置已全局
+/// 放行明文流量，可正常加载。此前无差别升级导致酷我来源封面全部显示
+/// 占位（接口层 URL 正常、加载层必挂）。与 plugin_runtime 侧归一化
+/// 保持同一份放行名单。
 String normalizeCoverImageUrl(String? imageUrl) {
   var normalized = imageUrl?.trim() ?? '';
   if (normalized.startsWith('//')) normalized = 'https:$normalized';
@@ -282,7 +285,10 @@ String normalizeCoverImageUrl(String? imageUrl) {
   final host = uri?.host.toLowerCase() ?? '';
   final isLocalHost =
       host == 'localhost' || host == '127.0.0.1' || host == '[::1]';
-  if (normalized.startsWith('http://') && !isLocalHost) {
+  const keepPlainHttpHosts = ['kwcdn.kuwo.cn'];
+  final keepPlain =
+      keepPlainHttpHosts.any((suffix) => host.endsWith(suffix));
+  if (normalized.startsWith('http://') && !isLocalHost && !keepPlain) {
     normalized = 'https://${normalized.substring(7)}';
   }
   return _applyNeteaseCoverScale(_stripBilibiliImageTransform(normalized));

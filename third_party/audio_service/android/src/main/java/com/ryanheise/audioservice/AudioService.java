@@ -24,6 +24,7 @@ import android.support.v4.media.RatingCompat;
 import android.support.v4.media.session.MediaControllerCompat;
 import android.support.v4.media.session.MediaSessionCompat;
 import android.support.v4.media.session.PlaybackStateCompat;
+import android.util.Log;
 import android.util.LruCache;
 import android.util.Size;
 import android.view.KeyEvent;
@@ -272,6 +273,21 @@ public class AudioService extends MediaBrowserServiceCompat {
     private List<NotificationCompat.Action> nativeActions = new ArrayList<>();
     private List<PlaybackStateCompat.CustomAction> customActions = new ArrayList<>();
     private int[] compactActionIndices;
+    // XY Music 本地补丁：媒体通知第二行（歌手位）的动态叠加歌词行。
+    // NotificationLyricsManager 在歌词行滚动时写入；null/空 时不叠加，
+    // 第二行保持纯歌手（蓝牙歌词开关关闭时的显示形态）。
+    private static volatile String mediaSecondLine;
+    // 进入歌词模式前的原始歌手行（MediaMetadata DISPLAY_SUBTITLE），
+    // 关闭蓝牙歌词 / 歌词消失时恢复；切歌时由 setMetadata 重新记录。
+    private static volatile String originalDisplaySubtitle;
+    // 进入歌词模式前的原始 ARTIST（MediaMetadata METADATA_KEY_ARTIST）。
+    // 华为/澎湃等 ROM 的系统媒体卡片第三行歌手位直接读 ARTIST 字段渲染
+    // （不走 DISPLAY_SUBTITLE / contentText），歌词模式必须把 ARTIST 同步
+    // 覆盖为歌词行，否则歌手行永远显示歌手名；关闭时还原。
+    private static volatile String originalArtist;
+    // 歌词行更新序号：每次写入歌词行 +1 并随通知 extras 透出，强制华为等
+    // ROM 感知通知内容变化，防止同 ID 通知行文字被系统媒体卡片缓存。
+    private static volatile int mediaSecondLineSeq;
     private MediaMetadataCompat mediaMetadata;
     private Bitmap artBitmap;
     private String notificationChannelId;
@@ -468,6 +484,13 @@ public class AudioService extends MediaBrowserServiceCompat {
 
     PlaybackStateCompat.CustomAction createCustomAction(MediaControl control) {
         int iconId = getResourceId(control.icon);
+        // XY Music 本地补丁：图标解析失败（资源收缩器误删/资源名写错）
+        // 时直接跳过该控件。icon=0 的 CustomAction 在华为/荣耀等 ROM 的
+        // 媒体控制中心会被当作越权注入丢弃，严格实现甚至可能在渲染时
+        // 抛异常导致应用被系统判为崩溃，这里从源头不注入坏控件。
+        if (iconId == 0) {
+            return null;
+        }
         if (control.customAction != null) {
             return new PlaybackStateCompat.CustomAction.Builder(control.customAction.name, control.label, iconId)
                 .setExtras(mapToBundle(control.customAction.extras))
@@ -492,6 +515,45 @@ public class AudioService extends MediaBrowserServiceCompat {
             }
         }
         return null;
+    }
+
+    // XY Music 本地补丁：custom 控件（收藏/播放模式）的通知 action。
+    // 华为（HarmonyOS）播控中心的五元组按钮（收藏/上一首/播放暂停/
+    // 下一首/循环模式）读的是通知的 Notification.Action 列表，不渲染
+    // PlaybackState 的 CustomAction——只把 custom 控件放进
+    // PlaybackState 时，华为永远只显示基础三键。QQ 音乐五键齐全正是
+    // 因为它的五个按钮都在通知 actions 里。点击经独立广播
+    // （MediaButtonReceiver.ACTION_CUSTOM_MEDIA_ACTION）路由回 Dart
+    // 的 customAction 回调（toggleFavorite/cyclePlayMode）。
+    NotificationCompat.Action createCustomNotificationAction(MediaControl control) {
+        int iconId = getResourceId(control.icon);
+        if (iconId == 0 || control.customAction == null) {
+            return null;
+        }
+        return new NotificationCompat.Action(iconId, control.label,
+                buildCustomActionPendingIntent(control.customAction.name));
+    }
+
+    PendingIntent buildCustomActionPendingIntent(String name) {
+        Intent intent = new Intent(this, MediaButtonReceiver.class);
+        intent.setAction(MediaButtonReceiver.ACTION_CUSTOM_MEDIA_ACTION);
+        intent.putExtra(MediaButtonReceiver.EXTRA_CUSTOM_ACTION_NAME, name);
+        int flags = PendingIntent.FLAG_UPDATE_CURRENT;
+        if (Build.VERSION.SDK_INT >= 23) {
+            flags |= PendingIntent.FLAG_IMMUTABLE;
+        }
+        return PendingIntent.getBroadcast(this, name.hashCode(), intent, flags);
+    }
+
+    public void handleCustomMediaAction(String name) {
+        if (name == null || name.isEmpty() || listener == null) {
+            return;
+        }
+        try {
+            listener.onCustomAction(name, null);
+        } catch (Throwable t) {
+            Log.w("AudioService", "handleCustomMediaAction failed: " + name, t);
+        }
     }
 
     PendingIntent buildMediaButtonPendingIntent(long action) {
@@ -527,16 +589,24 @@ public class AudioService extends MediaBrowserServiceCompat {
         this.nativeActions.clear();
         this.customActions.clear();
         // XY Music 本地补丁：controls 索引 → 通知标准控件索引映射。
-        // custom 控件只进 PlaybackState（供 Android 13+ 系统媒体卡片
-        // 渲染），不进 Android 12 传统通知的 actions，compact 索引需
-        // 换算到标准控件空间。
+        // custom 控件进 PlaybackState（供 Android 13+ 系统媒体卡片
+        // 渲染）的同时也生成通知 action（华为播控中心五元组按钮读的
+        // 是通知 actions，见 createCustomNotificationAction 注释），
+        // compact 索引按统一的通知 actions 空间换算。
         final int[] controlToNative = new int[controls.size()];
         for (int i = 0; i < controls.size(); i++) {
             final MediaControl control = controls.get(i);
             final PlaybackStateCompat.CustomAction customAction = createCustomAction(control);
-            controlToNative[i] = -1;
             if (customAction != null) {
                 customActions.add(customAction);
+                final NotificationCompat.Action customNotificationAction =
+                        createCustomNotificationAction(control);
+                if (customNotificationAction != null) {
+                    controlToNative[i] = nativeActions.size();
+                    nativeActions.add(customNotificationAction);
+                } else {
+                    controlToNative[i] = -1;
+                }
             } else {
                 controlToNative[i] = nativeActions.size();
                 nativeActions.add(createAction(control.icon, control.label, control.actionCode));
@@ -572,7 +642,14 @@ public class AudioService extends MediaBrowserServiceCompat {
                 .setBufferedPosition(bufferedPosition);
 
         for (PlaybackStateCompat.CustomAction action : this.customActions) {
-            stateBuilder.addCustomAction(action);
+            // XY Music 本地补丁：华为等 ROM 对媒体会话自定义控件有安全
+            // 审查（越权判定），单个控件注入异常不应拖垮整个播放状态
+            // 发布，否则通知/媒体卡片全灭且进程被记为崩溃。
+            try {
+                stateBuilder.addCustomAction(action);
+            } catch (Throwable t) {
+                Log.w("AudioService", "addCustomAction failed: " + action.getAction(), t);
+            }
         }
 
         if (queueIndex != null)
@@ -691,8 +768,18 @@ public class AudioService extends MediaBrowserServiceCompat {
             MediaDescriptionCompat description = mediaMetadata.getDescription();
             if (description.getTitle() != null)
                 builder.setContentTitle(description.getTitle());
-            if (description.getSubtitle() != null)
-                builder.setContentText(description.getSubtitle());
+            if (description.getSubtitle() != null) {
+                // XY Music 本地补丁：蓝牙歌词开启时歌手位直接显示当前歌词行
+                // （逐行歌词取代歌手名，即媒体卡片三行布局之二）；关闭时
+                // mediaSecondLine 为 null，恢复纯歌手名。
+                String subtitle = description.getSubtitle().toString();
+                String lyric = mediaSecondLine;
+                if (lyric != null && !lyric.isEmpty()) {
+                    builder.setContentText(lyric);
+                } else {
+                    builder.setContentText(subtitle);
+                }
+            }
             if (description.getDescription() != null)
                 builder.setSubText(description.getDescription());
             synchronized (this) {
@@ -714,8 +801,18 @@ public class AudioService extends MediaBrowserServiceCompat {
         }
         final MediaStyle style = new MediaStyle()
             .setMediaSession(mediaSession.getSessionToken());
-        if (Build.VERSION.SDK_INT < 33) {
+        // XY Music 本地补丁：恒调用 setShowActionsInCompactView。
+        // 上游按官方建议在 Android 13+ 跳过该方法（系统媒体卡片按
+        // PlaybackState 自动分配按钮槽位），但鸿蒙/HarmonyOS 兼容层在
+        // SDK>=33 时仍按该方法决定折叠态按钮行，跳过会导致媒体卡片
+        // 只剩播放/暂停默认槽（实测：缺上一曲/下一曲/循环按钮）。
+        // LX-X 等同类播放器正是恒调用该方法才三键齐全。原生 Android
+        // 13+ 上该调用无副作用（系统仍按 PlaybackState 渲染槽位），
+        // try/catch 兜底防止个别 ROM 实现抛异常导致通知构建失败。
+        try {
             style.setShowActionsInCompactView(compactActionIndices);
+        } catch (Throwable ignored) {
+            // ROM 实现差异：忽略，按钮行由系统默认策略兜底。
         }
         if (config.androidNotificationOngoing) {
             style.setShowCancelButton(true);
@@ -723,6 +820,16 @@ public class AudioService extends MediaBrowserServiceCompat {
             builder.setOngoing(true);
         }
         builder.setStyle(style);
+        // XY Music 本地补丁：通知 extras 附带歌词行递增序号。同 ID 通知在
+        // 华为/澎湃等 ROM 上存在文字缓存（buildNotification 内容变了但卡片
+        // 不刷新），序号变化可强制系统感知「内容已更新」。
+        try {
+            Bundle xyExtras = new Bundle(builder.getExtras());
+            xyExtras.putInt("xy_lyric_seq", mediaSecondLineSeq);
+            builder.setExtras(xyExtras);
+        } catch (Throwable ignored) {
+            // extras 失败只丢一次哨兵，不影响通知主体。
+        }
         return builder.build();
     }
 
@@ -773,6 +880,81 @@ public class AudioService extends MediaBrowserServiceCompat {
     private void updateNotification() {
         if (notificationCreated) {
             getNotificationManager().notify(NOTIFICATION_ID, buildNotification());
+        }
+    }
+
+    /**
+     * XY Music 本地补丁：更新媒体通知第二行（歌手位）的叠加歌词行。
+     * 由 NotificationLyricsManager 在歌词行滚动时调用；传 null/空 清除
+     * 叠加（第二行恢复为纯歌手）。全链路 try/catch，防华为越权闪退。
+     *
+     * 除通知 contentText 外同步刷新 MediaSession 的 MediaMetadata
+     * DISPLAY_SUBTITLE：华为/澎湃等 ROM 的系统媒体卡片优先读取
+     * MediaMetadata（标题/副标题/描述）而非通知 contentText，只改通知
+     * 文本会被系统卡片缓存住旧内容。两者同源更新，保证两种数据源下
+     * 第三行都能显示滚动歌词；通知 extras 附带递增序号强制系统感知变化。
+     */
+    public static void setMediaSecondLine(String lyric) {
+        mediaSecondLine = (lyric == null || lyric.isEmpty()) ? null : lyric;
+        try {
+            AudioService service = instance;
+            if (service != null) {
+                service.applyMediaSecondLine();
+                if (service.notificationCreated) {
+                    service.updateNotification();
+                }
+            }
+        } catch (Throwable ignored) {
+            // 通知更新失败不影响播放进程。
+        }
+    }
+
+    /** 同步 MediaMetadata 的 DISPLAY_SUBTITLE / ARTIST（媒体卡片第三行数据源）。 */
+    private void applyMediaSecondLine() {
+        mediaSecondLineSeq++;
+        if (mediaMetadata == null) return;
+        if (mediaSecondLine != null && !mediaSecondLine.isEmpty()) {
+            // 首次进入歌词模式时记录原始歌手名，供关闭时恢复。
+            if (originalDisplaySubtitle == null) {
+                MediaDescriptionCompat d = mediaMetadata.getDescription();
+                originalDisplaySubtitle =
+                    d.getSubtitle() != null ? d.getSubtitle().toString() : null;
+            }
+            if (originalArtist == null) {
+                CharSequence artist =
+                    mediaMetadata.getText(MediaMetadataCompat.METADATA_KEY_ARTIST);
+                originalArtist = artist != null ? artist.toString() : null;
+            }
+            if (originalDisplaySubtitle == null ||
+                !originalDisplaySubtitle.equals(mediaSecondLine)) {
+                mediaMetadata = new MediaMetadataCompat.Builder(mediaMetadata)
+                    .putString(MediaMetadataCompat.METADATA_KEY_DISPLAY_SUBTITLE, mediaSecondLine)
+                    .putString(MediaMetadataCompat.METADATA_KEY_ARTIST, mediaSecondLine)
+                    .build();
+                mediaSession.setMetadata(mediaMetadata);
+            }
+        } else {
+            MediaMetadataCompat.Builder builder = null;
+            if (originalDisplaySubtitle != null) {
+                builder = new MediaMetadataCompat.Builder(mediaMetadata)
+                    .putString(
+                        MediaMetadataCompat.METADATA_KEY_DISPLAY_SUBTITLE,
+                        originalDisplaySubtitle
+                    );
+            }
+            if (originalArtist != null) {
+                if (builder == null) builder = new MediaMetadataCompat.Builder(mediaMetadata);
+                builder.putString(
+                    MediaMetadataCompat.METADATA_KEY_ARTIST,
+                    originalArtist
+                );
+            }
+            if (builder != null) {
+                mediaMetadata = builder.build();
+                mediaSession.setMetadata(mediaMetadata);
+            }
+            originalDisplaySubtitle = null;
+            originalArtist = null;
         }
     }
 
@@ -875,6 +1057,24 @@ public class AudioService extends MediaBrowserServiceCompat {
             }
         }
         this.mediaMetadata = mediaMetadata;
+        // XY Music 本地补丁：蓝牙歌词开启（mediaSecondLine 非空）时，新歌
+        // 元数据到达后立即记录原始歌手名并把 DISPLAY_SUBTITLE / ARTIST 覆盖
+        // 为当前歌词行，保证切歌后华为等 ROM 的媒体卡片第三行继续显示歌词。
+        if (mediaSecondLine != null && !mediaSecondLine.isEmpty()) {
+            MediaDescriptionCompat d = mediaMetadata.getDescription();
+            originalDisplaySubtitle =
+                d.getSubtitle() != null ? d.getSubtitle().toString() : null;
+            CharSequence artist =
+                mediaMetadata.getText(MediaMetadataCompat.METADATA_KEY_ARTIST);
+            originalArtist = artist != null ? artist.toString() : null;
+            mediaMetadata = new MediaMetadataCompat.Builder(mediaMetadata)
+                .putString(MediaMetadataCompat.METADATA_KEY_DISPLAY_SUBTITLE, mediaSecondLine)
+                .putString(MediaMetadataCompat.METADATA_KEY_ARTIST, mediaSecondLine)
+                .build();
+        } else {
+            originalDisplaySubtitle = null;
+            originalArtist = null;
+        }
         mediaSession.setMetadata(mediaMetadata);
         handler.removeCallbacksAndMessages(null);
         handler.post(this::updateNotification);

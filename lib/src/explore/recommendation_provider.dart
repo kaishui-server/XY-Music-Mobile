@@ -456,7 +456,9 @@ Future<List<Song>> _loadHotChartSongs(
             : charts[random.nextInt(charts.length)];
         final songs = await runtime
             .getTopListSongs(plugin, chart, limit: 30)
-            .timeout(const Duration(seconds: 12));
+            // 酷我等插件的榜单详情要逐歌请求封面/音质（80 首 × 2 个
+            // 请求，且宿主侧有同 host 并发限流排队），放宽到 18s。
+            .timeout(const Duration(seconds: 18));
         final filterMissingCovers = _shouldFilterMissingCovers(
           songs.map((song) => song.coverUrl),
         );
