@@ -8896,19 +8896,27 @@ class _ProgressiveLyricWord extends StatefulWidget {
   State<_ProgressiveLyricWord> createState() => _ProgressiveLyricWordState();
 }
 
-class _ProgressiveLyricWordState extends State<_ProgressiveLyricWord> {
+class _ProgressiveLyricWordState extends State<_ProgressiveLyricWord>
+    with SingleTickerProviderStateMixin {
   /// 未唱暗色与未播放行灰度一致（55%）。
   static const double _dimAlpha = 0.55;
 
-  /// 逐词扫光档位（wordByWord）：填充前沿带内多档中间灰度从亮到暗渐进
-  /// 收尾（末档与暗色衔接），观感为柔和渐变带而非 5502 的硬边分界。
-  /// 3 档阶梯段间跳变可见（用户反馈「边界模糊不明显」），改为 5 档：
-  /// 亮→暗六级阶梯，每级差 ~0.08，视觉近似连续渐变；每帧仍最多 5 次
-  /// clip draw（零离屏），成本不变。
-  static const List<double> _stopAlphas = [1.0, 0.92, 0.84, 0.74, 0.64];
+  /// 已唱词上浮动画：进入纯白 stage 后文字向上位移的像素与时长/缓动。
+  /// 仅绘制期位移（Transform.translate），不改布局、不触发行高变化；
+  /// 动画只在 stage 切换时跑 ~550ms，之后零成本。
+  static const double _liftPx = 1.8;
+  static const Duration _liftDuration = Duration(milliseconds: 550);
 
-  /// 扫光渐变档排版缓存（跨帧复用；文本/样式变化才重排，每帧仅
-  /// clipRect+paint 5 次 draw call，零离屏零重复排版）。
+  late final AnimationController _liftController;
+  late final Animation<double> _lift;
+
+  /// 扫光亮档 alpha：已唱区纯白。过渡带不再用多档灰度阶梯，改由
+  /// _SweepWordPainter 在带内用 saveLayer+dstIn 白→透明渐变遮罩做连续
+  /// 过渡（替换 5 档阶梯的可见台阶）。
+  static const double _brightAlpha = 1.0;
+
+  /// 扫光亮档排版缓存（跨帧复用；文本/样式变化才重排，每帧仅 1 次亮区
+  /// clipRect draw + 带内窄条 saveLayer，零重复排版）。
   List<TextPainter>? _tpStops;
   String? _tpKey;
 
@@ -8932,14 +8940,15 @@ class _ProgressiveLyricWordState extends State<_ProgressiveLyricWord> {
     if (_tpKey == key && _tpStops != null) return;
     _invalidateSweepPainters();
     _tpStops = [
-      for (final a in _stopAlphas)
-        TextPainter(
-          text: TextSpan(
-            text: widget.text,
-            style: style.copyWith(color: Colors.white.withValues(alpha: a)),
+      TextPainter(
+        text: TextSpan(
+          text: widget.text,
+          style: style.copyWith(
+            color: Colors.white.withValues(alpha: _brightAlpha),
           ),
-          textDirection: TextDirection.ltr,
-        )..layout(),
+        ),
+        textDirection: TextDirection.ltr,
+      )..layout(),
     ];
     _tpKey = key;
   }
@@ -8955,6 +8964,15 @@ class _ProgressiveLyricWordState extends State<_ProgressiveLyricWord> {
   void initState() {
     super.initState();
     _stage = _stageFor(widget.position.value);
+    _liftController = AnimationController(
+      vsync: this,
+      duration: _liftDuration,
+      value: 0,
+    );
+    _lift = CurvedAnimation(
+      parent: _liftController,
+      curve: Curves.easeOutCubic,
+    );
     widget.position.addListener(_onPositionChanged);
   }
 
@@ -8972,19 +8990,13 @@ class _ProgressiveLyricWordState extends State<_ProgressiveLyricWord> {
         oldWidget.end != widget.end) {
       // 换行 / 偏移变化：按新时间轴重算阶段，避免沿用旧阶段。
       _invalidateSweepPainters();
-      final nextStage = _stageFor(widget.position.value);
-      if (nextStage != _stage) {
-        setState(() => _stage = nextStage);
-      }
+      _recomputeStage();
     }
     if (oldWidget.style != widget.style ||
         oldWidget.effectMode != widget.effectMode) {
       _resolveStyle();
       _invalidateSweepPainters();
-      final nextStage = _stageFor(widget.position.value);
-      if (nextStage != _stage) {
-        setState(() => _stage = nextStage);
-      }
+      _recomputeStage();
     }
     if (oldWidget.position != widget.position) {
       oldWidget.position.removeListener(_onPositionChanged);
@@ -9002,16 +9014,28 @@ class _ProgressiveLyricWordState extends State<_ProgressiveLyricWord> {
     return 1;
   }
 
+  /// 重算阶段并统一处理阶段切换副作用：进入已唱 stage 触发上浮缓动，
+  /// 离开已唱（seek/换行回退）复位上浮位移。
+  void _recomputeStage() {
+    final nextStage = _stageFor(widget.position.value);
+    if (nextStage == _stage) return;
+    final from = _stage;
+    setState(() {
+      _stage = nextStage;
+      if (nextStage == 2 && from != 2) {
+        _liftController.forward(from: 0);
+      } else if (nextStage != 2 && from == 2) {
+        _liftController.value = 0;
+      }
+    });
+  }
+
   void _onPositionChanged() {
     if (!mounted) return;
-    final nextStage = _stageFor(widget.position.value);
-    if (nextStage != _stage) {
-      setState(() => _stage = nextStage);
-      return;
-    }
-    // 淡入中的词每帧 setState（RichText 字符 alpha 插值）；未唱/已唱
-    // 静态阶段不触发任何重建。
-    if (nextStage == 1) {
+    _recomputeStage();
+    // 淡入中的词每帧 setState（Painter 前沿插值）；未唱/已唱静态阶段
+    // 不触发整词重建（已唱上浮由 AnimatedBuilder 局部驱动）。
+    if (_stage == 1) {
       setState(() {});
     }
   }
@@ -9019,6 +9043,7 @@ class _ProgressiveLyricWordState extends State<_ProgressiveLyricWord> {
   @override
   void dispose() {
     widget.position.removeListener(_onPositionChanged);
+    _liftController.dispose();
     _invalidateSweepPainters();
     super.dispose();
   }
@@ -9031,7 +9056,16 @@ class _ProgressiveLyricWordState extends State<_ProgressiveLyricWord> {
       return Text(widget.text, style: resolved.copyWith(color: dimColor));
     }
     if (_stage == 2) {
-      return Text(widget.text, style: resolved.copyWith(color: Colors.white));
+      // 已唱纯白 + 微微上浮（3px、easeOutCubic 缓动）。AnimatedBuilder
+      // 只在动画活跃期重建 Transform，child 复用不重建 Text。
+      return AnimatedBuilder(
+        animation: _lift,
+        child: Text(widget.text, style: resolved.copyWith(color: Colors.white)),
+        builder: (context, child) => Transform.translate(
+          offset: Offset(0, -_liftPx * _lift.value),
+          child: child,
+        ),
+      );
     }
     // 扫光填充（两种效果模式共用，参数不同）：底为暗色静态 Text（提供
     // 尺寸与基线），亮档与带内两档灰度由 foregroundPainter 按填充前沿
@@ -9046,12 +9080,12 @@ class _ProgressiveLyricWordState extends State<_ProgressiveLyricWord> {
 
 /// 词级扫光 Painter（渐进/逐词两种效果模式的填充过渡渲染）。
 ///
-/// 底层是暗色静态 Text（WidgetSpan 的基线/尺寸由它提供），Painter 只叠
-/// 画「亮档 + 带内两档灰度」：填充前沿 front 从词首推进到词尾，前沿后
-/// 全亮、前沿处一道渐变过渡带（0.87→0.70 两档近似渐变，非 5502 硬边）、
-/// 前沿前保持暗色。渐进模式短窗快闪+窄带（轻扫光），逐词模式跟词时长
-/// 填充+宽带（卡拉OK跟速）。零离屏、零每帧排版，重绘被词级
-/// RepaintBoundary 圈在词内，不传播到整页。
+/// 底层是暗色静态 Text（WidgetSpan 的基线/尺寸由它提供），Painter 叠画
+/// 「亮区 + 过渡带」：填充前沿 front 从词首推进到词尾，前沿前（已唱）
+/// 全亮、前沿处一道连续 alpha 渐变过渡带（saveLayer+dstIn 白→透明，非
+/// 阶梯近似）、前沿后（未唱）保持暗色。渐进模式宽带淡入轻扫光，逐词
+/// 模式窄带干脆。零重复排版：亮区零离屏，saveLayer 仅覆盖带内窄条；
+/// 重绘被词级 RepaintBoundary 圈在词内，不传播到整页。
 class _SweepWordPainter extends CustomPainter {
   _SweepWordPainter(this.state);
   final _ProgressiveLyricWordState state;
@@ -9070,7 +9104,6 @@ class _SweepWordPainter extends CustomPainter {
     final front =
         ((pos - w.start) / state._sweepDur).clamp(0.0, 1.0) * (size.width + band);
     final stops = state._tpStops!;
-    final n = stops.length;
     void seg(double x0, double x1, TextPainter tp) {
       if (x1 <= 0 || x1 <= x0) return;
       canvas.save();
@@ -9079,14 +9112,33 @@ class _SweepWordPainter extends CustomPainter {
       canvas.restore();
     }
 
-    // 亮档（前沿带之后到词头）+ 带内 n-1 档灰度阶梯（末档后接暗底）。
+    // 亮区（前沿渐变带之前）：直接 clipRect 叠亮档，零离屏。
     seg(0, math.min(front - band, size.width), stops[0]);
-    for (var i = 1; i < n; i++) {
-      seg(
-        front - band + band * (i - 1) / (n - 1),
-        math.min(front - band + band * i / (n - 1), size.width),
-        stops[i],
+    // 过渡带：带内小范围 saveLayer + 白→透明渐变遮罩（dstIn）做连续
+    // alpha 过渡，替换 5 档阶梯的可见台阶。带内左侧 alpha=1 无缝接亮
+    // 区，右侧渐降到 alpha=0 露出暗底，自然衔接未唱区；RGB 恒白仅变
+    // alpha 防 dstIn 乘法偏色。带宽被词边界压缩为 0 时该段自动跳过，
+    // 退化回纯 clipRect，逻辑等效。
+    final gx0 = math.max(0.0, front - band);
+    final gx1 = math.min(front, size.width);
+    if (gx1 > gx0 && gx1 > 0) {
+      final bandRect = Rect.fromLTWH(gx0, 0, gx1 - gx0, size.height);
+      canvas.save();
+      canvas.clipRect(bandRect);
+      canvas.saveLayer(bandRect, Paint());
+      stops[0].paint(canvas, Offset.zero);
+      canvas.drawRect(
+        bandRect,
+        Paint()
+          ..shader = ui.Gradient.linear(
+            Offset(gx0, 0),
+            Offset(gx1, 0),
+            [Colors.white, Colors.white.withValues(alpha: 0)],
+          )
+          ..blendMode = BlendMode.dstIn,
       );
+      canvas.restore();
+      canvas.restore();
     }
   }
 
