@@ -132,6 +132,8 @@ flutter:
     - assets/share_qzone.jpg
     - assets/creators/kaishui.jpg
     - assets/creators/qingci.jpg
+    - assets/weixin_qrcode.png
+    - assets/zfb_qrcode.jpg
 
   # To add assets to your application, add an assets section, like this:
   # assets:

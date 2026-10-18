@@ -7,9 +7,13 @@ import '../../src/ui/external_link.dart';
 import '../../src/update/app_update.dart';
 import '../../src/widgets/top_notice.dart' show XyNotice, XyNoticeType;
 import 'third_party_licenses_page.dart';
+import 'sponsor_page.dart';
 
 /// 项目主仓库地址。
 const String kProjectRepoUrl = 'https://github.com/kaishui-server/XY-Music-Mobile';
+
+/// 软件官网地址。
+const String kWebsiteUrl = 'https://xymusic.cc';
 
 /// 官方 QQ 交流群号。
 const String kQqGroupNumber = '656117919';
@@ -114,6 +118,23 @@ class AboutPage extends ConsumerWidget {
             ],
           ),
           const SizedBox(height: 18),
+          // 软件官网：点击跳转，长按复制。
+          _AboutCard(
+            children: [
+              _LinkRow(
+                icon: Icons.language_rounded,
+                title: '软件官网',
+                subtitle: 'xymusic.cc',
+                onTap: () => _openUrl(context, kWebsiteUrl),
+                onLongPress: () => _copyText(
+                  context,
+                  kWebsiteUrl,
+                  tip: '官网地址已复制',
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 18),
           _SectionLabel('创作者'),
           const SizedBox(height: 8),
           _AboutCard(
@@ -146,6 +167,22 @@ class AboutPage extends ConsumerWidget {
                 onTap: () => Navigator.of(context).push(
                   MaterialPageRoute<void>(
                     builder: (_) => const ThirdPartyLicensesPage(),
+                  ),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 18),
+          // 赞助：进入赞助页查看收款码。
+          _AboutCard(
+            children: [
+              _LinkRow(
+                icon: Icons.favorite_rounded,
+                title: '赞助',
+                subtitle: '支持开发者，查看收款码',
+                onTap: () => Navigator.of(context).push(
+                  MaterialPageRoute<void>(
+                    builder: (_) => const SponsorPage(),
                   ),
                 ),
               ),
