@@ -43,8 +43,8 @@ class VisualizerSettings {
   final double brightness; // 0..1
   // —— 主题颜色 ——
   final int themeIndex;
-  final double depthStrength; // 0..1 景深强度
   final bool explicitPlot; // 显式标绘图
+  final int terrainDensity; // 0..100 地形网格密度（默认 33 ≈ 64×64 柱体）
   // —— 音频检测 ——
   final double detectLevel; // 0..100 检测源灵敏度
   // —— Advanced 触发频段 ——
@@ -61,8 +61,8 @@ class VisualizerSettings {
     this.beatDuration = 10,
     this.brightness = 0.7,
     this.themeIndex = 0,
-    this.depthStrength = 0.5,
     this.explicitPlot = false,
+    this.terrainDensity = 33,
     this.detectLevel = 100,
     this.bandStart = 0,
     this.bandEnd = 7,
@@ -82,8 +82,8 @@ class VisualizerSettings {
     double? beatDuration,
     double? brightness,
     int? themeIndex,
-    double? depthStrength,
     bool? explicitPlot,
+    int? terrainDensity,
     double? detectLevel,
     int? bandStart,
     int? bandEnd,
@@ -97,8 +97,8 @@ class VisualizerSettings {
       beatDuration: beatDuration ?? this.beatDuration,
       brightness: brightness ?? this.brightness,
       themeIndex: themeIndex ?? this.themeIndex,
-      depthStrength: depthStrength ?? this.depthStrength,
       explicitPlot: explicitPlot ?? this.explicitPlot,
+      terrainDensity: terrainDensity ?? this.terrainDensity,
       detectLevel: detectLevel ?? this.detectLevel,
       bandStart: bandStart ?? this.bandStart,
       bandEnd: bandEnd ?? this.bandEnd,
@@ -114,8 +114,8 @@ class VisualizerSettings {
         'beatDuration': beatDuration,
         'brightness': brightness,
         'themeIndex': themeIndex,
-        'depthStrength': depthStrength,
         'explicitPlot': explicitPlot,
+        'terrainDensity': terrainDensity,
         'detectLevel': detectLevel,
         'bandStart': bandStart,
         'bandEnd': bandEnd,
@@ -131,8 +131,8 @@ class VisualizerSettings {
       beatDuration: (j['beatDuration'] as num?)?.toDouble() ?? 10,
       brightness: (j['brightness'] as num?)?.toDouble() ?? 0.7,
       themeIndex: (j['themeIndex'] as num?)?.toInt() ?? 0,
-      depthStrength: (j['depthStrength'] as num?)?.toDouble() ?? 0.5,
       explicitPlot: j['explicitPlot'] is bool ? j['explicitPlot'] : false,
+      terrainDensity: (j['terrainDensity'] as num?)?.toInt() ?? 33,
       detectLevel: (j['detectLevel'] as num?)?.toDouble() ?? 100,
       bandStart: (j['bandStart'] as num?)?.toInt() ?? 0,
       bandEnd: (j['bandEnd'] as num?)?.toInt() ?? 7,

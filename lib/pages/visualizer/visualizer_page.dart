@@ -1,31 +1,41 @@
-// visualizer_page.dart — 全屏音乐可视化页（5533 新增）。
+// visualizer_page.dart — 全屏音乐可视化页（5534 重写）。
 //
-// 复刻 sonic-topography 的核心形态：黑底粒子场景（地形/云海、星云两形态
-// 可切换）+ 左侧逐行歌词 + 底部毛玻璃播放条 + 左侧竖排形态/面板图标栏 +
-// 右侧设置抽屉（脉冲触发 / 主题颜色 / 音频检测）。
+// 1:1 对齐 sonic-topography 的核心体验：黑底 3D 场景（地形/云海、星云两
+// 形态可切换）+ 左侧逐行歌词 + 中央封面幽灵层 + 底部毛玻璃播放条 + 左侧
+// 竖排形态/面板图标栏 + 右侧设置抽屉（脉冲触发 / 主题颜色 / 音频检测）。
+// 页面锁定横屏；单指拖拽旋转视角（OrbitControls 语义）、双指缩放、
+// 点击/长按地形触发 ripple 波纹（按压时长映射强度 0.2~3.0）。
 //
-// 数据链：Android VisualizerBridge（输出混音 FFT，~20Hz）→
-// VisualizerSource（64 段对数频段 + 帧间平滑）→ BeatDetector（低频窗口
-// 谱通量节拍检测，移植 beatDetector.ts/kickEnvelope.ts）→ CustomPainter。
+// 数据链：Android VisualizerBridge（输出混音 FFT+waveform，~20Hz）→
+// VisualizerSource（64 段对数频段 + 帧间平滑 + FFT 失效波形兜底）→
+// BeatDetector（低频窗口谱通量节拍检测，移植 beatDetector.ts）→
+// CustomPainter（CPU 投影 + ui.Vertices）。
 //
 // 性能：场景渲染走 Ticker + repaint 通知器，歌词/进度条各自独立 watch，
 // 设置变更不触发场景重建。
 
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 import 'dart:math' as math;
+import 'dart:ui' as ui;
 import 'dart:ui' show ImageFilter;
 
 import 'package:flutter/material.dart';
 import 'package:flutter/scheduler.dart';
-import 'package:flutter/services.dart' show SystemUiOverlayStyle;
+import 'package:flutter/services.dart'
+    show SystemChrome, SystemUiOverlayStyle, DeviceOrientation;
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import '../../src/core/db_path.dart';
 import '../../src/player/beat_detector.dart';
 import '../../src/player/player_provider.dart';
 import '../../src/player/visualizer_source.dart';
 import '../../src/lyrics/lyrics_models.dart';
+import '../../src/rust/api.dart';
+import '../../src/widgets/cover_image.dart';
+import 'visualizer_engine.dart';
 import 'visualizer_scenes.dart';
 import 'visualizer_settings.dart';
 
@@ -49,14 +59,28 @@ class _VisualizerPageState extends ConsumerState<VisualizerPage>
 
   // 节拍链路状态。
   BeatDetectorState _beatState = createBeatDetectorState();
-  double _kickDeform = 0;
-  double _deformTarget = 0;
   bool _pendingOnset = false;
   double _lastEnvelope = 0;
   List<double> _displayBands = List.filled(kVisBandCount, 0);
   // 数据源状态。
   bool _sourceReady = false;
   bool _sourceFailed = false;
+  bool _noAudioHint = false; // 已启动但无音频输出提示
+
+  // 3D 相机 + ripple 缓冲（手势直接操作）。
+  final OrbitCamera _cam = OrbitCamera();
+  final VisRippleBuffer _ripples = VisRippleBuffer();
+
+  // 手势状态。
+  double? _pressAt; // 按下时刻（秒）
+  Offset? _pressPos;
+  Offset _lastFocal = Offset.zero;
+  double _lastScale = 1.0;
+  bool _inScale = false;
+
+  // 封面幽灵层（预处理后的低饱和提亮+遮罩图）。
+  ui.Image? _coverImage;
+  String? _coverKey;
 
   // UI 状态。
   _DrawerSection _drawer = _DrawerSection.none;
@@ -67,6 +91,9 @@ class _VisualizerPageState extends ConsumerState<VisualizerPage>
   @override
   void initState() {
     super.initState();
+    // 可视化仅限横屏：进入锁横屏，退出恢复。
+    SystemChrome.setPreferredOrientations(
+        const [DeviceOrientation.landscapeLeft, DeviceOrientation.landscapeRight]);
     _ticker = createTicker(_onTick)..start();
     unawaited(_bootSource());
   }
@@ -76,6 +103,7 @@ class _VisualizerPageState extends ConsumerState<VisualizerPage>
     _ticker?.dispose();
     _frameTick.dispose();
     unawaited(VisualizerSource.instance.stop());
+    SystemChrome.setPreferredOrientations(DeviceOrientation.values);
     super.dispose();
   }
 
@@ -140,16 +168,32 @@ class _VisualizerPageState extends ConsumerState<VisualizerPage>
       _lastEnvelope = 0;
     }
 
-    // —— 地形形变（节拍时长控制衰减速率）——
-    const maxDeform = 0.75;
-    final speed = 10.0 / math.max(0.5, settings.beatDuration);
+    // —— 节拍 ripple（对齐 MapScene onFreqTrigger：随机落点 + 强度上限 3）——
     if (_pendingOnset) {
-      _deformTarget = math.max(_deformTarget, maxDeform);
+      final rnd = math.Random();
+      final ang = rnd.nextDouble() * math.pi * 2;
+      final rad = math.sqrt(rnd.nextDouble()) * 20.0;
+      final strength = math.min(_lastEnvelope * 2.0, 3.0);
+      if (settings.form == VisualizerForm.terrain) {
+        _ripples.add(math.cos(ang) * rad, math.sin(ang) * rad, strength,
+            white: false, time: _time);
+      } else {
+        // 星云：ripple 落点用归一化偏移（-1..1）。
+        _ripples.add(math.cos(ang), math.sin(ang),
+            math.min(_lastEnvelope * 1.6, 2.2),
+            white: false, time: _time);
+      }
       _pendingOnset = false;
     }
-    _deformTarget = math.max(0, _deformTarget - _deformTarget * 10 * speed * dt);
-    _kickDeform += (_deformTarget - _kickDeform) *
-        (1 - math.exp(-18 * speed * dt));
+    // 地形形变已由 ripple 直接驱动（5534），保留节拍包络供核心辉光。
+
+    // —— 数据活跃度提示 ——
+    final active = _sourceReady && VisualizerSource.instance.hasData;
+    if (active && _noAudioHint) {
+      _noAudioHint = false;
+    } else if (!active && _sourceReady && !_noAudioHint) {
+      _noAudioHint = true;
+    }
 
     _frameTick.value++;
   }
@@ -160,11 +204,16 @@ class _VisualizerPageState extends ConsumerState<VisualizerPage>
     final player = ref.watch(playerProvider);
     final current = player.current;
 
-    // 歌曲切换时重载歌词偏移。
+    // 歌曲切换时重载歌词偏移 + 封面幽灵层。
     final songPath = current?.path ?? '';
     if (songPath.isNotEmpty && _offsetLoadedFor != songPath) {
       _offsetLoadedFor = songPath;
       unawaited(_loadLyricsOffset(songPath));
+    }
+    final coverKey = '$songPath\u0000${current?.coverUrl ?? ''}';
+    if (_coverKey != coverKey) {
+      _coverKey = coverKey;
+      unawaited(_loadCover(current));
     }
 
     return Scaffold(
@@ -174,14 +223,28 @@ class _VisualizerPageState extends ConsumerState<VisualizerPage>
         child: Stack(
           fit: StackFit.expand,
           children: [
-            // 场景层（Ticker 驱动，不随 riverpod 重建）。
+            // 场景层（Ticker 驱动，不随 riverpod 重建）+ 轨道相机手势。
             RepaintBoundary(
-              child: CustomPaint(
-                painter: settings.form == VisualizerForm.terrain
-                    ? TerrainScenePainter(_sceneData(settings))
-                    : NebulaScenePainter(_sceneData(settings)),
-                isComplex: true,
-                willChange: true,
+              child: GestureDetector(
+                behavior: HitTestBehavior.opaque,
+                onScaleStart: _onScaleStart,
+                onScaleUpdate: _onScaleUpdate,
+                onTapDown: (d) {
+                  _pressAt = _time;
+                  _pressPos = d.localPosition;
+                },
+                onTapUp: _onTapRelease,
+                onTapCancel: () {
+                  _pressAt = null;
+                  _pressPos = null;
+                },
+                child: CustomPaint(
+                  painter: settings.form == VisualizerForm.terrain
+                      ? TerrainScenePainter(_frame(settings))
+                      : NebulaScenePainter(_frame(settings)),
+                  isComplex: true,
+                  willChange: true,
+                ),
               ),
             ),
             // 歌词覆盖层。
@@ -203,9 +266,13 @@ class _VisualizerPageState extends ConsumerState<VisualizerPage>
                 onSelectDrawer: (s) => setState(() {
                   _drawer = _drawer == s ? _DrawerSection.none : s;
                 }),
-                onSelectForm: (f) => ref
-                    .read(visualizerSettingsProvider.notifier)
-                    .update((s) => s.copyWith(form: f)),
+                onSelectForm: (f) {
+                  // 切换形态时清空 ripple（两形态坐标系不同）。
+                  _ripples.clear();
+                  ref
+                      .read(visualizerSettingsProvider.notifier)
+                      .update((s) => s.copyWith(form: f));
+                },
               ),
             ),
             // 底部毛玻璃播放条。
@@ -223,12 +290,23 @@ class _VisualizerPageState extends ConsumerState<VisualizerPage>
               section: _drawer,
               onClose: () => setState(() => _drawer = _DrawerSection.none),
             ),
-            // 数据源失败提示（居中，短暂显示）。
+            // 数据源失败/无音频输出提示（居左下，短暂显示）。
             if (_sourceFailed)
               Positioned(
                 left: 68,
                 bottom: 150,
-                child: _SourceFailHint(onRetry: _retrySource),
+                child: _SourceFailHint(
+                  text: '频谱采集不可用（需要麦克风权限）',
+                  onRetry: _retrySource,
+                ),
+              )
+            else if (_noAudioHint)
+              Positioned(
+                left: 68,
+                bottom: 150,
+                child: _SourceFailHint(
+                  text: '未检测到音频输出，请播放音乐后重试',
+                ),
               ),
           ],
         ),
@@ -236,18 +314,189 @@ class _VisualizerPageState extends ConsumerState<VisualizerPage>
     );
   }
 
-  VisSceneData _sceneData(VisualizerSettings s) {
-    return VisSceneData(
+  // —— 轨道相机手势（OrbitControls 语义）——
+
+  void _onScaleStart(ScaleStartDetails d) {
+    _inScale = true;
+    _lastFocal = d.localFocalPoint;
+    _lastScale = 1.0;
+  }
+
+  void _onScaleUpdate(ScaleUpdateDetails d) {
+    final size = context.size;
+    if (size == null || !_inScale) return;
+    final delta = d.localFocalPoint - _lastFocal;
+    _lastFocal = d.localFocalPoint;
+    // 单指：纯旋转；双指：旋转+缩放（对齐 OrbitControls TOUCH.DOLLY_ROTATE）。
+    _cam.orbit(delta.dx, delta.dy, size.width, size.height);
+    if (d.pointerCount >= 2 && (d.scale - _lastScale).abs() > 0.0001) {
+      _cam.dolly(_lastScale / d.scale);
+      _lastScale = d.scale;
+    }
+  }
+
+  void _onTapRelease(TapUpDetails d) {
+    final pressAt = _pressAt;
+    _pressAt = null;
+    if (pressAt == null) return;
+    final settings = ref.read(visualizerSettingsProvider);
+    // 按压时长映射强度（对齐 sonic-topography：短按 0.2~0.4，长按至 3.0）。
+    final hold = (_time - pressAt).clamp(0.0, 3.0);
+    final strength =
+        hold < 0.25 ? 0.3 : math.min(0.2 + hold * 0.93, 3.0);
+    final pos = _pressPos ?? d.localPosition;
+    _pressPos = null;
+    if (settings.form == VisualizerForm.terrain) {
+      final gp = _cam.screenToGround(pos, context.size?.width ?? 1,
+          context.size?.height ?? 1);
+      if (gp == null) return;
+      final dist = math.sqrt(gp.dx * gp.dx + gp.dy * gp.dy);
+      if (dist > 84) return; // 地形范围外
+      _ripples.add(gp.dx, gp.dy, strength, white: false, time: _time);
+    } else {
+      // 星云：落点归一化到 -1..1。
+      final size = context.size;
+      if (size == null) return;
+      final nx = (pos.dx / size.width - 0.5) * 2;
+      final ny = (pos.dy / size.height - 0.5) * 2;
+      _ripples.add(nx.clamp(-1.0, 1.0), ny.clamp(-1.0, 1.0),
+          math.min(strength, 2.2), white: false, time: _time);
+    }
+  }
+
+  VisFrame _frame(VisualizerSettings s) {
+    return VisFrame(
       bands: _displayBands,
       kickEnvelope: s.pulseEnabled ? _lastEnvelope : 0,
-      kickDeform: s.pulseEnabled ? _kickDeform : 0,
       rms: VisualizerSource.instance.rms,
-      brightness: s.brightness,
-      depthStrength: s.depthStrength,
-      explicitPlot: s.explicitPlot,
       time: _time,
+      explicitPlot: s.explicitPlot,
       theme: s.theme,
+      brightness: s.brightness,
+      camera: _cam,
+      ripples: _ripples,
+      terrainDensity: s.terrainDensity,
+      coverImage: _coverImage,
     );
+  }
+
+  /// 封面幽灵层加载：在线封面走代理落盘缓存，本地歌走 ID3 提取；
+  /// 解码后预渲染「低饱和提亮 + 径向/垂直渐隐遮罩」版本（对齐
+  /// CoverShaderMaterial：baseOpacity 0.5、radialMask、horizonMask）。
+  Future<void> _loadCover(QueueItem? item) async {
+    try {
+      final songPath = item?.path ?? '';
+      if (songPath.isEmpty) {
+        if (mounted) setState(() => _coverImage = null);
+        return;
+      }
+      final coverUrl = normalizeCoverImageUrl(item?.coverUrl);
+      String? coverPath;
+      final cacheRoot = await ref.read(appDataDirProvider.future);
+      if (coverUrl.isEmpty) {
+        final dbPath = await ref.read(dbPathProvider.future);
+        coverPath = await getSongCover(
+          dbPath: dbPath,
+          cacheRoot: cacheRoot,
+          path: songPath,
+        );
+      } else {
+        final file =
+            File('$cacheRoot/vis_cover_${coverUrl.hashCode}.img');
+        if (!await file.exists() || await file.length() == 0) {
+          final dataUrl = await proxyImage(
+            url: coverUrl,
+            referer: 'https://music.163.com/',
+          );
+          final comma = dataUrl.indexOf(',');
+          if (comma > 0 && dataUrl.substring(0, comma).contains(';base64')) {
+            await file.writeAsBytes(
+              base64Decode(dataUrl.substring(comma + 1)),
+              flush: true,
+            );
+          }
+        }
+        if (await file.exists() && await file.length() > 0) {
+          coverPath = file.path;
+        }
+      }
+      if (coverPath == null || !File(coverPath).existsSync()) {
+        if (mounted) setState(() => _coverImage = null);
+        return;
+      }
+      final bytes = await File(coverPath).readAsBytes();
+      final codec =
+          await ui.instantiateImageCodec(bytes, targetWidth: 256);
+      final src = await codec.getNextFrame();
+      final masked = await _buildGhostCover(src.image);
+      src.image.dispose();
+      if (!mounted) return;
+      setState(() => _coverImage = masked);
+    } catch (_) {
+      if (mounted) setState(() => _coverImage = null);
+    }
+  }
+
+  /// 封面预处理：低饱和(25%)+提亮 mix(white,·,0.55) → 径向渐隐 → 垂直渐隐
+  /// → 整体 alpha 0.5。烘焙成一张图，每帧零离屏直接贴。
+  static Future<ui.Image> _buildGhostCover(ui.Image src) async {
+    const size = 256.0;
+    final rec = ui.PictureRecorder();
+    final c = ui.Canvas(rec, const Rect.fromLTWH(0, 0, size, size));
+    final dst = const Rect.fromLTWH(0, 0, size, size);
+    // ① 颜色：out = 0.55*(0.25*src + 0.75*gray(src)) + 0.45*255
+    const wr = 0.299, wg = 0.587, wb = 0.114;
+    c.drawImageRect(
+      src,
+      Rect.fromLTWH(0, 0, src.width.toDouble(), src.height.toDouble()),
+      dst,
+      Paint()
+        ..filterQuality = FilterQuality.medium
+        ..colorFilter = ColorFilter.matrix(<double>[
+          // R
+          0.55 * 0.25 + 0.55 * 0.75 * wr, 0.55 * 0.75 * wg,
+          0.55 * 0.75 * wb, 0, 0.45 * 255,
+          // G
+          0.55 * 0.75 * wr, 0.55 * 0.25 + 0.55 * 0.75 * wg,
+          0.55 * 0.75 * wb, 0, 0.45 * 255,
+          // B
+          0.55 * 0.75 * wr, 0.55 * 0.75 * wg,
+          0.55 * 0.25 + 0.55 * 0.75 * wb, 0, 0.45 * 255,
+          // A（baseOpacity 0.5）
+          0, 0, 0, 0.5, 0,
+        ]),
+    );
+    // ② 径向遮罩（radialMask：从中心立即衰减）。
+    c.saveLayer(dst, Paint());
+    c.drawRect(
+      dst,
+      Paint()
+        ..blendMode = ui.BlendMode.dstIn
+        ..shader = ui.Gradient.radial(
+          const Offset(size / 2, size / 2),
+          size * 0.62,
+          [const Color(0xFFFFFFFF), const Color(0x00FFFFFF)],
+          [0.0, 1.0],
+        ),
+    );
+    c.restore();
+    // ③ 垂直遮罩（horizonMask：smoothstep(0.05,0.45,v)，顶亮底隐）。
+    c.saveLayer(dst, Paint());
+    c.drawRect(
+      dst,
+      Paint()
+        ..blendMode = ui.BlendMode.dstIn
+        ..shader = ui.Gradient.linear(
+          const Offset(0, size * 0.05),
+          const Offset(0, size * 0.45),
+          [const Color(0x00FFFFFF), const Color(0xFFFFFFFF)],
+        ),
+    );
+    c.restore();
+    final pic = rec.endRecording();
+    final img = await pic.toImage(size.toInt(), size.toInt());
+    pic.dispose();
+    return img;
   }
 
   Future<void> _loadLyricsOffset(String path) async {
@@ -804,13 +1053,13 @@ class _SettingsDrawer extends ConsumerWidget {
                             ],
                           ),
                           _sliderRow(
-                            '景深强度',
-                            settings.depthStrength,
+                            '地形密度',
+                            settings.terrainDensity.toDouble(),
                             0,
-                            1,
-                            (v) => notifier
-                                .update((s) => s.copyWith(depthStrength: v)),
-                            label: settings.depthStrength.toStringAsFixed(1),
+                            100,
+                            (v) => notifier.update(
+                                (s) => s.copyWith(terrainDensity: v.round())),
+                            label: '${settings.terrainDensity}',
                           ),
                           _switchTile(
                             '显式标绘图',
@@ -978,8 +1227,9 @@ class _SettingsDrawer extends ConsumerWidget {
 // ---------------------------------------------------------------------------
 
 class _SourceFailHint extends StatelessWidget {
-  final VoidCallback onRetry;
-  const _SourceFailHint({required this.onRetry});
+  final String text;
+  final VoidCallback? onRetry;
+  const _SourceFailHint({required this.text, this.onRetry});
 
   @override
   Widget build(BuildContext context) {
@@ -996,19 +1246,21 @@ class _SourceFailHint extends StatelessWidget {
           const Icon(Icons.info_outline_rounded,
               size: 16, color: Colors.white70),
           const SizedBox(width: 8),
-          const Text(
-            '频谱采集不可用（需要麦克风权限）',
-            style: TextStyle(color: Colors.white70, fontSize: 12),
+          Text(
+            text,
+            style: const TextStyle(color: Colors.white70, fontSize: 12),
           ),
-          const SizedBox(width: 10),
-          GestureDetector(
-            onTap: onRetry,
-            child: const Text('重试',
-                style: TextStyle(
-                    color: Colors.white,
-                    fontSize: 12,
-                    fontWeight: FontWeight.bold)),
-          ),
+          if (onRetry != null) ...[
+            const SizedBox(width: 10),
+            GestureDetector(
+              onTap: onRetry,
+              child: const Text('重试',
+                  style: TextStyle(
+                      color: Colors.white,
+                      fontSize: 12,
+                      fontWeight: FontWeight.bold)),
+            ),
+          ],
         ],
       ),
     );

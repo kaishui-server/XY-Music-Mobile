@@ -97,7 +97,12 @@ object VisualizerBridge {
                     visualizer: Visualizer?,
                     waveform: ByteArray?,
                     samplingRate: Int,
-                ) = Unit
+                ) {
+                    val sink = eventSink ?: return
+                    val data = waveform ?: return
+                    val copy = data.copyOf()
+                    mainHandler.post { sink.success(arrayListOf<Any>("w", copy, samplingRate)) }
+                }
 
                 override fun onFftDataCapture(
                     visualizer: Visualizer?,
@@ -107,11 +112,11 @@ object VisualizerBridge {
                     val sink = eventSink ?: return
                     val data = fft ?: return
                     val copy = data.copyOf()
-                    mainHandler.post { sink.success(copy) }
+                    mainHandler.post { sink.success(arrayListOf<Any>("f", copy)) }
                 }
             },
             Visualizer.getMaxCaptureRate(),
-            false,
+            true,
             true,
         )
         v.enabled = true
