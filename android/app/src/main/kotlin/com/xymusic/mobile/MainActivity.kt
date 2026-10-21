@@ -522,6 +522,8 @@ class MainActivity : AudioServiceActivity() {
         super.configureFlutterEngine(flutterEngine)
         StoragePermissionBridge.register(this, flutterEngine)
         BluetoothLyricsLink.register(flutterEngine.dartExecutor.binaryMessenger, this)
+        // 可视化频谱桥：输出混音 FFT 采集（音乐可视化页数据源）。
+        VisualizerBridge.register(flutterEngine.dartExecutor.binaryMessenger, this)
         // 通知栏&锁屏实时歌词：Flutter 推送元数据+LRC+进度锚点+播放态，
         // 原生侧按墙钟推进当前行并更新 RemoteViews（华为防越权：不申请
         // 额外权限、仅标准字段与静态布局、全部路径 try/catch 兜底）。

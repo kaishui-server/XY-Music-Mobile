@@ -4484,6 +4484,17 @@ class _PlayerMoreSheetState extends ConsumerState<_PlayerMoreSheet> {
                         value: effectsActive ? '开' : '关',
                         onOpen: widget.onShowEffects,
                       ),
+                      // 全屏音乐可视化页（粒子地形/星云 + 歌词 + 脉冲触发）。
+                      _panelRow(
+                        context,
+                        icon: Icons.graphic_eq_rounded,
+                        title: '音乐可视化',
+                        value: '',
+                        onOpen: () {
+                          Navigator.pop(context);
+                          context.push('/visualizer');
+                        },
+                      ),
                       // 应用内音量：与设置页滑杆/音量键同源（settingsProvider.
                       // setVolume），拖动实时下发、弹层不收起；悬浮窗音量条
                       // 同源跟随。行高与 _settingRow 对齐（52），避免弹层

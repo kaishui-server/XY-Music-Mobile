@@ -6,6 +6,7 @@ import '../../pages/explore/explore_page.dart';
 import '../../pages/library/library_page.dart';
 import '../../pages/library/music_library_page.dart';
 import '../../pages/effects/effects_page.dart';
+import '../../pages/visualizer/visualizer_page.dart';
 import '../../pages/search/search_page.dart';
 import '../../pages/favorites/favorites_page.dart';
 import '../../pages/recent/recent_page.dart';
@@ -507,6 +508,12 @@ final appRouter = GoRouter(
       path: '/effects-page',
       pageBuilder: (context, state) =>
           _instantPage(state, const EffectsPage(showBackButton: true)),
+    ),
+    // 全屏音乐可视化页：从播放页更多菜单进入。
+    GoRoute(
+      path: '/visualizer',
+      pageBuilder: (context, state) =>
+          _instantPage(state, const VisualizerPage()),
     ),
     // 搜索页同为全屏覆盖。
     GoRoute(
