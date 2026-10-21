@@ -408,6 +408,8 @@ class EffectsNotifier extends AsyncNotifier<EffectsSettings> {
     await save(current.copyWith(clearAnimeEffect: true));
   }
 
+  /// 一键重置：关闭并还原所有音效设置为默认（anime 音效选中态、十段
+  /// 均衡器、变速变调等全部还原），自定义 EQ 预设一并清空。
   Future<void> resetAll() async {
     _customEqPresets = const [];
     await save(const EffectsSettings());

@@ -67,15 +67,22 @@ class _EffectsPageState extends ConsumerState<EffectsPage> {
       appBar: AppBar(
         title: const Text('音效'),
         automaticallyImplyLeading: widget.showBackButton,
+        actions: [
+          TextButton(
+            onPressed: () =>
+                unawaited(ref.read(effectsProvider.notifier).resetAll()),
+            child: const Text('一键重置'),
+          ),
+        ],
       ),
       body: ListView(
         padding: const EdgeInsets.fromLTRB(16, 8, 16, 32),
         children: [
-          _buildAnimeSection(theme, fx),
-          const SizedBox(height: 20),
           _buildEqualizerSection(theme, fx),
           const SizedBox(height: 20),
           _buildSpeedPitchSection(theme, fx),
+          const SizedBox(height: 20),
+          _buildAnimeSection(theme, fx),
         ],
       ),
     );
@@ -140,7 +147,7 @@ class _EffectsPageState extends ConsumerState<EffectsPage> {
     double max,
     int divisions,
     String Function(double) label,
-    ValueChanged<double> onChanged,
+    ValueChanged<double>? onChanged,
   ) {
     final theme = Theme.of(context);
     return Padding(
@@ -175,7 +182,7 @@ class _EffectsPageState extends ConsumerState<EffectsPage> {
     );
   }
 
-  // --------------------------------------------------------- ① anime 音效广场
+  // --------------------------------------------------------- anime 音效广场
 
   Widget _buildAnimeSection(ThemeData theme, EffectsSettings fx) {
     return Column(
@@ -220,16 +227,6 @@ class _EffectsPageState extends ConsumerState<EffectsPage> {
                     ),
                   ),
                 if (_effects != null && _effects!.isNotEmpty) ...[
-                  _buildAnimeTile(
-                    theme,
-                    name: '不使用音效',
-                    intro: '关闭 anime 音效，恢复原始声音',
-                    author: null,
-                    official: false,
-                    selected: !fx.hasAnimeEffect,
-                    onTap: () => unawaited(
-                        ref.read(effectsProvider.notifier).clearAnimeEffect()),
-                  ),
                   _buildAnimeGroup(theme, '官方精选',
                       _effects!.where((e) => e.official).toList(), fx),
                   _buildAnimeGroup(theme, '用户创作',
@@ -295,16 +292,21 @@ class _EffectsPageState extends ConsumerState<EffectsPage> {
               style: theme.textTheme.bodySmall
                   ?.copyWith(color: theme.colorScheme.outline)),
         ),
-        ...items.map((e) => _buildAnimeTile(
-              theme,
-              name: e.name,
-              intro: e.intro,
-              author: e.author,
-              official: e.official,
-              selected: fx.animeEffectId == e.id,
-              onTap: () => unawaited(
-                  ref.read(effectsProvider.notifier).setAnimeEffect(e)),
-            )),
+        ...items.map((e) {
+          final selected = fx.animeEffectId == e.id;
+          return _buildAnimeTile(
+            theme,
+            name: e.name,
+            intro: e.intro,
+            author: e.author,
+            official: e.official,
+            selected: selected,
+            // 单项开关：开启即生效（单选互斥，原开关自动关闭），关闭即停用。
+            onToggle: (on) => unawaited(on
+                ? ref.read(effectsProvider.notifier).setAnimeEffect(e)
+                : ref.read(effectsProvider.notifier).clearAnimeEffect()),
+          );
+        }),
       ],
     );
   }
@@ -316,12 +318,12 @@ class _EffectsPageState extends ConsumerState<EffectsPage> {
     required String? author,
     required bool official,
     required bool selected,
-    required VoidCallback onTap,
+    required ValueChanged<bool> onToggle,
   }) {
     final accent = theme.colorScheme.primary;
     return ListTile(
       dense: true,
-      onTap: onTap,
+      onTap: () => onToggle(!selected),
       tileColor: selected ? accent.withValues(alpha: 0.08) : null,
       title: Row(
         children: [
@@ -338,10 +340,6 @@ class _EffectsPageState extends ConsumerState<EffectsPage> {
           ),
           const SizedBox(width: 6),
           if (official) _buildBadge(theme, '官方', accent),
-          if (selected) ...[
-            const SizedBox(width: 6),
-            Icon(Icons.check_circle, size: 16, color: accent),
-          ],
         ],
       ),
       subtitle: Column(
@@ -368,6 +366,7 @@ class _EffectsPageState extends ConsumerState<EffectsPage> {
             ),
         ],
       ),
+      trailing: Switch(value: selected, onChanged: onToggle),
     );
   }
 
@@ -409,7 +408,11 @@ class _EffectsPageState extends ConsumerState<EffectsPage> {
                 12,
                 48,
                 (v) => '${v.toStringAsFixed(1)} dB',
-                (v) => unawaited(notifier.save(fx.copyWith(preamp: v))),
+                // 开关关闭时禁止调整（与滑杆组/预设一致）。
+                fx.equalizerEnabled
+                    ? (v) =>
+                        unawaited(notifier.save(fx.copyWith(preamp: v)))
+                    : null,
               ),
               // 内置预设
               Padding(
@@ -421,8 +424,10 @@ class _EffectsPageState extends ConsumerState<EffectsPage> {
                     for (final p in eqPresets)
                       ActionChip(
                         label: Text(p.name),
-                        onPressed: () =>
-                            unawaited(notifier.applyEqPreset(p.name)),
+                        onPressed: fx.equalizerEnabled
+                            ? () =>
+                                unawaited(notifier.applyEqPreset(p.name))
+                            : null,
                       ),
                   ],
                 ),
@@ -437,7 +442,9 @@ class _EffectsPageState extends ConsumerState<EffectsPage> {
                             ?.copyWith(color: theme.colorScheme.outline)),
                     const Spacer(),
                     TextButton.icon(
-                      onPressed: () => _showSaveCustomPresetDialog(theme),
+                      onPressed: fx.equalizerEnabled
+                          ? () => _showSaveCustomPresetDialog(theme)
+                          : null,
                       icon: const Icon(Icons.add, size: 16),
                       label: const Text('保存当前'),
                     ),
@@ -454,8 +461,10 @@ class _EffectsPageState extends ConsumerState<EffectsPage> {
                       for (final p in customPresets)
                         InputChip(
                           label: Text(p.name),
-                          onPressed: () =>
-                              unawaited(notifier.applyCustomEqPreset(p.name)),
+                          onPressed: fx.equalizerEnabled
+                              ? () => unawaited(
+                                  notifier.applyCustomEqPreset(p.name))
+                              : null,
                           onDeleted: () =>
                               unawaited(notifier.deleteCustomEqPreset(p.name)),
                         ),
@@ -468,7 +477,9 @@ class _EffectsPageState extends ConsumerState<EffectsPage> {
                 child: Align(
                   alignment: Alignment.centerRight,
                   child: TextButton(
-                    onPressed: () => unawaited(notifier.resetEqualizer()),
+                    onPressed: fx.equalizerEnabled
+                        ? () => unawaited(notifier.resetEqualizer())
+                        : null,
                     child: const Text('重置均衡器'),
                   ),
                 ),
@@ -506,8 +517,9 @@ class _EffectsPageState extends ConsumerState<EffectsPage> {
                             value: fx.gains[i].clamp(-12, 12),
                             min: -12,
                             max: 12,
-                            onChanged: (v) =>
-                                unawaited(notifier.setBand(i, v)),
+                            onChanged: fx.equalizerEnabled
+                                ? (v) => unawaited(notifier.setBand(i, v))
+                                : null,
                           ),
                         ),
                       ),
