@@ -447,30 +447,34 @@ class TerrainScenePainter extends CustomPainter {
       final top = topCols[i];
       final sTop = sideTopCols[i];
       final sBot = sideBotCols[i];
-      // 四个顶角 + 可见侧面底角。
-      final ax = wx - hw, az = wz - hw;
-      final bx = wx + hw, bz = wz - hw;
-      final cx2 = wx + hw, cz2 = wz + hw;
-      final dx2 = wx - hw, dz2 = wz + hw;
-      final pa = rig.project(ax, h, az);
-      final pb = rig.project(bx, h, bz);
-      final pc = rig.project(cx2, h, cz2);
-      final pd = rig.project(dx2, h, dz2);
+      // 四个顶角。
+      final pa = rig.project(wx - hw, h, wz - hw);
+      final pb = rig.project(wx + hw, h, wz - hw);
+      final pc = rig.project(wx + hw, h, wz + hw);
+      final pd = rig.project(wx - hw, h, wz + hw);
       if (pa == null || pb == null || pc == null || pd == null) continue;
-      // 可见侧面（法线朝相机的两个正交面）。
+      // 可见侧面（法线朝相机的两个正交面），顶/底点按 x(或 z) 端点显式取，
+      // 保证顶底一一配对。
       final exX = wx + fxSign * hw; // X 面外沿 x
       final ezZ = wz + fzSign * hw; // Z 面外沿 z
-      // X 面：顶边 (exX, h, wz∓hw) — 对应 pb/pc（fxSign=+1）或 pa/pd（-1）。
-      final bx0 = rig.project(exX, 0, fxSign > 0 ? bz : az);
-      final bx1 = rig.project(exX, 0, fxSign > 0 ? cz2 : dz2);
-      final tx0 = fxSign > 0 ? pb : pa;
-      final tx1 = fxSign > 0 ? pc : pd;
-      // Z 面：顶边 (wx∓hw, h, ezZ) — pc/pd（fzSign=+1）或 pb/pa（-1）。
-      final bz0 = rig.project(fxSign > 0 ? bx : ax, 0, ezZ);
-      final bz1 = rig.project(fzSign > 0 ? dx2 : cx2, 0, ezZ);
-      final tz0 = fzSign > 0 ? pc : pb;
-      final tz1 = fzSign > 0 ? pd : pa;
-      if (bx0 == null || bx1 == null || bz0 == null || bz1 == null) continue;
+      final tx0 = rig.project(exX, h, wz - hw);
+      final tx1 = rig.project(exX, h, wz + hw);
+      final bx0 = rig.project(exX, 0, wz - hw);
+      final bx1 = rig.project(exX, 0, wz + hw);
+      final tz0 = rig.project(wx + hw, h, ezZ);
+      final tz1 = rig.project(wx - hw, h, ezZ);
+      final bz0 = rig.project(wx + hw, 0, ezZ);
+      final bz1 = rig.project(wx - hw, 0, ezZ);
+      if (tx0 == null ||
+          tx1 == null ||
+          bx0 == null ||
+          bx1 == null ||
+          tz0 == null ||
+          tz1 == null ||
+          bz0 == null ||
+          bz1 == null) {
+        continue;
+      }
 
       // 顶面两三角（A,B,C + A,C,D）。
       emit(pa, top); emit(pb, top); emit(pc, top);

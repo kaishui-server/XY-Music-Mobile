@@ -81,6 +81,7 @@ class _VisualizerPageState extends ConsumerState<VisualizerPage>
   // 封面幽灵层（预处理后的低饱和提亮+遮罩图）。
   ui.Image? _coverImage;
   String? _coverKey;
+  String? _coverSourcePath; // 原始封面文件路径（播放栏缩略图用）
 
   // UI 状态。
   _DrawerSection _drawer = _DrawerSection.none;
@@ -249,33 +250,13 @@ class _VisualizerPageState extends ConsumerState<VisualizerPage>
             ),
             // 歌词覆盖层。
             Positioned(
-              left: 68,
+              left: 16,
               right: 24,
               top: 0,
-              bottom: 132,
+              bottom: 140,
               child: _LyricsOverlay(offsetTenths: _lyricsOffsetTenths),
             ),
-            // 左上返回 + 左侧图标栏。
-            Positioned(
-              left: 10,
-              top: 46,
-              child: _Rail(
-                activeDrawer: _drawer,
-                form: settings.form,
-                theme: settings.theme,
-                onSelectDrawer: (s) => setState(() {
-                  _drawer = _drawer == s ? _DrawerSection.none : s;
-                }),
-                onSelectForm: (f) {
-                  // 切换形态时清空 ripple（两形态坐标系不同）。
-                  _ripples.clear();
-                  ref
-                      .read(visualizerSettingsProvider.notifier)
-                      .update((s) => s.copyWith(form: f));
-                },
-              ),
-            ),
-            // 底部毛玻璃播放条。
+            // 底部毛玻璃播放条（循环/上一/播放/下一/队列/设置，对齐参考图）。
             Positioned(
               left: 16,
               right: 16,
@@ -283,17 +264,30 @@ class _VisualizerPageState extends ConsumerState<VisualizerPage>
               child: _GlassPlayBar(
                 songPath: songPath,
                 title: current?.title ?? '未在播放',
+                coverPath: _coverSourcePath,
+                onOpenSettings: () => setState(() {
+                  _drawer =
+                      _drawer == _DrawerSection.none ? _DrawerSection.theme : _DrawerSection.none;
+                }),
               ),
             ),
             // 右侧设置抽屉。
             _SettingsDrawer(
               section: _drawer,
               onClose: () => setState(() => _drawer = _DrawerSection.none),
+              onFormChanged: (f) {
+                // 切换形态时清空 ripple（两形态坐标系不同）。
+                _ripples.clear();
+                ref
+                    .read(visualizerSettingsProvider.notifier)
+                    .update((s) => s.copyWith(form: f));
+              },
+              onSectionChanged: (s) => setState(() => _drawer = s),
             ),
             // 数据源失败/无音频输出提示（居左下，短暂显示）。
             if (_sourceFailed)
               Positioned(
-                left: 68,
+                left: 16,
                 bottom: 150,
                 child: _SourceFailHint(
                   text: '频谱采集不可用（需要麦克风权限）',
@@ -302,7 +296,7 @@ class _VisualizerPageState extends ConsumerState<VisualizerPage>
               )
             else if (_noAudioHint)
               Positioned(
-                left: 68,
+                left: 16,
                 bottom: 150,
                 child: _SourceFailHint(
                   text: '未检测到音频输出，请播放音乐后重试',
@@ -387,7 +381,12 @@ class _VisualizerPageState extends ConsumerState<VisualizerPage>
     try {
       final songPath = item?.path ?? '';
       if (songPath.isEmpty) {
-        if (mounted) setState(() => _coverImage = null);
+        if (mounted) {
+          setState(() {
+            _coverImage = null;
+            _coverSourcePath = null;
+          });
+        }
         return;
       }
       final coverUrl = normalizeCoverImageUrl(item?.coverUrl);
@@ -421,7 +420,12 @@ class _VisualizerPageState extends ConsumerState<VisualizerPage>
         }
       }
       if (coverPath == null || !File(coverPath).existsSync()) {
-        if (mounted) setState(() => _coverImage = null);
+        if (mounted) {
+          setState(() {
+            _coverImage = null;
+            _coverSourcePath = null;
+          });
+        }
         return;
       }
       final bytes = await File(coverPath).readAsBytes();
@@ -431,9 +435,17 @@ class _VisualizerPageState extends ConsumerState<VisualizerPage>
       final masked = await _buildGhostCover(src.image);
       src.image.dispose();
       if (!mounted) return;
-      setState(() => _coverImage = masked);
+      setState(() {
+        _coverImage = masked;
+        _coverSourcePath = coverPath;
+      });
     } catch (_) {
-      if (mounted) setState(() => _coverImage = null);
+      if (mounted) {
+        setState(() {
+          _coverImage = null;
+          _coverSourcePath = null;
+        });
+      }
     }
   }
 
@@ -510,102 +522,6 @@ class _VisualizerPageState extends ConsumerState<VisualizerPage>
         setState(() => _lyricsOffsetTenths = v.toInt());
       }
     } catch (_) {}
-  }
-}
-
-// ---------------------------------------------------------------------------
-// 左侧图标栏：主题颜色 / 地形 / 星云 / 脉冲触发 / 音频检测
-// ---------------------------------------------------------------------------
-
-class _Rail extends StatelessWidget {
-  final _DrawerSection activeDrawer;
-  final VisualizerForm form;
-  final VisTheme theme;
-  final ValueChanged<_DrawerSection> onSelectDrawer;
-  final ValueChanged<VisualizerForm> onSelectForm;
-
-  const _Rail({
-    required this.activeDrawer,
-    required this.form,
-    required this.theme,
-    required this.onSelectDrawer,
-    required this.onSelectForm,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    final railColor = Color(theme.main).withValues(alpha: 0.8);
-    Widget btn({
-      required IconData icon,
-      required bool active,
-      required VoidCallback onTap,
-      String? tooltip,
-    }) {
-      return Tooltip(
-        message: tooltip ?? '',
-        child: Material(
-          color: Colors.white.withValues(alpha: active ? 0.16 : 0.06),
-          borderRadius: BorderRadius.circular(12),
-          child: InkWell(
-            borderRadius: BorderRadius.circular(12),
-            onTap: onTap,
-            child: SizedBox(
-              width: 42,
-              height: 42,
-              child: Icon(icon, size: 21, color: railColor),
-            ),
-          ),
-        ),
-      );
-    }
-
-    return Column(
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        // 返回播放页。
-        btn(
-          icon: Icons.keyboard_arrow_down_rounded,
-          active: false,
-          tooltip: '返回',
-          onTap: () => Navigator.of(context).maybePop(),
-        ),
-        const SizedBox(height: 10),
-        btn(
-          icon: Icons.palette_rounded,
-          active: activeDrawer == _DrawerSection.theme,
-          tooltip: '主题颜色',
-          onTap: () => onSelectDrawer(_DrawerSection.theme),
-        ),
-        const SizedBox(height: 8),
-        btn(
-          icon: Icons.landscape_rounded,
-          active: form == VisualizerForm.terrain,
-          tooltip: '地形',
-          onTap: () => onSelectForm(VisualizerForm.terrain),
-        ),
-        const SizedBox(height: 8),
-        btn(
-          icon: Icons.blur_on_rounded,
-          active: form == VisualizerForm.nebula,
-          tooltip: '星云',
-          onTap: () => onSelectForm(VisualizerForm.nebula),
-        ),
-        const SizedBox(height: 8),
-        btn(
-          icon: Icons.bolt_rounded,
-          active: activeDrawer == _DrawerSection.pulse,
-          tooltip: '脉冲触发',
-          onTap: () => onSelectDrawer(_DrawerSection.pulse),
-        ),
-        const SizedBox(height: 8),
-        btn(
-          icon: Icons.graphic_eq_rounded,
-          active: activeDrawer == _DrawerSection.detect,
-          tooltip: '音频检测',
-          onTap: () => onSelectDrawer(_DrawerSection.detect),
-        ),
-      ],
-    );
   }
 }
 
@@ -746,13 +662,21 @@ class _LyricsOverlayState extends ConsumerState<_LyricsOverlay> {
 }
 
 // ---------------------------------------------------------------------------
-// 底部毛玻璃播放条：进度 + 上一首/播放暂停/下一首。
+// 底部毛玻璃播放条：封面缩略图 + 进度 + 循环/上一首/播放暂停/下一首/
+// 播放队列/设置（对齐参考图布局）。
 // ---------------------------------------------------------------------------
 
 class _GlassPlayBar extends ConsumerStatefulWidget {
   final String songPath;
   final String title;
-  const _GlassPlayBar({required this.songPath, required this.title});
+  final String? coverPath; // 原始封面文件路径（缩略图）
+  final VoidCallback onOpenSettings;
+  const _GlassPlayBar({
+    required this.songPath,
+    required this.title,
+    required this.coverPath,
+    required this.onOpenSettings,
+  });
 
   @override
   ConsumerState<_GlassPlayBar> createState() => _GlassPlayBarState();
@@ -768,6 +692,71 @@ class _GlassPlayBarState extends ConsumerState<_GlassPlayBar> {
     return '$m:${s.toString().padLeft(2, '0')}';
   }
 
+  /// 播放队列面板：列表 + 当前行高亮，点击切歌。
+  void _showQueue() {
+    final player = ref.read(playerProvider);
+    final queue = player.queue;
+    final currentIdx = player.queueIndex;
+    showModalBottomSheet<void>(
+      context: context,
+      backgroundColor: const Color(0xEE101418),
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
+      builder: (ctx) => SafeArea(
+        child: ListView.builder(
+          padding: const EdgeInsets.symmetric(vertical: 10),
+          itemCount: queue.length,
+          itemBuilder: (ctx, i) {
+            final song = queue[i];
+            final active = i == currentIdx;
+            return ListTile(
+              dense: true,
+              leading: Text(
+                '${i + 1}',
+                style: TextStyle(
+                  color: active ? Colors.white : Colors.white54,
+                  fontSize: 12,
+                  fontFeatures: const [FontFeature.tabularFigures()],
+                ),
+              ),
+              title: Text(
+                song.title,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(
+                  color: active ? Colors.white : Colors.white.withValues(alpha: 0.78),
+                  fontSize: 14,
+                  fontWeight: active ? FontWeight.bold : FontWeight.w400,
+                ),
+              ),
+              subtitle: song.artist.isEmpty
+                  ? null
+                  : Text(
+                      song.artist,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        color: Colors.white.withValues(alpha: 0.45),
+                        fontSize: 11,
+                      ),
+                    ),
+              trailing: active
+                  ? Icon(Icons.graphic_eq_rounded,
+                      size: 16, color: Colors.white.withValues(alpha: 0.8))
+                  : null,
+              onTap: () {
+                Navigator.of(ctx).pop();
+                unawaited(
+                    ref.read(playerProvider.notifier).playIndex(i));
+              },
+            );
+          },
+        ),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final isPlaying =
@@ -776,6 +765,17 @@ class _GlassPlayBarState extends ConsumerState<_GlassPlayBar> {
         ref.watch(playerProvider.select((s) => s.position));
     final duration =
         ref.watch(playerProvider.select((s) => s.duration));
+    final playMode =
+        ref.watch(playerProvider.select((s) => s.playMode));
+    final queueLen = ref
+        .watch(playerProvider.select((s) => s.queue.length));
+    final notifier = ref.read(playerProvider.notifier);
+    const loopIcons = [
+      Icons.repeat_rounded,
+      Icons.repeat_one_rounded,
+      Icons.shuffle_rounded,
+    ];
+    final cover = widget.coverPath;
 
     return ClipRRect(
       borderRadius: BorderRadius.circular(22),
@@ -790,91 +790,150 @@ class _GlassPlayBarState extends ConsumerState<_GlassPlayBar> {
               color: Colors.white.withValues(alpha: 0.10),
             ),
           ),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
+          child: Row(
+            crossAxisAlignment: CrossAxisAlignment.center,
             children: [
-              Row(
-                children: [
-                  Text(_fmt(position),
-                      style: TextStyle(
-                        color: Colors.white.withValues(alpha: 0.65),
-                        fontSize: 11,
-                        fontFeatures: const [FontFeature.tabularFigures()],
-                      )),
-                  Expanded(
-                    child: SliderTheme(
-                      data: SliderTheme.of(context).copyWith(
-                        trackHeight: 2.5,
-                        overlayShape: SliderComponentShape.noOverlay,
-                        thumbShape:
-                            const RoundSliderThumbShape(enabledThumbRadius: 5),
-                        activeTrackColor: Colors.white.withValues(alpha: 0.85),
-                        inactiveTrackColor:
-                            Colors.white.withValues(alpha: 0.16),
-                        thumbColor: Colors.white,
+              // 封面缩略图。
+              ClipRRect(
+                borderRadius: BorderRadius.circular(12),
+                child: cover != null && File(cover).existsSync()
+                    ? Image.file(
+                        File(cover),
+                        width: 46,
+                        height: 46,
+                        fit: BoxFit.cover,
+                        gaplessPlayback: true,
+                      )
+                    : Container(
+                        width: 46,
+                        height: 46,
+                        color: Colors.white.withValues(alpha: 0.08),
+                        child: const Icon(Icons.music_note_rounded,
+                            size: 20, color: Colors.white38),
                       ),
-                      child: Slider(
-                        value: _dragValue ??
-                            position.clamp(0.0, duration > 0 ? duration : 1),
-                        max: duration > 0 ? duration : 1,
-                        onChanged: duration > 0
-                            ? (v) => setState(() => _dragValue = v)
-                            : null,
-                        onChangeEnd: (v) {
-                          _dragValue = null;
-                          unawaited(
-                              ref.read(playerProvider.notifier).seek(v));
-                        },
-                      ),
-                    ),
-                  ),
-                  Text(_fmt(duration),
-                      style: TextStyle(
-                        color: Colors.white.withValues(alpha: 0.65),
-                        fontSize: 11,
-                        fontFeatures: const [FontFeature.tabularFigures()],
-                      )),
-                ],
               ),
-              const SizedBox(height: 2),
-              Row(
-                mainAxisAlignment: MainAxisAlignment.center,
-                children: [
-                  IconButton(
-                    onPressed: () => unawaited(
-                        ref.read(playerProvider.notifier).previous()),
-                    icon: const Icon(Icons.skip_previous_rounded,
-                        color: Colors.white, size: 28),
-                  ),
-                  const SizedBox(width: 14),
-                  Material(
-                    color: Colors.white.withValues(alpha: 0.14),
-                    shape: const CircleBorder(),
-                    child: InkWell(
-                      customBorder: const CircleBorder(),
-                      onTap: () => unawaited(
-                          ref.read(playerProvider.notifier).toggle()),
-                      child: SizedBox(
-                        width: 52,
-                        height: 52,
-                        child: Icon(
-                          isPlaying
-                              ? Icons.pause_rounded
-                              : Icons.play_arrow_rounded,
-                          color: Colors.white,
-                          size: 32,
+              const SizedBox(width: 14),
+              Expanded(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Row(
+                      children: [
+                        Text(_fmt(position),
+                            style: TextStyle(
+                              color: Colors.white.withValues(alpha: 0.65),
+                              fontSize: 11,
+                              fontFeatures: const [FontFeature.tabularFigures()],
+                            )),
+                        Expanded(
+                          child: SliderTheme(
+                            data: SliderTheme.of(context).copyWith(
+                              trackHeight: 2.5,
+                              overlayShape: SliderComponentShape.noOverlay,
+                              thumbShape:
+                                  const RoundSliderThumbShape(enabledThumbRadius: 5),
+                              activeTrackColor: Colors.white.withValues(alpha: 0.85),
+                              inactiveTrackColor:
+                                  Colors.white.withValues(alpha: 0.16),
+                              thumbColor: Colors.white,
+                            ),
+                            child: Slider(
+                              value: _dragValue ??
+                                  position.clamp(0.0, duration > 0 ? duration : 1),
+                              max: duration > 0 ? duration : 1,
+                              onChanged: duration > 0
+                                  ? (v) => setState(() => _dragValue = v)
+                                  : null,
+                              onChangeEnd: (v) {
+                                _dragValue = null;
+                                unawaited(
+                                    ref.read(playerProvider.notifier).seek(v));
+                              },
+                            ),
+                          ),
                         ),
-                      ),
+                        Text(_fmt(duration),
+                            style: TextStyle(
+                              color: Colors.white.withValues(alpha: 0.65),
+                              fontSize: 11,
+                              fontFeatures: const [FontFeature.tabularFigures()],
+                            )),
+                      ],
                     ),
-                  ),
-                  const SizedBox(width: 14),
-                  IconButton(
-                    onPressed: () => unawaited(
-                        ref.read(playerProvider.notifier).next()),
-                    icon: const Icon(Icons.skip_next_rounded,
-                        color: Colors.white, size: 28),
-                  ),
-                ],
+                    const SizedBox(height: 2),
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        // 播放顺序（循环模式三态）。
+                        IconButton(
+                          tooltip: '播放顺序',
+                          onPressed: () =>
+                              unawaited(notifier.cyclePlayMode()),
+                          icon: Icon(
+                            loopIcons[playMode.clamp(0, 2)],
+                            size: 22,
+                            color: Colors.white.withValues(alpha: 0.85),
+                          ),
+                        ),
+                        const SizedBox(width: 10),
+                        IconButton(
+                          onPressed: () =>
+                              unawaited(notifier.previous()),
+                          icon: const Icon(Icons.skip_previous_rounded,
+                              color: Colors.white, size: 28),
+                        ),
+                        const SizedBox(width: 10),
+                        Material(
+                          color: Colors.white.withValues(alpha: 0.14),
+                          shape: const CircleBorder(),
+                          child: InkWell(
+                            customBorder: const CircleBorder(),
+                            onTap: () =>
+                                unawaited(notifier.toggle()),
+                            child: SizedBox(
+                              width: 50,
+                              height: 50,
+                              child: Icon(
+                                isPlaying
+                                    ? Icons.pause_rounded
+                                    : Icons.play_arrow_rounded,
+                                color: Colors.white,
+                                size: 30,
+                              ),
+                            ),
+                          ),
+                        ),
+                        const SizedBox(width: 10),
+                        IconButton(
+                          onPressed: () => unawaited(notifier.next()),
+                          icon: const Icon(Icons.skip_next_rounded,
+                              color: Colors.white, size: 28),
+                        ),
+                        const SizedBox(width: 10),
+                        IconButton(
+                          tooltip: '播放队列',
+                          onPressed: queueLen > 0 ? _showQueue : null,
+                          icon: Icon(
+                            Icons.queue_music_rounded,
+                            size: 24,
+                            color: Colors.white.withValues(
+                                alpha: queueLen > 0 ? 0.85 : 0.3),
+                          ),
+                        ),
+                        const SizedBox(width: 10),
+                        IconButton(
+                          tooltip: '可视化设置',
+                          onPressed: widget.onOpenSettings,
+                          icon: Icon(
+                            Icons.tune_rounded,
+                            size: 23,
+                            color: Colors.white.withValues(alpha: 0.85),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ],
+                ),
               ),
             ],
           ),
@@ -891,8 +950,15 @@ class _GlassPlayBarState extends ConsumerState<_GlassPlayBar> {
 class _SettingsDrawer extends ConsumerWidget {
   final _DrawerSection section;
   final VoidCallback onClose;
+  final ValueChanged<VisualizerForm> onFormChanged;
+  final ValueChanged<_DrawerSection> onSectionChanged;
 
-  const _SettingsDrawer({required this.section, required this.onClose});
+  const _SettingsDrawer({
+    required this.section,
+    required this.onClose,
+    required this.onFormChanged,
+    required this.onSectionChanged,
+  });
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
@@ -928,12 +994,7 @@ class _SettingsDrawer extends ConsumerWidget {
                           children: [
                             Expanded(
                               child: Text(
-                                switch (section) {
-                                  _DrawerSection.pulse => '脉冲触发',
-                                  _DrawerSection.theme => '主题颜色',
-                                  _DrawerSection.detect => '音频检测',
-                                  _ => '',
-                                },
+                                '可视化设置',
                                 style: const TextStyle(
                                   color: Colors.white,
                                   fontSize: 17,
@@ -948,6 +1009,33 @@ class _SettingsDrawer extends ConsumerWidget {
                                   color: Colors.white.withValues(alpha: 0.6)),
                             ),
                           ],
+                        ),
+                        const SizedBox(height: 10),
+                        // 形态切换（地形 / 星云）。
+                        _segmentTabs(
+                          labels: const ['地形 / 云海', '星云'],
+                          activeIndex: settings.form == VisualizerForm.terrain
+                              ? 0
+                              : 1,
+                          onChanged: (i) => onFormChanged(i == 0
+                              ? VisualizerForm.terrain
+                              : VisualizerForm.nebula),
+                        ),
+                        const SizedBox(height: 6),
+                        // 分节标签。
+                        _segmentTabs(
+                          labels: const ['脉冲', '主题', '检测'],
+                          activeIndex: switch (section) {
+                            _DrawerSection.pulse => 0,
+                            _DrawerSection.theme => 1,
+                            _DrawerSection.detect => 2,
+                            _ => 1,
+                          },
+                          onChanged: (i) => onSectionChanged(switch (i) {
+                            0 => _DrawerSection.pulse,
+                            2 => _DrawerSection.detect,
+                            _ => _DrawerSection.theme,
+                          }),
                         ),
                         if (section == _DrawerSection.pulse) ...[
                           _switchTile(
