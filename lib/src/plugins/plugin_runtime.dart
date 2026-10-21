@@ -4358,11 +4358,15 @@ class PluginRuntimeService {
     }
   }
 
-  /// 当前歌曲+插件的音质探测是否已完成（缓存命中）。
-  /// 用于 UI 判断是否跳过「正在读取插件支持的音质…」提示——同一首歌
-  /// 第二次点击音质选择器时直接用缓存结果，不再重复提示。
+  /// 当前歌曲+插件的音质探测是否已完成或已发起过（缓存命中）。
+  /// 用于 UI 判断是否跳过「正在读取插件支持的音质…」提示——探测完成落
+  /// _qualityDiscoveryDone；探测可能因让位起播/全档失败不落 done，但
+  /// future 已进 _qualityDiscoveryCache 且不会重跑，同样视为已知，避免
+  /// 同一首歌每次点击都重复提示。
   bool hasDiscoveredQualities(EnabledMusicPlugin plugin, Map<String, dynamic> rawData) {
-    return _qualityDiscoveryDone.containsKey(_qualityCacheKey(plugin, rawData));
+    final key = _qualityCacheKey(plugin, rawData);
+    return _qualityDiscoveryDone.containsKey(key) ||
+        _qualityDiscoveryCache.containsKey(key);
   }
 
   /// 探测当前歌曲和插件实际支持的音质。插件没有统一的音质枚举协议，

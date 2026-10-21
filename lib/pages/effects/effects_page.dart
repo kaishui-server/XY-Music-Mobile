@@ -71,7 +71,7 @@ class _EffectsPageState extends ConsumerState<EffectsPage> {
           TextButton(
             onPressed: () =>
                 unawaited(ref.read(effectsProvider.notifier).resetAll()),
-            child: const Text('一键重置'),
+            child: const Text('重置'),
           ),
         ],
       ),
