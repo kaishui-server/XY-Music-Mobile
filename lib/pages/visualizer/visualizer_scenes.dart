@@ -30,27 +30,26 @@ class VisFrame {
   final List<double> bands; // 64 段（已平滑+检测源增益）
   final double kickEnvelope; // 0..1 节拍包络
   final double rms; // 0..1 整体响度
-  final double time; // 秒
-  final bool explicitPlot;
-  final VisTheme theme;
-  final double brightness; // 设置 0..1
+  final double time; // 秒（已按「运动速度」缩放累加）
+  final VisualizerSettings settings;
   final OrbitCamera camera;
   final VisRippleBuffer ripples;
-  final int terrainDensity; // 0..100
   final ui.Image? coverImage; // 预处理后的封面幽灵图
+  final List<VisMeteor> meteors; // 活跃流星
   const VisFrame({
     required this.bands,
     required this.kickEnvelope,
     required this.rms,
     required this.time,
-    required this.explicitPlot,
-    required this.theme,
-    required this.brightness,
+    required this.settings,
     required this.camera,
     required this.ripples,
-    required this.terrainDensity,
     required this.coverImage,
+    required this.meteors,
   });
+
+  /// 亮度感（地形均衡器 Pres/Brill/Air 均值）。
+  double get brightness => settings.airBrightness;
 }
 
 Color _withAlpha(int value, double a) {
@@ -181,31 +180,37 @@ class _TerrainGrid {
 }
 
 // ---------------------------------------------------------------------------
-// 任意点高度（explicitPlot 山脊线用；与柱体公式同源，无网格数组）
+// 悬浮方块预生成（静态属性：位置/相位/自旋/尺寸抖动）
 // ---------------------------------------------------------------------------
 
-double _elevationAt(
-    double wx, double wz, double t, BandPartition a, double kickEnv) {
-  final dist = math.sqrt(wx * wx + wz * wz);
-  final falloff = glslSmoothstep(60, 30, dist);
-  final baseNoise = (snoise2D(wx * 0.05 + t * 0.1, wz * 0.05 + t * 0.05) + 1) *
-      0.5;
-  final wave = math.sin(wx * 0.15 + wz * 0.1 - t * 0.6) * 0.5 + 0.5;
-  final idle = (baseNoise + (wave - baseNoise) * 0.45) * 0.8 * falloff;
-  final subU = math.max(a.subBass, kickEnv * 0.85);
-  final bassU = math.max(a.bass, kickEnv * 0.7);
-  var audio = subU * glslSmoothstep(25, 0, dist) * 5.0 +
-      bassU *
-          glslSmoothstep(35, 5, dist + snoise2D(wx * 0.1, wz * 0.1 - t * 0.2) * 5) *
-          glslSmoothstep(0, 1, glslHash(wx, wz) + 0.35) *
-          4.0 +
-      a.lowMid * (snoise2D(wx * 0.05 + t * 0.1, wz * 0.05) * 0.5 + 0.5) * 2.5 +
-      a.mid * math.max(0.0, math.sin(wx * 0.2 + wz * 0.2 +
-          snoise2D(wx * 0.1, wz * 0.1) * 2.0 - t * 2.0)) *
-          3.0;
-  audio *= falloff;
-  audio = math.max(0.0, audio - 0.2);
-  return idle + audio;
+class Offset3 {
+  final double x, y, z;
+  const Offset3(this.x, this.y, this.z);
+}
+
+class _Block {
+  final double x, z, baseY, phase, spd, r01, liftJit;
+  const _Block(this.x, this.z, this.baseY, this.phase, this.spd, this.r01,
+      this.liftJit);
+}
+
+final List<_Block> _blocks = _makeBlocks();
+
+List<_Block> _makeBlocks() {
+  final rnd = math.Random(55351);
+  return List.generate(40, (_) {
+    final a = rnd.nextDouble() * math.pi * 2;
+    final r = 12 + math.sqrt(rnd.nextDouble()) * 66; // 12..78，避开中心封面轴
+    return _Block(
+      math.cos(a) * r,
+      math.sin(a) * r,
+      10 + rnd.nextDouble() * 32, // 高度 10..42
+      rnd.nextDouble() * math.pi * 2,
+      0.6 + rnd.nextDouble() * 0.9,
+      rnd.nextDouble(),
+      0.5 + rnd.nextDouble() * 0.9,
+    );
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -220,13 +225,16 @@ class TerrainScenePainter extends CustomPainter {
   void paint(Canvas canvas, Size size) {
     final rig = CameraRig(f.camera, size);
     final a = BandPartition.of(f.bands);
-    final pal = _paletteFor(f.theme);
-    final grid = _TerrainGrid.forDensity(f.terrainDensity);
+    final pal = _paletteFor(f.settings.theme);
+    final grid = _TerrainGrid.forDensity(f.settings.terrainDensity);
     final t = f.time;
+    // 地形均衡器：前 5 段增益乘到对应分区抬升，后 3 段均值做亮度。
+    final gains = f.settings.terrainGains;
+    final amp = (f.settings.amplitude / 50).clamp(0.0, 2.2);
 
     // kick 跟随低频（terrainResponse.deriveKickFollowLowBands 的效果等价）。
-    final subU = math.max(a.subBass, f.kickEnvelope * 0.85);
-    final bassU = math.max(a.bass, f.kickEnvelope * 0.7);
+    final subU = math.max(a.subBass, f.kickEnvelope * 0.85) * gains[0];
+    final bassU = math.max(a.bass, f.kickEnvelope * 0.7) * gains[1];
 
     final warmth = a.warmth;
     final uBrightness = f.brightness;
@@ -272,7 +280,7 @@ class TerrainScenePainter extends CustomPainter {
       final wave = math.sin(wx * 0.15 + wz * 0.1 - t * 0.6) * 0.5 + 0.5;
       final idle = (baseNoise + (wave - baseNoise) * 0.45) * 0.8 * falloff;
 
-      // ② 五频段分区抬升。
+      // ② 五频段分区抬升（受地形均衡器增益与总振幅控制）。
       var audio = subU * glslSmoothstep(25, 0, d) * 5.0 +
           bassU *
               glslSmoothstep(
@@ -280,16 +288,19 @@ class TerrainScenePainter extends CustomPainter {
               grid.bassGate[i] *
               4.0 +
           a.lowMid *
+              gains[2] *
               (snoise2D(wx * 0.05 + t * 0.1, wz * 0.05) * 0.5 + 0.5) *
               2.5 +
           a.mid *
+              gains[3] *
               math.max(0.0,
                   math.sin(wx * 0.2 + wz * 0.2 + grid.midS[i] * 2.0 - t * 2.0)) *
               3.0;
       if (grid.spikeFlag[i] == 1) {
-        audio += a.highMid * glslSmoothstep(10, 45, d) * grid.rnd77[i] * 2.5;
+        audio += a.highMid * gains[4] * glslSmoothstep(10, 45, d) *
+            grid.rnd77[i] * 2.5;
       }
-      audio *= falloff;
+      audio *= falloff * amp;
       audio = math.max(0.0, audio - 0.2); // 噪声门限
 
       // ③ ripple 高斯环。
@@ -389,35 +400,6 @@ class TerrainScenePainter extends CustomPainter {
       order.add(i);
     }
 
-    // 显式标绘图：中央山脊亮线。
-    if (f.explicitPlot) {
-      final path = Path();
-      bool started = false;
-      for (int s = 0; s <= 96; s++) {
-        final wx = -60 + 120 * s / 96;
-        final h = _elevationAt(wx, 0, t, a, f.kickEnvelope) + 1.0 + 0.35;
-        final p = rig.project(wx, h, 0);
-        if (p == null) {
-          started = false;
-          continue;
-        }
-        if (!started) {
-          path.moveTo(p.dx, p.dy);
-          started = true;
-        } else {
-          path.lineTo(p.dx, p.dy);
-        }
-      }
-      canvas.drawPath(
-        path,
-        Paint()
-          ..style = PaintingStyle.stroke
-          ..strokeWidth = 1.2
-          ..color = _withAlpha(
-              f.theme.accent, (0.35 + 0.45 * f.brightness).clamp(0, 1)),
-      );
-    }
-
     // —— 封面幽灵层（在柱体之前绘制：位于地形后方，被近处柱体遮出层次）——
     _paintCover(canvas, rig, a);
 
@@ -496,26 +478,212 @@ class TerrainScenePainter extends CustomPainter {
       canvas.drawVertices(vertices, ui.BlendMode.srcOver, Paint());
       vertices.dispose();
     }
+
+    // —— 悬浮方块（地形上空漂浮的发光立方体群）——
+    if (f.settings.blocksEnabled) {
+      _paintBlocks(canvas, rig, a, t);
+    }
+    // —— 流星（触发器生成的飞行光点）——
+    _paintMeteors(canvas, rig, t);
   }
 
-  /// 封面幽灵层：140×140 平面 @ (110,24,-110) rotY(-π/4)，透视贴图。
-  /// 脉冲对齐 MapScene：uPulse = bass*0.4 + subBass*0.2。
+  // -----------------------------------------------------------------------
+  // 悬浮方块：数量=强度、尺寸=min..max、浮动速度=speed，随 bass 上浮脉冲。
+  // -----------------------------------------------------------------------
+  void _paintBlocks(
+      Canvas canvas, CameraRig rig, BandPartition a, double t) {
+    final s = f.settings;
+    final count = (4 + 36 * s.blockIntensity / 100).round();
+    final speedK = 0.25 + s.blockSpeed / 100 * 1.3;
+    final liftK = 0.5 + s.blockIntensity / 100 * 1.5;
+
+    for (int bi = 0; bi < count && bi < _blocks.length; bi++) {
+      final b = _blocks[bi];
+      // 尺寸：minSize..maxSize（0..100 → 世界单位 ×0.2）。
+      final sizeW =
+          (s.blockMinSize + (s.blockMaxSize - s.blockMinSize) * b.r01) * 0.2;
+      final half = sizeW / 2;
+      // 浮动：正弦漂移 + bass 抬升脉冲。
+      final bob = math.sin(t * b.spd * speedK + b.phase) *
+          (1.2 + s.blockIntensity / 100 * 2.5);
+      final pulse = (a.bass * 0.6 + a.subBass * 0.3) * liftK * 5.0;
+      final cy = b.baseY + bob + pulse * b.liftJit;
+      // 旋转（慢速自旋）。
+      final ang = t * 0.35 * b.spd * speedK + b.phase * 1.7;
+      final ca = math.cos(ang), sa = math.sin(ang);
+      // 距离雾（与柱体一致）。
+      final dc = math.sqrt(b.x * b.x + b.z * b.z);
+      final alpha = 1.0 - glslSmoothstep(55, 78, dc);
+      if (alpha <= 0.03) continue;
+
+      // 8 顶点（rotY 后）。
+      final corners = <Offset3>[];
+      for (int ci2 = 0; ci2 < 8; ci2++) {
+        final lx = ((ci2 & 1) == 0 ? -half : half);
+        final ly = ((ci2 & 2) == 0 ? -half : half);
+        final lz = ((ci2 & 4) == 0 ? -half : half);
+        corners.add(Offset3(
+          b.x + lx * ca + lz * sa,
+          cy + ly,
+          b.z + -lx * sa + lz * ca,
+        ));
+      }
+      // 6 面（索引 + 外法线）。
+      const faces = <List<int>>[
+        [0, 1, 3, 2], // -Y 底
+        [4, 6, 7, 5], // +Y 顶
+        [0, 4, 5, 1], // -Z
+        [2, 3, 7, 6], // +Z
+        [0, 2, 6, 4], // -X
+        [1, 5, 7, 3], // +X
+      ];
+      const norms = <Offset3>[
+        Offset3(0, -1, 0),
+        Offset3(0, 1, 0),
+        Offset3(0, 0, -1),
+        Offset3(0, 0, 1),
+        Offset3(-1, 0, 0),
+        Offset3(1, 0, 0),
+      ];
+      // 面颜色：顶面最亮，侧面随法线方向渐暗；bass 脉冲提亮。
+      final glow = (0.30 + 0.45 * s.blockIntensity / 100 +
+              (a.bass * 0.5 + f.kickEnvelope * 0.35) * 0.8)
+          .clamp(0.0, 1.0);
+      final cTop = _withAlpha(0xFFFFFFFF, alpha);
+      final cMain =
+          _withAlpha(f.settings.theme.accent, alpha * glow);
+      final cDark =
+          _withAlpha(f.settings.theme.dim, alpha * glow * 0.45);
+
+      // 投影 8 点。
+      final proj = <Offset?>[
+        for (final c in corners) rig.project(c.x, c.y, c.z),
+      ];
+      if (proj.any((p) => p == null)) continue;
+
+      // 背面剔除：dot(法线, 相机-面心) > 0 才可见；可见面按深度从远到近。
+      final visible = <int>[];
+      for (int fi = 0; fi < 6; fi++) {
+        final face = faces[fi];
+        final n = norms[fi];
+        // 旋转法线。
+        final nx = n.x * ca + n.z * sa;
+        final nz = -n.x * sa + n.z * ca;
+        final fcx = b.x + nx * half;
+        final fcy = cy + n.y * half;
+        final fcz = b.z + nz * half;
+        final vx = rig.px - fcx, vy = rig.py - fcy, vz = rig.pz - fcz;
+        if (nx * vx + n.y * vy + nz * vz > 0) visible.add(fi);
+      }
+      visible.sort((fa, fb) {
+        double d(List<int> face) {
+          double sum = 0;
+          for (final ii in face) {
+            sum += rig.depthOf(corners[ii].x, corners[ii].y, corners[ii].z);
+          }
+          return sum / face.length;
+        }
+
+        return d(faces[fb]).compareTo(d(faces[fa]));
+      });
+      final path = Path();
+      for (final fi in visible) {
+        final face = faces[fi];
+        final p0 = proj[face[0]]!;
+        path.moveTo(p0.dx, p0.dy);
+        for (int k = 1; k < 4; k++) {
+          path.lineTo(proj[face[k]]!.dx, proj[face[k]]!.dy);
+        }
+        path.close();
+        // 顶面/主色/暗面：+Y 用白亮，-Y 用暗，侧面用主色。
+        final color = fi == 1
+            ? cTop
+            : (fi == 0
+                ? cDark
+                : cMain);
+        canvas.drawPath(path, Paint()..color = color);
+        // 顶缘描一条亮线增强发光感。
+        if (fi == 1) {
+          canvas.drawPath(
+            path,
+            Paint()
+              ..style = PaintingStyle.stroke
+              ..strokeWidth = 0.8
+              ..color = _withAlpha(f.settings.theme.accent, alpha * 0.9),
+          );
+        }
+      }
+    }
+  }
+
+  // -----------------------------------------------------------------------
+  // 流星：世界坐标飞行光点 + 拖尾，越老越淡。
+  // -----------------------------------------------------------------------
+  void _paintMeteors(Canvas canvas, CameraRig rig, double t) {
+    final accent = f.settings.theme.accent;
+    for (final m in f.meteors) {
+      final dt = t - m.t0;
+      if (dt < 0) continue;
+      final px = m.x + m.vx * dt;
+      final py = m.y + m.vy * dt;
+      final pz = m.z + m.vz * dt;
+      if (py < 0 || dt > 3.2) continue;
+      const tail = 0.16; // 拖尾秒数
+      final head = rig.project(px, py, pz);
+      final tailP = rig.project(
+          px - m.vx * tail, py - m.vy * tail, pz - m.vz * tail);
+      if (head == null || tailP == null) continue;
+      final fade = (math.exp(-dt * 1.1) * m.strength).clamp(0.0, 1.0);
+      // 拖尾：三段渐细。
+      final paint = Paint()
+        ..strokeCap = StrokeCap.round
+        ..style = PaintingStyle.stroke;
+      for (int k = 0; k < 3; k++) {
+        final t0 = tail * k / 3, t1 = tail * (k + 1) / 3;
+        final a0 = rig.project(px - m.vx * t0, py - m.vy * t0,
+            pz - m.vz * t0);
+        final a1 = rig.project(px - m.vx * t1, py - m.vy * t1,
+            pz - m.vz * t1);
+        if (a0 == null || a1 == null) continue;
+        paint.strokeWidth = 3.2 - k * 0.9;
+        paint.color = _withAlpha(k == 0 ? 0xFFFFFFFF : accent,
+            fade * (1 - k * 0.28));
+        canvas.drawLine(a0, a1, paint);
+      }
+      // 头部光点。
+      canvas.drawCircle(
+        head,
+        2.6,
+        Paint()..color = _withAlpha(0xFFFFFFFF, fade),
+      );
+      canvas.drawCircle(
+        head,
+        5.5,
+        Paint()..color = _withAlpha(accent, fade * 0.35),
+      );
+    }
+  }
+
+  /// 封面幽灵层：140×140 平面 @ (110,24,-110)，rotY(-π/4) 起始、
+  /// 按「旋转速度」缓慢自旋；脉冲对齐 MapScene：uPulse = bass*0.4 + subBass*0.2。
   void _paintCover(Canvas canvas, CameraRig rig, BandPartition a) {
     final img = f.coverImage;
-    if (img == null) return;
+    if (img == null || !f.settings.showCover) return;
     final coverPulse = (a.bass * 0.4 + a.subBass * 0.2).clamp(0.0, 1.0);
+    // 动态旋转角（rotationSpeed 0.2 → 约 0.12 rad/s）。
+    final ang = -math.pi / 4 + f.time * f.settings.rotationSpeed * 0.6;
+    final ca = math.cos(ang), sa = math.sin(ang);
     // 四角投影检查（在视野内才画）。
     const cx0 = 110.0, cy0 = 24.0, cz0 = -110.0;
     const half = 70.0;
-    const k = 0.70710678; // rotY(-45°)：local x → world (x·k, ·, x·k)
-    final c0 = rig.project(cx0 - half * k, cy0 + half, cz0 - half * k);
-    final c1 = rig.project(cx0 + half * k, cy0 + half, cz0 + half * k);
-    final c2 = rig.project(cx0 + half * k, cy0 - half, cz0 + half * k);
-    final c3 = rig.project(cx0 - half * k, cy0 - half, cz0 - half * k);
+    final c0 = rig.project(cx0 - half * ca, cy0 + half, cz0 + half * sa);
+    final c1 = rig.project(cx0 + half * ca, cy0 + half, cz0 - half * sa);
+    final c2 = rig.project(cx0 + half * ca, cy0 - half, cz0 - half * sa);
+    final c3 = rig.project(cx0 - half * ca, cy0 - half, cz0 + half * sa);
     if (c0 == null || c1 == null || c2 == null || c3 == null) return;
 
     // MVP（column-major）= S(视口) · P(透视) · V(lookAt) · M(模型)。
-    final mvp = _coverMvp(rig);
+    final mvp = _coverMvp(rig, ang);
     canvas.save();
     canvas.transform(mvp);
     final bright = 1.0 + coverPulse * 0.8;
@@ -554,8 +722,8 @@ Float64List _mat4Mul(Float64List a, Float64List b) {
   return out;
 }
 
-/// 封面平面的完整 MVP（透视 fov45 + lookAt + rotY(-45°) + 平移 + 视口）。
-Float64List _coverMvp(CameraRig rig) {
+/// 封面平面的完整 MVP（透视 fov45 + lookAt + rotY(ang) + 平移 + 视口）。
+Float64List _coverMvp(CameraRig rig, double ang) {
   const near = 0.5, far = 900.0;
   final fn = 1.0 / rig.tanHalfFov;
   final aspect = rig.aspect;
@@ -575,12 +743,13 @@ Float64List _coverMvp(CameraRig rig) {
     rig.rz, rig.uz, -rig.fz, 0,
     -rp, -up, fp, 1,
   ]);
-  // 模型：rotY(-45°) + 平移 (110,24,-110)。
-  const k = 0.70710678;
+  // 模型：rotY(ang) + 平移 (110,24,-110)。
+  final k = math.cos(ang);
+  final s2 = math.sin(ang);
   final m = Float64List.fromList(<double>[
-    k, 0, k, 0,
+    k, 0, -s2, 0,
     0, 1, 0, 0,
-    -k, 0, k, 0,
+    s2, 0, k, 0,
     110, 24, -110, 1,
   ]);
   // 视口：x=(x+1)/2*w，y=(1-y)/2*h。
@@ -655,6 +824,7 @@ class NebulaScenePainter extends CustomPainter {
   @override
   void paint(Canvas canvas, Size size) {
     final d = f;
+    final th = d.settings.theme;
     final center = Offset(size.width / 2, size.height * 0.47);
     final maxR = math.min(size.width, size.height) * 0.46;
     const tilt = 0.62;
@@ -670,6 +840,36 @@ class NebulaScenePainter extends CustomPainter {
         center + Offset(s.dx * maxR * 1.55, s.dy * maxR * 1.55 * tilt),
     ];
     canvas.drawPoints(PointMode.points, starPts, starPaint);
+
+    // 流星（屏幕空间飞行光点，归一化坐标 → maxR 尺度）。
+    for (final m in d.meteors) {
+      final dt = t - m.t0;
+      if (dt < 0 || dt > 3.2) continue;
+      final hx = center.dx + (m.x + m.vx * dt) * maxR;
+      final hy = center.dy + (m.y + m.vy * dt) * maxR * tilt;
+      const tail = 0.16;
+      final tx = center.dx + (m.x + m.vx * (dt - tail)) * maxR;
+      final ty = center.dy + (m.y + m.vy * (dt - tail)) * maxR * tilt;
+      final fade = (math.exp(-dt * 1.1) * m.strength).clamp(0.0, 1.0);
+      canvas.drawLine(
+        Offset(tx, ty),
+        Offset(hx, hy),
+        Paint()
+          ..strokeWidth = 2.2
+          ..strokeCap = StrokeCap.round
+          ..color = _withAlpha(0xFFFFFFFF, fade * 0.85),
+      );
+      canvas.drawCircle(
+        Offset(hx, hy),
+        2.2,
+        Paint()..color = _withAlpha(0xFFFFFFFF, fade),
+      );
+      canvas.drawCircle(
+        Offset(hx, hy),
+        5.0,
+        Paint()..color = _withAlpha(th.accent, fade * 0.3),
+      );
+    }
 
     // 脉冲环（beat/点击触发，从中心/落点扩散）。
     for (final r in d.ripples.slots) {
@@ -693,7 +893,7 @@ class NebulaScenePainter extends CustomPainter {
         Paint()
           ..style = PaintingStyle.stroke
           ..strokeWidth = 1.4
-          ..color = _withAlpha(r.white ? 0xFFFFFFFF : d.theme.accent, alpha),
+          ..color = _withAlpha(r.white ? 0xFFFFFFFF : th.accent, alpha),
       );
       canvas.restore();
     }
@@ -710,9 +910,9 @@ class NebulaScenePainter extends CustomPainter {
       Paint()
         ..shader = RadialGradient(colors: [
           _withAlpha(0xFFFFFFFF, (0.85 * coreGlow).clamp(0, 1)),
-          _withAlpha(d.theme.accent, (0.40 * coreGlow).clamp(0, 1)),
-          _withAlpha(d.theme.main, (0.14 * coreGlow).clamp(0, 1)),
-          _withAlpha(d.theme.main, 0),
+          _withAlpha(th.accent, (0.40 * coreGlow).clamp(0, 1)),
+          _withAlpha(th.main, (0.14 * coreGlow).clamp(0, 1)),
+          _withAlpha(th.main, 0),
         ], stops: const [0.0, 0.25, 0.62, 1.0]).createShader(coreRect),
     );
     // 外晕。
@@ -723,26 +923,10 @@ class NebulaScenePainter extends CustomPainter {
           height: maxR * 1.5 * tilt),
       Paint()
         ..shader = RadialGradient(colors: [
-          _withAlpha(d.theme.main, (0.10 * coreGlow).clamp(0, 1)),
-          _withAlpha(d.theme.main, 0),
+          _withAlpha(th.main, (0.10 * coreGlow).clamp(0, 1)),
+          _withAlpha(th.main, 0),
         ]).createShader(Rect.fromCircle(center: center, radius: maxR * 0.75)),
     );
-
-    // 显式标绘图：两圈基准环。
-    if (d.explicitPlot) {
-      final ringPaint = Paint()
-        ..style = PaintingStyle.stroke
-        ..strokeWidth = 1.1
-        ..color = _withAlpha(d.theme.accent, 0.22);
-      canvas.save();
-      canvas.translate(center.dx, center.dy);
-      canvas.scale(1, tilt);
-      canvas.drawCircle(Offset.zero, maxR * 0.62, ringPaint);
-      canvas.drawCircle(
-          Offset.zero, maxR * 0.40, ringPaint..color = _withAlpha(
-              d.theme.accent, 0.14));
-      canvas.restore();
-    }
 
     // 粒子：差速旋转（内快外慢）+ 频段径向外扩 + 环 lift。
     final ptsDim = <Offset>[];
@@ -802,9 +986,9 @@ class NebulaScenePainter extends CustomPainter {
       );
     }
 
-    drawPts(ptsDim, _withAlpha(d.theme.dim, aBase * 0.55), 1.1);
-    drawPts(ptsMid, _withAlpha(d.theme.main, aBase), 1.5);
-    drawPts(ptsHot, _withAlpha(d.theme.accent, (aBase * 0.9 + 0.3).clamp(0, 1)),
+    drawPts(ptsDim, _withAlpha(th.dim, aBase * 0.55), 1.1);
+    drawPts(ptsMid, _withAlpha(th.main, aBase), 1.5);
+    drawPts(ptsHot, _withAlpha(th.accent, (aBase * 0.9 + 0.3).clamp(0, 1)),
         1.8);
   }
 

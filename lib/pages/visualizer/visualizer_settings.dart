@@ -1,5 +1,8 @@
-// visualizer_settings.dart — 可视化页设置（脉冲触发 / 主题颜色 / 音频检测）
-// 的模型与持久化（SharedPreferences JSON，独立于全局 settingsProvider）。
+// visualizer_settings.dart — 可视化页全部设置面板的模型与持久化
+// （SharedPreferences JSON，独立于全局 settingsProvider）。
+//
+// 面板对齐 sonic-topography：主题配色 / 地形均衡器 / 悬浮方块 /
+// 脉冲触发 / 流星触发 / 歌词设置 / 音频检测。
 
 import 'dart:convert';
 
@@ -9,7 +12,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 /// 可视化形态。
 enum VisualizerForm { terrain, nebula }
 
-/// 主题色板（对齐视频里「主题颜色」五个预设）。
+/// 主题色板（对齐「主题配色」五个预设色卡）。
 class VisTheme {
   final String id;
   final String name;
@@ -23,46 +26,115 @@ class VisTheme {
 }
 
 const kVisThemes = <VisTheme>[
-  VisTheme('daylight', '极昼白', 0xFFFFFFFF, 0xFF9AA0A6, 0xFFE8EAED),
-  VisTheme('ice', '冰湖蓝', 0xFF7FD8F5, 0xFF2E6E86, 0xFFB8ECFF),
-  VisTheme('violet', '紫阳', 0xFFC0A6FF, 0xFF4A3B73, 0xFFE2D6FF),
-  VisTheme('lime', '青柠绿', 0xFFB8E986, 0xFF4E6B33, 0xFFE0F7C0),
-  VisTheme('dark', '暗黑', 0xFFB9BDC4, 0xFF4E5257, 0xFF8E959E),
+  VisTheme('ink', '墨韵', 0xFFE8EAED, 0xFF4E5257, 0xFFFFFFFF),
+  VisTheme('night', '暗夜', 0xFF7FD8F5, 0xFF2E6E86, 0xFFB8ECFF),
+  VisTheme('neon', '霓虹', 0xFFC0A6FF, 0xFF4A3B73, 0xFFE2D6FF),
+  VisTheme('cyber', '赛博', 0xFFB8E986, 0xFF4E6B33, 0xFFE0F7C0),
+  VisTheme('minimal', '极简', 0xFFB9BDC4, 0xFF3A3E44, 0xFF8E959E),
 ];
 
-/// 脉冲触发模式。
-enum PulseMode { autoBeat, advanced }
+/// 触发器模式（脉冲/流星共用）。
+enum TriggerMode { autoBeat, advanced }
+
+/// 歌词显示模式。
+enum LyricsMode { classic, bounce, space3d }
+
+/// 地形 EQ 单频段。
+class VisEqBand {
+  final bool on;
+  final double value; // 0..100
+  const VisEqBand({this.on = true, this.value = 50});
+  VisEqBand copyWith({bool? on, double? value}) =>
+      VisEqBand(on: on ?? this.on, value: value ?? this.value);
+}
+
+/// 8 频段地形 EQ（Sub/Bass/LoMid/Mid/HiMid/Pres/Brill/Air）。
+const kEqBandNames = ['Sub', 'Bass', 'LoMid', 'Mid', 'HiMid', 'Pres', 'Brill', 'Air'];
 
 class VisualizerSettings {
-  // —— 脉冲触发 ——
-  final bool pulseEnabled;
-  final PulseMode pulseMode;
-  final bool autoPulse;
-  final double sensitivity; // 0..100
-  final double beatDuration; // 0..30（节拍形变回复时长，秒×0.1 语义）
-  final double brightness; // 0..1
-  // —— 主题颜色 ——
+  // —— 主题配色 ——
   final int themeIndex;
-  final bool explicitPlot; // 显式标绘图
-  final int terrainDensity; // 0..100 地形网格密度（默认 33 ≈ 64×64 柱体）
+  final double rotationSpeed; // 0..1 封面盘旋转速度（默认 0.2）
+  final bool showCover; // 显示封面幽灵层
+  // —— 地形均衡器 ——
+  final List<VisEqBand> groundEq; // 8 段
+  final double motionSpeed; // 0..100 运动速度（默认 50）
+  final double amplitude; // 0..100 振幅（默认 50）
+  final int terrainDensity; // 0..100 地形密度（默认 46）
+  // —— 悬浮方块 ——
+  final bool blocksEnabled;
+  final double blockIntensity; // 0..100
+  final double blockMinSize; // 0..100
+  final double blockMaxSize; // 0..100
+  final double blockSpeed; // 0..100
+  // —— 脉冲触发 ——
+  final bool kickEnabled;
+  final TriggerMode kickMode;
+  final bool kickAutoTrack; // 自动追踪
+  final double kickSensitivity; // 0..1
+  final double kickCooldownFrames; // 0..240
+  final double kickStrength; // 0..1
+  // —— 流星触发 ——
+  final bool meteorEnabled;
+  final TriggerMode meteorMode;
+  final double meteorSensitivity; // 0..1
+  final double meteorCooldownFrames; // 0..240
+  final double meteorStrength; // 0..1
+  // —— 歌词设置 ——
+  final LyricsMode lyricsMode;
+  final bool lyricsShow;
+  final double lyricsActiveSize; // 活跃字号
+  final double lyricsInactiveSize; // 非活跃字号
+  final double lyricsMaxChars; // 每行最大字数
+  final bool lyricsFollowTheme; // 卡拉OK颜色跟随主题
+  final int lyricsColor; // 字体颜色（followTheme 关闭时生效，ARGB）
+  final bool lyricsSerif; // Serif / Sans
+  final double lyricsOffsetX; // 空间偏移
   // —— 音频检测 ——
-  final double detectLevel; // 0..100 检测源灵敏度
-  // —— Advanced 触发频段 ——
+  final double detectLevel; // 0..100 节拍检测灵敏度
+  // —— Advanced 触发频段（共用） ——
   final int bandStart;
   final int bandEnd;
   // —— 形态 ——
   final VisualizerForm form;
 
   const VisualizerSettings({
-    this.pulseEnabled = true,
-    this.pulseMode = PulseMode.autoBeat,
-    this.autoPulse = true,
-    this.sensitivity = 79,
-    this.beatDuration = 10,
-    this.brightness = 0.7,
     this.themeIndex = 0,
-    this.explicitPlot = false,
-    this.terrainDensity = 33,
+    this.rotationSpeed = 0.2,
+    this.showCover = true,
+    this.groundEq = const [
+      VisEqBand(value: 50), VisEqBand(value: 50), VisEqBand(value: 50),
+      VisEqBand(value: 50), VisEqBand(value: 50), VisEqBand(value: 50),
+      VisEqBand(value: 50), VisEqBand(value: 50),
+    ],
+    this.motionSpeed = 50,
+    this.amplitude = 50,
+    this.terrainDensity = 46,
+    this.blocksEnabled = true,
+    this.blockIntensity = 55,
+    this.blockMinSize = 9,
+    this.blockMaxSize = 26,
+    this.blockSpeed = 77,
+    this.kickEnabled = true,
+    this.kickMode = TriggerMode.autoBeat,
+    this.kickAutoTrack = true,
+    this.kickSensitivity = 0.8,
+    this.kickCooldownFrames = 15,
+    this.kickStrength = 0.2,
+    this.meteorEnabled = true,
+    this.meteorMode = TriggerMode.autoBeat,
+    this.meteorSensitivity = 0.5,
+    this.meteorCooldownFrames = 241,
+    this.meteorStrength = 0.5,
+    this.lyricsMode = LyricsMode.classic,
+    this.lyricsShow = true,
+    this.lyricsActiveSize = 15,
+    this.lyricsInactiveSize = 10,
+    this.lyricsMaxChars = 48,
+    this.lyricsFollowTheme = true,
+    this.lyricsColor = 0xFFFFFFFF,
+    this.lyricsSerif = false,
+    this.lyricsOffsetX = 0,
     this.detectLevel = 100,
     this.bandStart = 0,
     this.bandEnd = 7,
@@ -74,31 +146,91 @@ class VisualizerSettings {
           ? kVisThemes[themeIndex]
           : kVisThemes.first;
 
+  /// EQ 增益（0..1，off→0）。
+  double eqGain(int i) =>
+      i >= 0 && i < groundEq.length && groundEq[i].on
+          ? (groundEq[i].value / 100).clamp(0.0, 1.0)
+          : 0.0;
+
+  /// 前 5 段增益（sub/bass/lowMid/mid/highMid → 地形抬升）。
+  List<double> get terrainGains => [
+        eqGain(0), eqGain(1), eqGain(2), eqGain(3), eqGain(4),
+      ];
+
+  /// 后 3 段均值（Pres/Brill/Air → 亮度感）。
+  double get airBrightness => (eqGain(5) + eqGain(6) + eqGain(7)) / 3;
+
   VisualizerSettings copyWith({
-    bool? pulseEnabled,
-    PulseMode? pulseMode,
-    bool? autoPulse,
-    double? sensitivity,
-    double? beatDuration,
-    double? brightness,
     int? themeIndex,
-    bool? explicitPlot,
+    double? rotationSpeed,
+    bool? showCover,
+    List<VisEqBand>? groundEq,
+    double? motionSpeed,
+    double? amplitude,
     int? terrainDensity,
+    bool? blocksEnabled,
+    double? blockIntensity,
+    double? blockMinSize,
+    double? blockMaxSize,
+    double? blockSpeed,
+    bool? kickEnabled,
+    TriggerMode? kickMode,
+    bool? kickAutoTrack,
+    double? kickSensitivity,
+    double? kickCooldownFrames,
+    double? kickStrength,
+    bool? meteorEnabled,
+    TriggerMode? meteorMode,
+    double? meteorSensitivity,
+    double? meteorCooldownFrames,
+    double? meteorStrength,
+    LyricsMode? lyricsMode,
+    bool? lyricsShow,
+    double? lyricsActiveSize,
+    double? lyricsInactiveSize,
+    double? lyricsMaxChars,
+    bool? lyricsFollowTheme,
+    int? lyricsColor,
+    bool? lyricsSerif,
+    double? lyricsOffsetX,
     double? detectLevel,
     int? bandStart,
     int? bandEnd,
     VisualizerForm? form,
   }) {
     return VisualizerSettings(
-      pulseEnabled: pulseEnabled ?? this.pulseEnabled,
-      pulseMode: pulseMode ?? this.pulseMode,
-      autoPulse: autoPulse ?? this.autoPulse,
-      sensitivity: sensitivity ?? this.sensitivity,
-      beatDuration: beatDuration ?? this.beatDuration,
-      brightness: brightness ?? this.brightness,
       themeIndex: themeIndex ?? this.themeIndex,
-      explicitPlot: explicitPlot ?? this.explicitPlot,
+      rotationSpeed: rotationSpeed ?? this.rotationSpeed,
+      showCover: showCover ?? this.showCover,
+      groundEq: groundEq ?? this.groundEq,
+      motionSpeed: motionSpeed ?? this.motionSpeed,
+      amplitude: amplitude ?? this.amplitude,
       terrainDensity: terrainDensity ?? this.terrainDensity,
+      blocksEnabled: blocksEnabled ?? this.blocksEnabled,
+      blockIntensity: blockIntensity ?? this.blockIntensity,
+      blockMinSize: blockMinSize ?? this.blockMinSize,
+      blockMaxSize: blockMaxSize ?? this.blockMaxSize,
+      blockSpeed: blockSpeed ?? this.blockSpeed,
+      kickEnabled: kickEnabled ?? this.kickEnabled,
+      kickMode: kickMode ?? this.kickMode,
+      kickAutoTrack: kickAutoTrack ?? this.kickAutoTrack,
+      kickSensitivity: kickSensitivity ?? this.kickSensitivity,
+      kickCooldownFrames: kickCooldownFrames ?? this.kickCooldownFrames,
+      kickStrength: kickStrength ?? this.kickStrength,
+      meteorEnabled: meteorEnabled ?? this.meteorEnabled,
+      meteorMode: meteorMode ?? this.meteorMode,
+      meteorSensitivity: meteorSensitivity ?? this.meteorSensitivity,
+      meteorCooldownFrames: meteorCooldownFrames ?? this.meteorCooldownFrames,
+      meteorStrength: meteorStrength ?? this.meteorStrength,
+      lyricsMode: lyricsMode ?? this.lyricsMode,
+      lyricsShow: lyricsShow ?? this.lyricsShow,
+      lyricsActiveSize: lyricsActiveSize ?? this.lyricsActiveSize,
+      lyricsInactiveSize: lyricsInactiveSize ?? this.lyricsInactiveSize,
+      lyricsMaxChars: lyricsMaxChars ?? this.lyricsMaxChars,
+      lyricsFollowTheme: lyricsFollowTheme ?? this.lyricsFollowTheme,
+      lyricsColor: lyricsColor ?? this.lyricsColor,
+      lyricsSerif: lyricsSerif ?? this.lyricsSerif,
+      lyricsOffsetX: lyricsOffsetX ?? this.lyricsOffsetX,
       detectLevel: detectLevel ?? this.detectLevel,
       bandStart: bandStart ?? this.bandStart,
       bandEnd: bandEnd ?? this.bandEnd,
@@ -107,15 +239,40 @@ class VisualizerSettings {
   }
 
   Map<String, dynamic> toJson() => {
-        'pulseEnabled': pulseEnabled,
-        'pulseMode': pulseMode == PulseMode.autoBeat ? 'auto' : 'advanced',
-        'autoPulse': autoPulse,
-        'sensitivity': sensitivity,
-        'beatDuration': beatDuration,
-        'brightness': brightness,
         'themeIndex': themeIndex,
-        'explicitPlot': explicitPlot,
+        'rotationSpeed': rotationSpeed,
+        'showCover': showCover,
+        'groundEq': [
+          for (final b in groundEq) {'on': b.on, 'v': b.value}
+        ],
+        'motionSpeed': motionSpeed,
+        'amplitude': amplitude,
         'terrainDensity': terrainDensity,
+        'blocksEnabled': blocksEnabled,
+        'blockIntensity': blockIntensity,
+        'blockMinSize': blockMinSize,
+        'blockMaxSize': blockMaxSize,
+        'blockSpeed': blockSpeed,
+        'kickEnabled': kickEnabled,
+        'kickMode': kickMode == TriggerMode.autoBeat ? 'auto' : 'advanced',
+        'kickAutoTrack': kickAutoTrack,
+        'kickSensitivity': kickSensitivity,
+        'kickCooldownFrames': kickCooldownFrames,
+        'kickStrength': kickStrength,
+        'meteorEnabled': meteorEnabled,
+        'meteorMode': meteorMode == TriggerMode.autoBeat ? 'auto' : 'advanced',
+        'meteorSensitivity': meteorSensitivity,
+        'meteorCooldownFrames': meteorCooldownFrames,
+        'meteorStrength': meteorStrength,
+        'lyricsMode': lyricsMode.index,
+        'lyricsShow': lyricsShow,
+        'lyricsActiveSize': lyricsActiveSize,
+        'lyricsInactiveSize': lyricsInactiveSize,
+        'lyricsMaxChars': lyricsMaxChars,
+        'lyricsFollowTheme': lyricsFollowTheme,
+        'lyricsColor': lyricsColor,
+        'lyricsSerif': lyricsSerif,
+        'lyricsOffsetX': lyricsOffsetX,
         'detectLevel': detectLevel,
         'bandStart': bandStart,
         'bandEnd': bandEnd,
@@ -123,16 +280,63 @@ class VisualizerSettings {
       };
 
   static VisualizerSettings fromJson(Map<String, dynamic> j) {
+    List<VisEqBand> eq = const [];
+    if (j['groundEq'] is List) {
+      eq = [
+        for (final e in j['groundEq'] as List)
+          if (e is Map)
+            VisEqBand(
+              on: e['on'] is bool ? e['on'] : true,
+              value: (e['v'] as num?)?.toDouble() ?? 50,
+            ),
+      ];
+    }
     return VisualizerSettings(
-      pulseEnabled: j['pulseEnabled'] is bool ? j['pulseEnabled'] : true,
-      pulseMode: j['pulseMode'] == 'advanced' ? PulseMode.advanced : PulseMode.autoBeat,
-      autoPulse: j['autoPulse'] is bool ? j['autoPulse'] : true,
-      sensitivity: (j['sensitivity'] as num?)?.toDouble() ?? 79,
-      beatDuration: (j['beatDuration'] as num?)?.toDouble() ?? 10,
-      brightness: (j['brightness'] as num?)?.toDouble() ?? 0.7,
       themeIndex: (j['themeIndex'] as num?)?.toInt() ?? 0,
-      explicitPlot: j['explicitPlot'] is bool ? j['explicitPlot'] : false,
-      terrainDensity: (j['terrainDensity'] as num?)?.toInt() ?? 33,
+      rotationSpeed: (j['rotationSpeed'] as num?)?.toDouble() ?? 0.2,
+      showCover: j['showCover'] is bool ? j['showCover'] : true,
+      groundEq: eq.length == 8
+          ? eq
+          : const [
+              VisEqBand(value: 50), VisEqBand(value: 50), VisEqBand(value: 50),
+              VisEqBand(value: 50), VisEqBand(value: 50), VisEqBand(value: 50),
+              VisEqBand(value: 50), VisEqBand(value: 50),
+            ],
+      motionSpeed: (j['motionSpeed'] as num?)?.toDouble() ?? 50,
+      amplitude: (j['amplitude'] as num?)?.toDouble() ?? 50,
+      terrainDensity: (j['terrainDensity'] as num?)?.toInt() ?? 46,
+      blocksEnabled: j['blocksEnabled'] is bool ? j['blocksEnabled'] : true,
+      blockIntensity: (j['blockIntensity'] as num?)?.toDouble() ?? 55,
+      blockMinSize: (j['blockMinSize'] as num?)?.toDouble() ?? 9,
+      blockMaxSize: (j['blockMaxSize'] as num?)?.toDouble() ?? 26,
+      blockSpeed: (j['blockSpeed'] as num?)?.toDouble() ?? 77,
+      kickEnabled: j['kickEnabled'] is bool ? j['kickEnabled'] : true,
+      kickMode:
+          j['kickMode'] == 'advanced' ? TriggerMode.advanced : TriggerMode.autoBeat,
+      kickAutoTrack: j['kickAutoTrack'] is bool ? j['kickAutoTrack'] : true,
+      kickSensitivity: (j['kickSensitivity'] as num?)?.toDouble() ?? 0.8,
+      kickCooldownFrames: (j['kickCooldownFrames'] as num?)?.toDouble() ?? 15,
+      kickStrength: (j['kickStrength'] as num?)?.toDouble() ?? 0.2,
+      meteorEnabled: j['meteorEnabled'] is bool ? j['meteorEnabled'] : true,
+      meteorMode: j['meteorMode'] == 'advanced'
+          ? TriggerMode.advanced
+          : TriggerMode.autoBeat,
+      meteorSensitivity: (j['meteorSensitivity'] as num?)?.toDouble() ?? 0.5,
+      meteorCooldownFrames: (j['meteorCooldownFrames'] as num?)?.toDouble() ?? 241,
+      meteorStrength: (j['meteorStrength'] as num?)?.toDouble() ?? 0.5,
+      lyricsMode: LyricsMode.values.length >
+              ((j['lyricsMode'] as num?)?.toInt() ?? 0)
+          ? LyricsMode.values[(j['lyricsMode'] as num?)?.toInt() ?? 0]
+          : LyricsMode.classic,
+      lyricsShow: j['lyricsShow'] is bool ? j['lyricsShow'] : true,
+      lyricsActiveSize: (j['lyricsActiveSize'] as num?)?.toDouble() ?? 15,
+      lyricsInactiveSize: (j['lyricsInactiveSize'] as num?)?.toDouble() ?? 10,
+      lyricsMaxChars: (j['lyricsMaxChars'] as num?)?.toDouble() ?? 48,
+      lyricsFollowTheme:
+          j['lyricsFollowTheme'] is bool ? j['lyricsFollowTheme'] : true,
+      lyricsColor: (j['lyricsColor'] as num?)?.toInt() ?? 0xFFFFFFFF,
+      lyricsSerif: j['lyricsSerif'] is bool ? j['lyricsSerif'] : false,
+      lyricsOffsetX: (j['lyricsOffsetX'] as num?)?.toDouble() ?? 0,
       detectLevel: (j['detectLevel'] as num?)?.toDouble() ?? 100,
       bandStart: (j['bandStart'] as num?)?.toInt() ?? 0,
       bandEnd: (j['bandEnd'] as num?)?.toInt() ?? 7,
@@ -141,7 +345,7 @@ class VisualizerSettings {
   }
 }
 
-const String _kPrefsKey = 'visualizer.settings.v1';
+const String _kPrefsKey = 'visualizer.settings.v2';
 
 class VisualizerSettingsNotifier extends StateNotifier<VisualizerSettings> {
   VisualizerSettingsNotifier() : super(const VisualizerSettings()) {

@@ -192,9 +192,10 @@ class _XyMusicAppState extends ConsumerState<XyMusicApp>
     );
   }
 
-  /// 把“音量键调节应用内音量”开关推送给原生层（MainActivity 持有，
-  /// dispatchKeyEvent 里同步判断是否拦截音量键）。设置加载完成与
-  /// 用户切换时都会触发；失败静默（原生层保持默认不拦截）。
+  /// 把「音量键调节应用内音量」开关推送给原生层（MainActivity 持有）。
+  /// 前台物理音量键已不再拦截（始终调节系统媒体音量），该开关现仅
+  /// 控制悬浮窗音量条的分流模式：开启调应用内音量，关闭调系统音量。
+  /// 设置加载完成与用户切换时都会触发；失败静默。
   void _syncVolumeKeyCapture(bool enabled) {
     if (!Platform.isAndroid) return;
     MethodChannel('com.xymusic.mobile/volume_keys')
@@ -263,10 +264,11 @@ class _XyMusicAppState extends ConsumerState<XyMusicApp>
   Widget build(BuildContext context) {
     final init = ref.watch(rustInitProvider);
     final settings = ref.watch(settingsProvider).valueOrNull;
-    // 音量键拦截开关同步到原生层（含设置加载完成后的首次同步）。
+    // 音量键拦截开关同步到原生层（含设置加载完成后的首次同步），
+    // 仅影响悬浮窗音量条分流；前台音量键始终由系统处理。
     // 下面的 postFrame 补一次冷启动同步：select 的默认值与加载后的值
-    // 都为 true 时（开关本来就开着），listen 不会触发，原生拦截开关
-    // 会一直是默认 false——前台音量键不拦截直接改系统音量。
+    // 都为 true 时（开关本来就开着），listen 不会触发，悬浮窗分流
+    // 模式会一直是默认 false。
     ref.listen<bool>(
       settingsProvider.select(
         (s) => s.valueOrNull?.volumeKeyControlsAppVolume ?? true,

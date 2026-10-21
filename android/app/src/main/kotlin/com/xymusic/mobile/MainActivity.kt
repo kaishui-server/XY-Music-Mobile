@@ -67,9 +67,9 @@ class MainActivity : AudioServiceActivity() {
     /// Flutter 引擎就绪前（冷启动）时暂存动作名，等通道建好再转发。
     private var pendingDesktopLyricsAction: String? = null
 
-    /// 音量键拦截开关（Flutter 侧按设置推送）：开启时应用前台的
-    /// 音量键只调本应用播放音量，不动系统媒体音量。
-    private var volumeKeyCaptureEnabled = false
+    /// 「音量键调节应用内音量」开关由 Flutter 侧推送（setCaptureEnabled），
+    /// 现仅用于悬浮窗音量条分流（开启调应用内音量，关闭调系统音量）；
+    /// 前台物理音量键不再拦截——始终调节系统媒体音量。
     private var volumeKeyChannel: MethodChannel? = null
 
     /// 全局 Wi-Fi 高性能锁：阻止系统在播放/加载期间让 Wi-Fi 进入省电
@@ -571,9 +571,9 @@ class MainActivity : AudioServiceActivity() {
         ).also { channel ->
             channel.setMethodCallHandler { call, result ->
                 if (call.method == "setCaptureEnabled") {
-                    volumeKeyCaptureEnabled = call.argument<Boolean>("enabled") == true
+                    val enabled = call.argument<Boolean>("enabled") == true
                     // 悬浮窗音量条跟随同一开关：开启只调应用内音量，关闭调系统音量。
-                    MiniPlayerOverlayService.appVolumeMode = volumeKeyCaptureEnabled
+                    MiniPlayerOverlayService.appVolumeMode = enabled
                     result.success(true)
                 } else {
                     result.notImplemented()
@@ -1289,22 +1289,9 @@ class MainActivity : AudioServiceActivity() {
     /// 避免 AVRCP 长按连发导致连续切歌；对应的 ACTION_UP 直接吞掉。
     override fun dispatchKeyEvent(event: KeyEvent?): Boolean {
         if (event != null) {
-            // 音量键拦截（设置开启时）：应用前台按音量键只调本应用
-            // 播放音量，不弹系统音量面板、不动系统媒体音量（车机上
-            // 不影响导航等其他声音）。ACTION_DOWN 转发（含长按连发，
-            // 由 Flutter 侧节流），ACTION_UP 直接吞掉。
-            if (volumeKeyCaptureEnabled &&
-                (event.keyCode == KeyEvent.KEYCODE_VOLUME_UP ||
-                    event.keyCode == KeyEvent.KEYCODE_VOLUME_DOWN)
-            ) {
-                if (event.action == KeyEvent.ACTION_DOWN) {
-                    volumeKeyChannel?.invokeMethod(
-                        "onVolumeKey",
-                        if (event.keyCode == KeyEvent.KEYCODE_VOLUME_UP) "up" else "down",
-                    )
-                }
-                return true
-            }
+            // 物理音量键不再拦截：无论应用是否前台，音量键始终调节系统
+            // 媒体音量（系统音量再影响本应用播放响度，属单向影响、不改写
+            // 应用内音量值）。车机媒体键兜底转发保留。
             val action = mediaButtonAction(event.keyCode)
             if (action != null) {
                 if (event.action == KeyEvent.ACTION_DOWN && event.repeatCount == 0) {

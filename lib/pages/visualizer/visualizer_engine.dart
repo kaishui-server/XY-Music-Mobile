@@ -136,6 +136,30 @@ class VisRippleBuffer {
 }
 
 // ---------------------------------------------------------------------------
+// 流星（触发器生成，场景绘制）
+// ---------------------------------------------------------------------------
+
+/// 一颗流星：地形场景用世界坐标（xz ±90、y 10..45），
+/// 星云场景用归一化坐标（x/z ∈ -1..1，vy 为屏幕高度比例）。
+class VisMeteor {
+  double x, y, z;
+  double vx, vy, vz;
+  double t0; // 触发时刻（场景 time，秒）
+  double strength; // 0..1
+  bool active = true;
+  VisMeteor({
+    required this.x,
+    required this.y,
+    required this.z,
+    required this.vx,
+    required this.vy,
+    required this.vz,
+    required this.t0,
+    required this.strength,
+  });
+}
+
+// ---------------------------------------------------------------------------
 // 频段分区：64 段对数频谱 → 五频段 uniform
 // ---------------------------------------------------------------------------
 
@@ -317,14 +341,13 @@ class CameraRig {
   Offset? groundPoint(Offset screen) {
     final ndcX = (screen.dx / w) * 2 - 1;
     final ndcY = 1 - (screen.dy / h) * 2;
-    final dxx = rx * (ndcX * tanHalfFov * aspect) +
-        ux * (ndcY * tanHalfFov) +
-        fx;
-    final dyy = ry * (ndcX * tanHalfFov * aspect) +
-        uy * (ndcY * tanHalfFov) +
-        fy;
+    final ax = ndcX * tanHalfFov * aspect;
+    final ay = ndcY * tanHalfFov;
+    final dxx = rx * ax + ux * ay + fx;
+    final dyy = ry * ax + uy * ay + fy;
+    final dzz = rz * ax + uz * ay + fz;
     if (dyy >= -1e-4) return null;
     final t = -py / dyy;
-    return Offset(px + dxx * t, pz + dyy * t);
+    return Offset(px + dxx * t, pz + dzz * t);
   }
 }

@@ -1063,13 +1063,21 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
       // 否则“软件内不显示桌面歌词”时浮窗会一直停留在“暂无歌词”。
       _desktopLyricsHiddenSent = false;
       _requestDesktopLyricsSync(immediate: true);
-      // 音量：设置页滑杆与音量键都只写 settings.volume，这里统一下发到
-      // 播放引擎。此前滑杆只写设置、播放器从不监听该字段，导致设置页
-      // 调节音量对正在播放的音频毫无效果。
-      final nextVolume = next.valueOrNull?.volume;
-      final prevVolume = previous?.valueOrNull?.volume;
-      if (nextVolume != null && nextVolume != prevVolume) {
-        unawaited(_applyAppVolume(nextVolume));
+      // 音量：设置页滑杆/悬浮窗音量条只写 settings.volume，这里统一下发
+      // 有效播放音量到引擎（volumeProvider：开关关闭时恒 1.0，软件音量
+      // 由系统音量全权控制）。比较用有效值，开关切换也能即时生效。
+      final nextSettings = next.valueOrNull;
+      final prevSettings = previous?.valueOrNull;
+      if (nextSettings != null) {
+        final nextEff = _ref.read(volumeProvider);
+        final prevEff = prevSettings == null
+            ? null
+            : (prevSettings.volumeKeyControlsAppVolume
+                ? prevSettings.volume
+                : 1.0);
+        if (prevEff == null || nextEff != prevEff) {
+          unawaited(_applyAppVolume(nextEff));
+        }
       }
     });
     // 音效（均衡器/前级/变速变调）：音效页的全部修改都写入
@@ -1318,30 +1326,20 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
     await setAppVolume(target);
   }
 
-  /// 把「音量键调节应用内音量」开关与应用内音量同步到媒体会话：
-  /// 开启时切远程音量模式（任何界面按音量键都调应用内音量，含应用
-  /// 后台的悬浮窗场景——此前该场景音量键直接改系统媒体音量），关闭时
-  /// 恢复本地模式。settings 变化时由 listen 触发，桥接安装后补推一次。
+  /// 同步媒体会话音量模式：始终保持本地（LOCAL）模式——物理音量键在
+  /// 任何界面（前台/后台/锁屏/悬浮窗）都由系统直接调节系统媒体音量，
+  /// 不再切远程音量模式把按键转发为应用内音量。系统音量对应用响度的
+  /// 影响由播放链路自然叠加（单向影响、不同步改写应用内音量）。
   void _syncAndroidPlaybackInfo() {
     if (kIsWeb || defaultTargetPlatform != TargetPlatform.android) return;
-    final settings = _ref.read(settingsProvider).valueOrNull;
-    _mediaSessionBridge?.pushAndroidPlaybackInfo(
-      settings?.volumeKeyControlsAppVolume ?? true,
-      settings?.volume ?? 1.0,
-    );
+    _mediaSessionBridge?.pushAndroidPlaybackInfo(false, 1.0);
   }
 
-  /// 订阅 settings 变化驱动媒体会话音量模式：开关切换切换模式，远程
-  /// 模式下音量变化刷新系统面板显示。
+  /// settings 变化时维持本地音量模式（幂等，重复 push 会被去重）。
   void _subscribeAndroidPlaybackInfo() {
     if (kIsWeb || defaultTargetPlatform != TargetPlatform.android) return;
-    _ref.listen(settingsProvider, (_, next) {
-      final settings = next.valueOrNull;
-      if (settings == null) return;
-      _mediaSessionBridge?.pushAndroidPlaybackInfo(
-        settings.volumeKeyControlsAppVolume,
-        settings.volume,
-      );
+    _ref.listen(settingsProvider, (_, _) {
+      _mediaSessionBridge?.pushAndroidPlaybackInfo(false, 1.0);
     });
   }
 
@@ -6973,10 +6971,16 @@ Map<String, dynamic> buildPlaybackSessionPayload({
   };
 }
 
-/// 音量（与设置联动）。
+/// 应用内音量（播放引擎实际下发的有效值）。
+///
+/// 「音量键调节应用内音量」开启：应用内音量条独立控制软件音量，
+/// 系统媒体音量只影响最终响度（单向叠加、不改写该值）；
+/// 关闭：软件音量直接被系统音量控制——播放器音量恒为 1.0，
+/// 响度完全跟随系统媒体音量。
 final volumeProvider = Provider<double>((ref) {
-  return ref.watch(settingsProvider.select((s) => s.valueOrNull?.volume)) ??
-      1.0;
+  final s = ref.watch(settingsProvider).valueOrNull;
+  if (s != null && !s.volumeKeyControlsAppVolume) return 1.0;
+  return s?.volume ?? 1.0;
 });
 
 /// 音量键调节应用内音量后的最新值（仅音量键通道写入）。应用根节点

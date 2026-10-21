@@ -42,7 +42,7 @@ import 'visualizer_settings.dart';
 /// 歌词偏移存取 key（与播放页共用同一份配置）。
 const String _lyricsOffsetsKey = 'playerLyricsOffsetsTenthsV1';
 
-enum _DrawerSection { none, pulse, theme, detect }
+enum _DrawerSection { none, theme, groundEq, blocks, pulse, meteor, lyrics, detect }
 
 class VisualizerPage extends ConsumerStatefulWidget {
   const VisualizerPage({super.key});
@@ -55,12 +55,19 @@ class _VisualizerPageState extends ConsumerState<VisualizerPage>
     with SingleTickerProviderStateMixin {
   Ticker? _ticker;
   Duration _lastElapsed = Duration.zero;
-  double _time = 0;
+  double _time = 0; // 真实秒（按压时长/冷却计时）
+  double _shaderTime = 0; // 场景时间（按「运动速度」缩放累加）
 
-  // 节拍链路状态。
-  BeatDetectorState _beatState = createBeatDetectorState();
-  bool _pendingOnset = false;
-  double _lastEnvelope = 0;
+  // 节拍链路状态（脉冲/流星两套独立检测器）。
+  BeatDetectorState _kickBeat = createBeatDetectorState();
+  BeatDetectorState _meteorBeat = createBeatDetectorState();
+  bool _kickOnset = false;
+  double _kickEnv = 0;
+  bool _meteorOnset = false;
+  double _meteorEnv = 0;
+  double _lastKickAt = -999;
+  double _lastMeteorAt = -999;
+  final List<VisMeteor> _meteors = <VisMeteor>[];
   List<double> _displayBands = List.filled(kVisBandCount, 0);
   // 数据源状态。
   bool _sourceReady = false;
@@ -72,7 +79,7 @@ class _VisualizerPageState extends ConsumerState<VisualizerPage>
   final VisRippleBuffer _ripples = VisRippleBuffer();
 
   // 手势状态。
-  double? _pressAt; // 按下时刻（秒）
+  double? _pressAt; // 按下时刻（真实秒）
   Offset? _pressPos;
   Offset _lastFocal = Offset.zero;
   double _lastScale = 1.0;
@@ -132,6 +139,8 @@ class _VisualizerPageState extends ConsumerState<VisualizerPage>
     final settings = ref.read(visualizerSettingsProvider);
     final src = VisualizerSource.instance;
 
+    _shaderTime += dt * (settings.motionSpeed / 50).clamp(0.0, 2.5);
+
     if (_sourceReady) {
       final gain = (settings.detectLevel / 100).clamp(0.0, 2.0);
       final smoothed = src.stepSmoothed(dt);
@@ -148,45 +157,97 @@ class _VisualizerPageState extends ConsumerState<VisualizerPage>
       }
     }
 
-    // —— 节拍检测（脉冲触发）——
-    if (settings.pulseEnabled && settings.autoPulse) {
-      final start = settings.bandStart.clamp(0, kVisBandCount - 2);
-      final end = settings.bandEnd.clamp(start + 1, kVisBandCount - 1);
-      final List<double> windowBands = settings.pulseMode == PulseMode.advanced
-          ? _displayBands.sublist(start, math.min(end + 1, start + 8))
-          : _displayBands.sublist(0, 8);
-      final out = stepBeatDetector(
-        state: _beatState,
-        windowBands: windowBands,
-        deltaSeconds: dt,
-        sensitivity: settings.sensitivity,
+    // —— 触发器检测（脉冲 + 流星各一套，Advanced 用自定义频段窗口）——
+    _kickOnset = false;
+    _meteorOnset = false;
+    _kickEnv = 0;
+    _meteorEnv = 0;
+    if (settings.kickEnabled && _sourceReady) {
+      final out = _stepTrigger(
+        state: _kickBeat,
+        settings: settings,
+        delta: dt,
+        mode: settings.kickMode,
+        sensitivity: settings.kickSensitivity,
+        autoTrack: settings.kickAutoTrack,
       );
-      _beatState = out.state;
-      _pendingOnset = out.kickOnset;
-      _lastEnvelope = out.kickEnvelope;
-    } else {
-      _pendingOnset = false;
-      _lastEnvelope = 0;
+      _kickBeat = out.$1;
+      _kickOnset = out.$2;
+      _kickEnv = out.$3;
+    }
+    if (settings.meteorEnabled && _sourceReady) {
+      final out = _stepTrigger(
+        state: _meteorBeat,
+        settings: settings,
+        delta: dt,
+        mode: settings.meteorMode,
+        sensitivity: settings.meteorSensitivity,
+        autoTrack: true,
+      );
+      _meteorBeat = out.$1;
+      _meteorOnset = out.$2;
+      _meteorEnv = out.$3;
     }
 
-    // —— 节拍 ripple（对齐 MapScene onFreqTrigger：随机落点 + 强度上限 3）——
-    if (_pendingOnset) {
+    // —— 脉冲触发 → ripple（随机落点，强度×脉冲强度，冷却帧限流）——
+    if (_kickOnset && _time - _lastKickAt >= settings.kickCooldownFrames / 60.0) {
+      _lastKickAt = _time;
       final rnd = math.Random();
       final ang = rnd.nextDouble() * math.pi * 2;
-      final rad = math.sqrt(rnd.nextDouble()) * 20.0;
-      final strength = math.min(_lastEnvelope * 2.0, 3.0);
       if (settings.form == VisualizerForm.terrain) {
+        final rad = math.sqrt(rnd.nextDouble()) * 20.0;
+        final strength =
+            math.min(_kickEnv * 2.0 * settings.kickStrength * 5.0, 3.0);
         _ripples.add(math.cos(ang) * rad, math.sin(ang) * rad, strength,
-            white: false, time: _time);
+            white: false, time: _shaderTime);
       } else {
         // 星云：ripple 落点用归一化偏移（-1..1）。
         _ripples.add(math.cos(ang), math.sin(ang),
-            math.min(_lastEnvelope * 1.6, 2.2),
-            white: false, time: _time);
+            math.min(_kickEnv * 1.6 * settings.kickStrength * 5.0, 2.2),
+            white: false, time: _shaderTime);
       }
-      _pendingOnset = false;
     }
-    // 地形形变已由 ripple 直接驱动（5534），保留节拍包络供核心辉光。
+
+    // —— 流星触发 → 生成飞行光点（冷却帧限流）——
+    if (_meteorOnset &&
+        _time - _lastMeteorAt >= settings.meteorCooldownFrames / 60.0) {
+      _lastMeteorAt = _time;
+      final rnd = math.Random();
+      final strength =
+          math.min(_meteorEnv * settings.meteorStrength * 2.2, 1.5);
+      if (settings.form == VisualizerForm.terrain) {
+        final ang = rnd.nextDouble() * math.pi * 2;
+        final spd = 26 + rnd.nextDouble() * 14;
+        _meteors.add(VisMeteor(
+          x: math.cos(ang) * 95,
+          y: 22 + rnd.nextDouble() * 18,
+          z: math.sin(ang) * 95,
+          vx: -math.cos(ang) * spd,
+          vy: -(8 + rnd.nextDouble() * 8),
+          vz: -math.sin(ang) * spd,
+          t0: _shaderTime,
+          strength: strength,
+        ));
+      } else {
+        // 星云：归一化坐标（-1..1），vy 为屏幕高度比例。
+        final ang = rnd.nextDouble() * math.pi * 2;
+        final spd = 0.35 + rnd.nextDouble() * 0.3;
+        _meteors.add(VisMeteor(
+          x: math.cos(ang) * 0.9,
+          y: 0.45 + rnd.nextDouble() * 0.35,
+          z: math.sin(ang) * 0.5,
+          vx: -math.cos(ang) * spd,
+          vy: -(0.22 + rnd.nextDouble() * 0.16),
+          vz: -math.sin(ang) * spd * 0.4,
+          t0: _shaderTime,
+          strength: strength,
+        ));
+      }
+    }
+    // 清理过期流星。
+    if (_meteors.isNotEmpty) {
+      _meteors.removeWhere((m) => _shaderTime - m.t0 > 3.4);
+    }
 
     // —— 数据活跃度提示 ——
     final active = _sourceReady && VisualizerSource.instance.hasData;
@@ -197,6 +258,50 @@ class _VisualizerPageState extends ConsumerState<VisualizerPage>
     }
 
     _frameTick.value++;
+  }
+
+  /// 触发器推进一步：返回 (新状态, 是否 onset, 包络)。
+  /// Auto Beat 用低频四窗口；Advanced 用 bandStart..bandEnd 自定义窗口；
+  /// 灵敏度 0..1 → 检测器 0..100；「自动追踪」关闭时禁用窗口自动挑选
+  /// （固定 Classic 窗口，等效降低自适应）。
+  (BeatDetectorState, bool, double) _stepTrigger({
+    required BeatDetectorState state,
+    required VisualizerSettings settings,
+    required double delta,
+    required TriggerMode mode,
+    required double sensitivity,
+    required bool autoTrack,
+  }) {
+    List<double> windowBands;
+    if (mode == TriggerMode.advanced) {
+      final start = settings.bandStart.clamp(0, kVisBandCount - 2);
+      final end = settings.bandEnd.clamp(start + 1, kVisBandCount - 1);
+      windowBands = _displayBands.sublist(start, math.min(end + 1, start + 8));
+    } else {
+      windowBands = _displayBands.sublist(0, 8);
+    }
+    var out = stepBeatDetector(
+      state: state,
+      windowBands: windowBands,
+      deltaSeconds: delta,
+      sensitivity: sensitivity * 100,
+    );
+    var st = out.state;
+    if (!autoTrack) {
+      // 固定窗口：重置窗口评分避免自动切换（简化实现）。
+      st = BeatDetectorState(
+        activeWindowIndex: st.activeWindowIndex,
+        windowScores: List.filled(st.windowScores.length, 0),
+        previousWindowLevels: st.previousWindowLevels,
+        fluxHistory: st.fluxHistory,
+        fluxHistoryIndex: st.fluxHistoryIndex,
+        smoothedFlux: st.smoothedFlux,
+        previousSmoothedFlux: st.previousSmoothedFlux,
+        cooldownRemaining: st.cooldownRemaining,
+        kickEnvelopeState: st.kickEnvelopeState,
+      );
+    }
+    return (st, out.kickOnset, out.kickEnvelope);
   }
 
   @override
@@ -248,13 +353,16 @@ class _VisualizerPageState extends ConsumerState<VisualizerPage>
                 ),
               ),
             ),
-            // 歌词覆盖层。
+            // 歌词覆盖层（设置驱动：模式/字号/颜色/字体）。
             Positioned(
               left: 16,
               right: 24,
               top: 0,
               bottom: 140,
-              child: _LyricsOverlay(offsetTenths: _lyricsOffsetTenths),
+              child: _LyricsOverlay(
+                offsetTenths: _lyricsOffsetTenths,
+                settings: settings,
+              ),
             ),
             // 底部毛玻璃播放条（循环/上一/播放/下一/队列/设置，对齐参考图）。
             Positioned(
@@ -334,10 +442,11 @@ class _VisualizerPageState extends ConsumerState<VisualizerPage>
     _pressAt = null;
     if (pressAt == null) return;
     final settings = ref.read(visualizerSettingsProvider);
-    // 按压时长映射强度（对齐 sonic-topography：短按 0.2~0.4，长按至 3.0）。
+    // 按压时长映射强度（对齐 sonic-topography：短按 0.2~0.4，长按至 3.0），
+    // 再乘「脉冲强度」（默认 0.2 → ×1）。
     final hold = (_time - pressAt).clamp(0.0, 3.0);
-    final strength =
-        hold < 0.25 ? 0.3 : math.min(0.2 + hold * 0.93, 3.0);
+    final base = hold < 0.25 ? 0.3 : math.min(0.2 + hold * 0.93, 3.0);
+    final strength = base * settings.kickStrength * 5.0;
     final pos = _pressPos ?? d.localPosition;
     _pressPos = null;
     if (settings.form == VisualizerForm.terrain) {
@@ -346,7 +455,8 @@ class _VisualizerPageState extends ConsumerState<VisualizerPage>
       if (gp == null) return;
       final dist = math.sqrt(gp.dx * gp.dx + gp.dy * gp.dy);
       if (dist > 84) return; // 地形范围外
-      _ripples.add(gp.dx, gp.dy, strength, white: false, time: _time);
+      _ripples.add(gp.dx, gp.dy, math.min(strength, 3.0),
+          white: false, time: _shaderTime);
     } else {
       // 星云：落点归一化到 -1..1。
       final size = context.size;
@@ -354,23 +464,21 @@ class _VisualizerPageState extends ConsumerState<VisualizerPage>
       final nx = (pos.dx / size.width - 0.5) * 2;
       final ny = (pos.dy / size.height - 0.5) * 2;
       _ripples.add(nx.clamp(-1.0, 1.0), ny.clamp(-1.0, 1.0),
-          math.min(strength, 2.2), white: false, time: _time);
+          math.min(strength, 2.2), white: false, time: _shaderTime);
     }
   }
 
   VisFrame _frame(VisualizerSettings s) {
     return VisFrame(
       bands: _displayBands,
-      kickEnvelope: s.pulseEnabled ? _lastEnvelope : 0,
+      kickEnvelope: s.kickEnabled ? _kickEnv : 0,
       rms: VisualizerSource.instance.rms,
-      time: _time,
-      explicitPlot: s.explicitPlot,
-      theme: s.theme,
-      brightness: s.brightness,
+      time: _shaderTime,
+      settings: s,
       camera: _cam,
       ripples: _ripples,
-      terrainDensity: s.terrainDensity,
       coverImage: _coverImage,
+      meteors: _meteors,
     );
   }
 
@@ -526,12 +634,18 @@ class _VisualizerPageState extends ConsumerState<VisualizerPage>
 }
 
 // ---------------------------------------------------------------------------
-// 歌词覆盖层：逐行列表，当前行白色加圆点，其余灰暗小字；点击行跳转进度。
+// 歌词覆盖层：逐行列表，全部由「歌词设置」驱动：
+// 模式（经典/弹跳/3D空间）、显示开关、活跃/非活跃字号、每行最大字数、
+// 字体颜色、卡拉OK颜色跟随主题、Serif/Sans、空间偏移。
 // ---------------------------------------------------------------------------
 
 class _LyricsOverlay extends ConsumerStatefulWidget {
   final int offsetTenths;
-  const _LyricsOverlay({required this.offsetTenths});
+  final VisualizerSettings settings;
+  const _LyricsOverlay({
+    required this.offsetTenths,
+    required this.settings,
+  });
 
   @override
   ConsumerState<_LyricsOverlay> createState() => _LyricsOverlayState();
@@ -541,7 +655,8 @@ class _LyricsOverlayState extends ConsumerState<_LyricsOverlay> {
   final ScrollController _scroll = ScrollController();
   int _lastActive = -1;
 
-  static const double _rowExtent = 42;
+  double _rowExtent(VisualizerSettings s) =>
+      math.max(s.lyricsActiveSize, s.lyricsInactiveSize) * 2.6;
 
   @override
   void dispose() {
@@ -569,8 +684,17 @@ class _LyricsOverlayState extends ConsumerState<_LyricsOverlay> {
     return idx;
   }
 
+  /// 每行最大字数截断。
+  String _clip(String text, double maxChars) {
+    final n = maxChars.round();
+    if (n <= 0 || text.length <= n) return text;
+    return text.substring(0, n) + '…';
+  }
+
   @override
   Widget build(BuildContext context) {
+    final s = widget.settings;
+    if (!s.lyricsShow) return const SizedBox.shrink();
     final current = ref.watch(
         playerProvider.select((s) => s.current));
     final position = ref.watch(
@@ -584,6 +708,7 @@ class _LyricsOverlayState extends ConsumerState<_LyricsOverlay> {
           style: TextStyle(
             color: Colors.white.withValues(alpha: 0.3),
             fontSize: 13,
+            fontFamily: s.lyricsSerif ? 'Georgia' : null,
           ),
         ),
       );
@@ -593,7 +718,8 @@ class _LyricsOverlayState extends ConsumerState<_LyricsOverlay> {
       _lastActive = active;
       if (active >= 0 && _scroll.hasClients) {
         final h = _scroll.position.viewportDimension;
-        final target = (active * _rowExtent - h * 0.32).clamp(
+        final extent = _rowExtent(s);
+        final target = (active * extent - h * 0.32).clamp(
           0.0,
           _scroll.position.maxScrollExtent,
         );
@@ -605,55 +731,94 @@ class _LyricsOverlayState extends ConsumerState<_LyricsOverlay> {
       }
     }
 
+    // 颜色：卡拉OK跟随主题 → accent；否则用自选字体色。
+    final activeColor = s.lyricsFollowTheme
+        ? Color(s.theme.accent)
+        : Color(s.lyricsColor);
+    final fontFamily = s.lyricsSerif ? 'Georgia' : null;
+    final extent = _rowExtent(s);
+    final leftPad = s.lyricsOffsetX.clamp(-120.0, 240.0);
+
     return ListView.builder(
       controller: _scroll,
-      itemExtent: _rowExtent,
-      padding: EdgeInsets.symmetric(vertical: _rowExtent * 3),
+      itemExtent: extent,
+      padding: EdgeInsets.symmetric(vertical: extent * 3),
       itemCount: lines.length,
       itemBuilder: (context, i) {
         final isActive = i == active;
+        Widget row = Padding(
+          padding: const EdgeInsets.symmetric(vertical: 2),
+          child: Row(
+            children: [
+              SizedBox(
+                width: 14,
+                child: isActive
+                    ? Container(
+                        width: 5,
+                        height: 5,
+                        decoration: BoxDecoration(
+                          color: activeColor,
+                          shape: BoxShape.circle,
+                        ),
+                      )
+                    : null,
+              ),
+              Expanded(
+                child: AnimatedDefaultTextStyle(
+                  duration: const Duration(milliseconds: 220),
+                  style: TextStyle(
+                    color: isActive
+                        ? activeColor
+                        : Colors.white.withValues(alpha: 0.32),
+                    fontSize: isActive
+                        ? s.lyricsActiveSize
+                        : s.lyricsInactiveSize,
+                    fontWeight: isActive ? FontWeight.w700 : FontWeight.w400,
+                    height: 1.2,
+                    fontFamily: fontFamily,
+                  ),
+                  child: Text(
+                    _clip(lines[i].text, s.lyricsMaxChars),
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                ),
+              ),
+            ],
+          ),
+        );
+        // 模式：弹跳（活跃行弹性缩放入场）。
+        if (isActive && s.lyricsMode == LyricsMode.bounce) {
+          row = TweenAnimationBuilder<double>(
+            tween: Tween(begin: 1.18, end: 1.0),
+            duration: const Duration(milliseconds: 420),
+            curve: Curves.elasticOut,
+            builder: (context, v, child) => Transform.scale(
+                scale: v, alignment: Alignment.centerLeft, child: child),
+            child: row,
+          );
+        }
+        // 模式：3D空间（按行距做透视偏移，活跃行前凸）。
+        if (s.lyricsMode == LyricsMode.space3d) {
+          final depth = (i - active).abs();
+          final tilt = isActive ? -0.10 : (0.06 * math.min(depth, 6));
+          row = Transform(
+            alignment: Alignment.centerLeft,
+            transform: Matrix4.identity()
+              ..setEntry(3, 2, 0.0018)
+              ..rotateY(tilt)
+              ..translate(math.min(depth, 6) * 6.0, 0.0, isActive ? 24.0 : 0.0),
+            child: row,
+          );
+        }
         return GestureDetector(
           behavior: HitTestBehavior.opaque,
           onTap: () => unawaited(
             ref.read(playerProvider.notifier).seek(lines[i].time),
           ),
           child: Padding(
-            padding: const EdgeInsets.symmetric(vertical: 2),
-            child: Row(
-              children: [
-                SizedBox(
-                  width: 14,
-                  child: isActive
-                      ? Container(
-                          width: 5,
-                          height: 5,
-                          decoration: const BoxDecoration(
-                            color: Colors.white,
-                            shape: BoxShape.circle,
-                          ),
-                        )
-                      : null,
-                ),
-                Expanded(
-                  child: AnimatedDefaultTextStyle(
-                    duration: const Duration(milliseconds: 220),
-                    style: TextStyle(
-                      color: isActive
-                          ? Colors.white
-                          : Colors.white.withValues(alpha: 0.32),
-                      fontSize: isActive ? 17 : 13,
-                      fontWeight: isActive ? FontWeight.w700 : FontWeight.w400,
-                      height: 1.2,
-                    ),
-                    child: Text(
-                      lines[i].text,
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                    ),
-                  ),
-                ),
-              ],
-            ),
+            padding: EdgeInsets.only(left: leftPad),
+            child: row,
           ),
         );
       },
@@ -944,7 +1109,8 @@ class _GlassPlayBarState extends ConsumerState<_GlassPlayBar> {
 }
 
 // ---------------------------------------------------------------------------
-// 右侧设置抽屉：脉冲触发 / 主题颜色 / 音频检测。
+// 右侧设置抽屉：七节面板（主题配色 / 地形均衡器 / 悬浮方块 / 脉冲触发 /
+// 流星触发 / 歌词设置 / 音频检测），对齐 sonic-topography 设置面板。
 // ---------------------------------------------------------------------------
 
 class _SettingsDrawer extends ConsumerWidget {
@@ -960,11 +1126,115 @@ class _SettingsDrawer extends ConsumerWidget {
     required this.onSectionChanged,
   });
 
+  static const _sectionLabels = [
+    '主题配色', '地形均衡器', '悬浮方块', '脉冲触发', '流星触发', '歌词设置', '音频检测',
+  ];
+  static const _sectionOrder = [
+    _DrawerSection.theme,
+    _DrawerSection.groundEq,
+    _DrawerSection.blocks,
+    _DrawerSection.pulse,
+    _DrawerSection.meteor,
+    _DrawerSection.lyrics,
+    _DrawerSection.detect,
+  ];
+
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final visible = section != _DrawerSection.none;
     final settings = ref.watch(visualizerSettingsProvider);
     final notifier = ref.read(visualizerSettingsProvider.notifier);
+
+    Widget header(String title) => Padding(
+          padding: const EdgeInsets.only(top: 4, bottom: 2),
+          child: Text(
+            title,
+            style: const TextStyle(
+              color: Colors.white,
+              fontSize: 15,
+              fontWeight: FontWeight.bold,
+            ),
+          ),
+        );
+
+    Widget hint(String text) => Padding(
+          padding: const EdgeInsets.only(top: 4),
+          child: Text(
+            text,
+            style: TextStyle(
+              color: Colors.white.withValues(alpha: 0.45),
+              fontSize: 12,
+            ),
+          ),
+        );
+
+    // 触发器（脉冲/流星共用布局）。
+    List<Widget> triggerSection({
+      required bool enabled,
+      required ValueChanged<bool> onEnabled,
+      required TriggerMode mode,
+      required ValueChanged<TriggerMode> onMode,
+      bool? autoTrack,
+      ValueChanged<bool>? onAutoTrack,
+      required double sensitivity,
+      required ValueChanged<double> onSensitivity,
+      required double cooldown,
+      required ValueChanged<double> onCooldown,
+      required double strength,
+      required ValueChanged<double> onStrength,
+    }) {
+      return [
+        _switchTile('启用', enabled, onEnabled),
+        const SizedBox(height: 8),
+        _segmentTabs(
+          labels: const ['Auto Beat', 'Advanced'],
+          activeIndex: mode == TriggerMode.autoBeat ? 0 : 1,
+          onChanged: (i) =>
+              onMode(i == 0 ? TriggerMode.autoBeat : TriggerMode.advanced),
+        ),
+        if (autoTrack != null && mode == TriggerMode.autoBeat)
+          _switchTile('自动追踪', autoTrack, onAutoTrack!),
+        _sliderRow('灵敏度', sensitivity, 0, 1, onSensitivity,
+            label: sensitivity.toStringAsFixed(1)),
+        _sliderRow('冷却帧', cooldown, 0, 300, onCooldown,
+            label: cooldown.round().toString()),
+        _sliderRow('脉冲强度', strength, 0, 1, onStrength,
+            label: strength.toStringAsFixed(1)),
+        if (mode == TriggerMode.advanced) ...[
+          const SizedBox(height: 8),
+          Text(
+            '触发频段（Advanced）',
+            style: TextStyle(
+              color: Colors.white.withValues(alpha: 0.55),
+              fontSize: 12,
+            ),
+          ),
+          _sliderRow(
+            '下限',
+            settings.bandStart.toDouble(),
+            0,
+            27,
+            (v) => notifier.update((s) {
+              final start = v.toInt();
+              final end = math.max(start + 1, s.bandEnd);
+              return s.copyWith(bandStart: start, bandEnd: end);
+            }),
+            label: settings.bandStart.toString(),
+          ),
+          _sliderRow(
+            '上限',
+            settings.bandEnd.toDouble(),
+            1,
+            28,
+            (v) => notifier.update((s) {
+              final end = math.max(v.toInt(), s.bandStart + 1);
+              return s.copyWith(bandEnd: end);
+            }),
+            label: settings.bandEnd.toString(),
+          ),
+        ],
+      ];
+    }
 
     return Positioned(
       top: 0,
@@ -984,7 +1254,7 @@ class _SettingsDrawer extends ConsumerWidget {
               child: BackdropFilter(
                 filter: ImageFilter.blur(sigmaX: 22, sigmaY: 22),
                 child: Container(
-                  width: 292,
+                  width: 300,
                   color: Colors.black.withValues(alpha: 0.62),
                   child: SafeArea(
                     child: ListView(
@@ -1021,124 +1291,110 @@ class _SettingsDrawer extends ConsumerWidget {
                               ? VisualizerForm.terrain
                               : VisualizerForm.nebula),
                         ),
-                        const SizedBox(height: 6),
-                        // 分节标签。
-                        _segmentTabs(
-                          labels: const ['脉冲', '主题', '检测'],
-                          activeIndex: switch (section) {
-                            _DrawerSection.pulse => 0,
-                            _DrawerSection.theme => 1,
-                            _DrawerSection.detect => 2,
-                            _ => 1,
-                          },
-                          onChanged: (i) => onSectionChanged(switch (i) {
-                            0 => _DrawerSection.pulse,
-                            2 => _DrawerSection.detect,
-                            _ => _DrawerSection.theme,
-                          }),
+                        const SizedBox(height: 10),
+                        // 分节标签（横向滚动）。
+                        SingleChildScrollView(
+                          scrollDirection: Axis.horizontal,
+                          child: Row(
+                            children: [
+                              for (int i = 0; i < _sectionLabels.length; i++)
+                                Padding(
+                                  padding: EdgeInsets.only(
+                                      right: i == _sectionLabels.length - 1
+                                          ? 0
+                                          : 6),
+                                  child: _sectionChip(
+                                    _sectionLabels[i],
+                                    active: section == _sectionOrder[i],
+                                    onTap: () =>
+                                        onSectionChanged(_sectionOrder[i]),
+                                  ),
+                                ),
+                            ],
+                          ),
                         ),
-                        if (section == _DrawerSection.pulse) ...[
-                          _switchTile(
-                            '脉冲触发',
-                            settings.pulseEnabled,
-                            (v) => notifier.update((s) =>
-                                s.copyWith(pulseEnabled: v)),
-                          ),
-                          const SizedBox(height: 10),
-                          _segmentTabs(
-                            labels: const ['Auto Beat', 'Advanced'],
-                            activeIndex:
-                                settings.pulseMode == PulseMode.autoBeat ? 0 : 1,
-                            onChanged: (i) => notifier.update((s) => s.copyWith(
-                                pulseMode: i == 0
-                                    ? PulseMode.autoBeat
-                                    : PulseMode.advanced)),
-                          ),
-                          const SizedBox(height: 6),
-                          if (settings.pulseMode == PulseMode.autoBeat)
-                            _switchTile(
-                              '自动脉冲',
-                              settings.autoPulse,
-                              (v) => notifier
-                                  .update((s) => s.copyWith(autoPulse: v)),
-                            ),
-                          _sliderRow(
-                            '灵敏度',
-                            settings.sensitivity,
-                            0,
-                            100,
-                            (v) => notifier
-                                .update((s) => s.copyWith(sensitivity: v)),
-                            label: settings.sensitivity.toStringAsFixed(1),
-                          ),
-                          _sliderRow(
-                            '节拍时长',
-                            settings.beatDuration,
-                            1,
-                            30,
-                            (v) => notifier
-                                .update((s) => s.copyWith(beatDuration: v)),
-                            label: settings.beatDuration.toStringAsFixed(1),
-                          ),
-                          _sliderRow(
-                            '亮度',
-                            settings.brightness,
-                            0,
-                            1,
-                            (v) => notifier
-                                .update((s) => s.copyWith(brightness: v)),
-                            label: settings.brightness.toStringAsFixed(1),
-                          ),
-                          if (settings.pulseMode == PulseMode.advanced) ...[
-                            const SizedBox(height: 8),
-                            Text(
-                              '触发频段（Advanced）',
-                              style: TextStyle(
-                                color: Colors.white.withValues(alpha: 0.55),
-                                fontSize: 12,
-                              ),
-                            ),
-                            _sliderRow(
-                              '下限',
-                              settings.bandStart.toDouble(),
-                              0,
-                              27,
-                              (v) => notifier.update((s) {
-                                final start = v.toInt();
-                                final end = math.max(
-                                    start + 1, settings.bandEnd);
-                                return s.copyWith(
-                                    bandStart: start, bandEnd: end);
-                              }),
-                              label: settings.bandStart.toString(),
-                            ),
-                            _sliderRow(
-                              '上限',
-                              settings.bandEnd.toDouble(),
-                              1,
-                              28,
-                              (v) => notifier.update((s) {
-                                final end = math.max(v.toInt(),
-                                    settings.bandStart + 1);
-                                return s.copyWith(bandEnd: end);
-                              }),
-                              label: settings.bandEnd.toString(),
-                            ),
-                          ],
-                        ] else if (section == _DrawerSection.theme) ...[
-                          const SizedBox(height: 6),
+                        const SizedBox(height: 12),
+                        // —— 主题配色 ——
+                        if (section == _DrawerSection.theme) ...[
+                          header('主题配色'),
+                          const SizedBox(height: 8),
                           Row(
-                            mainAxisAlignment:
-                                MainAxisAlignment.spaceBetween,
+                            mainAxisAlignment: MainAxisAlignment.spaceBetween,
                             children: [
                               for (int i = 0; i < kVisThemes.length; i++)
-                                _swatch(
+                                _namedSwatch(
                                   kVisThemes[i],
                                   selected: settings.themeIndex == i,
                                   onTap: () => notifier.update(
                                       (s) => s.copyWith(themeIndex: i)),
                                 ),
                             ],
+                          ),
+                          const SizedBox(height: 8),
+                          OutlinedButton.icon(
+                            onPressed: () => notifier.update((s) =>
+                                const VisualizerSettings().copyWith(
+                                    form: s.form)),
+                            style: OutlinedButton.styleFrom(
+                              foregroundColor: Colors.white70,
+                              side: BorderSide(
+                                  color:
+                                      Colors.white.withValues(alpha: 0.25)),
+                              shape: RoundedRectangleBorder(
+                                  borderRadius: BorderRadius.circular(10)),
+                            ),
+                            icon: const Icon(Icons.restart_alt_rounded,
+                                size: 18),
+                            label: const Text('恢复全部默认设置',
+                                style: TextStyle(fontSize: 13)),
+                          ),
+                          _sliderRow(
+                            '旋转速度',
+                            settings.rotationSpeed,
+                            0,
+                            1,
+                            (v) => notifier.update(
+                                (s) => s.copyWith(rotationSpeed: v)),
+                            label: settings.rotationSpeed.toStringAsFixed(1),
+                          ),
+                          _switchTile(
+                            '显示封面',
+                            settings.showCover,
+                            (v) => notifier
+                                .update((s) => s.copyWith(showCover: v)),
+                          ),
+                        ]
+                        // —— 地形均衡器 ——
+                        else if (section == _DrawerSection.groundEq) ...[
+                          header('地形均衡器'),
+                          const SizedBox(height: 4),
+                          for (int i = 0; i < kEqBandNames.length; i++)
+                            _eqRow(
+                              settings,
+                              i,
+                              onChanged: (band) => notifier.update((s) {
+                                final eq = List<VisEqBand>.of(s.groundEq);
+                                eq[i] = band;
+                                return s.copyWith(groundEq: eq);
+                              }),
+                            ),
+                          _sliderRow(
+                            '运动速度',
+                            settings.motionSpeed,
+                            0,
+                            100,
+                            (v) => notifier
+                                .update((s) => s.copyWith(motionSpeed: v)),
+                            label: settings.motionSpeed.round().toString(),
+                          ),
+                          _sliderRow(
+                            '振幅',
+                            settings.amplitude,
+                            0,
+                            100,
+                            (v) => notifier
+                                .update((s) => s.copyWith(amplitude: v)),
+                            label: settings.amplitude.round().toString(),
                           ),
                           _sliderRow(
                             '地形密度',
@@ -1149,30 +1405,211 @@ class _SettingsDrawer extends ConsumerWidget {
                                 (s) => s.copyWith(terrainDensity: v.round())),
                             label: '${settings.terrainDensity}',
                           ),
+                        ]
+                        // —— 悬浮方块 ——
+                        else if (section == _DrawerSection.blocks) ...[
+                          header('悬浮方块'),
                           _switchTile(
-                            '显式标绘图',
-                            settings.explicitPlot,
+                            '启用',
+                            settings.blocksEnabled,
                             (v) => notifier
-                                .update((s) => s.copyWith(explicitPlot: v)),
+                                .update((s) => s.copyWith(blocksEnabled: v)),
                           ),
-                        ] else if (section == _DrawerSection.detect) ...[
                           _sliderRow(
-                            '检测源',
+                            '强度',
+                            settings.blockIntensity,
+                            0,
+                            100,
+                            (v) => notifier
+                                .update((s) => s.copyWith(blockIntensity: v)),
+                            label: settings.blockIntensity.round().toString(),
+                          ),
+                          _sliderRow(
+                            '最小尺寸',
+                            settings.blockMinSize,
+                            0,
+                            100,
+                            (v) => notifier.update((s) => s.copyWith(
+                                blockMinSize: v,
+                                blockMaxSize: math.max(v, s.blockMaxSize))),
+                            label: settings.blockMinSize.round().toString(),
+                          ),
+                          _sliderRow(
+                            '最大尺寸',
+                            settings.blockMaxSize,
+                            0,
+                            100,
+                            (v) => notifier.update((s) => s.copyWith(
+                                blockMaxSize: v,
+                                blockMinSize: math.min(v, s.blockMinSize))),
+                            label: settings.blockMaxSize.round().toString(),
+                          ),
+                          _sliderRow(
+                            '速度',
+                            settings.blockSpeed,
+                            0,
+                            100,
+                            (v) => notifier
+                                .update((s) => s.copyWith(blockSpeed: v)),
+                            label: settings.blockSpeed.round().toString(),
+                          ),
+                        ]
+                        // —— 脉冲触发 ——
+                        else if (section == _DrawerSection.pulse) ...[
+                          header('脉冲触发'),
+                          ...triggerSection(
+                            enabled: settings.kickEnabled,
+                            onEnabled: (v) => notifier
+                                .update((s) => s.copyWith(kickEnabled: v)),
+                            mode: settings.kickMode,
+                            onMode: (m) =>
+                                notifier.update((s) => s.copyWith(kickMode: m)),
+                            autoTrack: settings.kickAutoTrack,
+                            onAutoTrack: (v) => notifier
+                                .update((s) => s.copyWith(kickAutoTrack: v)),
+                            sensitivity: settings.kickSensitivity,
+                            onSensitivity: (v) => notifier
+                                .update((s) => s.copyWith(kickSensitivity: v)),
+                            cooldown: settings.kickCooldownFrames,
+                            onCooldown: (v) => notifier.update(
+                                (s) => s.copyWith(kickCooldownFrames: v)),
+                            strength: settings.kickStrength,
+                            onStrength: (v) => notifier
+                                .update((s) => s.copyWith(kickStrength: v)),
+                          ),
+                        ]
+                        // —— 流星触发 ——
+                        else if (section == _DrawerSection.meteor) ...[
+                          header('流星触发'),
+                          ...triggerSection(
+                            enabled: settings.meteorEnabled,
+                            onEnabled: (v) => notifier
+                                .update((s) => s.copyWith(meteorEnabled: v)),
+                            mode: settings.meteorMode,
+                            onMode: (m) => notifier
+                                .update((s) => s.copyWith(meteorMode: m)),
+                            sensitivity: settings.meteorSensitivity,
+                            onSensitivity: (v) => notifier.update(
+                                (s) => s.copyWith(meteorSensitivity: v)),
+                            cooldown: settings.meteorCooldownFrames,
+                            onCooldown: (v) => notifier.update(
+                                (s) => s.copyWith(meteorCooldownFrames: v)),
+                            strength: settings.meteorStrength,
+                            onStrength: (v) => notifier
+                                .update((s) => s.copyWith(meteorStrength: v)),
+                          ),
+                        ]
+                        // —— 歌词设置 ——
+                        else if (section == _DrawerSection.lyrics) ...[
+                          header('歌词设置'),
+                          const SizedBox(height: 8),
+                          _segmentTabs(
+                            labels: const ['经典', '弹跳', '3D空间'],
+                            activeIndex: settings.lyricsMode.index,
+                            onChanged: (i) => notifier.update((s) =>
+                                s.copyWith(
+                                    lyricsMode: LyricsMode.values[i])),
+                          ),
+                          _switchTile(
+                            '显示歌词',
+                            settings.lyricsShow,
+                            (v) => notifier
+                                .update((s) => s.copyWith(lyricsShow: v)),
+                          ),
+                          _sliderRow(
+                            '活跃字号',
+                            settings.lyricsActiveSize,
+                            5,
+                            40,
+                            (v) => notifier.update(
+                                (s) => s.copyWith(lyricsActiveSize: v)),
+                            label:
+                                settings.lyricsActiveSize.round().toString(),
+                          ),
+                          _sliderRow(
+                            '非活跃字号',
+                            settings.lyricsInactiveSize,
+                            3,
+                            30,
+                            (v) => notifier.update(
+                                (s) => s.copyWith(lyricsInactiveSize: v)),
+                            label:
+                                settings.lyricsInactiveSize.round().toString(),
+                          ),
+                          _sliderRow(
+                            '每行最大字数',
+                            settings.lyricsMaxChars.toDouble(),
+                            4,
+                            100,
+                            (v) => notifier.update(
+                                (s) =>
+                                    s.copyWith(lyricsMaxChars: v.round().toDouble())),
+                            label: '${settings.lyricsMaxChars.round()}',
+                          ),
+                          const SizedBox(height: 6),
+                          Text(
+                            '字体颜色',
+                            style: TextStyle(
+                              color: Colors.white.withValues(alpha: 0.55),
+                              fontSize: 12,
+                            ),
+                          ),
+                          const SizedBox(height: 6),
+                          Row(
+                            children: [
+                              _colorSwatch(
+                                0xFFFFFFFF,
+                                selected: settings.lyricsColor == 0xFFFFFFFF,
+                                onTap: () => notifier.update(
+                                    (s) => s.copyWith(lyricsColor: 0xFFFFFFFF)),
+                              ),
+                              const SizedBox(width: 8),
+                              for (final t in kVisThemes) ...[
+                                _colorSwatch(
+                                  t.main,
+                                  selected: settings.lyricsColor == t.main,
+                                  onTap: () => notifier.update(
+                                      (s) => s.copyWith(lyricsColor: t.main)),
+                                ),
+                                const SizedBox(width: 8),
+                              ],
+                            ],
+                          ),
+                          _switchTile(
+                            '卡拉OK颜色跟随主题',
+                            settings.lyricsFollowTheme,
+                            (v) => notifier.update(
+                                (s) => s.copyWith(lyricsFollowTheme: v)),
+                          ),
+                          _segmentTabs(
+                            labels: const ['Serif', 'Sans'],
+                            activeIndex: settings.lyricsSerif ? 0 : 1,
+                            onChanged: (i) => notifier
+                                .update((s) => s.copyWith(lyricsSerif: i == 0)),
+                          ),
+                          _sliderRow(
+                            '空间偏移',
+                            settings.lyricsOffsetX,
+                            -100,
+                            100,
+                            (v) => notifier
+                                .update((s) => s.copyWith(lyricsOffsetX: v)),
+                            label: settings.lyricsOffsetX.round().toString(),
+                          ),
+                        ]
+                        // —— 音频检测 ——
+                        else if (section == _DrawerSection.detect) ...[
+                          header('音频检测'),
+                          _sliderRow(
+                            '节拍检测灵敏度',
                             settings.detectLevel,
                             0,
                             100,
                             (v) => notifier
                                 .update((s) => s.copyWith(detectLevel: v)),
-                            label: settings.detectLevel.toStringAsFixed(1),
+                            label: settings.detectLevel.round().toString(),
                           ),
-                          const SizedBox(height: 6),
-                          Text(
-                            '调整频谱采集的输入增益，过高可能削波失真。',
-                            style: TextStyle(
-                              color: Colors.white.withValues(alpha: 0.45),
-                              fontSize: 12,
-                            ),
-                          ),
+                          hint('调整频谱采集的输入增益，过高可能削波失真。'),
                         ],
                       ],
                     ),
@@ -1186,21 +1623,167 @@ class _SettingsDrawer extends ConsumerWidget {
     );
   }
 
-  Widget _swatch(VisTheme t,
+  // —— 小部件 ——
+
+  Widget _sectionChip(String label,
+      {required bool active, required VoidCallback onTap}) {
+    return GestureDetector(
+      onTap: onTap,
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 7),
+        decoration: BoxDecoration(
+          color: active
+              ? Colors.white.withValues(alpha: 0.16)
+              : Colors.white.withValues(alpha: 0.05),
+          borderRadius: BorderRadius.circular(10),
+          border: Border.all(
+            color: active
+                ? Colors.white.withValues(alpha: 0.4)
+                : Colors.white.withValues(alpha: 0.08),
+          ),
+        ),
+        child: Text(
+          label,
+          style: TextStyle(
+            color: active ? Colors.white : Colors.white.withValues(alpha: 0.5),
+            fontSize: 12.5,
+            fontWeight: FontWeight.w600,
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _namedSwatch(VisTheme t,
+      {required bool selected, required VoidCallback onTap}) {
+    return GestureDetector(
+      onTap: onTap,
+      behavior: HitTestBehavior.opaque,
+      child: Column(
+        children: [
+          Container(
+            width: 36,
+            height: 36,
+            decoration: BoxDecoration(
+              gradient: LinearGradient(
+                colors: [Color(t.main), Color(t.dim)],
+                begin: Alignment.topLeft,
+                end: Alignment.bottomRight,
+              ),
+              shape: BoxShape.circle,
+              border: Border.all(
+                color: selected ? Colors.white : Colors.white24,
+                width: selected ? 2.5 : 1,
+              ),
+            ),
+          ),
+          const SizedBox(height: 4),
+          Text(
+            t.name,
+            style: TextStyle(
+              color: selected
+                  ? Colors.white
+                  : Colors.white.withValues(alpha: 0.55),
+              fontSize: 11,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _colorSwatch(int argb,
       {required bool selected, required VoidCallback onTap}) {
     return GestureDetector(
       onTap: onTap,
       child: Container(
-        width: 42,
-        height: 42,
+        width: 24,
+        height: 24,
         decoration: BoxDecoration(
-          color: Color(t.main),
+          color: Color(argb),
           shape: BoxShape.circle,
           border: Border.all(
             color: selected ? Colors.white : Colors.white24,
             width: selected ? 2.5 : 1,
           ),
         ),
+      ),
+    );
+  }
+
+  /// 地形均衡器单频段行：频段名 + On/Off 开关 + 0..100 滑杆。
+  Widget _eqRow(
+    VisualizerSettings settings,
+    int index, {
+    required ValueChanged<VisEqBand> onChanged,
+  }) {
+    final band = settings.groundEq[index];
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 2),
+      child: Column(
+        children: [
+          Row(
+            children: [
+              SizedBox(
+                width: 44,
+                child: Text(kEqBandNames[index],
+                    style: TextStyle(
+                      color: band.on
+                          ? Colors.white
+                          : Colors.white.withValues(alpha: 0.4),
+                      fontSize: 12.5,
+                      fontWeight: FontWeight.w600,
+                    )),
+              ),
+              SizedBox(
+                width: 40,
+                height: 26,
+                child: Transform.scale(
+                  scale: 0.72,
+                  child: Switch(
+                    value: band.on,
+                    onChanged: (v) => onChanged(band.copyWith(on: v)),
+                    activeThumbColor: Colors.white,
+                    activeTrackColor: Colors.white24,
+                    inactiveThumbColor: Colors.white30,
+                    inactiveTrackColor: Colors.white12,
+                  ),
+                ),
+              ),
+              Expanded(
+                child: SliderTheme(
+                  data: SliderThemeData(
+                    trackHeight: 2.5,
+                    overlayShape: SliderComponentShape.noOverlay,
+                    thumbShape:
+                        const RoundSliderThumbShape(enabledThumbRadius: 5),
+                    activeTrackColor: Colors.white.withValues(alpha: 0.85),
+                    inactiveTrackColor: Colors.white.withValues(alpha: 0.14),
+                    thumbColor: Colors.white,
+                  ),
+                  child: Slider(
+                    value: band.value.clamp(0, 100),
+                    min: 0,
+                    max: 100,
+                    onChanged: band.on ? (v) => onChanged(band.copyWith(value: v)) : null,
+                  ),
+                ),
+              ),
+              SizedBox(
+                width: 30,
+                child: Text(
+                  band.value.round().toString(),
+                  textAlign: TextAlign.end,
+                  style: TextStyle(
+                    color: Colors.white.withValues(alpha: 0.7),
+                    fontSize: 12,
+                    fontFeatures: const [FontFeature.tabularFigures()],
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ],
       ),
     );
   }
