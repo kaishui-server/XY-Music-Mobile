@@ -264,6 +264,9 @@ class _XyMusicAppState extends ConsumerState<XyMusicApp>
     final init = ref.watch(rustInitProvider);
     final settings = ref.watch(settingsProvider).valueOrNull;
     // 音量键拦截开关同步到原生层（含设置加载完成后的首次同步）。
+    // 下面的 postFrame 补一次冷启动同步：select 的默认值与加载后的值
+    // 都为 true 时（开关本来就开着），listen 不会触发，原生拦截开关
+    // 会一直是默认 false——前台音量键不拦截直接改系统音量。
     ref.listen<bool>(
       settingsProvider.select(
         (s) => s.valueOrNull?.volumeKeyControlsAppVolume ?? true,
@@ -275,6 +278,13 @@ class _XyMusicAppState extends ConsumerState<XyMusicApp>
         MiniPlayerOverlayBridge.requestSync();
       },
     );
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      _syncVolumeKeyCapture(
+        ref.read(settingsProvider).valueOrNull?.volumeKeyControlsAppVolume ??
+            true,
+      );
+    });
     // 音量键调节应用内音量的 OSD 反馈：音量键被拦截时系统音量面板
     // 不会出现，由根节点提示当前应用音量。
     ref.listen<double?>(volumeKeyOscProvider, (_, next) {

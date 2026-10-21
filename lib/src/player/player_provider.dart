@@ -639,6 +639,81 @@ class _MediaSessionBridge extends audio_service.CompositeAudioHandler {
   /// 通知栏「播放模式」按钮：循环切换列表循环/单曲循环/随机。
   Future<void> Function()? onCyclePlayMode;
 
+  /// 系统级音量键回调（MediaSession 远程音量模式）：设置「音量键调节
+  /// 应用内音量」开启后，媒体会话切到 setPlaybackToRemote，任何界面
+  /// （应用后台/桌面悬浮窗/锁屏）按物理音量键都由系统转发到这里，
+  /// 复用前台 dispatchKeyEvent 拦截同一条应用内音量路径，不再触碰
+  /// 系统媒体音量。direction 为 'up'/'down'。
+  Future<void> Function(String direction)? onVolumeKeyDirection;
+
+  /// 系统音量面板绝对值设置（远程音量模式下拖动面板/按键直达值），
+  /// volumeIndex 为 0..100。
+  Future<void> Function(int volumeIndex)? onVolumeSet;
+
+  /// 上次推送的 playbackInfo 状态（幂等去重：settings 任意字段变化
+  /// 都会触发重推，无需每次都下发原生）。
+  bool? _lastPushedAppVolumeMode;
+  int? _lastPushedProviderVolume;
+
+  /// 被包装的裸 handler（_PlayerAudioHandler extends BaseAudioHandler），
+  /// 其 androidPlaybackInfo 是公开 BehaviorSubject；SwitchAudioHandler 在
+  /// inner 替换时会重新订阅该流并桥接到 AudioService 的原生下发，所以
+  /// 远程/本地音量模式直接 add 到这里即可送达原生 mediaSession。
+  audio_service.BaseAudioHandler get _innerBase =>
+      _innerRef as audio_service.BaseAudioHandler;
+
+  /// 把媒体会话切到远程音量（appVolumeMode=true，音量键由系统转发到
+  /// [onVolumeKeyDirection]，系统音量面板显示应用内音量刻度）或恢复
+  /// 本地模式（音量键回归系统媒体音量）。volume 为应用内音量 0..1，
+  /// 用于同步面板显示；远程模式下音量变化需重推刷新面板。
+  void pushAndroidPlaybackInfo(bool appVolumeMode, double volume) {
+    if (appVolumeMode) {
+      final v = (volume * 100).round().clamp(0, 100);
+      if (_lastPushedAppVolumeMode == true && _lastPushedProviderVolume == v) {
+        return;
+      }
+      _lastPushedAppVolumeMode = true;
+      _lastPushedProviderVolume = v;
+      _innerBase.androidPlaybackInfo.add(
+        audio_service.RemoteAndroidPlaybackInfo(
+          volumeControlType: audio_service.AndroidVolumeControlType.absolute,
+          maxVolume: 100,
+          volume: v,
+        ),
+      );
+    } else {
+      if (_lastPushedAppVolumeMode == false) return;
+      _lastPushedAppVolumeMode = false;
+      _lastPushedProviderVolume = null;
+      _innerBase.androidPlaybackInfo
+          .add(audio_service.LocalAndroidPlaybackInfo());
+    }
+  }
+
+  /// 系统级音量键（远程音量模式）：步进调节应用内音量。暂停/后台/
+  /// 桌面悬浮窗场景的音量键统一走这里（前台场景优先被
+  /// MainActivity.dispatchKeyEvent 拦截，不会重复触发）。
+  @override
+  Future<void> androidAdjustRemoteVolume(
+    audio_service.AndroidVolumeDirection direction,
+  ) async {
+    super.androidAdjustRemoteVolume(direction);
+    final callback = onVolumeKeyDirection;
+    if (callback == null) return;
+    if (direction == audio_service.AndroidVolumeDirection.raise) {
+      await callback('up');
+    } else if (direction == audio_service.AndroidVolumeDirection.lower) {
+      await callback('down');
+    }
+  }
+
+  /// 系统音量面板绝对值（远程音量模式）：直接设置应用内音量。
+  @override
+  Future<void> androidSetRemoteVolume(int volumeIndex) async {
+    await super.androidSetRemoteVolume(volumeIndex);
+    await onVolumeSet?.call(volumeIndex);
+  }
+
   /// 发布给媒体会话的队列（应用队列转换的 MediaItem 列表）。
   /// 覆写 [queue] 后 SwitchAudioHandler 会把它经平台通道同步到
   /// 原生 mediaSession.setQueue，内部 handler 每次点播重载单曲
@@ -1047,6 +1122,8 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
     _init();
     _installCarMediaButtonChannel();
     _installVolumeKeyChannel();
+    // 媒体会话音量模式（远程/本地）随设置开关与音量变化同步。
+    _subscribeAndroidPlaybackInfo();
     // just_audio_background 的内部 handler 要等首个 AudioPlayer 完成平台
     // 初始化才会挂到 SwitchAudioHandler 上，延迟安装 + 播放时兜底重试。
     // 用可取消的 Timer 而非 Future.delayed：dispose 时取消，避免测试
@@ -1100,10 +1177,16 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
           return normalizePlayMode(state.playMode);
         }
         ..onToggleFavorite = _toggleFavoriteFromNotification
-        ..onCyclePlayMode = _cyclePlayModeFromNotification;
+        ..onCyclePlayMode = _cyclePlayModeFromNotification
+        ..onVolumeKeyDirection = _handleVolumeKeyDirection
+        ..onVolumeSet = _handleVolumeSet;
       bridge.attach();
       handler.inner = bridge;
       _mediaSessionBridge = bridge;
+      // 桥接就位后按当前开关/音量推送一次媒体会话音量模式（远程音量
+      // 模式需要 mediaSession 就绪后才有意义，settings 订阅早于此时
+      // 的推送会被 bridge 去重挡掉，这里兜底补推）。
+      _syncAndroidPlaybackInfo();
       // 安装完成后立即补推当前曲目与控件状态：桥接安装时序可能晚于
       // 首次起播（just_audio_background 初始化），若此前 syncMediaItem /
       // _publish 已执行但随后被裸 handler 覆盖，这里重推一次，确保
@@ -1203,21 +1286,62 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
     channel.setMethodCallHandler((call) async {
       if (call.method != 'onVolumeKey') return;
       final direction = call.arguments as String?;
-      if (direction != 'up' && direction != 'down') return;
-      final now = DateTime.now();
-      final last = _lastVolumeKeyAt;
-      if (last != null &&
-          now.difference(last) < const Duration(milliseconds: 120)) {
-        return;
-      }
-      _lastVolumeKeyAt = now;
-      final current = _ref.read(volumeProvider);
-      final target =
-          (direction == 'up' ? current + .05 : current - .05).clamp(0.0, 1.0);
-      if ((target - current).abs() < .001) return;
-      await setAppVolume(target);
-      // 供应用根节点显示“应用音量 xx%”的 OSD 反馈。
-      _ref.read(volumeKeyOscProvider.notifier).state = target;
+      await _handleVolumeKeyDirection(direction);
+    });
+  }
+
+  /// 音量键方向统一处理（前台 dispatchKeyEvent 拦截 + MediaSession 远程
+  /// 音量模式两条链路共用）：±5% 步进应用内音量，长按连发 120ms 节流，
+  /// 并发 OSD 反馈。
+  Future<void> _handleVolumeKeyDirection(String? direction) async {
+    if (direction != 'up' && direction != 'down') return;
+    final now = DateTime.now();
+    final last = _lastVolumeKeyAt;
+    if (last != null &&
+        now.difference(last) < const Duration(milliseconds: 120)) {
+      return;
+    }
+    _lastVolumeKeyAt = now;
+    final current = _ref.read(volumeProvider);
+    final target =
+        (direction == 'up' ? current + .05 : current - .05).clamp(0.0, 1.0);
+    if ((target - current).abs() < .001) return;
+    await setAppVolume(target);
+    // 供应用根节点显示“应用音量 xx%”的 OSD 反馈。
+    _ref.read(volumeKeyOscProvider.notifier).state = target;
+  }
+
+  /// 音量面板绝对值（MediaSession 远程音量模式）：面板拖动/按键直达值
+  /// 直接写应用内音量（不节流、不 OSD——面板本身已是可见反馈）。
+  Future<void> _handleVolumeSet(int volumeIndex) async {
+    final target = (volumeIndex / 100).clamp(0.0, 1.0);
+    await setAppVolume(target);
+  }
+
+  /// 把「音量键调节应用内音量」开关与应用内音量同步到媒体会话：
+  /// 开启时切远程音量模式（任何界面按音量键都调应用内音量，含应用
+  /// 后台的悬浮窗场景——此前该场景音量键直接改系统媒体音量），关闭时
+  /// 恢复本地模式。settings 变化时由 listen 触发，桥接安装后补推一次。
+  void _syncAndroidPlaybackInfo() {
+    if (kIsWeb || defaultTargetPlatform != TargetPlatform.android) return;
+    final settings = _ref.read(settingsProvider).valueOrNull;
+    _mediaSessionBridge?.pushAndroidPlaybackInfo(
+      settings?.volumeKeyControlsAppVolume ?? true,
+      settings?.volume ?? 1.0,
+    );
+  }
+
+  /// 订阅 settings 变化驱动媒体会话音量模式：开关切换切换模式，远程
+  /// 模式下音量变化刷新系统面板显示。
+  void _subscribeAndroidPlaybackInfo() {
+    if (kIsWeb || defaultTargetPlatform != TargetPlatform.android) return;
+    _ref.listen(settingsProvider, (_, next) {
+      final settings = next.valueOrNull;
+      if (settings == null) return;
+      _mediaSessionBridge?.pushAndroidPlaybackInfo(
+        settings.volumeKeyControlsAppVolume,
+        settings.volume,
+      );
     });
   }
 
