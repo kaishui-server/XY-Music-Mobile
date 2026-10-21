@@ -7,6 +7,7 @@
 // Canvas.drawPoints 单次调用，无 saveLayer/离屏。
 
 import 'dart:math' as math;
+import 'dart:ui' show PointMode;
 
 import 'package:flutter/material.dart';
 

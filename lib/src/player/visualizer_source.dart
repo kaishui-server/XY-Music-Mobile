@@ -9,7 +9,6 @@
 
 import 'dart:async';
 import 'dart:math' as math;
-import 'dart:typed_data';
 
 import 'package:flutter/services.dart';
 
@@ -37,7 +36,7 @@ class VisualizerSource {
   /// 事件流写入的目标频段（未经帧间平滑）。
   List<double> _targetBands = List.filled(kVisBandCount, 0);
   /// 帧间平滑后的当前频段（渲染层每帧调用 [stepSmoothed] 推进）。
-  List<double> _smoothedBands = List.filled(kVisBandCount, 0);
+  final List<double> _smoothedBands = List.filled(kVisBandCount, 0);
 
   /// 最近一次 FFT 的整体 RMS（0..1，供星云核心等使用）。
   double rms = 0;
@@ -93,7 +92,7 @@ class VisualizerSource {
     } catch (_) {}
   }
 
-  void _onFft(Object data) {
+  void _onFft(dynamic data) {
     if (data is! Uint8List || data.length < 4) return;
     final binCount = data.length ~/ 2; // 实部/虚部交错
     if (binCount < 8) return;

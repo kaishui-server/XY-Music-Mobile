@@ -83,7 +83,6 @@ const int _fluxHistorySize = 90;
 const double _windowScoreDecay = 0.965;
 const double _fluxSmoothing = 0.35;
 const double _cooldownSeconds = 0.12;
-const double _defaultSensitivity = 100;
 
 const _strictParams = BeatDetectorParams(
   thresholdStdDevGain: 2.6,

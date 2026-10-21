@@ -14,9 +14,11 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:math' as math;
+import 'dart:ui' show ImageFilter;
 
 import 'package:flutter/material.dart';
 import 'package:flutter/scheduler.dart';
+import 'package:flutter/services.dart' show SystemUiOverlayStyle;
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -52,7 +54,6 @@ class _VisualizerPageState extends ConsumerState<VisualizerPage>
   bool _pendingOnset = false;
   double _lastEnvelope = 0;
   List<double> _displayBands = List.filled(kVisBandCount, 0);
-
   // 数据源状态。
   bool _sourceReady = false;
   bool _sourceFailed = false;
@@ -387,10 +388,11 @@ class _LyricsOverlayState extends ConsumerState<_LyricsOverlay> {
     if (item == null) return const <LyricLine>[];
     final embedded = item.lyricsRaw?.trim() ?? '';
     if (embedded.isNotEmpty) {
-      final l = ref.watch(embeddedLyricsProvider(embedded));
-      if (l.isNotEmpty) return l;
+      final l = ref.watch(embeddedLyricsProvider(embedded)).valueOrNull;
+      if (l != null && l.isNotEmpty) return l;
     }
-    return ref.watch(songLyricsProvider(item.path));
+    return ref.watch(songLyricsProvider(item.path)).valueOrNull ??
+        const <LyricLine>[];
   }
 
   int _activeIndex(List<LyricLine> lines, double pos) {
