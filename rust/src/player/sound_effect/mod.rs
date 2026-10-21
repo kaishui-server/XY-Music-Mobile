@@ -421,6 +421,11 @@ pub struct SoundEffectSettings {
     pub v4a_enabled: bool,
     pub bypass: bool,
     pub audio_boost: f32,
+    // anime 音效引擎（open.anime.bzxhkj.com 开放平台）：原始 params JSON
+    // 直传官方 animefx.c 引擎（引擎内部自带 10 段 EQ/压缩/混响/次谐波/
+    // 激励/抖晃/旋转/展宽/空气感/增益全链）。None/空 = 未启用（直通）。
+    #[serde(default)]
+    pub anime_params: Option<String>,
 }
 
 /// 手动实现 Default：pitch_shift / playback_rate 必须为 100.0（原调原速），
@@ -471,6 +476,7 @@ impl Default for SoundEffectSettings {
             v4a_enabled: false,
             bypass: false,
             audio_boost: 0.0,
+            anime_params: None,
         }
     }
 }

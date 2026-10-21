@@ -43,6 +43,131 @@ fn url_path_extension(url: &str) -> Option<String> {
     }
 }
 
+// ===========================================================================
+// anime 音效引擎封装（open.anime.bzxhkj.com 开放平台官方 animefx.c）
+// ===========================================================================
+//
+// 官方引擎按 PCM16 交错样本设计，管线内样本是 f32（±1.0）：启用时每块做
+// f32→i16→引擎→f32 往返（官方 App 同为 16bit 口径）；未启用/淡出收敛后
+// 走零开销直通，不做任何域转换。
+//
+// 线程约定（引擎要求 set_params/set_bypass 与 process 串行化）：全部调用都
+// 在本文件的单个音频线程内完成（命令处理与 DSP 链同线程）。
+
+extern "C" {
+    fn animefx_create(rate: std::os::raw::c_int, ch: std::os::raw::c_int) -> *mut core::ffi::c_void;
+    fn animefx_destroy(ep: *mut core::ffi::c_void);
+    fn animefx_set_params(ep: *mut core::ffi::c_void, json: *const std::os::raw::c_char);
+    fn animefx_set_bypass(ep: *mut core::ffi::c_void, bypass: std::os::raw::c_int);
+    fn animefx_process(ep: *mut core::ffi::c_void, pcm: *mut i16, frames: std::os::raw::c_int);
+    fn animefx_reset(ep: *mut core::ffi::c_void);
+}
+
+struct AnimeFxEngine {
+    handle: *mut core::ffi::c_void,
+    sample_rate: u32,
+    /// 管线声道数（1/2，与 create 时传给引擎的一致）。
+    channels: usize,
+    /// true = 音效生效中（样本需过引擎）；false = 直通快路径。
+    active: bool,
+    /// 停用后的余量（帧）：官方 12ms 交叉淡化需要样本继续过引擎完成淡出，
+    /// 收敛后（wet<0.001）再切直通，避免硬切爆音。给 0.3s 余量足够。
+    fade_out_frames_left: u64,
+    i16_buf: Vec<i16>,
+    f32_buf: Vec<f32>,
+}
+
+// 引擎句柄仅在音频线程内解引用（见线程约定），跨线程仅持有/销毁。
+unsafe impl Send for AnimeFxEngine {}
+
+impl AnimeFxEngine {
+    fn new(sample_rate: u32, channels: u16) -> Self {
+        let handle = unsafe {
+            animefx_create(sample_rate as std::os::raw::c_int, channels as std::os::raw::c_int)
+        };
+        Self {
+            handle,
+            sample_rate,
+            channels: (channels.max(1)) as usize,
+            active: false,
+            fade_out_frames_left: 0,
+            i16_buf: Vec::new(),
+            f32_buf: Vec::new(),
+        }
+    }
+
+    /// 更新音效参数。params 为 None/空 = 停用（淡出后直通）；Some = 启用
+    /// （12ms 淡入）。
+    fn set_params_json(&mut self, params: Option<&str>) {
+        match params.map(str::trim).filter(|p| !p.is_empty()) {
+            Some(json) => {
+                if self.handle.is_null() {
+                    return;
+                }
+                if let Ok(c) = std::ffi::CString::new(json) {
+                    unsafe { animefx_set_params(self.handle, c.as_ptr()) };
+                    unsafe { animefx_set_bypass(self.handle, 0) };
+                    self.active = true;
+                    self.fade_out_frames_left = 0;
+                }
+            }
+            None => {
+                if self.active && !self.handle.is_null() {
+                    unsafe { animefx_set_bypass(self.handle, 1) };
+                    // 0.3s 余量让官方 12ms 淡出走完（块间逐步收敛到直通）。
+                    self.fade_out_frames_left = (self.sample_rate as u64) * 3 / 10;
+                }
+            }
+        }
+    }
+
+    fn reset(&mut self) {
+        if !self.handle.is_null() {
+            unsafe { animefx_reset(self.handle) };
+        }
+    }
+
+    /// 过引擎处理一块 f32 交错样本。未激活且无淡出余量时零开销直通。
+    fn process_block(&mut self, block: Vec<f32>) -> Vec<f32> {
+        if !self.active && self.fade_out_frames_left == 0 {
+            return block;
+        }
+        if self.handle.is_null() {
+            self.active = false;
+            self.fade_out_frames_left = 0;
+            return block;
+        }
+        let samples = block.len();
+        let frames = samples / self.channels;
+        self.i16_buf.clear();
+        self.i16_buf.reserve(samples);
+        for &s in &block {
+            let v = if s.is_finite() { s } else { 0.0 };
+            self.i16_buf
+                .push((v * 32767.0).clamp(-32768.0, 32767.0) as i16);
+        }
+        unsafe { animefx_process(self.handle, self.i16_buf.as_mut_ptr(), frames as std::os::raw::c_int) };
+        self.f32_buf.clear();
+        self.f32_buf.reserve(samples);
+        for &v in &self.i16_buf {
+            self.f32_buf.push(v as f32 / 32767.0);
+        }
+        if self.fade_out_frames_left > 0 {
+            self.fade_out_frames_left = self.fade_out_frames_left.saturating_sub(frames as u64);
+        }
+        std::mem::take(&mut self.f32_buf)
+    }
+}
+
+impl Drop for AnimeFxEngine {
+    fn drop(&mut self) {
+        if !self.handle.is_null() {
+            unsafe { animefx_destroy(self.handle) };
+            self.handle = core::ptr::null_mut();
+        }
+    }
+}
+
 /// 流缓存 Reader 的 MediaSource 适配：`Box<dyn ReadSeek>` 不自动实现
 /// Read/Seek 超 trait，用具体 newtype 转发以满足 symphonia 的
 /// `MediaSource` blanket impl。`total_shared` 为共享总长槽位（0 = 未知）：
@@ -951,10 +1076,12 @@ fn run_exclusive_playback(
     let mut equalizer = Equalizer::new(source_sample_rate, playback_channels, eq_handle.clone());
 
     let mut sound_effect = SoundEffectBlockProcessor::new(source_sample_rate, playback_channels);
+    let mut anime_fx = AnimeFxEngine::new(source_sample_rate, playback_channels);
     if !request.sound_effect_settings_json.is_empty() {
         if let Ok(se_settings) =
             serde_json::from_str::<SoundEffectSettings>(&request.sound_effect_settings_json)
         {
+            anime_fx.set_params_json(se_settings.anime_params.as_deref());
             sound_effect.set_settings(se_settings);
         }
     }
@@ -1098,6 +1225,7 @@ fn run_exclusive_playback(
                 normalizer.reset();
                 equalizer.reset();
                 sound_effect.reset();
+                anime_fx.reset();
                 progress.samples_played.store(
                     (time_secs * source_sample_rate as f64 * playback_channels as f64) as u64,
                     Ordering::Relaxed,
@@ -1136,6 +1264,7 @@ fn run_exclusive_playback(
                 eq_handle.set_settings(settings);
             }
             Some(ExclusiveCommand::SetSoundEffect(settings)) => {
+                anime_fx.set_params_json(settings.anime_params.as_deref());
                 sound_effect.set_settings(settings);
             }
         }
@@ -1176,6 +1305,9 @@ fn run_exclusive_playback(
         let normalized = normalizer.process_block(&block);
         let eq_applied = equalizer.process_block(&normalized);
         let effected = sound_effect.process_block(eq_applied);
+        // anime 音效引擎置于音效链末端：官方引擎内部含增益/软限幅收尾，
+        // 之前的变速变调/混响等已定型，避免被引擎压缩器二次整形。
+        let effected = anime_fx.process_block(effected);
         // 进度/曲终按源采样率域的样本数累计，重采样只改变写入的字节数。
         let produced = effected.len() as u64;
         let effected = match resampler.as_mut() {

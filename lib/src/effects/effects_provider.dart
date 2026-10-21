@@ -5,6 +5,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../rust/api.dart';
+import 'anime_api.dart';
 
 const eqFreqLabels = ['31', '62', '125', '250', '500', '1k', '2k', '4k', '8k', '16k'];
 
@@ -89,6 +90,9 @@ class EffectsSettings {
     this.virtualSurroundMode = '7.1',
     this.virtualSurroundSpread = 10,
     this.bypass = false,
+    this.animeEffectId,
+    this.animeEffectName = '',
+    this.animeParams = '',
   });
 
   final bool equalizerEnabled;
@@ -110,6 +114,15 @@ class EffectsSettings {
   final double virtualSurroundSpread;
   final bool bypass;
 
+  /// anime 音效（open.anime.bzxhkj.com 实时拉取列表）：选中音效的
+  /// id/名称/原始 params JSON。id 为 null = 未启用；params 原样直传
+  /// Rust 侧官方 animefx.c 引擎。
+  final int? animeEffectId;
+  final String animeEffectName;
+  final String animeParams;
+
+  bool get hasAnimeEffect => animeEffectId != null && animeParams.isNotEmpty;
+
   EffectsSettings copyWith({
     bool? equalizerEnabled,
     double? preamp,
@@ -128,6 +141,10 @@ class EffectsSettings {
     String? virtualSurroundMode,
     double? virtualSurroundSpread,
     bool? bypass,
+    int? animeEffectId,
+    String? animeEffectName,
+    String? animeParams,
+    bool clearAnimeEffect = false,
   }) => EffectsSettings(
     equalizerEnabled: equalizerEnabled ?? this.equalizerEnabled,
     preamp: preamp ?? this.preamp,
@@ -146,6 +163,11 @@ class EffectsSettings {
     virtualSurroundMode: virtualSurroundMode ?? this.virtualSurroundMode,
     virtualSurroundSpread: virtualSurroundSpread ?? this.virtualSurroundSpread,
     bypass: bypass ?? this.bypass,
+    animeEffectId:
+        clearAnimeEffect ? null : (animeEffectId ?? this.animeEffectId),
+    animeEffectName:
+        clearAnimeEffect ? '' : (animeEffectName ?? this.animeEffectName),
+    animeParams: clearAnimeEffect ? '' : (animeParams ?? this.animeParams),
   );
 
   Map<String, dynamic> toEqualizerRustJson() => {
@@ -169,6 +191,9 @@ class EffectsSettings {
         'virtualSurroundMode': virtualSurroundMode,
         'virtualSurroundSpread': virtualSurroundSpread,
         'bypass': bypass,
+        // anime params 原始 JSON 直传官方引擎；null = 未启用（Rust 侧
+        // Option<String>，None 时引擎直通）。
+        'animeFx': hasAnimeEffect ? animeParams : null,
       };
 
   /// 是否有任一音效处于启用状态（bypass 属于旁路关闭，不计入）：
@@ -178,11 +203,17 @@ class EffectsSettings {
       pitchShift != 100 ||
       playbackRate != 100 ||
       reverbKind != 'none' ||
-      spatialMode != 'none';
+      spatialMode != 'none' ||
+      hasAnimeEffect;
 
   Map<String, dynamic> toJson() => {
         ...toEqualizerRustJson(),
         ...toRustJson(),
+        // 本地持久化：anime 音效选中态（animeFx 已含在 toRustJson 中，
+        // 这里额外存 id/名称便于 UI 回显）。
+        'animeEffectId': animeEffectId,
+        'animeEffectName': animeEffectName,
+        'animeParams': animeParams,
       };
 
   /// 干/湿声归一化到 0..1。旧版本混响预设曾把 0..100 的百分比直接存入，
@@ -215,6 +246,9 @@ class EffectsSettings {
       virtualSurroundMode: j['virtualSurroundMode'] as String? ?? '7.1',
       virtualSurroundSpread: (j['virtualSurroundSpread'] as num?)?.toDouble() ?? 10,
       bypass: j['bypass'] as bool? ?? false,
+      animeEffectId: (j['animeEffectId'] as num?)?.toInt(),
+      animeEffectName: j['animeEffectName'] as String? ?? '',
+      animeParams: j['animeParams'] as String? ?? '',
     );
   }
 }
@@ -356,6 +390,22 @@ class EffectsNotifier extends AsyncNotifier<EffectsSettings> {
       spatialSpeed: speed ?? current.spatialSpeed,
       spatialRadius: radius ?? current.spatialRadius,
     ));
+  }
+
+  /// 选中 anime 音效：仅记录 id/名称/params，与十段均衡器、变速变调
+  /// 相互独立（animefx 引擎内部自带 EQ 与管线用户 EQ 级联，叠加生效）。
+  Future<void> setAnimeEffect(AnimeEffect fx) async {
+    final current = state.valueOrNull ?? const EffectsSettings();
+    await save(current.copyWith(
+      animeEffectId: fx.id,
+      animeEffectName: fx.name,
+      animeParams: fx.params,
+    ));
+  }
+
+  Future<void> clearAnimeEffect() async {
+    final current = state.valueOrNull ?? const EffectsSettings();
+    await save(current.copyWith(clearAnimeEffect: true));
   }
 
   Future<void> resetAll() async {

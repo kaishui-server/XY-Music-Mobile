@@ -1,729 +1,607 @@
+// effects_page.dart — 音效页（5531 重写）
+//
+// 结构：①anime 音效广场（open.anime.bzxhkj.com 实时拉取，官方精选/用户
+// 创作，选中后原始 params JSON 直传 Rust 侧官方 animefx.c 引擎）；
+// ②十段均衡器（预设 + 自定义预设保留）；③变速变调（保留）。
+// 旧版混响/空间音效区块被 anime 音效广场替代（其参数空间已被官方
+// schema v1 覆盖：混响/压缩/次谐波/激励/抖晃/旋转/展宽/空气感）。
+
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../../src/effects/anime_api.dart';
 import '../../src/effects/effects_provider.dart';
-import '../../src/navigation/sidebar_controller.dart';
-import '../../src/core/settings.dart';
 
-class EffectsPage extends ConsumerWidget {
+class EffectsPage extends ConsumerStatefulWidget {
   const EffectsPage({super.key, this.showBackButton = false});
 
-  /// 全屏路由（从播放页进入）时显示返回按钮；侧栏分支路由保持菜单按钮。
   final bool showBackButton;
 
   @override
-  Widget build(BuildContext context, WidgetRef ref) {
+  ConsumerState<EffectsPage> createState() => _EffectsPageState();
+}
+
+class _EffectsPageState extends ConsumerState<EffectsPage> {
+  List<AnimeEffect>? _effects;
+  bool _loading = true;
+  bool _fromCache = false;
+  String? _error;
+
+  @override
+  void initState() {
+    super.initState();
+    unawaited(_load());
+  }
+
+  Future<void> _load({bool force = false}) async {
+    setState(() {
+      _loading = true;
+      _error = null;
+    });
+    try {
+      final result = await fetchAnimeEffects(force: force);
+      if (!mounted) return;
+      setState(() {
+        _effects = result.effects;
+        _fromCache = result.fromCache;
+        _loading = false;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _error = e.toString();
+        _loading = false;
+      });
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
     final effects = ref.watch(effectsProvider);
-    final sidebarOnRight = ref.watch(
-      settingsProvider.select(
-        (value) => value.valueOrNull?.sidebarPosition == SidebarPosition.right,
-      ),
-    );
+    final fx = effects.valueOrNull ?? const EffectsSettings();
+
     return Scaffold(
       appBar: AppBar(
-        automaticallyImplyLeading: false,
-        leading: showBackButton
-            ? const BackButton()
-            : (sidebarOnRight ? null : const AppSidebarMenuButton()),
         title: const Text('音效'),
-        actions: [
-          TextButton.icon(
-            onPressed: () => ref.read(effectsProvider.notifier).resetAll(),
-            icon: const Icon(Icons.restart_alt, size: 18),
-            label: const Text('重置'),
-          ),
-          if (sidebarOnRight) const AppSidebarMenuButton(),
-        ],
+        automaticallyImplyLeading: widget.showBackButton,
       ),
-      body: effects.when(
-        loading: () => const Center(child: CircularProgressIndicator()),
-        error: (error, _) => Center(child: Text('音效设置加载失败：$error')),
-        data: (settings) {
-          final notifier = ref.read(effectsProvider.notifier);
-          return ListView(
-            padding: EdgeInsets.fromLTRB(
-              16,
-              8,
-              16,
-              MediaQuery.paddingOf(context).bottom + 24,
-            ),
-            children: [
-              _sectionHeader(context, '均衡器'),
-              _EqSection(settings: settings, notifier: notifier),
-              _sectionHeader(context, '变速变调'),
-              _PitchRateSection(settings: settings, notifier: notifier),
-              _sectionHeader(context, '混响'),
-              _ReverbSection(settings: settings, notifier: notifier),
-              _sectionHeader(context, '空间音效'),
-              _SpatialSection(settings: settings, notifier: notifier),
-              const SizedBox(height: 16),
-              Text(
-                '均衡器、前级与变速变调实时生效（系统原生音频引擎）；'
-                '混响、空间音效由 Rust DSP 引擎处理，'
-                '在独占音频输出下播放时生效。',
-                style: TextStyle(
-                  fontSize: 12,
-                  color: Theme.of(context).colorScheme.outline,
-                ),
-              ),
-            ],
-          );
-        },
+      body: ListView(
+        padding: const EdgeInsets.fromLTRB(16, 8, 16, 32),
+        children: [
+          _buildAnimeSection(theme, fx),
+          const SizedBox(height: 20),
+          _buildEqualizerSection(theme, fx),
+          const SizedBox(height: 20),
+          _buildSpeedPitchSection(theme, fx),
+        ],
       ),
     );
   }
 
-  static Widget _sectionHeader(BuildContext context, String title) => Padding(
-        padding: const EdgeInsets.only(top: 20, bottom: 8),
-        child: Text(
-          title,
-          style: TextStyle(
-            fontSize: 13,
-            color: Theme.of(context).colorScheme.primary,
-            fontWeight: FontWeight.w600,
+  // ------------------------------------------------------------- 通用小组件
+
+  Widget _sectionHeader(String title, String subtitle, {Widget? trailing}) {
+    final theme = Theme.of(context);
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 4),
+      child: Row(
+        children: [
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(title,
+                    style: theme.textTheme.titleMedium
+                        ?.copyWith(fontWeight: FontWeight.bold)),
+                const SizedBox(height: 2),
+                Text(subtitle,
+                    style: theme.textTheme.bodySmall
+                        ?.copyWith(color: theme.colorScheme.outline)),
+              ],
+            ),
           ),
-        ),
-      );
-}
+          if (trailing != null) trailing,
+        ],
+      ),
+    );
+  }
 
-class _EqSection extends StatelessWidget {
-  const _EqSection({required this.settings, required this.notifier});
-  final EffectsSettings settings;
-  final EffectsNotifier notifier;
+  Widget _card({required Widget child}) {
+    return Card(
+      elevation: 0,
+      margin: EdgeInsets.zero,
+      clipBehavior: Clip.antiAlias,
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(14),
+        side: BorderSide(color: Theme.of(context).dividerColor.withValues(alpha: 0.35)),
+      ),
+      child: child,
+    );
+  }
 
-  @override
-  Widget build(BuildContext context) {
-    final scheme = Theme.of(context).colorScheme;
-    final customPresets = notifier.customEqPresets;
+  Widget _switchRow(String title, bool value, ValueChanged<bool> onChanged,
+      {String? subtitle}) {
+    final theme = Theme.of(context);
+    return ListTile(
+      dense: true,
+      title: Text(title, style: theme.textTheme.bodyLarge),
+      subtitle: subtitle == null ? null : Text(subtitle, style: theme.textTheme.bodySmall),
+      trailing: Switch(value: value, onChanged: onChanged),
+    );
+  }
+
+  Widget _sliderRow(
+    String title,
+    double value,
+    double min,
+    double max,
+    int divisions,
+    String Function(double) label,
+    ValueChanged<double> onChanged,
+  ) {
+    final theme = Theme.of(context);
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 10, 16, 4),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              Text(title, style: theme.textTheme.bodyLarge),
+              Text(label(value),
+                  style: theme.textTheme.bodyMedium
+                      ?.copyWith(color: theme.colorScheme.primary)),
+            ],
+          ),
+          SliderTheme(
+            data: SliderTheme.of(context).copyWith(
+              trackHeight: 3,
+              overlayShape: SliderComponentShape.noOverlay,
+            ),
+            child: Slider(
+              value: value.clamp(min, max),
+              min: min,
+              max: max,
+              divisions: divisions,
+              onChanged: onChanged,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // --------------------------------------------------------- ① anime 音效广场
+
+  Widget _buildAnimeSection(ThemeData theme, EffectsSettings fx) {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        _GlassCard(
-          child: Row(
-            children: [
-              Container(
-                width: 46,
-                height: 46,
-                decoration: BoxDecoration(
-                  color: const Color(0x24EC4141),
-                  borderRadius: BorderRadius.circular(14),
-                ),
-                child: const Icon(Icons.equalizer, color: Color(0xFFEC4141)),
-              ),
-              const SizedBox(width: 13),
-              const Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text('十段均衡器',
-                        style: TextStyle(
-                            fontSize: 17, fontWeight: FontWeight.w700)),
-                    SizedBox(height: 3),
-                    Text('针对不同频段精细调整声音',
-                        style: TextStyle(fontSize: 12)),
-                  ],
-                ),
-              ),
-              Switch(
-                value: settings.equalizerEnabled,
-                onChanged: (v) => notifier.save(
-                    settings.copyWith(equalizerEnabled: v)),
-              ),
-            ],
+        _sectionHeader(
+          '音效广场',
+          '实时拉取 · 官方精选 / 用户创作 · 由官方 DSP 引擎渲染',
+          trailing: IconButton(
+            tooltip: '刷新',
+            onPressed: _loading ? null : () => unawaited(_load(force: true)),
+            icon: const Icon(Icons.refresh),
           ),
         ),
-        const SizedBox(height: 12),
-        SizedBox(
-          height: 42,
-          child: ListView(
-            scrollDirection: Axis.horizontal,
+        _card(
+          child: Column(
             children: [
-              Padding(
-                padding: const EdgeInsets.only(right: 8),
-                child: ActionChip(
-                  avatar: Icon(Icons.add, size: 18, color: scheme.primary),
-                  label: const Text('保存'),
-                  onPressed: () => _savePreset(context, notifier),
-                ),
-              ),
-              for (final p in eqPresets)
-                Padding(
-                  padding: const EdgeInsets.only(right: 8),
-                  child: ChoiceChip(
-                    label: Text(p.name),
-                    selected: _isPresetActive(settings, p.gains),
-                    onSelected: (_) => notifier.applyEqPreset(p.name),
-                  ),
-                ),
-              if (customPresets.isNotEmpty) ...[
-                Padding(
-                  padding: const EdgeInsets.only(right: 8),
-                  child: _dividerDot(context),
-                ),
-                for (final p in customPresets)
+              if (_loading)
+                const Padding(
+                  padding: EdgeInsets.symmetric(vertical: 36),
+                  child: CircularProgressIndicator(strokeWidth: 2.5),
+                )
+              else ...[
+                if (_error != null)
+                  _buildAnimeError(theme),
+                if (_fromCache && _effects != null && _effects!.isNotEmpty)
                   Padding(
-                    padding: const EdgeInsets.only(right: 8),
-                    child: GestureDetector(
-                      onLongPress: () =>
-                          _editPreset(context, notifier, p.name),
-                      child: ChoiceChip(
-                        label: Row(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            const Icon(Icons.person_pin, size: 14),
-                            const SizedBox(width: 4),
-                            Text(p.name),
-                          ],
+                    padding: const EdgeInsets.fromLTRB(16, 10, 16, 0),
+                    child: Row(
+                      children: [
+                        Icon(Icons.cloud_off,
+                            size: 15, color: theme.colorScheme.outline),
+                        const SizedBox(width: 6),
+                        Expanded(
+                          child: Text(
+                            '网络拉取失败，当前展示离线缓存',
+                            style: theme.textTheme.bodySmall
+                                ?.copyWith(color: theme.colorScheme.outline),
+                          ),
                         ),
-                        selected: _isPresetActive(settings, p.gains),
-                        onSelected: (_) =>
-                            notifier.applyCustomEqPreset(p.name),
-                      ),
+                      ],
                     ),
+                  ),
+                if (_effects != null && _effects!.isNotEmpty) ...[
+                  _buildAnimeTile(
+                    theme,
+                    name: '不使用音效',
+                    intro: '关闭 anime 音效，恢复原始声音',
+                    author: null,
+                    official: false,
+                    selected: !fx.hasAnimeEffect,
+                    onTap: () => unawaited(
+                        ref.read(effectsProvider.notifier).clearAnimeEffect()),
+                  ),
+                  _buildAnimeGroup(theme, '官方精选',
+                      _effects!.where((e) => e.official).toList(), fx),
+                  _buildAnimeGroup(theme, '用户创作',
+                      _effects!.where((e) => !e.official).toList(), fx),
+                ] else if (_error == null)
+                  Padding(
+                    padding: const EdgeInsets.symmetric(vertical: 28),
+                    child: Text('暂无上架音效',
+                        style: theme.textTheme.bodyMedium
+                            ?.copyWith(color: theme.colorScheme.outline)),
                   ),
               ],
             ],
           ),
         ),
-        Padding(
-          padding: const EdgeInsets.fromLTRB(4, 2, 0, 6),
-          child: Text(
-            customPresets.isEmpty
-                ? '长按自定义预设可重命名或删除'
-                : '预设 · 点按应用 · 长按编辑',
-            style: TextStyle(fontSize: 11, color: scheme.onSurfaceVariant),
+      ],
+    );
+  }
+
+  Widget _buildAnimeError(ThemeData theme) {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 14, 16, 12),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Icon(Icons.error_outline,
+                  size: 17, color: theme.colorScheme.error),
+              const SizedBox(width: 6),
+              Expanded(
+                child: Text(
+                  '音效列表拉取失败',
+                  style: theme.textTheme.bodyMedium
+                      ?.copyWith(color: theme.colorScheme.error),
+                ),
+              ),
+              TextButton(
+                onPressed: () => unawaited(_load(force: true)),
+                child: const Text('重试'),
+              ),
+            ],
           ),
+          Text(
+            _error ?? '',
+            style: theme.textTheme.bodySmall
+                ?.copyWith(color: theme.colorScheme.outline),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildAnimeGroup(
+      ThemeData theme, String title, List<AnimeEffect> items, EffectsSettings fx) {
+    if (items.isEmpty) return const SizedBox.shrink();
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Padding(
+          padding: const EdgeInsets.fromLTRB(16, 12, 16, 4),
+          child: Text(title,
+              style: theme.textTheme.bodySmall
+                  ?.copyWith(color: theme.colorScheme.outline)),
         ),
-        AnimatedOpacity(
-          opacity: settings.equalizerEnabled ? 1 : .42,
-          duration: const Duration(milliseconds: 180),
-          child: IgnorePointer(
-            ignoring: !settings.equalizerEnabled,
-            child: _GlassCard(
-              padding: const EdgeInsets.fromLTRB(8, 16, 8, 12),
-              child: Column(
-                children: [
-                  SizedBox(
-                    height: 200,
-                    child: Row(
-                      crossAxisAlignment: CrossAxisAlignment.stretch,
-                      children: [
-                        for (var i = 0; i < settings.gains.length; i++)
-                          Expanded(
-                            child: _EqBand(
-                              value: settings.gains[i],
-                              freqLabel: eqFreqLabels[i],
-                              onCommit: (v) => notifier.setBand(i, v),
-                            ),
-                          ),
-                      ],
-                    ),
-                  ),
-                  const SizedBox(height: 6),
-                  Row(
-                    children: [
-                      const SizedBox(width: 8),
-                      const Text('前级'),
-                      Expanded(
-                        child: Slider(
-                          min: -12,
-                          max: 12,
-                          divisions: 48,
-                          value: settings.preamp.clamp(-12, 12),
-                          onChanged: (v) => notifier
-                              .save(settings.copyWith(preamp: v)),
-                        ),
-                      ),
-                      SizedBox(
-                        width: 48,
-                        child: Text(
-                          '${settings.preamp.toStringAsFixed(1)} dB',
-                          style: const TextStyle(fontSize: 11),
-                        ),
-                      ),
-                      IconButton(
-                        tooltip: '重置',
-                        onPressed: notifier.resetEqualizer,
-                        icon: const Icon(Icons.restart_alt),
-                      ),
-                    ],
-                  ),
-                ],
+        ...items.map((e) => _buildAnimeTile(
+              theme,
+              name: e.name,
+              intro: e.intro,
+              author: e.author,
+              official: e.official,
+              selected: fx.animeEffectId == e.id,
+              onTap: () => unawaited(
+                  ref.read(effectsProvider.notifier).setAnimeEffect(e)),
+            )),
+      ],
+    );
+  }
+
+  Widget _buildAnimeTile(
+    ThemeData theme, {
+    required String name,
+    required String intro,
+    required String? author,
+    required bool official,
+    required bool selected,
+    required VoidCallback onTap,
+  }) {
+    final accent = theme.colorScheme.primary;
+    return ListTile(
+      dense: true,
+      onTap: onTap,
+      tileColor: selected ? accent.withValues(alpha: 0.08) : null,
+      title: Row(
+        children: [
+          Flexible(
+            child: Text(
+              name,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: theme.textTheme.bodyLarge?.copyWith(
+                fontWeight: selected ? FontWeight.bold : null,
+                color: selected ? accent : null,
               ),
             ),
+          ),
+          const SizedBox(width: 6),
+          if (official) _buildBadge(theme, '官方', accent),
+          if (selected) ...[
+            const SizedBox(width: 6),
+            Icon(Icons.check_circle, size: 16, color: accent),
+          ],
+        ],
+      ),
+      subtitle: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          if (intro.isNotEmpty)
+            Padding(
+              padding: const EdgeInsets.only(top: 2),
+              child: Text(
+                intro,
+                maxLines: 2,
+                overflow: TextOverflow.ellipsis,
+                style: theme.textTheme.bodySmall,
+              ),
+            ),
+          if (author != null && author.isNotEmpty)
+            Padding(
+              padding: const EdgeInsets.only(top: 2),
+              child: Text(
+                '作者：$author',
+                style: theme.textTheme.bodySmall
+                    ?.copyWith(color: theme.colorScheme.outline, fontSize: 11),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildBadge(ThemeData theme, String label, Color color) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
+      decoration: BoxDecoration(
+        borderRadius: BorderRadius.circular(4),
+        border: Border.all(color: color.withValues(alpha: 0.5)),
+      ),
+      child: Text(label,
+          style: TextStyle(
+              fontSize: 10, height: 1.3, color: color)),
+    );
+  }
+
+  // ----------------------------------------------------------- ② 十段均衡器
+
+  Widget _buildEqualizerSection(ThemeData theme, EffectsSettings fx) {
+    final notifier = ref.read(effectsProvider.notifier);
+    final customPresets = notifier.customEqPresets;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        _sectionHeader('十段均衡器', '31Hz ~ 16kHz · 与 anime 音效叠加生效'),
+        _card(
+          child: Column(
+            children: [
+              _switchRow(
+                '启用均衡器',
+                fx.equalizerEnabled,
+                (v) => unawaited(notifier
+                    .save(fx.copyWith(equalizerEnabled: v))),
+              ),
+              _sliderRow(
+                '前置增益',
+                fx.preamp,
+                -12,
+                12,
+                48,
+                (v) => '${v.toStringAsFixed(1)} dB',
+                (v) => unawaited(notifier.save(fx.copyWith(preamp: v))),
+              ),
+              // 内置预设
+              Padding(
+                padding: const EdgeInsets.fromLTRB(16, 4, 16, 0),
+                child: Wrap(
+                  spacing: 8,
+                  runSpacing: 8,
+                  children: [
+                    for (final p in eqPresets)
+                      ActionChip(
+                        label: Text(p.name),
+                        onPressed: () =>
+                            unawaited(notifier.applyEqPreset(p.name)),
+                      ),
+                  ],
+                ),
+              ),
+              // 自定义预设（保留：保存/应用/长按删除）
+              Padding(
+                padding: const EdgeInsets.fromLTRB(16, 10, 16, 4),
+                child: Row(
+                  children: [
+                    Text('自定义预设',
+                        style: theme.textTheme.bodySmall
+                            ?.copyWith(color: theme.colorScheme.outline)),
+                    const Spacer(),
+                    TextButton.icon(
+                      onPressed: () => _showSaveCustomPresetDialog(theme),
+                      icon: const Icon(Icons.add, size: 16),
+                      label: const Text('保存当前'),
+                    ),
+                  ],
+                ),
+              ),
+              if (customPresets.isNotEmpty)
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(16, 0, 16, 4),
+                  child: Wrap(
+                    spacing: 8,
+                    runSpacing: 8,
+                    children: [
+                      for (final p in customPresets)
+                        InputChip(
+                          label: Text(p.name),
+                          onPressed: () =>
+                              unawaited(notifier.applyCustomEqPreset(p.name)),
+                          onDeleted: () =>
+                              unawaited(notifier.deleteCustomEqPreset(p.name)),
+                        ),
+                    ],
+                  ),
+                ),
+              _buildEqSliders(theme, fx),
+              Padding(
+                padding: const EdgeInsets.fromLTRB(16, 0, 16, 10),
+                child: Align(
+                  alignment: Alignment.centerRight,
+                  child: TextButton(
+                    onPressed: () => unawaited(notifier.resetEqualizer()),
+                    child: const Text('重置均衡器'),
+                  ),
+                ),
+              ),
+            ],
           ),
         ),
       ],
     );
   }
 
-  Widget _dividerDot(BuildContext context) => Center(
-        child: Container(
-          width: 1,
-          height: 20,
-          color: Theme.of(context)
-              .colorScheme
-              .onSurfaceVariant
-              .withValues(alpha: 0.3),
+  Widget _buildEqSliders(ThemeData theme, EffectsSettings fx) {
+    final notifier = ref.read(effectsProvider.notifier);
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(8, 4, 8, 8),
+      child: SizedBox(
+        height: 168,
+        child: Row(
+          children: [
+            for (var i = 0; i < 10; i++)
+              Expanded(
+                child: Column(
+                  children: [
+                    Expanded(
+                      child: RotatedBox(
+                        quarterTurns: -1,
+                        child: SliderTheme(
+                          data: SliderTheme.of(context).copyWith(
+                            trackHeight: 2.5,
+                            overlayShape: SliderComponentShape.noOverlay,
+                            thumbShape:
+                                const RoundSliderThumbShape(enabledThumbRadius: 7),
+                          ),
+                          child: Slider(
+                            value: fx.gains[i].clamp(-12, 12),
+                            min: -12,
+                            max: 12,
+                            onChanged: (v) =>
+                                unawaited(notifier.setBand(i, v)),
+                          ),
+                        ),
+                      ),
+                    ),
+                    Text(eqFreqLabels[i],
+                        style: theme.textTheme.bodySmall
+                            ?.copyWith(fontSize: 10)),
+                    Text(
+                      fx.gains[i] == 0
+                          ? '0'
+                          : fx.gains[i].toStringAsFixed(1),
+                      style: theme.textTheme.bodySmall
+                          ?.copyWith(fontSize: 9, color: theme.colorScheme.outline),
+                    ),
+                  ],
+                ),
+              ),
+          ],
         ),
-      );
-
-  bool _isPresetActive(EffectsSettings s, List<double> gains) {
-    if (s.gains.length != gains.length) return false;
-    for (var i = 0; i < s.gains.length; i++) {
-      if ((s.gains[i] - gains[i]).abs() > 0.01) return false;
-    }
-    return true;
+      ),
+    );
   }
 
-  Future<void> _savePreset(
-      BuildContext context, EffectsNotifier manager) async {
+  Future<void> _showSaveCustomPresetDialog(ThemeData theme) async {
     final controller = TextEditingController();
     final name = await showDialog<String>(
       context: context,
       builder: (ctx) => AlertDialog(
-        title: const Text('保存均衡器预设'),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            const Text('将当前 EQ 增益保存为自定义预设，同名将覆盖',
-                style: TextStyle(fontSize: 12)),
-            const SizedBox(height: 16),
-            TextField(
-              controller: controller,
-              autofocus: true,
-              decoration: const InputDecoration(
-                labelText: '预设名称',
-                hintText: '例如：我的流行',
-                border: OutlineInputBorder(),
-                isDense: true,
-              ),
-            ),
-          ],
+        title: const Text('保存为自定义预设'),
+        content: TextField(
+          controller: controller,
+          autofocus: true,
+          decoration: const InputDecoration(hintText: '预设名称'),
         ),
         actions: [
           TextButton(
-            onPressed: () => Navigator.pop(ctx),
-            child: const Text('取消'),
-          ),
+              onPressed: () => Navigator.pop(ctx), child: const Text('取消')),
           FilledButton(
-            onPressed: () =>
-                Navigator.pop(ctx, controller.text.trim()),
-            child: const Text('保存'),
-          ),
+              onPressed: () => Navigator.pop(ctx, controller.text.trim()),
+              child: const Text('保存')),
         ],
       ),
     );
-    controller.dispose();
     if (name != null && name.isNotEmpty) {
-      await manager.saveCustomEqPreset(name);
+      await ref.read(effectsProvider.notifier).saveCustomEqPreset(name);
     }
   }
 
-  Future<void> _editPreset(
-      BuildContext context, EffectsNotifier manager, String name) async {
-    final action = await showDialog<String>(
-      context: context,
-      builder: (ctx) => SimpleDialog(
-        title: Text('预设「$name」'),
-        children: [
-          SimpleDialogOption(
-            onPressed: () => Navigator.pop(ctx, 'rename'),
-            child: const ListTile(
-              leading: Icon(Icons.drive_file_rename_outline),
-              title: Text('重命名'),
-            ),
-          ),
-          SimpleDialogOption(
-            onPressed: () => Navigator.pop(ctx, 'delete'),
-            child: ListTile(
-              leading: Icon(Icons.delete_outline,
-                  color: Theme.of(ctx).colorScheme.error),
-              title: Text('删除',
-                  style:
-                      TextStyle(color: Theme.of(ctx).colorScheme.error)),
-            ),
-          ),
-        ],
-      ),
-    );
-    if (action == 'rename') {
-      if (!context.mounted) return;
-      final controller = TextEditingController(text: name);
-      final newName = await showDialog<String>(
-        context: context,
-        builder: (ctx) => AlertDialog(
-          title: const Text('重命名预设'),
-          content: TextField(
-            controller: controller,
-            autofocus: true,
-            decoration: const InputDecoration(
-              labelText: '预设名称',
-              border: OutlineInputBorder(),
-              isDense: true,
-            ),
-            onSubmitted: (v) => Navigator.pop(ctx, v.trim()),
-          ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.pop(ctx),
-              child: const Text('取消'),
-            ),
-            FilledButton(
-              onPressed: () =>
-                  Navigator.pop(ctx, controller.text.trim()),
-              child: const Text('保存'),
-            ),
-          ],
-        ),
-      );
-      controller.dispose();
-      if (newName != null && newName.isNotEmpty) {
-        await manager.renameCustomEqPreset(name, newName);
-      }
-    } else if (action == 'delete') {
-      await manager.deleteCustomEqPreset(name);
-    }
-  }
-}
+  // ------------------------------------------------------------- ③ 变速变调
 
-class _PitchRateSection extends StatelessWidget {
-  const _PitchRateSection({required this.settings, required this.notifier});
-  final EffectsSettings settings;
-  final EffectsNotifier notifier;
-
-  @override
-  Widget build(BuildContext context) {
-    return _GlassCard(
-      child: Column(
-        children: [
-          _SliderTile(
-            label: '倍速',
-            value: settings.playbackRate,
-            min: 50,
-            max: 200,
-            displayBuilder: (v) => '${v.round()}%',
-            onChanged: (v) =>
-                notifier.save(settings.copyWith(playbackRate: v)),
-          ),
-          _SliderTile(
-            label: '变调',
-            value: settings.pitchShift,
-            min: 50,
-            max: 200,
-            displayBuilder: (v) => '${v.round()}%',
-            onChanged: (v) =>
-                notifier.save(settings.copyWith(pitchShift: v)),
-          ),
-          SwitchListTile(
-            secondary: const Icon(Icons.music_note),
-            title: const Text('变速时保持音调'),
-            value: settings.preservesPitch,
-            onChanged: (v) =>
-                notifier.save(settings.copyWith(preservesPitch: v)),
-          ),
-        ],
-      ),
-    );
-  }
-}
-
-class _ReverbSection extends StatelessWidget {
-  const _ReverbSection({required this.settings, required this.notifier});
-  final EffectsSettings settings;
-  final EffectsNotifier notifier;
-
-  @override
-  Widget build(BuildContext context) {
-    final active =
-        settings.reverbKind == 'none' ? null : settings.reverbPreset;
-    return _GlassCard(
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Wrap(
-            spacing: 8,
-            runSpacing: 8,
-            children: [
-              for (final p in [...reverbPresets, ...algoReverbPresets])
-                ChoiceChip(
-                  label: Text(p.label),
-                  selected: active == p.label,
-                  onSelected: (_) {
-                    if (active == p.label) {
-                      notifier.clearReverb();
-                    } else {
-                      final kind = reverbPresets.contains(p)
-                          ? 'convolution'
-                          : 'algorithmic';
-                      // 预设表用 0..100 表示干/湿声百分比，Rust 侧按 0..1 解释
-                      // （滑条同样以 v/100 写回），此处须 /100 归一化，否则
-                      // 混响干湿比会失真并被 toRustJson 的 clamp(0,1) 压成满值。
-                      notifier.setReverb(kind, p.label,
-                          p.dry / 100, p.wet / 100);
-                    }
-                  },
-                ),
-            ],
-          ),
-          if (settings.reverbKind != 'none') ...[
-            const SizedBox(height: 8),
-            _SliderTile(
-              label: '干声',
-              value: settings.reverbDry * 100,
-              min: 0,
-              max: 100,
-              displayBuilder: (v) => '${v.round()}%',
-              onChanged: (v) => notifier.setReverb(
-                  settings.reverbKind,
-                  settings.reverbPreset,
-                  v / 100,
-                  settings.reverbWet),
-            ),
-            _SliderTile(
-              label: '湿声',
-              value: settings.reverbWet * 100,
-              min: 0,
-              max: 100,
-              displayBuilder: (v) => '${v.round()}%',
-              onChanged: (v) => notifier.setReverb(
-                  settings.reverbKind,
-                  settings.reverbPreset,
-                  settings.reverbDry,
-                  v / 100),
-            ),
-          ],
-        ],
-      ),
-    );
-  }
-}
-
-class _SpatialSection extends StatelessWidget {
-  const _SpatialSection({required this.settings, required this.notifier});
-  final EffectsSettings settings;
-  final EffectsNotifier notifier;
-
-  @override
-  Widget build(BuildContext context) {
-    final mode = settings.spatialMode;
-    return _GlassCard(
-      child: Column(
-        children: [
-          Wrap(
-            spacing: 8,
-            runSpacing: 8,
-            children: [
-              for (final m in const [
-                ('none', '关闭'),
-                ('surround3d', '3D 环绕'),
-                ('d8', '8D 环绕'),
-                ('d36', '36D 环绕'),
-                ('virtual', '虚拟环绕'),
-              ])
-                ChoiceChip(
-                  label: Text(m.$2),
-                  selected: mode == m.$1,
-                  onSelected: (_) => notifier.setSpatial(
-                      mode == m.$1 ? 'none' : m.$1),
-                ),
-            ],
-          ),
-          if (mode == 'surround3d') ...[
-            _SliderTile(
-              label: '旋转速度',
-              value: settings.spatialSpeed,
-              min: 2,
-              max: 20,
-              displayBuilder: (v) =>
-                  '${v.toStringAsFixed(1)}s/圈',
-              onChanged: (v) => notifier.setSpatial(mode, speed: v),
-            ),
-            _SliderTile(
-              label: '声源距离',
-              value: settings.spatialRadius * 10,
-              min: 1,
-              max: 20,
-              displayBuilder: (v) => '${v.round()}',
-              onChanged: (v) =>
-                  notifier.setSpatial(mode, radius: v / 10),
-            ),
-          ],
-          if (mode == 'd8' || mode == 'd36') ...[
-            _SliderTile(
-              label: '旋转速度',
-              value: settings.spatialSpeed,
-              min: 2,
-              max: 60,
-              displayBuilder: (v) => '${v.round()}s/圈',
-              onChanged: (v) => notifier.setSpatial(mode, speed: v),
-            ),
-            _SliderTile(
-              label: '虚拟距离',
-              value: settings.spatialRadius * 5,
-              min: 1,
-              max: 20,
-              displayBuilder: (v) => '${v.round()}',
-              onChanged: (v) =>
-                  notifier.setSpatial(mode, radius: v / 5),
-            ),
-          ],
-          if (mode == 'virtual') ...[
-            _SliderTile(
-              label: '声场宽度',
-              value: settings.virtualSurroundSpread,
-              min: 1,
-              max: 20,
-              displayBuilder: (v) => '${v.round()}',
-              onChanged: (v) => notifier.save(
-                  settings.copyWith(virtualSurroundSpread: v)),
-            ),
-          ],
-        ],
-      ),
-    );
-  }
-}
-
-class _SliderTile extends StatefulWidget {
-  const _SliderTile({
-    required this.label,
-    required this.value,
-    required this.min,
-    required this.max,
-    required this.onChanged,
-    this.displayBuilder,
-  });
-
-  final String label;
-  final double value;
-  final double min;
-  final double max;
-  final String Function(double)? displayBuilder;
-  final ValueChanged<double> onChanged;
-
-  @override
-  State<_SliderTile> createState() => _SliderTileState();
-}
-
-class _SliderTileState extends State<_SliderTile> {
-  double? _draft;
-
-  @override
-  Widget build(BuildContext context) {
-    final v = (_draft ?? widget.value).clamp(widget.min, widget.max);
-    final text = widget.displayBuilder?.call(v) ?? v.round().toString();
-    return Row(
+  Widget _buildSpeedPitchSection(ThemeData theme, EffectsSettings fx) {
+    final notifier = ref.read(effectsProvider.notifier);
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        SizedBox(
-          width: 72,
-          child: Text(widget.label,
-              style: const TextStyle(fontSize: 13),
-              overflow: TextOverflow.ellipsis),
-        ),
-        Expanded(
-          child: Slider(
-            value: v,
-            min: widget.min,
-            max: widget.max,
-            onChanged: (x) => setState(() => _draft = x),
-            onChangeEnd: (x) {
-              widget.onChanged(x);
-              setState(() => _draft = null);
-            },
-          ),
-        ),
-        SizedBox(
-          width: 56,
-          child: Text(
-            text,
-            textAlign: TextAlign.right,
-            style: const TextStyle(fontSize: 12),
+        _sectionHeader('变速变调', '独立于音效与均衡器 · 100% 为原速原调'),
+        _card(
+          child: Column(
+            children: [
+              _sliderRow(
+                '变速',
+                fx.playbackRate,
+                50,
+                200,
+                30,
+                (v) =>
+                    '${(v / 100).toStringAsFixed(2)}x',
+                (v) => unawaited(
+                    notifier.save(fx.copyWith(playbackRate: v))),
+              ),
+              _sliderRow(
+                '变调',
+                fx.pitchShift,
+                50,
+                200,
+                30,
+                (v) => v == 100
+                    ? '原调'
+                    : '${v > 100 ? '+' : ''}${(v - 100).toStringAsFixed(0)}%',
+                (v) =>
+                    unawaited(notifier.save(fx.copyWith(pitchShift: v))),
+              ),
+              _switchRow(
+                '变速时保持音调',
+                fx.preservesPitch,
+                (v) => unawaited(
+                    notifier.save(fx.copyWith(preservesPitch: v))),
+                subtitle: '开启后调整倍速不改变音高',
+              ),
+              const SizedBox(height: 6),
+            ],
           ),
         ),
       ],
     );
   }
-}
-
-class _EqBand extends StatefulWidget {
-  const _EqBand({
-    required this.value,
-    required this.freqLabel,
-    required this.onCommit,
-  });
-
-  final double value;
-  final String freqLabel;
-  final ValueChanged<double> onCommit;
-
-  @override
-  State<_EqBand> createState() => _EqBandState();
-}
-
-class _EqBandState extends State<_EqBand> {
-  double? _draft;
-
-  @override
-  Widget build(BuildContext context) {
-    final scheme = Theme.of(context).colorScheme;
-    final v = (_draft ?? widget.value).clamp(-12.0, 12.0);
-    return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 6),
-      child: Column(
-        children: [
-          Text(
-            '${v >= 0 ? '+' : ''}${v.round()}',
-            style: TextStyle(fontSize: 11, color: scheme.onSurfaceVariant),
-          ),
-          Expanded(
-            child: RotatedBox(
-              quarterTurns: 3,
-              child: Slider(
-                value: v,
-                min: -12,
-                max: 12,
-                onChanged: (x) => setState(() => _draft = x),
-                onChangeEnd: (x) {
-                  widget.onCommit(x);
-                  setState(() => _draft = null);
-                },
-              ),
-            ),
-          ),
-          Text(widget.freqLabel,
-              style: TextStyle(fontSize: 11, color: scheme.onSurfaceVariant)),
-        ],
-      ),
-    );
-  }
-}
-
-class _GlassCard extends StatelessWidget {
-  const _GlassCard({
-    required this.child,
-    this.padding = const EdgeInsets.all(14),
-  });
-  final Widget child;
-  final EdgeInsets padding;
-
-  @override
-  Widget build(BuildContext context) => Container(
-        padding: padding,
-        decoration: BoxDecoration(
-          color: Theme.of(context)
-              .colorScheme
-              .surfaceContainer
-              .withValues(alpha: .72),
-          borderRadius: BorderRadius.circular(16),
-          border: Border.all(
-            color: Theme.of(context)
-                .colorScheme
-                .outlineVariant
-                .withValues(alpha: .35),
-          ),
-        ),
-        child: child,
-      );
 }

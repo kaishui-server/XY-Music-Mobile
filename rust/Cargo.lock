@@ -2553,6 +2553,7 @@ dependencies = [
  "aes",
  "amll-lyric",
  "base64 0.22.1",
+ "cc",
  "encoding_rs",
  "flate2",
  "flutter_rust_bridge",

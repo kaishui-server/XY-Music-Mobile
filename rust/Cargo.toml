@@ -40,6 +40,10 @@ symphonia = { version = "0.5.5", default-features = false, features = ["aac", "a
 uuid = { version = "1", features = ["v4"] }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 
+[build-dependencies]
+# 编译 anime 音效引擎（src/player/animefx.c，官方开放平台源码）
+cc = "1"
+
 [target.'cfg(target_os = "android")'.dependencies]
 libc = "0.2"
 
