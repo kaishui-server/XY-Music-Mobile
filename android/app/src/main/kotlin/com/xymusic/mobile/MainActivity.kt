@@ -646,6 +646,13 @@ class MainActivity : AudioServiceActivity() {
                         coverPath = call.argument<String>("coverPath") ?: "",
                         queueJson = call.argument<String>("queueJson") ?: "",
                         queueIndex = call.argument<Number>("queueIndex")?.toInt() ?: -1,
+                        // 应用内音量与分流模式：此前漏读导致悬浮窗音量条
+                        // 恒按系统音量处理（拖动直接写 STREAM_MUSIC），
+                        // 且播放页菜单滑块拖动后音量条不跟随。
+                        appVolume =
+                            (call.argument<Number>("appVolume")?.toDouble() ?: 1.0)
+                                .toFloat(),
+                        appVolumeMode = call.argument<Boolean>("appVolumeMode") == true,
                     )
                     // 服务已在运行时直连分发，省去每次进度刷新的 startService
                     // binder 往返；未运行（被系统回收）时才拉起服务恢复浮窗。
@@ -673,6 +680,8 @@ class MainActivity : AudioServiceActivity() {
                                 putExtra("coverPath", params.coverPath)
                                 putExtra("queueJson", params.queueJson)
                                 putExtra("queueIndex", params.queueIndex)
+                                putExtra("appVolume", params.appVolume)
+                                putExtra("appVolumeMode", params.appVolumeMode)
                             },
                         )
                         result.success(true)
