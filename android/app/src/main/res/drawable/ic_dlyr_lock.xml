@@ -3,11 +3,11 @@
     android:height="24dp"
     android:viewportWidth="24"
     android:viewportHeight="24">
-    <!-- 线性锁：弧形锁梁 + 圆角锁体描边 + 实心锁孔点；主体 12px 放大到
-         ~17px 与播放键等视觉重量 -->
+    <!-- 线性锁：弧形锁梁 + 圆角锁体描边 + 实心锁孔点；含描边墨迹高
+         15.8px 缩到 ~12.3px，与 A+/A− 文字键观感一致 -->
     <group
-        android:scaleX="1.4"
-        android:scaleY="1.4"
+        android:scaleX="0.78"
+        android:scaleY="0.78"
         android:pivotX="12"
         android:pivotY="12">
         <path
