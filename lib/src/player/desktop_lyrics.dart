@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter/services.dart';
+import 'package:flutter/widgets.dart';
 
 import '../core/custom_font.dart';
 import '../rust/api.dart';
@@ -22,7 +23,27 @@ class DesktopLyricsBridge {
   /// 关闭（浮窗本身已由原生移除）。未注册时忽略该回调。
   static void Function()? onCloseRequested;
 
+  /// 通知栏双击：请求开启桌面歌词悬浮窗（走设置开关完整链路）。
+  static void Function()? onOpenRequested;
+
+  /// 浮窗操作栏 ⚙ 设置键：请求打开桌面歌词设置页。
+  static void Function()? onOpenSettings;
+
+  /// 浮窗操作栏 A-/A+ 调节字号（sp）：设置页滑块跟随并持久化。
+  static void Function(double size)? onFontScaleChanged;
+
+  /// 浮窗操作栏锁定键切换：设置页「锁定桌面歌词」开关跟随。
+  static void Function(bool locked)? onLockedChanged;
+
+  /// 浮窗操作栏播放三键（prev/playPause/next）：播放层直接控制播放。
+  static void Function(String action)? onMediaKey;
+
   static bool _handlerInstalled = false;
+
+  /// 冷启动期间原生补发的动作（onOpenRequested/onOpenSettings）到达时，
+  /// 播放层尚未注册回调（PlayerNotifier 构造晚于原生 configureFlutterEngine
+  /// 的补发），消息若直接丢弃用户就得再点一次浮窗按键。暂存到注册后执行。
+  static String? _pendingAction;
 
   /// 安装原生 → Dart 的回调监听（只装一次）。原生浮窗拖动结束后会把纵向
   /// 位置（百分制）经 `onPositionChanged` 回传，这里转交给
@@ -31,13 +52,51 @@ class DesktopLyricsBridge {
     if (_handlerInstalled) return;
     _handlerInstalled = true;
     _channel.setMethodCallHandler((call) async {
-      if (call.method == 'onPositionChanged') {
-        final value = (call.arguments as num?)?.toDouble();
-        if (value != null) onPositionChanged?.call(value);
-      } else if (call.method == 'onCloseRequested') {
-        onCloseRequested?.call();
+      switch (call.method) {
+        case 'onPositionChanged':
+          final value = (call.arguments as num?)?.toDouble();
+          if (value != null) onPositionChanged?.call(value);
+        case 'onCloseRequested':
+          onCloseRequested?.call();
+        case 'onOpenRequested':
+          if (onOpenRequested != null) {
+            onOpenRequested!.call();
+          } else {
+            _pendingAction = 'onOpenRequested';
+          }
+        case 'onOpenSettings':
+          if (onOpenSettings != null) {
+            onOpenSettings!.call();
+          } else {
+            _pendingAction = 'onOpenSettings';
+          }
+        case 'onFontScaleChanged':
+          final value = (call.arguments as num?)?.toDouble();
+          if (value != null) onFontScaleChanged?.call(value);
+        case 'onLockedChanged':
+          final value = call.arguments as bool?;
+          if (value != null) onLockedChanged?.call(value);
+        case 'onMediaKey':
+          final value = call.arguments as String?;
+          if (value != null) onMediaKey?.call(value);
       }
       return null;
+    });
+  }
+
+  /// 播放层注册完 onOpenRequested/onOpenSettings 回调后调用：把冷启动
+  /// 期间暂存的动作补执行。推迟到首帧渲染后，避免 GoRouter 尚未挂载
+  /// 时 push 失败。
+  static void flushPendingAction() {
+    final action = _pendingAction;
+    if (action == null) return;
+    _pendingAction = null;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (action == 'onOpenSettings') {
+        onOpenSettings?.call();
+      } else if (action == 'onOpenRequested') {
+        onOpenRequested?.call();
+      }
     });
   }
 

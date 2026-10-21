@@ -1,4 +1,4 @@
-name: xy_music
+﻿name: xy_music
 description: "XY Music mobile application."
 # The following line prevents the package from being accidentally published to
 # pub.dev using `flutter pub publish`. This is preferred for private packages.
@@ -16,7 +16,7 @@ publish_to: 'none' # Remove this line if you wish to publish to pub.dev
 # https://developer.apple.com/library/archive/documentation/General/Reference/InfoPlistKeyReference/Articles/CoreFoundationKeys.html
 # In Windows, build-name is used as the major, minor, and patch parts
 # of the product and file versions while build-number is used as the build suffix.
-version: 2.4.0+5516
+version: 2.5.0+5529
 
 dependency_overrides:
   just_audio_background:
@@ -132,7 +132,7 @@ flutter:
     - assets/share_qzone.jpg
     - assets/creators/kaishui.jpg
     - assets/creators/qingci.jpg
-    - assets/weixin_qrcode.png
+    - assets/weixin_qrcode.jpg
     - assets/zfb_qrcode.jpg
 
   # To add assets to your application, add an assets section, like this:

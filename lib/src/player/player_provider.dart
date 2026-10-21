@@ -19,6 +19,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import '../core/db_path.dart';
 import '../core/settings.dart';
+import '../navigation/routes.dart';
 import '../cloud/cloud_credentials_store.dart';
 import '../cloud/cloud_registry.dart';
 import '../cloud/cloud_types.dart';
@@ -915,6 +916,56 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
       unawaited(
         _ref.read(settingsProvider.notifier).setDesktopLyricsEnabled(false),
       );
+    };
+    // 通知栏双击：请求开启桌面歌词悬浮窗（走设置开关链路，权限校验、
+    // 浮窗启动与数据同步全在 setEnabled(true) 一条链上完成）。
+    DesktopLyricsBridge.onOpenRequested = () {
+      final current = _ref.read(settingsProvider).valueOrNull;
+      if (current == null || current.desktopLyricsEnabled) return;
+      unawaited(
+        _ref.read(settingsProvider.notifier).setDesktopLyricsEnabled(true),
+      );
+    };
+    // 浮窗操作栏 ⚙ 设置键：打开桌面歌词设置子页。
+    DesktopLyricsBridge.onOpenSettings = () {
+      appRouter.push('/settings/desktop-lyrics');
+    };
+    // 冷启动场景：原生 configureFlutterEngine 的补发早于本构造，浮窗
+    // 「打开设置」消息曾被暂存——回调就位后补执行（首帧后 push），
+    // 否则用户点一次 ⚙ 只拉起 app 停在原页面，要再点一次才能进设置。
+    DesktopLyricsBridge.flushPendingAction();
+    // 浮窗操作栏 A-/A+：字号回写设置（设置页滑块跟随 + 持久化）。
+    DesktopLyricsBridge.onFontScaleChanged = (size) {
+      final current = _ref.read(settingsProvider).valueOrNull;
+      if (current == null ||
+          (current.desktopLyricsLyricFontSize - size).abs() < 0.5) {
+        return;
+      }
+      unawaited(
+        _ref
+            .read(settingsProvider.notifier)
+            .setDesktopLyricsLyricFontSize(size),
+      );
+    };
+    // 浮窗操作栏锁定键：锁定状态回写设置（设置页开关跟随）。
+    DesktopLyricsBridge.onLockedChanged = (locked) {
+      final current = _ref.read(settingsProvider).valueOrNull;
+      if (current == null || current.desktopLyricsLocked == locked) return;
+      unawaited(
+        _ref.read(settingsProvider.notifier).setDesktopLyricsLocked(locked),
+      );
+    };
+    // 桌面歌词操作栏播放三键：进程内通道直接控制播放（绕开系统
+    // dispatchMediaKeyEvent 的 ROM 后台派发限制）。
+    DesktopLyricsBridge.onMediaKey = (action) {
+      switch (action) {
+        case 'prev':
+          unawaited(previous());
+        case 'playPause':
+          unawaited(toggle());
+        case 'next':
+          unawaited(next());
+      }
     };
     // 统计周期刷写：后台静默化——退后台后暂停刷写（避免后台持续写盘
     // 唤醒），回前台由生命周期回调补刷一次累积时长。
@@ -2233,12 +2284,31 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
     final rawLyrics = item.lyricsRaw ?? '';
     final stillLoading =
         rawLyrics.trim().isEmpty && item.lyricsAttempted != true;
+    // 歌词偏移（每首歌独立，播放页设置，SharedPreferences 按 path 存储）：
+    // 车载/蓝牙端按 position 与行时间戳比对滚行，若不叠加偏移，车机上的
+    // 歌词等于没有偏移。语义对齐播放页 applyLyricsOffset（有效歌词进度
+    // = 播放进度 + 偏移十分之一秒），蓝牙端通过前移 position 等效实现。
+    var position = state.position;
+    final path = item.path;
+    if (path.isNotEmpty) {
+      try {
+        final preferences = await SharedPreferences.getInstance();
+        final raw = preferences.getString('playerLyricsOffsetsTenthsV1');
+        final decoded = raw == null || raw.isEmpty ? null : jsonDecode(raw);
+        final stored = decoded is Map ? decoded[path] : null;
+        final tenths =
+            ((stored as num?)?.toInt() ?? 0).clamp(-100, 100);
+        position += tenths / 10;
+      } catch (_) {
+        // 偏移读取失败按无偏移推送，不影响蓝牙歌词。
+      }
+    }
     await BluetoothLyricsBridge.sync(
       enabled: settings.bluetoothLyricsEnabled,
       title: item.title,
       artist: item.artist,
       lyrics: stillLoading ? '歌词加载中…' : await _bridgeLyricsText(rawLyrics),
-      position: state.position,
+      position: position,
       isPlaying: state.isPlaying,
       duration: state.duration,
     );

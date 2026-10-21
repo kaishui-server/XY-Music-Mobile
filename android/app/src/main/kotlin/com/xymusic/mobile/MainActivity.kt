@@ -47,11 +47,6 @@ class MainActivity : AudioServiceActivity() {
         private const val MINI_PLAYER_CHANNEL = "com.xymusic.mobile/mini_player"
         private const val CAPTURE_REQUEST = 4217
         private const val DIRECTORY_REQUEST = 4218
-
-        /// audio_service 单击媒体通知时拉起 Activity 所用的固定 action
-        /// （对应 AudioService.NOTIFICATION_CLICK_ACTION）。
-        private const val NOTIFICATION_CLICK_ACTION =
-            "com.ryanheise.audioservice.NOTIFICATION_CLICK"
     }
 
     private var pendingStartResult: MethodChannel.Result? = null
@@ -64,9 +59,13 @@ class MainActivity : AudioServiceActivity() {
     /// 浮窗内按钮/进度条的操作回调。
     private var miniPlayerChannel: MethodChannel? = null
 
-    /// 通知栏单击发生在 Flutter 引擎就绪前（冷启动）时置位，等通道建好
-    /// 再通知 Dart 打开迷你播放器悬浮窗。
-    private var pendingMiniPlayerRequest = false
+    /// 桌面歌词通道：Dart 侧据此启停浮窗、同步状态，并接收浮窗操作栏
+    /// 的回调（字号调节/锁定切换/设置键/关闭）。
+    private var desktopLyricsChannelRef: MethodChannel? = null
+
+    /// 通知栏双击（自动开桌面歌词）或浮窗 ⚙ 设置键（打开设置页）发生在
+    /// Flutter 引擎就绪前（冷启动）时暂存动作名，等通道建好再转发。
+    private var pendingDesktopLyricsAction: String? = null
 
     /// 音量键拦截开关（Flutter 侧按设置推送）：开启时应用前台的
     /// 音量键只调本应用播放音量，不动系统媒体音量。
@@ -89,9 +88,8 @@ class MainActivity : AudioServiceActivity() {
         FreezeProbe.start(this)
         // 冷启动深链暂存：Flutter 引擎就绪后由 getInitialDeepLink 取走。
         pendingDeepLink = extractDeepLink(intent)
-        // 通知栏单击冷启动：通知 Dart 打开迷你播放器悬浮窗（通道未就绪时
-        // 先暂存，见 requestMiniPlayerFromNotification）。
-        if (isNotificationClick(intent)) requestMiniPlayerFromNotification()
+        // 通知栏双击（自动开桌面歌词）/浮窗 ⚙ 设置键的冷启动转发。
+        handleDesktopLyricsIntent(intent)
         acquirePlaybackWifiLock()
     }
 
@@ -130,29 +128,32 @@ class MainActivity : AudioServiceActivity() {
         extractDeepLink(intent)?.let { raw ->
             deepLinkChannel?.invokeMethod("onDeepLink", raw)
         }
-        // 通知栏单击：通知 Dart 打开迷你播放器悬浮窗。
-        if (isNotificationClick(intent)) requestMiniPlayerFromNotification()
+        // 通知栏双击（自动开桌面歌词）/浮窗 ⚙ 设置键的热启动转发。
+        // 单击进软件由 Receiver 直接拉起 Activity，无需额外动作。
+        handleDesktopLyricsIntent(intent)
     }
 
-    /// 是否为系统媒体通知的单击拉起（audio_service 固定 action）。
-    /// 这里直接用字面量而非 `AudioService.NOTIFICATION_CLICK_ACTION`：
-    /// 引用该类会使 Kotlin 要求其父类 androidx.media.MediaBrowserServiceCompat
-    /// 出现在 app 模块编译类路径上，而 app 并未直接依赖 androidx.media。
-    private fun isNotificationClick(intent: Intent?): Boolean =
-        intent?.action == NOTIFICATION_CLICK_ACTION
-
-    /// 通知栏单击后请求 Dart 打开迷你播放器悬浮窗。Dart 侧会把设置开关
-    /// 置为开启并回调 setEnabled，由统一的 setEnabled 链路完成悬浮窗权限
-    /// 校验与启动，避免原生/Dart 两处各起一次浮窗。通道未就绪（冷启动
-    /// 早于 Flutter 引擎）时暂存，等 configureFlutterEngine 建好通道再发。
-    private fun requestMiniPlayerFromNotification() {
-        val channel = miniPlayerChannel
+    /// 分发桌面歌词相关的启动意图：
+    /// - extra `auto_enable_desktop_lyrics`：通知栏双击 → 请求 Dart 开启
+    ///   桌面歌词悬浮窗（走设置开关链路，权限校验/状态同步全在 Dart）；
+    /// - extra `open_desktop_lyrics_settings`：浮窗 ⚙ 设置键 → 请求 Dart
+    ///   打开桌面歌词设置页。
+    /// 通道未就绪（冷启动早于 Flutter 引擎）时暂存动作名。
+    private fun handleDesktopLyricsIntent(intent: Intent?) {
+        val method = when {
+            intent?.getBooleanExtra("auto_enable_desktop_lyrics", false) == true ->
+                "onOpenRequested"
+            intent?.getBooleanExtra("open_desktop_lyrics_settings", false) == true ->
+                "onOpenSettings"
+            else -> return
+        }
+        val channel = desktopLyricsChannelRef
         if (channel == null) {
-            pendingMiniPlayerRequest = true
+            pendingDesktopLyricsAction = method
             return
         }
         try {
-            channel.invokeMethod("onNotificationClick", null)
+            channel.invokeMethod(method, null)
         } catch (_: Exception) {
             // 引擎已销毁时忽略。
         }
@@ -682,10 +683,10 @@ class MainActivity : AudioServiceActivity() {
                 else -> result.notImplemented()
             }
         }
-        // 冷启动通知栏单击：通道就绪后补发一次打开请求。
-        if (pendingMiniPlayerRequest) {
-            pendingMiniPlayerRequest = false
-            requestMiniPlayerFromNotification()
+        // 冷启动期间到达的通知双击/⚙ 设置键请求：通道就绪后补发。
+        pendingDesktopLyricsAction?.let { method ->
+            pendingDesktopLyricsAction = null
+            desktopLyricsChannelRef?.invokeMethod(method, null)
         }
         deepLinkChannel = MethodChannel(
             flutterEngine.dartExecutor.binaryMessenger,
@@ -988,6 +989,38 @@ class MainActivity : AudioServiceActivity() {
                     result.success(payload)
                     return@setMethodCallHandler
                 }
+                if (call.method == "getStorageRoots") {
+                    // 枚举可用的存储卷根（含外置 SD 卡）：getExternalFilesDirs
+                    // 返回每个卷上的应用专属目录，从其路径推出卷根
+                    // /storage/XXXX-XXXX。部分 ROM（华为等）限制第三方 app
+                    // 直接枚举 /storage 目录，走系统 API 最可靠；再按挂载
+                    // 状态过滤，未挂载/已拔出的卷不返回。
+                    val roots = mutableListOf<String>()
+                    for (dir in getExternalFilesDirs(null)) {
+                        if (dir == null) continue
+                        val path = dir.absolutePath
+                        if (!path.startsWith("/storage/")) continue
+                        // 未挂载/已拔出的卷直接跳过。
+                        if (android.os.Environment.getExternalStorageState(dir) !=
+                            android.os.Environment.MEDIA_MOUNTED
+                        ) {
+                            continue
+                        }
+                        // 主存储（模拟卷 /storage/emulated/0）由 Dart 侧固定
+                        // 提供，这里只返回物理外置卷（SD 卡等）。不过滤的话
+                        // 主存储条目会被误推出 /storage/emulated（少一层 /0）。
+                        if (android.os.Environment.isExternalStorageEmulated(dir)) {
+                            continue
+                        }
+                        val volume = path.removePrefix("/storage/")
+                            .substringBefore('/')
+                        if (volume.isEmpty()) continue
+                        val root = "/storage/$volume"
+                        if (root !in roots) roots.add(root)
+                    }
+                    result.success(roots)
+                    return@setMethodCallHandler
+                }
                 if (call.method != "getDeviceInfo") {
                     result.notImplemented()
                     return@setMethodCallHandler
@@ -1065,6 +1098,7 @@ class MainActivity : AudioServiceActivity() {
             }
         val desktopLyricsChannel =
             MethodChannel(flutterEngine.dartExecutor.binaryMessenger, DESKTOP_LYRICS_CHANNEL)
+        desktopLyricsChannelRef = desktopLyricsChannel
         // 手动拖动浮窗后把纵向位置（百分制）回传 Dart，让设置页滑块与
         // 实际位置同步，避免下一次进度更新用旧滑块值把浮窗拉回（位置复位）。
         DesktopLyricsService.positionReporter = { percent ->
@@ -1078,6 +1112,30 @@ class MainActivity : AudioServiceActivity() {
         DesktopLyricsService.closeReporter = {
             try {
                 desktopLyricsChannel.invokeMethod("onCloseRequested", null)
+            } catch (_: Exception) {
+                // 引擎已销毁时忽略。
+            }
+        }
+        // 操作栏 A-/A+ 调节字号后回传 Dart：设置页滑块跟随并持久化。
+        DesktopLyricsService.fontSizeReporter = { size ->
+            try {
+                desktopLyricsChannel.invokeMethod("onFontScaleChanged", size)
+            } catch (_: Exception) {
+                // 引擎已销毁时忽略。
+            }
+        }
+        // 操作栏锁定键切换后回传 Dart：设置页「锁定桌面歌词」开关跟随。
+        DesktopLyricsService.lockedReporter = { locked ->
+            try {
+                desktopLyricsChannel.invokeMethod("onLockedChanged", locked)
+            } catch (_: Exception) {
+                // 引擎已销毁时忽略。
+            }
+        }
+        // 操作栏播放三键：转发 Dart 直接控制播放（prev/playPause/next）。
+        DesktopLyricsService.mediaKeyReporter = { action ->
+            try {
+                desktopLyricsChannel.invokeMethod("onMediaKey", action)
             } catch (_: Exception) {
                 // 引擎已销毁时忽略。
             }

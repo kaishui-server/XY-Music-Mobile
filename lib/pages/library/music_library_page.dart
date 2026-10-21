@@ -1,7 +1,4 @@
 import 'dart:async';
-import 'dart:io';
-
-import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
@@ -10,8 +7,6 @@ import 'package:lpinyin/lpinyin.dart';
 import '../../src/core/settings.dart';
 import '../../src/favorites/favorites_provider.dart';
 import '../../src/library/library_provider.dart';
-import '../../src/library/native_storage_permission.dart';
-import '../../src/library/scan_settings_provider.dart';
 import '../../src/navigation/sidebar_controller.dart';
 import '../../src/player/player_provider.dart';
 import '../../src/playlists/playlist_import_actions.dart';
@@ -30,7 +25,7 @@ import '../../src/widgets/frosted_search_field.dart';
 import '../../src/widgets/queue_sheet.dart';
 import '../../src/widgets/song_list_view.dart';
 import '../../src/widgets/top_notice.dart';
-import 'folder_browser_page.dart';
+import '../settings/scan_folders_page.dart';
 
 /// 收藏分页右上角「更多」菜单项。
 enum _FavoritesMenuAction {
@@ -41,7 +36,7 @@ enum _FavoritesMenuAction {
   refresh,
 }
 
-/// 音乐库：收藏 / 歌单 / 本地音乐 / 最近播放 / 播放列表 / 文件夹
+/// 音乐库：收藏 / 歌单 / 本地音乐 / 最近播放 / 播放列表
 /// 的统一分页入口。单一 AppBar，右上角按钮随当前分页切换；
 /// 各分页的搜索 / 排序 / 多选状态统一提升到本 State，切页不丢失。
 class MusicLibraryPage extends ConsumerStatefulWidget {
@@ -54,7 +49,7 @@ class MusicLibraryPage extends ConsumerStatefulWidget {
 class _MusicLibraryPageState extends ConsumerState<MusicLibraryPage>
     with TickerProviderStateMixin {
   late final TabController _tabController = TabController(
-    length: 6,
+    length: 5,
     vsync: this,
   );
 
@@ -64,7 +59,7 @@ class _MusicLibraryPageState extends ConsumerState<MusicLibraryPage>
     vsync: this,
   );
 
-  static const _tabs = ['收藏', '歌单', '本地音乐', '文件夹', '最近播放', '播放列表'];
+  static const _tabs = ['收藏', '歌单', '本地音乐', '最近播放', '播放列表'];
 
   // ---- 收藏分页状态 ----
   String _favQuery = '';
@@ -104,6 +99,10 @@ class _MusicLibraryPageState extends ConsumerState<MusicLibraryPage>
   final Set<String> _localSelectedPaths = <String>{};
   bool _localSelectionMode = false;
   bool _localDeleting = false;
+  bool _localSearchMode = false;
+  String _localQuery = '';
+  final TextEditingController _localSearchController = TextEditingController();
+  final FocusNode _localSearchFocus = FocusNode();
 
   /// 歌曲子分页的排序：custom 表示曲库原始顺序（扫描序），其余键
   /// 按拼音排序；歌手 / 专辑子分页固定按拼音分组，不参与排序。
@@ -123,23 +122,14 @@ class _MusicLibraryPageState extends ConsumerState<MusicLibraryPage>
   Map<String, List<Song>> _localGroupCache = const <String, List<Song>>{};
   List<String> _localGroupCacheNames = const <String>[];
 
-  /// 曲库重扫进行中（本地音乐 / 文件夹分页共用的刷新按钮状态）。
+  /// 曲库重扫进行中（本地音乐分页刷新按钮状态）。
   bool _libraryScanning = false;
-
-  /// 添加扫描目录进行中（文件夹分页右上角按钮）。
-  bool _addingFolder = false;
 
   // ---- 最近播放分页状态 ----
   bool _recentSearchMode = false;
   String _recentQuery = '';
   final TextEditingController _recentSearchController = TextEditingController();
   final FocusNode _recentSearchFocus = FocusNode();
-
-  // ---- 文件夹分页状态 ----
-  bool _folderSearchMode = false;
-  String _folderQuery = '';
-  final TextEditingController _folderSearchController = TextEditingController();
-  final FocusNode _folderSearchFocus = FocusNode();
 
   // ---- 播放列表分页状态 ----
   /// 播放列表（播放队列）的滚动控制器：「定位当前播放」按钮用它把正在
@@ -182,8 +172,8 @@ class _MusicLibraryPageState extends ConsumerState<MusicLibraryPage>
     _favSearchFocus.dispose();
     _recentSearchController.dispose();
     _recentSearchFocus.dispose();
-    _folderSearchController.dispose();
-    _folderSearchFocus.dispose();
+    _localSearchController.dispose();
+    _localSearchFocus.dispose();
     _queueScrollController.dispose();
     super.dispose();
   }
@@ -325,7 +315,8 @@ class _MusicLibraryPageState extends ConsumerState<MusicLibraryPage>
           ),
         ];
       case 2:
-        // 本地音乐：多选（仅歌曲子分页）+ 刷新。
+        // 本地音乐：搜索 / 多选模式显示取消；常规态右上角只留扫描目录与
+        // 搜索，排序 / 多选 / 刷新下沉到歌曲列表顶部的工具行（图三样式）。
         if (_localSelectionMode) {
           return [
             IconButton(
@@ -335,66 +326,30 @@ class _MusicLibraryPageState extends ConsumerState<MusicLibraryPage>
             ),
           ];
         }
-        return [
-          // 排序仅对歌曲子分页生效（歌手/专辑子分页固定拼音分组）。
-          SongSortMenuButton(
-            sort: _localSort,
-            onSortChanged: (sort) => setState(() => _localSort = sort),
-          ),
-          IconButton(
-            tooltip: '多选',
-            onPressed: _localTabController.index == 0 &&
-                    ref.read(libraryProvider).songs.isNotEmpty
-                ? _enterLocalSelection
-                : null,
-            icon: const Icon(Icons.library_add_check_rounded),
-          ),
-          IconButton(
-            tooltip: _libraryScanning ? '扫描中...' : '刷新本地曲库',
-            onPressed: _libraryScanning ? null : _refreshLibrary,
-            icon: _libraryScanning
-                ? const SizedBox.square(
-                    dimension: 20,
-                    child: CircularProgressIndicator(strokeWidth: 2),
-                  )
-                : const Icon(Icons.refresh_rounded),
-          ),
-        ];
-      case 3:
-        // 文件夹：扫描目录 + 搜索 + 刷新。
-        if (_folderSearchMode) {
+        if (_localSearchMode) {
           return [
-            TextButton(onPressed: _exitFolderSearch, child: const Text('取消')),
+            TextButton(onPressed: _exitLocalSearch, child: const Text('取消')),
           ];
         }
         return [
           IconButton(
-            tooltip: _addingFolder ? '添加中...' : '扫描目录',
-            onPressed: _addingFolder ? null : _addScanFolder,
-            icon: _addingFolder
-                ? const SizedBox.square(
-                    dimension: 20,
-                    child: CircularProgressIndicator(strokeWidth: 2),
-                  )
-                : const Icon(Icons.create_new_folder_outlined),
+            tooltip: _libraryScanning ? '扫描中...' : '扫描目录',
+            onPressed: _libraryScanning
+                ? null
+                : () => Navigator.of(context).push(
+                      MaterialPageRoute<void>(
+                        builder: (_) => const ScanFoldersPage(),
+                      ),
+                    ),
+            icon: const Icon(Icons.create_new_folder_outlined),
           ),
           IconButton(
             tooltip: '搜索',
-            onPressed: _enterFolderSearch,
+            onPressed: _enterLocalSearch,
             icon: const Icon(Icons.search_rounded),
           ),
-          IconButton(
-            tooltip: _libraryScanning ? '扫描中...' : '刷新',
-            onPressed: _libraryScanning ? null : _refreshLibrary,
-            icon: _libraryScanning
-                ? const SizedBox.square(
-                    dimension: 20,
-                    child: CircularProgressIndicator(strokeWidth: 2),
-                  )
-                : const Icon(Icons.refresh_rounded),
-          ),
         ];
-      case 4:
+      case 3:
         // 最近播放：搜索 + 清空。
         if (_recentSearchMode) {
           return [
@@ -439,14 +394,13 @@ class _MusicLibraryPageState extends ConsumerState<MusicLibraryPage>
         ],
         bottom: TabBar(
           controller: _tabController,
-          isScrollable: true,
-          tabAlignment: TabAlignment.start,
+          // 平均分布：五个分页等宽填充，不滚动。
           labelStyle: const TextStyle(
-            fontSize: 17,
+            fontSize: 15,
             fontWeight: FontWeight.w700,
           ),
           unselectedLabelStyle: const TextStyle(
-            fontSize: 15,
+            fontSize: 14,
             fontWeight: FontWeight.w600,
           ),
           tabs: [
@@ -465,7 +419,6 @@ class _MusicLibraryPageState extends ConsumerState<MusicLibraryPage>
             _DeferredTab(_buildFavoritesTab),
             _DeferredTab(_buildPlaylistsTab),
             _DeferredTab(_buildLocalTab),
-            _DeferredTab(_buildFoldersTab),
             _DeferredTab(_buildRecentTab),
             _DeferredTab(_buildQueueTab),
           ],
@@ -1161,9 +1114,25 @@ class _MusicLibraryPageState extends ConsumerState<MusicLibraryPage>
   }
 
   // ==========================================================================
-  // 本地音乐分页：歌曲 / 歌手 / 专辑 三个子分页；多选（歌曲子分页）
-  // 与刷新按钮位于 AppBar。
+  // 本地音乐分页：歌曲 / 歌手 / 专辑 三个子分页；搜索在右上角，
+  // 排序 / 多选 / 刷新在歌曲列表顶部的工具行。
   // ==========================================================================
+
+  void _enterLocalSearch() {
+    setState(() => _localSearchMode = true);
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) _localSearchFocus.requestFocus();
+    });
+  }
+
+  void _exitLocalSearch() {
+    _localSearchFocus.unfocus();
+    setState(() {
+      _localSearchMode = false;
+      _localQuery = '';
+      _localSearchController.clear();
+    });
+  }
 
   void _enterLocalSelection() {
     setState(() {
@@ -1224,7 +1193,8 @@ class _MusicLibraryPageState extends ConsumerState<MusicLibraryPage>
     );
   }
 
-  /// 多选批量删除本地音乐：永久删除设备上的文件，并同步移除收藏与曲库。
+  /// 多选批量删除本地音乐：默认仅从列表移除（文件保留在磁盘），勾选
+  /// 「同时删除本地文件」才永久删除设备文件，并同步移除收藏与重扫曲库。
   Future<void> _localDeleteSelected() async {
     if (_localDeleting || _localSelectedPaths.isEmpty) return;
     final songs = ref
@@ -1233,58 +1203,98 @@ class _MusicLibraryPageState extends ConsumerState<MusicLibraryPage>
         .where((song) => _localSelectedPaths.contains(song.path))
         .toList();
     if (songs.isEmpty) return;
-    final message = songs.length == 1
-        ? '确定永久删除《${songs.first.title}》吗？\n该操作会删除设备上的音乐文件，不可恢复。'
-        : '确定永久删除选中的 ${songs.length} 首歌曲吗？\n该操作会删除设备上的音乐文件，不可恢复。';
-    final ok = await showDialog<bool>(
+    final target = songs.length == 1 ? '《${songs.first.title}》' : '选中的 ${songs.length} 首歌曲';
+    var alsoDeleteFiles = false;
+    final deleteFiles = await showDialog<bool>(
       context: context,
-      builder: (ctx) => AlertDialog(
-        title: const Text('删除歌曲'),
-        content: Text(message),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx, false),
-            child: const Text('取消'),
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setDialogState) => AlertDialog(
+          title: const Text('删除歌曲'),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text('确定删除$target吗？'),
+              const SizedBox(height: 8),
+              CheckboxListTile(
+                value: alsoDeleteFiles,
+                onChanged: (value) =>
+                    setDialogState(() => alsoDeleteFiles = value ?? false),
+                controlAffinity: ListTileControlAffinity.leading,
+                contentPadding: EdgeInsets.zero,
+                dense: true,
+                title: const Text('同时删除本地文件'),
+                subtitle: Text(
+                  alsoDeleteFiles ? '文件将被永久删除，不可恢复' : '仅从列表移除，文件保留在设备上',
+                  style: TextStyle(
+                    fontSize: 12,
+                    color: alsoDeleteFiles
+                        ? Theme.of(ctx).colorScheme.error
+                        : Theme.of(ctx).colorScheme.onSurfaceVariant,
+                  ),
+                ),
+              ),
+            ],
           ),
-          FilledButton(
-            style: FilledButton.styleFrom(
-              backgroundColor: Theme.of(ctx).colorScheme.error,
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(ctx, false),
+              child: const Text('取消'),
             ),
-            onPressed: () => Navigator.pop(ctx, true),
-            child: const Text('删除'),
-          ),
-        ],
+            FilledButton(
+              style: FilledButton.styleFrom(
+                backgroundColor: Theme.of(ctx).colorScheme.error,
+              ),
+              onPressed: () => Navigator.pop(ctx, true),
+              child: const Text('删除'),
+            ),
+          ],
+        ),
       ),
     );
-    if (ok != true || !mounted) return;
+    if (deleteFiles != true || !mounted) return;
     setState(() => _localDeleting = true);
-    var failed = 0;
     try {
-      for (final song in songs) {
-        try {
-          await deleteMusicFile(path: song.path);
-        } catch (_) {
-          failed++;
+      if (alsoDeleteFiles) {
+        var failed = 0;
+        for (final song in songs) {
+          try {
+            await deleteMusicFile(path: song.path);
+          } catch (_) {
+            failed++;
+          }
         }
-      }
-      // 同步收藏：已删除文件的收藏项一并移除，避免残留失效路径。
-      final favorites = ref.read(favoritesProvider);
-      for (final song in songs) {
-        if (favorites.contains(song.path)) {
-          await ref.read(favoritesProvider.notifier).toggle(song.path);
+        // 同步收藏：已删除文件的收藏项一并移除，避免残留失效路径。
+        final favorites = ref.read(favoritesProvider);
+        for (final song in songs) {
+          if (favorites.contains(song.path)) {
+            await ref.read(favoritesProvider.notifier).toggle(song.path);
+          }
         }
+        // 重扫文件夹把删除同步进数据库（增量 diff，只处理变更）。
+        await ref.read(libraryProvider.notifier).scanAllFolders();
+        if (!mounted) return;
+        _localExitSelection();
+        XyNotice.show(
+          context,
+          message: failed > 0
+              ? '已删除 ${songs.length - failed} 首，$failed 首删除失败'
+              : '已删除 ${songs.length} 首',
+          type: failed > 0 ? XyNoticeType.warning : XyNoticeType.success,
+        );
+      } else {
+        // 仅从列表移除：文件与数据库记录保留，本地音乐列表（含歌手/
+        // 专辑分组视图）不再展示。
+        await ref
+            .read(libraryProvider.notifier)
+            .hideSongs([for (final song in songs) song.path]);
+        if (!mounted) return;
+        _localExitSelection();
+        XyNotice.show(
+          context,
+          message: '已从列表移除 ${songs.length} 首（重新扫描后恢复）',
+        );
       }
-      // 重扫文件夹把删除同步进数据库（增量 diff，只处理变更）。
-      await ref.read(libraryProvider.notifier).scanAllFolders();
-      if (!mounted) return;
-      _localExitSelection();
-      XyNotice.show(
-        context,
-        message: failed > 0
-            ? '已删除 ${songs.length - failed} 首，$failed 首删除失败'
-            : '已删除 ${songs.length} 首',
-        type: failed > 0 ? XyNoticeType.warning : XyNoticeType.success,
-      );
     } finally {
       if (mounted) setState(() => _localDeleting = false);
     }
@@ -1417,8 +1427,7 @@ class _MusicLibraryPageState extends ConsumerState<MusicLibraryPage>
       children: [
         TabBar(
           controller: _localTabController,
-          isScrollable: true,
-          tabAlignment: TabAlignment.start,
+          // 平均分布：歌曲/歌手/专辑三个子分页等宽填充，不滚动。
           labelStyle: const TextStyle(fontSize: 15, fontWeight: FontWeight.w700),
           unselectedLabelStyle: const TextStyle(
             fontSize: 14,
@@ -1469,19 +1478,65 @@ class _MusicLibraryPageState extends ConsumerState<MusicLibraryPage>
   Widget _buildLocalSongsTab(BuildContext context, List<Song> songs) {
     // 排序仅作用于歌曲子分页的展示与播放顺序；custom = 曲库扫描序。
     final sortedSongs = _localSortedSongs(songs);
-    final allSelected = sortedSongs.isNotEmpty &&
-        _localSelectedPaths.length == sortedSongs.length &&
-        sortedSongs.every((song) => _localSelectedPaths.contains(song.path));
+    // 搜索过滤在排序之后应用：排序缓存不失效，只筛展示与播放集合。
+    final query = _localQuery.trim().toLowerCase();
+    final visibleSongs = query.isEmpty
+        ? sortedSongs
+        : sortedSongs.where((s) => _matchesSongQuery(s, query)).toList();
+    final allSelected = visibleSongs.isNotEmpty &&
+        _localSelectedPaths.length == visibleSongs.length &&
+        visibleSongs.every((song) => _localSelectedPaths.contains(song.path));
     return Column(
       children: [
+        if (_localSearchMode)
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 6, 16, 0),
+            child: FrostedSearchField(
+              controller: _localSearchController,
+              focusNode: _localSearchFocus,
+              hintText: '搜索歌曲、歌手、专辑',
+              onChanged: (value) => setState(() => _localQuery = value),
+              showClearSuffix: true,
+            ),
+          ),
         _TabHeaderBar(
-          countLabel: '${sortedSongs.length} 首歌曲',
+          countLabel: query.isEmpty
+              ? '${visibleSongs.length} 首歌曲'
+              : '${visibleSongs.length} / ${sortedSongs.length} 首歌曲',
           onAction: () =>
-              ref.read(libraryProvider.notifier).playAll(sortedSongs),
+              ref.read(libraryProvider.notifier).playAll(visibleSongs),
+        ),
+        // 工具行（图三样式）：左侧排序下拉，右侧多选 / 刷新小图标。
+        Padding(
+          padding: const EdgeInsets.fromLTRB(16, 0, 8, 2),
+          child: Row(
+            children: [
+              SongSortMenuButton(
+                sort: _localSort,
+                onSortChanged: (sort) => setState(() => _localSort = sort),
+              ),
+              const Spacer(),
+              IconButton(
+                tooltip: '多选',
+                onPressed: visibleSongs.isEmpty ? null : _enterLocalSelection,
+                icon: const Icon(Icons.checklist_rounded),
+              ),
+              IconButton(
+                tooltip: _libraryScanning ? '扫描中...' : '刷新',
+                onPressed: _libraryScanning ? null : _refreshLibrary,
+                icon: _libraryScanning
+                    ? const SizedBox.square(
+                        dimension: 20,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      )
+                    : const Icon(Icons.refresh_rounded),
+              ),
+            ],
+          ),
         ),
         Expanded(
           child: SongsListView(
-            songs: sortedSongs,
+            songs: visibleSongs,
             padding: EdgeInsets.fromLTRB(
               10,
               0,
@@ -1810,183 +1865,6 @@ class _MusicLibraryPageState extends ConsumerState<MusicLibraryPage>
         ),
       ],
     );
-  }
-
-  // ==========================================================================
-  // 文件夹分页：扫描目录 / 搜索 / 刷新按钮位于 AppBar。
-  // ==========================================================================
-
-  void _enterFolderSearch() {
-    setState(() => _folderSearchMode = true);
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (mounted) _folderSearchFocus.requestFocus();
-    });
-  }
-
-  void _exitFolderSearch() {
-    _folderSearchFocus.unfocus();
-    setState(() {
-      _folderSearchMode = false;
-      _folderQuery = '';
-      _folderSearchController.clear();
-    });
-  }
-
-  /// 添加扫描目录：权限 → 目录选择（Android 自建浏览器 / 桌面系统选择器）
-  /// → 加入扫描列表并立即扫描（与设置页添加目录同款流程）。
-  Future<void> _addScanFolder() async {
-    if (_addingFolder) return;
-    setState(() => _addingFolder = true);
-    try {
-      // 权限走原生桥（MusicFree 同款），按系统版本申请真实所需权限。
-      if (!await NativeStoragePermission.ensure()) {
-        _toast(await NativeStoragePermission.deniedHint);
-        return;
-      }
-      String? dir;
-      if (Platform.isAndroid) {
-        // 自建目录浏览器：返回真实文件路径且与扫描走同一套权限。
-        if (!mounted) return;
-        dir = await Navigator.of(context).push<String>(
-          MaterialPageRoute(builder: (_) => const FolderBrowserPage()),
-        );
-      } else {
-        dir = await FilePicker.platform.getDirectoryPath();
-      }
-      if (dir == null || dir.startsWith('content://')) return; // 用户取消
-      // 非 Android（SAF 路径）校验可读性；Android 浏览器能列出即已可读。
-      if (!Platform.isAndroid &&
-          !await NativeStoragePermission.isReadableDirectory(dir)) {
-        _toast('无法读取所选文件夹');
-        return;
-      }
-      await ref.read(scanFoldersProvider.notifier).addFolder(dir);
-      // 添加即扫描：不扫的话歌曲要等用户手动刷新才出现。
-      _toast('已添加扫描目录，开始扫描...');
-      try {
-        final count = await ref.read(libraryProvider.notifier).scanAllFolders();
-        if (!mounted) return;
-        if (count == 0) {
-          _toast('已添加目录，但未扫描到歌曲，请确认目录内有受支持格式的音频文件');
-        } else {
-          _toast('已添加目录，共扫描到 $count 首歌曲');
-        }
-      } on Exception catch (e) {
-        if (!mounted) return;
-        _toast('扫描失败：${e.toString().replaceFirst('Exception: ', '')}');
-      }
-    } catch (e) {
-      _toast('添加失败：$e');
-    } finally {
-      if (mounted) setState(() => _addingFolder = false);
-    }
-  }
-
-  Widget _buildFoldersTab(BuildContext context) {
-    final root = ref.watch(libraryProvider.select((s) => s.folderRoot));
-    if (root.isEmpty) {
-      return const _EmptyHint('暂无文件夹\n点击右上角「扫描目录」添加本地音乐目录');
-    }
-    final query = _folderQuery.trim().toLowerCase();
-    final nodes = query.isEmpty
-        ? root
-        : root.where((node) {
-            final name = node.name.isNotEmpty
-                ? node.name
-                : node.path.split('/').last;
-            return name.toLowerCase().contains(query) ||
-                node.path.toLowerCase().contains(query);
-          }).toList();
-    return Column(
-      children: [
-        if (_folderSearchMode)
-          Padding(
-            padding: const EdgeInsets.fromLTRB(16, 6, 16, 0),
-            child: FrostedSearchField(
-              controller: _folderSearchController,
-              focusNode: _folderSearchFocus,
-              hintText: '搜索文件夹',
-              onChanged: (value) => setState(() => _folderQuery = value),
-              showClearSuffix: true,
-            ),
-          ),
-        _TabHeaderBar(
-          countLabel: query.isEmpty
-              ? '${root.length} 个根目录'
-              : '${nodes.length} / ${root.length} 个根目录',
-          onAction: () => _playFolderSongs(null),
-        ),
-        Expanded(
-          child: nodes.isEmpty
-              ? const Center(child: Text('未找到匹配的文件夹'))
-              : ListView.builder(
-                  padding: EdgeInsets.fromLTRB(
-              16,
-              2,
-              16,
-              MediaQuery.paddingOf(context).bottom + 12,
-            ),
-                  itemCount: nodes.length,
-                  itemBuilder: (context, index) {
-                    final node = nodes[index];
-                    return Padding(
-                      padding: const EdgeInsets.only(bottom: 8),
-                      child: XyPanel(
-                        padding: EdgeInsets.zero,
-                        child: ListTile(
-                          contentPadding: const EdgeInsets.symmetric(
-                            horizontal: 12,
-                            vertical: 4,
-                          ),
-                          leading: Container(
-                            width: 44,
-                            height: 44,
-                            decoration: BoxDecoration(
-                              color: Theme.of(
-                                context,
-                              ).colorScheme.primary.withValues(alpha: 0.14),
-                              borderRadius: BorderRadius.circular(13),
-                            ),
-                            child: Icon(
-                              Icons.folder_rounded,
-                              color: Theme.of(context).colorScheme.primary,
-                            ),
-                          ),
-                          title: Text(
-                            node.name.isNotEmpty
-                                ? node.name
-                                : node.path.split('/').last,
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                            style: const TextStyle(fontWeight: FontWeight.w700),
-                          ),
-                          subtitle: Text(
-                            '${node.songCount} 首${node.childCount > 0 ? ' · ${node.childCount} 个子文件夹' : ''}',
-                          ),
-                          trailing: Icon(
-                            Icons.play_circle_outline_rounded,
-                            color: Theme.of(
-                              context,
-                            ).colorScheme.onSurfaceVariant,
-                          ),
-                          onTap: () => _playFolderSongs(node.path),
-                        ),
-                      ),
-                    );
-                  },
-                ),
-        ),
-      ],
-    );
-  }
-
-  /// 播放文件夹内全部歌曲；path 为 null 时播放整个本地曲库。
-  Future<void> _playFolderSongs(String? path) async {
-    final songs = path == null
-        ? ref.read(libraryProvider).songs
-        : await ref.read(libraryProvider.notifier).songsByFolder(path);
-    if (songs.isEmpty) return;
-    await ref.read(libraryProvider.notifier).playAll(songs);
   }
 }
 

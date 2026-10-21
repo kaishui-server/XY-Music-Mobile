@@ -4358,6 +4358,13 @@ class PluginRuntimeService {
     }
   }
 
+  /// 当前歌曲+插件的音质探测是否已完成（缓存命中）。
+  /// 用于 UI 判断是否跳过「正在读取插件支持的音质…」提示——同一首歌
+  /// 第二次点击音质选择器时直接用缓存结果，不再重复提示。
+  bool hasDiscoveredQualities(EnabledMusicPlugin plugin, Map<String, dynamic> rawData) {
+    return _qualityDiscoveryDone.containsKey(_qualityCacheKey(plugin, rawData));
+  }
+
   /// 探测当前歌曲和插件实际支持的音质。插件没有统一的音质枚举协议，
   /// 所以先读取歌曲返回的音质元数据，再对没有声明的插件 token 调用一次
   /// getMediaSource；只有返回有效 URL 才会展示给用户。

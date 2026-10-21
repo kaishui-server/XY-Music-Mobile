@@ -2087,7 +2087,22 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
         ? playbackQuality
         : ref.read(settingsProvider).valueOrNull?.onlineDefaultQuality ??
               '320k';
-    XyNotice.show(context, message: '正在读取插件支持的音质…');
+    // 同一首歌+插件的音质探测有缓存：缓存命中时跳过提示，只有首次真正
+    // 需要联网探测才显示「正在读取插件支持的音质…」，避免每次点击弹窗。
+    final runtime = ref.read(pluginRuntimeProvider);
+    final raw = item.pluginData;
+    final pluginId = item.pluginId?.trim() ?? '';
+    bool cached = false;
+    if (raw != null && raw.isNotEmpty && pluginId.isNotEmpty) {
+      try {
+        final plugins = await ref.read(enabledMusicPluginsProvider.future);
+        final plugin = plugins.where((value) => value.id == pluginId).firstOrNull;
+        if (plugin != null && runtime.hasDiscoveredQualities(plugin, raw)) {
+          cached = true;
+        }
+      } catch (_) {}
+    }
+    if (!cached) XyNotice.show(context, message: '正在读取插件支持的音质…');
     final qualities = await _discoverQualityOptions(item, preferred: current);
     if (!mounted) return;
     // 音质菜单右侧文件大小：有损档位先用码率×时长估算占位，无损/未知
@@ -4468,6 +4483,61 @@ class _PlayerMoreSheetState extends ConsumerState<_PlayerMoreSheet> {
                         title: '音效',
                         value: effectsActive ? '开' : '关',
                         onOpen: widget.onShowEffects,
+                      ),
+                      // 应用内音量：与设置页滑杆/音量键同源（settingsProvider.
+                      // setVolume），拖动实时下发、弹层不收起；悬浮窗音量条
+                      // 同源跟随。行高与 _settingRow 对齐（52），避免弹层
+                      // 行高不均。
+                      Container(
+                        constraints: const BoxConstraints(minHeight: 52),
+                        alignment: Alignment.centerLeft,
+                        padding: const EdgeInsets.symmetric(horizontal: 6),
+                        child: Row(
+                          children: [
+                            Icon(
+                              Icons.volume_up_rounded,
+                              size: 20,
+                              color: scheme.onSurfaceVariant,
+                            ),
+                            const SizedBox(width: 11),
+                            Text(
+                              '应用内音量',
+                              style: TextStyle(
+                                fontSize: 15,
+                                fontWeight: FontWeight.w600,
+                                color: scheme.onSurface,
+                              ),
+                            ),
+                            Expanded(
+                              child: SliderTheme(
+                                data: SliderThemeData(
+                                  trackHeight: 3,
+                                  overlayShape: SliderComponentShape.noOverlay,
+                                ),
+                                child: Slider(
+                                  value: (settings?.volume ?? 1.0).clamp(
+                                    0.0,
+                                    1.0,
+                                  ),
+                                  onChanged: (v) => ref
+                                      .read(settingsProvider.notifier)
+                                      .setVolume(v),
+                                ),
+                              ),
+                            ),
+                            SizedBox(
+                              width: 40,
+                              child: Text(
+                                '${((settings?.volume ?? 1.0) * 100).round()}%',
+                                textAlign: TextAlign.end,
+                                style: TextStyle(
+                                  fontSize: 12,
+                                  color: scheme.onSurfaceVariant,
+                                ),
+                              ),
+                            ),
+                          ],
+                        ),
                       ),
                       _settingRow(
                         context,

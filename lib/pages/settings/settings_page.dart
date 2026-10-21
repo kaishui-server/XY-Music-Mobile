@@ -1309,34 +1309,30 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
         _desktopLyricsPositionTile(context, settings, notifier),
         _tile(
           context,
-          icon: Icons.format_color_text_outlined,
-          title: '歌词颜色',
-          trailing: _desktopColorDot(
-            context,
-            settings?.desktopLyricsLyricColor ?? 0xFFFFFFFF,
+          icon: Icons.palette_outlined,
+          title: '歌词样式',
+          trailing: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              _desktopColorDot(
+                context,
+                settings?.desktopLyricsLyricColor ?? 0xFFFFFFFF,
+              ),
+              const SizedBox(width: 4),
+              _desktopColorDot(
+                context,
+                settings?.desktopLyricsTranslationColor ?? 0xFFE1E1E6,
+              ),
+              const SizedBox(width: 4),
+              _desktopColorDot(
+                context,
+                settings?.desktopLyricsBackgroundColor ?? 0xFF18181C,
+              ),
+            ],
           ),
-          onTap: () => _pickDesktopLyricsColor(
-            context,
-            ref,
-            title: '歌词颜色',
-            current: settings?.desktopLyricsLyricColor ?? 0xFFFFFFFF,
-            save: notifier.setDesktopLyricsLyricColor,
-          ),
-        ),
-        _tile(
-          context,
-          icon: Icons.translate_outlined,
-          title: '翻译颜色',
-          trailing: _desktopColorDot(
-            context,
-            settings?.desktopLyricsTranslationColor ?? 0xFFE1E1E6,
-          ),
-          onTap: () => _pickDesktopLyricsColor(
-            context,
-            ref,
-            title: '翻译颜色',
-            current: settings?.desktopLyricsTranslationColor ?? 0xFFE1E1E6,
-            save: notifier.setDesktopLyricsTranslationColor,
+          onTap: () => showDialog<void>(
+            context: context,
+            builder: (_) => const _DesktopLyricsStyleSheet(),
           ),
         ),
         _tile(
@@ -1359,40 +1355,6 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
             min: 10,
             max: 28,
             onChanged: notifier.setDesktopLyricsTranslationFontSize,
-          ),
-        ),
-        _tile(
-          context,
-          icon: Icons.format_color_fill_outlined,
-          title: '背景颜色',
-          trailing: _desktopColorDot(
-            context,
-            settings?.desktopLyricsBackgroundColor ?? 0xFF18181C,
-          ),
-          onTap: () => _pickDesktopLyricsColor(
-            context,
-            ref,
-            title: '背景颜色',
-            current: settings?.desktopLyricsBackgroundColor ?? 0xFF18181C,
-            save: notifier.setDesktopLyricsBackgroundColor,
-          ),
-        ),
-        _tile(
-          context,
-          icon: Icons.opacity_outlined,
-          title: '背景透明度',
-          trailing: SizedBox(
-            width: 145,
-            child: Slider(
-              value: settings?.desktopLyricsBackgroundOpacity ?? .85,
-              min: .1,
-              max: 1,
-              divisions: 18,
-              label:
-                  '${(((settings?.desktopLyricsBackgroundOpacity ?? .85) * 100).round())}%',
-              onChanged: (value) =>
-                  notifier.setDesktopLyricsBackgroundOpacity(value),
-            ),
           ),
         ),
         _desktopLyricsPreview(context, settings),
@@ -2458,107 +2420,6 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
     );
   }
 
-  Future<void> _pickDesktopLyricsColor(
-    BuildContext context,
-    WidgetRef ref, {
-    required String title,
-    required int current,
-    required Future<void> Function(int) save,
-  }) async {
-    const colors = [
-      0xFFFFFFFF,
-      0xFFE1E1E6,
-      0xFFFFCDD2,
-      0xFFFFE0B2,
-      0xFFFFF9C4,
-      0xFFC8E6C9,
-      0xFFB3E5FC,
-      0xFFD1C4E9,
-      0xFF263238,
-      0xFF37474F,
-      0xFF4A148C,
-      0xFF880E4F,
-      0xFF7F0000,
-      0xFF0D47A1,
-      0xFF01579B,
-      0xFF1B5E20,
-      0xFF33691E,
-      0xFF4E342E,
-      0xFF000000,
-      0xFF18181C,
-    ];
-    final choice = await showModalBottomSheet<int>(
-      context: context,
-      useRootNavigator: true,
-      builder: (sheetContext) => Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Text(title, style: const TextStyle(fontWeight: FontWeight.w600)),
-            const SizedBox(height: 16),
-            Wrap(
-              spacing: 12,
-              runSpacing: 12,
-              children: [
-                for (final color in colors)
-                  InkWell(
-                    onTap: () => Navigator.pop(sheetContext, color),
-                    borderRadius: BorderRadius.circular(20),
-                    child: Container(
-                      width: 40,
-                      height: 40,
-                      decoration: BoxDecoration(
-                        color: Color(color),
-                        shape: BoxShape.circle,
-                        border: Border.all(
-                          color: color == current
-                              ? Theme.of(sheetContext).colorScheme.primary
-                              : Theme.of(sheetContext).colorScheme.outline,
-                          width: color == current ? 3 : 1,
-                        ),
-                      ),
-                      child: color == current
-                          ? const Icon(
-                              Icons.check,
-                              color: Colors.white,
-                              size: 20,
-                            )
-                          : null,
-                    ),
-                  ),
-                InkWell(
-                  onTap: () => Navigator.pop(sheetContext, -1),
-                  borderRadius: BorderRadius.circular(20),
-                  child: Container(
-                    width: 40,
-                    height: 40,
-                    decoration: BoxDecoration(
-                      shape: BoxShape.circle,
-                      border: Border.all(
-                        color: Theme.of(sheetContext).colorScheme.outline,
-                      ),
-                    ),
-                    child: const Icon(Icons.colorize_outlined, size: 20),
-                  ),
-                ),
-              ],
-            ),
-          ],
-        ),
-      ),
-    );
-    if (choice == -1 && context.mounted) {
-      final custom = await showDialog<int>(
-        context: context,
-        builder: (_) => _CustomDesktopColorDialog(initial: current),
-      );
-      if (custom != null) await save(custom);
-    } else if (choice != null) {
-      await save(choice);
-    }
-  }
-
   Widget _volumeSlider(AppSettings? s, SettingsNotifier n) {
     return SizedBox(
       width: 120,
@@ -3417,70 +3278,458 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
   }
 }
 
-class _CustomDesktopColorDialog extends StatefulWidget {
-  const _CustomDesktopColorDialog({required this.initial});
-
-  final int initial;
+/// 桌面歌词「歌词样式」统一面板：歌词/翻译/背景三处颜色与背景透明度
+/// 集中在一处调整（原先分散的四个设置项收拢于此）。
+/// - 顶部实时预览：按当前三色 + 背景透明度渲染歌词示例；
+/// - 目标切换（歌词/翻译/背景）后，下方是共用取色体
+///   [_DesktopColorPickerBody]（色板 + RGB/十六进制），选背景时额外
+///   显示背景透明度滑块；
+/// - 所有调整即时写入设置并作用于桌面歌词悬浮窗。
+class _DesktopLyricsStyleSheet extends ConsumerStatefulWidget {
+  const _DesktopLyricsStyleSheet();
 
   @override
-  State<_CustomDesktopColorDialog> createState() =>
-      _CustomDesktopColorDialogState();
+  ConsumerState<_DesktopLyricsStyleSheet> createState() =>
+      _DesktopLyricsStyleSheetState();
 }
 
-class _CustomDesktopColorDialogState extends State<_CustomDesktopColorDialog> {
-  late double _red;
-  late double _green;
-  late double _blue;
+class _DesktopLyricsStyleSheetState
+    extends ConsumerState<_DesktopLyricsStyleSheet> {
+  /// 当前取色目标：0=歌词 1=翻译 2=背景。
+  int _target = 0;
+  static const _targets = ['歌词', '翻译', '背景'];
+
+  @override
+  Widget build(BuildContext context) {
+    final settings = ref.watch(settingsProvider).valueOrNull;
+    if (settings == null) {
+      return const SizedBox(height: 120);
+    }
+    final notifier = ref.read(settingsProvider.notifier);
+    final lyricColor = settings.desktopLyricsLyricColor;
+    final translationColor = settings.desktopLyricsTranslationColor;
+    final backgroundColor = settings.desktopLyricsBackgroundColor;
+    final opacity = settings.desktopLyricsBackgroundOpacity;
+    final currentColor = switch (_target) {
+      0 => lyricColor,
+      1 => translationColor,
+      _ => backgroundColor,
+    };
+    // 居中弹窗形式：底部弹层会被十六进制输入的软键盘遮住下半部分，
+    // Dialog + viewInsets 底部避让让键盘弹出时整体上移不遮挡。
+    return Dialog(
+      backgroundColor: Theme.of(context).colorScheme.surface,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+      insetPadding: const EdgeInsets.symmetric(horizontal: 32, vertical: 40),
+      child: Padding(
+        padding: EdgeInsets.only(
+          bottom: MediaQuery.of(context).viewInsets.bottom * 0.6,
+        ),
+        child: ConstrainedBox(
+          constraints: BoxConstraints(
+            maxHeight: MediaQuery.of(context).size.height * 0.72,
+          ),
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(20, 16, 20, 16),
+            child: SingleChildScrollView(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+              Row(
+                children: [
+                  const Expanded(
+                    child: Text(
+                      '歌词样式',
+                      style: TextStyle(
+                        fontSize: 17,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                  ),
+                  IconButton(
+                    onPressed: () => Navigator.pop(context),
+                    icon: const Icon(Icons.close_rounded, size: 20),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 10),
+              // 实时预览：三色 + 背景透明度共同渲染，调整即时可见。
+              Container(
+                height: 92,
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+                decoration: BoxDecoration(
+                  color: Color(backgroundColor).withOpacity(opacity),
+                  borderRadius: BorderRadius.circular(14),
+                  border: Border.all(color: Colors.white12),
+                ),
+                child: Column(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      children: [
+                        Flexible(
+                          child: Text(
+                            '示例已播放歌词',
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: TextStyle(
+                              color: Color(lyricColor),
+                              fontSize: 16,
+                              fontWeight: FontWeight.w700,
+                            ),
+                          ),
+                        ),
+                        const SizedBox(width: 10),
+                        const Text(
+                          '03:21',
+                          style: TextStyle(
+                              color: Colors.white38, fontSize: 11),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 5),
+                    Text(
+                      '示例未播放歌词 · 翻译行',
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        color: Color(translationColor),
+                        fontSize: 13,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(height: 14),
+              SegmentedButton<int>(
+                segments: [
+                  for (var i = 0; i < _targets.length; i++)
+                    ButtonSegment(value: i, label: Text(_targets[i])),
+                ],
+                selected: {_target},
+                showSelectedIcon: false,
+                onSelectionChanged: (selection) =>
+                    setState(() => _target = selection.first),
+              ),
+              const SizedBox(height: 14),
+              _DesktopColorPickerBody(
+                // initial 变化时内部 didUpdateWidget 自动重置。
+                initial: currentColor,
+                onChanged: (value) {
+                  switch (_target) {
+                    case 0:
+                      notifier.setDesktopLyricsLyricColor(value);
+                    case 1:
+                      notifier.setDesktopLyricsTranslationColor(value);
+                    default:
+                      notifier.setDesktopLyricsBackgroundColor(value);
+                  }
+                },
+              ),
+              // 背景透明度只在「背景」目标下显示（背景颜色面板内调节）。
+              if (_target == 2) ...[
+                const SizedBox(height: 6),
+                Row(
+                  children: [
+                    const SizedBox(
+                      width: 76,
+                      child: Text('背景透明度'),
+                    ),
+                    Expanded(
+                      child: Slider(
+                        value: opacity,
+                        min: .1,
+                        max: 1,
+                        divisions: 18,
+                        label: '${(opacity * 100).round()}%',
+                        onChanged: (value) => notifier
+                            .setDesktopLyricsBackgroundOpacity(value),
+                      ),
+                    ),
+                    SizedBox(
+                      width: 40,
+                      child: Text('${(opacity * 100).round()}%'),
+                    ),
+                  ],
+                ),
+              ],
+            ],
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// 桌面歌词自定义颜色选择器（图二式）：
+/// - 色板（饱和度×明度二维面板 + 色相条）为公共取色区，两种模式共用；
+/// - 模式切换：RGB 三通道滑块 / 十六进制输入（支持粘贴 # / 0x 前缀），
+///   默认显示 RGB；
+/// - 纯内容组件（不带对话框壳）：每次变色经 [onChanged] 即时回调，由
+///   宿主（歌词样式面板）写入设置，调整过程实时生效。
+class _DesktopColorPickerBody extends StatefulWidget {
+  const _DesktopColorPickerBody({
+    required this.initial,
+    required this.onChanged,
+  });
+
+  final int initial;
+  final ValueChanged<int> onChanged;
+
+  @override
+  State<_DesktopColorPickerBody> createState() =>
+      _DesktopColorPickerBodyState();
+}
+
+class _DesktopColorPickerBodyState extends State<_DesktopColorPickerBody> {
+  static const _tabs = ['RGB', '十六进制'];
+
+  late Color _color;
+  late HSVColor _hsv;
+  int _tabIndex = 0;
+  final _hexController = TextEditingController();
 
   @override
   void initState() {
     super.initState();
-    final color = Color(widget.initial);
-    _red = (color.r * 255).roundToDouble();
-    _green = (color.g * 255).roundToDouble();
-    _blue = (color.b * 255).roundToDouble();
+    _color = Color(widget.initial);
+    _hsv = HSVColor.fromColor(_color);
+    _hexController.text = _hexOf(_color);
   }
 
-  Color get _color =>
-      Color.fromARGB(255, _red.round(), _green.round(), _blue.round());
+  @override
+  void didUpdateWidget(covariant _DesktopColorPickerBody oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    // 宿主切换取色目标（歌词/翻译/背景）时以新 initial 重置内部状态。
+    if (oldWidget.initial != widget.initial) {
+      _color = Color(widget.initial);
+      _hsv = HSVColor.fromColor(_color);
+      _hexController.text = _hexOf(_color);
+    }
+  }
+
+  @override
+  void dispose() {
+    _hexController.dispose();
+    super.dispose();
+  }
+
+  static String _hexOf(Color c) {
+    String part(double v) =>
+        (v * 255).round().toRadixString(16).padLeft(2, '0').toUpperCase();
+    return '${part(c.r)}${part(c.g)}${part(c.b)}';
+  }
+
+  /// 统一改色入口：同步 HSV 状态与 hex 输入框（[updateHex] 为 false 时
+  /// 不回写输入框，避免用户输入中被覆盖导致光标跳动），并即时回调宿主。
+  void _applyColor(Color c, {bool updateHex = true}) {
+    setState(() {
+      _color = c;
+      _hsv = HSVColor.fromColor(c);
+      if (updateHex) _hexController.text = _hexOf(c);
+    });
+    widget.onChanged(_color.toARGB32());
+  }
+
+  /// 色板/色相条拖动：只更新对应分量，另一分量保持。
+  void _applyHsv(HSVColor v) {
+    final c = v.toColor();
+    setState(() {
+      _color = c;
+      _hsv = v;
+      _hexController.text = _hexOf(c);
+    });
+    widget.onChanged(_color.toARGB32());
+  }
+
+  void _applyHex(String text) {
+    var hex = text.trim();
+    if (hex.startsWith('#')) hex = hex.substring(1);
+    if (hex.toLowerCase().startsWith('0x')) hex = hex.substring(2);
+    hex = hex.replaceAll(RegExp(r'[^0-9a-fA-F]'), '');
+    if (hex.length < 6) return; // 不足 6 位不应用（保留当前色）
+    final value = int.tryParse(hex.substring(0, 6), radix: 16);
+    if (value == null) return;
+    _applyColor(Color(0xFF000000 | value), updateHex: false);
+  }
 
   @override
   Widget build(BuildContext context) {
-    return AlertDialog(
-      title: const Text('自定义颜色'),
-      content: SingleChildScrollView(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        // 色板为公共取色区：两种模式（RGB/十六进制）下都显示。
+        _buildPalette(),
+        const SizedBox(height: 10),
+        SegmentedButton<int>(
+          segments: [
+            for (var i = 0; i < _tabs.length; i++)
+              ButtonSegment(value: i, label: Text(_tabs[i])),
+          ],
+          selected: {_tabIndex},
+          showSelectedIcon: false,
+          onSelectionChanged: (selection) =>
+              setState(() => _tabIndex = selection.first),
+        ),
+        const SizedBox(height: 12),
+        if (_tabIndex == 0)
+          _buildRgb()
+        else
+          _buildHex(),
+      ],
+    );
+  }
+
+  /// 色板模式：饱和度×明度二维面板 + 色相条。
+  Widget _buildPalette() {
+    final hsv = _hsv;
+    return Column(
+      children: [
+        SizedBox(
+          height: 180,
+          child: LayoutBuilder(
+            builder: (context, constraints) {
+              void pick(Offset local) {
+                final s = (local.dx / constraints.maxWidth)
+                    .clamp(0.0, 1.0)
+                    .toDouble();
+                final v = (1 - local.dy / constraints.maxHeight)
+                    .clamp(0.0, 1.0)
+                    .toDouble();
+                _applyHsv(hsv.withSaturation(s).withValue(v));
+              }
+
+              return GestureDetector(
+                onTapDown: (d) => pick(d.localPosition),
+                onPanStart: (d) => pick(d.localPosition),
+                onPanUpdate: (d) => pick(d.localPosition),
+                child: CustomPaint(
+                  painter: _HsPalettePainter(hue: hsv.hue),
+                  child: Stack(
+                    children: [
+                      // 当前色指示点：s→横坐标、v→纵坐标（底部为明度 0）。
+                      Positioned(
+                        left: hsv.saturation * constraints.maxWidth - 9,
+                        top: (1 - hsv.value) * constraints.maxHeight - 9,
+                        child: Container(
+                          width: 18,
+                          height: 18,
+                          decoration: BoxDecoration(
+                            shape: BoxShape.circle,
+                            color: _color,
+                            border: Border.all(color: Colors.white, width: 2),
+                            boxShadow: const [
+                              BoxShadow(color: Colors.black38, blurRadius: 3),
+                            ],
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              );
+            },
+          ),
+        ),
+        const SizedBox(height: 10),
+        SliderTheme(
+          data: SliderTheme.of(context).copyWith(
+            trackHeight: 10,
+            thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 9),
+            overlayShape: const RoundSliderOverlayShape(overlayRadius: 14),
+          ),
+          child: Slider(
+            value: hsv.hue.clamp(0.0, 360.0),
+            max: 360,
+            onChanged: (h) => _applyHsv(hsv.withHue(h)),
+          ),
+        ),
+      ],
+    );
+  }
+
+  /// RGB 模式：三通道滑块（保留原有调色方式）。
+  Widget _buildRgb() {
+    final c = _color;
+    final r = (c.r * 255).round();
+    final g = (c.g * 255).round();
+    final b = (c.b * 255).round();
+    return Column(
+      children: [
+        _channelSlider(
+          '红',
+          r.toDouble(),
+          Colors.red,
+          (value) => _applyColor(
+            Color.fromARGB(255, value.round(), g, b),
+          ),
+        ),
+        _channelSlider(
+          '绿',
+          g.toDouble(),
+          Colors.green,
+          (value) => _applyColor(
+            Color.fromARGB(255, r, value.round(), b),
+          ),
+        ),
+        _channelSlider(
+          '蓝',
+          b.toDouble(),
+          Colors.blue,
+          (value) => _applyColor(
+            Color.fromARGB(255, r, g, value.round()),
+          ),
+        ),
+      ],
+    );
+  }
+
+  /// 十六进制模式：色块 + 输入框（支持粘贴 # / 0x 前缀）。
+  Widget _buildHex() {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
           children: [
             Container(
-              width: double.infinity,
-              height: 52,
+              width: 40,
+              height: 40,
               decoration: BoxDecoration(
                 color: _color,
-                borderRadius: BorderRadius.circular(12),
+                borderRadius: BorderRadius.circular(10),
+                border: Border.all(color: Colors.white24),
               ),
             ),
-            const SizedBox(height: 12),
-            _channelSlider('红', _red, Colors.red, (value) {
-              setState(() => _red = value);
-            }),
-            _channelSlider('绿', _green, Colors.green, (value) {
-              setState(() => _green = value);
-            }),
-            _channelSlider('蓝', _blue, Colors.blue, (value) {
-              setState(() => _blue = value);
-            }),
+            const SizedBox(width: 10),
+            Expanded(
+              child: TextField(
+                controller: _hexController,
+                onChanged: _applyHex,
+                maxLength: 8,
+                style: const TextStyle(
+                  fontFeatures: [FontFeature.tabularFigures()],
+                  letterSpacing: 1.2,
+                ),
+                decoration: const InputDecoration(
+                  counterText: '',
+                  hintText: 'RRGGBB',
+                  border: OutlineInputBorder(),
+                  isDense: true,
+                ),
+              ),
+            ),
           ],
         ),
-      ),
-      actions: [
-        TextButton(
-          onPressed: () => Navigator.pop(context),
-          child: const Text('取消'),
-        ),
-        FilledButton(
-          onPressed: () => Navigator.pop(context, _color.toARGB32()),
-          child: const Text('应用'),
+        const SizedBox(height: 6),
+        const Text(
+          '输入或粘贴 6 位色值，支持 # 或 0x 前缀',
+          style: TextStyle(color: Colors.white38, fontSize: 11),
         ),
       ],
     );
@@ -3509,6 +3758,38 @@ class _CustomDesktopColorDialogState extends State<_CustomDesktopColorDialog> {
       ],
     );
   }
+}
+
+/// 饱和度×明度二维渐变色板：底色为当前色相的纯色，横向白→纯色
+/// （饱和度 0→1）、纵向透→黑（明度 1→0），两层渐变叠画即得 HSV 取色面。
+class _HsPalettePainter extends CustomPainter {
+  _HsPalettePainter({required this.hue});
+
+  final double hue;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final rect = Offset.zero & size;
+    final pure = HSVColor.fromAHSV(1, hue, 1, 1).toColor();
+    final saturationPaint = Paint()
+      ..shader = LinearGradient(
+        begin: Alignment.centerLeft,
+        end: Alignment.centerRight,
+        colors: [Colors.white, pure],
+      ).createShader(rect);
+    canvas.drawRect(rect, saturationPaint);
+    final valuePaint = Paint()
+      ..shader = const LinearGradient(
+        begin: Alignment.topCenter,
+        end: Alignment.bottomCenter,
+        colors: [Colors.transparent, Colors.black],
+      ).createShader(rect);
+    canvas.drawRect(rect, valuePaint);
+  }
+
+  @override
+  bool shouldRepaint(_HsPalettePainter oldDelegate) =>
+      oldDelegate.hue != hue;
 }
 
 class _ColorDot extends StatelessWidget {

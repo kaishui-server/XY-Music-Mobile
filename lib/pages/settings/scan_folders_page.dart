@@ -108,19 +108,26 @@ class _ScanFoldersPageState extends ConsumerState<ScanFoldersPage> {
   Widget build(BuildContext context) {
     final foldersAsync = ref.watch(scanFoldersProvider);
     final scheme = Theme.of(context).colorScheme;
+    // 悬浮底栏 + 迷你播放栏固定占据底部条带（Shell 已把高度注入
+    // MediaQuery.padding.bottom），页面底部两角/底部的按钮都会被遮挡，
+    // 「添加目录」改为悬浮在页面正中央。
+    final folders = foldersAsync.valueOrNull ?? const [];
     return Scaffold(
       appBar: AppBar(title: const Text('扫描文件夹')),
-      floatingActionButton: FloatingActionButton.extended(
-        onPressed: _adding ? null : _addFolder,
-        icon: _adding
-            ? const SizedBox(
-                width: 18,
-                height: 18,
-                child: CircularProgressIndicator(strokeWidth: 2),
-              )
-            : const Icon(Icons.create_new_folder),
-        label: const Text('添加目录'),
-      ),
+      floatingActionButton: folders.isEmpty
+          ? null
+          : FloatingActionButton.extended(
+              onPressed: _adding ? null : _addFolder,
+              icon: _adding
+                  ? const SizedBox(
+                      width: 18,
+                      height: 18,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    )
+                  : const Icon(Icons.create_new_folder),
+              label: const Text('添加目录'),
+            ),
+      floatingActionButtonLocation: const _CenterFabLocation(),
       body: foldersAsync.when(
         loading: () => const Center(child: CircularProgressIndicator()),
         error: (e, _) => Center(child: Text('加载失败：$e')),
@@ -144,12 +151,24 @@ class _ScanFoldersPageState extends ConsumerState<ScanFoldersPage> {
                     ),
                     const SizedBox(height: 4),
                     Text(
-                      '点击右下角「添加目录」选择本地音乐文件夹，\n然后到「音乐库 → 文件夹」下拉刷新开始扫描',
+                      '点击「添加目录」选择本地音乐文件夹，\n然后到「音乐库 → 本地音乐」下拉刷新开始扫描',
                       textAlign: TextAlign.center,
                       style: TextStyle(
                         fontSize: 13,
                         color: scheme.onSurfaceVariant,
                       ),
+                    ),
+                    const SizedBox(height: 20),
+                    FilledButton.icon(
+                      onPressed: _adding ? null : _addFolder,
+                      icon: _adding
+                          ? const SizedBox(
+                              width: 18,
+                              height: 18,
+                              child: CircularProgressIndicator(strokeWidth: 2),
+                            )
+                          : const Icon(Icons.create_new_folder),
+                      label: const Text('添加目录'),
                     ),
                   ],
                 ),
@@ -157,7 +176,11 @@ class _ScanFoldersPageState extends ConsumerState<ScanFoldersPage> {
             );
           }
           return ListView.separated(
-            padding: const EdgeInsets.only(bottom: 24),
+            // 底部留白计入悬浮底栏 + 播放栏（Shell 注入值已含系统安全区），
+            // 防止列表尾部条目/删除按钮被遮挡。
+            padding: EdgeInsets.only(
+              bottom: MediaQuery.paddingOf(context).bottom + 24,
+            ),
             itemCount: folders.length,
             separatorBuilder: (_, _) => const Divider(height: 1),
             itemBuilder: (context, i) {
@@ -179,6 +202,21 @@ class _ScanFoldersPageState extends ConsumerState<ScanFoldersPage> {
           );
         },
       ),
+    );
+  }
+}
+
+/// 页面正中央的 FAB 位置：悬浮底栏/播放栏固定占据底部条带，默认
+/// endFloat/centerFloat 都会被遮挡，居中悬浮最稳妥。
+class _CenterFabLocation extends FloatingActionButtonLocation {
+  const _CenterFabLocation();
+
+  @override
+  Offset getOffset(ScaffoldPrelayoutGeometry scaffoldGeometry) {
+    final size = scaffoldGeometry.floatingActionButtonSize;
+    return Offset(
+      (scaffoldGeometry.scaffoldSize.width - size.width) / 2,
+      (scaffoldGeometry.scaffoldSize.height - size.height) / 2,
     );
   }
 }

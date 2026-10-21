@@ -39,7 +39,7 @@ class SponsorPage extends StatelessWidget {
           const SizedBox(height: 24),
           _QrCodeCard(
             title: '微信收款码',
-            asset: 'assets/weixin_qrcode.png',
+            asset: 'assets/weixin_qrcode.jpg',
           ),
           const SizedBox(height: 20),
           _QrCodeCard(

@@ -1,6 +1,7 @@
 import 'dart:convert';
 
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 import '../core/db_path.dart';
 import '../core/settings.dart';
@@ -228,6 +229,8 @@ class LibraryNotifier extends StateNotifier<LibraryState> {
   Future<void> load() async {
     state = state.copyWith(loading: true, error: null);
     try {
+      // 隐藏名单先于解析加载：songs/分组视图都要按名单过滤。
+      await _loadHiddenPaths();
       final dbPath = await _ref.read(dbPathProvider.future);
       final songsJson = await getLibrarySongsCached(dbPath: dbPath);
       final foldersJson = await getLibraryFolders(dbPath: dbPath);
@@ -235,7 +238,7 @@ class LibraryNotifier extends StateNotifier<LibraryState> {
       final albumsJson = await getLibraryAlbumCatalog(dbPath: dbPath);
       final treeJson = await getLibraryHierarchy(dbPath: dbPath);
       state = LibraryState(
-        songs: _parseSongs(songsJson),
+        songs: _applyHidden(_parseSongs(songsJson)),
         // getLibraryFolders 返回 [{path, song_count}, ...]，取出 path。
         folders: (jsonDecode(foldersJson) as List)
             .map((e) => (e as Map<String, dynamic>)['path'] as String? ?? '')
@@ -260,6 +263,39 @@ class LibraryNotifier extends StateNotifier<LibraryState> {
   List<Song> _parseSongs(String json) => (jsonDecode(json) as List)
       .map((e) => Song.fromJson(e as Map<String, dynamic>))
       .toList();
+
+  /// 已从本地列表移除（文件保留在磁盘）的路径集合。持久化于
+  /// SharedPreferences，数据库记录保留，仅本地音乐列表与歌手/专辑
+  /// 分组视图不再展示；若之后文件被真正删除，重扫后条目自然消失。
+  Set<String> _hiddenPaths = {};
+
+  static const _hiddenPathsKey = 'library.hidden_paths';
+
+  Future<void> _loadHiddenPaths() async {
+    final prefs = await SharedPreferences.getInstance();
+    _hiddenPaths =
+        (prefs.getStringList(_hiddenPathsKey) ?? const []).toSet();
+  }
+
+  Future<void> _persistHiddenPaths() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setStringList(_hiddenPathsKey, _hiddenPaths.toList());
+  }
+
+  /// 过滤掉已从列表移除的歌曲（songs/歌手/专辑分组共用同一数据源，
+  /// 一处过滤三个视图同步生效）。
+  List<Song> _applyHidden(List<Song> songs) => _hiddenPaths.isEmpty
+      ? songs
+      : songs.where((song) => !_hiddenPaths.contains(song.path)).toList();
+
+  /// 从本地列表移除歌曲（文件保留在磁盘，不删数据库记录）。播放队列
+  /// 中已加入的不受影响；收藏保留（文件仍在，可正常播放）。
+  Future<void> hideSongs(List<String> paths) async {
+    if (paths.isEmpty) return;
+    _hiddenPaths.addAll(paths);
+    await _persistHiddenPaths();
+    state = state.copyWith(songs: _applyHidden(state.songs));
+  }
 
   Future<List<FolderNodeData>> folderChildren(String path) async {
     final dbPath = await _ref.read(dbPathProvider.future);
@@ -323,6 +359,13 @@ class LibraryNotifier extends StateNotifier<LibraryState> {
       allowedFormats: allowed,
       minimumDurationSeconds: minDuration > 0 ? minDuration : null,
     );
+    // 重扫视为重新开始：清空「仅从列表移除」的隐藏名单——文件仍在
+    // 磁盘的歌曲会被重新扫出并恢复显示，否则名单会永久吞掉这些条目
+    // （表现为目录里明明有歌、扫描完成但列表不显示）。
+    if (_hiddenPaths.isNotEmpty) {
+      _hiddenPaths = {};
+      await _persistHiddenPaths();
+    }
     await load();
     // 一首都没扫到且有错误时，抛出以便 UI 展示真实原因。
     if (summary.foundSongs == 0 && summary.errors.isNotEmpty) {
@@ -343,7 +386,7 @@ class LibraryNotifier extends StateNotifier<LibraryState> {
       dbPath: dbPath,
       paths: paths,
     );
-    return _parseSongs(songsJson);
+    return _applyHidden(_parseSongs(songsJson));
   }
 
   /// 按专辑 key 取歌曲列表。
@@ -358,7 +401,7 @@ class LibraryNotifier extends StateNotifier<LibraryState> {
       dbPath: dbPath,
       paths: paths,
     );
-    return _parseSongs(songsJson);
+    return _applyHidden(_parseSongs(songsJson));
   }
 
   /// 按文件夹取歌曲列表。

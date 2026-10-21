@@ -6,11 +6,16 @@ import android.content.Intent
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.PixelFormat
+import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.graphics.drawable.ColorDrawable
+import android.media.AudioManager
 import android.os.Build
 import android.os.IBinder
 import android.os.SystemClock
+import android.os.VibrationEffect
+import android.os.Vibrator
+import android.os.VibratorManager
 import android.provider.Settings
 import android.text.Layout
 import android.text.SpannableString
@@ -18,11 +23,13 @@ import android.text.Spanned
 import android.text.style.ForegroundColorSpan
 import android.view.Choreographer
 import android.view.Gravity
+import android.view.KeyEvent
 import android.view.View
 import android.view.WindowManager
 import android.view.MotionEvent
-import android.widget.FrameLayout
+import android.widget.ImageView
 import android.widget.LinearLayout
+import android.widget.Space
 import android.widget.TextView
 import org.json.JSONArray
 import kotlin.math.abs
@@ -82,6 +89,18 @@ class DesktopLyricsService : Service() {
         @Volatile
         var closeReporter: (() -> Unit)? = null
 
+        /** 操作栏 A-/A+ 调节字号后回传 Dart：设置页滑块与持久化跟随。 */
+        @Volatile
+        var fontSizeReporter: ((Float) -> Unit)? = null
+
+        /** 操作栏锁定键切换后回传 Dart：设置页「锁定桌面歌词」开关跟随。 */
+        @Volatile
+        var lockedReporter: ((Boolean) -> Unit)? = null
+        /** 操作栏播放三键：action=prev/playPause/next，经 MainActivity 转发
+         * Dart 直接控制播放（系统 dispatchMediaKeyEvent 在部分 ROM 后台
+         * 被静默丢弃，进程内通道最可靠）。 */
+        var mediaKeyReporter: ((String) -> Unit)? = null
+
         private fun wordProgress(span: WordSpan, position: Double): Double = when {
             position <= span.timeStart -> 0.0
             position >= span.timeEnd || span.timeEnd <= span.timeStart -> 1.0
@@ -102,7 +121,7 @@ class DesktopLyricsService : Service() {
     private var windowManager: WindowManager? = null
     private var panel: View? = null
     private var lyricView: TextView? = null
-    private var translationView: TextView? = null
+    private var controlBar: LinearLayout? = null
     private var overlayParams: WindowManager.LayoutParams? = null
     private var downX = 0f
     private var downY = 0f
@@ -118,24 +137,46 @@ class DesktopLyricsService : Service() {
     /** 已应用的自定义字体路径（空 = 系统默认），避免重复创建 Typeface。 */
     private var appliedFontPath: String? = null
 
-    // ---- 关闭按钮与长按判定 ----
-    /** 关闭按钮（默认隐藏，长按浮窗显示）。 */
-    private var closeButton: View? = null
-    /** 歌词内容层（承载背景色/圆角）。背景色必须设在它上面：外层 root
-     * 只是叠放关闭按钮的容器，设在外层会被内容层自身背景盖住。 */
+    // ---- 锁定与字号（操作栏 ↔ Dart 设置双向同步） ----
+    /** 浮窗侧锁定状态：锁定 = 禁止拖动并隐藏操作栏，长按歌词 600ms 解锁。 */
+    private var localLocked = false
+    /** 浮窗侧字号（sp）：操作栏 A-/A+ 即时应用，随后回传 Dart 持久化。 */
+    private var localFontSize = 24f
+    /** 浮窗操作后等待 Dart 回显的锁定值：回显到达前忽略 Dart 推来的
+     * locked 值（Dart 写回有延迟，提前跟随会造成操作栏闪烁）。 */
+    private var pendingLockedEcho: Boolean? = null
+    /** 同上，A-/A+ 调节后的字号回显。 */
+    private var pendingFontSizeEcho: Float? = null
+    /** 锁定时长按解锁判定（非锁定态不用）。 */
+    private var unlockRunnable: Runnable? = null
+
+    /** 操作栏播放/暂停键：图标随播放状态动态切换（播放中=⏸、暂停=▶）。 */
+    private var playKey: ImageView? = null
+    private var lastPlayingIcon = true
+
+    /** 操作栏与分隔线：默认隐藏，单击歌词行切换显隐。 */
+    private var dividerRow: View? = null
+    private var barVisible = false
+
+    /// 按当前状态应用操作栏/分隔线可见性：锁定或未呼出时整体隐藏。
+    private fun applyBarVisibility() {
+        val visible = barVisible && !localLocked
+        controlBar?.visibility = if (visible) View.VISIBLE else View.GONE
+        dividerRow?.visibility = if (visible) View.VISIBLE else View.GONE
+    }
+
+    /// 单击歌词行：切换操作栏呼出/收起。
+    private fun toggleControlBar() {
+        barVisible = !barVisible
+        applyBarVisibility()
+    }
+
+    /** 歌词内容层（承载背景色/圆角）。外层 root 只做容器，设在外层会被
+     * 内容层自身背景盖住。 */
     private var panelContent: View? = null
-    /** 本次手势是否已触发长按：触发后手势转为「显示关闭按钮」，不再拖动。 */
-    private var longPressTriggered = false
     /** 是否正在手动拖动浮窗：拖动期间忽略按百分制重算位置（否则每 500ms
      * 的进度同步会把浮窗拉回上一次滑块刻度值，表现为「整十吸附」）。 */
     private var dragging = false
-    private val longPressRunnable = Runnable {
-        longPressTriggered = true
-        showCloseButton()
-    }
-    private val hideCloseRunnable = Runnable {
-        closeButton?.visibility = View.GONE
-    }
 
     // ---- 逐字渲染状态 ----
     // Dart 侧只按内容变化/低频(500ms)位置校正推送，帧循环用 Choreographer
@@ -155,7 +196,6 @@ class DesktopLyricsService : Service() {
     private var lastContentKey: String? = null
     private var lastBackgroundKey: String? = null
     private var lastLyricColor = Color.WHITE
-    private var lastTranslationColor = Color.argb(190, 225, 225, 230)
 
     /** 上次已应用的「暂停时隐藏歌词」状态（true 表示歌词内容处于隐藏态）。 */
     private var lastHideLyrics = false
@@ -230,84 +270,52 @@ class DesktopLyricsService : Service() {
                 android.graphics.Typeface.DEFAULT,
                 android.graphics.Typeface.BOLD,
             )
-            maxLines = 2
+            // 单行行高（对齐 QQ 音乐桌面歌词）：长句省略号截断，不换行。
+            maxLines = 1
             ellipsize = android.text.TextUtils.TruncateAt.END
             gravity = Gravity.CENTER
             textAlignment = View.TEXT_ALIGNMENT_CENTER
-            setLineSpacing(0f, 1.3f)
+            setLineSpacing(0f, 1.2f)
             positionProvider = { currentRenderPosition() }
         }
-        val translation = TextView(this).apply {
-            setTextColor(Color.argb(190, 225, 225, 230))
-            textSize = 12f
-            typeface = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-                android.graphics.Typeface.create(
-                    android.graphics.Typeface.DEFAULT,
-                    800,
-                    false,
-                )
-            } else {
-                android.graphics.Typeface.create(
-                    android.graphics.Typeface.DEFAULT,
-                    android.graphics.Typeface.BOLD,
-                )
+        // 单行行高略微加高：歌词行上下各加 6dp 内边距，视觉更松弛、居中。
+        val vPad = (6 * resources.displayMetrics.density).toInt()
+        lyric.setPadding(0, vPad, 0, vPad)
+        val density = resources.displayMetrics.density
+        // 歌词行与操作栏之间的分隔线（细半透明白线，水平内缩居中）。
+        val divider = View(this).apply {
+            background = GradientDrawable().apply {
+                setColor(Color.argb(55, 255, 255, 255))
+                cornerRadius = 1f
             }
-            maxLines = 2
-            ellipsize = android.text.TextUtils.TruncateAt.END
-            gravity = Gravity.CENTER
-            textAlignment = View.TEXT_ALIGNMENT_CENTER
-            setLineSpacing(0f, 1.25f)
         }
         val content = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER_HORIZONTAL
-            setPadding(28, 15, 28, 15)
+            setPadding(28, 14, 28, 14)
             addView(lyric, LinearLayout.LayoutParams(-1, -2))
-            addView(translation, LinearLayout.LayoutParams(-1, -2))
+            addView(
+                divider,
+                LinearLayout.LayoutParams(-1, (1 * density).toInt()).apply {
+                    setMargins((36 * density).toInt(), (7 * density).toInt(), (36 * density).toInt(), (7 * density).toInt())
+                },
+            )
+            // 操作栏默认隐藏：单击歌词行切换显隐（见触摸 UP 分支）。
+            addView(buildControlBar())
             background = GradientDrawable().apply {
                 cornerRadius = 32f
                 setColor(Color.argb(218, 24, 24, 28))
                 setStroke(1, Color.argb(75, 255, 255, 255))
             }
         }
-        // 关闭按钮：默认隐藏，长按浮窗才显示（平时不碍眼）。用 FrameLayout
-        // 叠放在歌词右上角，不影响歌词自身布局与浮窗高度。
-        val density = resources.displayMetrics.density
-        val close = TextView(this).apply {
-            text = "×"
-            setTextColor(Color.WHITE)
-            textSize = 16f
-            gravity = Gravity.CENTER
-            includeFontPadding = false
-            background = GradientDrawable().apply {
-                shape = GradientDrawable.OVAL
-                setColor(Color.argb(205, 0, 0, 0))
-                setStroke(1, Color.argb(100, 255, 255, 255))
-            }
-            visibility = View.GONE
-        }
-        close.setOnClickListener {
-            // 点关闭：同步关闭设置里的桌面歌词开关，再移除浮窗。
-            closeReporter?.invoke()
-            stopSelf()
-        }
-        val closeSize = (26 * density).toInt()
-        val root = FrameLayout(this).apply {
-            addView(content, FrameLayout.LayoutParams(-1, -2))
-            addView(
-                close,
-                FrameLayout.LayoutParams(closeSize, closeSize, Gravity.TOP or Gravity.END)
-                    .apply {
-                        topMargin = (4 * density).toInt()
-                        rightMargin = (4 * density).toInt()
-                    },
-            )
-        }
-        closeButton = close
         lyricView = lyric
-        translationView = translation
+        controlBar =
+            content.getChildAt(2) as? LinearLayout
+        // 分隔线随操作栏一起显隐（包一层行容器控制 visibility 更稳）。
+        dividerRow = content.getChildAt(1)
+        applyBarVisibility()
         panelContent = content
-        panel = root
+        panel = content
         val type = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
         } else {
@@ -325,12 +333,11 @@ class DesktopLyricsService : Service() {
                 WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
             PixelFormat.TRANSLUCENT,
         ).apply {
-            // 纵向锚定在顶边：y 自屏幕顶边起算。行数变化（如翻译行显隐、
-            // 长句换行）导致浮窗高度变化时，系统按 gravity 锚定的一侧先
-            // 布局、addOnLayoutChangeListener 再修正 y。锚定底边时浮窗
-            // 「向上长」，顶边先冲出屏幕再被拉回，浮窗在顶部时表现为一次
-            // 可见的跳动；锚定顶边则顶边天然不动、内容向下扩展，顶部
-            // （percent=0）时 y 恒为 0 无需修正，完全无跳动。
+            // 纵向锚定在顶边：y 自屏幕顶边起算。行数变化（如长句换行）
+            // 导致浮窗高度变化时，系统按 gravity 锚定的一侧先布局、
+            // addOnLayoutChangeListener 再修正 y。锚定底边时浮窗「向上长」，
+            // 顶边先冲出屏幕再被拉回，浮窗在顶部时表现为一次可见的跳动；
+            // 锚定顶边则顶边天然不动、内容向下扩展，完全无跳动。
             gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
             val prefs = getSharedPreferences("desktop_lyrics", MODE_PRIVATE)
             x = prefs.getInt("x", 0)
@@ -342,29 +349,36 @@ class DesktopLyricsService : Service() {
         }
         overlayParams = params
         val touchSlop = android.view.ViewConfiguration.get(this).scaledTouchSlop
-        root.setOnTouchListener { _, event ->
+        content.setOnTouchListener { view, event ->
             when (event.actionMasked) {
                 MotionEvent.ACTION_DOWN -> {
                     downX = event.rawX
                     downY = event.rawY
                     startX = params.x
                     startY = baseY
-                    longPressTriggered = false
-                    // 进入拖动：期间忽略按百分制重算位置，保证拖动连续不吸附。
-                    dragging = true
-                    // 长按 450ms 显示关闭按钮；开始拖动会取消该定时。
-                    root.postDelayed(longPressRunnable, 450)
+                    if (localLocked) {
+                        // 锁定态：长按 600ms 解锁（带震动反馈），期间忽略一切移动。
+                        val runnable = Runnable {
+                            unlockRunnable = null
+                            setLocked(false)
+                            vibrate()
+                        }
+                        unlockRunnable = runnable
+                        view.postDelayed(runnable, 600)
+                    } else {
+                        // 进入拖动：期间忽略按百分制重算位置，保证拖动连续不吸附。
+                        dragging = true
+                    }
                     true
                 }
                 MotionEvent.ACTION_MOVE -> {
-                    if (longPressTriggered) {
-                        // 长按已触发：本次手势转为「显示关闭按钮」，不再拖动。
+                    if (localLocked) {
+                        if (abs(event.rawX - downX) > touchSlop ||
+                            abs(event.rawY - downY) > touchSlop
+                        ) {
+                            cancelUnlock(view)
+                        }
                         return@setOnTouchListener true
-                    }
-                    if (abs(event.rawX - downX) > touchSlop ||
-                        abs(event.rawY - downY) > touchSlop
-                    ) {
-                        root.removeCallbacks(longPressRunnable)
                     }
                     params.x = startX + (event.rawX - downX).toInt()
                     // 拖动直接写浮窗位置；拖动结束后再换算回百分制回传。
@@ -373,21 +387,25 @@ class DesktopLyricsService : Service() {
                     baseY = clampY(startY + (event.rawY - downY).toInt())
                     params.y = baseY
                     try {
-                        windowManager?.updateViewLayout(root, params)
+                        windowManager?.updateViewLayout(view, params)
                     } catch (_: Exception) {
                         // 系统回收浮窗时忽略最后一次拖动。
                     }
                     true
                 }
                 MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
-                    root.removeCallbacks(longPressRunnable)
-                    // 先退出拖动态，后续同步即可按新的百分制值校正（值已一致）。
-                    dragging = false
-                    if (longPressTriggered) {
-                        // 长按手势不产生位置回传。
-                        longPressTriggered = false
+                    if (localLocked) {
+                        cancelUnlock(view)
                         return@setOnTouchListener true
                     }
+                    // 单击（位移在 slop 内）切换操作栏显隐；拖动结束照旧存位置。
+                    val moved = abs(event.rawX - downX) > touchSlop ||
+                        abs(event.rawY - downY) > touchSlop
+                    if (!moved && event.actionMasked == MotionEvent.ACTION_UP) {
+                        toggleControlBar()
+                    }
+                    // 先退出拖动态，后续同步即可按新的百分制值校正（值已一致）。
+                    dragging = false
                     getSharedPreferences("desktop_lyrics", MODE_PRIVATE)
                         .edit()
                         .putInt("x", params.x)
@@ -402,20 +420,163 @@ class DesktopLyricsService : Service() {
         }
         // 浮窗首次测量/内容高度变化时重算 y：整屏钳制的上边界依赖浮窗
         // 实际高度，布局完成前拿不到，需在布局变化后补一次钳制。
-        root.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ ->
+        content.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ ->
             applyWindowPosition()
         }
         windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
         try {
-            windowManager?.addView(root, params)
+            windowManager?.addView(content, params)
         } catch (_: Exception) {
             panel = null
-            closeButton = null
             panelContent = null
             lyricView = null
-            translationView = null
+            controlBar = null
             overlayParams = null
             stopSelf()
+        }
+    }
+
+    /// 锁定态长按解锁的定时取消（移动超阈值或手指抬起）。
+    private fun cancelUnlock(view: View) {
+        unlockRunnable?.let { view.removeCallbacks(it) }
+        unlockRunnable = null
+    }
+
+    /// 底部操作栏（一行 8 键）：播放三键 + 字号调节 + 锁定 + 设置 + 关闭。
+    /// 样式对齐 MusicFree 桌面版：Material 线性图标键集中居中、小间距
+    /// （字号键用 A−/A+ 文字）。锁定态整栏隐藏（只剩歌词行），长按解锁。
+    private fun buildControlBar(): LinearLayout {
+        val density = resources.displayMetrics.density
+        fun icon(resId: Int, onClick: () -> Unit): ImageView =
+            ImageView(this).apply {
+                setImageResource(resId)
+                val pad = (6 * density).toInt()
+                setPadding(pad, pad, pad, pad)
+                background = null
+                setOnClickListener { onClick() }
+            }
+        fun textKey(label: String, onClick: () -> Unit): TextView =
+            TextView(this).apply {
+                text = label
+                setTextColor(Color.WHITE)
+                textSize = 13f
+                gravity = Gravity.CENTER
+                includeFontPadding = false
+                typeface = Typeface.DEFAULT_BOLD
+                val pad = (6 * density).toInt()
+                setPadding(pad, pad, pad, pad)
+                background = null
+                // 与图标键同高（24dp 图标 + 6dp×2 内边距 = 36dp），八个键等高。
+                layoutParams = LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.WRAP_CONTENT,
+                    (36 * density).toInt(),
+                )
+                setOnClickListener { onClick() }
+            }
+        fun gapView(): View = Space(this).apply {
+            layoutParams = LinearLayout.LayoutParams((4 * density).toInt(), 1)
+        }
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+            // 播放/暂停键：先创建并登记成员，再按当前状态放初始图标。
+            val playButton = icon(R.drawable.ic_dlyr_pause) {
+                sendMediaKey("playPause")
+            }
+            playKey = playButton
+            // 播放三键（播放/暂停图标随状态动态切换，见 applyUpdate）
+            addView(icon(R.drawable.ic_dlyr_prev) {
+                sendMediaKey("prev")
+            })
+            addView(playButton)
+            addView(icon(R.drawable.ic_dlyr_next) {
+                sendMediaKey("next")
+            })
+            addView(gapView())
+            // 字号调节（文字键）
+            addView(textKey("A−") { adjustFontSize(-2f) })
+            addView(textKey("A+") { adjustFontSize(2f) })
+            addView(gapView())
+            // 锁定 / 设置 / 关闭
+            addView(icon(R.drawable.ic_dlyr_lock) { setLocked(true) })
+            addView(icon(R.drawable.ic_dlyr_settings) { openSettings() })
+            addView(icon(R.drawable.ic_dlyr_close) {
+                closeReporter?.invoke()
+                stopSelf()
+            })
+        }
+    }
+
+    /// 播放三键：走进程内 reporter → MainActivity → Dart（player_provider
+    /// 直接控制播放）。系统 dispatchMediaKeyEvent 依赖「活跃媒体会话」路由，
+    /// 在部分 ROM（澎湃/ColorOS 后台派发限制）会被静默丢弃导致按键无反应。
+    private fun sendMediaKey(action: String) {
+        mediaKeyReporter?.invoke(action)
+    }
+
+    /// A-/A+：字号即时应用 + 回传 Dart 持久化（设置页滑块跟随）。
+    private fun adjustFontSize(delta: Float) {
+        val target = (localFontSize + delta).coerceIn(16f, 40f)
+        if (abs(target - localFontSize) < 0.1f) return
+        localFontSize = target
+        applyFontSize(target)
+        pendingFontSizeEcho = target
+        fontSizeReporter?.invoke(target)
+    }
+
+    /// 应用字号（sp）：与当前渲染值差 0.5px 内跳过，避免重复触发重排。
+    private fun applyFontSize(sp: Float) {
+        val view = lyricView ?: return
+        val scaled = sp * resources.displayMetrics.scaledDensity
+        if (abs(view.textSize - scaled) > .5f) view.textSize = sp
+    }
+
+    /// 锁定切换：隐藏/恢复操作栏 + 回传 Dart 同步设置页开关。
+    private fun setLocked(value: Boolean) {
+        localLocked = value
+        pendingLockedEcho = value
+        lockedReporter?.invoke(value)
+        applyLockedState()
+    }
+
+    /// 锁定状态渲染：锁定时只剩歌词行。
+    private fun applyLockedState() {
+        // 锁定语义 = 禁拖 + 收起操作栏（长按解锁后恢复用户上次的呼出状态）。
+        applyBarVisibility()
+    }
+
+    /// ⚙ 设置键：进入软件的桌面歌词设置页（MainActivity 转发 Dart 路由）。
+    private fun openSettings() {
+        val intent = Intent(this, MainActivity::class.java).apply {
+            putExtra("open_desktop_lyrics_settings", true)
+            addFlags(
+                Intent.FLAG_ACTIVITY_NEW_TASK or
+                    Intent.FLAG_ACTIVITY_SINGLE_TOP or
+                    Intent.FLAG_ACTIVITY_CLEAR_TOP,
+            )
+        }
+        try {
+            startActivity(intent)
+        } catch (_: Exception) {
+            // 极端情况下 Activity 未导出（不应发生），忽略。
+        }
+    }
+
+    /// 长按解锁的震动反馈（轻触感）。
+    private fun vibrate() {
+        try {
+            val vibrator = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                val manager = getSystemService(VIBRATOR_MANAGER_SERVICE) as VibratorManager
+                manager.defaultVibrator
+            } else {
+                @Suppress("DEPRECATION")
+                getSystemService(VIBRATOR_SERVICE) as Vibrator
+            }
+            vibrator.vibrate(
+                VibrationEffect.createOneShot(30, VibrationEffect.DEFAULT_AMPLITUDE),
+            )
+        } catch (_: Exception) {
+            // 部分设备无震动器，忽略。
         }
     }
 
@@ -436,13 +597,14 @@ class DesktopLyricsService : Service() {
         ensurePanel()
         val lyric = p.lyric.ifBlank { "暂无歌词" }
 
-        // 暂停时隐藏歌词：开启且未在播放时隐藏歌词/翻译内容（浮窗背景保留），
+        // 暂停时隐藏歌词：开启且未在播放时隐藏整个浮窗（歌词/分隔线/
+        // 操作栏/背景一体隐藏，只藏文本会留下空背景块悬浮在桌面上），
         // 恢复播放或关闭该选项后重新显示。
         val hideLyrics = p.hideOnPause && !p.isPlaying
         if (hideLyrics != lastHideLyrics) {
             lastHideLyrics = hideLyrics
-            // 隐藏/恢复与播放态由同一 push 到达，可见性跟随设置值与播放态，
-            // 仅在状态翻转时刷新视图（避免每次进度同步重复 setVisibility）。
+            panelContent?.visibility =
+                if (hideLyrics) View.GONE else View.VISIBLE
         }
 
         // 位置/字体类参数：纵向位置百分制、自定义字体。这些参数变化频率
@@ -451,11 +613,30 @@ class DesktopLyricsService : Service() {
         applyFont(p.lyricFontPath)
         applyWindowPosition()
 
+        // 锁定状态同步（浮窗操作栏 ↔ Dart 设置页双向）：
+        // 浮窗操作后的回显到达前忽略 Dart 推来的值，避免操作栏闪烁。
+        if (pendingLockedEcho != null) {
+            if (p.locked == pendingLockedEcho) pendingLockedEcho = null
+        } else if (p.locked != localLocked) {
+            localLocked = p.locked
+            applyLockedState()
+        }
+
+        // 播放/暂停键图标动态切换：播放中显示 ⏸（点按暂停），暂停显示 ▶。
+        if (playKey != null && p.isPlaying != lastPlayingIcon) {
+            lastPlayingIcon = p.isPlaying
+            playKey?.setImageResource(
+                if (p.isPlaying) R.drawable.ic_dlyr_pause else R.drawable.ic_dlyr_play,
+            )
+        }
+
+        // 锁定不再使用 FLAG_NOT_TOUCHABLE 全窗穿透（那样长按解锁手势也
+        // 收不到事件）；锁定语义 = 禁止拖动 + 隐藏操作栏，触摸仍由浮窗
+        // 消费（锁定时长按 600ms 解锁）。
         overlayParams?.let { params ->
             val desiredFlags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
                 WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
-                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
-                (if (p.locked) WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE else 0)
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
             if (params.flags != desiredFlags) {
                 params.flags = desiredFlags
                 try {
@@ -476,7 +657,7 @@ class DesktopLyricsService : Service() {
         lyricsPlaying = p.isPlaying
         wordEffectMode = p.effectMode
 
-        val contentKey = "$lyric\u0000${p.translation}\u0000${p.wordsJson}" +
+        val contentKey = "$lyric\u0000${p.wordsJson}" +
             "\u0000${p.effectMode}\u0000${p.lyricColor}"
         if (contentKey != lastContentKey) {
             lastContentKey = contentKey
@@ -513,46 +694,23 @@ class DesktopLyricsService : Service() {
             renderWordProgress()
         }
 
-        translationView?.let { view ->
-            if (view.text.toString() != p.translation) {
-                view.text = p.translation
-            }
-            // 无翻译且无罗马音的歌曲不显示副行：空文本的 TextView 仍会
-            // 占一行高度，副行残留为空白行，因此按内容显隐整个视图。
-            // 「暂停时隐藏歌词」开启且未播放时，主行/副行一起隐藏。
-            val translationVisible = p.translation.isNotBlank() && !hideLyrics
-            val desiredVisibility =
-                if (translationVisible) View.VISIBLE else View.GONE
-            if (view.visibility != desiredVisibility) {
-                view.visibility = desiredVisibility
-            }
-            if (lastTranslationColor != p.translationColor) {
-                lastTranslationColor = p.translationColor
-                view.setTextColor(p.translationColor)
-            }
-            val translationFontSize = p.translationFontSize.coerceIn(10f, 28f)
-            if (abs(
-                    view.textSize -
-                        translationFontSize * resources.displayMetrics.scaledDensity,
-                ) > .5f
-            ) {
-                view.textSize = translationFontSize
-            }
+        // 字号同步（浮窗 A-/A+ ↔ Dart 设置页滑块）：回显到达前忽略 Dart 值。
+        // 暂停时隐藏歌词：主行一同隐藏（背景保留，浮窗仍可拖动）。
+        val lyricFontSize = (pendingFontSizeEcho ?: p.lyricFontSize).coerceIn(16f, 40f)
+        if (pendingFontSizeEcho != null &&
+            abs(pendingFontSizeEcho!! - p.lyricFontSize) < 0.1f
+        ) {
+            pendingFontSizeEcho = null
         }
-        val lyricFontSize = p.lyricFontSize.coerceIn(16f, 40f)
         lyricView?.let { view ->
-            // 暂停时隐藏歌词：主行与副行一同隐藏（背景保留，浮窗仍可拖动）。
             val desiredVisibility = if (hideLyrics) View.GONE else View.VISIBLE
             if (view.visibility != desiredVisibility) {
                 view.visibility = desiredVisibility
             }
-            if (abs(
-                    view.textSize -
-                        lyricFontSize * resources.displayMetrics.scaledDensity,
-                ) > .5f
-            ) {
-                view.textSize = lyricFontSize
+            if (abs(localFontSize - lyricFontSize) > 0.1f) {
+                localFontSize = lyricFontSize
             }
+            applyFontSize(localFontSize)
         }
 
         val backgroundKey = "${p.noBackground}|${p.backgroundColor}|${p.backgroundOpacity}"
@@ -784,14 +942,6 @@ class DesktopLyricsService : Service() {
         positionReporter?.invoke(percent)
     }
 
-    /** 长按浮窗后显示关闭按钮，4 秒后自动隐藏（避免一直挂在浮窗上）。 */
-    private fun showCloseButton() {
-        val button = closeButton ?: return
-        button.removeCallbacks(hideCloseRunnable)
-        button.visibility = View.VISIBLE
-        button.postDelayed(hideCloseRunnable, 4000)
-    }
-
     /// 应用自定义字体；路径为空或创建失败时回退系统默认字体。
     private fun applyFont(path: String) {
         if (path == appliedFontPath) return
@@ -810,19 +960,6 @@ class DesktopLyricsService : Service() {
             }
         }
         lyricView?.typeface = custom
-        translationView?.typeface = if (path.isEmpty()) {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-                android.graphics.Typeface.create(
-                    android.graphics.Typeface.DEFAULT,
-                    800,
-                    false,
-                )
-            } else {
-                fallback
-            }
-        } else {
-            custom
-        }
     }
 
     override fun onDestroy() {
@@ -837,10 +974,10 @@ class DesktopLyricsService : Service() {
             }
         }
         panel = null
-        closeButton = null
         panelContent = null
         lyricView = null
-        translationView = null
+        controlBar = null
+        playKey = null
         overlayParams = null
         wordText = null
         wordSpans = emptyList()

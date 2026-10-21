@@ -70,6 +70,11 @@ class _CustomColorPickerSheetState extends State<_CustomColorPickerSheet> {
   }
 
   /// 十六进制输入解析：支持 6 位 RGB，非法输入忽略。
+  ///
+  /// 注意：解析成功后不能回写输入框文本（历史实现曾规范化重写并重置
+  /// 光标），否则编辑中间字符时光标会跳到末尾、出现「退格删的不是那个
+  /// 字符/位置没空出来直接变色值」的怪象。文本保持用户输入原样，仅
+  /// 解析驱动颜色；输入框文本只在滑杆拖动时由 [_syncHexField] 全量同步。
   void _applyHex(String text) {
     if (_syncingHex) return;
     final normalized = text.trim().replaceFirst('#', '');
@@ -78,7 +83,6 @@ class _CustomColorPickerSheetState extends State<_CustomColorPickerSheet> {
     if (parsed == null || parsed < 0 || parsed > 0xFFFFFF) return;
     setState(() {
       _hsv = HSVColor.fromColor(Color(0xFF000000 | parsed));
-      _syncHexField();
     });
   }
 
