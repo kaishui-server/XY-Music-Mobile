@@ -356,8 +356,14 @@ class _VisualizerPageState extends ConsumerState<VisualizerPage>
                 },
                 child: CustomPaint(
                   painter: settings.form == VisualizerForm.terrain
-                      ? TerrainScenePainter(_frame(settings))
-                      : NebulaScenePainter(_frame(settings)),
+                      ? TerrainScenePainter(
+                          _frame(settings),
+                          repaint: _frameTick, // Ticker 每帧驱动重绘
+                        )
+                      : NebulaScenePainter(
+                          _frame(settings),
+                          repaint: _frameTick,
+                        ),
                   isComplex: true,
                   willChange: true,
                 ),

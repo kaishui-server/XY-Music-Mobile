@@ -273,8 +273,9 @@ class CameraRig {
     final px = cam.posX, py = cam.posY, pz = cam.posZ;
     final len = math.sqrt(px * px + py * py + pz * pz);
     final fx = -px / len, fy = -py / len, fz = -pz / len;
-    // r = normalize(cross(f, up(0,1,0)))；cross(f, up) = (f.z, 0, -f.x)
-    var rxx = fz, rzz = -fx;
+    // r = normalize(cross(f, up(0,1,0)))；cross(f, up) = (-f.z, 0, f.x)。
+    // （u = cross(r, f) 保证右手系 up 朝上。）
+    var rxx = -fz, rzz = fx;
     final rl = math.sqrt(rxx * rxx + rzz * rzz);
     if (rl < 1e-6) {
       rxx = 1;
@@ -312,13 +313,14 @@ class CameraRig {
   });
 
   /// 世界坐标 → 屏幕像素。相机背后返回 null。
+  /// 相机空间 z 取 d·f（前方为正），near=0.5 裁剪。
   Offset? project(double x, double y, double z) {
     final dx = x - px;
     final dy = y - py;
     final dz = z - pz;
     final cx = dx * rx + dy * ry + dz * rz;
     final cy = dx * ux + dy * uy + dz * uz;
-    final cz = -(dx * fx + dy * fy + dz * fz);
+    final cz = dx * fx + dy * fy + dz * fz;
     if (cz < 0.5) return null;
     final inv = 1.0 / (cz * tanHalfFov);
     final ndcX = cx * inv / aspect;
@@ -329,12 +331,12 @@ class CameraRig {
     );
   }
 
-  /// 世界坐标深度（相机空间 z，越大越远）。
+  /// 世界坐标深度（相机空间 z，越大越远，前方为正）。
   double depthOf(double x, double y, double z) {
     final dx = x - px;
     final dy = y - py;
     final dz = z - pz;
-    return -(dx * fx + dy * fy + dz * fz);
+    return dx * fx + dy * fy + dz * fz;
   }
 
   /// 屏幕点反投影与 y=0 平面的交点（世界 xz）。

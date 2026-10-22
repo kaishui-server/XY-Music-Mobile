@@ -242,7 +242,7 @@ List<_Block> _makeBlocks() {
 
 class TerrainScenePainter extends CustomPainter {
   final VisFrame f;
-  TerrainScenePainter(this.f);
+  TerrainScenePainter(this.f, {super.repaint});
 
   @override
   void paint(Canvas canvas, Size size) {
@@ -542,9 +542,11 @@ class TerrainScenePainter extends CustomPainter {
     final intensity = s.blockIntensity / 100;
     final pulse = f.blockPulse;
     final sizeMix = (pulse * (0.5 + intensity * 1.7)).clamp(0.0, 1.0);
-    final minVisual = 0.12 + (0.75 - 0.12) * s.blockMinSize / 100;
+    // 尺寸映射回世界单位量级（静止即可见，脉冲时放大）：
+    // min 0.9+2.0·minSize%，max 1.4+3.6·maxSize%（默认 9/26 → 1.08/2.34）。
+    final minVisual = 0.9 + 2.0 * s.blockMinSize / 100;
     final maxVisual = math.max(
-        minVisual + 0.05, 0.45 + (3.2 - 0.45) * s.blockMaxSize / 100);
+        minVisual + 0.3, 1.4 + 3.6 * s.blockMaxSize / 100);
     final pulseScale = minVisual + (maxVisual - minVisual) * sizeMix;
 
     for (int bi = 0; bi < count && bi < _blocks.length; bi++) {
@@ -822,7 +824,7 @@ class _NebulaParticle {
 
 class NebulaScenePainter extends CustomPainter {
   final VisFrame f;
-  NebulaScenePainter(this.f);
+  NebulaScenePainter(this.f, {super.repaint});
 
   static final List<_NebulaParticle> _particles = _makeParticles();
   static final List<Offset> _bgStars = _makeStars();

@@ -417,11 +417,44 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
                 Log.e(TAG, "default ExoPlaybackException: " + exoError.getUnexpectedException().getMessage());
             }
             // TODO: send both errorCode and type
-            sendError(exoError.type, exoError.getMessage(), mapOf("index", currentIndex));
+            sendError(exoError.type, describePlaybackCauseChain(exoError), mapOf("index", currentIndex));
         } else {
             Log.e(TAG, "default PlaybackException: " + error.getMessage());
-            sendError(error.errorCode, error.getMessage(), mapOf("index", currentIndex));
+            sendError(error.errorCode, describePlaybackCauseChain(error), mapOf("index", currentIndex));
         }
+    }
+
+    /**
+     * 组装「顶层消息 <- cause1 <- cause2 …」的完整异常链描述。
+     * 顶层 message（如 "Source error"）不含 HTTP 状态/主机等根因信息，
+     * 全部在 cause 链里（HttpDataSource.InvalidResponseCodeException 携带
+     * responseCode、IOException 携带 TLS/连接错误文本）。透传给 Dart 层
+     * 用于播放失败提示与播放链路日志定位。
+     */
+    private static String describePlaybackCauseChain(PlaybackException error) {
+        String top = error.getMessage() != null ? error.getMessage() : error.getClass().getSimpleName();
+        StringBuilder sb = new StringBuilder(top);
+        Throwable cause = error.getCause();
+        int depth = 0;
+        while (cause != null && depth < 6) {
+            sb.append(" <- ").append(cause.getClass().getSimpleName());
+            final String msg = cause.getMessage();
+            if (msg != null && !msg.isEmpty()) {
+                sb.append(": ").append(msg.length() > 300 ? msg.substring(0, 300) : msg);
+            }
+            if (cause instanceof androidx.media3.datasource.HttpDataSource.InvalidResponseCodeException) {
+                final androidx.media3.datasource.HttpDataSource.InvalidResponseCodeException rc =
+                        (androidx.media3.datasource.HttpDataSource.InvalidResponseCodeException) cause;
+                sb.append(" httpStatus=").append(rc.responseCode);
+                if (rc.dataSpec != null && rc.dataSpec.uri != null) {
+                    final String uri = rc.dataSpec.uri.toString();
+                    sb.append(" url=").append(uri.length() > 160 ? uri.substring(0, 160) : uri);
+                }
+            }
+            cause = cause.getCause();
+            depth++;
+        }
+        return sb.toString();
     }
 
     private void completeSeek() {

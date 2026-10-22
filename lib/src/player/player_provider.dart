@@ -3638,13 +3638,23 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
         );
         if (owned != null) {
           final setUrlStopwatch = Stopwatch()..start();
-          Future<void> submitOwnedUrl(_RecognizedAudioSource resolved) =>
-              _setPlayerUrl(
-                resolved.url,
-                headers: resolved.headers.isEmpty ? null : resolved.headers,
-                tag: mediaItem,
-                requestId: requestId,
-              );
+          // 洛雪直链与网盘同病：ExoPlayer 直连部分 CDN（如酷我
+          // car-er.kuwo.cn 明文 http）会报 (0) Source error，而 Dart 网络栈
+          // 请求同一 URL 正常。统一走本地回环代理转发，播放器只连
+          // 127.0.0.1，真实 CDN 请求由 Dart 网络栈发起并流式转发。
+          Future<void> submitOwnedUrl(_RecognizedAudioSource resolved) async {
+            final proxyUrl = await CloudPlaybackProxy.instance.register(
+              resolved.url,
+              resolved.headers,
+              'lx:${item.path.hashCode}',
+            );
+            await _setPlayerUrl(
+              proxyUrl,
+              headers: null, // 鉴权头已由代理注入
+              tag: mediaItem,
+              requestId: requestId,
+            );
+          }
           try {
             await submitOwnedUrl(owned);
           } catch (error) {
@@ -3664,7 +3674,8 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
           playbackChainLog(
             '[播放链路] ${item.path} setUrl ${setUrlStopwatch.elapsedMilliseconds}ms',
           );
-          if (!(state.current?.lyricsAttempted ?? false)) {
+          if (!(state.current?.lyricsAttempted ?? false) ||
+              await _shouldRefreshStaleLyrics(queueIndex)) {
             unawaited(
               _loadLxLyrics(
                 queueIndex,
@@ -3713,9 +3724,14 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
         if (source == null) {
           throw Exception('无法获取识曲结果的播放地址，请确认至少启用了一个可用音乐插件');
         }
-        await _setPlayerUrl(
+        final lxProxyUrl = await CloudPlaybackProxy.instance.register(
           source.url,
-          headers: source.headers.isEmpty ? null : source.headers,
+          source.headers,
+          'lx-recognized:${item.path.hashCode}',
+        );
+        await _setPlayerUrl(
+          lxProxyUrl,
+          headers: null, // 鉴权头已由代理注入
           tag: mediaItem,
           requestId: requestId,
         );
@@ -5652,23 +5668,57 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
   /// 进入播放详情页时主动完成一次歌词探测，不依赖歌词页是否已经滑到。
   /// 网络歌曲、LX 音源和本地歌曲分别走各自的歌词来源；没有歌词时也会
   /// 标记为已探测，交给详情页提示用户在歌词页关联歌词。
+  /// 5536 前自动拉取的歌词把翻译/罗马音行直接拼在主词后（无哨兵分段），
+  /// Rust 解析器在 yrc/qrc 增强主词胜出时会整体丢弃这类行——升级前已缓存
+  /// 队列的设备（如长期测试机）表现为外文歌有原文无翻译。判断当前歌曲：
+  /// 已有歌词缺哨兵分段且未手动关联歌词 → 允许重新拉取刷新（会话内每首
+  /// 只尝试一次，避免音源本身无翻译时反复请求）。
+  static const _kTranslationSentinel = '<!--xym:track:translation-->';
+  static const _kRomanizationSentinel = '<!--xym:track:romanization-->';
+  final Set<String> _staleLyricsRefreshTried = {};
+
+  Future<bool> _shouldRefreshStaleLyrics(int index) async {
+    if (index < 0 || index >= state.queue.length) return false;
+    final item = state.queue[index];
+    final raw = item.lyricsRaw?.trim() ?? '';
+    if (raw.isEmpty) return false;
+    if (raw.contains(_kTranslationSentinel) ||
+        raw.contains(_kRomanizationSentinel)) {
+      return false;
+    }
+    if (_staleLyricsRefreshTried.contains(item.path)) return false;
+    try {
+      final remembered = await _loadRememberedLyrics(item.path);
+      if (remembered != null && remembered.trim().isNotEmpty) return false;
+    } catch (_) {
+      // 关联记录读取失败时按未关联处理，允许刷新。
+    }
+    _staleLyricsRefreshTried.add(item.path);
+    return true;
+  }
+
   Future<void> ensureCurrentLyricsChecked() async {
     final index = state.queueIndex;
     final item = state.current;
-    if (item == null ||
-        index < 0 ||
-        item.lyricsRaw?.trim().isNotEmpty == true) {
+    if (item == null || index < 0) return;
+    final hasLyrics = item.lyricsRaw?.trim().isNotEmpty == true;
+    var refreshStale = false;
+    if (hasLyrics) {
+      refreshStale = await _shouldRefreshStaleLyrics(index);
+      if (!refreshStale) return;
+    } else if (item.lyricsAttempted) {
       return;
     }
-    if (item.lyricsAttempted) return;
 
     switch (playbackSourceTypeFor(item)) {
       case PlaybackSourceType.localFile:
+        // 本地歌词无翻译来源，旧格式刷新没有意义。
+        if (refreshStale) return;
         await _loadLocalLyrics(index, item.path);
       case PlaybackSourceType.plugin:
         final pluginData = item.pluginData;
         if (pluginData == null || pluginData.isEmpty) {
-          _markLyricsAttemptedForPath(index, item.path);
+          if (!refreshStale) _markLyricsAttemptedForPath(index, item.path);
           return;
         }
         final plugins = await _ref.read(enabledMusicPluginsProvider.future);
@@ -5676,7 +5726,7 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
             .where((candidate) => candidate.id == item.pluginId)
             .firstOrNull;
         if (plugin == null) {
-          _markLyricsAttemptedForPath(index, item.path);
+          if (!refreshStale) _markLyricsAttemptedForPath(index, item.path);
           return;
         }
         await _loadPluginLyrics(index, plugin, item);
@@ -5685,10 +5735,10 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
         if (raw is Map) {
           await _loadLxLyrics(index, item.path, Map<String, dynamic>.from(raw));
         } else {
-          _markLyricsAttemptedForPath(index, item.path);
+          if (!refreshStale) _markLyricsAttemptedForPath(index, item.path);
         }
       case PlaybackSourceType.networkUrl:
-        _markLyricsAttemptedForPath(index, item.path);
+        if (!refreshStale) _markLyricsAttemptedForPath(index, item.path);
     }
   }
 
