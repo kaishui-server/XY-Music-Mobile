@@ -229,9 +229,14 @@ String buildLxLyricsRaw(Map<String, dynamic> payload) {
   }
   final translation = text(payload['tlyric']);
   final romanization = text(payload['rlyric']);
+  // 哨兵分段协议（与 plugin_runtime _extractLyricsWithTranslation 一致）：
+  // Rust 解析器按注释行把后续段落识别为独立翻译/罗马音轨道，QRC/TTML
+  // 等增强主词胜出时无哨兵直拼的翻译行会被整体丢弃。
+  const translationSentinel = '<!--xym:track:translation-->';
+  const romanizationSentinel = '<!--xym:track:romanization-->';
   return [
     result,
-    translation,
-    romanization,
-  ].where((item) => item.isNotEmpty).join('\n');
+    if (translation.isNotEmpty) ...[translationSentinel, translation],
+    if (romanization.isNotEmpty) ...[romanizationSentinel, romanization],
+  ].join('\n');
 }

@@ -6025,8 +6025,14 @@ class PluginRuntimeService {
       final romaji = _decodeBase64Text(data['roma']);
       return [
         main,
-        if (translation.isNotEmpty) translation,
-        if (romaji.isNotEmpty) romaji,
+        if (translation.isNotEmpty) ...[
+          _kTrackTranslationSentinel,
+          translation,
+        ],
+        if (romaji.isNotEmpty) ...[
+          _kTrackRomanizationSentinel,
+          romaji,
+        ],
       ].join('\n');
     } catch (_) {
       return '';
@@ -6069,7 +6075,8 @@ class PluginRuntimeService {
       final main = _decodeBase64Text(decoded['lyric']);
       if (main.isEmpty) return '';
       final translation = _decodeBase64Text(decoded['trans']);
-      return translation.isEmpty ? main : '$main\n$translation';
+      if (translation.isEmpty) return main;
+      return '$main\n$_kTrackTranslationSentinel\n$translation';
     } catch (_) {
       return '';
     }
@@ -6778,9 +6785,15 @@ class PluginRuntimeService {
     return RegExp(r'^[0-9a-fA-F\s]+$').hasMatch(text);
   }
 
-  /// 插件歌词响应还原为「主歌词 + 翻译 + 罗马音」的拼接文本，与
-  /// buildLxLyricsRaw 的输出格式一致：Rust 解析器按时间戳与文字脚本
-  /// 把翻译/罗马音行合并进 displayLine 的对应字段。此前只取主歌词，
+  /// 翻译/罗马音轨道哨兵：Rust 解析器按此注释行把后续段落识别为独立
+  /// 翻译/罗马音轨道。QRC/TTML 等增强主词候选胜出时，无哨兵直拼的
+  /// 翻译行会被整体丢弃（real_wy_e2e_test 固化的根因）。
+  static const String _kTrackTranslationSentinel = '<!--xym:track:translation-->';
+  static const String _kTrackRomanizationSentinel = '<!--xym:track:romanization-->';
+
+  /// 插件歌词响应还原为「主歌词 + 哨兵 + 翻译 + 哨兵 + 罗马音」的拼接
+  /// 文本，与 buildLxLyricsRaw 的输出格式一致：Rust 解析器按时间戳与
+  /// 哨兵行把翻译/罗马音合并进 displayLine 的对应字段。此前只取主歌词，
   /// MusicFree 插件（ILyricSource.rawLrc + translation，或 LX 风格的
   /// lyric + tlyric）返回的翻译被整段丢弃，表现为插件歌曲无翻译。
   static String _extractLyricsWithTranslation(dynamic value) {
@@ -6803,9 +6816,17 @@ class PluginRuntimeService {
     final translation = _extractTranslation(value);
     final romaji = _extractRomaji(value);
     if (translation.isEmpty && romaji.isEmpty) return main;
-    return [main, translation, romaji]
-        .where((item) => item.isNotEmpty)
-        .join('\n');
+    return [
+      main,
+      if (translation.isNotEmpty) ...[
+        _kTrackTranslationSentinel,
+        translation,
+      ],
+      if (romaji.isNotEmpty) ...[
+        _kTrackRomanizationSentinel,
+        romaji,
+      ],
+    ].join('\n');
   }
 
   static String _extractTranslation(dynamic value) {

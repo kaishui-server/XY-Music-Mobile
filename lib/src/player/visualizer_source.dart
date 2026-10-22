@@ -242,9 +242,18 @@ class VisualizerSource {
 
   /// 渲染层每帧调用：向目标频段做 attack/release 平滑（30ms/180ms，
   /// 对齐 Rust RealtimeSpectrumAnalyzer），返回平滑后的频段列表。
-  List<double> stepSmoothed(double dt) {
-    final attack = 1.0 - math.exp(-dt / 0.03);
-    final release = 1.0 - math.exp(-dt / 0.18);
+  /// [ratePerSecond]：对齐 sonic-topography 的响应速率
+  /// responseRate = lerp(2.2, 60, motionSpeed/100)——统一指数趋近，
+  /// 不区分 attack/release；为空时走默认 30ms/180ms 攻丝释放。
+  List<double> stepSmoothed(double dt, {double? ratePerSecond}) {
+    final double attack;
+    final double release;
+    if (ratePerSecond != null) {
+      attack = release = 1.0 - math.exp(-ratePerSecond * dt);
+    } else {
+      attack = 1.0 - math.exp(-dt / 0.03);
+      release = 1.0 - math.exp(-dt / 0.18);
+    }
     for (int i = 0; i < kVisBandCount; i++) {
       final target = _targetBands[i];
       final cur = _smoothedBands[i];

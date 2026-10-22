@@ -56,7 +56,8 @@ class _VisualizerPageState extends ConsumerState<VisualizerPage>
   Ticker? _ticker;
   Duration _lastElapsed = Duration.zero;
   double _time = 0; // 真实秒（按压时长/冷却计时）
-  double _shaderTime = 0; // 场景时间（按「运动速度」缩放累加）
+  double _shaderTime = 0; // 场景时间（真实时间流，对齐参考 uTime=clock）
+  double _blockPulse = 0; // 悬浮方块脉冲（kick 包络的指数平滑）
 
   // 节拍链路状态（脉冲/流星两套独立检测器）。
   BeatDetectorState _kickBeat = createBeatDetectorState();
@@ -139,11 +140,15 @@ class _VisualizerPageState extends ConsumerState<VisualizerPage>
     final settings = ref.read(visualizerSettingsProvider);
     final src = VisualizerSource.instance;
 
-    _shaderTime += dt * (settings.motionSpeed / 50).clamp(0.0, 2.5);
+    _shaderTime += dt;
+
+    // 「运动速度」= 频谱响应速率（对齐 sonic-topography
+    // responseRate = lerp(2.2, 60, motionSpeed/100)，统一指数趋近）。
+    final motionRate = 2.2 + (60 - 2.2) * settings.motionSpeed / 100;
 
     if (_sourceReady) {
       final gain = (settings.detectLevel / 100).clamp(0.0, 2.0);
-      final smoothed = src.stepSmoothed(dt);
+      final smoothed = src.stepSmoothed(dt, ratePerSecond: motionRate);
       for (int i = 0; i < kVisBandCount; i++) {
         _displayBands[i] = math.min(1.0, smoothed[i] * gain);
       }
@@ -156,6 +161,11 @@ class _VisualizerPageState extends ConsumerState<VisualizerPage>
                 (1 - w * 0.7);
       }
     }
+
+    // 悬浮方块脉冲：kick 包络按「速度」设置的速率做指数趋近平滑
+    // （对齐 MapScene：pulseSpeed = lerp(3, 36, speed/100)）。
+    final blockRate = 3.0 + (36.0 - 3.0) * settings.blockSpeed / 100;
+    _blockPulse += (_kickEnv - _blockPulse) * (1 - math.exp(-blockRate * dt));
 
     // —— 触发器检测（脉冲 + 流星各一套，Advanced 用自定义频段窗口）——
     _kickOnset = false;
@@ -474,6 +484,7 @@ class _VisualizerPageState extends ConsumerState<VisualizerPage>
       kickEnvelope: s.kickEnabled ? _kickEnv : 0,
       rms: VisualizerSource.instance.rms,
       time: _shaderTime,
+      blockPulse: _blockPulse,
       settings: s,
       camera: _cam,
       ripples: _ripples,

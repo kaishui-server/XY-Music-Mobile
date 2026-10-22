@@ -152,14 +152,6 @@ class VisualizerSettings {
           ? (groundEq[i].value / 100).clamp(0.0, 1.0)
           : 0.0;
 
-  /// 前 5 段增益（sub/bass/lowMid/mid/highMid → 地形抬升）。
-  List<double> get terrainGains => [
-        eqGain(0), eqGain(1), eqGain(2), eqGain(3), eqGain(4),
-      ];
-
-  /// 后 3 段均值（Pres/Brill/Air → 亮度感）。
-  double get airBrightness => (eqGain(5) + eqGain(6) + eqGain(7)) / 3;
-
   VisualizerSettings copyWith({
     int? themeIndex,
     double? rotationSpeed,

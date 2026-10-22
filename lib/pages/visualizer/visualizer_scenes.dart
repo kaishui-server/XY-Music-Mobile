@@ -30,7 +30,8 @@ class VisFrame {
   final List<double> bands; // 64 段（已平滑+检测源增益）
   final double kickEnvelope; // 0..1 节拍包络
   final double rms; // 0..1 整体响度
-  final double time; // 秒（已按「运动速度」缩放累加）
+  final double time; // 秒（真实时间流）
+  final double blockPulse; // 悬浮方块脉冲（kickEnvelope 按「速度」平滑）
   final VisualizerSettings settings;
   final OrbitCamera camera;
   final VisRippleBuffer ripples;
@@ -41,6 +42,7 @@ class VisFrame {
     required this.kickEnvelope,
     required this.rms,
     required this.time,
+    required this.blockPulse,
     required this.settings,
     required this.camera,
     required this.ripples,
@@ -48,8 +50,26 @@ class VisFrame {
     required this.meteors,
   });
 
-  /// 亮度感（地形均衡器 Pres/Brill/Air 均值）。
-  double get brightness => settings.airBrightness;
+  /// 单段地形均衡器曲线（对齐 groundEqSettings.applyGroundEqBandValue）：
+  /// 默认 50 → ×1.0；>50 增益 ×(1+delta·1.8)；<50 衰减；关闭 → 0。
+  double eqCurve(int i) {
+    if (i < 0 || i >= settings.groundEq.length) return 0;
+    final b = settings.groundEq[i];
+    if (!b.on) return 0;
+    final d = (b.value - 50) / 50;
+    return d >= 0 ? 1 + d * 1.8 : (1 - d * 0.35) * (1 - d * 0.35);
+  }
+
+  /// 亮度感 = 高三段 EQ 曲线值占全段之和的比例
+  /// （对齐 MapScene uBrightness 的占比公式）。
+  double get brightness {
+    final hi = eqCurve(5) + eqCurve(6) + eqCurve(7);
+    var sum = 0.0;
+    for (var i = 0; i < 8; i++) {
+      sum += eqCurve(i);
+    }
+    return (hi / math.max(0.001, sum)).clamp(0.0, 1.0);
+  }
 }
 
 Color _withAlpha(int value, double a) {
@@ -189,26 +209,29 @@ class Offset3 {
 }
 
 class _Block {
-  final double x, z, baseY, phase, spd, r01, liftJit;
-  const _Block(this.x, this.z, this.baseY, this.phase, this.spd, this.r01,
-      this.liftJit);
+  final double x, z, baseY, baseScale, phase, spd;
+  const _Block(this.x, this.z, this.baseY, this.baseScale, this.phase,
+      this.spd);
 }
 
 final List<_Block> _blocks = _makeBlocks();
 
+/// 对齐 MapScene floatingBlocks：五圈螺旋环形分布（半径 14..75、高度
+/// 6..24、基准尺寸 0.75..1.15、确定性伪随机相位/自旋）。
 List<_Block> _makeBlocks() {
-  final rnd = math.Random(55351);
-  return List.generate(40, (_) {
-    final a = rnd.nextDouble() * math.pi * 2;
-    final r = 12 + math.sqrt(rnd.nextDouble()) * 66; // 12..78，避开中心封面轴
+  const count = 120;
+  return List.generate(count, (i) {
+    final ring = i / count;
+    final angle = ring * math.pi * 2 * 5.0 + math.sin(i * 12.9898) * 0.7;
+    final radius = 14.0 + (i * 37) % 62;
+    final height = 6.0 + (i * 17) % 19;
     return _Block(
-      math.cos(a) * r,
-      math.sin(a) * r,
-      10 + rnd.nextDouble() * 32, // 高度 10..42
-      rnd.nextDouble() * math.pi * 2,
-      0.6 + rnd.nextDouble() * 0.9,
-      rnd.nextDouble(),
-      0.5 + rnd.nextDouble() * 0.9,
+      math.cos(angle) * radius,
+      math.sin(angle) * radius,
+      height,
+      0.75 + (i * 11) % 9 * 0.05,
+      i * 0.73,
+      0.18 + (i * 7) % 10 * 0.035,
     );
   });
 }
@@ -228,16 +251,35 @@ class TerrainScenePainter extends CustomPainter {
     final pal = _paletteFor(f.settings.theme);
     final grid = _TerrainGrid.forDensity(f.settings.terrainDensity);
     final t = f.time;
-    // 地形均衡器：前 5 段增益乘到对应分区抬升，后 3 段均值做亮度。
-    final gains = f.settings.terrainGains;
-    final amp = (f.settings.amplitude / 50).clamp(0.0, 2.2);
+    // 地形均衡器：sub/bass 走 terrainResponse.deriveKickFollowLowBands 的
+    // 加法混合（kick 节拍包络主导：1.28/1.15，频段能量基底 0.22/0.20），
+    // 再按 EQ delta 曲线缩放（默认 50 → ×1.0）；中频段直接乘 EQ 曲线。
+    final kickNorm = (f.kickEnvelope / 0.75).clamp(0.0, 1.0);
+    double lowMix(double energy, double baseGain, double kickGain, int i,
+        double maxV) {
+      final b = f.settings.groundEq[i];
+      if (!b.on) return 0;
+      final d = (b.value - 50) / 50;
+      final raw = energy * baseGain + kickNorm * kickGain;
+      final v = d >= 0
+          ? raw * (1 + d * 1.8)
+          : math.max(0, raw + d * 0.35) * (1 + d * 0.35);
+      return math.min(v, maxV);
+    }
 
-    // kick 跟随低频（terrainResponse.deriveKickFollowLowBands 的效果等价）。
-    final subU = math.max(a.subBass, f.kickEnvelope * 0.85) * gains[0];
-    final bassU = math.max(a.bass, f.kickEnvelope * 0.7) * gains[1];
+    final subU = lowMix(a.subBass, 0.22, 1.28, 0, 1.2);
+    final bassU = lowMix(a.bass, 0.20, 1.15, 1, 1.15);
+    final gLowMid = f.eqCurve(2);
+    final gMid = f.eqCurve(3);
+    final gHighMid = f.eqCurve(4);
 
     final warmth = a.warmth;
     final uBrightness = f.brightness;
+    // 振幅：≤50 线性衰减到 0；>50 平方放最大到 15×（对齐 MapScene）。
+    final amp = f.settings.amplitude <= 50
+        ? f.settings.amplitude / 50
+        : 1.0 +
+            math.pow((f.settings.amplitude - 50) / 50, 2).toDouble() * 14.0;
 
     // 活跃 ripple 列表（避免每柱体扫 10 槽）。
     final act = <VisRipple>[];
@@ -288,16 +330,16 @@ class TerrainScenePainter extends CustomPainter {
               grid.bassGate[i] *
               4.0 +
           a.lowMid *
-              gains[2] *
+              gLowMid *
               (snoise2D(wx * 0.05 + t * 0.1, wz * 0.05) * 0.5 + 0.5) *
               2.5 +
           a.mid *
-              gains[3] *
+              gMid *
               math.max(0.0,
                   math.sin(wx * 0.2 + wz * 0.2 + grid.midS[i] * 2.0 - t * 2.0)) *
               3.0;
       if (grid.spikeFlag[i] == 1) {
-        audio += a.highMid * gains[4] * glslSmoothstep(10, 45, d) *
+        audio += a.highMid * gHighMid * glslSmoothstep(10, 45, d) *
             grid.rnd77[i] * 2.5;
       }
       audio *= falloff * amp;
@@ -488,28 +530,31 @@ class TerrainScenePainter extends CustomPainter {
   }
 
   // -----------------------------------------------------------------------
-  // 悬浮方块：数量=强度、尺寸=min..max、浮动速度=speed，随 bass 上浮脉冲。
+  // 悬浮方块：数量随强度（默认 80）、脉冲尺寸/抬升随 kick 包络平滑值。
   // -----------------------------------------------------------------------
   void _paintBlocks(
       Canvas canvas, CameraRig rig, BandPartition a, double t) {
     final s = f.settings;
-    final count = (4 + 36 * s.blockIntensity / 100).round();
-    final speedK = 0.25 + s.blockSpeed / 100 * 1.3;
-    final liftK = 0.5 + s.blockIntensity / 100 * 1.5;
+    // 数量：默认强度 55 → 80 个（对齐 DEFAULT_FLOATING_BLOCK_COUNT）。
+    final count = (80 * s.blockIntensity / 55).round().clamp(0, 120);
+    // 脉冲尺寸混合（对齐 MapScene floatingBlock）：
+    // sizeMix = pulse·(0.5 + intensity·1.7) → pulseScale lerp(min, max)。
+    final intensity = s.blockIntensity / 100;
+    final pulse = f.blockPulse;
+    final sizeMix = (pulse * (0.5 + intensity * 1.7)).clamp(0.0, 1.0);
+    final minVisual = 0.12 + (0.75 - 0.12) * s.blockMinSize / 100;
+    final maxVisual = math.max(
+        minVisual + 0.05, 0.45 + (3.2 - 0.45) * s.blockMaxSize / 100);
+    final pulseScale = minVisual + (maxVisual - minVisual) * sizeMix;
 
     for (int bi = 0; bi < count && bi < _blocks.length; bi++) {
       final b = _blocks[bi];
-      // 尺寸：minSize..maxSize（0..100 → 世界单位 ×0.2）。
-      final sizeW =
-          (s.blockMinSize + (s.blockMaxSize - s.blockMinSize) * b.r01) * 0.2;
-      final half = sizeW / 2;
-      // 浮动：正弦漂移 + bass 抬升脉冲。
-      final bob = math.sin(t * b.spd * speedK + b.phase) *
-          (1.2 + s.blockIntensity / 100 * 2.5);
-      final pulse = (a.bass * 0.6 + a.subBass * 0.3) * liftK * 5.0;
-      final cy = b.baseY + bob + pulse * b.liftJit;
+      final half = b.baseScale * pulseScale / 2;
+      // 浮动：小幅正弦漂移（±0.45）+ kick 脉冲抬升。
+      final bob = math.sin(t * (0.55 + b.spd) + b.phase) * 0.45;
+      final cy = b.baseY + bob + pulse * intensity * 1.4;
       // 旋转（慢速自旋）。
-      final ang = t * 0.35 * b.spd * speedK + b.phase * 1.7;
+      final ang = t * b.spd + b.phase;
       final ca = math.cos(ang), sa = math.sin(ang);
       // 距离雾（与柱体一致）。
       final dc = math.sqrt(b.x * b.x + b.z * b.z);
@@ -546,8 +591,8 @@ class TerrainScenePainter extends CustomPainter {
         Offset3(1, 0, 0),
       ];
       // 面颜色：顶面最亮，侧面随法线方向渐暗；bass 脉冲提亮。
-      final glow = (0.30 + 0.45 * s.blockIntensity / 100 +
-              (a.bass * 0.5 + f.kickEnvelope * 0.35) * 0.8)
+      final glow = (0.30 + 0.45 * intensity +
+              (a.bass * 0.5 + pulse * 0.35) * 0.8)
           .clamp(0.0, 1.0);
       final cTop = _withAlpha(0xFFFFFFFF, alpha);
       final cMain =
@@ -564,7 +609,6 @@ class TerrainScenePainter extends CustomPainter {
       // 背面剔除：dot(法线, 相机-面心) > 0 才可见；可见面按深度从远到近。
       final visible = <int>[];
       for (int fi = 0; fi < 6; fi++) {
-        final face = faces[fi];
         final n = norms[fi];
         // 旋转法线。
         final nx = n.x * ca + n.z * sa;
