@@ -107,13 +107,15 @@ class _Palette {
 
 /// 主题氛围天空（对齐参考版：暗夜=深蓝紫、赛博=深绿、霓虹=深紫、
 /// 墨韵/极简=浅灰白雾），逐主题显式给定而非通用派生。
+/// 5540 调暗暗色系（5539 反馈「不像夜晚」），浅色主题保持不动。
 const _themeSkies = <String, List<int>>{
   // [skyTop, horizonFog]
   'ink': [0xFF3E434B, 0xFF9AA1AB],
-  'night': [0xFF060E1E, 0xFF1D4E6E],
-  'neon': [0xFF110823, 0xFF483569],
-  'cyber': [0xFF05140B, 0xFF2B5A20],
+  'night': [0xFF04070F, 0xFF0E2236],
+  'neon': [0xFF0A0517, 0xFF2A1F45],
+  'cyber': [0xFF030B06, 0xFF1A3A14],
   'minimal': [0xFFBFC3C9, 0xFFE4E7EB],
+  'ember': [0xFF05070F, 0xFF16213C],
 };
 
 _Palette _paletteFor(VisTheme theme) {
@@ -125,9 +127,13 @@ _Palette _paletteFor(VisTheme theme) {
   // 5538 的 ×0.16/×0.34 压得过暗（用户反馈「整体太暗看不清」）。
   double d1(int v) => dr(v) * 0.24;
   double d2(int v) => dr(v) * 0.55;
-  // warm（能量）系：主题色向白提亮派生；提亮幅度加大让热区饱和鲜艳。
-  double hw(num v, double t) => dr(v) + (1.0 - dr(v)) * t;
-  final sky = _themeSkies[theme.id] ?? const [0xFF060E1E, 0xFF1D4E6E];
+  // warm（能量）系：HSV 提 V 保 S 派生（5540 对齐 LX-X 鲜艳度——
+  // 向白提亮会冲淡饱和度导致热区发灰）。
+  Color warmOf(Color c, double v) =>
+      HSVColor.fromColor(c).withValue(v.clamp(0.0, 1.0)).toColor();
+  final warmCore = warmOf(accent, 0.95);
+  final warmEdge = warmOf(main, 0.8);
+  final sky = _themeSkies[theme.id] ?? const [0xFF04070F, 0xFF0E2236];
   final skyTop = Color(sky[0]);
   final skyFog = Color(sky[1]);
   return _Palette(
@@ -135,8 +141,8 @@ _Palette _paletteFor(VisTheme theme) {
     d2(dim.red), d2(dim.green), d2(dim.blue),
     dr(accent.red), dr(accent.green), dr(accent.blue),
     dr(main.red), dr(main.green), dr(main.blue),
-    hw(accent.red, 0.55), hw(accent.green, 0.55), hw(accent.blue, 0.55),
-    hw(main.red, 0.42), hw(main.green, 0.42), hw(main.blue, 0.42),
+    dr(warmCore.red), dr(warmCore.green), dr(warmCore.blue),
+    dr(warmEdge.red), dr(warmEdge.green), dr(warmEdge.blue),
     dr(accent.red), dr(accent.green), dr(accent.blue),
     dr(skyTop.red), dr(skyTop.green), dr(skyTop.blue),
     dr(skyFog.red), dr(skyFog.green), dr(skyFog.blue),
@@ -186,7 +192,7 @@ void _paintSky(Canvas canvas, Size size, _Palette pal,
           Offset(size.width * 0.5, size.height * 0.44),
           size.width * 0.55,
           [
-            _col(0.25, pal.hgR, pal.hgG, pal.hgB),
+            _col(0.16, pal.hgR, pal.hgG, pal.hgB),
             _col(0.0, pal.hgR, pal.hgG, pal.hgB),
           ],
         ),
@@ -793,14 +799,13 @@ class TerrainScenePainter extends CustomPainter {
 
   /// 封面幽灵层：88×88 平面 @ (105,26,-105)（移动端横屏默认机位下
   /// 约占屏高 46%、悬于地形上空偏右上，对齐参考版观感），rotY(-π/4)
-  /// 起始、按「旋转速度」缓慢自旋；脉冲对齐 MapScene：
-  /// uPulse = bass*0.4 + subBass*0.2。
+  /// 固定朝向（5540 起封面不再自旋，与参考一致）；脉冲对齐 MapScene：
+  /// uPulse = bass*0.4 + subBass*0.2，亮度增益收敛到 ×0.3 保持暗调。
   void _paintCover(Canvas canvas, CameraRig rig, BandPartition a) {
     final img = f.coverImage;
     if (img == null || !f.settings.showCover) return;
     final coverPulse = (a.bass * 0.4 + a.subBass * 0.2).clamp(0.0, 1.0);
-    // 动态旋转角（rotationSpeed 0.2 → 约 0.12 rad/s）。
-    final ang = -math.pi / 4 + f.time * f.settings.rotationSpeed * 0.6;
+    const ang = -math.pi / 4;
     final ca = math.cos(ang), sa = math.sin(ang);
     // 四角投影检查（在视野内才画）。
     // cy 取得较低（近地平线）：底部没入雾中由烘焙遮罩渐隐（对齐参考
@@ -821,7 +826,7 @@ class TerrainScenePainter extends CustomPainter {
     // 注意不能写成倒置 dst rect（bottom<top 是空矩形，Skia 直接不绘制，
     // 这正是 5538 封面幽灵层完全不可见的根因）。
     canvas.scale(1, -1);
-    final bright = 1.0 + coverPulse * 0.8;
+    final bright = 1.0 + coverPulse * 0.3;
     canvas.drawImageRect(
       img,
       Rect.fromLTWH(0, 0, img.width.toDouble(), img.height.toDouble()),

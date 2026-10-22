@@ -576,15 +576,17 @@ class _VisualizerPageState extends ConsumerState<VisualizerPage>
     }
   }
 
-  /// 封面预处理：低饱和(25%)+提亮 mix(white,·,0.55) → 径向渐隐 → 垂直渐隐
-  /// → 整体 alpha 0.5。烘焙成一张图，每帧零离屏直接贴。
+  /// 封面预处理：压暗(×0.72)+降饱和(55%) → 径向渐隐 → 垂直渐隐
+  /// → 整体 alpha 0.55。对齐参考版「封面融入夜空」的暗调低对比观感
+  /// （5539 的低饱和+提亮把彩色封面洗成白雾团）。烘焙成一张图，每帧零离屏直接贴。
   static Future<ui.Image> _buildGhostCover(ui.Image src) async {
     const size = 256.0;
     final rec = ui.PictureRecorder();
     final c = ui.Canvas(rec, const Rect.fromLTWH(0, 0, size, size));
     final dst = const Rect.fromLTWH(0, 0, size, size);
-    // ① 颜色：out = 0.55*(0.25*src + 0.75*gray(src)) + 0.45*255
+    // ① 颜色：out = 0.72 * (gray + 0.55*(src - gray))，无提亮平移。
     const wr = 0.299, wg = 0.587, wb = 0.114;
+    const sat = 0.55, dim = 0.72;
     c.drawImageRect(
       src,
       Rect.fromLTWH(0, 0, src.width.toDouble(), src.height.toDouble()),
@@ -593,19 +595,19 @@ class _VisualizerPageState extends ConsumerState<VisualizerPage>
         ..filterQuality = FilterQuality.medium
         ..colorFilter = ColorFilter.matrix(<double>[
           // R
-          0.55 * 0.25 + 0.55 * 0.75 * wr, 0.55 * 0.75 * wg,
-          0.55 * 0.75 * wb, 0, 0.45 * 255,
+          dim * (wr + sat * (1 - wr)), dim * (wg * (1 - sat)),
+          dim * (wb * (1 - sat)), 0, 0,
           // G
-          0.55 * 0.75 * wr, 0.55 * 0.25 + 0.55 * 0.75 * wg,
-          0.55 * 0.75 * wb, 0, 0.45 * 255,
+          dim * (wr * (1 - sat)), dim * (wg + sat * (1 - wg)),
+          dim * (wb * (1 - sat)), 0, 0,
           // B
-          0.55 * 0.75 * wr, 0.55 * 0.75 * wg,
-          0.55 * 0.25 + 0.55 * 0.75 * wb, 0, 0.45 * 255,
-          // A（baseOpacity 0.5）
-          0, 0, 0, 0.5, 0,
+          dim * (wr * (1 - sat)), dim * (wg * (1 - sat)),
+          dim * (wb + sat * (1 - wb)), 0, 0,
+          // A（整体透明度 0.55）
+          0, 0, 0, 0.55, 0,
         ]),
     );
-    // ② 径向遮罩（radialMask：边缘缓出，保留主体可读）。
+    // ② 径向遮罩（radialMask：55% 内基本全显，边缘缓出溶解入天空）。
     c.saveLayer(dst, Paint());
     c.drawRect(
       dst,
@@ -614,8 +616,8 @@ class _VisualizerPageState extends ConsumerState<VisualizerPage>
         ..shader = ui.Gradient.radial(
           const Offset(size / 2, size / 2),
           size * 0.85,
-          [const Color(0xFFFFFFFF), const Color(0x00FFFFFF)],
-          [0.0, 1.0],
+          const [Color(0xFFFFFFFF), Color(0xE6FFFFFF), Color(0x00FFFFFF)],
+          const [0.0, 0.55, 1.0],
         ),
     );
     c.restore();
@@ -750,8 +752,10 @@ class _LyricsOverlayState extends ConsumerState<_LyricsOverlay> {
       }
     }
 
-    // 颜色：歌词颜色独立于主题——始终用歌词设置里的自选字体色。
-    final activeColor = Color(s.lyricsColor);
+    // 颜色：开启「卡拉OK颜色跟随主题」时用主题强调色，否则用自选字体色。
+    final activeColor = s.lyricsFollowTheme
+        ? Color(s.theme.accent)
+        : Color(s.lyricsColor);
     final fontFamily = s.lyricsSerif ? 'Georgia' : null;
     final extent = _rowExtent(s);
     final leftPad = s.lyricsOffsetX.clamp(-120.0, 240.0);
@@ -1370,15 +1374,6 @@ class _SettingsDrawer extends ConsumerWidget {
                             label: const Text('恢复全部默认设置',
                                 style: TextStyle(fontSize: 13)),
                           ),
-                          _sliderRow(
-                            '旋转速度',
-                            settings.rotationSpeed,
-                            0,
-                            1,
-                            (v) => notifier.update(
-                                (s) => s.copyWith(rotationSpeed: v)),
-                            label: settings.rotationSpeed.toStringAsFixed(1),
-                          ),
                           _switchTile(
                             '显示封面',
                             settings.showCover,
@@ -1591,6 +1586,12 @@ class _SettingsDrawer extends ConsumerWidget {
                                 const SizedBox(width: 8),
                               ],
                             ],
+                          ),
+                          _switchTile(
+                            '卡拉OK颜色跟随主题',
+                            settings.lyricsFollowTheme,
+                            (v) => notifier.update(
+                                (s) => s.copyWith(lyricsFollowTheme: v)),
                           ),
                           _segmentTabs(
                             labels: const ['Serif', 'Sans'],

@@ -31,6 +31,8 @@ const kVisThemes = <VisTheme>[
   VisTheme('neon', '霓虹', 0xFFC0A6FF, 0xFF4A3B73, 0xFFE2D6FF),
   VisTheme('cyber', '赛博', 0xFFB8E986, 0xFF4E6B33, 0xFFE0F7C0),
   VisTheme('minimal', '极简', 0xFFB9BDC4, 0xFF3A3E44, 0xFF8E959E),
+  // 烈焰（5540 新增，对齐 LX-X 火焰橙红紫观感；追加末位保持旧 themeIndex 稳定）。
+  VisTheme('ember', '烈焰', 0xFFFFB05C, 0xFF6E2440, 0xFFFF5A36),
 ];
 
 /// 触发器模式（脉冲/流星共用）。
@@ -54,7 +56,6 @@ const kEqBandNames = ['Sub', 'Bass', 'LoMid', 'Mid', 'HiMid', 'Pres', 'Brill', '
 class VisualizerSettings {
   // —— 主题配色 ——
   final int themeIndex;
-  final double rotationSpeed; // 0..1 封面盘旋转速度（默认 0.2）
   final bool showCover; // 显示封面幽灵层
   // —— 地形均衡器 ——
   final List<VisEqBand> groundEq; // 8 段
@@ -87,6 +88,7 @@ class VisualizerSettings {
   final double lyricsInactiveSize; // 非活跃字号
   final double lyricsMaxChars; // 每行最大字数
   final int lyricsColor; // 字体颜色（ARGB，独立于主题不随配色变化）
+  final bool lyricsFollowTheme; // 卡拉OK颜色跟随主题
   final bool lyricsSerif; // Serif / Sans
   final double lyricsOffsetX; // 空间偏移
   // —— 音频检测 ——
@@ -99,7 +101,6 @@ class VisualizerSettings {
 
   const VisualizerSettings({
     this.themeIndex = 1, // 默认暗夜（对齐参考版默认观感）
-    this.rotationSpeed = 0.2,
     this.showCover = true,
     this.groundEq = const [
       VisEqBand(value: 50), VisEqBand(value: 50), VisEqBand(value: 50),
@@ -131,6 +132,7 @@ class VisualizerSettings {
     this.lyricsInactiveSize = 10,
     this.lyricsMaxChars = 48,
     this.lyricsColor = 0xFFFFFFFF,
+    this.lyricsFollowTheme = true,
     this.lyricsSerif = false,
     this.lyricsOffsetX = 0,
     this.detectLevel = 100,
@@ -152,7 +154,6 @@ class VisualizerSettings {
 
   VisualizerSettings copyWith({
     int? themeIndex,
-    double? rotationSpeed,
     bool? showCover,
     List<VisEqBand>? groundEq,
     double? motionSpeed,
@@ -180,6 +181,7 @@ class VisualizerSettings {
     double? lyricsInactiveSize,
     double? lyricsMaxChars,
     int? lyricsColor,
+    bool? lyricsFollowTheme,
     bool? lyricsSerif,
     double? lyricsOffsetX,
     double? detectLevel,
@@ -189,7 +191,6 @@ class VisualizerSettings {
   }) {
     return VisualizerSettings(
       themeIndex: themeIndex ?? this.themeIndex,
-      rotationSpeed: rotationSpeed ?? this.rotationSpeed,
       showCover: showCover ?? this.showCover,
       groundEq: groundEq ?? this.groundEq,
       motionSpeed: motionSpeed ?? this.motionSpeed,
@@ -217,6 +218,7 @@ class VisualizerSettings {
       lyricsInactiveSize: lyricsInactiveSize ?? this.lyricsInactiveSize,
       lyricsMaxChars: lyricsMaxChars ?? this.lyricsMaxChars,
       lyricsColor: lyricsColor ?? this.lyricsColor,
+      lyricsFollowTheme: lyricsFollowTheme ?? this.lyricsFollowTheme,
       lyricsSerif: lyricsSerif ?? this.lyricsSerif,
       lyricsOffsetX: lyricsOffsetX ?? this.lyricsOffsetX,
       detectLevel: detectLevel ?? this.detectLevel,
@@ -229,7 +231,6 @@ class VisualizerSettings {
   Map<String, dynamic> toJson() => {
         'v': kVisSettingsVersion,
         'themeIndex': themeIndex,
-        'rotationSpeed': rotationSpeed,
         'showCover': showCover,
         'groundEq': [
           for (final b in groundEq) {'on': b.on, 'v': b.value}
@@ -259,6 +260,7 @@ class VisualizerSettings {
         'lyricsInactiveSize': lyricsInactiveSize,
         'lyricsMaxChars': lyricsMaxChars,
         'lyricsColor': lyricsColor,
+        'lyricsFollowTheme': lyricsFollowTheme,
         'lyricsSerif': lyricsSerif,
         'lyricsOffsetX': lyricsOffsetX,
         'detectLevel': detectLevel,
@@ -287,7 +289,6 @@ class VisualizerSettings {
     }
     return VisualizerSettings(
       themeIndex: (j['themeIndex'] as num?)?.toInt() ?? 1,
-      rotationSpeed: (j['rotationSpeed'] as num?)?.toDouble() ?? 0.2,
       showCover: j['showCover'] is bool ? j['showCover'] : true,
       groundEq: eq.length == 8
           ? eq
@@ -327,6 +328,9 @@ class VisualizerSettings {
       lyricsInactiveSize: (j['lyricsInactiveSize'] as num?)?.toDouble() ?? 10,
       lyricsMaxChars: (j['lyricsMaxChars'] as num?)?.toDouble() ?? 48,
       lyricsColor: (j['lyricsColor'] as num?)?.toInt() ?? 0xFFFFFFFF,
+      lyricsFollowTheme: j['lyricsFollowTheme'] is bool
+          ? j['lyricsFollowTheme']
+          : true,
       lyricsSerif: j['lyricsSerif'] is bool ? j['lyricsSerif'] : false,
       lyricsOffsetX: (j['lyricsOffsetX'] as num?)?.toDouble() ?? 0,
       detectLevel: (j['detectLevel'] as num?)?.toDouble() ?? 100,

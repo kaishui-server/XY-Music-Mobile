@@ -121,6 +121,7 @@ class DesktopLyricsService : Service() {
     private var windowManager: WindowManager? = null
     private var panel: View? = null
     private var lyricView: TextView? = null
+    private var translationView: TextView? = null
     private var controlBar: LinearLayout? = null
     private var overlayParams: WindowManager.LayoutParams? = null
     private var downX = 0f
@@ -196,6 +197,7 @@ class DesktopLyricsService : Service() {
     private var lastContentKey: String? = null
     private var lastBackgroundKey: String? = null
     private var lastLyricColor = Color.WHITE
+    private var lastTranslationKey: String? = null
 
     /** 上次已应用的「暂停时隐藏歌词」状态（true 表示歌词内容处于隐藏态）。 */
     private var lastHideLyrics = false
@@ -281,6 +283,18 @@ class DesktopLyricsService : Service() {
         // 单行行高略微加高：歌词行上下各加 6dp 内边距，视觉更松弛、居中。
         val vPad = (6 * resources.displayMetrics.density).toInt()
         lyric.setPadding(0, vPad, 0, vPad)
+        // 翻译副行（外文歌「原文 + 翻译」双行；中文歌无翻译自然隐藏）。
+        val translation = TextView(this).apply {
+            setTextColor(Color.argb(230, 225, 225, 230))
+            textSize = 13f
+            maxLines = 1
+            ellipsize = android.text.TextUtils.TruncateAt.END
+            gravity = Gravity.CENTER
+            textAlignment = View.TEXT_ALIGNMENT_CENTER
+            setLineSpacing(0f, 1.15f)
+            visibility = View.GONE
+        }
+        translation.setPadding(0, 0, 0, vPad)
         val density = resources.displayMetrics.density
         // 歌词行与操作栏之间的分隔线（细半透明白线，水平内缩居中）。
         val divider = View(this).apply {
@@ -294,6 +308,7 @@ class DesktopLyricsService : Service() {
             gravity = Gravity.CENTER_HORIZONTAL
             setPadding(28, 14, 28, 14)
             addView(lyric, LinearLayout.LayoutParams(-1, -2))
+            addView(translation, LinearLayout.LayoutParams(-1, -2))
             addView(
                 divider,
                 LinearLayout.LayoutParams(-1, (1 * density).toInt()).apply {
@@ -309,10 +324,11 @@ class DesktopLyricsService : Service() {
             }
         }
         lyricView = lyric
+        translationView = translation
         controlBar =
-            content.getChildAt(2) as? LinearLayout
+            content.getChildAt(3) as? LinearLayout
         // 分隔线随操作栏一起显隐（包一层行容器控制 visibility 更稳）。
-        dividerRow = content.getChildAt(1)
+        dividerRow = content.getChildAt(2)
         applyBarVisibility()
         panelContent = content
         panel = content
@@ -430,6 +446,7 @@ class DesktopLyricsService : Service() {
             panel = null
             panelContent = null
             lyricView = null
+            translationView = null
             controlBar = null
             overlayParams = null
             stopSelf()
@@ -713,6 +730,30 @@ class DesktopLyricsService : Service() {
             applyFontSize(localFontSize)
         }
 
+        // 翻译副行（外文歌「原文 + 翻译」双行）：无翻译/暂停隐藏时隐藏。
+        // 文本+颜色+字号构成变化键，未变化时跳过 setText（避免布局抖动）。
+        translationView?.let { view ->
+            val trans = p.translation.trim()
+            val desiredVisibility = if (trans.isEmpty() || hideLyrics) {
+                View.GONE
+            } else {
+                View.VISIBLE
+            }
+            if (view.visibility != desiredVisibility) {
+                view.visibility = desiredVisibility
+            }
+            val transKey = "$trans\u0000${p.translationColor}\u0000${p.translationFontSize}"
+            if (desiredVisibility == View.VISIBLE && transKey != lastTranslationKey) {
+                lastTranslationKey = transKey
+                if (view.text.toString() != trans) view.text = trans
+                if (view.currentTextColor != p.translationColor) {
+                    view.setTextColor(p.translationColor)
+                }
+                val transScaled = p.translationFontSize * resources.displayMetrics.scaledDensity
+                if (abs(view.textSize - transScaled) > .5f) view.textSize = p.translationFontSize
+            }
+        }
+
         val backgroundKey = "${p.noBackground}|${p.backgroundColor}|${p.backgroundOpacity}"
         if (backgroundKey != lastBackgroundKey) {
             lastBackgroundKey = backgroundKey
@@ -960,6 +1001,8 @@ class DesktopLyricsService : Service() {
             }
         }
         lyricView?.typeface = custom
+        // 翻译副行同字体、常规字重（主行 BOLD 会显得过重）。
+        translationView?.typeface = android.graphics.Typeface.create(custom, Typeface.NORMAL)
     }
 
     override fun onDestroy() {
@@ -976,6 +1019,7 @@ class DesktopLyricsService : Service() {
         panel = null
         panelContent = null
         lyricView = null
+        translationView = null
         controlBar = null
         playKey = null
         overlayParams = null
