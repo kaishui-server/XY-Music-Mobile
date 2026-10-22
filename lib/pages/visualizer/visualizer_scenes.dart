@@ -89,6 +89,9 @@ class _Palette {
   final double wcR, wcG, wcB; // warmCore
   final double weR, weG, weB; // warmEdge
   final double rpR, rpG, rpB; // rippleColor
+  final double stR, stG, stB; // 天空顶色
+  final double sbR, sbG, sbB; // 地平线雾色
+  final double hgR, hgG, hgB; // 地平线辉光（main 派生）
   const _Palette(
       this.b1r, this.b1g, this.b1b,
       this.b2r, this.b2g, this.b2b,
@@ -96,29 +99,48 @@ class _Palette {
       this.ceR, this.ceG, this.ceB,
       this.wcR, this.wcG, this.wcB,
       this.weR, this.weG, this.weB,
-      this.rpR, this.rpG, this.rpB);
+      this.rpR, this.rpG, this.rpB,
+      this.stR, this.stG, this.stB,
+      this.sbR, this.sbG, this.sbB,
+      this.hgR, this.hgG, this.hgB);
 }
+
+/// 主题氛围天空（对齐参考版：暗夜=深蓝紫、赛博=深绿、霓虹=深紫、
+/// 墨韵/极简=浅灰白雾），逐主题显式给定而非通用派生。
+const _themeSkies = <String, List<int>>{
+  // [skyTop, horizonFog]
+  'ink': [0xFF3E434B, 0xFF9AA1AB],
+  'night': [0xFF060E1E, 0xFF1D4E6E],
+  'neon': [0xFF110823, 0xFF483569],
+  'cyber': [0xFF05140B, 0xFF2B5A20],
+  'minimal': [0xFFBFC3C9, 0xFFE4E7EB],
+};
 
 _Palette _paletteFor(VisTheme theme) {
   final dim = Color(theme.dim);
   final main = Color(theme.main);
   final accent = Color(theme.accent);
   double dr(num v) => v / 255;
-  // base1/2：由 dim 深化（对齐默认 (0.01,0.02,0.04)/(0.03,0.05,0.09) 的暗度级别）。
-  double d1(int v) => dr(v) * 0.16;
-  double d2(int v) => dr(v) * 0.34;
-  // warm（能量）系：由主题色本身向白提亮派生（中心热区 accent+45% 白、
-  // 热区边缘 main+25% 白）。不再收敛到固定橙红——此前 70% 固定橙红导致
-  // 五个主题的地形主体颜色几乎一致，换主题看起来「只改了脉冲颜色」。
+  // base1/2：由 dim 深化。参考版地形底色可读性明显高于纯黑——
+  // 5538 的 ×0.16/×0.34 压得过暗（用户反馈「整体太暗看不清」）。
+  double d1(int v) => dr(v) * 0.24;
+  double d2(int v) => dr(v) * 0.55;
+  // warm（能量）系：主题色向白提亮派生；提亮幅度加大让热区饱和鲜艳。
   double hw(num v, double t) => dr(v) + (1.0 - dr(v)) * t;
+  final sky = _themeSkies[theme.id] ?? const [0xFF060E1E, 0xFF1D4E6E];
+  final skyTop = Color(sky[0]);
+  final skyFog = Color(sky[1]);
   return _Palette(
     d1(dim.red), d1(dim.green), d1(dim.blue),
     d2(dim.red), d2(dim.green), d2(dim.blue),
     dr(accent.red), dr(accent.green), dr(accent.blue),
     dr(main.red), dr(main.green), dr(main.blue),
-    hw(accent.red, 0.45), hw(accent.green, 0.45), hw(accent.blue, 0.45),
-    hw(main.red, 0.25), hw(main.green, 0.25), hw(main.blue, 0.25),
+    hw(accent.red, 0.55), hw(accent.green, 0.55), hw(accent.blue, 0.55),
+    hw(main.red, 0.42), hw(main.green, 0.42), hw(main.blue, 0.42),
     dr(accent.red), dr(accent.green), dr(accent.blue),
+    dr(skyTop.red), dr(skyTop.green), dr(skyTop.blue),
+    dr(skyFog.red), dr(skyFog.green), dr(skyFog.blue),
+    dr(main.red), dr(main.green), dr(main.blue),
   );
 }
 
@@ -128,6 +150,48 @@ int _argb(double a, double r, double g, double b) {
   int gi = (g.clamp(0, 1) * 255).round();
   int bi = (b.clamp(0, 1) * 255).round();
   return (ai << 24) | (ri << 16) | (gi << 8) | bi;
+}
+
+Color _col(double a, double r, double g, double b) =>
+    Color(_argb(a, r, g, b));
+
+/// 主题氛围天空：纵向渐变（顶暗 → 地平线雾光）+ 地平线中央辉光，
+/// 对齐参考版的「天空感」——背景不再是纯黑。
+void _paintSky(Canvas canvas, Size size, _Palette pal,
+    {bool horizonGlow = true}) {
+  final rect = Offset.zero & size;
+  canvas.drawRect(
+    rect,
+    Paint()
+      ..shader = ui.Gradient.linear(
+        Offset(0, 0),
+        Offset(0, size.height),
+        [
+          _col(1, pal.stR, pal.stG, pal.stB),
+          _col(1, pal.stR + (pal.sbR - pal.stR) * 0.55,
+              pal.stG + (pal.sbG - pal.stG) * 0.55,
+              pal.stB + (pal.sbB - pal.stB) * 0.55),
+          _col(1, pal.sbR, pal.sbG, pal.sbB),
+          _col(1, pal.sbR * 0.55, pal.sbG * 0.55, pal.sbB * 0.55),
+        ],
+        [0.0, 0.30, 0.44, 1.0],
+      ),
+  );
+  if (horizonGlow) {
+    // 地平线雾光（main 派生的椭圆辉光，叠加一次 srcOver 无需离屏）。
+    canvas.drawRect(
+      rect,
+      Paint()
+        ..shader = ui.Gradient.radial(
+          Offset(size.width * 0.5, size.height * 0.44),
+          size.width * 0.55,
+          [
+            _col(0.25, pal.hgR, pal.hgG, pal.hgB),
+            _col(0.0, pal.hgR, pal.hgG, pal.hgB),
+          ],
+        ),
+    );
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -249,6 +313,8 @@ class TerrainScenePainter extends CustomPainter {
     final rig = CameraRig(f.camera, size);
     final a = BandPartition.of(f.bands);
     final pal = _paletteFor(f.settings.theme);
+    // 主题氛围天空（最底层，先于封面/地形绘制）。
+    _paintSky(canvas, size, pal);
     final grid = _TerrainGrid.forDensity(f.settings.terrainDensity);
     final t = f.time;
     // 地形均衡器：sub/bass 走 terrainResponse.deriveKickFollowLowBands 的
@@ -376,9 +442,17 @@ class TerrainScenePainter extends CustomPainter {
       }
       ripN = ripN.clamp(0.0, 1.0);
       ripW = ripW.clamp(0.0, 1.0);
+      // ④ ripple 环经过处触发「高音同款」散射尖刺：与 ②的 highMid 尖刺
+      // 同公式同散列，波纹扫过的 spike 列像高频段那样竖起光柱——
+      // 音乐高音越足环上光柱越高（0.5 底噪保证静音段单击也有反应）。
+      if (grid.spikeFlag[i] == 1 && ripN > 0.01) {
+        rippleElev +=
+            ripN * (0.5 + a.highMid * gHighMid) * grid.rnd77[i] * 2.5;
+      }
 
       final elev = idle + audio + rippleElev;
-      final normElev = (elev / 8.0).clamp(0.0, 1.0);
+      // 归一化分母 8→6：更高的 normElev 让顶面 glow 混合更充分（更鲜艳）。
+      final normElev = (elev / 6.0).clamp(0.0, 1.0);
 
       // —— 着色（对齐 fragment shader）——
       final distFade = 1.0 - glslSmoothstep(40, 75, d);
@@ -395,12 +469,19 @@ class TerrainScenePainter extends CustomPainter {
       tgR += (brightCoolR - tgR) * uBrightness * 0.6;
       tgG += (brightCoolG - tgG) * uBrightness * 0.6;
       tgB += (brightCoolB - tgB) * uBrightness * 0.6;
-      // glow = mix(base2, targetGlow, normElev) * distFade
-      final glowR = (pal.b2r + (tgR - pal.b2r) * normElev) * distFade;
-      final glowG = (pal.b2g + (tgG - pal.b2g) * normElev) * distFade;
-      final glowB = (pal.b2b + (tgB - pal.b2b) * normElev) * distFade;
-      // 顶面：topIntensity = smoothstep(0, 0.4, normElev)
-      final topInt = glslSmoothstep(0, 0.4, normElev);
+      // glow = mix(base2, targetGlow, normElev) * distFade + 主题色环境辉光。
+      // 环境辉光项让远处/平坦柱体也保持主题色调（参考版的「辉光感」，
+      // 否则地形大部分面积是纯 base2 暗色，主题一换几乎看不出区别）。
+      final glowR = (pal.b2r + (tgR - pal.b2r) * normElev) * distFade +
+          tgR * 0.30 * distFade;
+      final glowG = (pal.b2g + (tgG - pal.b2g) * normElev) * distFade +
+          tgG * 0.30 * distFade;
+      final glowB = (pal.b2b + (tgB - pal.b2b) * normElev) * distFade +
+          tgB * 0.30 * distFade;
+      // 顶面：topIntensity = smoothstep(0, 0.4, normElev)，抬底 0.38
+      // 让低矮柱体也参与主题色（平底 0 会让大面积地形退回 base2）。
+      final topInt =
+          math.max(glslSmoothstep(0, 0.4, normElev), 0.38);
       var cR = pal.b2r + (glowR - pal.b2r) * topInt;
       var cG = pal.b2g + (glowG - pal.b2g) * topInt;
       var cB = pal.b2b + (glowB - pal.b2b) * topInt;
@@ -722,8 +803,10 @@ class TerrainScenePainter extends CustomPainter {
     final ang = -math.pi / 4 + f.time * f.settings.rotationSpeed * 0.6;
     final ca = math.cos(ang), sa = math.sin(ang);
     // 四角投影检查（在视野内才画）。
-    const cx0 = 105.0, cy0 = 26.0, cz0 = -105.0;
-    const half = 44.0;
+    // cy 取得较低（近地平线）：底部没入雾中由烘焙遮罩渐隐（对齐参考
+    // 「封面自地平线雾气中浮起」的观感），顶部完整可见不裁边。
+    const cx0 = 95.0, cy0 = 6.0, cz0 = -95.0;
+    const half = 42.0;
     final c0 = rig.project(cx0 - half * ca, cy0 + half, cz0 + half * sa);
     final c1 = rig.project(cx0 + half * ca, cy0 + half, cz0 - half * sa);
     final c2 = rig.project(cx0 + half * ca, cy0 - half, cz0 - half * sa);
@@ -731,14 +814,18 @@ class TerrainScenePainter extends CustomPainter {
     if (c0 == null || c1 == null || c2 == null || c3 == null) return;
 
     // MVP（column-major）= S(视口) · P(透视) · V(lookAt) · M(模型)。
-    final mvp = _coverMvp(rig, ang);
+    final mvp = _coverMvp(rig, ang, cx0, cy0, cz0);
     canvas.save();
     canvas.transform(mvp);
+    // 翻转 v 轴保证封面正立（MVP 的 NDC y 向上、图片 v 向下）。
+    // 注意不能写成倒置 dst rect（bottom<top 是空矩形，Skia 直接不绘制，
+    // 这正是 5538 封面幽灵层完全不可见的根因）。
+    canvas.scale(1, -1);
     final bright = 1.0 + coverPulse * 0.8;
     canvas.drawImageRect(
       img,
       Rect.fromLTWH(0, 0, img.width.toDouble(), img.height.toDouble()),
-      Rect.fromLTRB(-half, half, half, -half), // 垂直翻转保证封面正立
+      Rect.fromLTRB(-half, -half, half, half),
       Paint()
         ..filterQuality = FilterQuality.medium
         ..colorFilter = ColorFilter.matrix(<double>[
@@ -771,7 +858,9 @@ Float64List _mat4Mul(Float64List a, Float64List b) {
 }
 
 /// 封面平面的完整 MVP（透视 fov45 + lookAt + rotY(ang) + 平移 + 视口）。
-Float64List _coverMvp(CameraRig rig, double ang) {
+/// 平移中心必须与 _paintCover 的四角检查常量一致（参数化避免两处漂移）。
+Float64List _coverMvp(CameraRig rig, double ang, double cx, double cy,
+    double cz) {
   const near = 0.5, far = 900.0;
   final fn = 1.0 / rig.tanHalfFov;
   final aspect = rig.aspect;
@@ -782,23 +871,25 @@ Float64List _coverMvp(CameraRig rig, double ang) {
     0, 0, 2 * far * near / (near - far), 0,
   ]);
   // lookAt：basis r/u/f，行 [r;-r·p][u;-u·p][-f;f·p]。
+  // 注意第三行平移项是 +f·p（= -|pos|，负值）：写成 -(f·p) 会把深度
+  // 坍缩约 10×，NDC 反向放大，封面整个被推到屏幕外（5538 根因之二）。
   final rp = rig.rx * rig.px + rig.ry * rig.py + rig.rz * rig.pz;
   final up = rig.ux * rig.px + rig.uy * rig.py + rig.uz * rig.pz;
-  final fp = -(rig.fx * rig.px + rig.fy * rig.py + rig.fz * rig.pz);
+  final fp = rig.fx * rig.px + rig.fy * rig.py + rig.fz * rig.pz;
   final v = Float64List.fromList(<double>[
     rig.rx, rig.ux, -rig.fx, 0,
     rig.ry, rig.uy, -rig.fy, 0,
     rig.rz, rig.uz, -rig.fz, 0,
     -rp, -up, fp, 1,
   ]);
-  // 模型：rotY(ang) + 平移 (105,26,-105)。
+  // 模型：rotY(ang) + 平移 (cx, cy, cz)。
   final k = math.cos(ang);
   final s2 = math.sin(ang);
   final m = Float64List.fromList(<double>[
     k, 0, -s2, 0,
     0, 1, 0, 0,
     s2, 0, k, 0,
-    105, 26, -105, 1,
+    cx, cy, cz, 1,
   ]);
   // 视口：x=(x+1)/2*w，y=(1-y)/2*h。
   final s = Float64List.fromList(<double>[
@@ -873,6 +964,8 @@ class NebulaScenePainter extends CustomPainter {
   void paint(Canvas canvas, Size size) {
     final d = f;
     final th = d.settings.theme;
+    // 主题氛围天空（星云无地平线，只做纵向渐变）。
+    _paintSky(canvas, size, _paletteFor(th), horizonGlow: false);
     final center = Offset(size.width / 2, size.height * 0.47);
     final maxR = math.min(size.width, size.height) * 0.46;
     const tilt = 0.62;

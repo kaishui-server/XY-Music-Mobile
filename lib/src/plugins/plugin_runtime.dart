@@ -210,6 +210,11 @@ List<String> pluginQualityCandidates(String? preferredQuality) => <String>{
   'super',
 }.toList();
 
+/// 音质探测单次结果：qualities 供选择器展示（已与历史探测并集），
+/// complete=false 表示本轮探测被起播解析让位/熔断中断，结论不完整——
+/// 调用方不得把不完整结果常驻缓存，也不得用它覆盖完整探测结果。
+typedef _QualityProbeOutcome = ({List<String> qualities, bool complete});
+
 /// 音质档位的展示标签（设置页、播放页音质选择器共用）。
 /// 档位集合对齐 MusicFree：96k / 128k / 192k / 320k / flac / flac24bit /
 /// hires / vinyl / dolby / atmos / atmos_plus / master，另兼容插件侧
@@ -1056,11 +1061,13 @@ class PluginRuntimeService {
   final Map<String, Future<void>> _loadTasks = {};
   final Map<String, Future<String>> _pluginSourceTasks = {};
   final Map<String, _NeteaseTrackMeta> _neteaseTrackMetaCache = {};
-  final Map<String, Future<List<String>>> _qualityDiscoveryCache = {};
+  final Map<String, Future<_QualityProbeOutcome>> _qualityDiscoveryCache = {};
 
   /// 已完成的音质探测结果（同步可读）：正式解析音质链时用它裁剪候选档位，
   /// 避免对探测确认不支持的高档位逐一发起完整网络解析（每档失败在插件内部
-  /// 还要多接口重试，是未缓存歌起播 10s+ 的主要来源）。
+  /// 还要多接口重试，是未缓存歌起播 10s+ 的主要来源）。只存完整跑完的
+  /// 探测结果——被让位的半截结果一旦覆盖这里，解析链与选择器会同时
+  /// 丢掉高档位（表现为手动切音质后更高的音质选项消失）。
   final Map<String, List<String>> _qualityDiscoveryDone = {};
 
   /// 正在进行的起播解析数量：音质探测（preloadQualities）逐档调用 musicUrl
@@ -1112,6 +1119,75 @@ class PluginRuntimeService {
     final uri = Uri.tryParse(url);
     if (uri == null || uri.host.isEmpty) return false;
     return uri.path.trim().length > 1;
+  }
+
+  /// 假音质嗅探的码率下限（bps）：LX 源（ikun/聆澜等）要 320k 实发 128k
+  /// 时魔数仍是 mp3，只能靠 Content-Range 总长 ÷ 时长估算平均码率拦截。
+  static const Map<String, int> _qualityMinBitrateBps = {
+    '320k': 224000,
+    'hires': 224000,
+  };
+
+  /// 假音质嗅探：上游无货时部分 LX 源仍返回可播 URL，但实际下发低音质
+  /// 文件（要 flac 给 mp3/m4a、要 320k 给 128k）。
+  /// - flac 系档位：Range 拉前 16 字节验 `fLaC` 魔数，不符即假；
+  /// - 320k/hires：用 Content-Range 总长与歌曲时长估算平均码率，
+  ///   低于下限（224kbps，128k/192k 假货均拦）即假。
+  /// 嗅探失败（不支持 Range/网络抖动/无时长）一律放行，不误伤可用直链。
+  Future<bool> _verifyLxQualityReal(
+    String url,
+    String quality,
+    int? durationMs,
+  ) async {
+    final q = quality.toLowerCase();
+    final wantsFlac = q.contains('flac');
+    final minBps = _qualityMinBitrateBps[q];
+    if (!wantsFlac && minBps == null) return true;
+    final uri = Uri.tryParse(url);
+    if (uri == null) return true;
+    HttpClient? client;
+    try {
+      client = HttpClient()
+        ..connectionTimeout = const Duration(seconds: 4)
+        ..autoUncompress = false;
+      final request = await client.getUrl(uri)
+        ..headers.set(HttpHeaders.rangeHeader, 'bytes=0-15')
+        ..headers.set(HttpHeaders.userAgentHeader, 'xyplayer');
+      final response =
+          await request.close().timeout(const Duration(seconds: 6));
+      final contentRange = response.headers.value('content-range');
+      final bytes = <int>[];
+      // break 跳出 await-for 会自动 cancel 订阅并断开连接（拿到魔数即止，
+      // 防止服务器忽略 Range 时把整个文件体拖进内存）。
+      await for (final chunk in response) {
+        bytes.addAll(chunk.take(16 - bytes.length));
+        if (bytes.length >= 16) break;
+      }
+      if (wantsFlac) {
+        final isFlac = bytes.length >= 4 &&
+            bytes[0] == 0x66 &&
+            bytes[1] == 0x4C &&
+            bytes[2] == 0x61 &&
+            bytes[3] == 0x43;
+        if (!isFlac) return false;
+      }
+      if (minBps != null &&
+          contentRange != null &&
+          durationMs != null &&
+          durationMs > 30000) {
+        final total = int.tryParse(
+            RegExp(r'/(\d+)$').firstMatch(contentRange)?.group(1) ?? '');
+        if (total != null && total > 0) {
+          final bps = total * 8 * 1000 ~/ durationMs;
+          if (bps < minBps) return false;
+        }
+      }
+      return true;
+    } catch (_) {
+      return true;
+    } finally {
+      client?.close(force: true);
+    }
   }
 
   /// 上述两张表都按歌曲/插件维度常驻，长时间在线播放会持续累积；
@@ -4386,23 +4462,32 @@ class PluginRuntimeService {
     Map<String, dynamic> rawData, {
     String? preferredQuality,
   }) {
-    final future = _qualityDiscoveryCache.putIfAbsent(
-      _qualityCacheKey(plugin, rawData),
-      () => _discoverQualitiesUncached(plugin, rawData),
-    );
+    final key = _qualityCacheKey(plugin, rawData);
+    var future = _qualityDiscoveryCache[key];
+    if (future == null) {
+      future = _discoverQualitiesUncached(plugin, rawData);
+      _qualityDiscoveryCache[key] = future;
+    }
     while (_qualityDiscoveryCache.length > _qualityDiscoveryCacheLimit) {
       final evicted = _qualityDiscoveryCache.keys.first;
       _qualityDiscoveryCache.remove(evicted);
       _qualityDiscoveryDone.remove(evicted);
     }
-    return future.then((qualities) {
+    return future.then((outcome) {
       final preferred = preferredQuality?.trim() ?? '';
       // 探测结果可能只包含当前音质能够解析出的子集。始终保留歌曲
       // 元数据中声明的全部音质，避免用户切换音质后重新打开选择器时，
       // 未被本次探测返回的母带/Hi-Res 等选项被覆盖掉。
       final declared = _qualityTokensFromRaw(rawData);
-      final merged = <String>{...declared, ...qualities};
+      final merged = <String>{...declared, ...outcome.qualities};
       if (preferred.isNotEmpty) merged.add(preferred);
+      // 让位/熔断产生的「半截探测」不常驻缓存：丢弃本次 future，下次
+      // 打开选择器重新补齐剩余档位（已确认档位经 _qualityDiscoveryDone
+      // 并集保留）。否则切音质/起播期间撞上探测让位，选择器会被永久
+      // 钉死在半截列表上——表现为手动降级后更高的音质选项消失。
+      if (!outcome.complete) {
+        _qualityDiscoveryCache.remove(key);
+      }
       if (merged.isEmpty) return const ['320k'];
       // 按档位从低到高排序：插件返回的 token 顺序不可控（受 JSON 键序、
       // 探测时序影响），不排序时选择器会出现“母带在无损前面”等乱序。
@@ -4449,16 +4534,26 @@ class PluginRuntimeService {
     return '${plugin.id}|$id';
   }
 
-  Future<List<String>> _discoverQualitiesUncached(
+  Future<_QualityProbeOutcome> _discoverQualitiesUncached(
     EnabledMusicPlugin plugin,
     Map<String, dynamic> rawData,
   ) async {
+    final key = _qualityCacheKey(plugin, rawData);
+    // 历史已确认的档位直接带入：让位中断后的补测只需探测缺失档，
+    // 展示侧也始终保有「曾经验证过」的完整下限。
+    final probedBefore =
+        _qualityDiscoveryDone[key]?.toList() ?? const <String>[];
     final declared = _qualityTokensFromRaw(rawData);
     if (plugin.isAnimemusic) {
       // REST 后端逐档实测：music/url 返回有效地址才展示给用户。
-      final supported = <String>[];
+      final supported = <String>[...probedBefore];
+      var yielded = false;
       for (final quality in plugin.animemusicQualities) {
-        if (_activeResolves > 0) break;
+        if (supported.contains(quality)) continue;
+        if (_activeResolves > 0) {
+          yielded = true;
+          break;
+        }
         try {
           final source = await _resolveAnimemusicMediaSource(
             plugin,
@@ -4470,12 +4565,14 @@ class PluginRuntimeService {
           // 单一音质探测失败不应阻断整个选择器。
         }
       }
-      if (supported.isNotEmpty) {
-        _qualityDiscoveryDone[_qualityCacheKey(plugin, rawData)] =
-            List<String>.from(supported);
-        return supported;
+      // 只有完整跑完才落 done（done 同时是解析链裁剪梯子的依据）。
+      if (!yielded && supported.isNotEmpty) {
+        _qualityDiscoveryDone[key] = List<String>.from(supported);
       }
-      return plugin.animemusicQualities;
+      if (supported.isNotEmpty) {
+        return (qualities: supported, complete: !yielded);
+      }
+      return (qualities: plugin.animemusicQualities, complete: !yielded);
     }
     final candidates = <String>{
       ...declared,
@@ -4496,20 +4593,33 @@ class PluginRuntimeService {
           if (discovered.isNotEmpty) {
             // 插件探测通常只报告本次请求成功的音质，不能用它覆盖
             // 歌曲返回的声明列表；两者取并集才能稳定保留所有选项。
-            return <String>{...declared, ...discovered}.toList();
+            final merged = <String>{...declared, ...discovered,
+              ...probedBefore,
+            }.toList();
+            _qualityDiscoveryDone[key] = List<String>.from(merged);
+            return (qualities: merged, complete: true);
           }
         }
       } catch (_) {
         // 后台探测失败时继续走当前 isolate 的兼容路径。
       }
     }
-    final supported = <String>[];
+    final supported = <String>[...probedBefore];
     final probeStopwatch = Stopwatch()..start();
+    // 让位/熔断会让探测提前终止：yielded=true 时结果只是半截结论。
+    var yielded = false;
+    // LX 音源熔断期内逐档 musicUrl 必然全档假阴性（连接级失败与档位
+    // 无关），此时探测等于没测——按不完整结论返回，冷却后重新补齐。
+    if (plugin.isLx && _lxCircuitOpen(plugin)) yielded = true;
     for (final quality in candidates) {
+      if (supported.contains(quality)) continue;
       // 探测让位于起播解析：逐档探测是每档一次完整 musicUrl 网络解析
       //（串行，一首歌最多十几秒），用户在探测进行中点歌/切歌时提前
       // 返回已探到的部分，剩余档位留给下一轮探测补齐。
-      if (_activeResolves > 0) break;
+      if (_activeResolves > 0) {
+        yielded = true;
+        break;
+      }
       try {
         final ok = plugin.isLx
             ? await _probeLxQuality(plugin, rawData, quality)
@@ -4519,12 +4629,10 @@ class PluginRuntimeService {
         // 单一音质探测失败不应阻断整个选择器。
       }
     }
-    // 同步落一份探测结果：正式解析音质链据此裁剪候选档位（见
-    // _resolveLxMediaSource）。中途让位时 supported 为部分结果，只有
-    // 非空才落盘，避免用「探测被让位」覆盖掉已有的完整结果。
-    if (supported.isNotEmpty) {
-      _qualityDiscoveryDone[_qualityCacheKey(plugin, rawData)] =
-          List<String>.from(supported);
+    // 只有探测完整跑完（未让位/未熔断）才落盘：被让位的半截结果一旦
+    // 覆盖完整结果，解析链据此裁剪的候选梯子与选择器会同时丢掉高档位。
+    if (!yielded && supported.isNotEmpty) {
+      _qualityDiscoveryDone[key] = List<String>.from(supported);
     }
     if (probeStopwatch.elapsedMilliseconds > 5000) {
       AppLogStore.instance.add(
@@ -4533,11 +4641,15 @@ class PluginRuntimeService {
         '${probeStopwatch.elapsedMilliseconds}ms',
       );
     }
-    if (supported.isNotEmpty) return supported;
+    if (supported.isNotEmpty) {
+      return (qualities: supported, complete: !yielded);
+    }
     // 某些插件只在真正解析时返回地址，保留声明值让用户仍可选择；
     // 没有任何声明时至少保留当前档位，播放逻辑会继续执行兼容回退。
-    if (declared.isNotEmpty) return declared;
-    return const ['320k'];
+    if (declared.isNotEmpty) {
+      return (qualities: declared, complete: !yielded);
+    }
+    return (qualities: const ['320k'], complete: !yielded);
   }
 
   Future<bool> _probeMusicFreeQuality(
@@ -4710,21 +4822,24 @@ class PluginRuntimeService {
     var qualities = pluginQualityCandidates(preferredQuality);
     // 已完成的音质探测（discoverQualities）记录了该插件+歌曲真实可解析
     // 的档位；盲试 8 档时每个不支持的高档位都要在插件内部走一遍多接口
-    // 重试超时（每档数秒，未缓存歌起播 10s+ 的主要来源）。有探测结果时
-    // 只试「首选档（若被探测支持）+ 探测确认的最高档」，其余档位仅在
-    // 探测列表为空（从未探测成功）时才兜底尝试。
+    // 重试超时（每档数秒，未缓存歌起播 10s+ 的主要来源）。有完整探测结果时
+    // 按「首选档 + 探测确认的档位（高→低）」尝试，不盲试未确认档位。
     final discovered = _qualityDiscoveryDone[_qualityCacheKey(plugin, rawData)];
     if (discovered != null && discovered.isNotEmpty) {
       final preferred = preferredQuality?.trim() ?? '';
-      final supported = discovered
+      final rest = discovered
           .where((q) => q != preferred)
           .toList()
         ..sort((a, b) => qualityTierRank(b).compareTo(qualityTierRank(a)));
-      final trimmed = <String>[
-        if (discovered.contains(preferred)) preferred,
-        if (supported.isNotEmpty) supported.first,
+      // 用户显式选择的首选档永远排第一，即使探测未确认（探测可能被让位
+      // 截断，忽略它等于手动选的高档被静默丢弃）；其后保留全部已确认档位
+      // 从高到低——假音质嗅探可能连续否掉多档，只留首选+最高档时没有
+      // 更低档可降。这些都是探测验证过有直链的档位，失败是嗅探快速拒绝，
+      // 不会像盲试未支持档那样逐档超时。
+      qualities = <String>[
+        if (preferred.isNotEmpty) preferred,
+        ...rest,
       ];
-      if (trimmed.isNotEmpty) qualities = trimmed;
     }
     // 先完整尝试插件自己的接口。自定义 LX 音源通常只支持部分音质，
     // 不能因为第一档音质失败就立刻等待公共接口超时。
@@ -4733,6 +4848,9 @@ class PluginRuntimeService {
     // 解析白等 20s+），连续 3 档同一错误立即换下一个源。
     var sameErrorStreak = 0;
     String? lastErrorMessage;
+    // 歌曲时长（ms，lx musicInfo.interval）用于 320k 假音质码率估算。
+    final intervalMs = int.tryParse(
+        songInfo['interval']?.toString().split('.').first ?? '');
     for (final quality in qualities) {
       final attemptStopwatch = Stopwatch()..start();
       try {
@@ -4750,6 +4868,11 @@ class PluginRuntimeService {
               'LX返回假直链（仅域名无路径，上游无该档音质）音质$quality');
         }
         if (looksHttp) {
+          // 假音质嗅探：URL 可播但实际下发低音质文件（要 flac 给 mp3、
+          // 要 320k 给 128k）同样视为该档失败，走降级重试。
+          if (!await _verifyLxQualityReal(pluginUrl, quality, intervalMs)) {
+            throw Exception('LX返回假音质（$quality 实际下发内容不符）');
+          }
           _lxConnectivityFailures.remove(plugin.id);
           if (attemptStopwatch.elapsedMilliseconds > 3000) {
             AppLogStore.instance.add(
@@ -4823,6 +4946,16 @@ class PluginRuntimeService {
           continue;
         }
         if (url.isNotEmpty) {
+          // 公共解析同样做假音质嗅探（要 flac 给 mp3 / 要 320k 给 128k）。
+          if (!await _verifyLxQualityReal(url, quality, intervalMs)) {
+            AppLogStore.instance.add(
+              '[播放链路] LX公共解析返回假音质（$quality 实际下发内容不符）'
+              '${plugin.name}',
+              level: AppLogLevel.info,
+            );
+            lastError ??= Exception('LX公共解析返回假音质（$quality）');
+            continue;
+          }
           _lxConnectivityFailures.remove(plugin.id);
           if (attemptStopwatch.elapsedMilliseconds > 3000) {
             AppLogStore.instance.add(

@@ -301,7 +301,13 @@ class DesktopLyricsBridge {
       final parsed = await parseLyrics(rawLyrics: source);
       final payload = jsonDecode(parsed);
       if (payload is! Map) return const [];
-      return (payload['displayLines'] as List? ?? const [])
+      // lyricsRaw 是「原文 LRC 块 + \n + 翻译 LRC 块」整段拼接形态（插件
+      // 翻译透传），原文行与翻译行同时间轴并存为两条独立 displayLine
+      // （text 各自内容、translation 字段为空）。外文歌要在桌面歌词
+      // 显示「原文 + 翻译副行」，必须先按时间戳把同刻度行配对归组：
+      // 组内首行为原文主行，其余行合并为翻译副行；无配对行则保持单行。
+      // Dart Map 保持插入序，归组不改变行序。
+      final rawEntries = (payload['displayLines'] as List? ?? const [])
           .whereType<Map>()
           .map((raw) {
             final line = Map<String, dynamic>.from(raw);
@@ -316,25 +322,55 @@ class DesktopLyricsBridge {
                 )
                 .where((word) => word.text.isNotEmpty)
                 .toList();
-            // 副行显示翻译；无翻译时回退显示罗马音/音译。
-            // 两者都缺（纯原文歌曲）时副行为空，原生侧将隐藏第二行。
-            final translationText = _cleanDesktopLyricText(
-              line['translation']?.toString() ?? '',
-            );
-            final romajiText = _cleanDesktopLyricText(
-              line['romaji']?.toString() ?? '',
-            );
-            return _DesktopLyricLine(
-              time: (line['time'] as num?)?.toDouble() ?? 0,
-              text: _cleanDesktopLyricText(line['text']?.toString() ?? ''),
-              translation: translationText.isNotEmpty
-                  ? translationText
-                  : romajiText,
-              words: words,
+            return (
+              _DesktopLyricLine(
+                time: (line['time'] as num?)?.toDouble() ?? 0,
+                text: _cleanDesktopLyricText(line['text']?.toString() ?? ''),
+                translation: _cleanDesktopLyricText(
+                  line['translation']?.toString() ?? '',
+                ),
+                words: words,
+              ),
+              _cleanDesktopLyricText(line['romaji']?.toString() ?? ''),
             );
           })
-          .where((line) => line.text.trim().isNotEmpty)
+          .where((e) => e.$1.text.trim().isNotEmpty)
           .toList();
+      // 同刻度归组配对（key=厘秒桶，组内首行为原文主行，后续行合并为
+      // 翻译副行；时间戳精确相等才能配对，避免误伤合唱同刻度不同拍行）。
+      final paired = <_DesktopLyricLine>[];
+      final romajiByIndex = <String>[];
+      final groupFirstIndex = <int, int>{};
+      for (final e in rawEntries) {
+        final line = e.$1;
+        final key = (line.time * 100).round();
+        final fi = groupFirstIndex[key];
+        if (fi == null) {
+          groupFirstIndex[key] = paired.length;
+          paired.add(line);
+          romajiByIndex.add(e.$2);
+        } else if (paired[fi].translation.isEmpty &&
+            line.text != paired[fi].text) {
+          paired[fi] = _DesktopLyricLine(
+            time: paired[fi].time,
+            text: paired[fi].text,
+            translation: line.text,
+            words: paired[fi].words,
+          );
+        }
+      }
+      // 罗马音兜底：配对后仍无翻译的行回退显示罗马音/音译。
+      for (var i = 0; i < paired.length; i++) {
+        if (paired[i].translation.isEmpty && romajiByIndex[i].isNotEmpty) {
+          paired[i] = _DesktopLyricLine(
+            time: paired[i].time,
+            text: paired[i].text,
+            translation: romajiByIndex[i],
+            words: paired[i].words,
+          );
+        }
+      }
+      return paired;
     } catch (_) {
       return const [];
     }

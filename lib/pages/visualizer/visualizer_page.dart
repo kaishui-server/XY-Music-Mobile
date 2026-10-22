@@ -460,10 +460,10 @@ class _VisualizerPageState extends ConsumerState<VisualizerPage>
     _pressAt = null;
     if (pressAt == null) return;
     final settings = ref.read(visualizerSettingsProvider);
-    // 按压时长映射强度（对齐 sonic-topography：短按 0.2~0.4，长按至 3.0），
-    // 再乘「脉冲强度」（默认 0.2 → ×1）。
+    // 按压时长映射强度：快速单击 0.9，长按渐强至 3.0（0.3 时波纹环几乎
+    // 看不见——用户反馈「单击波纹弱」）；再乘「脉冲强度」（默认 0.5 → ×2.5）。
     final hold = (_time - pressAt).clamp(0.0, 3.0);
-    final base = hold < 0.25 ? 0.3 : math.min(0.2 + hold * 0.93, 3.0);
+    final base = hold < 0.25 ? 0.9 : math.min(0.8 + hold * 0.73, 3.0);
     final strength = base * settings.kickStrength * 5.0;
     final pos = _pressPos ?? d.localPosition;
     _pressPos = null;
@@ -750,10 +750,8 @@ class _LyricsOverlayState extends ConsumerState<_LyricsOverlay> {
       }
     }
 
-    // 颜色：卡拉OK跟随主题 → accent；否则用自选字体色。
-    final activeColor = s.lyricsFollowTheme
-        ? Color(s.theme.accent)
-        : Color(s.lyricsColor);
+    // 颜色：歌词颜色独立于主题——始终用歌词设置里的自选字体色。
+    final activeColor = Color(s.lyricsColor);
     final fontFamily = s.lyricsSerif ? 'Georgia' : null;
     final extent = _rowExtent(s);
     final leftPad = s.lyricsOffsetX.clamp(-120.0, 240.0);
@@ -1593,12 +1591,6 @@ class _SettingsDrawer extends ConsumerWidget {
                                 const SizedBox(width: 8),
                               ],
                             ],
-                          ),
-                          _switchTile(
-                            '卡拉OK颜色跟随主题',
-                            settings.lyricsFollowTheme,
-                            (v) => notifier.update(
-                                (s) => s.copyWith(lyricsFollowTheme: v)),
                           ),
                           _segmentTabs(
                             labels: const ['Serif', 'Sans'],

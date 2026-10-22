@@ -424,7 +424,9 @@ pub struct SoundEffectSettings {
     // anime 音效引擎（open.anime.bzxhkj.com 开放平台）：原始 params JSON
     // 直传官方 animefx.c 引擎（引擎内部自带 10 段 EQ/压缩/混响/次谐波/
     // 激励/抖晃/旋转/展宽/空气感/增益全链）。None/空 = 未启用（直通）。
-    #[serde(default)]
+    // Dart 侧键名是 animeFx（EffectsSettings.toRustJson），必须 rename 对齐
+    // ——否则 serde 静默忽略未知键，引擎永远拿不到参数（5538「听不出差别」根因）。
+    #[serde(rename = "animeFx", default)]
     pub anime_params: Option<String>,
 }
 
@@ -674,5 +676,24 @@ impl SoundEffectBlockProcessor {
             out.extend_from_slice(&self.frame);
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Dart 侧 EffectsSettings.toRustJson 的 anime 键是 animeFx，
+    /// serde 必须 rename 对齐——否则参数静默丢失、引擎全程直通。
+    #[test]
+    fn anime_fx_key_roundtrip() {
+        let json = r#"{"pitchShift":100,"playbackRate":100,"animeFx":"{\"eq\":{\"on\":true},\"exc\":{\"on\":true,\"amt\":0.6}}"}"#;
+        let s: SoundEffectSettings = serde_json::from_str(json).expect("deserialize");
+        assert!(s.anime_params.is_some(), "animeFx 键必须映射到 anime_params");
+        assert!(s.anime_params.as_deref().unwrap().contains("exc"));
+        // 未启用时（null）应为 None 而非反序列化失败。
+        let s2: SoundEffectSettings =
+            serde_json::from_str::<SoundEffectSettings>(r#"{"animeFx":null}"#).expect("null ok");
+        assert!(s2.anime_params.is_none());
     }
 }

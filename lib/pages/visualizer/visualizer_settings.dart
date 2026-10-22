@@ -86,8 +86,7 @@ class VisualizerSettings {
   final double lyricsActiveSize; // 活跃字号
   final double lyricsInactiveSize; // 非活跃字号
   final double lyricsMaxChars; // 每行最大字数
-  final bool lyricsFollowTheme; // 卡拉OK颜色跟随主题
-  final int lyricsColor; // 字体颜色（followTheme 关闭时生效，ARGB）
+  final int lyricsColor; // 字体颜色（ARGB，独立于主题不随配色变化）
   final bool lyricsSerif; // Serif / Sans
   final double lyricsOffsetX; // 空间偏移
   // —— 音频检测 ——
@@ -99,7 +98,7 @@ class VisualizerSettings {
   final VisualizerForm form;
 
   const VisualizerSettings({
-    this.themeIndex = 0,
+    this.themeIndex = 1, // 默认暗夜（对齐参考版默认观感）
     this.rotationSpeed = 0.2,
     this.showCover = true,
     this.groundEq = const [
@@ -120,7 +119,7 @@ class VisualizerSettings {
     this.kickAutoTrack = true,
     this.kickSensitivity = 0.8,
     this.kickCooldownFrames = 15,
-    this.kickStrength = 0.2,
+    this.kickStrength = 0.5, // 默认脉冲强度（0.2 的节拍/单击波纹偏弱）
     this.meteorEnabled = true,
     this.meteorMode = TriggerMode.autoBeat,
     this.meteorSensitivity = 0.5,
@@ -131,7 +130,6 @@ class VisualizerSettings {
     this.lyricsActiveSize = 15,
     this.lyricsInactiveSize = 10,
     this.lyricsMaxChars = 48,
-    this.lyricsFollowTheme = true,
     this.lyricsColor = 0xFFFFFFFF,
     this.lyricsSerif = false,
     this.lyricsOffsetX = 0,
@@ -181,7 +179,6 @@ class VisualizerSettings {
     double? lyricsActiveSize,
     double? lyricsInactiveSize,
     double? lyricsMaxChars,
-    bool? lyricsFollowTheme,
     int? lyricsColor,
     bool? lyricsSerif,
     double? lyricsOffsetX,
@@ -219,7 +216,6 @@ class VisualizerSettings {
       lyricsActiveSize: lyricsActiveSize ?? this.lyricsActiveSize,
       lyricsInactiveSize: lyricsInactiveSize ?? this.lyricsInactiveSize,
       lyricsMaxChars: lyricsMaxChars ?? this.lyricsMaxChars,
-      lyricsFollowTheme: lyricsFollowTheme ?? this.lyricsFollowTheme,
       lyricsColor: lyricsColor ?? this.lyricsColor,
       lyricsSerif: lyricsSerif ?? this.lyricsSerif,
       lyricsOffsetX: lyricsOffsetX ?? this.lyricsOffsetX,
@@ -231,6 +227,7 @@ class VisualizerSettings {
   }
 
   Map<String, dynamic> toJson() => {
+        'v': kVisSettingsVersion,
         'themeIndex': themeIndex,
         'rotationSpeed': rotationSpeed,
         'showCover': showCover,
@@ -261,7 +258,6 @@ class VisualizerSettings {
         'lyricsActiveSize': lyricsActiveSize,
         'lyricsInactiveSize': lyricsInactiveSize,
         'lyricsMaxChars': lyricsMaxChars,
-        'lyricsFollowTheme': lyricsFollowTheme,
         'lyricsColor': lyricsColor,
         'lyricsSerif': lyricsSerif,
         'lyricsOffsetX': lyricsOffsetX,
@@ -272,6 +268,12 @@ class VisualizerSettings {
       };
 
   static VisualizerSettings fromJson(Map<String, dynamic> j) {
+    // 旧版本存档（无 v 或 v < 当前）→ 一次性弃用，回到新版默认值
+    // （5539 调整了暗夜主题/脉冲强度等默认观感，老存档的旧默认值不再适用）。
+    final storedV = (j['v'] as num?)?.toInt() ?? 1;
+    if (storedV < kVisSettingsVersion) {
+      return const VisualizerSettings();
+    }
     List<VisEqBand> eq = const [];
     if (j['groundEq'] is List) {
       eq = [
@@ -284,7 +286,7 @@ class VisualizerSettings {
       ];
     }
     return VisualizerSettings(
-      themeIndex: (j['themeIndex'] as num?)?.toInt() ?? 0,
+      themeIndex: (j['themeIndex'] as num?)?.toInt() ?? 1,
       rotationSpeed: (j['rotationSpeed'] as num?)?.toDouble() ?? 0.2,
       showCover: j['showCover'] is bool ? j['showCover'] : true,
       groundEq: eq.length == 8
@@ -324,8 +326,6 @@ class VisualizerSettings {
       lyricsActiveSize: (j['lyricsActiveSize'] as num?)?.toDouble() ?? 15,
       lyricsInactiveSize: (j['lyricsInactiveSize'] as num?)?.toDouble() ?? 10,
       lyricsMaxChars: (j['lyricsMaxChars'] as num?)?.toDouble() ?? 48,
-      lyricsFollowTheme:
-          j['lyricsFollowTheme'] is bool ? j['lyricsFollowTheme'] : true,
       lyricsColor: (j['lyricsColor'] as num?)?.toInt() ?? 0xFFFFFFFF,
       lyricsSerif: j['lyricsSerif'] is bool ? j['lyricsSerif'] : false,
       lyricsOffsetX: (j['lyricsOffsetX'] as num?)?.toDouble() ?? 0,
@@ -338,6 +338,9 @@ class VisualizerSettings {
 }
 
 const String _kPrefsKey = 'visualizer.settings.v2';
+
+/// 设置存档版本：提升后旧存档一次性重置为新默认值。
+const int kVisSettingsVersion = 2;
 
 class VisualizerSettingsNotifier extends StateNotifier<VisualizerSettings> {
   VisualizerSettingsNotifier() : super(const VisualizerSettings()) {
