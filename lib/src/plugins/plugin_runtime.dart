@@ -1105,6 +1105,15 @@ class PluginRuntimeService {
     return until != null && DateTime.now().isBefore(until);
   }
 
+  /// 校验直链是否真实可用：上游无货时部分 LX 源返回 code=200 但 url 仅剩
+  /// host（形如 https://aqqmusic.tc.qq.com/ 的空路径假直链）。host-only
+  /// 的 URL 必须视为该档音质失败并降级重试，不能当成功直链交给播放器。
+  static bool _hasUrlPath(String url) {
+    final uri = Uri.tryParse(url);
+    if (uri == null || uri.host.isEmpty) return false;
+    return uri.path.trim().length > 1;
+  }
+
   /// 上述两张表都按歌曲/插件维度常驻，长时间在线播放会持续累积；
   /// 加硬上限并按插入顺序淘汰最旧条目，避免常驻内存随播放时长攀升。
   static const int _neteaseTrackMetaCacheLimit = 256;
@@ -4733,8 +4742,14 @@ class PluginRuntimeService {
           'info': {'type': quality, 'musicInfo': songInfo},
         });
         final pluginUrl = response?.toString().trim() ?? '';
-        if (pluginUrl.startsWith('http://') ||
-            pluginUrl.startsWith('https://')) {
+        final looksHttp = pluginUrl.startsWith('http://') ||
+            pluginUrl.startsWith('https://');
+        if (looksHttp && !_hasUrlPath(pluginUrl)) {
+          // 假直链（仅域名无路径）= 该档音质无货：抛错走统一降级重试。
+          throw Exception(
+              'LX返回假直链（仅域名无路径，上游无该档音质）音质$quality');
+        }
+        if (looksHttp) {
           _lxConnectivityFailures.remove(plugin.id);
           if (attemptStopwatch.elapsedMilliseconds > 3000) {
             AppLogStore.instance.add(
@@ -4797,6 +4812,16 @@ class PluginRuntimeService {
         final url = decoded is Map
             ? decoded['url']?.toString().trim() ?? ''
             : '';
+        if (url.isNotEmpty && !_hasUrlPath(url)) {
+          // 公共解析同样会出现 host-only 假直链：按该档失败降级重试。
+          AppLogStore.instance.add(
+            '[播放链路] LX公共解析返回假直链（仅域名无路径）'
+            '${plugin.name} 音质$quality',
+            level: AppLogLevel.info,
+          );
+          lastError ??= Exception('LX公共解析返回假直链（仅域名无路径）');
+          continue;
+        }
         if (url.isNotEmpty) {
           _lxConnectivityFailures.remove(plugin.id);
           if (attemptStopwatch.elapsedMilliseconds > 3000) {
@@ -5694,7 +5719,7 @@ class PluginRuntimeService {
     final response = await fetchLyricFromSource(
       source: source,
       songInfoJson: jsonEncode(info),
-    ).timeout(const Duration(seconds: 20));
+    ).timeout(const Duration(seconds: 25));
     if (response.trim().isEmpty || response.trim() == 'null') return '';
     final decoded = jsonDecode(response);
     if (decoded is! Map) return '';

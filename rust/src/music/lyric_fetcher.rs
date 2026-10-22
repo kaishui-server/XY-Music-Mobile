@@ -12,7 +12,7 @@ use base64::Engine;
 use serde::{Deserialize, Serialize};
 
 use regex::Regex;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 // ==================== Regex caches (module-level, compiled once) ====================
 static KG_ID_HEADER_RE: OnceLock<Regex> = OnceLock::new();
@@ -2559,6 +2559,164 @@ async fn fetch_mg_lyric(song_info: &LyricSongInfo) -> Result<Option<LyricResult>
 
 // ==================== 对外入口 ====================
 
+// ---- 跨源翻译聚合 ----
+// 主源有歌词但无翻译时（如 tx 官方接口对部分外文歌不返回 trans 字段），
+// 按「歌名+歌手」并发到其他源搜索同一首歌并取其翻译歌词回填。
+// 翻译覆盖率：kg（KRC 内嵌翻译）> wy（tlyric）> tx/mg；kw 的 H5 歌词
+// 接口没有翻译字段，不参与聚合。参考洛雪移动端的多源歌词聚合行为。
+
+/// 聚合结果缓存（歌曲级 LRU，cap 256，只在聚合成功时写入）。
+static CROSS_TRANSLATION_CACHE: OnceLock<Mutex<Vec<(String, String)>>> = OnceLock::new();
+
+fn cross_translation_cache() -> &'static Mutex<Vec<(String, String)>> {
+    CROSS_TRANSLATION_CACHE.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn cache_get_translation(key: &str) -> Option<String> {
+    let mut guard = cross_translation_cache().lock().ok()?;
+    if let Some(pos) = guard.iter().position(|(k, _)| k == key) {
+        let (_, value) = guard.remove(pos);
+        guard.push((key.to_string(), value.clone()));
+        return Some(value);
+    }
+    None
+}
+
+fn cache_put_translation(key: String, value: String) {
+    const CAP: usize = 256;
+    if let Ok(mut guard) = cross_translation_cache().lock() {
+        if let Some(pos) = guard.iter().position(|(k, _)| *k == key) {
+            guard.remove(pos);
+        }
+        guard.push((key, value));
+        if guard.len() > CAP {
+            guard.remove(0);
+        }
+    }
+}
+
+fn norm_lyric_text(s: &str) -> String {
+    s.replace(' ', "").to_lowercase()
+}
+
+/// 宽松匹配：歌名互相包含 + 歌手分段有交集即认为同一首歌。
+fn lyric_song_matches(
+    origin_name: &str,
+    origin_singers: &[String],
+    item_name: &str,
+    item_singer: &str,
+) -> bool {
+    let a = norm_lyric_text(origin_name);
+    let b = norm_lyric_text(item_name);
+    if a.is_empty() || b.is_empty() || !(a.contains(&b) || b.contains(&a)) {
+        return false;
+    }
+    let splitters = ['/', ',', '&', '、', ';'];
+    let item_singers: Vec<String> = item_singer
+        .split(splitters)
+        .map(norm_lyric_text)
+        .filter(|s| !s.is_empty())
+        .collect();
+    origin_singers.iter().any(|o| {
+        item_singers
+            .iter()
+            .any(|i| i.contains(o) || o.contains(i))
+    })
+}
+
+/// 单个源：搜索 → 匹配 → 拉歌词 → 返回翻译。整体 8s 超时，
+/// 失败/无匹配/无翻译一律返回 None（聚合是尽力而为，不阻塞主歌词）。
+async fn fetch_translation_from_source(
+    source: &str,
+    song_info: &LyricSongInfo,
+    keyword: &str,
+) -> Option<String> {
+    tokio::time::timeout(std::time::Duration::from_secs(8), async {
+        let items = crate::music::lx_search::lx_search(source, keyword, 3)
+            .await
+            .ok()?;
+        let origin_name = &song_info.name;
+        let splitters = ['/', ',', '&', '、', ';'];
+        let origin_singers: Vec<String> = song_info
+            .singer
+            .split(splitters)
+            .map(norm_lyric_text)
+            .filter(|s| !s.is_empty())
+            .collect();
+        for item in items {
+            if !lyric_song_matches(
+                origin_name,
+                &origin_singers,
+                &item.name,
+                &item.singer,
+            ) {
+                continue;
+            }
+            let info = LyricSongInfo {
+                songmid: item.songmid,
+                hash: item.hash,
+                name: item.name.clone(),
+                singer: item.singer.clone(),
+                album_name: if item.album_name.is_empty() {
+                    None
+                } else {
+                    Some(item.album_name)
+                },
+                interval: if item.interval.is_empty() {
+                    None
+                } else {
+                    Some(item.interval)
+                },
+                interval_ms: None,
+                song_id: item.song_id,
+                str_media_mid: item.str_media_mid,
+                album_mid: item.album_mid,
+                album_id: if item.album_id.is_null() {
+                    None
+                } else {
+                    Some(item.album_id)
+                },
+                copyright_id: item.copyright_id,
+                source: Some(source.to_string()),
+            };
+            let fetched = match source {
+                "kg" => fetch_kg_lyric(&info).await,
+                "wy" => fetch_wy_lyric(&info).await,
+                "tx" => fetch_tx_lyric(&info).await,
+                "mg" => fetch_mg_lyric(&info).await,
+                _ => Ok(None),
+            };
+            // 该匹配项无翻译时继续试下一个搜索结果（最多 3 条）。
+            if let Ok(Some(r)) = fetched {
+                if !r.tlyric.trim().is_empty() {
+                    return Some(r.tlyric);
+                }
+            }
+        }
+        None
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+/// 并发四个候选源聚合翻译，按 kg > wy > tx > mg 优先级取第一个命中。
+async fn fetch_translation_cross_source(origin: &str, song_info: &LyricSongInfo) -> String {
+    let keyword = format!("{} {}", song_info.name.trim(), song_info.singer.trim());
+    let (kg, wy, tx, mg) = tokio::join!(
+        async { fetch_translation_from_source("kg", song_info, &keyword).await },
+        async { fetch_translation_from_source("wy", song_info, &keyword).await },
+        async { fetch_translation_from_source("tx", song_info, &keyword).await },
+        async { fetch_translation_from_source("mg", song_info, &keyword).await },
+    );
+    let pick = |value: Option<String>, src: &str| if src == origin { None } else { value };
+    pick(kg, "kg")
+        .or_else(|| pick(wy, "wy"))
+        .or_else(|| pick(tx, "tx"))
+        .or_else(|| pick(mg, "mg"))
+        .unwrap_or_default()
+}
+
 pub async fn fetch_lyric_from_source(
     source: String,
     song_info: LyricSongInfo,
@@ -2571,7 +2729,24 @@ pub async fn fetch_lyric_from_source(
         "mg" => fetch_mg_lyric(&song_info).await?,
         _ => return Ok(None),
     };
-    Ok(result)
+    let Some(mut result) = result else {
+        return Ok(None);
+    };
+    // 翻译聚合：有实质歌词（>40B，排除「纯音乐」等占位行）但主源无翻译时，
+    // 跨源补齐。缓存命中直接回填，避免重复聚合搜索。
+    if result.lyric.trim().len() > 40 && result.tlyric.trim().is_empty() {
+        let cache_key = format!("{}:{}", source, song_info.songmid);
+        if let Some(cached) = cache_get_translation(&cache_key) {
+            result.tlyric = cached;
+        } else {
+            let translation = fetch_translation_cross_source(&source, &song_info).await;
+            if !translation.trim().is_empty() {
+                result.tlyric = translation.clone();
+                cache_put_translation(cache_key, translation);
+            }
+        }
+    }
+    Ok(Some(result))
 }
 
 #[cfg(test)]
@@ -2730,6 +2905,45 @@ mod lx_chain_tests {
             assert!(!media_url.is_empty(), "{source} 订阅源未返回播放地址");
             assert!(lx_len > 0, "{source} 内置链路应有逐字歌词");
         }
+    }
+
+    /// 翻译跨源聚合端到端：A Little Love-冯曦妤 的 tx 官方接口不返回 trans
+    /// 字段（实测 transLen=0），主源歌词有但无翻译——聚合应从其他源
+    /// （kg/wy/mg）补齐翻译。运行：`cargo test -- --ignored --nocapture tx_a_little_love`
+    #[tokio::test]
+    #[ignore = "依赖网络与搜索接口可用性"]
+    async fn tx_a_little_love_translation_aggregation() {
+        let song_info = LyricSongInfo {
+            songmid: "001IAqkK0p2b7s".to_string(),
+            hash: None,
+            name: "A Little Love".to_string(),
+            singer: "冯曦妤".to_string(),
+            album_name: None,
+            interval: None,
+            interval_ms: None,
+            song_id: None,
+            str_media_mid: None,
+            album_mid: None,
+            album_id: None,
+            copyright_id: None,
+            source: Some("tx".to_string()),
+        };
+        let result = fetch_lyric_from_source("tx".to_string(), song_info)
+            .await
+            .expect("tx 歌词抓取失败")
+            .expect("tx 无歌词结果");
+        println!(
+            "A Little Love: lyric {}B lxlyric {}B tlyric {}B",
+            result.lyric.len(),
+            result.lxlyric.len(),
+            result.tlyric.len(),
+        );
+        if !result.tlyric.is_empty() {
+            let head: String = result.tlyric.chars().take(120).collect();
+            println!("---- tlyric head ----\n{head}");
+        }
+        assert!(!result.lyric.trim().is_empty(), "主歌词不应为空");
+        assert!(!result.tlyric.trim().is_empty(), "聚合后应有翻译歌词");
     }
 
     /// 调试用：网易 song_id=1901371647（陈奕迅 - 孤勇者，确认有 YRC）直测逐字链路。

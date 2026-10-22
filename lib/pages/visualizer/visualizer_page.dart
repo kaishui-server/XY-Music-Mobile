@@ -370,11 +370,13 @@ class _VisualizerPageState extends ConsumerState<VisualizerPage>
               ),
             ),
             // 歌词覆盖层（设置驱动：模式/字号/颜色/字体）。
+            // 手势分区：左带（40% 宽）归歌词（拖动滚动 / 点行跳转），
+            // 右带留给场景层（拖动=轨道视角旋转，单击=涟漪波纹）。
             Positioned(
               left: 16,
-              right: 24,
               top: 0,
               bottom: 140,
+              width: MediaQuery.of(context).size.width * 0.40,
               child: _LyricsOverlay(
                 offsetTenths: _lyricsOffsetTenths,
                 settings: settings,
@@ -603,7 +605,7 @@ class _VisualizerPageState extends ConsumerState<VisualizerPage>
           0, 0, 0, 0.5, 0,
         ]),
     );
-    // ② 径向遮罩（radialMask：从中心立即衰减）。
+    // ② 径向遮罩（radialMask：边缘缓出，保留主体可读）。
     c.saveLayer(dst, Paint());
     c.drawRect(
       dst,
@@ -611,22 +613,22 @@ class _VisualizerPageState extends ConsumerState<VisualizerPage>
         ..blendMode = ui.BlendMode.dstIn
         ..shader = ui.Gradient.radial(
           const Offset(size / 2, size / 2),
-          size * 0.62,
+          size * 0.85,
           [const Color(0xFFFFFFFF), const Color(0x00FFFFFF)],
           [0.0, 1.0],
         ),
     );
     c.restore();
-    // ③ 垂直遮罩（horizonMask：smoothstep(0.05,0.45,v)，顶亮底隐）。
+    // ③ 垂直遮罩（horizonMask：上部全显，向下 55%→95% 渐隐入地平线）。
     c.saveLayer(dst, Paint());
     c.drawRect(
       dst,
       Paint()
         ..blendMode = ui.BlendMode.dstIn
         ..shader = ui.Gradient.linear(
-          const Offset(0, size * 0.05),
-          const Offset(0, size * 0.45),
-          [const Color(0x00FFFFFF), const Color(0xFFFFFFFF)],
+          const Offset(0, size * 0.55),
+          const Offset(0, size * 0.95),
+          [const Color(0xFFFFFFFF), const Color(0x00FFFFFF)],
         ),
     );
     c.restore();
@@ -1155,24 +1157,22 @@ class _SettingsDrawer extends ConsumerWidget {
     _DrawerSection.lyrics,
     _DrawerSection.detect,
   ];
+  // 图标栏（对齐参考图：垂直图标列，选中项圆角描边高亮）。
+  static const _sectionIcons = [
+    Icons.palette_outlined, // 主题配色
+    Icons.equalizer_rounded, // 地形均衡器
+    Icons.view_in_ar_rounded, // 悬浮方块
+    Icons.monitor_heart_outlined, // 脉冲触发
+    Icons.auto_awesome_outlined, // 流星触发
+    Icons.music_note_outlined, // 歌词设置
+    Icons.graphic_eq_rounded, // 音频检测
+  ];
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final visible = section != _DrawerSection.none;
     final settings = ref.watch(visualizerSettingsProvider);
     final notifier = ref.read(visualizerSettingsProvider.notifier);
-
-    Widget header(String title) => Padding(
-          padding: const EdgeInsets.only(top: 4, bottom: 2),
-          child: Text(
-            title,
-            style: const TextStyle(
-              color: Colors.white,
-              fontSize: 15,
-              fontWeight: FontWeight.bold,
-            ),
-          ),
-        );
 
     Widget hint(String text) => Padding(
           padding: const EdgeInsets.only(top: 4),
@@ -1271,17 +1271,47 @@ class _SettingsDrawer extends ConsumerWidget {
               child: BackdropFilter(
                 filter: ImageFilter.blur(sigmaX: 22, sigmaY: 22),
                 child: Container(
-                  width: 300,
+                  width: 332,
                   color: Colors.black.withValues(alpha: 0.62),
-                  child: SafeArea(
-                    child: ListView(
-                      padding: const EdgeInsets.fromLTRB(18, 14, 18, 24),
-                      children: [
+                  child: Row(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      // 左缘图标栏（选中项圆角描边高亮，对齐参考图）。
+                      Container(
+                        width: 56,
+                        color: Colors.black.withValues(alpha: 0.35),
+                        child: SafeArea(
+                          top: false,
+                          child: Column(
+                            children: [
+                              const SizedBox(height: 10),
+                              for (int i = 0; i < _sectionOrder.length; i++)
+                                _railIcon(
+                                  i,
+                                  selected: section == _sectionOrder[i],
+                                  onTap: () =>
+                                      onSectionChanged(_sectionOrder[i]),
+                                ),
+                            ],
+                          ),
+                        ),
+                      ),
+                      // 右侧内容面板。
+                      Expanded(
+                        child: SafeArea(
+                          top: false,
+                          child: ListView(
+                            padding:
+                                const EdgeInsets.fromLTRB(16, 14, 16, 24),
+                            children: [
                         Row(
                           children: [
                             Expanded(
                               child: Text(
-                                '可视化设置',
+                                section == _DrawerSection.none
+                                    ? '可视化设置'
+                                    : _sectionLabels[
+                                        _sectionOrder.indexOf(section)],
                                 style: const TextStyle(
                                   color: Colors.white,
                                   fontSize: 17,
@@ -1308,32 +1338,9 @@ class _SettingsDrawer extends ConsumerWidget {
                               ? VisualizerForm.terrain
                               : VisualizerForm.nebula),
                         ),
-                        const SizedBox(height: 10),
-                        // 分节标签（横向滚动）。
-                        SingleChildScrollView(
-                          scrollDirection: Axis.horizontal,
-                          child: Row(
-                            children: [
-                              for (int i = 0; i < _sectionLabels.length; i++)
-                                Padding(
-                                  padding: EdgeInsets.only(
-                                      right: i == _sectionLabels.length - 1
-                                          ? 0
-                                          : 6),
-                                  child: _sectionChip(
-                                    _sectionLabels[i],
-                                    active: section == _sectionOrder[i],
-                                    onTap: () =>
-                                        onSectionChanged(_sectionOrder[i]),
-                                  ),
-                                ),
-                            ],
-                          ),
-                        ),
                         const SizedBox(height: 12),
                         // —— 主题配色 ——
                         if (section == _DrawerSection.theme) ...[
-                          header('主题配色'),
                           const SizedBox(height: 8),
                           Row(
                             mainAxisAlignment: MainAxisAlignment.spaceBetween,
@@ -1383,7 +1390,6 @@ class _SettingsDrawer extends ConsumerWidget {
                         ]
                         // —— 地形均衡器 ——
                         else if (section == _DrawerSection.groundEq) ...[
-                          header('地形均衡器'),
                           const SizedBox(height: 4),
                           for (int i = 0; i < kEqBandNames.length; i++)
                             _eqRow(
@@ -1425,7 +1431,6 @@ class _SettingsDrawer extends ConsumerWidget {
                         ]
                         // —— 悬浮方块 ——
                         else if (section == _DrawerSection.blocks) ...[
-                          header('悬浮方块'),
                           _switchTile(
                             '启用',
                             settings.blocksEnabled,
@@ -1473,7 +1478,6 @@ class _SettingsDrawer extends ConsumerWidget {
                         ]
                         // —— 脉冲触发 ——
                         else if (section == _DrawerSection.pulse) ...[
-                          header('脉冲触发'),
                           ...triggerSection(
                             enabled: settings.kickEnabled,
                             onEnabled: (v) => notifier
@@ -1497,7 +1501,6 @@ class _SettingsDrawer extends ConsumerWidget {
                         ]
                         // —— 流星触发 ——
                         else if (section == _DrawerSection.meteor) ...[
-                          header('流星触发'),
                           ...triggerSection(
                             enabled: settings.meteorEnabled,
                             onEnabled: (v) => notifier
@@ -1518,7 +1521,6 @@ class _SettingsDrawer extends ConsumerWidget {
                         ]
                         // —— 歌词设置 ——
                         else if (section == _DrawerSection.lyrics) ...[
-                          header('歌词设置'),
                           const SizedBox(height: 8),
                           _segmentTabs(
                             labels: const ['经典', '弹跳', '3D空间'],
@@ -1616,7 +1618,6 @@ class _SettingsDrawer extends ConsumerWidget {
                         ]
                         // —— 音频检测 ——
                         else if (section == _DrawerSection.detect) ...[
-                          header('音频检测'),
                           _sliderRow(
                             '节拍检测灵敏度',
                             settings.detectLevel,
@@ -1632,39 +1633,51 @@ class _SettingsDrawer extends ConsumerWidget {
                     ),
                   ),
                 ),
-              ),
+              ],
             ),
           ),
         ),
       ),
+    ),
+  ),
+        ),
     );
   }
 
   // —— 小部件 ——
 
-  Widget _sectionChip(String label,
-      {required bool active, required VoidCallback onTap}) {
+  /// 图标栏单元（对齐参考图：圆角方框描边高亮）。
+  Widget _railIcon(int i,
+      {required bool selected, required VoidCallback onTap}) {
     return GestureDetector(
       onTap: onTap,
+      behavior: HitTestBehavior.opaque,
       child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 7),
-        decoration: BoxDecoration(
-          color: active
-              ? Colors.white.withValues(alpha: 0.16)
-              : Colors.white.withValues(alpha: 0.05),
-          borderRadius: BorderRadius.circular(10),
-          border: Border.all(
-            color: active
-                ? Colors.white.withValues(alpha: 0.4)
-                : Colors.white.withValues(alpha: 0.08),
+        width: 56,
+        height: 50,
+        alignment: Alignment.center,
+        child: Container(
+          width: 38,
+          height: 38,
+          alignment: Alignment.center,
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(10),
+            color: selected
+                ? Colors.white.withValues(alpha: 0.10)
+                : Colors.transparent,
+            border: Border.all(
+              width: 1.4,
+              color: selected
+                  ? Colors.white.withValues(alpha: 0.85)
+                  : Colors.transparent,
+            ),
           ),
-        ),
-        child: Text(
-          label,
-          style: TextStyle(
-            color: active ? Colors.white : Colors.white.withValues(alpha: 0.5),
-            fontSize: 12.5,
-            fontWeight: FontWeight.w600,
+          child: Icon(
+            _sectionIcons[i],
+            size: 20,
+            color: selected
+                ? Colors.white
+                : Colors.white.withValues(alpha: 0.45),
           ),
         ),
       ),

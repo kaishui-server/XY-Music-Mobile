@@ -5618,7 +5618,7 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
       final response = await fetchLyricFromSource(
         source: source,
         songInfoJson: jsonEncode(songInfo),
-      ).timeout(const Duration(seconds: 20));
+      ).timeout(const Duration(seconds: 25));
       if (response.trim().isEmpty || response.trim() == 'null') {
         _markLyricsAttemptedForPath(index, path);
         return;

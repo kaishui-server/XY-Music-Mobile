@@ -8,8 +8,8 @@
 //   - 噪声门限 max(0, elev-0.2)（静音时地面完全平坦）
 //   - ripple 高斯环扩散（彩色 kick 波 + 白色锐波）
 //   - 顶面发光 + 侧面暗柱 + 距离雾（远处 alpha 淡出）
-//   - 专辑封面幽灵层（140×140 平面 @ (110,24,-110) rotY(-45°)，
-//     对齐 MapScene 的 COVER_SCREEN_POSITION/ROTATION）
+//   - 专辑封面幽灵层（88×88 平面 @ (105,26,-105) rotY(-45°)，
+//     悬浮地形上空偏右上，对齐参考版观感）
 //   渲染走 CPU 投影 + ui.Vertices 单次提交，无 saveLayer。
 //
 // ②星云：对数螺旋星系盘（双臂 + 差速旋转 + 亮核呼吸 + 频段外扩 +
@@ -103,21 +103,21 @@ _Palette _paletteFor(VisTheme theme) {
   final dim = Color(theme.dim);
   final main = Color(theme.main);
   final accent = Color(theme.accent);
-  double dr(int v) => v / 255;
+  double dr(num v) => v / 255;
   // base1/2：由 dim 深化（对齐默认 (0.01,0.02,0.04)/(0.03,0.05,0.09) 的暗度级别）。
   double d1(int v) => dr(v) * 0.16;
   double d2(int v) => dr(v) * 0.34;
-  // warm 系：从 accent/main 向暖色收敛（对齐默认 warmCore(1,.2,.1)/warmEdge(1,.6,0)）。
-  double mixc(double a, double b, double t) => a + (b - a) * t;
+  // warm（能量）系：由主题色本身向白提亮派生（中心热区 accent+45% 白、
+  // 热区边缘 main+25% 白）。不再收敛到固定橙红——此前 70% 固定橙红导致
+  // 五个主题的地形主体颜色几乎一致，换主题看起来「只改了脉冲颜色」。
+  double hw(num v, double t) => dr(v) + (1.0 - dr(v)) * t;
   return _Palette(
     d1(dim.red), d1(dim.green), d1(dim.blue),
     d2(dim.red), d2(dim.green), d2(dim.blue),
     dr(accent.red), dr(accent.green), dr(accent.blue),
     dr(main.red), dr(main.green), dr(main.blue),
-    mixc(dr(accent.red), 1.0, 0.7), mixc(dr(accent.green), 0.2, 0.7),
-    mixc(dr(accent.blue), 0.1, 0.7),
-    mixc(dr(main.red), 1.0, 0.7), mixc(dr(main.green), 0.6, 0.7),
-    mixc(dr(main.blue), 0.0, 0.7),
+    hw(accent.red, 0.45), hw(accent.green, 0.45), hw(accent.blue, 0.45),
+    hw(main.red, 0.25), hw(main.green, 0.25), hw(main.blue, 0.25),
     dr(accent.red), dr(accent.green), dr(accent.blue),
   );
 }
@@ -710,8 +710,10 @@ class TerrainScenePainter extends CustomPainter {
     }
   }
 
-  /// 封面幽灵层：140×140 平面 @ (110,24,-110)，rotY(-π/4) 起始、
-  /// 按「旋转速度」缓慢自旋；脉冲对齐 MapScene：uPulse = bass*0.4 + subBass*0.2。
+  /// 封面幽灵层：88×88 平面 @ (105,26,-105)（移动端横屏默认机位下
+  /// 约占屏高 46%、悬于地形上空偏右上，对齐参考版观感），rotY(-π/4)
+  /// 起始、按「旋转速度」缓慢自旋；脉冲对齐 MapScene：
+  /// uPulse = bass*0.4 + subBass*0.2。
   void _paintCover(Canvas canvas, CameraRig rig, BandPartition a) {
     final img = f.coverImage;
     if (img == null || !f.settings.showCover) return;
@@ -720,8 +722,8 @@ class TerrainScenePainter extends CustomPainter {
     final ang = -math.pi / 4 + f.time * f.settings.rotationSpeed * 0.6;
     final ca = math.cos(ang), sa = math.sin(ang);
     // 四角投影检查（在视野内才画）。
-    const cx0 = 110.0, cy0 = 24.0, cz0 = -110.0;
-    const half = 70.0;
+    const cx0 = 105.0, cy0 = 26.0, cz0 = -105.0;
+    const half = 44.0;
     final c0 = rig.project(cx0 - half * ca, cy0 + half, cz0 + half * sa);
     final c1 = rig.project(cx0 + half * ca, cy0 + half, cz0 - half * sa);
     final c2 = rig.project(cx0 + half * ca, cy0 - half, cz0 - half * sa);
@@ -789,14 +791,14 @@ Float64List _coverMvp(CameraRig rig, double ang) {
     rig.rz, rig.uz, -rig.fz, 0,
     -rp, -up, fp, 1,
   ]);
-  // 模型：rotY(ang) + 平移 (110,24,-110)。
+  // 模型：rotY(ang) + 平移 (105,26,-105)。
   final k = math.cos(ang);
   final s2 = math.sin(ang);
   final m = Float64List.fromList(<double>[
     k, 0, -s2, 0,
     0, 1, 0, 0,
     s2, 0, k, 0,
-    110, 24, -110, 1,
+    105, 26, -105, 1,
   ]);
   // 视口：x=(x+1)/2*w，y=(1-y)/2*h。
   final s = Float64List.fromList(<double>[
