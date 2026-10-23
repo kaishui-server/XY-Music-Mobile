@@ -506,8 +506,9 @@ class _VisualizerPageState extends ConsumerState<VisualizerPage>
   }
 
   /// 封面幽灵层加载：在线封面走代理落盘缓存，本地歌走 ID3 提取；
-  /// 解码后预渲染「低饱和提亮 + 径向/垂直渐隐遮罩」版本（对齐
-  /// CoverShaderMaterial：baseOpacity 0.5、radialMask、horizonMask）。
+  /// 双尺寸解码（解码器直出、零离屏）：内层 512px 清晰纹理承载中心
+  /// 轮廓，外层 64px 纹理 GPU 放大即强柔焦承载雾环；暗化/去饱和/径向
+  /// 与垂直渐隐全部由顶点色承载（ghost_cover.ghostVertexColor）。
   Future<void> _loadCover(QueueItem? item) async {
     try {
       final songPath = item?.path ?? '';
@@ -560,12 +561,28 @@ class _VisualizerPageState extends ConsumerState<VisualizerPage>
         return;
       }
       final bytes = await File(coverPath).readAsBytes();
-      final codec =
+      // 双尺寸解码：instantiateImageCodec 直出（5542/5545 实锤离屏烘焙
+      // 管线在 Impeller 真机不可靠，解码器直出才是跨端一致的产物）。
+      final sharpCodec =
           await ui.instantiateImageCodec(bytes, targetWidth: 512);
-      final src = await codec.getNextFrame();
-      final textures = await buildGhostTextures(src.image);
-      src.image.dispose();
-      if (!mounted) return;
+      final sharp = (await sharpCodec.getNextFrame()).image;
+      ui.Image? blur;
+      try {
+        final blurCodec =
+            await ui.instantiateImageCodec(bytes, targetWidth: 64);
+        blur = (await blurCodec.getNextFrame()).image;
+      } catch (_) {
+        // 64px 解码失败时降级：雾环复用清晰纹理（仅柔焦程度不同）。
+      }
+      final textures = buildGhostTextures(
+        sharpSrc: sharp,
+        blurSrc: blur ?? sharp,
+      );
+      if (!mounted) {
+        sharp.dispose();
+        blur?.dispose();
+        return;
+      }
       setState(() {
         _coverImage?.dispose();
         _coverImage = textures;

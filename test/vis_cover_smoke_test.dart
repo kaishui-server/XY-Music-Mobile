@@ -46,7 +46,8 @@ void main() {
     final bands = List<double>.filled(64, 0.35);
 
     final cover = await _solidImage(256, 255, 40, 40);
-    final ghost = await buildGhostTextures(cover);
+    // 零离屏直通：雾环降级复用同一纹理（仅柔焦程度不同，与 page 一致）。
+    final ghost = buildGhostTextures(sharpSrc: cover, blurSrc: cover);
 
     VisFrame make(VisualizerSettings s, GhostTextures? img) => VisFrame(
           bands: bands,

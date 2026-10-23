@@ -23,7 +23,12 @@ import 'dart:ui' as ui;
 /// 纹理生成是纯 Dart 像素循环（压暗 ×0.66、降饱和 ×0.5），结果与设备
 /// 无关；不在这里做模糊/遮罩。
 
-/// 双层纹理：[sharp] 内层清晰 / [blur] 外层雾环。
+/// 双层纹理：[sharp] 内层清晰（建议 512px 解码）/ [blur] 外层雾环
+/// （建议 64px 解码，GPU 放大即强柔焦）。纹理即解码器直出的原始封面——
+/// **不做任何离屏加工**：5542/5545 两次实测 Impeller 真机上
+/// PictureRecorder.toImage + toByteData 回读不可靠（测试环境全过、真机
+/// 产物损坏导致封面不显示），暗化/饱和/雾化全部改由顶点色承载（GPU
+/// modulate，见 ghostVertexColor）。
 class GhostTextures {
   const GhostTextures({required this.sharp, required this.blur});
   final ui.Image sharp;
@@ -34,49 +39,12 @@ class GhostTextures {
   }
 }
 
-/// 生成双层暗化纹理（sharp=256px / blur=64px）。
-Future<GhostTextures> buildGhostTextures(ui.Image src) async {
-  final sharp = await _bakeDimmed(src, 256);
-  final blur = await _bakeDimmed(src, 64);
-  return GhostTextures(sharp: sharp, blur: blur);
-}
-
-Future<ui.Image> _bakeDimmed(ui.Image src, int side) async {
-  final rec = ui.PictureRecorder();
-  final c = ui.Canvas(
-    rec,
-    ui.Rect.fromLTWH(0, 0, side.toDouble(), side.toDouble()),
-  );
-  c.drawImageRect(
-    src,
-    ui.Rect.fromLTWH(0, 0, src.width.toDouble(), src.height.toDouble()),
-    ui.Rect.fromLTWH(0, 0, side.toDouble(), side.toDouble()),
-    ui.Paint()..filterQuality = ui.FilterQuality.high,
-  );
-  final pic = rec.endRecording();
-  final small = await pic.toImage(side, side);
-  pic.dispose();
-  final data = await small.toByteData(format: ui.ImageByteFormat.rawRgba);
-  small.dispose();
-  final px = data!.buffer.asUint8List();
-  const wr = 0.299, wg = 0.587, wb = 0.114;
-  const sat = 0.5, dim = 0.66;
-  for (var o = 0; o < px.length; o += 4) {
-    if (px[o + 3] == 0) continue;
-    final gray = wr * px[o] + wg * px[o + 1] + wb * px[o + 2];
-    px[o] = _clamp255(dim * (gray + sat * (px[o] - gray)));
-    px[o + 1] = _clamp255(dim * (gray + sat * (px[o + 1] - gray)));
-    px[o + 2] = _clamp255(dim * (gray + sat * (px[o + 2] - gray)));
-  }
-  final completer = Completer<ui.Image>();
-  ui.decodeImageFromPixels(
-    px,
-    side,
-    side,
-    ui.PixelFormat.rgba8888,
-    completer.complete,
-  );
-  return completer.future;
+/// 组装双层纹理（调用方用 instantiateImageCodec 分别解码两个尺寸）。
+GhostTextures buildGhostTextures({
+  required ui.Image sharpSrc,
+  required ui.Image blurSrc,
+}) {
+  return GhostTextures(sharp: sharpSrc, blur: blurSrc);
 }
 
 /// 单层幽灵网格顶点颜色：径向包络 × 垂直渐隐 × 雾气波动 × 亮度。
@@ -108,10 +76,15 @@ int ghostVertexColor(
   }
   final a =
       (baseAlpha * radial * vert * mist * 255).round().clamp(0, 255);
-  final rgb = (bright * 255).round().clamp(0, 255);
+  // 乘性暗化（沉入夜空）：纹理是解码器直出的原封面，原 CPU 管线的
+  // 压暗×0.66 + 降饱和改由顶点色 GPU 调制承载——偏蓝的中性暗色把封面
+  // 压进夜空底色（5539 教训：向白提亮会冲淡饱和发灰，故只压不提）。
+  final r = _clamp255(bright * 0.62 * 255);
+  final g = _clamp255(bright * 0.66 * 255);
+  final b = _clamp255(bright * 0.74 * 255);
   // 顶点色未预乘（drawVertices 按 non-premultiplied 处理后与纹理相乘，
   // 再经 paint 混合上屏）。
-  return (a << 24) | (rgb << 16) | (rgb << 8) | rgb;
+  return (a << 24) | (r << 16) | (g << 8) | b;
 }
 
 /// 径向包络（d=归一化径向距离，0 中心 → 1 边缘 → 1.41 四角）：

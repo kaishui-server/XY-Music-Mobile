@@ -7814,6 +7814,10 @@ class PluginRuntimeService {
           'url': source.url,
           'headers': source.headers,
           'lyrics': source.lyrics,
+          // ekey 必须随结果跨 isolate 回传：QQ L1/L2 插件返回 *.mflac
+          // 加密流时，代理层靠它做 QMC 逐块解密（此前仅序列化
+          // url/headers/lyrics，真机上 ekey 恒为 null → Source error）。
+          'ekey': source.ekey,
         };
         break;
       case 'probeMediaSource':
