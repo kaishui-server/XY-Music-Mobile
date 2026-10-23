@@ -8436,7 +8436,7 @@ class _PluginProxyHttpClient extends http.BaseClient {
     try {
       final responseJson = await pluginHttpRequestBinary(
         method: method,
-        url: url,
+        url: rewriteSourceApiPlainRequest(url),
         headersJson: headersJson,
         body: body,
         // 8s：正常音源 1~3s 返回；死源（明文被拦/服务器挂）等待越久，
@@ -8450,6 +8450,24 @@ class _PluginProxyHttpClient extends http.BaseClient {
     } catch (_) {
       return null;
     }
+  }
+
+  /// QQ Source API 兼容：MusicFree 插件（L1/L2）固定 encrypted=1 请求
+  /// 加密流（*.mflac + ekey），XY 插件引擎无 QMC 解密器，ekey 被丢弃后
+  /// 加密流无法播放（真机 5543 日志：代理请求 *.mflac → Source error，
+  /// 弦予/MusicFree 能播是因为它们内置 QMC 解密）。Source API 的
+  /// encrypted=0 返回明文直链（全档实测可用），故在引擎网络层拦截改写，
+  /// 插件生态 L1/L2 全档直接可播。仅命中 /source/song 路径，足够特化。
+  static String rewriteSourceApiPlainRequest(String url) {
+    if (!url.contains('encrypted=1')) return url;
+    final uri = Uri.tryParse(url);
+    if (uri == null || !uri.path.contains('/source/song')) return url;
+    return uri
+        .replace(queryParameters: <String, String>{
+          ...uri.queryParameters,
+          'encrypted': '0',
+        })
+        .toString();
   }
 
   /// 判断插件 HTTP 响应是否为 text/html 页面（运营商拦截页特征）。

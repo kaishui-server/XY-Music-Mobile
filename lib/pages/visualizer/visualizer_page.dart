@@ -561,7 +561,7 @@ class _VisualizerPageState extends ConsumerState<VisualizerPage>
       final codec =
           await ui.instantiateImageCodec(bytes, targetWidth: 256);
       final src = await codec.getNextFrame();
-      final masked = await buildGhostCover(src.image);
+      final masked = await buildGhostTexture(src.image);
       src.image.dispose();
       if (!mounted) return;
       setState(() {

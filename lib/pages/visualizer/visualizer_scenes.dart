@@ -24,6 +24,7 @@ import 'package:flutter/material.dart';
 
 import 'visualizer_engine.dart';
 import 'visualizer_settings.dart';
+import 'ghost_cover.dart';
 
 /// 每帧渲染输入。
 class VisFrame {
@@ -827,19 +828,24 @@ class TerrainScenePainter extends CustomPainter {
     // 这正是 5538 封面幽灵层完全不可见的根因）。
     canvas.scale(1, -1);
     final bright = 1.0 + coverPulse * 0.3;
-    canvas.drawImageRect(
-      img,
-      Rect.fromLTWH(0, 0, img.width.toDouble(), img.height.toDouble()),
-      Rect.fromLTRB(-half, -half, half, half),
-      Paint()
-        ..filterQuality = FilterQuality.medium
-        ..colorFilter = ColorFilter.matrix(<double>[
-          bright, 0, 0, 0, 0,
-          0, bright, 0, 0, 0,
-          0, 0, bright, 0, 0,
-          0, 0, 0, 1, 0,
-        ]),
+    // 顶点色网格渲染（对齐 LX-X「天空中的圆形雾化投影」）：径向雾化
+    // （中心全显→四角完全消融）与垂直渐隐编码在顶点色 alpha，GPU 逐
+    // 像素插值；纹理为 128px 暗化小图（CPU 烘焙），GPU 放大自然柔焦。
+    // 不用 drawImageRect+离屏遮罩：Impeller 离屏管线 dstIn/toByteData
+    // 回读不可靠（5540-5543 真机矩形轮廓始终清晰），顶点色与地形网格
+    // 同一条管线，真机长期验证可靠。
+    final verts = buildGhostVertices(
+      half: half,
+      bright: bright,
+      textureW: img.width,
+      textureH: img.height,
     );
+    canvas.drawVertices(
+      verts,
+      BlendMode.srcOver,
+      Paint()..filterQuality = FilterQuality.medium,
+    );
+    verts.dispose();
     canvas.restore();
   }
 

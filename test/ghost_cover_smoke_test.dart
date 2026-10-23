@@ -1,7 +1,7 @@
-// 冒烟测试：验证封面幽灵层烘焙管线（buildGhostCover）的实际输出。
-// 5540/5541 曾因 Impeller 离屏管线上 dstIn 遮罩与 imageFilter+colorFilter
-// 组合失效，封面矩形轮廓始终清晰；管线改为多级降采样 + CPU 逐像素后，
-// 输出必须满足：四角完全消融、中心可见、边缘弱于中心、整体压暗。
+// 冒烟测试：验证封面幽灵层「CPU 暗化纹理 + 顶点色雾化网格」管线。
+// 5540-5543 实测 Impeller 离屏管线上 dstIn 遮罩/toByteData 回读不可靠
+// （真机矩形轮廓始终清晰），故雾化改由顶点色承载（drawVertices 与地
+// 形网格同管线），纹理只做 CPU 压暗降饱和（纯 Dart、与设备无关）。
 
 import 'dart:ui' as ui;
 
@@ -34,27 +34,43 @@ Future<List<int>> _pixel(ui.Image image, int x, int y) async {
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
 
-  test('ghost cover: corners dissolved, center visible, dimmed', () async {
+  test('ghost texture: 128px, dimmed and desaturated, alpha intact',
+      () async {
     final src = await _solidImage(256, 220, 60, 60);
-    final out = await buildGhostCover(src);
-    expect(out.width, 256);
-    expect(out.height, 256);
+    final tex = await buildGhostTexture(src);
+    expect(tex.width, 128);
+    expect(tex.height, 128);
 
-    // 四角完全消融（无矩形轮廓）。
-    for (final (x, y) in [(2, 2), (253, 2), (2, 253), (253, 253)]) {
-      final p = await _pixel(out, x, y);
-      expect(p[3], 0, reason: '四角($x,$y)应完全透明，alpha=${p[3]}');
+    final center = await _pixel(tex, 64, 64);
+    // alpha 不动（雾化交给顶点色），RGB 压暗降饱和。
+    expect(center[3], 255);
+    expect(center[0], lessThan(220), reason: 'R 应被压暗：${center[0]}');
+  });
+
+  test('ghost vertex colors: corners dissolved, center visible', () {
+    const base = 0.62;
+    int alphaAt(double fx, double fy) {
+      final c = ghostVertexColor(fx, fy, bright: 1.0, baseAlpha: base);
+      return (c >> 24) & 0xFF;
     }
 
-    // 中心可见（降采样放大后中心即源色）。
-    final center = await _pixel(out, 128, 128);
-    expect(center[3], greaterThan(80), reason: '中心应可见，alpha=${center[3]}');
-
-    // 边缘中点弱于中心（雾化收边）。
-    final edge = await _pixel(out, 128, 2);
-    expect(edge[3], lessThan(center[3]), reason: '上边缘应弱于中心');
-
-    // 整体压暗降饱和：中心通道 ≤ 源色（0.66×灰度偏移后不可能超过源值）。
-    expect(center[0], lessThan(220), reason: 'R 应被压暗，r=${center[0]}');
+    // 四角完全消融（圆形雾化投影，无矩形轮廓）。
+    expect(alphaAt(0, 0), 0, reason: '左上角应透明');
+    expect(alphaAt(1, 0), 0, reason: '右上角应透明');
+    expect(alphaAt(0, 1), 0, reason: '左下角应透明');
+    expect(alphaAt(1, 1), 0, reason: '右下角应透明');
+    // 中心全显（baseAlpha=0.62 → ~158）。
+    final center = alphaAt(0.5, 0.5);
+    expect(center, greaterThan(120));
+    expect(center, lessThan(200));
+    // 边中点弱于中心（雾化收边）。
+    expect(alphaAt(0.5, 0.0), lessThan(center), reason: '顶边中点应弱于中心');
+    // 底部垂直渐隐。
+    expect(alphaAt(0.5, 1.0), 0, reason: '底缘应完全渐隐');
+    // 脉冲提亮只改 RGB（1.3×255 截断到 255），alpha 不受影响。
+    final bright =
+        ghostVertexColor(0.5, 0.5, bright: 1.3, baseAlpha: base);
+    expect((bright >> 16) & 0xFF, 255);
+    expect((bright >> 24) & 0xFF, center);
   });
 }
