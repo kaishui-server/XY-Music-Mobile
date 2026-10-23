@@ -233,6 +233,8 @@ class AppSettings {
     // 列表中的网络歌曲（导入歌单/搜索结果）是否加载网络封面。
     this.showPlaylistSongCovers = true,
     this.onlineDefaultQuality = '320k',
+    this.qqSourceApiKey = '',
+    this.qqSourceApiUrl = '',
     this.libraryMinDurationSeconds = 0,
     this.showLyricsTranslation = true,
     // 播放详情页歌词页：单击歌词行调整播放进度（默认开启）。
@@ -352,6 +354,14 @@ class AppSettings {
   /// 大歌单的打开速度；本地歌曲封面走本地缓存，不受影响。
   final bool showPlaylistSongCovers;
   final String onlineDefaultQuality;
+
+  /// QQ 音乐 Source API 卡密（X-API-KEY）。配置后 QQ（tx）歌曲的播放
+  /// 解析优先走 Source API（与 MusicFree L1/L2 插件同通道），支持
+  /// 母带/全景声等全部档位；留空时仅使用洛雪音源脚本解析。
+  final String qqSourceApiKey;
+
+  /// Source API 接口地址，留空使用默认地址。
+  final String qqSourceApiUrl;
   final int libraryMinDurationSeconds;
   final bool showLyricsTranslation;
 
@@ -458,6 +468,8 @@ class AppSettings {
     bool? showQualityBadges,
     bool? showPlaylistSongCovers,
     String? onlineDefaultQuality,
+    String? qqSourceApiKey,
+    String? qqSourceApiUrl,
     int? libraryMinDurationSeconds,
     bool? showLyricsTranslation,
     bool? lyricTapSeek,
@@ -545,6 +557,8 @@ class AppSettings {
       showPlaylistSongCovers:
           showPlaylistSongCovers ?? this.showPlaylistSongCovers,
       onlineDefaultQuality: onlineDefaultQuality ?? this.onlineDefaultQuality,
+      qqSourceApiKey: qqSourceApiKey ?? this.qqSourceApiKey,
+      qqSourceApiUrl: qqSourceApiUrl ?? this.qqSourceApiUrl,
       libraryMinDurationSeconds:
           libraryMinDurationSeconds ?? this.libraryMinDurationSeconds,
       showLyricsTranslation:
@@ -686,6 +700,8 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
       showPlaylistSongCovers:
           prefs.getBool('showPlaylistSongCovers') ?? true,
       onlineDefaultQuality: prefs.getString('onlineDefaultQuality') ?? '320k',
+      qqSourceApiKey: prefs.getString('qqSourceApiKey') ?? '',
+      qqSourceApiUrl: prefs.getString('qqSourceApiUrl') ?? '',
       libraryMinDurationSeconds: prefs.getInt('libraryMinDurationSeconds') ?? 0,
       showLyricsTranslation: prefs.getBool('showLyricsTranslation') ?? true,
       lyricTapSeek: prefs.getBool('lyricTapSeek') ?? true,
@@ -934,6 +950,8 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
       prefs.setBool('showQualityBadges', next.showQualityBadges),
       prefs.setBool('showPlaylistSongCovers', next.showPlaylistSongCovers),
       prefs.setString('onlineDefaultQuality', next.onlineDefaultQuality),
+      prefs.setString('qqSourceApiKey', next.qqSourceApiKey),
+      prefs.setString('qqSourceApiUrl', next.qqSourceApiUrl),
       prefs.setInt('libraryMinDurationSeconds', next.libraryMinDurationSeconds),
       prefs.setBool('showLyricsTranslation', next.showLyricsTranslation),
       prefs.setBool('lyricTapSeek', next.lyricTapSeek),
@@ -1207,6 +1225,12 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
     (state.valueOrNull ?? const AppSettings()).copyWith(
       onlineDefaultQuality: q,
     ),
+  );
+  Future<void> setQqSourceApiKey(String v) => _save(
+    (state.valueOrNull ?? const AppSettings()).copyWith(qqSourceApiKey: v),
+  );
+  Future<void> setQqSourceApiUrl(String v) => _save(
+    (state.valueOrNull ?? const AppSettings()).copyWith(qqSourceApiUrl: v),
   );
   Future<void> setLibraryMinDurationSeconds(int s) => _save(
     (state.valueOrNull ?? const AppSettings()).copyWith(

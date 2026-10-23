@@ -878,83 +878,51 @@ fn tx_handle_result(raw_list: &serde_json::Value) -> Vec<LxSearchItem> {
         let mut types = Vec::new();
         let mut lx_types = HashMap::new();
 
-        let size_128 = file
-            .get("size_128mp3")
-            .and_then(|v| v.as_f64())
-            .unwrap_or(0.0);
-        let size_320 = file
-            .get("size_320mp3")
-            .and_then(|v| v.as_f64())
-            .unwrap_or(0.0);
-        let size_flac = file
-            .get("size_flac")
-            .and_then(|v| v.as_f64())
-            .unwrap_or(0.0);
-        let size_hires = file
-            .get("size_hires")
-            .and_then(|v| v.as_f64())
-            .unwrap_or(0.0);
-
-        if size_128 > 0.0 {
-            let s = size_formate(size_128);
+        // 与 MusicFree L1/L2 插件 parseQualities 对齐：解析 QQ 下发的全部
+        // 档位与大小（size_new[0]=臻品母带、[1]=全景声、[2]=全景声2.0、
+        // [4]=黑胶）。声明档位连同大小进 types/lx_types，音质选择器无需
+        // 逐档联网探测即可摆出完整列表，切换低音质后高档也不会消失。
+        let size_new = file.get("size_new").and_then(|v| v.as_array());
+        let mut push_type = |token: &str, bytes: f64| {
+            if bytes <= 0.0 {
+                return;
+            }
+            let s = size_formate(bytes);
             types.push(LxTypeTuple {
-                quality_type: "128k".into(),
+                quality_type: token.to_string(),
                 size: Some(s.clone()),
                 hash: None,
             });
             lx_types.insert(
-                "128k".into(),
+                token.to_string(),
                 LxTypeEntry {
                     size: Some(s),
                     hash: None,
                 },
             );
-        }
-        if size_320 > 0.0 {
-            let s = size_formate(size_320);
-            types.push(LxTypeTuple {
-                quality_type: "320k".into(),
-                size: Some(s.clone()),
-                hash: None,
-            });
-            lx_types.insert(
-                "320k".into(),
-                LxTypeEntry {
-                    size: Some(s),
-                    hash: None,
-                },
-            );
-        }
-        if size_flac > 0.0 {
-            let s = size_formate(size_flac);
-            types.push(LxTypeTuple {
-                quality_type: "flac".into(),
-                size: Some(s.clone()),
-                hash: None,
-            });
-            lx_types.insert(
-                "flac".into(),
-                LxTypeEntry {
-                    size: Some(s),
-                    hash: None,
-                },
-            );
-        }
-        if size_hires > 0.0 {
-            let s = size_formate(size_hires);
-            types.push(LxTypeTuple {
-                quality_type: "flac24bit".into(),
-                size: Some(s.clone()),
-                hash: None,
-            });
-            lx_types.insert(
-                "flac24bit".into(),
-                LxTypeEntry {
-                    size: Some(s),
-                    hash: None,
-                },
-            );
-        }
+        };
+        let file_size = |keys: &[&str]| -> f64 {
+            keys.iter()
+                .find_map(|k| file.get(*k).and_then(|v| v.as_f64()))
+                .unwrap_or(0.0)
+        };
+        let size_new_at = |idx: usize| -> f64 {
+            size_new
+                .and_then(|a| a.get(idx))
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0)
+        };
+        push_type("96k", file_size(&["size_96ogg"]));
+        push_type("128k", file_size(&["size_128mp3"]));
+        push_type("192k", file_size(&["size_192ogg"]));
+        push_type("320k", file_size(&["size_320mp3"]));
+        push_type("flac", file_size(&["size_flac"]));
+        push_type("flac24bit", file_size(&["size_hires"]));
+        push_type("vinyl", size_new_at(4));
+        push_type("dolby", file_size(&["size_dolby"]));
+        push_type("atmos", size_new_at(1));
+        push_type("atmos_plus", size_new_at(2));
+        push_type("master", size_new_at(0));
 
         let album = item.get("album").unwrap_or(&serde_json::Value::Null);
         let album_id = album

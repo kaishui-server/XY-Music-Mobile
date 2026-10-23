@@ -1083,6 +1083,15 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
         ),
         _tile(
           context,
+          icon: Icons.vpn_key_rounded,
+          title: 'QQ音乐 Source API 卡密',
+          trailing: Text(
+            (settings?.qqSourceApiKey.isNotEmpty ?? false) ? '已配置' : '未配置',
+          ),
+          onTap: () => _editQqSourceApiKey(context, ref, settings),
+        ),
+        _tile(
+          context,
           icon: Icons.queue_music_rounded,
           title: '播放歌曲时',
           trailing: DropdownButtonHideUnderline(
@@ -2986,6 +2995,63 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
         },
       ),
     );
+  }
+
+  /// 编辑 QQ 音乐 Source API 卡密（与 MusicFree L1/L2 音源插件同通道）。
+  /// 配置后 QQ 音乐歌曲的播放/下载解析优先经该接口（支持母带/全景声等
+  /// 全部档位、明文直链），失败时回退洛雪音源脚本；留空仅用洛雪脚本。
+  Future<void> _editQqSourceApiKey(
+    BuildContext context,
+    WidgetRef ref,
+    AppSettings? settings,
+  ) async {
+    final controller = TextEditingController(
+      text: settings?.qqSourceApiKey ?? '',
+    );
+    final result = await showDialog<String>(
+      context: context,
+      useRootNavigator: true,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('QQ音乐 Source API 卡密'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text(
+              '与 MusicFree L1/L2 音源插件同通道。配置后 QQ 音乐歌曲'
+              '（含母带/臻品全景声等）优先经该接口解析，洛雪脚本兜底；'
+              '留空仅使用洛雪脚本。',
+              style: TextStyle(fontSize: 12.5),
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: controller,
+              autofocus: true,
+              maxLines: 3,
+              minLines: 1,
+              decoration: const InputDecoration(
+                hintText: '粘贴卡密（X-API-KEY）',
+                isDense: true,
+                border: OutlineInputBorder(),
+              ),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(dialogContext).pop(),
+            child: const Text('取消'),
+          ),
+          TextButton(
+            onPressed: () =>
+                Navigator.of(dialogContext).pop(controller.text.trim()),
+            child: const Text('保存'),
+          ),
+        ],
+      ),
+    );
+    if (result == null) return;
+    await ref.read(settingsProvider.notifier).setQqSourceApiKey(result);
   }
 
   Future<void> _pickQuality(

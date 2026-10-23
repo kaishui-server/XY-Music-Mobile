@@ -576,23 +576,25 @@ class _VisualizerPageState extends ConsumerState<VisualizerPage>
     }
   }
 
-  /// 封面预处理：压暗(×0.72)+降饱和(55%) → 径向渐隐 → 垂直渐隐
-  /// → 整体 alpha 0.55。对齐参考版「封面融入夜空」的暗调低对比观感
-  /// （5539 的低饱和+提亮把彩色封面洗成白雾团）。烘焙成一张图，每帧零离屏直接贴。
+  /// 封面预处理（对齐 LX-X「天空中的模糊投影」）：高斯模糊 → 压暗+降饱和
+  /// → 径向雾化（四角/边缘完全消融，无矩形轮廓）→ 垂直渐隐 → 整体 alpha。
+  /// 烘焙成一张图，每帧零离屏直接贴。
   static Future<ui.Image> _buildGhostCover(ui.Image src) async {
     const size = 256.0;
     final rec = ui.PictureRecorder();
     final c = ui.Canvas(rec, const Rect.fromLTWH(0, 0, size, size));
     final dst = const Rect.fromLTWH(0, 0, size, size);
-    // ① 颜色：out = 0.72 * (gray + 0.55*(src - gray))，无提亮平移。
+    // ① 颜色：out = 0.66 * (gray + 0.5*(src - gray))，并整体高斯模糊成
+    // 失焦投影；无提亮平移（5539 的提亮会把封面洗成白雾团）。
     const wr = 0.299, wg = 0.587, wb = 0.114;
-    const sat = 0.55, dim = 0.72;
+    const sat = 0.5, dim = 0.66;
     c.drawImageRect(
       src,
       Rect.fromLTWH(0, 0, src.width.toDouble(), src.height.toDouble()),
       dst,
       Paint()
         ..filterQuality = FilterQuality.medium
+        ..imageFilter = ui.ImageFilter.blur(sigmaX: 12, sigmaY: 12)
         ..colorFilter = ColorFilter.matrix(<double>[
           // R
           dim * (wr + sat * (1 - wr)), dim * (wg * (1 - sat)),
@@ -603,11 +605,12 @@ class _VisualizerPageState extends ConsumerState<VisualizerPage>
           // B
           dim * (wr * (1 - sat)), dim * (wg * (1 - sat)),
           dim * (wb + sat * (1 - wb)), 0, 0,
-          // A（整体透明度 0.55）
-          0, 0, 0, 0.55, 0,
+          // A（整体透明度 0.5）
+          0, 0, 0, 0.5, 0,
         ]),
     );
-    // ② 径向遮罩（radialMask：55% 内基本全显，边缘缓出溶解入天空）。
+    // ② 径向雾化遮罩：中心基本全显，向外溶解；四角（0.707×size 处）与
+    // 边缘完全透明，封面只余一团柔光虚影，无任何矩形轮廓。
     c.saveLayer(dst, Paint());
     c.drawRect(
       dst,
@@ -615,9 +618,14 @@ class _VisualizerPageState extends ConsumerState<VisualizerPage>
         ..blendMode = ui.BlendMode.dstIn
         ..shader = ui.Gradient.radial(
           const Offset(size / 2, size / 2),
-          size * 0.85,
-          const [Color(0xFFFFFFFF), Color(0xE6FFFFFF), Color(0x00FFFFFF)],
-          const [0.0, 0.55, 1.0],
+          size * 0.71,
+          const [
+            Color(0xFFFFFFFF),
+            Color(0xE6FFFFFF),
+            Color(0x40FFFFFF),
+            Color(0x00FFFFFF),
+          ],
+          const [0.0, 0.38, 0.62, 0.95],
         ),
     );
     c.restore();

@@ -18,6 +18,7 @@ import '../logging/app_log_store.dart';
 import '../rust/api.dart';
 import '../player/lx_lyrics_builder.dart';
 import 'plugin_metadata.dart';
+import 'qq_source_api.dart';
 import 'qrc_decrypt.dart';
 
 class EnabledMusicPlugin {
@@ -302,6 +303,75 @@ const _qualityDiscoveryFallback = [
 /// 供下载弹窗秒开时先填充音质列表，无需等待插件逐档联网探测。
 List<String> declaredQualityTokens(dynamic value) =>
     _qualityTokensFromRaw(value);
+
+/// 读取插件歌曲快照中声明的音质体积（token → 字节）。LX 歌曲的
+/// types/lx_types 在 Rust 搜索阶段就带 QQ 各档位真实体积（size_formate
+/// 产物，如 "2.9MB"）；选择器/下载弹窗直接展示，不再逐档联网探测。
+Map<String, String> declaredQualitySizes(dynamic value) {
+  final result = <String, String>{};
+  void put(dynamic token, dynamic size) {
+    final key = token?.toString().trim() ?? '';
+    final text = size?.toString().trim() ?? '';
+    if (key.isEmpty || text.isEmpty) return;
+    result.putIfAbsent(key, () => text);
+  }
+
+  void visit(dynamic node) {
+    if (node is List) {
+      for (final entry in node) {
+        visit(entry);
+      }
+      return;
+    }
+    if (node is! Map) return;
+    for (final entry in node.entries) {
+      final key = entry.key.toString().toLowerCase();
+      final v = entry.value;
+      if (key == 'lx_types' || key == '_types') {
+        if (v is Map) {
+          for (final e in v.entries) {
+            if (e.value is Map) {
+              put(e.key, (e.value as Map)['size']);
+            } else {
+              put(e.key, e.value);
+            }
+          }
+        }
+      } else if (key == 'types') {
+        if (v is List) {
+          for (final e in v) {
+            if (e is Map) put(e['type'] ?? e['quality_type'], e['size']);
+          }
+        }
+      } else if (v is Map || v is List) {
+        visit(v);
+      }
+    }
+  }
+
+  visit(value);
+  return result;
+}
+
+/// 解析 Rust size_formate 产物（"845B" / "12.3KB" / "2.9MB" / "1.2GB"）
+/// 回字节数；无法识别返回 null。
+int? parseLxDeclaredSize(String text) {
+  final match = RegExp(r'^([\d.]+)\s*(B|KB|MB|GB)$', caseSensitive: false)
+      .firstMatch(text.trim());
+  if (match == null) return null;
+  final value = double.tryParse(match.group(1) ?? '');
+  if (value == null) return null;
+  switch ((match.group(2) ?? 'B').toUpperCase()) {
+    case 'KB':
+      return (value * 1024).round();
+    case 'MB':
+      return (value * 1024 * 1024).round();
+    case 'GB':
+      return (value * 1024 * 1024 * 1024).round();
+    default:
+      return value.round();
+  }
+}
 
 /// 从插件歌曲快照中提取插件声明的音质标识。不同 MusicFree/LX 插件
 /// 使用的字段并不统一，因此这里兼容 qualities、formats、_types 等常见
@@ -4682,6 +4752,23 @@ class PluginRuntimeService {
     // 熔断中的插件跳过探测：服务器不可达时每档 5s 超时×8 档是纯后台负载。
     if (_lxCircuitOpen(plugin)) return false;
     final songInfo = Map<String, dynamic>.from(value);
+    // tx 歌曲配置了 Source API 卡密时直接探测 Source API：洛雪脚本对 tx
+    // 全档失效时逐档脚本探测是 8×5s 纯浪费，且 Source API 档位权威。
+    if (songInfo['source']?.toString().trim() == 'tx') {
+      final prefs = await SharedPreferences.getInstance();
+      final apiKey = prefs.getString('qqSourceApiKey')?.trim() ?? '';
+      if (apiKey.isNotEmpty) {
+        return QqSourceApi.probe(
+          songId: (songInfo['songmid'] ?? songInfo['songId'] ??
+                  songInfo['id'])
+              ?.toString() ??
+              '',
+          quality: quality,
+          apiKey: apiKey,
+          apiUrl: prefs.getString('qqSourceApiUrl'),
+        );
+      }
+    }
     try {
       final response = await _callLxOnCurrentIsolate(plugin, {
         'action': 'musicUrl',
@@ -4846,12 +4933,54 @@ class PluginRuntimeService {
     // 连续同因失败快速放弃：插件返回与音质无关的错误（如 unknow error、
     // 无权限）时，换档重试只是把同一错误再撞 N 次（实测 8 档 × 两路
     // 解析白等 20s+），连续 3 档同一错误立即换下一个源。
+    // QQ（tx）歌曲优先走 Source API（与 MusicFree L1/L2 插件同通道）：
+    // L1/L2 音源更新后洛雪脚本对 tx 全档解析失效，而 Source API 直出
+    // 明文 vkey 直链且档位权威（要什么档给什么档，无需假音质嗅探）。
+    // 配置了卡密时逐档先试 Source API，失败（该档无货/网络异常）再回退
+    // 洛雪脚本；连续 2 档失败视为服务不可达，本轮跳过避免逐档超时拖垮梯子。
+    final qqSourceApiUsable = songInfo['source']?.toString().trim() == 'tx';
+    String qqApiKey = '';
+    String? qqApiUrl;
+    if (qqSourceApiUsable) {
+      final prefs = await SharedPreferences.getInstance();
+      qqApiKey = prefs.getString('qqSourceApiKey')?.trim() ?? '';
+      qqApiUrl = prefs.getString('qqSourceApiUrl')?.trim();
+    }
+    var qqApiConsecutiveFailures = 0;
     var sameErrorStreak = 0;
     String? lastErrorMessage;
     // 歌曲时长（ms，lx musicInfo.interval）用于 320k 假音质码率估算。
     final intervalMs = int.tryParse(
         songInfo['interval']?.toString().split('.').first ?? '');
     for (final quality in qualities) {
+      if (qqApiKey.isNotEmpty && qqApiConsecutiveFailures < 2) {
+        try {
+          final sourceApiResult = await QqSourceApi.resolve(
+            songId: (songInfo['songmid'] ?? songInfo['songId'] ??
+                    songInfo['id'])
+                ?.toString() ??
+                '',
+            quality: quality,
+            apiKey: qqApiKey,
+            apiUrl: qqApiUrl,
+          );
+          _lxConnectivityFailures.remove(plugin.id);
+          AppLogStore.instance.add(
+            '[播放链路] Source API解析成功 音质$quality '
+            '${sourceApiResult.filename}',
+          );
+          return PluginMediaSource(
+            url: _normalizeMediaUrl(sourceApiResult.url),
+          );
+        } catch (error) {
+          qqApiConsecutiveFailures++;
+          AppLogStore.instance.add(
+            '[播放链路] Source API解析失败 音质$quality '
+            '${_friendlyError(error.toString())}',
+            level: AppLogLevel.info,
+          );
+        }
+      }
       final attemptStopwatch = Stopwatch()..start();
       try {
         final response = await _callLxOnCurrentIsolate(plugin, {

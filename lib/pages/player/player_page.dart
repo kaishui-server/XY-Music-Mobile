@@ -2109,7 +2109,15 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
     // 档位随后异步探测真实直链大小（成功无 ≈ 前缀，探测中显示进度圈）。
     final qualitySizes = <String, _QualitySize?>{};
     final probing = <String>{};
+    // 优先用搜索阶段已声明的真实体积（Rust 搜索随 types/lx_types 下发
+    // QQ 全档位大小），声明缺失的档位再按码率估算。
+    final declaredSizes = declaredQualitySizes(item.pluginData);
     for (final value in qualities) {
+      final declaredBytes = parseLxDeclaredSize(declaredSizes[value] ?? '');
+      if (declaredBytes != null && declaredBytes > 0) {
+        qualitySizes[value] = _QualitySize(declaredBytes);
+        continue;
+      }
       final bytes = estimateLossyDownloadSizeBytes(value, item.durationMs);
       if (bytes != null) {
         qualitySizes[value] = _QualitySize(bytes, estimated: true);
@@ -2306,6 +2314,17 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
   _QualitySize? _estimateDownloadSize(QueueItem item, String quality) {
     final bytes = estimateLossyDownloadSizeBytes(quality, item.durationMs);
     return bytes == null ? null : _QualitySize(bytes, estimated: true);
+  }
+
+  /// 提取插件快照中声明的音质真实体积（token → 字节）。Rust 搜索随
+  /// types/lx_types 下发 QQ 全档位大小，弹窗直接展示、无需逐档实测。
+  Map<String, int> _declaredQualitySizeMap(QueueItem item) {
+    final result = <String, int>{};
+    declaredQualitySizes(item.pluginData).forEach((token, text) {
+      final bytes = parseLxDeclaredSize(text);
+      if (bytes != null && bytes > 0) result[token] = bytes;
+    });
+    return result;
   }
 
   /// 解析该音质真实直链并探测其文件大小（字节）。解析失败或无法确定时
@@ -2688,6 +2707,7 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
           ),
           estimateSize: (quality) => _estimateDownloadSize(item, quality),
           probeSize: (quality) => _probeDownloadSize(item, quality),
+          declaredSizes: _declaredQualitySizeMap(item),
         ),
       );
     } else {
@@ -3590,6 +3610,7 @@ class _DownloadOptionsDialog extends StatefulWidget {
     this.discoverQualities,
     this.estimateSize,
     this.probeSize,
+    this.declaredSizes,
   });
 
   final String initialDirectory;
@@ -3603,7 +3624,11 @@ class _DownloadOptionsDialog extends StatefulWidget {
   final Future<List<String>> Function()? discoverQualities;
 
   /// 有损档位的即时估算大小（同步，可能为 null）；先显示、后由实测替换。
-  final _QualitySize? Function(String quality)? estimateSize;
+  final _QualitySize? Function(String)? estimateSize;
+
+  /// 搜索阶段已声明的音质真实体积（token → 字节，随 types/lx_types 下发）；
+  /// 有声明时直接展示真实值，不再联网实测。
+  final Map<String, int>? declaredSizes;
 
   /// 探测某音质的真实文件大小（字节），供下拉框右侧展示。
   final Future<int?> Function(String quality)? probeSize;
@@ -3638,8 +3663,13 @@ class _DownloadOptionsDialogState extends State<_DownloadOptionsDialog> {
       widget.qualities.isEmpty ? const ['320k'] : widget.qualities,
     );
     _quality = _normalizeQuality(widget.initialQuality, _qualities);
-    // 先用估算值填位，保证下拉框一打开就有大小可看，随后实测替换。
+    // 先用声明体积/估算值填位，保证下拉框一打开就有大小可看，随后实测替换。
     for (final quality in _qualities) {
+      final declared = widget.declaredSizes?[quality];
+      if (declared != null && declared > 0) {
+        _qualitySizes[quality] = _QualitySize(declared);
+        continue;
+      }
       final estimate = widget.estimateSize?.call(quality);
       if (estimate != null) _qualitySizes[quality] = estimate;
     }
@@ -3667,6 +3697,11 @@ class _DownloadOptionsDialogState extends State<_DownloadOptionsDialog> {
     });
     final added = merged.where((q) => !_qualities.contains(q)).toList();
     for (final quality in added) {
+      final declared = widget.declaredSizes?[quality];
+      if (declared != null && declared > 0) {
+        _qualitySizes[quality] = _QualitySize(declared);
+        continue;
+      }
       final estimate = widget.estimateSize?.call(quality);
       if (estimate != null) _qualitySizes[quality] = estimate;
     }
@@ -3688,6 +3723,9 @@ class _DownloadOptionsDialogState extends State<_DownloadOptionsDialog> {
           _probingQualities.contains(quality)) {
         continue;
       }
+      // 声明体积已是搜索阶段下发的真实值，无需实测。
+      final declared = widget.declaredSizes?[quality];
+      if (declared != null && declared > 0) continue;
       _probingQualities.add(quality);
       unawaited(
         probe(quality).then((bytes) {
