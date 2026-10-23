@@ -120,8 +120,32 @@ class CloudPlaybackProxy {
       final (resp, errBody) = await _openUpstream(task, req.method, range);
 
       req.response.statusCode = resp.statusCode;
+      // QQ 音乐等 CDN 会对明文流返回撒谎的 Content-Type：L1 直链是
+      // .flac/.mp3 内容却带 audio/x-ogg，ExoPlayer 按 Content-Type 选
+      // Ogg 提取器解析非 Ogg 数据直接 (0) Source error（低品质 .mp3 +
+      // audio/mpeg 正常、L2 卡密上游 Content-Type 正常，故仅部分档位
+      // 复现）。改写为 application/octet-stream 让播放器按内容嗅探格式。
+      final contentType = resp.headers.value(HttpHeaders.contentTypeHeader);
+      if (contentType != null) {
+        final path = Uri.tryParse(task.url)?.path.toLowerCase() ?? '';
+        final lyingOgg = contentType.toLowerCase().contains('ogg') &&
+            !path.endsWith('.ogg') &&
+            !path.endsWith('.oga') &&
+            !path.endsWith('.opus');
+        if (lyingOgg) {
+          playbackChainLog(
+            '[播放链路] 代理改写撒谎Content-Type：$contentType → '
+            'application/octet-stream host='
+            '${Uri.tryParse(task.url)?.host ?? '未知'} 扩展名='
+            '${path.isEmpty ? '无' : path.split('.').last}',
+          );
+        }
+        req.response.headers.set(
+          HttpHeaders.contentTypeHeader,
+          lyingOgg ? 'application/octet-stream' : contentType,
+        );
+      }
       for (final name in const [
-        HttpHeaders.contentTypeHeader,
         HttpHeaders.contentLengthHeader,
         HttpHeaders.contentRangeHeader,
         HttpHeaders.acceptRangesHeader,

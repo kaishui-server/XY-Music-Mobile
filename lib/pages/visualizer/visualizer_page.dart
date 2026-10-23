@@ -21,6 +21,8 @@ import 'dart:math' as math;
 import 'dart:ui' as ui;
 import 'dart:ui' show ImageFilter;
 
+import 'ghost_cover.dart';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/scheduler.dart';
 import 'package:flutter/services.dart'
@@ -559,7 +561,7 @@ class _VisualizerPageState extends ConsumerState<VisualizerPage>
       final codec =
           await ui.instantiateImageCodec(bytes, targetWidth: 256);
       final src = await codec.getNextFrame();
-      final masked = await _buildGhostCover(src.image);
+      final masked = await buildGhostCover(src.image);
       src.image.dispose();
       if (!mounted) return;
       setState(() {
@@ -574,78 +576,6 @@ class _VisualizerPageState extends ConsumerState<VisualizerPage>
         });
       }
     }
-  }
-
-  /// 封面预处理（对齐 LX-X「天空中的模糊投影」）：高斯模糊 → 压暗+降饱和
-  /// → 径向雾化（四角/边缘完全消融，无矩形轮廓）→ 垂直渐隐 → 整体 alpha。
-  /// 烘焙成一张图，每帧零离屏直接贴。
-  static Future<ui.Image> _buildGhostCover(ui.Image src) async {
-    const size = 256.0;
-    final rec = ui.PictureRecorder();
-    final c = ui.Canvas(rec, const Rect.fromLTWH(0, 0, size, size));
-    final dst = const Rect.fromLTWH(0, 0, size, size);
-    // ① 颜色：out = 0.66 * (gray + 0.5*(src - gray))，并整体高斯模糊成
-    // 失焦投影；无提亮平移（5539 的提亮会把封面洗成白雾团）。
-    const wr = 0.299, wg = 0.587, wb = 0.114;
-    const sat = 0.5, dim = 0.66;
-    c.drawImageRect(
-      src,
-      Rect.fromLTWH(0, 0, src.width.toDouble(), src.height.toDouble()),
-      dst,
-      Paint()
-        ..filterQuality = FilterQuality.medium
-        ..imageFilter = ui.ImageFilter.blur(sigmaX: 12, sigmaY: 12)
-        ..colorFilter = ColorFilter.matrix(<double>[
-          // R
-          dim * (wr + sat * (1 - wr)), dim * (wg * (1 - sat)),
-          dim * (wb * (1 - sat)), 0, 0,
-          // G
-          dim * (wr * (1 - sat)), dim * (wg + sat * (1 - wg)),
-          dim * (wb * (1 - sat)), 0, 0,
-          // B
-          dim * (wr * (1 - sat)), dim * (wg * (1 - sat)),
-          dim * (wb + sat * (1 - wb)), 0, 0,
-          // A（整体透明度 0.5）
-          0, 0, 0, 0.5, 0,
-        ]),
-    );
-    // ② 径向雾化遮罩：中心基本全显，向外溶解；四角（0.707×size 处）与
-    // 边缘完全透明，封面只余一团柔光虚影，无任何矩形轮廓。
-    c.saveLayer(dst, Paint());
-    c.drawRect(
-      dst,
-      Paint()
-        ..blendMode = ui.BlendMode.dstIn
-        ..shader = ui.Gradient.radial(
-          const Offset(size / 2, size / 2),
-          size * 0.71,
-          const [
-            Color(0xFFFFFFFF),
-            Color(0xE6FFFFFF),
-            Color(0x40FFFFFF),
-            Color(0x00FFFFFF),
-          ],
-          const [0.0, 0.38, 0.62, 0.95],
-        ),
-    );
-    c.restore();
-    // ③ 垂直遮罩（horizonMask：上部全显，向下 55%→95% 渐隐入地平线）。
-    c.saveLayer(dst, Paint());
-    c.drawRect(
-      dst,
-      Paint()
-        ..blendMode = ui.BlendMode.dstIn
-        ..shader = ui.Gradient.linear(
-          const Offset(0, size * 0.55),
-          const Offset(0, size * 0.95),
-          [const Color(0xFFFFFFFF), const Color(0x00FFFFFF)],
-        ),
-    );
-    c.restore();
-    final pic = rec.endRecording();
-    final img = await pic.toImage(size.toInt(), size.toInt());
-    pic.dispose();
-    return img;
   }
 
   Future<void> _loadLyricsOffset(String path) async {
