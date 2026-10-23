@@ -18,12 +18,23 @@ import 'dart:io';
 import 'package:flutter/foundation.dart';
 
 import 'playback_chain_log.dart';
+import 'qmc_crypto.dart';
 
 class _ProxyTask {
-  _ProxyTask(this.url, this.headers, this.label);
+  _ProxyTask(this.url, this.headers, this.label, this.ekey);
   final String url;
   final Map<String, String> headers;
   final String label;
+
+  /// QQ 音乐 QMC ekey（base64）：非空时转发流逐块解密（qmc_crypto）。
+  final String? ekey;
+  Uint8List? _rawKeyCache;
+
+  /// ekey → raw key（TEA 解密），每任务只算一次。
+  Uint8List resolveRawKey() {
+    return _rawKeyCache ??= decryptEKey(ekey!);
+  }
+
   DateTime lastUsed = DateTime.now();
 }
 
@@ -44,11 +55,14 @@ class CloudPlaybackProxy {
         ..autoUncompress = false;
 
   /// 登记直链并返回本地代理 URL（播放器用它替代真实直链）。
+  ///
+  /// [ekey] 非空时（QQ QMC 加密流）转发时逐块解密。
   Future<String> register(
     String url,
     Map<String, String> headers,
-    String label,
-  ) async {
+    String label, {
+    String? ekey,
+  }) async {
     final server = await _ensureServer();
     // LRU 淘汰：只保留最近使用的少量直链，防队列长播累积泄漏。
     while (_tasks.length >= _maxTasks) {
@@ -64,11 +78,12 @@ class CloudPlaybackProxy {
       _tasks.remove(oldestKey);
     }
     final token = 't${DateTime.now().microsecondsSinceEpoch}_${_seq++}';
-    _tasks[token] = _ProxyTask(url, headers, label);
+    _tasks[token] = _ProxyTask(url, headers, label, ekey);
     playbackChainLog(
       '[播放链路] 代理登记 $label token=…${token.substring(token.length - 4)} '
       'host=${Uri.tryParse(url)?.host ?? '解析失败'} '
-      'headers=[${headers.keys.join(',')}]',
+      'headers=[${headers.keys.join(',')}]'
+      '${ekey != null ? ' QMC加密流' : ''}',
     );
     // 代理路径携带真实文件名（含扩展名）：ExoPlayer 优先按 URI 扩展名
     // 选择提取器（flac/mp3/ogg...），即使 CDN 对明文流返回撒谎的
@@ -179,7 +194,36 @@ class CloudPlaybackProxy {
         return;
       }
       // 零缓冲流式转发：CDN → Dart → 播放器逐块搬运，不整段落内存。
-      await req.response.addStream(resp);
+      // QMC 加密流（QQ *.mflac）：逐块原位解密后回放。解密起点 = 本段
+      // 响应在完整文件中的绝对偏移（Content-Range bytes N-M/T 的 N，
+      // 200 全量则 0），RC4/MapL 模式按全局 offset 定位密钥流，seek 的
+      // Range 请求同样正确（qmc_crypto 与 MusicFree Kotlin 实现对齐）。
+      if (task.ekey != null) {
+        var start = 0;
+        final cr = resp.headers.value(HttpHeaders.contentRangeHeader);
+        final m = RegExp(r'bytes\s+(\d+)-').firstMatch(cr ?? '');
+        if (m != null) start = int.parse(m.group(1)!);
+        try {
+          final decoder = QmcDecoder.fromRawKey(task.resolveRawKey());
+          var consumed = 0;
+          playbackChainLog(
+            '[播放链路] QMC 解密启动 offset=$start '
+            'keyLen=${task.resolveRawKey().length}',
+          );
+          final decrypted = resp.cast<List<int>>().map((chunk) {
+            final buf = Uint8List.fromList(chunk);
+            decoder.decryptChunk(buf, start + consumed);
+            consumed += buf.length;
+            return buf;
+          });
+          await req.response.addStream(decrypted);
+        } catch (e) {
+          playbackChainLog('[播放链路] QMC 解密失败（原样透传）: $e');
+          await req.response.addStream(resp);
+        }
+      } else {
+        await req.response.addStream(resp);
+      }
       await req.response.close();
     } catch (e) {
       // 转发层异常（TLS 握手/连接重置/上游中断）在此处对 Dart 完全可见

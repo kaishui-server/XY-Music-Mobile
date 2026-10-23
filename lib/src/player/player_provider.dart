@@ -3576,6 +3576,8 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
           headers: resolved.headers.isEmpty ? null : resolved.headers,
           tag: mediaItem,
           requestId: requestId,
+          // QQ QMC 加密流（*.mflac + ekey）：由回环代理边拉边解密。
+          ekey: resolved.ekey,
         );
         try {
           await submitUrl(source);
@@ -3821,6 +3823,7 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
     Map<String, String>? headers,
     Object? tag,
     int? requestId,
+    String? ekey,
   }) async {
     await _enqueueSourceOperation(() async {
       if (requestId != null && requestId != _playRequestId) return;
@@ -3834,29 +3837,46 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
         if (!dspViaProxy) {
           unawaited(_warmUpPlaybackDns(url));
         }
-        _dspStreamUrl = url;
-        _dspStreamHeaders = headers;
-        _dspLocalPath = null;
+        // QMC 加密流（*.mflac）不能交给 Rust DSP 直读（读回的是密文），
+        // DSP 记录置空走纯播放器链路。
+        if (ekey != null) {
+          _dspStreamUrl = null;
+          _dspStreamHeaders = null;
+          _dspLocalPath = null;
+        } else {
+          _dspStreamUrl = url;
+          _dspStreamHeaders = headers;
+          _dspLocalPath = null;
+        }
         if (requestId != null && requestId != _playRequestId) return;
         // 无头直链统一改走本地回环代理：ExoPlayer 直连部分 CDN 会因
         // 撒谎 Content-Type / TLS 兼容性报 (0) Source error（QQ L1
         // 直链 fLaC 内容带 audio/x-ogg，真机日志证实此前走无头直连
         // 从未经过代理的 CT 改写），代理转发时改写 Content-Type 且
-        // 路径携带真实扩展名，播放器按扩展名选提取器。登记失败则
-        // 回退原直连行为，不阻塞播放。有头直连保持原行为。
-        if (headers == null && !dspViaProxy) {
+        // 路径携带真实扩展名，播放器按扩展名选提取器。QMC 加密流
+        // （ekey 非空）必须走代理边拉边解密——即使插件带 headers，
+        // 加密流直连也必然失败。登记失败则回退原直连行为，不阻塞
+        // 播放。无 ekey 的有头直连保持原行为。
+        if ((headers == null || ekey != null) && !dspViaProxy) {
           try {
-            url = await CloudPlaybackProxy.instance
-                .register(url, const <String, String>{}, 'setUrl-无头');
+            url = await CloudPlaybackProxy.instance.register(
+              url,
+              headers ?? const <String, String>{},
+              'setUrl',
+              ekey: ekey,
+            );
+            // 鉴权头已交由代理注入，直连重试不需要再带。
+            headers = null;
           } catch (e) {
-            playbackChainLog('[播放链路] 无头代理登记失败，回退直连: $e');
+            playbackChainLog('[播放链路] 代理登记失败，回退直连: $e');
           }
         }
         final host = Uri.tryParse(url)?.host ?? '';
         final viaProxy = host == '127.0.0.1' || host == 'localhost';
         playbackChainLog(
           '[播放链路] setUrl 开始 ${viaProxy ? '本地代理通道' : host} '
-          '(${headers == null ? (viaProxy ? '头由代理注入' : '无头直连') : '直连 ${headers.length} 头'})',
+          '(${headers == null ? (viaProxy ? '头由代理注入' : '无头直连') : '直连 ${headers?.length ?? 0} 头'})'
+          '${ekey != null ? ' QMC加密' : ''}',
         );
       }
       // setUrl 加超时保护：部分机型上 ExoPlayer 加载特定 URL 可能卡死

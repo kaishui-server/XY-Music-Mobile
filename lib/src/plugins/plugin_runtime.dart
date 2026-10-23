@@ -152,10 +152,15 @@ class PluginMediaSource {
     required this.url,
     this.headers = const {},
     this.lyrics = '',
+    this.ekey,
   });
   final String url;
   final Map<String, String> headers;
   final String lyrics;
+
+  /// QQ 音乐 QMC ekey（base64）：MusicFree 插件（L1/L2）的 getMediaSource
+  /// 返回 *.mflac 加密流时携带；由回环代理边拉边解密（qmc_crypto.dart）。
+  final String? ekey;
 }
 
 /// 播放源缓存的条目：inFlight 非空表示解析正在进行（并发调用直接
@@ -599,7 +604,11 @@ Future<List<EnabledMusicPlugin>> loadEnabledMusicPlugins(Ref ref) async {
                   .where((item) => item.isNotEmpty)
                   .toList())
             : const ['128k', '192k', '320k', 'flac'],
-        userVariables: savedVariables[id] ?? const {},
+        userVariables: _defaultedUserVariables(
+          metadata,
+          id,
+          savedVariables[id] ?? const {},
+        ),
         sourceUrl: sourceUrls[id] ?? '',
         availableMethods: metadata.availableMethods,
       ),
@@ -619,6 +628,24 @@ Future<List<EnabledMusicPlugin>> loadEnabledMusicPlugins(Ref ref) async {
   }
   plugins.sort((a, b) => a.name.compareTo(b.name));
   return plugins;
+}
+
+/// QQ 音源插件的默认用户变量：**仅 L2** 的 `USE_SPONSORED_MV_API` 未填
+/// 时默认启用官方 MV 通道（插件源码 isUserVariableEnabled 空值视为关闭，
+/// 用户要求 L2 免配置即可播 MV）；**L1 需要手动填写 true/1 才开启 MV，
+/// 不注入默认值**。判定用名称/ID 含 "l2"（如 "qq - l2"/"qq--l2"），
+/// 其余插件（含 L1）变量保持原样。
+Map<String, String> _defaultedUserVariables(
+  PluginMetadata metadata,
+  String id,
+  Map<String, String> saved,
+) {
+  final name = metadata.name?.toLowerCase() ?? '';
+  final pid = id.toLowerCase();
+  final isL2 = name.contains('l2') || pid.contains('l2');
+  if (!isL2) return saved;
+  if (saved.containsKey('USE_SPONSORED_MV_API')) return saved;
+  return <String, String>{...saved, 'USE_SPONSORED_MV_API': 'true'};
 }
 
 /// SharedPreferences 中持久化插件拖拽顺序的键（插件 ID 列表，从上到下）。
@@ -6448,10 +6475,12 @@ class PluginRuntimeService {
         headers[entry.key.toString()] = entry.value.toString();
       }
     }
+    final ekey = value['ekey']?.toString().trim() ?? '';
     return PluginMediaSource(
       url: _normalizeMediaUrl(url),
       headers: headers,
       lyrics: _extractLyricsWithTranslation(value),
+      ekey: ekey.isEmpty ? null : ekey,
     );
   }
 
@@ -8436,7 +8465,7 @@ class _PluginProxyHttpClient extends http.BaseClient {
     try {
       final responseJson = await pluginHttpRequestBinary(
         method: method,
-        url: rewriteSourceApiPlainRequest(url),
+        url: url,
         headersJson: headersJson,
         body: body,
         // 8s：正常音源 1~3s 返回；死源（明文被拦/服务器挂）等待越久，
@@ -8450,24 +8479,6 @@ class _PluginProxyHttpClient extends http.BaseClient {
     } catch (_) {
       return null;
     }
-  }
-
-  /// QQ Source API 兼容：MusicFree 插件（L1/L2）固定 encrypted=1 请求
-  /// 加密流（*.mflac + ekey），XY 插件引擎无 QMC 解密器，ekey 被丢弃后
-  /// 加密流无法播放（真机 5543 日志：代理请求 *.mflac → Source error，
-  /// 弦予/MusicFree 能播是因为它们内置 QMC 解密）。Source API 的
-  /// encrypted=0 返回明文直链（全档实测可用），故在引擎网络层拦截改写，
-  /// 插件生态 L1/L2 全档直接可播。仅命中 /source/song 路径，足够特化。
-  static String rewriteSourceApiPlainRequest(String url) {
-    if (!url.contains('encrypted=1')) return url;
-    final uri = Uri.tryParse(url);
-    if (uri == null || !uri.path.contains('/source/song')) return url;
-    return uri
-        .replace(queryParameters: <String, String>{
-          ...uri.queryParameters,
-          'encrypted': '0',
-        })
-        .toString();
   }
 
   /// 判断插件 HTTP 响应是否为 text/html 页面（运营商拦截页特征）。

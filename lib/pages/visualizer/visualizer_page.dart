@@ -89,7 +89,7 @@ class _VisualizerPageState extends ConsumerState<VisualizerPage>
   bool _inScale = false;
 
   // 封面幽灵层（预处理后的低饱和提亮+遮罩图）。
-  ui.Image? _coverImage;
+  GhostTextures? _coverImage;
   String? _coverKey;
   String? _coverSourcePath; // 原始封面文件路径（播放栏缩略图用）
 
@@ -113,6 +113,8 @@ class _VisualizerPageState extends ConsumerState<VisualizerPage>
   void dispose() {
     _ticker?.dispose();
     _frameTick.dispose();
+    _coverImage?.dispose();
+    _coverImage = null;
     unawaited(VisualizerSource.instance.stop());
     SystemChrome.setPreferredOrientations(DeviceOrientation.values);
     super.dispose();
@@ -559,13 +561,14 @@ class _VisualizerPageState extends ConsumerState<VisualizerPage>
       }
       final bytes = await File(coverPath).readAsBytes();
       final codec =
-          await ui.instantiateImageCodec(bytes, targetWidth: 256);
+          await ui.instantiateImageCodec(bytes, targetWidth: 512);
       final src = await codec.getNextFrame();
-      final masked = await buildGhostTexture(src.image);
+      final textures = await buildGhostTextures(src.image);
       src.image.dispose();
       if (!mounted) return;
       setState(() {
-        _coverImage = masked;
+        _coverImage?.dispose();
+        _coverImage = textures;
         _coverSourcePath = coverPath;
       });
     } catch (_) {

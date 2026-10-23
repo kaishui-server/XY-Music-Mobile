@@ -36,7 +36,7 @@ class VisFrame {
   final VisualizerSettings settings;
   final OrbitCamera camera;
   final VisRippleBuffer ripples;
-  final ui.Image? coverImage; // 预处理后的封面幽灵图
+  final GhostTextures? coverImage; // 预处理后的封面幽灵双层纹理
   final List<VisMeteor> meteors; // 活跃流星
   const VisFrame({
     required this.bands,
@@ -803,8 +803,8 @@ class TerrainScenePainter extends CustomPainter {
   /// 固定朝向（5540 起封面不再自旋，与参考一致）；脉冲对齐 MapScene：
   /// uPulse = bass*0.4 + subBass*0.2，亮度增益收敛到 ×0.3 保持暗调。
   void _paintCover(Canvas canvas, CameraRig rig, BandPartition a) {
-    final img = f.coverImage;
-    if (img == null || !f.settings.showCover) return;
+    final ghost = f.coverImage;
+    if (ghost == null || !f.settings.showCover) return;
     final coverPulse = (a.bass * 0.4 + a.subBass * 0.2).clamp(0.0, 1.0);
     const ang = -math.pi / 4;
     final ca = math.cos(ang), sa = math.sin(ang);
@@ -828,24 +828,37 @@ class TerrainScenePainter extends CustomPainter {
     // 这正是 5538 封面幽灵层完全不可见的根因）。
     canvas.scale(1, -1);
     final bright = 1.0 + coverPulse * 0.3;
-    // 顶点色网格渲染（对齐 LX-X「天空中的圆形雾化投影」）：径向雾化
-    // （中心全显→四角完全消融）与垂直渐隐编码在顶点色 alpha，GPU 逐
-    // 像素插值；纹理为 128px 暗化小图（CPU 烘焙），GPU 放大自然柔焦。
-    // 不用 drawImageRect+离屏遮罩：Impeller 离屏管线 dstIn/toByteData
-    // 回读不可靠（5540-5543 真机矩形轮廓始终清晰），顶点色与地形网格
-    // 同一条管线，真机长期验证可靠。
-    final verts = buildGhostVertices(
+    final time = f.time;
+    // 双层顶点色网格渲染（对齐 LX-X「天空中的巨大圆形雾化投影」）：
+    // 外层 = 64px 糊化纹理的雾环（边缘高斯模糊感 + 雾气漂浮），先画；
+    // 内层 = 256px 清晰纹理的中心区（人物轮廓可辨），后画。两层都是
+    // 径向顶点色包络（圆形投影、四边完全消融、无矩形轮廓），GPU 逐
+    // 像素插值零离屏——Impeller 离屏管线 dstIn/toByteData 回读不可靠
+    // （5540-5543 真机矩形轮廓始终清晰的根因），顶点色与地形网格同
+    // 一条管线，真机长期验证可靠。
+    final paint = Paint()..filterQuality = FilterQuality.medium;
+    final outer = buildGhostVertices(
+      layer: GhostLayer.outer,
       half: half,
       bright: bright,
-      textureW: img.width,
-      textureH: img.height,
+      textureW: ghost.blur.width,
+      textureH: ghost.blur.height,
+      time: time,
+      baseAlpha: 0.42,
     );
-    canvas.drawVertices(
-      verts,
-      BlendMode.srcOver,
-      Paint()..filterQuality = FilterQuality.medium,
+    canvas.drawVertices(outer, BlendMode.srcOver, paint);
+    outer.dispose();
+    final inner = buildGhostVertices(
+      layer: GhostLayer.inner,
+      half: half,
+      bright: bright,
+      textureW: ghost.sharp.width,
+      textureH: ghost.sharp.height,
+      time: time,
+      baseAlpha: 0.68,
     );
-    verts.dispose();
+    canvas.drawVertices(inner, BlendMode.srcOver, paint);
+    inner.dispose();
     canvas.restore();
   }
 

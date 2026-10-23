@@ -7,6 +7,7 @@ import 'dart:typed_data';
 import 'dart:ui' as ui;
 
 import 'package:flutter_test/flutter_test.dart';
+import 'package:xy_music/pages/visualizer/ghost_cover.dart';
 import 'package:xy_music/pages/visualizer/visualizer_engine.dart';
 import 'package:xy_music/pages/visualizer/visualizer_scenes.dart';
 import 'package:xy_music/pages/visualizer/visualizer_settings.dart';
@@ -45,8 +46,9 @@ void main() {
     final bands = List<double>.filled(64, 0.35);
 
     final cover = await _solidImage(256, 255, 40, 40);
+    final ghost = await buildGhostTextures(cover);
 
-    VisFrame make(VisualizerSettings s, ui.Image? img) => VisFrame(
+    VisFrame make(VisualizerSettings s, GhostTextures? img) => VisFrame(
           bands: bands,
           kickEnvelope: 0,
           rms: 0.3,
@@ -72,7 +74,7 @@ void main() {
     // 全部主题过一遍（导出 PNG 供人工核对观感）。
     for (var ti = 0; ti < kVisThemes.length; ti++) {
       final s = VisualizerSettings(themeIndex: ti);
-      final img = await paint(TerrainScenePainter(make(s, cover)));
+      final img = await paint(TerrainScenePainter(make(s, ghost)));
       await _dumpPng(img, 'build/vis_smoke/theme_${kVisThemes[ti].id}.png');
       final px = await _snap(img);
       // 统计天空区（顶部 25%）平均亮度，验证天空不再是纯黑。
@@ -89,7 +91,7 @@ void main() {
 
     final settings = const VisualizerSettings();
     final withCover = await paint(
-        TerrainScenePainter(make(settings, cover)));
+        TerrainScenePainter(make(settings, ghost)));
     final without = await paint(
         TerrainScenePainter(make(settings, null)));
 
