@@ -3827,16 +3827,33 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
       // DSP 源记录：在线直链交给 Rust 流缓存直读（与 ExoPlayer 各自
       // 连接 CDN）。与 setUrl 同在串行队列内，切歌时不会记录到旧曲 URL。
       if (url.startsWith('http')) {
+        final dspHost = Uri.tryParse(url)?.host ?? '';
+        final dspViaProxy = dspHost == '127.0.0.1' || dspHost == 'localhost';
+        // DNS 预热必须在登记代理前做：登记后 URL 变 127.0.0.1，真实
+        // CDN 域名就丢了。预热失败不阻塞播放链路。
+        if (!dspViaProxy) {
+          unawaited(_warmUpPlaybackDns(url));
+        }
         _dspStreamUrl = url;
         _dspStreamHeaders = headers;
         _dspLocalPath = null;
         if (requestId != null && requestId != _playRequestId) return;
+        // 无头直链统一改走本地回环代理：ExoPlayer 直连部分 CDN 会因
+        // 撒谎 Content-Type / TLS 兼容性报 (0) Source error（QQ L1
+        // 直链 fLaC 内容带 audio/x-ogg，真机日志证实此前走无头直连
+        // 从未经过代理的 CT 改写），代理转发时改写 Content-Type 且
+        // 路径携带真实扩展名，播放器按扩展名选提取器。登记失败则
+        // 回退原直连行为，不阻塞播放。有头直连保持原行为。
+        if (headers == null && !dspViaProxy) {
+          try {
+            url = await CloudPlaybackProxy.instance
+                .register(url, const <String, String>{}, 'setUrl-无头');
+          } catch (e) {
+            playbackChainLog('[播放链路] 无头代理登记失败，回退直连: $e');
+          }
+        }
         final host = Uri.tryParse(url)?.host ?? '';
         final viaProxy = host == '127.0.0.1' || host == 'localhost';
-        // DNS 预热只对真实域名有意义；回环代理地址跳过。
-        if (!viaProxy) {
-          unawaited(_warmUpPlaybackDns(url));
-        }
         playbackChainLog(
           '[播放链路] setUrl 开始 ${viaProxy ? '本地代理通道' : host} '
           '(${headers == null ? (viaProxy ? '头由代理注入' : '无头直连') : '直连 ${headers.length} 头'})',

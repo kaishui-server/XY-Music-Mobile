@@ -70,7 +70,14 @@ class CloudPlaybackProxy {
       'host=${Uri.tryParse(url)?.host ?? '解析失败'} '
       'headers=[${headers.keys.join(',')}]',
     );
-    return 'http://127.0.0.1:$server/ct/$token';
+    // 代理路径携带真实文件名（含扩展名）：ExoPlayer 优先按 URI 扩展名
+    // 选择提取器（flac/mp3/ogg...），即使 CDN 对明文流返回撒谎的
+    // Content-Type（如 QQ L1 直链 fLaC 内容带 audio/x-ogg）也能正确
+    // 解码，不依赖响应头与嗅探。
+    final segments = Uri.tryParse(url)?.pathSegments ?? const <String>[];
+    final filename =
+        segments.isNotEmpty ? segments.last : 'audio';
+    return 'http://127.0.0.1:$server/ct/$token/$filename';
   }
 
   Future<int> _ensureServer() async {
@@ -98,7 +105,10 @@ class CloudPlaybackProxy {
     );
     try {
       final segs = req.uri.pathSegments;
-      final token = segs.isNotEmpty ? segs.last : '';
+      // 路径形态 /ct/<token>/<filename>（新版带文件名供播放器按扩展名
+      // 选提取器），兼容旧形态 /ct/<token>：token 在文件名前一位。
+      final token =
+          segs.length > 2 ? segs[segs.length - 2] : (segs.isNotEmpty ? segs.last : '');
       final task = _tasks[token];
       if (task == null) {
         // 本地 404 必须留痕：123 CDN 曾出现播放秒失败且代理层零日志，

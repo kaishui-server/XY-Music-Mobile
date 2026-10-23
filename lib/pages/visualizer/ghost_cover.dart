@@ -2,48 +2,36 @@ import 'dart:async';
 import 'dart:math' as math;
 import 'dart:ui' as ui;
 
-/// 封面幽灵层预处理（对齐 LX-X「天空中的模糊投影」）：多级降采样强模糊 →
-/// CPU 逐像素压暗降饱和 → 径向雾化（四角/边缘完全消融）→ 垂直渐隐。
+/// 封面幽灵层预处理（对齐 LX-X「天空中的失焦投影」）：轻度高斯柔焦
+/// （内容可辨）→ CPU 逐像素压暗降饱和 → 径向雾化（四角/边缘完全消融）
+/// → 垂直渐隐。
 ///
-/// 不走 saveLayer/dstIn 烘焙与 ImageFilter：Impeller 离屏管线上 dstIn
-/// 遮罩、以及同 paint 的 imageFilter+colorFilter 组合实测会失效
-/// （5540/5541 封面矩形轮廓始终清晰的根因），逐像素处理结果与渲染引擎
-/// 无关；烘焙一次，每帧零离屏直接贴。
+/// 颜色与遮罩不走 saveLayer/dstIn 烘焙、不与 blur 同挂一个 paint：
+/// Impeller 离屏管线上 dstIn 遮罩、以及同 paint 的
+/// imageFilter+colorFilter 组合实测会失效（5540/5541 封面矩形轮廓始终
+/// 清晰的根因），逐像素处理结果与渲染引擎无关；烘焙一次，每帧零离屏
+/// 直接贴。
 Future<ui.Image> buildGhostCover(ui.Image src) async {
-  const size = 256.0, blurSide = 48.0;
+  const size = 256.0;
   const side = 256;
-  // ① 强模糊 = 多级降采样放大：src → 48px（高质量缩小丢高频）→
-  //    256px（高质量放大糊化），不依赖 ImageFilter.blur。
-  final downRec = ui.PictureRecorder();
-  final downC = ui.Canvas(
-    downRec,
-    const ui.Rect.fromLTWH(0, 0, blurSide, blurSide),
-  );
-  downC.drawImageRect(
+  // ① 轻度柔焦（对齐 LX-X「内容清晰、边缘雾化」的失焦投影观感）：
+  //    ImageFilter.blur 单独挂 paint——5541 实证单独 imageFilter 在
+  //    Impeller 离屏管线上生效；但与 colorFilter 同挂时 colorFilter 被
+  //    吞，故颜色与遮罩一律放到 CPU 逐像素阶段。降采样模拟的强模糊
+  //    （5542 的 48px）会把中心内容糊掉，弃用。
+  final rec = ui.PictureRecorder();
+  final c = ui.Canvas(rec, const ui.Rect.fromLTWH(0, 0, size, size));
+  c.drawImageRect(
     src,
     ui.Rect.fromLTWH(0, 0, src.width.toDouble(), src.height.toDouble()),
-    const ui.Rect.fromLTWH(0, 0, blurSide, blurSide),
-    ui.Paint()..filterQuality = ui.FilterQuality.high,
-  );
-  final downPic = downRec.endRecording();
-  final small = await downPic.toImage(blurSide.toInt(), blurSide.toInt());
-  downPic.dispose();
-
-  final upRec = ui.PictureRecorder();
-  final upC = ui.Canvas(
-    upRec,
     const ui.Rect.fromLTWH(0, 0, size, size),
+    ui.Paint()
+      ..filterQuality = ui.FilterQuality.high
+      ..imageFilter = ui.ImageFilter.blur(sigmaX: 2.2, sigmaY: 2.2),
   );
-  upC.drawImageRect(
-    small,
-    const ui.Rect.fromLTWH(0, 0, blurSide, blurSide),
-    const ui.Rect.fromLTWH(0, 0, size, size),
-    ui.Paint()..filterQuality = ui.FilterQuality.high,
-  );
-  final upPic = upRec.endRecording();
-  final upscaled = await upPic.toImage(size.toInt(), size.toInt());
-  upPic.dispose();
-  small.dispose();
+  final pic = rec.endRecording();
+  final upscaled = await pic.toImage(side, side);
+  pic.dispose();
 
   // ② CPU 逐像素：颜色 dim*(gray + 0.5*(c-gray))、整体 alpha 0.5、
   //    径向雾化（中心全显，边缘中点剩约 19%，四角 0.707×size 处完全
