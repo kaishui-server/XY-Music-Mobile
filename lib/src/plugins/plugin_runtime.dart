@@ -1636,7 +1636,23 @@ class PluginRuntimeService {
       return _searchLxPlugin(plugin, keyword, onlySource: lxSource);
     }
     if (plugin.isAnimemusic) {
-      return _searchAnimemusic(plugin, keyword);
+      try {
+        final animemusicSongs = await _searchAnimemusic(plugin, keyword);
+        if (animemusicSongs.isEmpty) {
+          AppLogStore.instance.add(
+            '[插件搜索] ${plugin.name} 搜索"$keyword"返回空结果（后端空data）',
+            level: AppLogLevel.warning,
+          );
+        }
+        return animemusicSongs;
+      } catch (error) {
+        AppLogStore.instance.add(
+          '[插件搜索] ${plugin.name} 搜索"$keyword"后端调用失败: '
+          '${_friendlyError(error.toString())}',
+          level: AppLogLevel.error,
+        );
+        rethrow;
+      }
     }
     dynamic response;
     Object? pluginError;
@@ -1649,6 +1665,11 @@ class PluginRuntimeService {
               'music',
             ]);
     } catch (error) {
+      AppLogStore.instance.add(
+        '[插件搜索] ${plugin.name} 搜索"$keyword"插件调用异常: '
+        '${_friendlyError(error.toString())}',
+        level: AppLogLevel.error,
+      );
       if (!_isQqMusicPlugin(plugin)) rethrow;
       pluginError = error;
     }
@@ -1658,6 +1679,11 @@ class PluginRuntimeService {
       try {
         list = await _searchQqWebFallback(keyword);
       } catch (fallbackError) {
+        AppLogStore.instance.add(
+          '[插件搜索] ${plugin.name} 搜索"$keyword"QQ备用接口失败: '
+          '${_friendlyError(fallbackError.toString())}',
+          level: AppLogLevel.error,
+        );
         if (pluginError != null) {
           throw Exception(
             'QQ音乐搜索失败：${_friendlyError(pluginError.toString())}；'
@@ -1681,7 +1707,12 @@ class PluginRuntimeService {
       try {
         songs = await _searchAnimemusic(plugin, keyword);
       } catch (_) {
-        // 后端不可用时维持空结果。
+        // 后端不可用时维持空结果，但必须留痕：惜梦系主搜索为空时
+        // 兜底再失败 = 后端不可用，是用户侧"搜索失败"的关键线索。
+        AppLogStore.instance.add(
+          '[插件搜索] ${plugin.name} 搜索"$keyword"惜梦后端兜底失败（维持空结果）',
+          level: AppLogLevel.warning,
+        );
       }
     }
     // 听书类插件（如 one-酷我听书）声明仅支持 album 类型搜索，music
@@ -1702,6 +1733,12 @@ class PluginRuntimeService {
       } catch (_) {
         // album 兜底失败维持空结果。
       }
+    }
+    if (songs.isEmpty) {
+      AppLogStore.instance.add(
+        '[插件搜索] ${plugin.name} 搜索"$keyword"返回空结果（插件空data或解析为空）',
+        level: AppLogLevel.warning,
+      );
     }
     return songs;
   }
@@ -2608,7 +2645,14 @@ class PluginRuntimeService {
     Object? lastError;
     for (final (source, rawJson, error) in responses) {
       if (rawJson == null) {
-        if (error != null) lastError = error;
+        if (error != null) {
+          lastError = error;
+          AppLogStore.instance.add(
+            '[LX搜索] 平台$source 搜索"$keyword"失败: '
+            '${_friendlyError(error.toString())}',
+            level: AppLogLevel.error,
+          );
+        }
         continue;
       }
       try {
@@ -2625,10 +2669,21 @@ class PluginRuntimeService {
         }
       } catch (decodeError) {
         lastError = decodeError;
+        AppLogStore.instance.add(
+          '[LX搜索] 平台$source 搜索"$keyword"响应解析失败: '
+          '${_friendlyError(decodeError.toString())}',
+          level: AppLogLevel.error,
+        );
       }
     }
-    if (results.isEmpty && lastError != null) {
-      throw Exception('LX 搜索失败：${_friendlyError(lastError.toString())}');
+    if (results.isEmpty) {
+      if (lastError != null) {
+        throw Exception('LX 搜索失败：${_friendlyError(lastError.toString())}');
+      }
+      AppLogStore.instance.add(
+        '[LX搜索] ${plugin.name} 搜索"$keyword"所有平台返回空结果（空data或解析为空）',
+        level: AppLogLevel.warning,
+      );
     }
     return results;
   }
