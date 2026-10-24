@@ -150,7 +150,8 @@ class _PlaylistsPageState extends ConsumerState<PlaylistsPage> {
             IconButton(
               tooltip: '导入歌单',
               onPressed: () => showPlaylistImportOptions(context, ref),
-              icon: const Icon(Icons.download_rounded),
+              // 导入 ≠ 下载：download 图标与歌单下载按钮混淆（5550），改用「加入歌单」语义。
+              icon: const Icon(Icons.playlist_add_rounded),
             ),
             IconButton(
               tooltip: '新建歌单',
@@ -412,7 +413,7 @@ class _EmptyPlaylists extends StatelessWidget {
               children: [
                 OutlinedButton.icon(
                   onPressed: onImport,
-                  icon: const Icon(Icons.download_rounded),
+                  icon: const Icon(Icons.playlist_add_rounded),
                   label: const Text('导入'),
                 ),
                 const SizedBox(width: 10),

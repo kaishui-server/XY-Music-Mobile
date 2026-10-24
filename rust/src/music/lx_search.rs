@@ -58,6 +58,56 @@ fn search_cache() -> &'static Arc<RwLock<HashMap<String, SearchCacheEntry>>> {
 }
 
 const SEARCH_CACHE_TTL_SECS: u64 = 300; // 5 分钟
+
+/// 瞬态失败（风控/网络抖动）短期缓存：多个插件页签并发同一关键词、
+/// 或用户连点重试时共享同一失败结果，避免短时间重复冲击上游接口把
+/// 间歇性风控打成持续风控（5547 实锤：同关键词 4 秒 25 次上游请求）。
+const SEARCH_FAILURE_TTL_SECS: u64 = 6;
+
+static SEARCH_FAILURES: OnceLock<Arc<RwLock<HashMap<String, (Instant, String)>>>> =
+    OnceLock::new();
+
+fn search_failures() -> &'static Arc<RwLock<HashMap<String, (Instant, String)>>> {
+    SEARCH_FAILURES.get_or_init(|| Arc::new(RwLock::new(HashMap::new())))
+}
+
+/// 同 key 并发去重锁：同 (source, keyword, limit) 的并发请求共享一次
+/// 实际执行，后到者拿锁后二次查缓存直接复用结果。
+static SEARCH_INFLIGHT: OnceLock<Arc<RwLock<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>> =
+    OnceLock::new();
+
+fn search_inflight() -> &'static Arc<RwLock<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> {
+    SEARCH_INFLIGHT.get_or_init(|| Arc::new(RwLock::new(HashMap::new())))
+}
+
+async fn get_cached_failure(source: &str, keyword: &str, limit: u32) -> Option<String> {
+    let key = make_search_cache_key(source, keyword, limit);
+    let mut cache = search_failures().write().await;
+    let (at, err) = cache.get(&key)?;
+    if at.elapsed() >= Duration::from_secs(SEARCH_FAILURE_TTL_SECS) {
+        cache.remove(&key);
+        return None;
+    }
+    Some(err.clone())
+}
+
+async fn set_cached_failure(source: &str, keyword: &str, limit: u32, err: String) {
+    let key = make_search_cache_key(source, keyword, limit);
+    let mut cache = search_failures().write().await;
+    // 惰性清理过期项，避免失败键长期堆积。
+    let now = Instant::now();
+    cache.retain(|_, (at, _)| now.duration_since(*at) < Duration::from_secs(SEARCH_FAILURE_TTL_SECS));
+    cache.insert(key, (now, err));
+}
+
+async fn inflight_lock(source: &str, keyword: &str, limit: u32) -> Arc<tokio::sync::Mutex<()>> {
+    let key = make_search_cache_key(source, keyword, limit);
+    let mut map = search_inflight().write().await;
+    map.entry(key)
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+}
+
 /// 缓存硬上限：过期清理后仍超容量时，按 LRU（最久未访问）淘汰
 const SEARCH_CACHE_MAX_ENTRIES: usize = 200;
 
@@ -1179,19 +1229,46 @@ async fn search_wy(keyword: &str, limit: u32) -> Result<Vec<LxSearchItem>, Strin
         limit
     );
 
-    let result = http_get_json(
-        &url,
-        &[
-            ("User-Agent", "Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/69.0.3497.100 Safari/537.36"),
-            ("Referer", "https://music.163.com"),
-            ("Cookie", "MUSIC_A=1"),
-        ],
-    )
-    .await?;
-
-    if result.get("code").and_then(|v| v.as_i64()) != Some(200) {
-        return Err("WY search: code != 200".to_string());
+    // 网易对同 IP 高频搜索有风控（业务码非 200，5547 实锤 4 秒 25 连发
+    // 后恒失败）：带退避重试两次（与 tx/kw 的退避策略一致），重试耗尽才
+    // 报错；错误信息透出实际业务码与描述，便于定位。
+    let headers = [
+        ("User-Agent", "Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/69.0.3497.100 Safari/537.36"),
+        ("Referer", "https://music.163.com"),
+        ("Cookie", "MUSIC_A=1"),
+    ];
+    let mut result: Option<serde_json::Value> = None;
+    let mut last_err = String::new();
+    for attempt in 0..=2 {
+        if attempt > 0 {
+            tokio::time::sleep(Duration::from_millis(800 * attempt as u64)).await;
+        }
+        match http_get_json(&url, &headers).await {
+            Ok(value) => {
+                if value.get("code").and_then(|v| v.as_i64()) == Some(200) {
+                    result = Some(value);
+                    break;
+                }
+                let code = value.get("code").and_then(|v| v.as_i64()).unwrap_or(-1);
+                let msg = value
+                    .get("message")
+                    .or_else(|| value.get("msg"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim();
+                last_err = if msg.is_empty() {
+                    format!("WY search: code={}", code)
+                } else {
+                    format!("WY search: code={} msg={}", code, msg)
+                };
+            }
+            Err(error) => last_err = error,
+        }
     }
+    let result = match result {
+        Some(value) => value,
+        None => return Err(last_err),
+    };
 
     let songs = result
         .pointer("/result/songs")
@@ -1537,20 +1614,40 @@ pub async fn lx_search(
         return Ok(cached);
     }
 
+    // 瞬态失败缓存：短窗口内的重复请求直接复用失败结果，不再打上游
+    // （多个插件页签并发同一关键词/用户连点重试的风控放大器，5547）。
+    if let Some(err) = get_cached_failure(source, keyword, actual_limit).await {
+        return Err(err);
+    }
+
+    // 并发去重：同 key 并发请求共享一次实际执行，后到者拿锁后二次查
+    // 两级缓存直接复用，避免同一关键词并发 N 份上游请求。
+    let lock = inflight_lock(source, keyword, actual_limit).await;
+    let _guard = lock.lock().await;
+    if let Some(cached) = get_cached_search(source, keyword, actual_limit).await {
+        return Ok(cached);
+    }
+    if let Some(err) = get_cached_failure(source, keyword, actual_limit).await {
+        return Err(err);
+    }
+
     // 执行搜索
-    let items = match source {
+    let result = match source {
         "kw" => search_kw(keyword, actual_limit).await,
         "kg" => search_kg(keyword, actual_limit).await,
         "tx" => search_tx(keyword, actual_limit).await,
         "wy" => search_wy(keyword, actual_limit).await,
         "mg" => search_mg(keyword, actual_limit).await,
         _ => Err(format!("Unknown LX source: {}", source)),
-    }?;
+    };
 
-    // 写入缓存
-    set_cached_search(source, keyword, actual_limit, items.clone()).await;
+    // 成功写结果缓存，失败写瞬态失败缓存（短 TTL）
+    match &result {
+        Ok(items) => set_cached_search(source, keyword, actual_limit, items.clone()).await,
+        Err(err) => set_cached_failure(source, keyword, actual_limit, err.clone()).await,
+    }
 
-    Ok(items)
+    result
 }
 
 /// 清除所有 LX 缓存（URL + 搜索）
@@ -1564,6 +1661,40 @@ pub async fn clear_lx_all_cache() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ===== 瞬态失败缓存（5547）=====
+
+    /// 真联网验证 wy 搜索（含退避重试与 code/msg 错误透出）。
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "依赖网络与网易接口可用性"]
+    async fn test_search_wy_real_network() {
+        let items = search_wy("临安初雨", 30).await.expect("wy 搜索应成功");
+        assert!(!items.is_empty(), "wy 搜索结果不应为空");
+        assert!(items.iter().all(|item| item.source == "wy"));
+        assert!(items.iter().all(|item| !item.songmid.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn test_failure_cache_roundtrip() {
+        let key = ("wy", "xy-failure-cache-probe", 30u32);
+        assert!(get_cached_failure(key.0, key.1, key.2).await.is_none());
+        set_cached_failure(key.0, key.1, key.2, "WY search: code=-460".into()).await;
+        let cached = get_cached_failure(key.0, key.1, key.2)
+            .await
+            .expect("失败缓存应命中");
+        assert_eq!(cached, "WY search: code=-460");
+    }
+
+    /// 同 key 并发去重：两个并发 lx_search 共享一次实际执行。
+    /// 用「unknown」源：第一次执行报错并写入失败缓存，并发第二请求
+    /// 在锁内二次查缓存命中，结果一致。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_lx_search_dedupes_concurrent_same_key() {
+        let (source, keyword) = ("unknown-src", "xy-dedup-probe");
+        let (r1, r2) = tokio::join!(lx_search(source, keyword, 30), lx_search(source, keyword, 30));
+        assert!(r1.is_err());
+        assert_eq!(r1.err(), r2.err());
+    }
 
     // ===== format_play_time =====
 

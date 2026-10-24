@@ -374,16 +374,19 @@ class _VisualizerPageState extends ConsumerState<VisualizerPage>
               ),
             ),
             // 歌词覆盖层（设置驱动：模式/字号/颜色/字体）。
-            // 手势分区：左带（40% 宽）归歌词（拖动滚动 / 点行跳转），
-            // 右带留给场景层（拖动=轨道视角旋转，单击=涟漪波纹）。
+            // 5547：左右手势分区废除——歌词层不参与任何手势
+            // （IgnorePointer），全屏手势统一控制脉冲方块地形图
+            // （拖动=轨道视角旋转，单击/长按=涟漪波纹）。
             Positioned(
               left: 16,
               top: 0,
               bottom: 140,
               width: MediaQuery.of(context).size.width * 0.40,
-              child: _LyricsOverlay(
-                offsetTenths: _lyricsOffsetTenths,
-                settings: settings,
+              child: IgnorePointer(
+                child: _LyricsOverlay(
+                  offsetTenths: _lyricsOffsetTenths,
+                  settings: settings,
+                ),
               ),
             ),
             // 底部毛玻璃播放条（循环/上一/播放/下一/队列/设置，对齐参考图）。

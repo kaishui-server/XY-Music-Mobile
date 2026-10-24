@@ -135,6 +135,10 @@ class _SearchPageState extends ConsumerState<SearchPage>
   int _queryToken = 0;
   DateTime _lastInputAt = DateTime.fromMillisecondsSinceEpoch(0);
   Timer? _submitConfirmTimer;
+  // 同关键词防抖：键盘搜索动作与失焦回调可能对同一关键词双发提交，
+  // 短窗口内重复提交直接忽略，避免高频冲击上游接口触发风控（5547）。
+  String _lastSearchKeyword = '';
+  DateTime _lastSearchAt = DateTime.fromMillisecondsSinceEpoch(0);
 
   @override
   void initState() {
@@ -313,6 +317,13 @@ class _SearchPageState extends ConsumerState<SearchPage>
   Future<void> _search(String input) async {
     final keyword = input.trim();
     if (keyword.isEmpty) return;
+    final now = DateTime.now();
+    if (keyword == _lastSearchKeyword &&
+        now.difference(_lastSearchAt) < const Duration(milliseconds: 600)) {
+      return;
+    }
+    _lastSearchKeyword = keyword;
+    _lastSearchAt = now;
     _searchedRevision = _inputRevision;
     _recordHistory(keyword);
     final token = ++_queryToken;

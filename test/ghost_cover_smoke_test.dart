@@ -1,9 +1,10 @@
-// 冒烟测试：验证封面幽灵层「解码器直出双层纹理 + 顶点色雾化网格」管线。
-// 5540-5543 实测 Impeller 离屏管线上 dstIn 遮罩/toByteData 回读不可靠
-// （真机矩形轮廓始终清晰），故纹理为解码直出零加工，雾化/暗化全部由
-// 顶点色承载（drawVertices 与地形网格同管线）。
-// 5546 双层化：内层 512px 清晰纹理（人物轮廓可辨）+ 外层 64px 糊化
-// 纹理雾环（边缘高斯模糊感）+ 雾气漂浮（顶点 alpha/位置随时间扰动）。
+// 冒烟测试：验证封面幽灵层「解码器直出双层纹理 + drawImageRect + 渐变
+// 雾罩」管线。
+// 5546 真机「一团白」根因：drawVertices 的 paint 从未绑定 ImageShader，
+// 纹理坐标无纹理可采，只画出顶点色灰团。5547 改为 drawImageRect 直出
+// （5540-5543 真机实证可见），压暗/降饱和由 ghostDimMatrix 单一
+// colorFilter 承载，消散/渐隐由 gradient shader 直绘（零离屏、零顶点
+// 色、零像素回读）。
 
 import 'dart:ui' as ui;
 
@@ -47,7 +48,7 @@ void main() {
     expect(tex.blur.height, 64);
 
     // 纹理即解码直出的原始像素（alpha/RGB 均不加工）——暗化/去饱和由
-    // 顶点色承载，任何 CPU 像素加工都会重新引入真机不可靠管线。
+    // colorFilter 矩阵承载，任何 CPU 像素加工都会重新引入真机不可靠管线。
     final center = await _pixel(tex.sharp, 128, 128);
     expect(center, [220, 60, 60, 255]);
     final blurCenter = await _pixel(tex.blur, 32, 32);
@@ -55,73 +56,56 @@ void main() {
     tex.dispose();
   });
 
-  int alphaAt(
-    double fx,
-    double fy, {
-    required GhostLayer layer,
-    double base = 0.62,
-    double time = 0,
-  }) {
-    final c = ghostVertexColor(
-      fx,
-      fy,
-      layer: layer,
-      bright: 1.0,
-      baseAlpha: base,
-      time: time,
-    );
-    return (c >> 24) & 0xFF;
-  }
-
-  test('inner layer: corners dissolved, center visible', () {
-    // 四角完全消融（圆形雾化投影，无矩形轮廓）。
-    expect(alphaAt(0, 0, layer: GhostLayer.inner), 0);
-    expect(alphaAt(1, 0, layer: GhostLayer.inner), 0);
-    expect(alphaAt(0, 1, layer: GhostLayer.inner), 0);
-    expect(alphaAt(1, 1, layer: GhostLayer.inner), 0);
-    // 中心全显。
-    final center = alphaAt(0.5, 0.5, layer: GhostLayer.inner);
-    expect(center, greaterThan(120));
-    expect(center, lessThan(200));
+  test('dim matrix: night tint (0.50/0.54/0.63) × saturation 0.42', () {
+    final m = ghostDimMatrix(bright: 1.0);
+    expect(m.length, 20);
+    // 亮度基準系数（0.2126/0.7152/0.0722，sat=0.42）：
+    // R 行 = 0.50 × [0.2126×0.58+0.42, 0.7152×0.58, 0.0722×0.58, 0, 0]。
+    expect(m[0], closeTo(0.50 * (0.2126 * 0.58 + 0.42), 1e-9));
+    expect(m[1], closeTo(0.50 * (0.7152 * 0.58), 1e-9));
+    expect(m[2], closeTo(0.50 * (0.0722 * 0.58), 1e-9));
+    expect(m[3], 0);
+    expect(m[4], 0);
+    // G 行 = 0.54 × [0.1063, 0.8358, 0.0419, ...]。
+    expect(m[5], closeTo(0.54 * (0.2126 * 0.58), 1e-9));
+    expect(m[6], closeTo(0.54 * (0.7152 * 0.58 + 0.42), 1e-9));
+    // B 行 = 0.63 × [0.1063, 0.4148, 0.5619, 0, 0]。
+    expect(m[10], closeTo(0.63 * (0.2126 * 0.58), 1e-9));
+    expect(m[11], closeTo(0.63 * (0.7152 * 0.58), 1e-9));
+    expect(m[12], closeTo(0.63 * (0.0722 * 0.58 + 0.42), 1e-9));
+    // alpha 行恒等（不改动纹理透明度）。
+    expect(m[15], 0);
+    expect(m[16], 0);
+    expect(m[17], 0);
+    expect(m[18], 1);
+    expect(m[19], 0);
   });
 
-  test('outer layer: mist ring peaks off-center, corners dissolved', () {
-    // 中心透明（雾环不遮清晰区）、d≈0.4 处峰值、四角完全消融。
-    expect(alphaAt(0.5, 0.5, layer: GhostLayer.outer), 0);
-    final ring = alphaAt(0.7, 0.5, layer: GhostLayer.outer);
-    expect(ring, greaterThan(0), reason: '雾环应有可见 alpha');
-    expect(alphaAt(0, 0, layer: GhostLayer.outer), 0);
-    expect(alphaAt(1, 1, layer: GhostLayer.outer), 0);
-  });
-
-  test('mist flicker: outer layer alpha varies with time, inner static',
-      () {
-    var innerChanged = false;
-    var outerChanged = false;
-    for (final t in [0.0, 0.4, 1.1, 2.3]) {
-      final a0 = alphaAt(0.8, 0.6, layer: GhostLayer.outer, time: t);
-      final a1 = alphaAt(0.8, 0.6, layer: GhostLayer.outer, time: 0.0);
-      if (a0 != a1) outerChanged = true;
-      final i0 = alphaAt(0.5, 0.2, layer: GhostLayer.inner, time: t);
-      final i1 = alphaAt(0.5, 0.2, layer: GhostLayer.inner, time: 0.0);
-      if (i0 != i1) innerChanged = true;
+  test('dim matrix: bright scales RGB rows proportionally, alpha intact', () {
+    final a = ghostDimMatrix(bright: 1.0);
+    final b = ghostDimMatrix(bright: 1.3);
+    for (var i = 0; i < 15; i++) {
+      expect(b[i], closeTo(a[i] * 1.3, 1e-9), reason: 'index $i');
     }
-    expect(outerChanged, isTrue, reason: '外层雾气应随时间漂浮波动');
-    expect(innerChanged, isFalse, reason: '内层清晰区应静止');
+    // bright 只调 RGB 不调 alpha 行。
+    for (var i = 15; i < 20; i++) {
+      expect(b[i], a[i], reason: 'index $i');
+    }
   });
 
-  test('vertex colors: bright modulates RGB (night tint), alpha intact', () {
-    const base = 0.62;
-    final c =
-        ghostVertexColor(0.5, 0.5, layer: GhostLayer.inner, bright: 1.0, baseAlpha: base, time: 0);
-    final b = ghostVertexColor(
-        0.5, 0.5, layer: GhostLayer.inner, bright: 1.3, baseAlpha: base, time: 0);
-    expect(((b >> 24) & 0xFF), ((c >> 24) & 0xFF),
-        reason: 'bright 只调 RGB 不调 alpha');
-    // 乘性暗化：RGB 按夜空色调制（0.62/0.66/0.74），亮度提升等比放大。
-    expect(((c >> 16) & 0xFF), (0.62 * 255).round());
-    expect(((c >> 8) & 0xFF), (0.66 * 255).round());
-    expect((c & 0xFF), (0.74 * 255).round());
-    expect(((b >> 16) & 0xFF), (1.3 * 0.62 * 255).round());
+  test('dim matrix: desaturates pure red (G/B lifted, channel spread shrunk)',
+      () {
+    final m = ghostDimMatrix(bright: 1.0);
+    // 纯红 (255,0,0) 输出：
+    // R = 0.50×0.5433×255 ≈ 69.3，G = 0.54×0.1233×255 ≈ 17.0，
+    // B = 0.63×0.1233×255 ≈ 19.8 —— 降饱和后的暗红（G/B 不再为 0）。
+    final r = 0.50 * (0.2126 * 0.58 + 0.42) * 255;
+    final g = 0.54 * (0.2126 * 0.58) * 255;
+    final b = 0.63 * (0.2126 * 0.58) * 255;
+    expect(m[0] * 255, closeTo(r, 0.01));
+    expect(m[5] * 255, closeTo(g, 0.01));
+    expect(m[10] * 255, closeTo(b, 0.01));
+    expect(g, greaterThan(0));
+    expect(b, greaterThan(0));
   });
 }

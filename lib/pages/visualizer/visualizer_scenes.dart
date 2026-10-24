@@ -162,42 +162,70 @@ int _argb(double a, double r, double g, double b) {
 Color _col(double a, double r, double g, double b) =>
     Color(_argb(a, r, g, b));
 
+/// 已知颜色的指定 alpha 版本（消散罩取色用）。
+Color _colOf(double a, Color c) => Color.fromARGB(
+    (a.clamp(0.0, 1.0) * 255).round(), c.red, c.green, c.blue);
+
+/// 天空渐变在屏幕高度分数 ty（0=顶 1=底）处的颜色。
+/// 严格对齐 _paintSky 的四段渐变（stops [0, .30, .44, 1]、第二色为
+/// skyTop→skyFog 的 55% 混合、末段降至 55% 亮度）——消散罩用它取色
+/// 才能与背景天空零色差（「光圈」问题的根治点）。
+Color _skyColorAt(_Palette pal, double ty) {
+  final m1r = pal.stR + (pal.sbR - pal.stR) * 0.55;
+  final m1g = pal.stG + (pal.sbG - pal.stG) * 0.55;
+  final m1b = pal.stB + (pal.sbB - pal.stB) * 0.55;
+  if (ty <= 0.30) {
+    final t = (ty / 0.30).clamp(0.0, 1.0);
+    return _col(1, pal.stR + (m1r - pal.stR) * t,
+        pal.stG + (m1g - pal.stG) * t, pal.stB + (m1b - pal.stB) * t);
+  }
+  if (ty <= 0.44) {
+    final t = ((ty - 0.30) / 0.14).clamp(0.0, 1.0);
+    return _col(
+        1, m1r + (pal.sbR - m1r) * t, m1g + (pal.sbG - m1g) * t,
+        m1b + (pal.sbB - m1b) * t);
+  }
+  final t = ((ty - 0.44) / 0.56).clamp(0.0, 1.0);
+  return _col(1, pal.sbR * (1 - 0.45 * t), pal.sbG * (1 - 0.45 * t),
+      pal.sbB * (1 - 0.45 * t));
+}
+
+/// _paintSky 的基础垂直渐变（5554：封面消散罩复用同一构造，罩内逐点
+/// 色与背景一致 = 零色差零黑圈）。
+Paint _skyBasePaint(_Palette pal, Size size) => Paint()
+  ..shader = ui.Gradient.linear(
+    Offset(0, 0),
+    Offset(0, size.height),
+    [
+      _col(1, pal.stR, pal.stG, pal.stB),
+      _col(1, pal.stR + (pal.sbR - pal.stR) * 0.55,
+          pal.stG + (pal.sbG - pal.stG) * 0.55,
+          pal.stB + (pal.sbB - pal.stB) * 0.55),
+      _col(1, pal.sbR, pal.sbG, pal.sbB),
+      _col(1, pal.sbR * 0.55, pal.sbG * 0.55, pal.sbB * 0.55),
+    ],
+    [0.0, 0.30, 0.44, 1.0],
+  );
+
+/// _paintSky 的地平线辉光层（main 派生的椭圆辉光）。
+Paint _skyGlowPaint(_Palette pal, Size size) => Paint()
+  ..shader = ui.Gradient.radial(
+    Offset(size.width * 0.5, size.height * 0.44),
+    size.width * 0.55,
+    [
+      _col(0.16, pal.hgR, pal.hgG, pal.hgB),
+      _col(0.0, pal.hgR, pal.hgG, pal.hgB),
+    ],
+  );
+
 /// 主题氛围天空：纵向渐变（顶暗 → 地平线雾光）+ 地平线中央辉光，
 /// 对齐参考版的「天空感」——背景不再是纯黑。
 void _paintSky(Canvas canvas, Size size, _Palette pal,
     {bool horizonGlow = true}) {
   final rect = Offset.zero & size;
-  canvas.drawRect(
-    rect,
-    Paint()
-      ..shader = ui.Gradient.linear(
-        Offset(0, 0),
-        Offset(0, size.height),
-        [
-          _col(1, pal.stR, pal.stG, pal.stB),
-          _col(1, pal.stR + (pal.sbR - pal.stR) * 0.55,
-              pal.stG + (pal.sbG - pal.stG) * 0.55,
-              pal.stB + (pal.sbB - pal.stB) * 0.55),
-          _col(1, pal.sbR, pal.sbG, pal.sbB),
-          _col(1, pal.sbR * 0.55, pal.sbG * 0.55, pal.sbB * 0.55),
-        ],
-        [0.0, 0.30, 0.44, 1.0],
-      ),
-  );
+  canvas.drawRect(rect, _skyBasePaint(pal, size));
   if (horizonGlow) {
-    // 地平线雾光（main 派生的椭圆辉光，叠加一次 srcOver 无需离屏）。
-    canvas.drawRect(
-      rect,
-      Paint()
-        ..shader = ui.Gradient.radial(
-          Offset(size.width * 0.5, size.height * 0.44),
-          size.width * 0.55,
-          [
-            _col(0.16, pal.hgR, pal.hgG, pal.hgB),
-            _col(0.0, pal.hgR, pal.hgG, pal.hgB),
-          ],
-        ),
-    );
+    canvas.drawRect(rect, _skyGlowPaint(pal, size));
   }
 }
 
@@ -531,7 +559,7 @@ class TerrainScenePainter extends CustomPainter {
     }
 
     // —— 封面幽灵层（在柱体之前绘制：位于地形后方，被近处柱体遮出层次）——
-    _paintCover(canvas, rig, a);
+    _paintCover(canvas, rig, a, size);
 
     // —— 第二遍：从远到近排序后一次 drawVertices ——
     order.sort((ia, ib) => depths[ib].compareTo(depths[ia]));
@@ -802,15 +830,28 @@ class TerrainScenePainter extends CustomPainter {
   /// 约占屏高 46%、悬于地形上空偏右上，对齐参考版观感），rotY(-π/4)
   /// 固定朝向（5540 起封面不再自旋，与参考一致）；脉冲对齐 MapScene：
   /// uPulse = bass*0.4 + subBass*0.2，亮度增益收敛到 ×0.3 保持暗调。
-  void _paintCover(Canvas canvas, CameraRig rig, BandPartition a) {
+  ///
+  /// 渲染管线（5547 定稿）：drawImageRect 直出 + 渐变雾罩——
+  /// ① 封面纹理经 MVP 变换后 drawImageRect 直绘（5540-5543 真机实证
+  ///    该路径可见；5546 的 drawVertices 管线 paint 从未绑定 ImageShader，
+  ///    纹理坐标无纹理可采，真机只画出顶点色灰团=「一团白」根因）；
+  /// ② 压暗+降饱和由单一 colorFilter 承载（5542 教训：与 imageFilter
+  ///    同挂会被吞，只挂一个安全）；
+  /// ③ 消散由「天空色渐进罩」承载（5550 定稿）：5548 的 20×20 分格
+  ///    drawImageRect 逐格 alpha 在真机可辨网格台阶（用户明确不要网格）。
+  ///    封面单次直绘后，在屏幕空间叠加天空色径向罩（中心轻雾 →
+  ///    边缘完全溶入天空），罩色按屏幕高度与 _paintSky 同源取色
+  ///    （_skyColorAt）——无网格、零离屏、零色差光圈；雾团与中心轻雾
+  ///    保留（用户确认）。
+  void _paintCover(Canvas canvas, CameraRig rig, BandPartition a, Size size) {
     final ghost = f.coverImage;
     if (ghost == null || !f.settings.showCover) return;
     final coverPulse = (a.bass * 0.4 + a.subBass * 0.2).clamp(0.0, 1.0);
     const ang = -math.pi / 4;
     final ca = math.cos(ang), sa = math.sin(ang);
     // 四角投影检查（在视野内才画）。
-    // cy 取得较低（近地平线）：底部没入雾中由烘焙遮罩渐隐（对齐参考
-    // 「封面自地平线雾气中浮起」的观感），顶部完整可见不裁边。
+    // 5553 恢复 5547 定稿机位：近地平线低悬（底部没入雾中由地平线渐隐
+    // 遮蔽，「封面自地平线雾气中浮起」观感），顶部完整可见不裁边。
     const cx0 = 95.0, cy0 = 6.0, cz0 = -95.0;
     const half = 42.0;
     final c0 = rig.project(cx0 - half * ca, cy0 + half, cz0 + half * sa);
@@ -821,6 +862,7 @@ class TerrainScenePainter extends CustomPainter {
 
     // MVP（column-major）= S(视口) · P(透视) · V(lookAt) · M(模型)。
     final mvp = _coverMvp(rig, ang, cx0, cy0, cz0);
+    final pal = _paletteFor(f.settings.theme);
     canvas.save();
     canvas.transform(mvp);
     // 翻转 v 轴保证封面正立（MVP 的 NDC y 向上、图片 v 向下）。
@@ -828,37 +870,118 @@ class TerrainScenePainter extends CustomPainter {
     // 这正是 5538 封面幽灵层完全不可见的根因）。
     canvas.scale(1, -1);
     final bright = 1.0 + coverPulse * 0.3;
-    final time = f.time;
-    // 双层顶点色网格渲染（对齐 LX-X「天空中的巨大圆形雾化投影」）：
-    // 外层 = 64px 糊化纹理的雾环（边缘高斯模糊感 + 雾气漂浮），先画；
-    // 内层 = 256px 清晰纹理的中心区（人物轮廓可辨），后画。两层都是
-    // 径向顶点色包络（圆形投影、四边完全消融、无矩形轮廓），GPU 逐
-    // 像素插值零离屏——Impeller 离屏管线 dstIn/toByteData 回读不可靠
-    // （5540-5543 真机矩形轮廓始终清晰的根因），顶点色与地形网格同
-    // 一条管线，真机长期验证可靠。
-    final paint = Paint()..filterQuality = FilterQuality.medium;
-    final outer = buildGhostVertices(
-      layer: GhostLayer.outer,
-      half: half,
-      bright: bright,
-      textureW: ghost.blur.width,
-      textureH: ghost.blur.height,
-      time: time,
-      baseAlpha: 0.42,
+    final t = f.time;
+
+    // —— 5553 恢复 5547 观感（弃顶点色网格，沿用直绘管线）——
+    // 单张 sharp 纹理直绘（乘性夜色压暗由 ghostDimMatrix 承载）：
+    // 不叠 blur 纹理（5547 重影根因=第二层糊化内容轮廓），不画雾色
+    // 矩形罩（5547 光圈根因=固定雾色与天空色差）；圆形消散由屏幕空间
+    // 天空色渐进罩承载（函数尾），「边缘雾环」观感由天空色软雾团环绕
+    // 承载（下方雾团组）。
+    final m = ghostDimMatrix(bright: bright);
+    canvas.drawImageRect(
+      ghost.sharp,
+      Rect.fromLTWH(
+          0, 0, ghost.sharp.width.toDouble(), ghost.sharp.height.toDouble()),
+      Rect.fromLTWH(-half, -half, 2 * half, 2 * half),
+      Paint()
+        ..filterQuality = FilterQuality.medium
+        ..colorFilter = ColorFilter.matrix(m),
     );
-    canvas.drawVertices(outer, BlendMode.srcOver, paint);
-    outer.dispose();
-    final inner = buildGhostVertices(
-      layer: GhostLayer.inner,
-      half: half,
-      bright: bright,
-      textureW: ghost.sharp.width,
-      textureH: ghost.sharp.height,
-      time: time,
-      baseAlpha: 0.68,
+
+    // 雾团组的公用雾色（地平线雾与地平线辉光的 5:5 混合，再向辉光
+    // 偏移 10%）：与背景天空同源，低 alpha 下零色差。
+    var fogR = pal.stR + (pal.sbR - pal.stR) * 0.5;
+    var fogG = pal.stG + (pal.sbG - pal.stG) * 0.5;
+    var fogB = pal.stB + (pal.sbB - pal.stB) * 0.5;
+    fogR += (pal.hgR - fogR) * 0.10;
+    fogG += (pal.hgG - fogG) * 0.10;
+    fogB += (pal.hgB - fogB) * 0.10;
+    // 雾团组（5553 雾环观感）：对齐 5547「边缘雾环 + 雾气漂浮」——
+    // 外缘 3 团天空色软雾沿封面边缘缓慢环绕（半径呼吸），内部 2 团低
+    // 透明度雾缓慢漂移。全部为天空色（_paletteFor 同源），与背景零色差
+    // = 无光圈；纯色雾团无内容轮廓 = 与 sharp 中心无重影。
+    // 参数：[相位, 轨道半径比(负=内部漂移), 基础半径比, 基础 alpha]。
+    const fogSeeds = <(double, double, double, double)>[
+      (0.0, 0.98, 0.44, 0.085),
+      (2.1, 0.92, 0.48, 0.075),
+      (4.2, 1.04, 0.42, 0.080),
+      (1.2, -0.34, 0.34, 0.070),
+      (3.6, -0.52, 0.38, 0.060),
+    ];
+    for (final (ph, orb, br, ba) in fogSeeds) {
+      final double mx;
+      final double my;
+      if (orb > 0) {
+        // 外缘环绕：绕封面中心公转（缓慢）+ 半径/亮度呼吸。
+        final ang0 = t * 0.09 + ph;
+        mx = math.cos(ang0) * half * orb;
+        my = math.sin(ang0) * half * orb * 0.72 + half * 0.05;
+      } else {
+        // 内部漂移（5550 原轨迹）：多频正弦游走。
+        mx = math.sin(t * 0.13 + ph) * half * 0.45 +
+            (ph < 2.5 ? -half * 0.32 : half * 0.34);
+        my = math.cos(t * 0.10 + ph * 1.3) * half * 0.28 + half * 0.18;
+      }
+      final mr = half * br * (1 + 0.15 * math.sin(t * 0.21 + ph));
+      final ma = ba * (0.8 + 0.3 * math.sin(t * 0.5 + ph));
+      canvas.drawCircle(
+        Offset(mx, my),
+        mr,
+        Paint()
+          ..shader = ui.Gradient.radial(
+            Offset(mx, my),
+            mr,
+            [
+              _col(ma.clamp(0.0, 1.0), fogR, fogG, fogB),
+              _col(0, fogR, fogG, fogB),
+            ],
+          ),
+      );
+    }
+    canvas.restore();
+
+    // —— 屏幕空间消散罩（5554 修黑圈）：帧内 saveLayer + 圆形 clip 内
+    // 填「与 _paintSky 完全同款」的垂直渐变+辉光，再 dstIn 径向 alpha
+    // （中心 0.32 → 0.36r 起 → 0.56r 满幅，5547 包络不变）。旧实现用
+    // 封面中心高度的单色 radial 罩近似垂直渐变天空，罩圈跨越天空亮度
+    // 梯度（上暗下亮的地平线雾）必然环形色差——真机「封面外侧大黑圈」
+    // 根因。新结构圆内每点色 = 背景该点色（零色差），消散由 dstIn 承
+    // 载；帧内 saveLayer+dstIn 与官方 FadeTransition 同管线（5542 教训
+    // 针对 PictureRecorder.toImage 离屏烘焙，帧内 saveLayer 可靠）。
+    final center = Offset(
+      (c0.dx + c1.dx + c2.dx + c3.dx) / 4,
+      (c0.dy + c1.dy + c2.dy + c3.dy) / 4,
     );
-    canvas.drawVertices(inner, BlendMode.srcOver, paint);
-    inner.dispose();
+    var maxR = 0.0;
+    for (final c in [c0, c1, c2, c3]) {
+      maxR = math.max(maxR, (c - center).distance);
+    }
+    final r = maxR * 1.02;
+    final circleBounds = Rect.fromCircle(center: center, radius: r);
+    canvas.saveLayer(circleBounds, Paint());
+    canvas.save();
+    canvas.clipPath(Path()..addOval(circleBounds));
+    final rect = Offset.zero & size;
+    canvas.drawRect(rect, _skyBasePaint(pal, size));
+    canvas.drawRect(rect, _skyGlowPaint(pal, size));
+    canvas.restore();
+    canvas.drawCircle(
+      center,
+      r,
+      Paint()
+        ..blendMode = BlendMode.dstIn
+        ..shader = ui.Gradient.radial(
+          center,
+          r,
+          [
+            _colOf(0.32, const Color(0xFFFFFFFF)),
+            _colOf(0.32, const Color(0xFFFFFFFF)),
+            _colOf(1.0, const Color(0xFFFFFFFF)),
+          ],
+          const [0.0, 0.36, 0.56],
+        ),
+    );
     canvas.restore();
   }
 

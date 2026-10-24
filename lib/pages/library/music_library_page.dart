@@ -311,7 +311,8 @@ class _MusicLibraryPageState extends ConsumerState<MusicLibraryPage>
           IconButton(
             tooltip: '导入歌单',
             onPressed: () => showPlaylistImportOptions(context, ref),
-            icon: const Icon(Icons.download_rounded),
+            // 导入 ≠ 下载：与歌单页导入入口统一为「加入歌单」语义（5550）。
+            icon: const Icon(Icons.playlist_add_rounded),
           ),
         ];
       case 2:

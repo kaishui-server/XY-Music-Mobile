@@ -43,6 +43,7 @@ import '../../src/share/share_sheet.dart';
 import 'vinyl_tonearm.dart';
 import '../../src/widgets/batch_download.dart';
 import '../../src/widgets/cover_image.dart';
+import '../../src/widgets/lyric_settings_sheet.dart';
 import '../../src/widgets/queue_sheet.dart';
 import '../../src/widgets/source_switch.dart';
 import '../../src/widgets/top_notice.dart';
@@ -354,6 +355,12 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
   @override
   void initState() {
     super.initState();
+    // 详情页常驻沉浸：隐藏状态栏，顶部下划短暂呼出（sticky 由系统在
+    // 数秒无操作后自动收回），不影响下拉通知栏/控制中心手势；退出页面
+    // 在 dispose 恢复 edgeToEdge。
+    unawaited(
+      SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky),
+    );
     _playingSubscription = ref.listenManual<bool>(
       playerProvider.select((state) => state.isPlaying),
       (_, playing) => unawaited(_setScreenAwake(playing)),
@@ -1403,7 +1410,7 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
         onSwitchSource: () => unawaited(_switchSource(item)),
         onRestoreSource: () => unawaited(_restoreSource(item)),
         onPickQuality: () => unawaited(_pickPlaybackQuality()),
-        onPickLyricFontSize: () => unawaited(_pickLyricFontSize()),
+        onLyricSettings: _showLyricSettings,
         onShare: () => unawaited(_showShareSheet(item)),
         onToggleDesktopLyrics: () => unawaited(_toggleDesktopLyrics()),
         onShowEffects: () => unawaited(_showEffectsSheet()),
@@ -1979,25 +1986,11 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
     );
   }
 
-  /// 歌词字号调整弹窗：双滑杆实时调整（主歌词 + 迷你歌词各自独立），
-  /// 下方用示例歌词预览效果，拖动即写入设置。
-  /// 设置页“播放详情页歌词-歌词字号”共用同一份数据。
-  Future<void> _pickLyricFontSize() async {
-    await showModalBottomSheet<void>(
-      context: context,
-      useRootNavigator: true,
-      showDragHandle: true,
-      isScrollControlled: true,
-      builder: (sheetContext) => _LyricFontSizeSheet(
-        initial: ref.read(settingsProvider).valueOrNull?.lyricFontSize ?? 18.0,
-        initialMini:
-            ref.read(settingsProvider).valueOrNull?.miniLyricFontSize ?? 14.0,
-        onChanged: (value) =>
-            ref.read(settingsProvider.notifier).setLyricFontSize(value),
-        onMiniChanged: (value) =>
-            ref.read(settingsProvider.notifier).setMiniLyricFontSize(value),
-      ),
-    );
+  /// 歌词设置底部面板：颜色（未播/已播）、字号（主/迷你）、翻译/罗马音
+  /// 开关、逐字动效、对齐方式集中一处调整，即时写入设置。
+  /// 设置页「播放详情页歌词-歌词设置」共用同一面板与同一份数据。
+  Future<void> _showLyricSettings() {
+    return showLyricSettingsSheet(context);
   }
 
   /// 播放/关闭 MV 或 Bilibili 视频：当前正在播放则关闭，否则按类型启动。
@@ -2016,7 +2009,8 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
   }
 
   /// MV 横竖屏切换：横屏时锁定横向并进入沉浸式全屏（隐藏状态栏/导航栏，
-  /// 视频铺满整屏）；切回竖屏时恢复系统默认方向与 edgeToEdge 系统栏。
+  /// 视频铺满整屏）；切回竖屏时恢复系统默认方向。播放详情页常态即
+  /// immersiveSticky 沉浸（initState 设置），竖屏分支保持同一模式即可。
   Future<void> _toggleVideoOrientation() async {
     final next = !_videoLandscape;
     if (!mounted) return;
@@ -2029,17 +2023,17 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
             ]
           : DeviceOrientation.values,
     );
-    await SystemChrome.setEnabledSystemUIMode(
-      next ? SystemUiMode.immersiveSticky : SystemUiMode.edgeToEdge,
-    );
+    await SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
   }
 
-  /// 视频关闭或页面退出时解除横屏锁定与沉浸模式，恢复系统默认。
+  /// 视频关闭或页面退出时解除横屏锁定。播放详情页仍在前台（视频关闭
+  /// 场景）时保持 immersiveSticky 沉浸；页面退出由 dispose 统一恢复
+  /// edgeToEdge。
   void _resetVideoOrientation() {
     if (!_videoLandscape) return;
     _videoLandscape = false;
     unawaited(SystemChrome.setPreferredOrientations(DeviceOrientation.values));
-    unawaited(SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge));
+    unawaited(SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky));
   }
 
   Future<void> _addToPlaylist(QueueItem item) async {
@@ -3035,8 +3029,10 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
   void dispose() {
     // 视频控制器由会话对象持有，退出详情页只销毁页面 UI，不暂停或释放视频。
     // 这样从详情页返回后，视频仍可继续播放；重新进入详情页时会重新绑定。
-    // 横屏锁定跟随详情页生命周期，离开页面即解除。
+    // 横屏锁定跟随详情页生命周期，离开页面即解除；同时恢复系统状态栏
+    // （initState 进入详情页时切换到了 immersiveSticky 常驻沉浸）。
     _resetVideoOrientation();
+    unawaited(SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge));
     VideoPlaybackSession.revision.removeListener(_syncVideoSession);
     _playingSubscription?.close();
     _playingSubscription = null;
@@ -3278,7 +3274,7 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
             : () => unawaited(_linkLyrics(current)),
         onDesktopLyrics: () => unawaited(_toggleDesktopLyrics()),
         onQuality: () => unawaited(_pickPlaybackQuality()),
-        onLyricFontSizePage: () => unawaited(_pickLyricFontSize()),
+        onLyricSettings: _showLyricSettings,
         onPlayMv: current == null || !_mvButtonVisible(current)
             ? null
             : () => unawaited(_toggleMvOrVideo(current)),
@@ -3318,7 +3314,7 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
             : () => unawaited(_linkLyrics(current)),
         onDesktopLyrics: () => unawaited(_toggleDesktopLyrics()),
         onQuality: () => unawaited(_pickPlaybackQuality()),
-        onLyricFontSizePage: () => unawaited(_pickLyricFontSize()),
+        onLyricSettings: _showLyricSettings,
         onPlayMv: current == null || !_mvButtonVisible(current)
             ? null
             : () => unawaited(_toggleMvOrVideo(current)),
@@ -4027,7 +4023,7 @@ class _PlayerMoreSheet extends ConsumerStatefulWidget {
     required this.onSwitchSource,
     required this.onRestoreSource,
     required this.onPickQuality,
-    required this.onPickLyricFontSize,
+    required this.onLyricSettings,
     required this.onShare,
     required this.onToggleDesktopLyrics,
     required this.onShowEffects,
@@ -4060,7 +4056,7 @@ class _PlayerMoreSheet extends ConsumerStatefulWidget {
   final VoidCallback onSwitchSource;
   final VoidCallback onRestoreSource;
   final VoidCallback onPickQuality;
-  final VoidCallback onPickLyricFontSize;
+  final VoidCallback onLyricSettings;
   final VoidCallback onShare;
   final VoidCallback onToggleDesktopLyrics;
   final VoidCallback onShowEffects;
@@ -4479,14 +4475,14 @@ class _PlayerMoreSheetState extends ConsumerState<_PlayerMoreSheet> {
                       _settingRow(
                         context,
                         icon: Icons.format_size_rounded,
-                        title: '歌词字号',
+                        title: '歌词设置',
                         value: '${lyricFontSize.toInt()}号',
                         trailing: Icon(
                           Icons.chevron_right_rounded,
                           size: 20,
                           color: scheme.outline,
                         ),
-                        onTap: () => _popThen(widget.onPickLyricFontSize),
+                        onTap: () => _popThen(widget.onLyricSettings),
                       ),
                       _switchRow(
                         context,
@@ -6233,28 +6229,37 @@ class _PlayerDetailBackground extends ConsumerWidget {
         (mode == PlayerDetailBackgroundMode.customImage &&
             detailImagePath.isEmpty);
 
+    // 自定义背景压暗遮罩开关：关闭后自定义图片/壁纸背景不再叠加暗色
+    // 遮罩与深色渐变（纯色背景保持原色，5547）；流光模式与回退场景的
+    // 可读性遮罩不受该开关影响。
+    // 5550 减淡：开启时的压暗只需保证顶部图标与播放栏同背景可区分，
+    // 纯白背景不应明显发灰（原 .58 全屏罩 + .16/.65 渐变过重）。
+    final dimOverlay = flowing || (settings?.playerDetailBackgroundDim ?? true);
+
     return RepaintBoundary(
       child: Stack(
         fit: StackFit.expand,
         children: [
           Positioned.fill(child: backdrop),
-          // 流光模式：深色压暗，blob 的 plus 叠加负责提供流动色彩。
-          if (flowing)
-            ColoredBox(color: Colors.black.withValues(alpha: .24))
-          else
-            ColoredBox(color: Color(0xFF080A0F).withValues(alpha: .58)),
-          DecoratedBox(
-            decoration: BoxDecoration(
-              gradient: LinearGradient(
-                begin: Alignment.topCenter,
-                end: Alignment.bottomCenter,
-                colors: flowing
-                    ? [Color(0x10000000), Color(0x26000000), Color(0x55000000)]
-                    : [Color(0x29000000), Color(0x12000000), Color(0xA6000000)],
-                stops: [0, .48, 1],
+          if (dimOverlay) ...[
+            // 流光模式：深色压暗，blob 的 plus 叠加负责提供流动色彩。
+            if (flowing)
+              ColoredBox(color: Colors.black.withValues(alpha: .24))
+            else
+              ColoredBox(color: Color(0xFF080A0F).withValues(alpha: .26)),
+            DecoratedBox(
+              decoration: BoxDecoration(
+                gradient: LinearGradient(
+                  begin: Alignment.topCenter,
+                  end: Alignment.bottomCenter,
+                  colors: flowing
+                      ? [Color(0x10000000), Color(0x26000000), Color(0x55000000)]
+                      : [Color(0x14000000), Color(0x0A000000), Color(0x78000000)],
+                  stops: [0, .48, 1],
+                ),
               ),
             ),
-          ),
+          ],
         ],
       ),
     );
@@ -7944,6 +7949,32 @@ class _MiniLyrics extends ConsumerWidget {
     AsyncValue<List<LyricLine>> lyrics,
     double fontSize,
   ) {
+    // 逐字渲染与颜色跟随歌词设置（与歌词页同一套配置）。
+    final effectMode = ref.watch(
+      settingsProvider.select(
+        (value) =>
+            value.valueOrNull?.lyricWordEffectMode ??
+            LyricWordEffectMode.progressive,
+      ),
+    );
+    final playedColor = Color(
+      ref.watch(
+        settingsProvider.select(
+          (value) =>
+              value.valueOrNull?.playerLyricPlayedColor ??
+              kDefaultPlayerLyricPlayedColor,
+        ),
+      ),
+    );
+    final unplayedColor = Color(
+      ref.watch(
+        settingsProvider.select(
+          (value) =>
+              value.valueOrNull?.playerLyricUnplayedColor ??
+              kDefaultPlayerLyricUnplayedColor,
+        ),
+      ),
+    );
     return lyrics.when(
       loading: () => _message('正在获取歌词…', fontSize),
       error: (_, _) => _message('暂无歌词', fontSize),
@@ -7990,7 +8021,13 @@ class _MiniLyrics extends ConsumerWidget {
                 children: [
                   for (var i = 0; i < rows.length; i++) ...[
                     if (i > 0) const SizedBox(height: 3),
-                    _rowText(rows[i], fontSize),
+                    _rowText(
+                      rows[i],
+                      fontSize,
+                      effectMode: effectMode,
+                      playedColor: playedColor,
+                      unplayedColor: unplayedColor,
+                    ),
                   ],
                 ],
               ),
@@ -8031,6 +8068,7 @@ class _MiniLyrics extends ConsumerWidget {
         _MiniLyricRow(
           text: text,
           isActive: i == active,
+          line: lines[i],
           translation: translation,
         ),
       );
@@ -8040,9 +8078,46 @@ class _MiniLyrics extends ConsumerWidget {
 
   /// 单行渲染：当前行高亮加粗，其余行淡色小字；两者都可在下方跟随
   /// 一行小字翻译（翻译同样占用展示行数）。
-  Widget _rowText(_MiniLyricRow row, double fontSize) {
+  ///
+  /// 活动行逐字渲染：与歌词页同一套词级管线（[_TimedLyricText]，
+  /// Ticker 帧间插值 + position 校准），颜色/效果模式跟随歌词设置；
+  /// 行无词级时间轴或逐字动效关闭时回落静态文本。
+  Widget _rowText(
+    _MiniLyricRow row,
+    double fontSize, {
+    required LyricWordEffectMode effectMode,
+    required Color playedColor,
+    required Color unplayedColor,
+  }) {
     final isActive = row.isActive;
-    final lyric = Text(
+    final line = row.line;
+    final wordTimed =
+        isActive &&
+        effectMode != LyricWordEffectMode.none &&
+        line != null &&
+        line.words.isNotEmpty;
+    // 迷你区每行高度固定：逐字行用 ClipRect 裁掉超宽换行（与旧
+    // maxLines:1 的裁切行为一致），单行时 Align 顶对齐即自然居中。
+    final lyric = wordTimed
+        ? SizedBox(
+            height: fontSize * 1.3,
+            child: ClipRect(
+              child: Align(
+                alignment: Alignment.topCenter,
+                child: _TimedLyricText(
+                  line: line,
+                  offsetTenths: offsetTenths,
+                  selected: true,
+                  effectMode: effectMode,
+                  textAlign: TextAlign.center,
+                  baseFontSize: fontSize,
+                  playedColor: playedColor,
+                  unplayedColor: unplayedColor,
+                ),
+              ),
+            ),
+          )
+        : Text(
       row.text,
       // 当前行换行上限：四行窗口每行单行；两行窗口仅在无翻译且字号
       // 不大时允许软换行（否则「当前行两行 + 翻译 + 下一行」会超出
@@ -8115,15 +8190,20 @@ class _MiniLyrics extends ConsumerWidget {
 }
 
 /// 迷你歌词单行数据：一行歌词，可携带随行小字翻译（翻译另占一行）。
+/// [line] 保留原始行引用：活动行逐字渲染需要词级时间轴（words）。
 class _MiniLyricRow {
   const _MiniLyricRow({
     required this.text,
     required this.isActive,
+    this.line,
     this.translation = '',
   });
 
   final String text;
   final bool isActive;
+
+  /// 原始歌词行（含词级时间轴）；迷你歌词自建行时可为 null。
+  final LyricLine? line;
   final String translation;
 }
 
@@ -8216,6 +8296,18 @@ class _LyricsViewState extends ConsumerState<_LyricsView>
         ref.watch(settingsProvider).valueOrNull?.lyricFontSize ?? 18.0;
     final showTranslation =
         ref.watch(settingsProvider).valueOrNull?.showLyricsTranslation ?? true;
+    final showRomaji =
+        ref.watch(settingsProvider).valueOrNull?.showLyricsRomaji ?? true;
+    // 歌词颜色（歌词设置面板可自定义）：已播/未播两色贯穿主歌词、翻译与
+    // 逐字动效。默认值即历史渲染（已播纯白 / 未播白 55%）。
+    final playedColor = Color(
+      ref.watch(settingsProvider).valueOrNull?.playerLyricPlayedColor ??
+          kDefaultPlayerLyricPlayedColor,
+    );
+    final unplayedColor = Color(
+      ref.watch(settingsProvider).valueOrNull?.playerLyricUnplayedColor ??
+          kDefaultPlayerLyricUnplayedColor,
+    );
     final tapSeek =
         ref.watch(settingsProvider).valueOrNull?.lyricTapSeek ?? true;
     final textAlign = switch (lyricAlignment) {
@@ -8236,7 +8328,10 @@ class _LyricsViewState extends ConsumerState<_LyricsView>
           textAlign,
           baseFontSize,
           showTranslation,
+          showRomaji,
           tapSeek,
+          playedColor,
+          unplayedColor,
         ),
       );
     } else if (widget.item.pluginId != null && !widget.item.lyricsAttempted) {
@@ -8259,7 +8354,10 @@ class _LyricsViewState extends ConsumerState<_LyricsView>
           textAlign,
           baseFontSize,
           showTranslation,
+          showRomaji,
           tapSeek,
+          playedColor,
+          unplayedColor,
         ),
       );
     }
@@ -8272,7 +8370,10 @@ class _LyricsViewState extends ConsumerState<_LyricsView>
     TextAlign textAlign,
     double baseFontSize,
     bool showTranslation,
+    bool showRomaji,
     bool tapSeek,
+    Color playedColor,
+    Color unplayedColor,
   ) {
     if (lines.isEmpty) {
       return _lyricsEmpty(context, '暂无歌词', onLinkLyrics: widget.onLinkLyrics);
@@ -8315,6 +8416,10 @@ class _LyricsViewState extends ConsumerState<_LyricsView>
                     itemBuilder: (context, index) {
                       final line = lines[index];
                       final selected = index == active;
+                      // 本行基色：已播/未播由歌词设置的两色表达。
+                      final lineColor = selected
+                          ? playedColor
+                          : unplayedColor;
                       return InkWell(
                         key: _lineKeys.putIfAbsent(index, GlobalKey.new),
                         // 设置关闭“单击歌词调整进度”时禁用点击跳转。
@@ -8362,61 +8467,63 @@ class _LyricsViewState extends ConsumerState<_LyricsView>
                                   )
                                 : null,
                           ),
-                          child: AnimatedOpacity(
-                            duration: const Duration(milliseconds: 220),
-                            curve: Curves.easeOutCubic,
-                            opacity: selected ? 1 : .55,
-                            child: Column(
-                              crossAxisAlignment: CrossAxisAlignment.stretch,
-                              children: [
-                                _TimedLyricText(
-                                  line: line,
-                                  offsetTenths: widget.offsetTenths,
-                                  selected: selected,
-                                  effectMode: effectMode,
+                          // 行内颜色即状态：已播/未播由歌词设置的两色表达
+                          // （默认=历史观感：纯白 / 白 55%）。不再用
+                          // AnimatedOpacity 调透明度——自定义颜色会被
+                          // 二次衰减导致选色失真；翻译/罗马音按行基色的
+                          // alpha 比例派生，保持原层次。
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.stretch,
+                            children: [
+                              _TimedLyricText(
+                                line: line,
+                                offsetTenths: widget.offsetTenths,
+                                selected: selected,
+                                effectMode: effectMode,
+                                textAlign: textAlign,
+                                baseFontSize: baseFontSize,
+                                playedColor: playedColor,
+                                unplayedColor: unplayedColor,
+                              ),
+                              if (line.translation.isNotEmpty &&
+                                  showTranslation) ...[
+                                const SizedBox(height: 4),
+                                Text(
+                                  line.translation,
                                   textAlign: textAlign,
-                                  baseFontSize: baseFontSize,
+                                  style: TextStyle(
+                                    // 主歌词的一半（约 9sp）在手机上
+                                    // 几乎不可见，用户反馈“翻译不见了”，
+                                    // 恢复 baseFontSize - 5；字重用
+                                    // ExtraBold 强化加粗观感。
+                                    fontSize: (baseFontSize - 5).clamp(
+                                      10.0,
+                                      26.0,
+                                    ),
+                                    fontWeight: FontWeight.w800,
+                                    color: lineColor.withValues(
+                                      alpha: lineColor.a * .68,
+                                    ),
+                                  ),
                                 ),
-                                if (line.translation.isNotEmpty &&
-                                    showTranslation) ...[
-                                  const SizedBox(height: 4),
-                                  Text(
-                                    line.translation,
-                                    textAlign: textAlign,
-                                    style: TextStyle(
-                                      // 主歌词的一半（约 9sp）在手机上
-                                      // 几乎不可见，用户反馈“翻译不见了”，
-                                      // 恢复 baseFontSize - 5；字重用
-                                      // ExtraBold 强化加粗观感。
-                                      fontSize: (baseFontSize - 5).clamp(
-                                        10.0,
-                                        26.0,
-                                      ),
-                                      fontWeight: FontWeight.w800,
-                                      color: Colors.white.withValues(
-                                        alpha: .68,
-                                      ),
-                                    ),
-                                  ),
-                                ],
-                                if (line.romaji.isNotEmpty) ...[
-                                  const SizedBox(height: 3),
-                                  Text(
-                                    line.romaji,
-                                    textAlign: textAlign,
-                                    style: TextStyle(
-                                      fontSize: (baseFontSize - 6).clamp(
-                                        9.0,
-                                        24.0,
-                                      ),
-                                      color: Colors.white.withValues(
-                                        alpha: .48,
-                                      ),
-                                    ),
-                                  ),
-                                ],
                               ],
-                            ),
+                              if (line.romaji.isNotEmpty && showRomaji) ...[
+                                const SizedBox(height: 3),
+                                Text(
+                                  line.romaji,
+                                  textAlign: textAlign,
+                                  style: TextStyle(
+                                    fontSize: (baseFontSize - 6).clamp(
+                                      9.0,
+                                      24.0,
+                                    ),
+                                    color: lineColor.withValues(
+                                      alpha: lineColor.a * .48,
+                                    ),
+                                  ),
+                                ),
+                              ],
+                            ],
                           ),
                         ),
                       );
@@ -8575,203 +8682,6 @@ class _LyricsViewState extends ConsumerState<_LyricsView>
   );
 }
 
-/// 歌词字号调整弹窗：双滑杆（主歌词 + 迷你歌词）+ 实时预览。拖动即写入
-/// 设置（实时生效），播放详情页歌词会立即使用新字号重新渲染；两类字号
-/// 彼此独立。
-class _LyricFontSizeSheet extends StatefulWidget {
-  const _LyricFontSizeSheet({
-    required this.initial,
-    required this.initialMini,
-    required this.onChanged,
-    required this.onMiniChanged,
-  });
-
-  final double initial;
-  final double initialMini;
-  final ValueChanged<double> onChanged;
-  final ValueChanged<double> onMiniChanged;
-
-  @override
-  State<_LyricFontSizeSheet> createState() => _LyricFontSizeSheetState();
-}
-
-class _LyricFontSizeSheetState extends State<_LyricFontSizeSheet> {
-  late double _value;
-  late double _miniValue;
-
-  @override
-  void initState() {
-    super.initState();
-    _value = widget.initial;
-    _miniValue = widget.initialMini;
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final scheme = Theme.of(context).colorScheme;
-    return Padding(
-      padding: EdgeInsets.only(
-        left: 20,
-        right: 20,
-        bottom: 20 + MediaQuery.viewInsetsOf(context).bottom,
-      ),
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: [
-          Row(
-            children: [
-              Icon(Icons.format_size_rounded, color: scheme.primary),
-              const SizedBox(width: 12),
-              const Text('歌词字号', style: TextStyle(fontSize: 16)),
-              const Spacer(),
-              Text(
-                _value.toStringAsFixed(0),
-                style: TextStyle(
-                  fontSize: 15,
-                  fontWeight: FontWeight.w700,
-                  color: scheme.primary,
-                ),
-              ),
-            ],
-          ),
-          Slider(
-            value: _value,
-            min: 12,
-            max: 32,
-            divisions: 20,
-            label: _value.toStringAsFixed(0),
-            onChanged: (value) {
-              setState(() => _value = value);
-              widget.onChanged(value);
-            },
-          ),
-          const SizedBox(height: 8),
-          Row(
-            children: [
-              Icon(Icons.subtitles_outlined, color: scheme.primary),
-              const SizedBox(width: 12),
-              const Text('迷你歌词字号', style: TextStyle(fontSize: 16)),
-              const Spacer(),
-              Text(
-                _miniValue.toStringAsFixed(0),
-                style: TextStyle(
-                  fontSize: 15,
-                  fontWeight: FontWeight.w700,
-                  color: scheme.primary,
-                ),
-              ),
-            ],
-          ),
-          Slider(
-            value: _miniValue,
-            min: 10,
-            max: 24,
-            divisions: 14,
-            label: _miniValue.toStringAsFixed(0),
-            onChanged: (value) {
-              setState(() => _miniValue = value);
-              widget.onMiniChanged(value);
-            },
-          ),
-          const SizedBox(height: 6),
-          Container(
-            padding: const EdgeInsets.symmetric(vertical: 18, horizontal: 16),
-            decoration: BoxDecoration(
-              color: scheme.surfaceContainerHighest.withValues(alpha: .5),
-              borderRadius: BorderRadius.circular(14),
-            ),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: [
-                Text(
-                  '正在播放的歌词行',
-                  textAlign: TextAlign.center,
-                  style: TextStyle(
-                    fontSize: math.min(32, _value + 6),
-                    height: 1.3,
-                    fontWeight: FontWeight.w800,
-                    color: scheme.onSurface,
-                  ),
-                ),
-                const SizedBox(height: 6),
-                Text(
-                  '其他歌词行',
-                  textAlign: TextAlign.center,
-                  style: TextStyle(
-                    fontSize: _value,
-                    height: 1.3,
-                    fontWeight: FontWeight.w600,
-                    color: scheme.onSurface.withValues(alpha: .45),
-                  ),
-                ),
-                const SizedBox(height: 5),
-                Text(
-                  '翻译歌词行',
-                  textAlign: TextAlign.center,
-                  style: TextStyle(
-                    fontSize: (_value - 5).clamp(10.0, 26.0),
-                    color: scheme.onSurface.withValues(alpha: .4),
-                  ),
-                ),
-              ],
-            ),
-          ),
-          const SizedBox(height: 8),
-          // 迷你歌词预览：与封面下方的迷你歌词展示区等高，
-          // 直观展示迷你歌词字号的效果。
-          Container(
-            height: 78,
-            alignment: Alignment.center,
-            decoration: BoxDecoration(
-              color: scheme.surfaceContainerHighest.withValues(alpha: .5),
-              borderRadius: BorderRadius.circular(14),
-            ),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Text(
-                  '迷你歌词主行',
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  textAlign: TextAlign.center,
-                  style: TextStyle(
-                    fontSize: _miniValue,
-                    fontWeight: FontWeight.w700,
-                    color: scheme.onSurface,
-                  ),
-                ),
-                if (_miniValue <= 20) ...[
-                  const SizedBox(height: 3),
-                  Text(
-                    '迷你歌词副行',
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    textAlign: TextAlign.center,
-                    style: TextStyle(
-                      fontSize: _miniValue * .82,
-                      color: scheme.onSurface.withValues(alpha: .5),
-                    ),
-                  ),
-                ],
-              ],
-            ),
-          ),
-          const SizedBox(height: 8),
-          Text(
-            '迷你歌词超过 20 只显示单行；两类字号独立保存，重启后保留',
-            textAlign: TextAlign.center,
-            style: TextStyle(
-              fontSize: 12,
-              color: scheme.onSurface.withValues(alpha: .5),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-}
-
 class _TimedLyricText extends ConsumerStatefulWidget {
   const _TimedLyricText({
     required this.line,
@@ -8780,6 +8690,8 @@ class _TimedLyricText extends ConsumerStatefulWidget {
     required this.effectMode,
     required this.textAlign,
     required this.baseFontSize,
+    required this.playedColor,
+    required this.unplayedColor,
   });
 
   final LyricLine line;
@@ -8792,6 +8704,11 @@ class _TimedLyricText extends ConsumerStatefulWidget {
 
   /// 设置中的歌词基础字号：所有行统一字号，不再对当前行放大。
   final double baseFontSize;
+
+  /// 歌词设置中的已播/未播颜色：主歌词、逐字动效高亮用已播色，未播行
+  /// 与词内未唱部分用未播色。
+  final Color playedColor;
+  final Color unplayedColor;
 
   @override
   ConsumerState<_TimedLyricText> createState() => _TimedLyricTextState();
@@ -8863,8 +8780,9 @@ class _TimedLyricTextState extends ConsumerState<_TimedLyricText>
     final line = widget.line;
     final textAlign = widget.textAlign;
     // 当前播放行不再叠加阴影，逐字/逐词高亮也不再发光，保持纯色渲染。
+    // 行基色=已播色（活动行）或未播色（非活动行），来自歌词设置。
     final baseStyle = TextStyle(
-      color: Colors.white,
+      color: widget.selected ? widget.playedColor : widget.unplayedColor,
       fontSize: widget.baseFontSize,
       height: 1.3,
       fontWeight: FontWeight.w600,
@@ -8950,6 +8868,8 @@ class _TimedLyricTextState extends ConsumerState<_TimedLyricText>
                   start: word.start,
                   end: word.end,
                   effectMode: LyricWordEffectMode.progressive,
+                  playedColor: widget.playedColor,
+                  unplayedColor: widget.unplayedColor,
                 ),
               ),
             ),
@@ -8971,15 +8891,17 @@ class _TimedLyricTextState extends ConsumerState<_TimedLyricText>
               alignment: PlaceholderAlignment.baseline,
               baseline: TextBaseline.alphabetic,
               child: RepaintBoundary(
-                child: _ProgressiveLyricWord(
-                  text: word.text,
-                  style: baseStyle,
-                  position: _positionNotifier,
-                  start: word.start,
-                  end: word.end,
-                  effectMode: LyricWordEffectMode.wordByWord,
+                  child: _ProgressiveLyricWord(
+                    text: word.text,
+                    style: baseStyle,
+                    position: _positionNotifier,
+                    start: word.start,
+                    end: word.end,
+                    effectMode: LyricWordEffectMode.wordByWord,
+                    playedColor: widget.playedColor,
+                    unplayedColor: widget.unplayedColor,
+                  ),
                 ),
-              ),
             ),
         ],
       ),
@@ -8997,6 +8919,8 @@ class _ProgressiveLyricWord extends StatefulWidget {
     required this.start,
     required this.end,
     required this.effectMode,
+    required this.playedColor,
+    required this.unplayedColor,
   });
 
   final String text;
@@ -9004,6 +8928,11 @@ class _ProgressiveLyricWord extends StatefulWidget {
 
   /// 效果模式：progressive=整字依次淡入；wordByWord=渐进填充+扫光带。
   final LyricWordEffectMode effectMode;
+
+  /// 歌词设置的已播/未播颜色：已唱（stage2 与扫光亮档）用已播色，未唱
+  /// （stage0 与扫光底）用未播色。
+  final Color playedColor;
+  final Color unplayedColor;
 
   /// 行级共享进度（已应用歌词偏移）。词只监听这个 ValueListenable 做
   /// 局部更新，不参与整行 TextSpan 树重建。
@@ -9016,20 +8945,12 @@ class _ProgressiveLyricWord extends StatefulWidget {
 }
 
 class _ProgressiveLyricWordState extends State<_ProgressiveLyricWord> {
-  /// 未唱暗色与未播放行灰度一致（55%）。
-  static const double _dimAlpha = 0.55;
-
   /// 已唱词上浮：位移随扫光进度推进——stage1 填充期间按 0~1 进度渐进
   /// 上浮（easeOutCubic 缓动：填充前段上浮稍快、后段趋缓），唱到
   /// stage2 时已自然达到最大量并稳定，不再需要切换时触发动画；
   /// seek/换行回退时位移随进度回退复位。仅绘制期位移
   /// （Transform.translate），不改布局、不触发行高变化。
   static const double _liftPx = 1.8;
-
-  /// 扫光亮档 alpha：已唱区纯白。过渡带不再用多档灰度阶梯，改由
-  /// _SweepWordPainter 在带内用 saveLayer+dstIn 白→透明渐变遮罩做连续
-  /// 过渡（替换 5 档阶梯的可见台阶）。
-  static const double _brightAlpha = 1.0;
 
   /// 扫光亮档排版缓存（跨帧复用；文本/样式变化才重排，每帧仅 1 次亮区
   /// clipRect draw + 带内窄条 saveLayer，零重复排版）。
@@ -9061,16 +8982,16 @@ class _ProgressiveLyricWordState extends State<_ProgressiveLyricWord> {
 
   void _ensureSweepPainters() {
     final style = _resolved ?? widget.style;
-    final key = '${widget.text}|${style.hashCode}';
+    // key 携带已播色：颜色设置变化时强制重建亮档排版缓存。
+    final key =
+        '${widget.text}|${style.hashCode}|${widget.playedColor.toARGB32()}';
     if (_tpKey == key && _tpStops != null) return;
     _invalidateSweepPainters();
     _tpStops = [
       TextPainter(
         text: TextSpan(
           text: widget.text,
-          style: style.copyWith(
-            color: Colors.white.withValues(alpha: _brightAlpha),
-          ),
+          style: style.copyWith(color: widget.playedColor),
         ),
         textDirection: TextDirection.ltr,
       )..layout(),
@@ -9113,6 +9034,11 @@ class _ProgressiveLyricWordState extends State<_ProgressiveLyricWord> {
       _resolveStyle();
       _invalidateSweepPainters();
       _recomputeStage();
+    }
+    if (oldWidget.playedColor != widget.playedColor ||
+        oldWidget.unplayedColor != widget.unplayedColor) {
+      // 颜色设置变化：重建扫光亮档排版缓存（未唱色在 build 直读无需缓存）。
+      _invalidateSweepPainters();
     }
     if (oldWidget.position != widget.position) {
       oldWidget.position.removeListener(_onPositionChanged);
@@ -9161,15 +9087,19 @@ class _ProgressiveLyricWordState extends State<_ProgressiveLyricWord> {
   @override
   Widget build(BuildContext context) {
     final resolved = _resolved ?? widget.style;
-    final dimColor = Colors.white.withValues(alpha: _dimAlpha);
+    // 未唱=歌词设置的未播色（默认白 55%），已唱=已播色（默认纯白）。
+    final dimColor = widget.unplayedColor;
     if (_stage == 0) {
       return Text(widget.text, style: resolved.copyWith(color: dimColor));
     }
     if (_stage == 2) {
-      // 已唱纯白：上浮已随扫光进度推进到最大并稳定，直接绘制期位移。
+      // 已唱：上浮已随扫光进度推进到最大并稳定，直接绘制期位移。
       return Transform.translate(
         offset: Offset(0, -_liftOffset),
-        child: Text(widget.text, style: resolved.copyWith(color: Colors.white)),
+        child: Text(
+          widget.text,
+          style: resolved.copyWith(color: widget.playedColor),
+        ),
       );
     }
     // 扫光填充（两种效果模式共用，参数不同）：底为暗色静态 Text（提供
@@ -9265,7 +9195,7 @@ class _GlassControlCard extends ConsumerWidget {
     this.onLinkLyrics,
     this.onDesktopLyrics,
     this.onQuality,
-    this.onLyricFontSizePage,
+    this.onLyricSettings,
     this.onPlayMv,
     this.onLyricsOffset,
   });
@@ -9276,7 +9206,7 @@ class _GlassControlCard extends ConsumerWidget {
   final VoidCallback? onLinkLyrics;
   final VoidCallback? onDesktopLyrics;
   final VoidCallback? onQuality;
-  final VoidCallback? onLyricFontSizePage;
+  final VoidCallback? onLyricSettings;
   final VoidCallback? onPlayMv;
   final VoidCallback? onLyricsOffset;
 
@@ -9307,7 +9237,7 @@ class _GlassControlCard extends ConsumerWidget {
                   onLinkLyrics: onLinkLyrics,
                   onDesktopLyrics: onDesktopLyrics,
                   onQuality: onQuality,
-                  onLyricFontSizePage: onLyricFontSizePage,
+                  onLyricSettings: onLyricSettings,
                   onPlayMv: onPlayMv,
                   onLyricsOffset: onLyricsOffset,
                 ),
@@ -9439,7 +9369,7 @@ class _TitleRow extends ConsumerWidget {
     this.onLinkLyrics,
     this.onDesktopLyrics,
     this.onQuality,
-    this.onLyricFontSizePage,
+    this.onLyricSettings,
     this.onPlayMv,
     this.onLyricsOffset,
   });
@@ -9449,7 +9379,7 @@ class _TitleRow extends ConsumerWidget {
   final VoidCallback? onLinkLyrics;
   final VoidCallback? onDesktopLyrics;
   final VoidCallback? onQuality;
-  final VoidCallback? onLyricFontSizePage;
+  final VoidCallback? onLyricSettings;
   final VoidCallback? onPlayMv;
 
   /// 本地歌曲时快捷按钮位的「歌词偏移」入口。
@@ -9570,8 +9500,8 @@ class _TitleRow extends ConsumerWidget {
           _quickAction(
             context,
             icon: Icons.format_size_rounded,
-            tooltip: '字号调整',
-            onPressed: onLyricFontSizePage,
+            tooltip: '歌词设置',
+            onPressed: onLyricSettings,
           ),
         if (!showMetadata)
           _quickAction(

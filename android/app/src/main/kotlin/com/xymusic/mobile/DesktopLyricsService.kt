@@ -139,17 +139,30 @@ class DesktopLyricsService : Service() {
     private var appliedFontPath: String? = null
 
     // ---- 锁定与字号（操作栏 ↔ Dart 设置双向同步） ----
-    /** 浮窗侧锁定状态：锁定 = 禁止拖动并隐藏操作栏，长按歌词 600ms 解锁。 */
+    /** 浮窗侧锁定状态：锁定 = 禁止拖动并隐藏操作栏，窗口收窄为歌词内容
+     * 宽度（窗口框之外触摸穿透到桌面），长按歌词 600ms 唤出快捷键栏。 */
     private var localLocked = false
     /** 浮窗侧字号（sp）：操作栏 A-/A+ 即时应用，随后回传 Dart 持久化。 */
     private var localFontSize = 24f
     /** 浮窗操作后等待 Dart 回显的锁定值：回显到达前忽略 Dart 推来的
-     * locked 值（Dart 写回有延迟，提前跟随会造成操作栏闪烁）。 */
+     * locked 值（Dart 写回有延迟，提前跟随会造成操作栏闪烁）。
+     * 回显超过 2s 未被确认自动过期——否则 Dart 推来的解锁值会被永久
+     * 吞掉，表现为「锁定后无法解锁」（回显等待与 Dart 推送互相死锁）。 */
     private var pendingLockedEcho: Boolean? = null
-    /** 同上，A-/A+ 调节后的字号回显。 */
+    private var pendingLockedEchoAt = 0L
+    /** 同上，A-/A+ 调节后的字号回显（同样 2s 过期防死锁）。 */
     private var pendingFontSizeEcho: Float? = null
-    /** 锁定时长按解锁判定（非锁定态不用）。 */
-    private var unlockRunnable: Runnable? = null
+    private var pendingFontSizeEchoAt = 0L
+    /** 锁定时长按唤出快捷键栏的定时判定（非锁定态不用）。 */
+    private var lockPressRunnable: Runnable? = null
+    /** 长按已触发唤栏：松手（UP）不得被当作「单击收栏」处理。 */
+    private var lockPressFired = false
+    /** 锁定切换补偿：切换会同时改变窗口宽度（MATCH↔WRAP）与操作栏显隐
+     * （高度变化），relayout 后按旧百分制重算 y 会让歌词跳位；记录切换前
+     * 的屏幕绝对位置（水平中心 + 窗口顶边），布局变化后在 listener 补偿。 */
+    private var lockCompensatePending = false
+    private var lockCompensateCenter = 0f
+    private var lockCompensateTop = 0
 
     /** 操作栏播放/暂停键：图标随播放状态动态切换（播放中=⏸、暂停=▶）。 */
     private var playKey: ImageView? = null
@@ -159,11 +172,11 @@ class DesktopLyricsService : Service() {
     private var dividerRow: View? = null
     private var barVisible = false
 
-    /// 按当前状态应用操作栏/分隔线可见性：锁定或未呼出时整体隐藏。
+    /// 按当前状态应用操作栏/分隔线可见性：未呼出时隐藏。锁定态由
+    /// setLocked 强制收栏；锁定时长按歌词重新唤出（快捷键栏含解锁键）。
     private fun applyBarVisibility() {
-        val visible = barVisible && !localLocked
-        controlBar?.visibility = if (visible) View.VISIBLE else View.GONE
-        dividerRow?.visibility = if (visible) View.VISIBLE else View.GONE
+        controlBar?.visibility = if (barVisible) View.VISIBLE else View.GONE
+        dividerRow?.visibility = if (barVisible) View.VISIBLE else View.GONE
     }
 
     /// 单击歌词行：切换操作栏呼出/收起。
@@ -272,8 +285,10 @@ class DesktopLyricsService : Service() {
                 android.graphics.Typeface.DEFAULT,
                 android.graphics.Typeface.BOLD,
             )
-            // 单行行高（对齐 QQ 音乐桌面歌词）：长句省略号截断，不换行。
-            maxLines = 1
+            // 主行最多两行：单行放得下保持单行，放不下自动换行到第二行
+            //（不限外文歌），仍放不下才省略号截断（5547）。KaraokeTextView
+            // 的逐字扫光按 Layout 逐行分段裁剪，多行下工作正常。
+            maxLines = 2
             ellipsize = android.text.TextUtils.TruncateAt.END
             gravity = Gravity.CENTER
             textAlignment = View.TEXT_ALIGNMENT_CENTER
@@ -356,7 +371,12 @@ class DesktopLyricsService : Service() {
             // 锚定顶边则顶边天然不动、内容向下扩展，完全无跳动。
             gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
             val prefs = getSharedPreferences("desktop_lyrics", MODE_PRIVATE)
-            x = prefs.getInt("x", 0)
+            // 5552：历史脏 x（异常补偿持久化）会在服务重建时把窗口 clamp
+            // 到屏幕左右边缘（「X 轴贴边偏移」），启动即钳到合理范围。
+            x = prefs.getInt("x", 0).coerceIn(
+                -resources.displayMetrics.widthPixels / 2,
+                resources.displayMetrics.widthPixels / 2,
+            )
             // 恢复已应用的纵向位置：服务被回收重建时 Dart 会把当前滑块值
             // 再推一次，记住已应用值才不会造成位置跳变。
             appliedPercent = prefs.getFloat("percent", DEFAULT_PERCENT)
@@ -373,13 +393,17 @@ class DesktopLyricsService : Service() {
                     startX = params.x
                     startY = baseY
                     if (localLocked) {
-                        // 锁定态：长按 600ms 解锁（带震动反馈），期间忽略一切移动。
+                        // 锁定态：长按 600ms 唤出快捷键栏（带震动反馈），
+                        // 栏内锁定键即解锁入口；移动超阈值取消（见 MOVE）。
+                        lockPressFired = false
                         val runnable = Runnable {
-                            unlockRunnable = null
-                            setLocked(false)
+                            lockPressRunnable = null
+                            lockPressFired = true
+                            barVisible = true
+                            applyBarVisibility()
                             vibrate()
                         }
-                        unlockRunnable = runnable
+                        lockPressRunnable = runnable
                         view.postDelayed(runnable, 600)
                     } else {
                         // 进入拖动：期间忽略按百分制重算位置，保证拖动连续不吸附。
@@ -392,7 +416,7 @@ class DesktopLyricsService : Service() {
                         if (abs(event.rawX - downX) > touchSlop ||
                             abs(event.rawY - downY) > touchSlop
                         ) {
-                            cancelUnlock(view)
+                            cancelLockPress(view)
                         }
                         return@setOnTouchListener true
                     }
@@ -411,7 +435,17 @@ class DesktopLyricsService : Service() {
                 }
                 MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
                     if (localLocked) {
-                        cancelUnlock(view)
+                        cancelLockPress(view)
+                        // 未触发的单击收栏：长按唤栏后的松手不算单击
+                        // （lockPressFired 已置位），否则栏会立即消失。
+                        if (event.actionMasked == MotionEvent.ACTION_UP && barVisible &&
+                            !lockPressFired &&
+                            abs(event.rawX - downX) <= touchSlop &&
+                            abs(event.rawY - downY) <= touchSlop
+                        ) {
+                            barVisible = false
+                            applyBarVisibility()
+                        }
                         return@setOnTouchListener true
                     }
                     // 单击（位移在 slop 内）切换操作栏显隐；拖动结束照旧存位置。
@@ -437,6 +471,7 @@ class DesktopLyricsService : Service() {
         // 浮窗首次测量/内容高度变化时重算 y：整屏钳制的上边界依赖浮窗
         // 实际高度，布局完成前拿不到，需在布局变化后补一次钳制。
         content.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ ->
+            compensateLockLayout()
             applyWindowPosition()
         }
         windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
@@ -453,15 +488,16 @@ class DesktopLyricsService : Service() {
         }
     }
 
-    /// 锁定态长按解锁的定时取消（移动超阈值或手指抬起）。
-    private fun cancelUnlock(view: View) {
-        unlockRunnable?.let { view.removeCallbacks(it) }
-        unlockRunnable = null
+    /// 锁定态长按唤栏的定时取消（移动超阈值或手指抬起）。
+    private fun cancelLockPress(view: View) {
+        lockPressRunnable?.let { view.removeCallbacks(it) }
+        lockPressRunnable = null
     }
 
     /// 底部操作栏（一行 8 键）：播放三键 + 字号调节 + 锁定 + 设置 + 关闭。
     /// 样式对齐 MusicFree 桌面版：Material 线性图标键集中居中、小间距
-    /// （字号键用 A−/A+ 文字）。锁定态整栏隐藏（只剩歌词行），长按解锁。
+    /// （字号键用 A−/A+ 文字）。锁定态整栏隐藏，长按歌词重新唤出，
+    /// 栏内锁定键为解锁入口（锁定/解锁切换）。
     private fun buildControlBar(): LinearLayout {
         val density = resources.displayMetrics.density
         fun icon(resId: Int, onClick: () -> Unit): ImageView =
@@ -514,8 +550,8 @@ class DesktopLyricsService : Service() {
             addView(textKey("A−") { adjustFontSize(-2f) })
             addView(textKey("A+") { adjustFontSize(2f) })
             addView(gapView())
-            // 锁定 / 设置 / 关闭
-            addView(icon(R.drawable.ic_dlyr_lock) { setLocked(true) })
+            // 锁定 / 设置 / 关闭（锁定键按当前状态切换：锁定态下即解锁）
+            addView(icon(R.drawable.ic_dlyr_lock) { setLocked(!localLocked) })
             addView(icon(R.drawable.ic_dlyr_settings) { openSettings() })
             addView(icon(R.drawable.ic_dlyr_close) {
                 closeReporter?.invoke()
@@ -538,6 +574,7 @@ class DesktopLyricsService : Service() {
         localFontSize = target
         applyFontSize(target)
         pendingFontSizeEcho = target
+        pendingFontSizeEchoAt = SystemClock.elapsedRealtime()
         fontSizeReporter?.invoke(target)
     }
 
@@ -548,18 +585,86 @@ class DesktopLyricsService : Service() {
         if (abs(view.textSize - scaled) > .5f) view.textSize = sp
     }
 
-    /// 锁定切换：隐藏/恢复操作栏 + 回传 Dart 同步设置页开关。
+    /// 锁定切换：锁定时强制收起操作栏 + 回传 Dart 同步设置页开关。
     private fun setLocked(value: Boolean) {
         localLocked = value
+        if (value) barVisible = false
         pendingLockedEcho = value
+        pendingLockedEchoAt = SystemClock.elapsedRealtime()
         lockedReporter?.invoke(value)
         applyLockedState()
     }
 
-    /// 锁定状态渲染：锁定时只剩歌词行。
+    /// 锁定状态渲染：窗口收窄为歌词内容宽度（窗口框之外触摸穿透到桌面，
+    /// 不再以整行横幅挡住桌面图标/下层应用），操作栏隐藏，长按歌词唤出
+    /// 快捷键栏（含解锁键）。
     private fun applyLockedState() {
-        // 锁定语义 = 禁拖 + 收起操作栏（长按解锁后恢复用户上次的呼出状态）。
+        // 记录切换前的屏幕绝对位置：宽度与操作栏显隐同时变化引起的
+        // relayout 会让 applyWindowPosition 按旧百分制把歌词拉到新位置
+        // （「锁定后位置偏移」根因），布局完成后由 compensateLockLayout
+        // 补偿回切换前的歌词位置。
+        panel?.let {
+            // 5552：历史异常补偿可能把 x 写成大值并持久化（「X 轴贴边偏移」
+            // 的残留根因——WMS 会把越界窗口 clamp 到屏幕边缘）。切换前先
+            // 钳到合理范围，再以清洗后的位置作为补偿基准。
+            val sw = resources.displayMetrics.widthPixels
+            overlayParams?.let { pr ->
+                val sx = pr.x.coerceIn(-sw / 2, sw / 2)
+                if (sx != pr.x) {
+                    pr.x = sx
+                    getSharedPreferences("desktop_lyrics", MODE_PRIVATE)
+                        .edit().putInt("x", sx).apply()
+                    try {
+                        windowManager?.updateViewLayout(it, pr)
+                    } catch (_: Exception) {
+                        // 浮窗已被系统回收时忽略。
+                    }
+                }
+            }
+            val loc = IntArray(2)
+            it.getLocationOnScreen(loc)
+            lockCompensateCenter = loc[0] + it.width / 2f
+            lockCompensateTop = loc[1]
+            lockCompensatePending = true
+        }
         applyBarVisibility()
+        applyWindowFlags()
+        // 双保险（5551）：布局回调可能在系统送达新 frame 之前触发，导致
+        // 一次性补偿被旧布局白白消耗（「锁定后位置偏移仍在」）。切换后
+        // 下一帧与 120ms 各再强制对齐一次；对齐幂等（dx/dy≈0 时 no-op），
+        // 华为等 ROM 对 WRAP_CONTENT 悬浮窗 gravity/x 的差异处理也被
+        // 实测对齐覆盖。
+        panel?.post { compensateLockLayout(force = true) }
+        panel?.postDelayed({ compensateLockLayout(force = true) }, 120)
+    }
+
+    /// 应用窗口触摸 flags 与宽度：
+    /// - 锁定：宽度收窄为 WRAP_CONTENT（歌词内容实际宽度）且保持可触摸
+    ///   ——长按歌词唤出快捷键栏是锁定态的解锁入口，触摸事件必须能到达
+    ///   浮窗；窗口框之外（其余整屏）的触摸因 FLAG_NOT_TOUCH_MODAL +
+    ///   紧贴内容的窗口框自然穿透到桌面。不能加 FLAG_NOT_TOUCHABLE：
+    ///   全窗穿透后长按手势收不到任何事件（5547 教训）。
+    /// - 非锁定：恢复全宽（MATCH_PARENT），便于拖动与操作栏布局。
+    private fun applyWindowFlags() {
+        overlayParams?.let { params ->
+            val desiredFlags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
+            val desiredWidth = if (localLocked) {
+                WindowManager.LayoutParams.WRAP_CONTENT
+            } else {
+                WindowManager.LayoutParams.MATCH_PARENT
+            }
+            if (params.flags != desiredFlags || params.width != desiredWidth) {
+                params.flags = desiredFlags
+                params.width = desiredWidth
+                try {
+                    panel?.let { windowManager?.updateViewLayout(it, params) }
+                } catch (_: Exception) {
+                    // 浮窗已被系统回收时忽略状态更新。
+                }
+            }
+        }
     }
 
     /// ⚙ 设置键：进入软件的桌面歌词设置页（MainActivity 转发 Dart 路由）。
@@ -631,11 +736,18 @@ class DesktopLyricsService : Service() {
         applyWindowPosition()
 
         // 锁定状态同步（浮窗操作栏 ↔ Dart 设置页双向）：
-        // 浮窗操作后的回显到达前忽略 Dart 推来的值，避免操作栏闪烁。
+        // 浮窗操作后的回显到达前忽略 Dart 推来的值，避免操作栏闪烁；
+        // 回显 2s 未被确认自动过期，保证设置页开关永远能解锁（防死锁）。
+        if (pendingLockedEcho != null &&
+            SystemClock.elapsedRealtime() - pendingLockedEchoAt > 2000
+        ) {
+            pendingLockedEcho = null
+        }
         if (pendingLockedEcho != null) {
             if (p.locked == pendingLockedEcho) pendingLockedEcho = null
         } else if (p.locked != localLocked) {
             localLocked = p.locked
+            if (p.locked) barVisible = false
             applyLockedState()
         }
 
@@ -647,22 +759,8 @@ class DesktopLyricsService : Service() {
             )
         }
 
-        // 锁定不再使用 FLAG_NOT_TOUCHABLE 全窗穿透（那样长按解锁手势也
-        // 收不到事件）；锁定语义 = 禁止拖动 + 隐藏操作栏，触摸仍由浮窗
-        // 消费（锁定时长按 600ms 解锁）。
-        overlayParams?.let { params ->
-            val desiredFlags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
-                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
-            if (params.flags != desiredFlags) {
-                params.flags = desiredFlags
-                try {
-                    panel?.let { windowManager?.updateViewLayout(it, params) }
-                } catch (_: Exception) {
-                    // 浮窗已被系统回收时忽略状态更新。
-                }
-            }
-        }
+        // 锁定状态渲染（含窗口触摸 flags 切换）。
+        applyLockedState()
 
         val wasPlaying = lyricsPlaying
         val deviation = p.position - currentRenderPosition()
@@ -711,14 +809,16 @@ class DesktopLyricsService : Service() {
             renderWordProgress()
         }
 
-        // 字号同步（浮窗 A-/A+ ↔ Dart 设置页滑块）：回显到达前忽略 Dart 值。
-        // 暂停时隐藏歌词：主行一同隐藏（背景保留，浮窗仍可拖动）。
-        val lyricFontSize = (pendingFontSizeEcho ?: p.lyricFontSize).coerceIn(16f, 40f)
+        // 字号同步（浮窗 A-/A+ ↔ Dart 设置页滑块）：回显到达前忽略 Dart
+        // 值，2s 未确认自动过期（防死锁），随后以 Dart 推送为准。
         if (pendingFontSizeEcho != null &&
-            abs(pendingFontSizeEcho!! - p.lyricFontSize) < 0.1f
+            (abs(pendingFontSizeEcho!! - p.lyricFontSize) < 0.1f ||
+                SystemClock.elapsedRealtime() - pendingFontSizeEchoAt > 2000)
         ) {
             pendingFontSizeEcho = null
         }
+        // 暂停时隐藏歌词：主行一同隐藏（背景保留，浮窗仍可拖动）。
+        val lyricFontSize = (pendingFontSizeEcho ?: p.lyricFontSize).coerceIn(16f, 40f)
         lyricView?.let { view ->
             val desiredVisibility = if (hideLyrics) View.GONE else View.VISIBLE
             if (view.visibility != desiredVisibility) {
@@ -956,6 +1056,51 @@ class DesktopLyricsService : Service() {
                 panel?.let { windowManager?.updateViewLayout(it, params) }
             } catch (_: Exception) {
                 // 浮窗已被系统回收时忽略位置更新。
+            }
+        }
+    }
+
+    /** 锁定切换的位置补偿：布局稳定后把歌词拉回切换前的屏幕绝对位置
+     * （水平保持文本中心、垂直保持窗口顶边——锁定只增减窗口底部内容）。
+     * 纵向补偿同步回写百分制真源并推给 Dart，防止随后的更新用旧滑块值
+     * 把浮窗再拉回去。补偿自身触发的 relayout 不再补偿（标志已清）。 */
+    private fun compensateLockLayout(force: Boolean = false) {
+        // 手动拖动期间绝不补偿（会把浮窗从用户指下拉走）。
+        if (dragging) return
+        if (!lockCompensatePending && !force) return
+        lockCompensatePending = false
+        val p = panel
+        val params = overlayParams
+        if (p == null || params == null) return
+        val loc = IntArray(2)
+        p.getLocationOnScreen(loc)
+        var changed = false
+        // 5552：dx 钳制——部分 ROM 对悬浮窗 getLocationOnScreen 的读数
+        // 存在系统偏差，会放大出异常 dx 把窗口推到屏幕边缘并把脏值写进
+        // prefs 持久化；超过半屏宽的补偿视为读数异常直接丢弃。
+        val sw = resources.displayMetrics.widthPixels
+        val dx = (lockCompensateCenter - (loc[0] + p.width / 2f)).toInt()
+        if (abs(dx) in 1..(sw / 2)) {
+            params.x = (params.x + dx).coerceIn(-sw / 2, sw / 2)
+            getSharedPreferences("desktop_lyrics", MODE_PRIVATE)
+                .edit().putInt("x", params.x).apply()
+            changed = true
+        }
+        val dy = lockCompensateTop - loc[1]
+        if (abs(dy) >= 1) {
+            baseY = clampY(baseY + dy)
+            params.y = baseY
+            appliedPercent = yToPercent(baseY)
+            getSharedPreferences("desktop_lyrics", MODE_PRIVATE)
+                .edit().putFloat("percent", appliedPercent).apply()
+            positionReporter?.invoke(appliedPercent)
+            changed = true
+        }
+        if (changed) {
+            try {
+                windowManager?.updateViewLayout(p, params)
+            } catch (_: Exception) {
+                // 浮窗已被系统回收时忽略补偿。
             }
         }
     }

@@ -432,7 +432,8 @@ class _PlaylistTile extends StatelessWidget {
                   child: CircularProgressIndicator(strokeWidth: 2),
                 )
               else
-                Icon(Icons.download_rounded, size: 20, color: scheme.primary),
+                // 导入条目图标：与下载动作区分（5550）。
+                Icon(Icons.playlist_add_rounded, size: 20, color: scheme.primary),
             ],
           ),
         ),

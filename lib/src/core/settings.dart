@@ -165,6 +165,11 @@ enum LyricWordEffectMode { wordByWord, progressive, none }
 /// 播放详情页歌词的水平显示位置。
 enum LyricDisplayAlignment { left, center, right }
 
+/// 播放详情页歌词默认颜色：已播=纯白，未播=白 55% alpha
+/// （0x8C = 140/255 ≈ 0.55，与历史「未播行透明度 .55」渲染观感一致）。
+const kDefaultPlayerLyricPlayedColor = 0xFFFFFFFF;
+const kDefaultPlayerLyricUnplayedColor = 0x8CFFFFFF;
+
 /// 扫描支持的主流音频格式大类（与 Rust 白名单展开对应）。
 /// wma/ape 与 MusicFree 的本地音乐支持格式对齐（opus 归入 ogg 大类）。
 const kSupportedScanFormats = <String>[
@@ -223,6 +228,8 @@ class AppSettings {
     this.customBackgroundFade = 0.0,
     this.playerDetailCustomImagePath = '',
     this.playerDetailBackgroundMode = PlayerDetailBackgroundMode.flowingLight,
+    // 自定义图片/壁纸背景上的暗色压暗遮罩开关（关闭后纯色背景不变暗）。
+    this.playerDetailBackgroundDim = true,
     this.playerCoverStyle = PlayerCoverStyle.classic,
     this.vinylTonearm = true,
     this.pageTransitionMode = PageTransitionMode.fade,
@@ -237,12 +244,15 @@ class AppSettings {
     this.qqSourceApiUrl = '',
     this.libraryMinDurationSeconds = 0,
     this.showLyricsTranslation = true,
+    this.showLyricsRomaji = true,
     // 播放详情页歌词页：单击歌词行调整播放进度（默认开启）。
     this.lyricTapSeek = true,
     this.lyricWordEffectMode = LyricWordEffectMode.progressive,
     this.lyricDisplayAlignment = LyricDisplayAlignment.left,
     this.lyricFontSize = 22.0,
     this.miniLyricFontSize = 14.0,
+    this.playerLyricPlayedColor = kDefaultPlayerLyricPlayedColor,
+    this.playerLyricUnplayedColor = kDefaultPlayerLyricUnplayedColor,
     this.desktopLyricsEnabled = false,
     this.bluetoothLyricsEnabled = false,
     this.desktopLyricsHideInApp = true,
@@ -331,6 +341,9 @@ class AppSettings {
   final double customBackgroundFade;
   final String playerDetailCustomImagePath;
   final PlayerDetailBackgroundMode playerDetailBackgroundMode;
+
+  /// 自定义图片/壁纸背景上的暗色压暗遮罩开关。
+  final bool playerDetailBackgroundDim;
   final PlayerCoverStyle playerCoverStyle;
 
   /// 黑胶唱片封面是否显示唱针（复刻 BakaMusic 经典款唱针）。
@@ -365,6 +378,9 @@ class AppSettings {
   final int libraryMinDurationSeconds;
   final bool showLyricsTranslation;
 
+  /// 播放详情页歌词是否显示罗马音/音译行（有罗马音数据时）。
+  final bool showLyricsRomaji;
+
   /// 播放详情页歌词页：单击歌词行调整播放进度。
   final bool lyricTapSeek;
   final LyricWordEffectMode lyricWordEffectMode;
@@ -375,6 +391,12 @@ class AppSettings {
 
   /// 播放页封面下方迷你歌词的主行字号；超过单行阈值时自动只显示主行。
   final double miniLyricFontSize;
+
+  /// 播放详情页歌词「已播放」文字颜色（ARGB）。
+  final int playerLyricPlayedColor;
+
+  /// 播放详情页歌词「未播放」文字颜色（ARGB）。
+  final int playerLyricUnplayedColor;
   final bool desktopLyricsEnabled;
   final bool bluetoothLyricsEnabled;
   final bool desktopLyricsHideInApp;
@@ -459,6 +481,7 @@ class AppSettings {
     double? customBackgroundFade,
     String? playerDetailCustomImagePath,
     PlayerDetailBackgroundMode? playerDetailBackgroundMode,
+    bool? playerDetailBackgroundDim,
     PlayerCoverStyle? playerCoverStyle,
     bool? vinylTonearm,
     PageTransitionMode? pageTransitionMode,
@@ -472,11 +495,14 @@ class AppSettings {
     String? qqSourceApiUrl,
     int? libraryMinDurationSeconds,
     bool? showLyricsTranslation,
+    bool? showLyricsRomaji,
     bool? lyricTapSeek,
     LyricWordEffectMode? lyricWordEffectMode,
     LyricDisplayAlignment? lyricDisplayAlignment,
     double? lyricFontSize,
     double? miniLyricFontSize,
+    int? playerLyricPlayedColor,
+    int? playerLyricUnplayedColor,
     bool? desktopLyricsEnabled,
     bool? bluetoothLyricsEnabled,
     bool? desktopLyricsHideInApp,
@@ -545,6 +571,8 @@ class AppSettings {
           playerDetailCustomImagePath ?? this.playerDetailCustomImagePath,
       playerDetailBackgroundMode:
           playerDetailBackgroundMode ?? this.playerDetailBackgroundMode,
+      playerDetailBackgroundDim:
+          playerDetailBackgroundDim ?? this.playerDetailBackgroundDim,
       playerCoverStyle: playerCoverStyle ?? this.playerCoverStyle,
     vinylTonearm: vinylTonearm ?? this.vinylTonearm,
     pageTransitionMode: pageTransitionMode ?? this.pageTransitionMode,
@@ -563,12 +591,17 @@ class AppSettings {
           libraryMinDurationSeconds ?? this.libraryMinDurationSeconds,
       showLyricsTranslation:
           showLyricsTranslation ?? this.showLyricsTranslation,
+      showLyricsRomaji: showLyricsRomaji ?? this.showLyricsRomaji,
       lyricTapSeek: lyricTapSeek ?? this.lyricTapSeek,
       lyricWordEffectMode: lyricWordEffectMode ?? this.lyricWordEffectMode,
       lyricDisplayAlignment:
           lyricDisplayAlignment ?? this.lyricDisplayAlignment,
       lyricFontSize: lyricFontSize ?? this.lyricFontSize,
       miniLyricFontSize: miniLyricFontSize ?? this.miniLyricFontSize,
+      playerLyricPlayedColor:
+          playerLyricPlayedColor ?? this.playerLyricPlayedColor,
+      playerLyricUnplayedColor:
+          playerLyricUnplayedColor ?? this.playerLyricUnplayedColor,
       desktopLyricsEnabled: desktopLyricsEnabled ?? this.desktopLyricsEnabled,
       bluetoothLyricsEnabled:
           bluetoothLyricsEnabled ?? this.bluetoothLyricsEnabled,
@@ -682,6 +715,7 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
       playerDetailBackgroundMode: _playerDetailBackgroundModeFromInt(
         prefs.getInt('playerDetailBackgroundMode') ?? 0,
       ),
+      playerDetailBackgroundDim: prefs.getBool('playerDetailBackgroundDim') ?? true,
       playerCoverStyle: _playerCoverStyleFromInt(
         prefs.getInt('playerCoverStyle') ?? 0,
       ),
@@ -704,6 +738,7 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
       qqSourceApiUrl: prefs.getString('qqSourceApiUrl') ?? '',
       libraryMinDurationSeconds: prefs.getInt('libraryMinDurationSeconds') ?? 0,
       showLyricsTranslation: prefs.getBool('showLyricsTranslation') ?? true,
+      showLyricsRomaji: prefs.getBool('showLyricsRomaji') ?? true,
       lyricTapSeek: prefs.getBool('lyricTapSeek') ?? true,
       lyricWordEffectMode: _lyricWordEffectModeFromPrefs(prefs),
       lyricDisplayAlignment: _lyricDisplayAlignmentFromPrefs(prefs),
@@ -715,6 +750,12 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
           (prefs.getDouble('miniLyricFontSize') ?? 14.0)
               .clamp(10.0, 24.0)
               .toDouble(),
+      playerLyricPlayedColor:
+          prefs.getInt('playerLyricPlayedColor') ??
+          kDefaultPlayerLyricPlayedColor,
+      playerLyricUnplayedColor:
+          prefs.getInt('playerLyricUnplayedColor') ??
+          kDefaultPlayerLyricUnplayedColor,
       desktopLyricsEnabled: prefs.getBool('desktopLyricsEnabled') ?? false,
       bluetoothLyricsEnabled: prefs.getBool('bluetoothLyricsEnabled') ?? false,
       desktopLyricsHideInApp: prefs.getBool('desktopLyricsHideInApp') ?? true,
@@ -935,6 +976,7 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
         'playerDetailBackgroundMode',
         next.playerDetailBackgroundMode.index,
       ),
+      prefs.setBool('playerDetailBackgroundDim', next.playerDetailBackgroundDim),
       prefs.setInt('playerCoverStyle', next.playerCoverStyle.index),
       prefs.setBool('vinylTonearm', next.vinylTonearm),
       prefs.setInt('pageTransitionMode', next.pageTransitionMode.index),
@@ -954,11 +996,14 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
       prefs.setString('qqSourceApiUrl', next.qqSourceApiUrl),
       prefs.setInt('libraryMinDurationSeconds', next.libraryMinDurationSeconds),
       prefs.setBool('showLyricsTranslation', next.showLyricsTranslation),
+      prefs.setBool('showLyricsRomaji', next.showLyricsRomaji),
       prefs.setBool('lyricTapSeek', next.lyricTapSeek),
       prefs.setInt('lyricWordEffectMode', next.lyricWordEffectMode.index),
       prefs.setInt('lyricDisplayAlignment', next.lyricDisplayAlignment.index),
       prefs.setDouble('lyricFontSize', next.lyricFontSize),
       prefs.setDouble('miniLyricFontSize', next.miniLyricFontSize),
+      prefs.setInt('playerLyricPlayedColor', next.playerLyricPlayedColor),
+      prefs.setInt('playerLyricUnplayedColor', next.playerLyricUnplayedColor),
       prefs.setBool('desktopLyricsEnabled', next.desktopLyricsEnabled),
       prefs.setBool('bluetoothLyricsEnabled', next.bluetoothLyricsEnabled),
       prefs.setBool('desktopLyricsHideInApp', next.desktopLyricsHideInApp),
@@ -1183,6 +1228,13 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
       vinylTonearm: value,
     ),
   );
+
+  /// 自定义图片/壁纸背景的暗色压暗遮罩开关。
+  Future<void> setPlayerDetailBackgroundDim(bool value) => _save(
+    (state.valueOrNull ?? const AppSettings()).copyWith(
+      playerDetailBackgroundDim: value,
+    ),
+  );
   Future<void> setPageTransitionMode(PageTransitionMode mode) => _save(
     (state.valueOrNull ?? const AppSettings()).copyWith(
       pageTransitionMode: mode,
@@ -1240,6 +1292,24 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
   Future<void> setShowLyricsTranslation(bool v) => _save(
     (state.valueOrNull ?? const AppSettings()).copyWith(
       showLyricsTranslation: v,
+    ),
+  );
+
+  Future<void> setShowLyricsRomaji(bool v) => _save(
+    (state.valueOrNull ?? const AppSettings()).copyWith(showLyricsRomaji: v),
+  );
+
+  /// 播放详情页歌词「已播放」颜色。
+  Future<void> setPlayerLyricPlayedColor(int color) => _save(
+    (state.valueOrNull ?? const AppSettings()).copyWith(
+      playerLyricPlayedColor: color,
+    ),
+  );
+
+  /// 播放详情页歌词「未播放」颜色。
+  Future<void> setPlayerLyricUnplayedColor(int color) => _save(
+    (state.valueOrNull ?? const AppSettings()).copyWith(
+      playerLyricUnplayedColor: color,
     ),
   );
 
