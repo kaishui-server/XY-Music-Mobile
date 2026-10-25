@@ -141,10 +141,7 @@ const String _probeUserAgent =
 /// 关键点：必须带上解析音源时拿到的请求头（Referer/Cookie 等），否则部分
 /// CDN 会返回错误页，导致 hi-res/杜比/母带这类直链的大小失真。同时排除
 /// HLS 播放列表与错误页等非音频响应；无法确定时返回 null（界面显示“未知”）。
-Future<int?> _probeDirectSize(
-  String url,
-  Map<String, String> headers,
-) async {
+Future<int?> _probeDirectSize(String url, Map<String, String> headers) async {
   final uri = Uri.tryParse(url);
   if (uri == null || (uri.scheme != 'http' && uri.scheme != 'https')) {
     return null;
@@ -247,7 +244,15 @@ bool _isBilibiliQueueItem(QueueItem item) {
 /// 正在播放页：现代毛玻璃风格。
 /// 封面大圆角浮于详情页背景之上，下方播放栏直接叠加在背景上。
 class PlayerPage extends ConsumerStatefulWidget {
-  const PlayerPage({super.key});
+  const PlayerPage({super.key, this.coverHidden = false, this.coverAnchorKey});
+
+  /// 拖动展开预览模式下隐藏详情页自带封面（封面区域留空/透明，
+  /// 由播放栏迷你封面放大层持续提供），默认 false 不影响真实路由页。
+  final bool coverHidden;
+
+  /// 封面区域占位锚点：拖动预览时用于读取真实封面最终矩形，使
+  /// 放大层目标与路由页封面无缝衔接。仅预览层传入，真实页为 null。
+  final GlobalKey? coverAnchorKey;
 
   @override
   ConsumerState<PlayerPage> createState() => _PlayerPageState();
@@ -1505,18 +1510,13 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
 
   /// 查看作者发布的歌曲：以歌曲数据里的歌手条目为目录项，复用搜索页
   /// 的歌手详情页加载作品；插件未实现详情接口时由运行时回退按名搜索。
-  Future<void> _openArtistWorks(
-    QueueItem item,
-    _SongArtistInfo artist,
-  ) async {
+  Future<void> _openArtistWorks(QueueItem item, _SongArtistInfo artist) async {
     // 与 _showSongInfoSheet 一致：识曲歌曲按完整回退链兜底，保证
     // 「作品」入口打开后仍能定位到实际解析该歌的插件。
     final plugins = await ref.read(enabledMusicPluginsProvider.future);
     final pluginId = recognizedPluginIdForDisplay(item, plugins);
     if (pluginId == null || pluginId.isEmpty) return;
-    final plugin = plugins
-        .where((plugin) => plugin.id == pluginId)
-        .firstOrNull;
+    final plugin = plugins.where((plugin) => plugin.id == pluginId).firstOrNull;
     if (!mounted) return;
     if (plugin == null) {
       XyNotice.show(
@@ -2033,7 +2033,9 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
     if (!_videoLandscape) return;
     _videoLandscape = false;
     unawaited(SystemChrome.setPreferredOrientations(DeviceOrientation.values));
-    unawaited(SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky));
+    unawaited(
+      SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky),
+    );
   }
 
   Future<void> _addToPlaylist(QueueItem item) async {
@@ -2090,7 +2092,9 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
     if (raw != null && raw.isNotEmpty && pluginId.isNotEmpty) {
       try {
         final plugins = await ref.read(enabledMusicPluginsProvider.future);
-        final plugin = plugins.where((value) => value.id == pluginId).firstOrNull;
+        final plugin = plugins
+            .where((value) => value.id == pluginId)
+            .firstOrNull;
         if (plugin != null && runtime.hasDiscoveredQualities(plugin, raw)) {
           cached = true;
         }
@@ -2118,10 +2122,7 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
       }
     }
     var probingStarted = false;
-    Widget sizeTrailing(
-      BuildContext sheetContext,
-      String value,
-    ) {
+    Widget sizeTrailing(BuildContext sheetContext, String value) {
       final size = qualitySizes[value];
       if (size == null) {
         if (probing.contains(value)) {
@@ -2155,14 +2156,17 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
       for (final value in qualities) {
         if (qualitySizes.containsKey(value)) continue;
         probing.add(value);
-        unawaited(_probeDownloadSize(item, value).then((bytes) {
-          if (!sheetContext.mounted) return;
-          setSheetState(() {
-            probing.remove(value);
-            qualitySizes[value] =
-                bytes != null && bytes > 0 ? _QualitySize(bytes) : null;
-          });
-        }));
+        unawaited(
+          _probeDownloadSize(item, value).then((bytes) {
+            if (!sheetContext.mounted) return;
+            setSheetState(() {
+              probing.remove(value);
+              qualitySizes[value] = bytes != null && bytes > 0
+                  ? _QualitySize(bytes)
+                  : null;
+            });
+          }),
+        );
       }
     }
 
@@ -2191,8 +2195,7 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
                             Icon(
                               Icons.check_rounded,
                               size: 20,
-                              color:
-                                  Theme.of(sheetContext).colorScheme.primary,
+                              color: Theme.of(sheetContext).colorScheme.primary,
                             ),
                           if (value == current) const SizedBox(width: 6),
                           sizeTrailing(sheetContext, value),
@@ -2695,10 +2698,8 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
           initialQuality: settings?.downloadQuality ?? playback.currentQuality,
           qualities: _declaredQualityOptions(item, playback.currentQuality),
           initialWriteMetadata: settings?.downloadWriteMetadata ?? true,
-          discoverQualities: () => _discoverQualityOptions(
-            item,
-            preferred: playback.currentQuality,
-          ),
+          discoverQualities: () =>
+              _discoverQualityOptions(item, preferred: playback.currentQuality),
           estimateSize: (quality) => _estimateDownloadSize(item, quality),
           probeSize: (quality) => _probeDownloadSize(item, quality),
           declaredSizes: _declaredQualitySizeMap(item),
@@ -3182,8 +3183,9 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
     // 翻译单独占行），播放栏弹出（上浮动画）时自然收为两行，自动隐藏
     // 后恢复四行。展示区预留行数恒为 4，避免封面随行数抖动。
     final immersiveMiniLyrics = portraitImmersive && current != null;
-    final miniLyricRows =
-        immersiveMiniLyrics && !_portraitControlsVisible ? 4 : 2;
+    final miniLyricRows = immersiveMiniLyrics && !_portraitControlsVisible
+        ? 4
+        : 2;
     final miniLyricReserveRows = immersiveMiniLyrics ? 4 : 2;
 
     final detailPager = LayoutBuilder(
@@ -3217,7 +3219,9 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
                 offsetTenths: _lyricsOffsetTenths,
                 // 竖屏时封面本体铺到屏幕顶端（见 _ImmersiveTopCover），
                 // 这里退化为透明手势占位（横屏由左侧封面栏直接绘制）。
-                paintCover: false,
+                // 预览层隐藏封面时同样保持透明占位并挂锚点。
+                paintCover: !widget.coverHidden,
+                coverAnchorKey: widget.coverAnchorKey,
                 miniLyricRows: miniLyricRows,
                 miniLyricReserveRows: miniLyricReserveRows,
                 onTap: current == null ? null : _toggleLyrics,
@@ -3231,6 +3235,8 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
                 item: current,
                 offsetTenths: _lyricsOffsetTenths,
                 style: coverStyle,
+                coverHidden: widget.coverHidden,
+                coverAnchorKey: widget.coverAnchorKey,
                 miniLyricRows: miniLyricRows,
                 miniLyricReserveRows: miniLyricReserveRows,
                 onTap: current == null ? null : _toggleLyrics,
@@ -3542,7 +3548,12 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
               Positioned(
                 top: 0,
                 left: 0,
-                child: _ImmersiveTopCover(item: current, side: viewport.width),
+                child: _ImmersiveTopCover(
+                  item: current,
+                  side: viewport.width,
+                  coverHidden: widget.coverHidden,
+                  coverAnchorKey: widget.coverAnchorKey,
+                ),
               ),
             SafeArea(
               child: isLandscape
@@ -3565,6 +3576,8 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
                                   // 沉浸式在横屏分栏下退化为居中方形封面。
                                   style: coverStyle,
                                   landscape: true,
+                                  coverHidden: widget.coverHidden,
+                                  coverAnchorKey: widget.coverAnchorKey,
                                   onLongPress: current == null
                                       ? null
                                       : () => unawaited(_showMoreMenu(current)),
@@ -3687,10 +3700,11 @@ class _DownloadOptionsDialogState extends State<_DownloadOptionsDialog> {
       return;
     }
     if (!mounted) return;
-    final merged = _dedupeQualities([..._qualities, ...found])..sort((a, b) {
-      final rank = qualityTierRank(a).compareTo(qualityTierRank(b));
-      return rank != 0 ? rank : a.compareTo(b);
-    });
+    final merged = _dedupeQualities([..._qualities, ...found])
+      ..sort((a, b) {
+        final rank = qualityTierRank(a).compareTo(qualityTierRank(b));
+        return rank != 0 ? rank : a.compareTo(b);
+      });
     final added = merged.where((q) => !_qualities.contains(q)).toList();
     for (final quality in added) {
       final declared = widget.declaredSizes?[quality];
@@ -4705,7 +4719,12 @@ String _artistAvatarOf(Map<String, dynamic> map) {
 
   final direct = readFrom(map);
   if (direct.isNotEmpty) return direct;
-  for (final nestedKey in const ['user_info', 'author_info', 'user', 'artist']) {
+  for (final nestedKey in const [
+    'user_info',
+    'author_info',
+    'user',
+    'artist',
+  ]) {
     final nested = map[nestedKey];
     if (nested is Map) {
       final found = readFrom(nested);
@@ -4740,7 +4759,8 @@ List<_SongArtistInfo> _songArtistsOf(QueueItem item) {
   final data = item.pluginData;
   List<dynamic> entries = const [];
   if (data != null) {
-    final list = data['singerList'] ??
+    final list =
+        data['singerList'] ??
         data['singers'] ??
         data['artists'] ??
         data['artistList'];
@@ -4840,7 +4860,11 @@ class _SongInfoSheet extends StatelessWidget {
   /// 点击作者查看作品；null（本地歌曲/插件缺失）时作者行不可点。
   final void Function(_SongArtistInfo artist)? onOpenArtist;
 
-  Widget _infoRow(BuildContext context, {required String label, String? value}) {
+  Widget _infoRow(
+    BuildContext context, {
+    required String label,
+    String? value,
+  }) {
     if (value == null || value.trim().isEmpty) return const SizedBox.shrink();
     final scheme = Theme.of(context).colorScheme;
     return Padding(
@@ -4981,7 +5005,9 @@ class _SongInfoSheet extends StatelessWidget {
                                   width: 38,
                                   height: 38,
                                   decoration: BoxDecoration(
-                                    color: scheme.primary.withValues(alpha: .14),
+                                    color: scheme.primary.withValues(
+                                      alpha: .14,
+                                    ),
                                     shape: BoxShape.circle,
                                   ),
                                   child: Icon(
@@ -5374,11 +5400,11 @@ class _SkipRangeDialogState extends State<_SkipRangeDialog> {
     return half > 60 ? 60 : half;
   }();
 
-  late int _head = widget.initialHeadSeconds
-      .round()
-      .clamp(0, _sliderMax);
-  late int _tail =
-      (widget.maxSeconds - widget.initialEndSeconds).round().clamp(0, _sliderMax);
+  late int _head = widget.initialHeadSeconds.round().clamp(0, _sliderMax);
+  late int _tail = (widget.maxSeconds - widget.initialEndSeconds).round().clamp(
+    0,
+    _sliderMax,
+  );
 
   // 头尾之和不能超过曲长：拖动时把另一侧夹回允许范围。
   int get _headMax => (_sliderMax - _tail).clamp(0, _sliderMax);
@@ -5431,7 +5457,8 @@ class _SkipRangeDialogState extends State<_SkipRangeDialog> {
           child: const Text('取消'),
         ),
         FilledButton(
-          onPressed: () => Navigator.pop(context, (_head.toDouble(), _tail.toDouble())),
+          onPressed: () =>
+              Navigator.pop(context, (_head.toDouble(), _tail.toDouble())),
           child: const Text('确定'),
         ),
       ],
@@ -5481,7 +5508,8 @@ class _DottedSlider extends StatelessWidget {
         final width = box.maxWidth;
         return GestureDetector(
           behavior: HitTestBehavior.opaque,
-          onHorizontalDragStart: (d) => _handleOffset(d.localPosition.dx, width),
+          onHorizontalDragStart: (d) =>
+              _handleOffset(d.localPosition.dx, width),
           onHorizontalDragUpdate: (d) =>
               _handleOffset(d.localPosition.dx, width),
           child: SizedBox(
@@ -5535,11 +5563,7 @@ class _DottedSliderPainter extends CustomPainter {
     final dotPaint = Paint();
     for (var i = 0; i <= max; i++) {
       dotPaint.color = i <= value ? activeDot : inactiveDot;
-      canvas.drawCircle(
-        Offset(_xFor(i, usableWidth), 44),
-        2.4,
-        dotPaint,
-      );
+      canvas.drawCircle(Offset(_xFor(i, usableWidth), 44), 2.4, dotPaint);
     }
 
     // 竖线把手（白色描边增强与刻度点的对比）。
@@ -5552,7 +5576,12 @@ class _DottedSliderPainter extends CustomPainter {
     );
     canvas.drawRRect(
       RRect.fromRectAndRadius(
-        Rect.fromLTRB(thumbX - 3.2, _thumbTop - 1, thumbX + 3.2, _thumbBottom + 1),
+        Rect.fromLTRB(
+          thumbX - 3.2,
+          _thumbTop - 1,
+          thumbX + 3.2,
+          _thumbBottom + 1,
+        ),
         const Radius.circular(3.2),
       ),
       Paint()
@@ -6253,8 +6282,16 @@ class _PlayerDetailBackground extends ConsumerWidget {
                   begin: Alignment.topCenter,
                   end: Alignment.bottomCenter,
                   colors: flowing
-                      ? [Color(0x10000000), Color(0x26000000), Color(0x55000000)]
-                      : [Color(0x14000000), Color(0x0A000000), Color(0x78000000)],
+                      ? [
+                          Color(0x10000000),
+                          Color(0x26000000),
+                          Color(0x55000000),
+                        ]
+                      : [
+                          Color(0x14000000),
+                          Color(0x0A000000),
+                          Color(0x78000000),
+                        ],
                   stops: [0, .48, 1],
                 ),
               ),
@@ -7126,6 +7163,8 @@ class _BigCover extends ConsumerWidget {
     this.landscape = false,
     this.miniLyricRows = 2,
     this.miniLyricReserveRows = 2,
+    this.coverHidden = false,
+    this.coverAnchorKey,
   });
   final QueueItem? item;
   final int offsetTenths;
@@ -7144,6 +7183,12 @@ class _BigCover extends ConsumerWidget {
   /// 迷你歌词展示区预留行数：沉浸模式恒按 4 行预留，播放栏弹出
   /// 收为 2 行时封面不随之抖动。
   final int miniLyricReserveRows;
+
+  /// 隐藏封面图像（保留同尺寸透明占位，供预览层锚定最终封面位置）。
+  final bool coverHidden;
+
+  /// 封面占位锚点：拖动预览时读取封面最终矩形，与放大层目标对齐。
+  final GlobalKey? coverAnchorKey;
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
@@ -7234,21 +7279,32 @@ class _BigCover extends ConsumerWidget {
                     Positioned(
                       top: 0,
                       left: 0,
-                      child: switch (style) {
-                        // 圆形旋转封面（参考 MusicFree）：25 秒一圈，
-                        // 播放时匀速旋转、暂停时停住，切歌（key 变化）归零。
-                        PlayerCoverStyle.circle => _buildCircle(playing, side),
-                        // 黑胶唱片（参考 BakaMusic）：盘面 24 秒一圈。
-                        PlayerCoverStyle.vinyl => _VinylCover(
-                          item: item,
-                          playing: playing,
-                          size: side,
-                          showTonearm: showTonearm,
-                          onTap: onTap,
-                          onLongPress: onLongPress,
-                        ),
-                        _ => _buildClassic(side),
-                      },
+                      child: coverHidden
+                          // 预览层：封面区域留空，仅保留同尺寸透明占位
+                          //（放大层持续提供封面视觉，占位用于锚定目标矩形）。
+                          ? SizedBox(
+                              key: coverAnchorKey,
+                              width: side,
+                              height: side,
+                            )
+                          : switch (style) {
+                              // 圆形旋转封面（参考 MusicFree）：25 秒一圈，
+                              // 播放时匀速旋转、暂停时停住，切歌（key 变化）归零。
+                              PlayerCoverStyle.circle => _buildCircle(
+                                playing,
+                                side,
+                              ),
+                              // 黑胶唱片（参考 BakaMusic）：盘面 24 秒一圈。
+                              PlayerCoverStyle.vinyl => _VinylCover(
+                                item: item,
+                                playing: playing,
+                                size: side,
+                                showTonearm: showTonearm,
+                                onTap: onTap,
+                                onLongPress: onLongPress,
+                              ),
+                              _ => _buildClassic(side),
+                            },
                     ),
                     if (item != null && showCoverExtras)
                       Positioned(
@@ -7498,6 +7554,7 @@ class _ImmersiveCoverPage extends StatelessWidget {
     this.onTap,
     this.onLongPress,
     this.paintCover = true,
+    this.coverAnchorKey,
     this.miniLyricRows = 2,
     this.miniLyricReserveRows = 2,
   });
@@ -7510,6 +7567,9 @@ class _ImmersiveCoverPage extends StatelessWidget {
   /// false 时封面区域退化为透明占位（保留手势与尺寸，迷你歌词位置
   /// 不变）：封面本体由播放页外层 Stack 绘制，铺到屏幕顶端。
   final bool paintCover;
+
+  /// 封面占位锚点：拖动预览时读取封面最终矩形，与放大层目标对齐。
+  final GlobalKey? coverAnchorKey;
 
   /// 迷你歌词当前展示行数（沉浸模式播放栏隐藏 4 行、弹出 2 行）。
   final int miniLyricRows;
@@ -7539,6 +7599,7 @@ class _ImmersiveCoverPage extends StatelessWidget {
               button: onTap != null,
               label: onTap == null ? null : '显示歌词',
               child: SizedBox(
+                key: coverAnchorKey,
                 width: side,
                 height: side,
                 child: paintCover
@@ -7617,51 +7678,67 @@ class _ImmersiveCoverPage extends StatelessWidget {
 /// 的标题行背后），同样应用 62% 清晰 + 底部渐隐，顶部叠加轻微暗色
 /// 渐变保证白色标题文字可读。
 class _ImmersiveTopCover extends StatelessWidget {
-  const _ImmersiveTopCover({required this.item, required this.side});
+  const _ImmersiveTopCover({
+    required this.item,
+    required this.side,
+    this.coverHidden = false,
+    this.coverAnchorKey,
+  });
 
   final QueueItem item;
   final double side;
 
+  /// 预览层隐藏封面：保留同尺寸透明占位（放大层提供封面视觉）。
+  final bool coverHidden;
+
+  /// 封面占位锚点：拖动预览时读取封面最终矩形，与放大层目标对齐。
+  final GlobalKey? coverAnchorKey;
+
   @override
   Widget build(BuildContext context) {
     return SizedBox(
+      key: coverAnchorKey,
       width: side,
       height: side,
-      child: ShaderMask(
-        blendMode: BlendMode.dstIn,
-        shaderCallback: (bounds) => const LinearGradient(
-          begin: Alignment.topCenter,
-          end: Alignment.bottomCenter,
-          colors: [Colors.white, Colors.white, Colors.transparent],
-          stops: [0, .62, 1],
-        ).createShader(bounds),
-        child: Stack(
-          fit: StackFit.expand,
-          children: [
-            CoverImage(
-              key: ValueKey('immersiveTop:${item.path}:${item.coverUrl ?? ''}'),
-              songPath: item.path,
-              imageUrl: item.coverUrl,
-              width: side,
-              height: side,
-              radius: 0,
-              highQuality: true,
-              icon: Icons.music_note_rounded,
-            ),
-            // 顶部可读性渐变（标题文字浮在封面上）。
-            const DecoratedBox(
-              decoration: BoxDecoration(
-                gradient: LinearGradient(
-                  begin: Alignment.topCenter,
-                  end: Alignment.bottomCenter,
-                  colors: [Color(0x59000000), Colors.transparent],
-                  stops: [0, .28],
-                ),
+      child: coverHidden
+          ? const SizedBox.shrink()
+          : ShaderMask(
+              blendMode: BlendMode.dstIn,
+              shaderCallback: (bounds) => const LinearGradient(
+                begin: Alignment.topCenter,
+                end: Alignment.bottomCenter,
+                colors: [Colors.white, Colors.white, Colors.transparent],
+                stops: [0, .62, 1],
+              ).createShader(bounds),
+              child: Stack(
+                fit: StackFit.expand,
+                children: [
+                  CoverImage(
+                    key: ValueKey(
+                      'immersiveTop:${item.path}:${item.coverUrl ?? ''}',
+                    ),
+                    songPath: item.path,
+                    imageUrl: item.coverUrl,
+                    width: side,
+                    height: side,
+                    radius: 0,
+                    highQuality: true,
+                    icon: Icons.music_note_rounded,
+                  ),
+                  // 顶部可读性渐变（标题文字浮在封面上）。
+                  const DecoratedBox(
+                    decoration: BoxDecoration(
+                      gradient: LinearGradient(
+                        begin: Alignment.topCenter,
+                        end: Alignment.bottomCenter,
+                        colors: [Color(0x59000000), Colors.transparent],
+                        stops: [0, .28],
+                      ),
+                    ),
+                  ),
+                ],
               ),
             ),
-          ],
-        ),
-      ),
     );
   }
 }
@@ -7937,11 +8014,7 @@ class _MiniLyrics extends ConsumerWidget {
     if (item.pluginId != null) {
       return _message('暂无歌词', fontSize);
     }
-    return _buildAsync(
-      ref,
-      ref.watch(songLyricsProvider(item.path)),
-      fontSize,
-    );
+    return _buildAsync(ref, ref.watch(songLyricsProvider(item.path)), fontSize);
   }
 
   Widget _buildAsync(
@@ -7985,7 +8058,8 @@ class _MiniLyrics extends ConsumerWidget {
         final raw = ref.watch(
           playerProvider.select(
             (state) => lines.lastIndexWhere(
-              (line) => line.time <= applyLyricsOffset(state.position, offsetTenths),
+              (line) =>
+                  line.time <= applyLyricsOffset(state.position, offsetTenths),
             ),
           ),
         );
@@ -8118,36 +8192,38 @@ class _MiniLyrics extends ConsumerWidget {
             ),
           )
         : Text(
-      row.text,
-      // 当前行换行上限：四行窗口每行单行；两行窗口仅在无翻译且字号
-      // 不大时允许软换行（否则「当前行两行 + 翻译 + 下一行」会超出
-      // 展示区高度）。
-      maxLines:
-          isActive &&
-              maxRows <= 2 &&
-              row.translation.isEmpty &&
-              fontSize <= _singleLineThreshold
-          ? 2
-          : 1,
-      softWrap: true,
-      overflow: isActive && maxRows <= 2
-          ? TextOverflow.clip
-          : TextOverflow.ellipsis,
-      textAlign: TextAlign.center,
-      style: isActive
-          ? TextStyle(
-              color: Colors.white,
-              fontSize: fontSize,
-              fontWeight: FontWeight.w700,
-              height: 1.3,
-              shadows: const [Shadow(color: Colors.black54, blurRadius: 10)],
-            )
-          : TextStyle(
-              color: Colors.white.withValues(alpha: .5),
-              fontSize: fontSize * .82,
-              height: 1.3,
-            ),
-    );
+            row.text,
+            // 当前行换行上限：四行窗口每行单行；两行窗口仅在无翻译且字号
+            // 不大时允许软换行（否则「当前行两行 + 翻译 + 下一行」会超出
+            // 展示区高度）。
+            maxLines:
+                isActive &&
+                    maxRows <= 2 &&
+                    row.translation.isEmpty &&
+                    fontSize <= _singleLineThreshold
+                ? 2
+                : 1,
+            softWrap: true,
+            overflow: isActive && maxRows <= 2
+                ? TextOverflow.clip
+                : TextOverflow.ellipsis,
+            textAlign: TextAlign.center,
+            style: isActive
+                ? TextStyle(
+                    color: Colors.white,
+                    fontSize: fontSize,
+                    fontWeight: FontWeight.w700,
+                    height: 1.3,
+                    shadows: const [
+                      Shadow(color: Colors.black54, blurRadius: 10),
+                    ],
+                  )
+                : TextStyle(
+                    color: Colors.white.withValues(alpha: .5),
+                    fontSize: fontSize * .82,
+                    height: 1.3,
+                  ),
+          );
     if (row.translation.isEmpty) return lyric;
     return Column(
       mainAxisSize: MainAxisSize.min,
@@ -8276,7 +8352,9 @@ class _LyricsViewState extends ConsumerState<_LyricsView>
     final raw = ref.watch(
       playerProvider.select(
         (state) => lines.lastIndexWhere(
-          (line) => line.time <= applyLyricsOffset(state.position, widget.offsetTenths),
+          (line) =>
+              line.time <=
+              applyLyricsOffset(state.position, widget.offsetTenths),
         ),
       ),
     );
@@ -8417,9 +8495,7 @@ class _LyricsViewState extends ConsumerState<_LyricsView>
                       final line = lines[index];
                       final selected = index == active;
                       // 本行基色：已播/未播由歌词设置的两色表达。
-                      final lineColor = selected
-                          ? playedColor
-                          : unplayedColor;
+                      final lineColor = selected ? playedColor : unplayedColor;
                       return InkWell(
                         key: _lineKeys.putIfAbsent(index, GlobalKey.new),
                         // 设置关闭“单击歌词调整进度”时禁用点击跳转。
@@ -8767,8 +8843,7 @@ class _TimedLyricTextState extends ConsumerState<_TimedLyricText>
       _baseClock = elapsed;
       return;
     }
-    final estimateMs =
-        _basePositionMs + (elapsed - _baseClock).inMilliseconds;
+    final estimateMs = _basePositionMs + (elapsed - _baseClock).inMilliseconds;
     final next = applyLyricsOffset(estimateMs / 1000.0, widget.offsetTenths);
     if ((next - _positionNotifier.value).abs() > 0.01) {
       _positionNotifier.value = next;
@@ -8802,36 +8877,32 @@ class _TimedLyricTextState extends ConsumerState<_TimedLyricText>
     // 小范围更新。逐字=字符依次淡入，逐词=渐进填充+扫光带（_buildSweepText）。
     if (widget.effectMode == LyricWordEffectMode.progressive ||
         widget.effectMode == LyricWordEffectMode.wordByWord) {
-      ref.listen(
-        playerProvider.select((state) => state.position),
-        (_, next) {
-          // position 采样（前台 200~250ms 一跳）只用于校准 Ticker 推算
-          // 基准，且不能每次都硬拉回：采样点的引擎位置相对当下时刻天然
-          // 滞后（采样误差 ±100ms），硬校准会让扫光每 200ms 锯齿回跳。
-          // 对齐 BakaMusic（AMLL）timeline 的校准语义：seek/恢复播放等
-          // 大跳变瞬间回正（commitPlayerTimeState 的 seeking 分支），
-          // 普通漂移按 30% 平滑收敛，推算保持单调推进。
-          // 基准单位统一毫秒（_baseClock 相对系），对外 notifier 写秒。
-          final estimateMs =
-              _basePositionMs + (_lastElapsed - _baseClock).inMilliseconds;
-          final driftSec = next - estimateMs / 1000.0;
-          _baseClock = _lastElapsed;
-          if (driftSec.abs() > 0.5) {
-            _basePositionMs = next * 1000.0;
-            _positionNotifier.value = applyLyricsOffset(
-              next,
-              widget.offsetTenths,
-            );
-          } else {
-            _basePositionMs = estimateMs + driftSec * 300.0;
-          }
-        },
-      );
+      ref.listen(playerProvider.select((state) => state.position), (_, next) {
+        // position 采样（前台 200~250ms 一跳）只用于校准 Ticker 推算
+        // 基准，且不能每次都硬拉回：采样点的引擎位置相对当下时刻天然
+        // 滞后（采样误差 ±100ms），硬校准会让扫光每 200ms 锯齿回跳。
+        // 对齐 BakaMusic（AMLL）timeline 的校准语义：seek/恢复播放等
+        // 大跳变瞬间回正（commitPlayerTimeState 的 seeking 分支），
+        // 普通漂移按 30% 平滑收敛，推算保持单调推进。
+        // 基准单位统一毫秒（_baseClock 相对系），对外 notifier 写秒。
+        final estimateMs =
+            _basePositionMs + (_lastElapsed - _baseClock).inMilliseconds;
+        final driftSec = next - estimateMs / 1000.0;
+        _baseClock = _lastElapsed;
+        if (driftSec.abs() > 0.5) {
+          _basePositionMs = next * 1000.0;
+          _positionNotifier.value = applyLyricsOffset(
+            next,
+            widget.offsetTenths,
+          );
+        } else {
+          _basePositionMs = estimateMs + driftSec * 300.0;
+        }
+      });
       if (!_calibratedOnce) {
         // 首帧基准：不等下一次 position 采样（200ms 后才到），直接用
         // 当前快照初始化，避免挂载瞬间从 0 秒起算造成扫光闪跳。
-        _basePositionMs =
-            ref.read(playerProvider).position * 1000.0;
+        _basePositionMs = ref.read(playerProvider).position * 1000.0;
         _calibratedOnce = true;
       }
       _ensureTicker();
@@ -8891,17 +8962,17 @@ class _TimedLyricTextState extends ConsumerState<_TimedLyricText>
               alignment: PlaceholderAlignment.baseline,
               baseline: TextBaseline.alphabetic,
               child: RepaintBoundary(
-                  child: _ProgressiveLyricWord(
-                    text: word.text,
-                    style: baseStyle,
-                    position: _positionNotifier,
-                    start: word.start,
-                    end: word.end,
-                    effectMode: LyricWordEffectMode.wordByWord,
-                    playedColor: widget.playedColor,
-                    unplayedColor: widget.unplayedColor,
-                  ),
+                child: _ProgressiveLyricWord(
+                  text: word.text,
+                  style: baseStyle,
+                  position: _positionNotifier,
+                  start: word.start,
+                  end: word.end,
+                  effectMode: LyricWordEffectMode.wordByWord,
+                  playedColor: widget.playedColor,
+                  unplayedColor: widget.unplayedColor,
                 ),
+              ),
             ),
         ],
       ),
@@ -9138,10 +9209,13 @@ class _SweepWordPainter extends CustomPainter {
     // 柔和；逐词=窄带（词宽 18%，clamp 5~12px）：过渡几乎瞬时，填充前沿
     // 干脆利落（不加淡入）。
     final progressive = w.effectMode == LyricWordEffectMode.progressive;
-    final band = (size.width * (progressive ? 0.50 : 0.18))
-        .clamp(progressive ? 14.0 : 5.0, progressive ? 30.0 : 12.0);
+    final band = (size.width * (progressive ? 0.50 : 0.18)).clamp(
+      progressive ? 14.0 : 5.0,
+      progressive ? 30.0 : 12.0,
+    );
     final front =
-        ((pos - w.start) / state._sweepDur).clamp(0.0, 1.0) * (size.width + band);
+        ((pos - w.start) / state._sweepDur).clamp(0.0, 1.0) *
+        (size.width + band);
     final stops = state._tpStops!;
     void seg(double x0, double x1, TextPainter tp) {
       if (x1 <= 0 || x1 <= x0) return;
@@ -9169,11 +9243,10 @@ class _SweepWordPainter extends CustomPainter {
       canvas.drawRect(
         bandRect,
         Paint()
-          ..shader = ui.Gradient.linear(
-            Offset(gx0, 0),
-            Offset(gx1, 0),
-            [Colors.white, Colors.white.withValues(alpha: 0)],
-          )
+          ..shader = ui.Gradient.linear(Offset(gx0, 0), Offset(gx1, 0), [
+            Colors.white,
+            Colors.white.withValues(alpha: 0),
+          ])
           ..blendMode = BlendMode.dstIn,
       );
       canvas.restore();
@@ -9661,11 +9734,12 @@ class _ProgressBarState extends ConsumerState<_ProgressBar> {
     final head = hasDuration && settings != null
         ? (settings.skipHeadSeconds > 0 ? settings.skipHeadSeconds : 0.0)
         : 0.0;
-    final tailStart = hasDuration && settings != null &&
-            settings.skipTailSeconds > 0
+    final tailStart =
+        hasDuration && settings != null && settings.skipTailSeconds > 0
         ? dur - settings.skipTailSeconds
         : dur;
-    final useRange = hasDuration && (head > 0 || tailStart < dur) && head < tailStart;
+    final useRange =
+        hasDuration && (head > 0 || tailStart < dur) && head < tailStart;
     final lo = useRange ? head : 0.0;
     final hi = useRange ? tailStart : dur;
     final sliderPosition = useRange ? position.clamp(lo, hi) : position;
