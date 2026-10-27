@@ -80,6 +80,15 @@ class MainActivity : AudioServiceActivity() {
     private var wifiLock: WifiManager.WifiLock? = null
 
     override fun onCreate(savedInstanceState: android.os.Bundle?) {
+        // Rust std::env::temp_dir() 在 Android 上默认解析为 /data/local/tmp
+        //（应用 UID 无权写入），流缓存建文件恒失败（os error 2）→ DSP 接管
+        // 恒回退原生输出，音效广场在线流永远无效。进程级 TMPDIR 指向应用
+        // 缓存目录后，Rust 侧 temp_dir 与 Dart 侧 Directory.systemTemp 一并
+        // 修复；getCacheDir() 保证目录存在，无需额外 mkdir。
+        try {
+            android.system.Os.setenv("TMPDIR", cacheDir.absolutePath, true)
+        } catch (_: Exception) {
+        }
         super.onCreate(savedInstanceState)
         // 尽早安装，捕获进程内所有线程的未捕获异常并写入崩溃文件。
         CrashHandler.install(this)
@@ -694,11 +703,12 @@ class MainActivity : AudioServiceActivity() {
                 else -> result.notImplemented()
             }
         }
-        // 冷启动期间到达的通知双击/⚙ 设置键请求：通道就绪后补发。
-        pendingDesktopLyricsAction?.let { method ->
-            pendingDesktopLyricsAction = null
-            desktopLyricsChannelRef?.invokeMethod(method, null)
-        }
+        // 冷启动期间到达的通知双击/⚙ 设置键请求：**不**在这里立即补发。
+        // configureFlutterEngine 执行时 Dart isolate 可能尚未运行、原生
+        // → Dart 的 invokeMethod 会静默丢失（且 pending 已被清空，用户
+        // 再点一次才生效）；改为 Dart 侧 handler 安装后主动调用
+        // `getPendingDesktopLyricsAction` 拉取（见下方 method call
+        // handler 与 desktop_lyrics.dart 的 ensureReady）。
         deepLinkChannel = MethodChannel(
             flutterEngine.dartExecutor.binaryMessenger,
             DEEPLINK_CHANNEL,
@@ -1154,6 +1164,15 @@ class MainActivity : AudioServiceActivity() {
         desktopLyricsChannel
             .setMethodCallHandler { call, result ->
                 when (call.method) {
+                    // Dart 侧 handler 就绪后主动拉取冷启动期间暂存的动作。
+                    // 冷启动时原生 configureFlutterEngine 远早于 Dart isolate
+                    // 的 setMethodCallHandler 安装，立即 invoke 的消息会直接
+                    // 丢失且 pending 已被清空——改为 Dart 拉取才可靠。
+                    "getPendingDesktopLyricsAction" -> {
+                        val action = pendingDesktopLyricsAction
+                        pendingDesktopLyricsAction = null
+                        result.success(action)
+                    }
                     "setEnabled" -> {
                         val enabled = call.argument<Boolean>("enabled") == true
                         if (!enabled) {

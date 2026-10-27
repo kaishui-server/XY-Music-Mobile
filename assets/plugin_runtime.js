@@ -55,3 +55,183 @@ buffer/index.js:
    * @license  MIT
    *)
 */
+
+/* ===== XY Buffer polyfill（QuickJS 无 Node Buffer/TextEncoder）=====
+ * 汽水、QQ 等插件的请求签名与 KRC/逐字歌词解码依赖 Buffer.from /
+ * Buffer.concat / buf.toString('base64'|'utf8'|'hex')。缺失时插件抛
+ * "Buffer is not defined" 并降级为纯 LRC，翻译/逐字/罗马音全部丢失。
+ */
+(function (global) {
+  "use strict";
+  if (global.Buffer && typeof global.Buffer.from === "function") return;
+  var B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  function utf8Encode(str) {
+    var out = [];
+    for (var i = 0; i < str.length; i++) {
+      var c = str.codePointAt(i);
+      if (c > 0xffff) i++;
+      if (c < 0x80) out.push(c);
+      else if (c < 0x800) out.push(0xc0 | (c >> 6), 0x80 | (c & 63));
+      else if (c < 0x10000) {
+        out.push(0xe0 | (c >> 12), 0x80 | ((c >> 6) & 63), 0x80 | (c & 63));
+      } else {
+        out.push(
+          0xf0 | (c >> 18),
+          0x80 | ((c >> 12) & 63),
+          0x80 | ((c >> 6) & 63),
+          0x80 | (c & 63)
+        );
+      }
+    }
+    return out;
+  }
+  function utf8Decode(bytes) {
+    var out = "", i = 0;
+    while (i < bytes.length) {
+      var c = bytes[i++];
+      if (c < 0x80) out += String.fromCharCode(c);
+      else if (c < 0xe0) {
+        out += String.fromCharCode(((c & 31) << 6) | (bytes[i++] & 63));
+      } else if (c < 0xf0) {
+        out += String.fromCharCode(
+          ((c & 15) << 12) | ((bytes[i++] & 63) << 6) | (bytes[i++] & 63)
+        );
+      } else {
+        var cp =
+          ((c & 7) << 18) |
+          ((bytes[i++] & 63) << 12) |
+          ((bytes[i++] & 63) << 6) |
+          (bytes[i++] & 63);
+        cp -= 0x10000;
+        out += String.fromCharCode(0xd800 + (cp >> 10), 0xdc00 + (cp & 0x3ff));
+      }
+    }
+    return out;
+  }
+  function b64Decode(str) {
+    str = String(str).replace(/[^A-Za-z0-9+/]/g, "");
+    var out = [], buf = 0, bits = 0;
+    for (var i = 0; i < str.length; i++) {
+      var idx = B64.indexOf(str.charAt(i));
+      if (idx < 0) continue;
+      buf = (buf << 6) | idx;
+      bits += 6;
+      if (bits >= 8) {
+        bits -= 8;
+        out.push((buf >> bits) & 0xff);
+      }
+    }
+    return out;
+  }
+  function b64Encode(bytes) {
+    var out = "", buf = 0, bits = 0;
+    for (var i = 0; i < bytes.length; i++) {
+      buf = (buf << 8) | (bytes[i] & 0xff);
+      bits += 8;
+      while (bits >= 6) {
+        bits -= 6;
+        out += B64.charAt((buf >> bits) & 63);
+      }
+    }
+    if (bits > 0) out += B64.charAt((buf << (6 - bits)) & 63);
+    while (out.length % 4 !== 0) out += "=";
+    return out;
+  }
+  function hexEncode(bytes) {
+    var out = "";
+    for (var i = 0; i < bytes.length; i++) {
+      out += ((bytes[i] >> 4) & 15).toString(16) + (bytes[i] & 15).toString(16);
+    }
+    return out;
+  }
+  function hexDecode(str) {
+    str = String(str).replace(/[^0-9a-fA-F]/g, "");
+    var out = [];
+    for (var i = 0; i + 1 < str.length; i += 2) {
+      out.push(parseInt(str.substr(i, 2), 16));
+    }
+    return out;
+  }
+  function toBytes(value, encoding) {
+    if (value == null) return [];
+    if (value instanceof XYBuffer) return Array.prototype.slice.call(value);
+    if (
+      value instanceof Uint8Array ||
+      value instanceof Int8Array ||
+      Array.isArray(value) ||
+      (typeof ArrayBuffer !== "undefined" && value instanceof ArrayBuffer)
+    ) {
+      var view = value instanceof ArrayBuffer ? new Uint8Array(value) : value;
+      var out = [];
+      for (var i = 0; i < view.length; i++) out.push(view[i] & 0xff);
+      return out;
+    }
+    var text = String(value);
+    var enc = (encoding || "utf8").toLowerCase();
+    if (enc === "base64") return b64Decode(text);
+    if (enc === "hex") return hexDecode(text);
+    if (enc === "latin1" || enc === "binary" || enc === "ascii") {
+      var arr = [];
+      for (var j = 0; j < text.length; j++) arr.push(text.charCodeAt(j) & 0xff);
+      return arr;
+    }
+    return utf8Encode(text);
+  }
+  class XYBuffer extends Uint8Array {
+    constructor(value, encoding) {
+      var bytes = toBytes(value, encoding);
+      super(bytes.length);
+      for (var i = 0; i < bytes.length; i++) this[i] = bytes[i] & 0xff;
+    }
+    toString(encoding) {
+      var enc = (encoding || "utf8").toLowerCase();
+      if (enc === "base64") return b64Encode(this);
+      if (enc === "hex") return hexEncode(this);
+      if (enc === "latin1" || enc === "binary" || enc === "ascii") {
+        var out = "";
+        for (var i = 0; i < this.length; i++) {
+          out += String.fromCharCode(this[i]);
+        }
+        return out;
+      }
+      return utf8Decode(this);
+    }
+    slice(start, end) {
+      return new XYBuffer(Array.prototype.slice.call(this, start, end));
+    }
+    subarray(start, end) {
+      return this.slice(start, end);
+    }
+    toJSON() {
+      return { type: "Buffer", data: Array.from(this) };
+    }
+    static isBuffer(x) {
+      return x instanceof XYBuffer;
+    }
+    static from(value, encoding) {
+      return new XYBuffer(value, encoding);
+    }
+    static alloc(size, fill) {
+      var buf = new XYBuffer(new Array(size).fill(0));
+      if (fill !== undefined) {
+        var f = toBytes(fill);
+        for (var i = 0; i < size; i++) buf[i] = f[i % f.length] & 0xff;
+      }
+      return buf;
+    }
+    static allocUnsafe(size) {
+      return XYBuffer.alloc(size);
+    }
+    static concat(list) {
+      var out = [];
+      for (var i = 0; i < list.length; i++) {
+        var item = list[i];
+        out = out.concat(
+          item instanceof XYBuffer ? Array.from(item) : toBytes(item)
+        );
+      }
+      return new XYBuffer(out);
+    }
+  }
+  global.Buffer = XYBuffer;
+})(globalThis);

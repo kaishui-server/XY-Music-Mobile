@@ -54,16 +54,26 @@ Page<void> _instantPage(GoRouterState state, Widget child) =>
       child: child,
     );
 
-/// 播放详情页专属页面工厂：固定底部滑入/收回转场（见
+/// 播放详情页 Page：创建 [XyPlayerSheetRoute]（转场参数与手势驱动接口
+/// 都定义在路由类上）。
+class XyPlayerSheetPage<T> extends Page<T> {
+  const XyPlayerSheetPage({required super.key, required this.child});
+
+  final Widget child;
+
+  @override
+  Route<T> createRoute(BuildContext context) => XyPlayerSheetRoute<T>(
+    settings: this,
+    builder: (context) => child,
+  );
+}
+
+/// 播放详情页专属页面工厂：XianYu 式底部滑入/收回转场（见
 /// [xyPlayerSheetTransition]），不受全局页面切换模式设置影响。
+/// 详情页下滑收起手势需要实时驱动转场控制器，因此不用
+/// CustomTransitionPage（拿不到路由控制器），改用自定义 [XyPlayerSheetPage]。
 Page<void> _playerSheetPage(GoRouterState state, Widget child) =>
-    CustomTransitionPage<void>(
-      key: state.pageKey,
-      transitionDuration: xyPageTransitionDuration,
-      reverseTransitionDuration: xyPageReverseTransitionDuration,
-      transitionsBuilder: xyPlayerSheetTransition,
-      child: child,
-    );
+    XyPlayerSheetPage<void>(key: state.pageKey, child: child);
 
 /// 主路由：使用 StatefulShellRoute 保持各一级页面状态。
 final appRouter = GoRouter(

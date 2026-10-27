@@ -56,23 +56,23 @@ void main() {
     tex.dispose();
   });
 
-  test('dim matrix: night tint (0.50/0.54/0.63) × saturation 0.42', () {
+  test('dim matrix: night tint 0.62/0.66/0.74 (pure multiplicative)', () {
     final m = ghostDimMatrix(bright: 1.0);
     expect(m.length, 20);
-    // 亮度基準系数（0.2126/0.7152/0.0722，sat=0.42）：
-    // R 行 = 0.50 × [0.2126×0.58+0.42, 0.7152×0.58, 0.0722×0.58, 0, 0]。
-    expect(m[0], closeTo(0.50 * (0.2126 * 0.58 + 0.42), 1e-9));
-    expect(m[1], closeTo(0.50 * (0.7152 * 0.58), 1e-9));
-    expect(m[2], closeTo(0.50 * (0.0722 * 0.58), 1e-9));
+    // 5553 恢复 5547 定稿：纯乘性夜色 tint（对角矩阵），保 V 压暗、
+    // 不降饱和——R×0.62 / G×0.66 / B×0.74。
+    expect(m[0], closeTo(0.62, 1e-9));
+    expect(m[1], 0);
+    expect(m[2], 0);
     expect(m[3], 0);
     expect(m[4], 0);
-    // G 行 = 0.54 × [0.1063, 0.8358, 0.0419, ...]。
-    expect(m[5], closeTo(0.54 * (0.2126 * 0.58), 1e-9));
-    expect(m[6], closeTo(0.54 * (0.7152 * 0.58 + 0.42), 1e-9));
-    // B 行 = 0.63 × [0.1063, 0.4148, 0.5619, 0, 0]。
-    expect(m[10], closeTo(0.63 * (0.2126 * 0.58), 1e-9));
-    expect(m[11], closeTo(0.63 * (0.7152 * 0.58), 1e-9));
-    expect(m[12], closeTo(0.63 * (0.0722 * 0.58 + 0.42), 1e-9));
+    expect(m[5], 0);
+    expect(m[6], closeTo(0.66, 1e-9));
+    expect(m[7], 0);
+    expect(m[10], 0);
+    expect(m[11], 0);
+    expect(m[12], closeTo(0.74, 1e-9));
+    expect(m[13], 0);
     // alpha 行恒等（不改动纹理透明度）。
     expect(m[15], 0);
     expect(m[16], 0);
@@ -93,19 +93,12 @@ void main() {
     }
   });
 
-  test('dim matrix: desaturates pure red (G/B lifted, channel spread shrunk)',
-      () {
+  test('dim matrix: keeps pure red pure (no desaturation, G/B stay 0)', () {
     final m = ghostDimMatrix(bright: 1.0);
-    // 纯红 (255,0,0) 输出：
-    // R = 0.50×0.5433×255 ≈ 69.3，G = 0.54×0.1233×255 ≈ 17.0，
-    // B = 0.63×0.1233×255 ≈ 19.8 —— 降饱和后的暗红（G/B 不再为 0）。
-    final r = 0.50 * (0.2126 * 0.58 + 0.42) * 255;
-    final g = 0.54 * (0.2126 * 0.58) * 255;
-    final b = 0.63 * (0.2126 * 0.58) * 255;
-    expect(m[0] * 255, closeTo(r, 0.01));
-    expect(m[5] * 255, closeTo(g, 0.01));
-    expect(m[10] * 255, closeTo(b, 0.01));
-    expect(g, greaterThan(0));
-    expect(b, greaterThan(0));
+    // 纯红 (255,0,0) 输出 R = 0.62×255 ≈ 158.1，G/B = 0——纯乘性压暗
+    // 不做亮度混合降饱和（5539 教训：降饱和会把彩色封面洗灰）。
+    expect(m[0] * 255, closeTo(0.62 * 255, 0.01));
+    expect(m[5], 0);
+    expect(m[10], 0);
   });
 }

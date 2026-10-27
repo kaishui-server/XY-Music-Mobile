@@ -7170,19 +7170,36 @@ class PluginRuntimeService {
   static String _extractLyricsWithTranslation(dynamic value) {
     final main = _extractLyrics(value);
     if (main.isEmpty || value is! Map) return main;
-    // 主歌词是密文（QQ crypt:1）时，翻译/罗马音同样是密文。此前直接丢弃
-    // 翻译；现在把密文的翻译/罗马音按行拼接透传，Rust 侧逐行解密后把
-    // 翻译行合并进解析管线（对齐桌面端 combined 链路）。明文翻译在密文
-    // 主词场景下无法随行拼接（会破坏 hex 检测），仍维持放弃。
+    // 主歌词是密文（QQ crypt:1 等）。旧接口降级响应是「密文主词 + 明文
+    // 翻译」（getLyricLegacy 的 trans 经 he.decode 已是明文），此前明文
+    // 翻译被整段丢弃（表现：QQ L1/L2、baka 源外文歌无翻译）。现在逐轨道
+    // 独立解密（解密器按行处理且保留明文行），再用哨兵显式分轨拼接——
+    // 密文/明文混合与全密文都收敛到同一条明文哨兵链路，轨道边界不再靠
+    // 时间戳猜测；个别轨道解密失败保留原文，不影响其余轨道。
     if (_isLikelyEncryptedLyrics(main)) {
-      final parts = <String>[main];
-      for (final extra in [
-        _extractTranslation(value),
-        _extractRomaji(value),
-      ]) {
-        if (_isLikelyEncryptedLyrics(extra)) parts.add(extra);
+      final translation = _extractTranslation(value);
+      final romaji = _extractRomaji(value);
+      final mainText = decryptQrcLyrics(main) ?? main;
+      final transText = translation.isEmpty
+          ? ''
+          : (decryptQrcLyrics(translation) ?? translation);
+      final romaText =
+          romaji.isEmpty ? '' : (decryptQrcLyrics(romaji) ?? romaji);
+      if (mainText == main && transText.isEmpty && romaText.isEmpty) {
+        // 主词解密失败且无明文轨道：维持原密文透传（Rust 侧解密兜底）。
+        return main;
       }
-      return parts.join('\n');
+      return [
+        mainText,
+        if (transText.isNotEmpty) ...[
+          _kTrackTranslationSentinel,
+          transText,
+        ],
+        if (romaText.isNotEmpty) ...[
+          _kTrackRomanizationSentinel,
+          romaText,
+        ],
+      ].join('\n');
     }
     final translation = _extractTranslation(value);
     final romaji = _extractRomaji(value);

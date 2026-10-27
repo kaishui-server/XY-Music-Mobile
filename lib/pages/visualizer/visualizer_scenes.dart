@@ -27,18 +27,23 @@ import 'visualizer_settings.dart';
 import 'ghost_cover.dart';
 
 /// 每帧渲染输入。
+/// 注意：time/kickEnvelope/rms/blockPulse 是「活」字段——painter 由 build
+/// 创建并持有 VisFrame 引用，画面由 repaint 每帧驱动，播放中页面频繁
+/// rebuild 会重建 painter 掩盖快照问题；暂停/无音频时无 rebuild，若这些
+/// 字段是 final 快照则地形时间流冻结（脉冲不回落、波纹不扩散）。因此
+/// 页面 _onTick 每帧原地更新这些字段，paint() 始终读到最新时间流。
 class VisFrame {
-  final List<double> bands; // 64 段（已平滑+检测源增益）
-  final double kickEnvelope; // 0..1 节拍包络
-  final double rms; // 0..1 整体响度
-  final double time; // 秒（真实时间流）
-  final double blockPulse; // 悬浮方块脉冲（kickEnvelope 按「速度」平滑）
+  final List<double> bands; // 64 段（已平滑+检测源增益，内容每帧更新）
+  double kickEnvelope; // 0..1 节拍包络（活字段）
+  double rms; // 0..1 整体响度（活字段）
+  double time; // 秒（真实时间流，活字段）
+  double blockPulse; // 悬浮方块脉冲（kickEnvelope 按「速度」平滑，活字段）
   final VisualizerSettings settings;
   final OrbitCamera camera;
   final VisRippleBuffer ripples;
   final GhostTextures? coverImage; // 预处理后的封面幽灵双层纹理
   final List<VisMeteor> meteors; // 活跃流星
-  const VisFrame({
+  VisFrame({
     required this.bands,
     required this.kickEnvelope,
     required this.rms,
@@ -106,17 +111,15 @@ class _Palette {
       this.hgR, this.hgG, this.hgB);
 }
 
-/// 主题氛围天空（对齐参考版：暗夜=深蓝紫、赛博=深绿、霓虹=深紫、
-/// 墨韵/极简=浅灰白雾），逐主题显式给定而非通用派生。
-/// 5540 调暗暗色系（5539 反馈「不像夜晚」），浅色主题保持不动。
+/// 主题氛围天空（对齐参考版：暗夜=深蓝夜幕、赛博=深绿、霓虹=深蓝夜幕（原烈焰）、
+/// 极简=深灰蓝），逐主题显式给定而非通用派生。墨韵（ink）已移除。
 const _themeSkies = <String, List<int>>{
   // [skyTop, horizonFog]
-  'ink': [0xFF3E434B, 0xFF9AA1AB],
-  'night': [0xFF04070F, 0xFF0E2236],
-  'neon': [0xFF0A0517, 0xFF2A1F45],
-  'cyber': [0xFF030B06, 0xFF1A3A14],
-  'minimal': [0xFFBFC3C9, 0xFFE4E7EB],
-  'ember': [0xFF05070F, 0xFF16213C],
+  'night': [0xFF020410, 0xFF0B1E45],
+  'neon': [0xFF05070F, 0xFF16213C],
+  'cyber': [0xFF020A04, 0xFF0A2A12],
+  'minimal': [0xFF3E434B, 0xFF9AA1AB],
+  'phantom': [0xFF0A0517, 0xFF2A1F45],
 };
 
 _Palette _paletteFor(VisTheme theme) {
@@ -161,6 +164,30 @@ int _argb(double a, double r, double g, double b) {
 
 Color _col(double a, double r, double g, double b) =>
     Color(_argb(a, r, g, b));
+
+// ---------------------------------------------------------------------------
+// 快速 exp(-q)（q ≥ 0）：512 桶线性插值查表，误差 <1e-3（视觉无感）。
+// ripple 每帧命中柱数千次调用，查表比 math.exp 快一个数量级。
+// ---------------------------------------------------------------------------
+final Float64List _expNegTable = _buildExpNegTable();
+const double _expNegScale = 51.2; // 512 桶覆盖 q ∈ [0,10]
+
+Float64List _buildExpNegTable() {
+  final t = Float64List(513);
+  for (int i = 0; i <= 512; i++) {
+    t[i] = math.exp(-i / _expNegScale);
+  }
+  return t;
+}
+
+double _fastExpNeg(double q) {
+  if (q >= 10.0) return 0.0;
+  if (q < 0.0) q = 0.0;
+  final x = q * _expNegScale;
+  final i0 = x.toInt();
+  final f = x - i0;
+  return _expNegTable[i0] + (_expNegTable[i0 + 1] - _expNegTable[i0]) * f;
+}
 
 /// 已知颜色的指定 alpha 版本（消散罩取色用）。
 Color _colOf(double a, Color c) => Color.fromARGB(
@@ -240,9 +267,27 @@ class _TerrainGrid {
   final Float64List px, pz, dist, falloff, rnd, bassGate, midS, rnd11, rnd77;
   final Uint8List spikeFlag;
 
+  // —— 帧级复用缓冲（painter 每帧新建实例，缓存必须挂在本静态单例上；
+  // 单可视化页面使用，无并发写）——
+  /// 距离雾 alpha（纯几何，静态预计算：1-smoothstep(55,78,d)）。
+  final Float64List alpha;
+  /// 粗噪声网格（步长 2 格，节点 (cN+1)²）：snoise 特征尺度 ≥5 格，
+  /// 双线性插值无损观感；每帧 3×(cN+1)² 次 snoise 替代 3×n² 次。
+  final int cN;
+  final Float64List coarseA, coarseB, coarseC;
+  /// 每帧逐柱计算缓冲（复用避免每帧 ~1MB 分配引发 GC 抖动）。
+  final Float64List depths, heights;
+  final Int32List topCols, sideTopCols, sideBotCols;
+  final List<int> order;
+  /// 第二遍顶点缓冲：n²柱 × 18 顶点 × (x,y)。按帧实际用量 sublist。
+  final Float32List posBuf;
+  final Int32List colBuf;
+
   const _TerrainGrid._(this.n, this.spacing, this.halfW, this.px, this.pz,
       this.dist, this.falloff, this.rnd, this.bassGate, this.midS, this.rnd11,
-      this.rnd77, this.spikeFlag);
+      this.rnd77, this.spikeFlag, this.alpha, this.cN, this.coarseA,
+      this.coarseB, this.coarseC, this.depths, this.heights, this.topCols,
+      this.sideTopCols, this.sideBotCols, this.order, this.posBuf, this.colBuf);
 
   static final Map<int, _TerrainGrid> _cache = {};
 
@@ -272,6 +317,7 @@ class _TerrainGrid {
     final rnd11 = Float64List(count);
     final rnd77 = Float64List(count);
     final spike = Uint8List(count);
+    final alpha = Float64List(count);
     for (int x = 0; x < n; x++) {
       for (int z = 0; z < n; z++) {
         final i = x * n + z;
@@ -281,6 +327,7 @@ class _TerrainGrid {
         pz[i] = wz;
         final d = math.sqrt(wx * wx + wz * wz);
         dist[i] = d;
+        alpha[i] = 1.0 - glslSmoothstep(55, 78, d);
         falloff[i] = glslSmoothstep(60, 30, d);
         final r = glslHash(wx, wz);
         rnd[i] = r;
@@ -292,9 +339,32 @@ class _TerrainGrid {
         spike[i] = glslFract(r * 13.3) > 0.8 ? 1 : 0;
       }
     }
+    // 粗噪声网格：步长 2 格，节点 (n/2+1)²（含网格外伪节点供奇数行列插值）。
+    final cN = n >> 1;
+    final cn2 = (cN + 1) * (cN + 1);
+    final vertsPerCol = 18; // 顶面 6 + 两侧面 12
     return _TerrainGrid._(
         n, spacing, halfW, px, pz, dist, falloff, rnd, bassGate, midS, rnd11,
-        rnd77, spike);
+        rnd77, spike, alpha, cN,
+        Float64List(cn2), Float64List(cn2), Float64List(cn2),
+        Float64List(count), Float64List(count),
+        Int32List(count), Int32List(count), Int32List(count), <int>[],
+        Float32List(count * vertsPerCol * 2), Int32List(count * vertsPerCol));
+  }
+
+  /// 每帧填充粗噪声网格（三路 snoise，替代逐柱计算）。
+  void fillCoarseNoise(double t) {
+    var k = 0;
+    for (int jx = 0; jx <= cN; jx++) {
+      final wx = jx * 2 * spacing - n * spacing / 2;
+      for (int jz = 0; jz <= cN; jz++) {
+        final wz = jz * 2 * spacing - n * spacing / 2;
+        coarseA[k] = snoise2D(wx * 0.05 + t * 0.1, wz * 0.05 + t * 0.05);
+        coarseB[k] = snoise2D(wx * 0.1, wz * 0.1 - t * 0.2);
+        coarseC[k] = snoise2D(wx * 0.05 + t * 0.1, wz * 0.05);
+        k++;
+      }
+    }
   }
 }
 
@@ -382,10 +452,35 @@ class TerrainScenePainter extends CustomPainter {
         : 1.0 +
             math.pow((f.settings.amplitude - 50) / 50, 2).toDouble() * 14.0;
 
-    // 活跃 ripple 列表（避免每柱体扫 10 槽）。
-    final act = <VisRipple>[];
+    // 活跃 ripple 预计算（把每柱循环里重复的常量提出去；radius<0 的
+    // 尚未出生 ripple 在此过滤，柱循环零判断）。
+    final actX = Float64List(10);
+    final actZ = Float64List(10);
+    final actRadius = Float64List(10);
+    final actBand = Float64List(10); // 3*sqrt(width)
+    final actInvW = Float64List(10); // 1/width
+    final actFadeK = Float64List(10); // 1/fadeDist
+    final actElev = Float64List(10);
+    final actStrength = Float64List(10);
+    final actWhite = Uint8List(10);
+    var actN = 0;
     for (final r in f.ripples.slots) {
-      if (r.active && t - r.t0 < 5.0) act.add(r);
+      if (!r.active || t - r.t0 >= 5.0) continue;
+      final white = r.white;
+      final speed = white ? 20.0 : 15.0;
+      final radius = (t - r.t0) * speed;
+      if (radius < 0) continue;
+      final width = white ? 1.0 : 3.0;
+      actX[actN] = r.x;
+      actZ[actN] = r.z;
+      actRadius[actN] = radius;
+      actBand[actN] = 3 * math.sqrt(width);
+      actInvW[actN] = 1.0 / width;
+      actFadeK[actN] = 1.0 / (white ? 8.0 : 15.0);
+      actElev[actN] = white ? 1.0 : 4.0;
+      actStrength[actN] = r.strength;
+      actWhite[actN] = white ? 1 : 0;
+      actN++;
     }
 
     // 顶面颜色常量（不随柱体变化的中间量）。
@@ -398,41 +493,67 @@ class TerrainScenePainter extends CustomPainter {
     // 可见侧面（法线朝相机的两个正交面）由 fxSign/fzSign 决定；
     // sideGlow 顶缘强度 = normElev×1.5（uSharpness 取 0.35 的简化）。
 
-    // —— 第一遍：逐柱体算高度/颜色/深度 ——
+    // —— 第一遍：逐柱体算高度/颜色/深度（缓冲复用，零分配）——
     final n2 = grid.n * grid.n;
-    final depths = Float64List(n2);
-    final heights = Float64List(n2);
-    final topCols = Int32List(n2);
-    final sideTopCols = Int32List(n2);
-    final sideBotCols = Int32List(n2);
-    final order = <int>[];
+    final depths = grid.depths;
+    final heights = grid.heights;
+    final topCols = grid.topCols;
+    final sideTopCols = grid.sideTopCols;
+    final sideBotCols = grid.sideBotCols;
+    final order = grid.order;
+    order.clear();
+    // 粗噪声网格（3×(cN+1)² 次 snoise 替代 3×n² 次，双线性插值到柱）。
+    grid.fillCoarseNoise(t);
+    final cN = grid.cN;
+    final gCA = grid.coarseA;
+    final gCB = grid.coarseB;
+    final gCC = grid.coarseC;
 
     for (int i = 0; i < n2; i++) {
       final d = grid.dist[i];
-      // 距离雾 alpha（对齐 alphaFade=1-smoothstep(55,78,vDistance)）。
-      final alpha = 1.0 - glslSmoothstep(55, 78, d);
+      // 距离雾 alpha（静态预计算）。
+      final alpha = grid.alpha[i];
       if (alpha <= 0.015) continue;
 
       final wx = grid.px[i];
       final wz = grid.pz[i];
       final falloff = grid.falloff[i];
+      // 粗噪声双线性权重（x/z 奇偶固定 0/0.5 两档）。
+      final ix = i ~/ grid.n;
+      final iz = i - ix * grid.n;
+      final cx = ix >> 1;
+      final cz = iz >> 1;
+      final c00 = cx * (cN + 1) + cz;
+      final c10 = c00 + (cN + 1);
+      final fx = (ix & 1) * 0.5;
+      final fz = (iz & 1) * 0.5;
+      final w00 = (1 - fx) * (1 - fz);
+      final w10 = fx * (1 - fz);
+      final w01 = (1 - fx) * fz;
+      final w11 = fx * fz;
+      final noiseA =
+          gCA[c00] * w00 + gCA[c10] * w10 + gCA[c00 + 1] * w01 + gCA[c10 + 1] * w11;
+      final noiseB =
+          gCB[c00] * w00 + gCB[c10] * w10 + gCB[c00 + 1] * w01 + gCB[c10 + 1] * w11;
+      final noiseC =
+          gCC[c00] * w00 + gCC[c10] * w10 + gCC[c00 + 1] * w01 + gCC[c10 + 1] * w11;
+      // ix=n-1（奇）时 cx=(n-2)/2、c10 行=cx+1=cN ✓；iz=n-1 时 c00+1 列=cN ✓
+      // （节点网格 (cN+1)² 含网格外伪节点，插值始终在界内）。
 
       // ① idle 海面。
-      final baseNoise =
-          (snoise2D(wx * 0.05 + t * 0.1, wz * 0.05 + t * 0.05) + 1) * 0.5;
+      final baseNoise = (noiseA + 1) * 0.5;
       final wave = math.sin(wx * 0.15 + wz * 0.1 - t * 0.6) * 0.5 + 0.5;
       final idle = (baseNoise + (wave - baseNoise) * 0.45) * 0.8 * falloff;
 
       // ② 五频段分区抬升（受地形均衡器增益与总振幅控制）。
       var audio = subU * glslSmoothstep(25, 0, d) * 5.0 +
           bassU *
-              glslSmoothstep(
-                  35, 5, d + snoise2D(wx * 0.1, wz * 0.1 - t * 0.2) * 5) *
+              glslSmoothstep(35, 5, d + noiseB * 5) *
               grid.bassGate[i] *
               4.0 +
           a.lowMid *
               gLowMid *
-              (snoise2D(wx * 0.05 + t * 0.1, wz * 0.05) * 0.5 + 0.5) *
+              (noiseC * 0.5 + 0.5) *
               2.5 +
           a.mid *
               gMid *
@@ -446,30 +567,27 @@ class TerrainScenePainter extends CustomPainter {
       audio *= falloff * amp;
       audio = math.max(0.0, audio - 0.2); // 噪声门限
 
-      // ③ ripple 高斯环。
+      // ③ ripple 高斯环：dd² 区间判定环带（环带外零 sqrt），命中后
+      // 单次查表 exp（合并时间衰减）。
       double rippleElev = 0;
       double ripN = 0;
       double ripW = 0;
-      for (int k = 0; k < act.length; k++) {
-        final r = act[k];
-        final ddx = wx - r.x;
-        final ddz = wz - r.z;
-        final dd = math.sqrt(ddx * ddx + ddz * ddz);
-        final speed = r.white ? 20.0 : 15.0;
-        final width = r.white ? 1.0 : 3.0;
-        final fadeDist = r.white ? 8.0 : 15.0;
-        final elevScale = r.white ? 1.0 : 4.0;
-        final radius = (t - r.t0) * speed;
-        if (radius < 0) continue;
-        final ring = dd - radius;
-        if (ring > 3 * math.sqrt(width) || ring < -3 * math.sqrt(width)) {
-          continue;
-        }
+      for (int k = 0; k < actN; k++) {
+        final ddx = wx - actX[k];
+        final ddz = wz - actZ[k];
+        final dd2 = ddx * ddx + ddz * ddz;
+        final radius = actRadius[k];
+        final band = actBand[k];
+        final inner = radius - band;
+        final lo = inner > 0 ? inner * inner : 0.0;
+        final hi = (radius + band) * (radius + band);
+        if (dd2 < lo || dd2 > hi) continue;
+        final ring = math.sqrt(dd2) - radius;
         final pulse =
-            math.exp(-ring * ring / width) * math.exp(-radius / fadeDist) *
-                r.strength;
-        rippleElev += pulse * elevScale;
-        if (r.white) {
+            _fastExpNeg(ring * ring * actInvW[k] + radius * actFadeK[k]) *
+                actStrength[k];
+        rippleElev += pulse * actElev[k];
+        if (actWhite[k] == 1) {
           ripW += pulse;
         } else {
           ripN += pulse;
@@ -563,9 +681,8 @@ class TerrainScenePainter extends CustomPainter {
 
     // —— 第二遍：从远到近排序后一次 drawVertices ——
     order.sort((ia, ib) => depths[ib].compareTo(depths[ia]));
-    final vertsPerCol = 18; // 顶面 6 + 两侧面 12
-    final positions = Float32List(order.length * vertsPerCol * 2);
-    final colors = Int32List(order.length * vertsPerCol);
+    final positions = grid.posBuf;
+    final colors = grid.colBuf;
     var vi = 0;
     var ci = 0;
     final hw = grid.halfW;
@@ -1070,10 +1187,12 @@ class NebulaScenePainter extends CustomPainter {
   static final List<Offset> _bgStars = _makeStars();
 
   /// 双臂对数螺旋 + 中心核球聚集。
+  /// 粒子数 2400 → 1200：单击/节拍触发脉冲时每帧要遍历全部粒子做外推
+  /// 计算（cos/sin/exp），减半后无脉冲时开销显著下降，脉冲仍保持密度。
   static List<_NebulaParticle> _makeParticles() {
     final rnd = math.Random(20260421);
     final list = <_NebulaParticle>[];
-    for (int i = 0; i < 2400; i++) {
+    for (int i = 0; i < 1200; i++) {
       final isBulge = rnd.nextDouble() < 0.18; // 18% 核球
       final double r01;
       final double ang;
@@ -1216,6 +1335,15 @@ class NebulaScenePainter extends CustomPainter {
         ]).createShader(Rect.fromCircle(center: center, radius: maxR * 0.75)),
     );
 
+    // 预筛当前帧有效的脉冲环（寿命窗口内），粒子外推只遍历有效环，
+    // 避免每粒子 × 全部槽位的空转（单击/节拍触发后卡顿根因之一）。
+    final liveRipples = <(double, double)>[];
+    for (final rp in d.ripples.slots) {
+      if (!rp.active) continue;
+      final dt = t - rp.t0;
+      if (dt < 0 || dt > 3) continue;
+      liveRipples.add((dt * maxR * 0.85, rp.strength));
+    }
     // 粒子：差速旋转（内快外慢）+ 频段径向外扩 + 环 lift。
     final ptsDim = <Offset>[];
     final ptsMid = <Offset>[];
@@ -1229,11 +1357,7 @@ class NebulaScenePainter extends CustomPainter {
           (1.0 + band * 0.30 * (1.25 - p.r01));
       // 脉冲环对粒子的外推与提亮。
       double lift = 0;
-      for (final rp in d.ripples.slots) {
-        if (!rp.active) continue;
-        final dt = t - rp.t0;
-        if (dt < 0 || dt > 3) continue;
-        final ringR = dt * maxR * 0.85;
+      for (final (ringR, strength) in liveRipples) {
         final pr = p.r01 * maxR;
         final diff = (pr - ringR).abs();
         if (diff < maxR * 0.09) {
@@ -1242,8 +1366,8 @@ class NebulaScenePainter extends CustomPainter {
               lift,
               w *
                   math.exp(-ringR / (maxR * 0.5)) *
-                  rp.strength);
-          r += w * rp.strength * maxR * 0.03;
+                  strength);
+          r += w * strength * maxR * 0.03;
         }
       }
       final pos = Offset(

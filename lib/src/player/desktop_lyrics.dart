@@ -100,6 +100,36 @@ class DesktopLyricsBridge {
     });
   }
 
+  /// 播放层注册完回调后调用：从原生主动拉取冷启动期间暂存的动作并执行。
+  /// 冷启动场景原生 configureFlutterEngine 执行远早于本桥接的
+  /// setMethodCallHandler 安装，原生当时立即 invoke 的消息会静默丢失
+  /// （通道无 Dart 接收端，且 pending 已被清空）——原生侧已不再立即
+  /// 补发，改由这里在 handler 就绪后拉取，保证「浮窗 ⚙ 设置键 / 通知
+  /// 双击」在冷启动后一次命中，不用再点第二次。
+  static Future<void> ensureReady() async {
+    if (!Platform.isAndroid) return;
+    _ensureHandler();
+    try {
+      final action = await _channel.invokeMethod<String>(
+        'getPendingDesktopLyricsAction',
+      );
+      if (action == null || action.isEmpty) return;
+      // 拉取时播放层回调必然已注册（ensureReady 在注册之后才调用），
+      // 直接延后到首帧执行，避免 GoRouter 尚未挂载时 push 失败。
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (action == 'onOpenSettings') {
+          onOpenSettings?.call();
+        } else if (action == 'onOpenRequested') {
+          onOpenRequested?.call();
+        }
+      });
+    } on PlatformException {
+      // 冷启动瞬间原生 handler 尚未就绪时忽略（下一次 ensureReady 重试）。
+    } on MissingPluginException {
+      // 非 Android 构建没有对应原生实现。
+    }
+  }
+
   static bool? _lastEnabled;
   static String? _lastContentSignature;
   static bool? _lastIsPlayingSent;

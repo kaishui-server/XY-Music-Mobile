@@ -3816,8 +3816,116 @@ pub fn semantic_line_to_lyric_line(line: &SemanticLine) -> LyricLinePayload {
     }
 }
 
+// =========================================================================
+// 哨兵分轨（Dart 提取层 → Rust 合并层契约）
+// =========================================================================
+
+/// BakaMusic 系插件（QQ/酷狗等）在逐字主词与明文 LRC 翻译无法进入同一解析
+/// 候选时，由 Dart 提取层用以下注释行把 主词/翻译/罗马音 三轨拼接后整体
+/// 下发（见 plugin_runtime.dart 的 _kTrackTranslationSentinel 等）。
+/// 逐字候选（KRC/QRC/YRC）胜出后会把不含词级时间的翻译候选整段丢弃，
+/// 因此翻译必须在候选竞争之外、按时间戳合并回主轨行。
+const TRACK_TRANSLATION_SENTINEL: &str = "<!--xym:track:translation-->";
+const TRACK_ROMANIZATION_SENTINEL: &str = "<!--xym:track:romanization-->";
+/// 辅助轨时间戳与主轨行 start_ms 的最大对齐偏差（毫秒）。
+const AUX_TRACK_MERGE_TOLERANCE_MS: i64 = 600;
+
+struct SplitSentinelTracks {
+    main: String,
+    translation: Option<String>,
+    romanization: Option<String>,
+}
+
+/// 按独立哨兵行把原始文本拆成 主词/翻译/罗马音 三段；无哨兵时原样返回。
+fn split_sentinel_tracks(raw: &str) -> SplitSentinelTracks {
+    let mut main = String::with_capacity(raw.len());
+    let mut translation = String::new();
+    let mut romanization = String::new();
+    let mut found = false;
+    {
+        let mut target = &mut main;
+        for line in raw.lines() {
+            let trimmed = line.trim();
+            if trimmed == TRACK_TRANSLATION_SENTINEL {
+                target = &mut translation;
+                found = true;
+                continue;
+            }
+            if trimmed == TRACK_ROMANIZATION_SENTINEL {
+                target = &mut romanization;
+                found = true;
+                continue;
+            }
+            target.push_str(line);
+            target.push('\n');
+        }
+    }
+    if !found {
+        return SplitSentinelTracks {
+            main: raw.to_string(),
+            translation: None,
+            romanization: None,
+        };
+    }
+    SplitSentinelTracks {
+        main,
+        translation: Some(translation),
+        romanization: Some(romanization),
+    }
+}
+
+/// 把辅助轨（普通 LRC）行按时间戳合并进主轨行：对每条辅助行找 start_ms
+/// 偏差最小且在容差内的主轨行。主轨行已有内容（QRC XML 原生翻译等）时
+/// 不覆盖，仅对重复文本去重后追加。
+fn merge_auxiliary_track(
+    main_lines: &mut [ParsedLine],
+    aux_lines: &[ParsedLine],
+    translation: bool,
+) {
+    for aux in aux_lines {
+        let text = aux.text.trim();
+        if text.is_empty() {
+            continue;
+        }
+        let Some(best) = main_lines
+            .iter_mut()
+            .filter(|line| {
+                (line.start_ms as i64 - aux.start_ms as i64).abs() <= AUX_TRACK_MERGE_TOLERANCE_MS
+            })
+            .min_by_key(|line| (line.start_ms as i64 - aux.start_ms as i64).abs())
+        else {
+            continue;
+        };
+        let slot = if translation {
+            &mut best.translated_text
+        } else {
+            &mut best.roman_text
+        };
+        match slot {
+            Some(existing) if !existing.trim().is_empty() => {
+                if !existing.contains(text) {
+                    existing.push(' ');
+                    existing.push_str(text);
+                }
+            }
+            _ => *slot = Some(text.to_string()),
+        }
+    }
+}
+
 pub fn build_structured_lyrics_payload(raw_lyrics: String) -> StructuredLyricsPayload {
-    let parsed_lines = parse_raw_lyrics(&raw_lyrics);
+    let tracks = split_sentinel_tracks(&raw_lyrics);
+    let mut parsed_lines = parse_raw_lyrics(&tracks.main);
+    if let Some(aux) = tracks.translation.as_deref().filter(|t| !t.trim().is_empty()) {
+        merge_auxiliary_track(&mut parsed_lines, &parse_manual_lrc_like(aux), true);
+    }
+    if let Some(aux) = tracks
+        .romanization
+        .as_deref()
+        .filter(|t| !t.trim().is_empty())
+    {
+        merge_auxiliary_track(&mut parsed_lines, &parse_manual_lrc_like(aux), false);
+    }
     let document = build_lyric_document(&parsed_lines);
     let semantic_lines = document
         .as_ref()
@@ -3840,7 +3948,7 @@ pub fn build_structured_lyrics_payload(raw_lyrics: String) -> StructuredLyricsPa
 mod tests {
     use super::{
         build_structured_lyrics_payload, parse_raw_lyrics, score_romanized_latin_text,
-        ParsedLineSourceFormat,
+        ParsedLineSourceFormat, TRACK_TRANSLATION_SENTINEL,
     };
 
     /// 端到端：泡沫（QQ QRC）样本经 Dart convertLxLyricToEnhancedLrc 落盘的
@@ -3891,6 +3999,62 @@ mod tests {
             word_timed, total,
             "应所有行都有词级时间，实际 {word_timed}/{total}"
         );
+    }
+
+    /// 哨兵分轨：逐字主词（洛雪 `<mm:ss.mmm>` 风格）+ 哨兵分隔的明文 LRC
+    /// 翻译。此前逐字候选胜出后，不含词级时间的翻译候选被整段丢弃，
+    /// 表现为酷狗/QQ 源翻译全部消失。
+    #[test]
+    fn merges_sentinel_translation_track_into_word_timed_lines() {
+        let raw = [
+            "<00:01.000>I'm <00:01.500>in <00:02.000>love",
+            "<00:03.000>with <00:03.500>the <00:04.000>shape",
+            TRACK_TRANSLATION_SENTINEL,
+            "[00:01.00]我爱上了你妙曼的姿态",
+            "[00:03.00]我爱上了你的轮廓",
+        ]
+        .join("\n");
+        let payload = build_structured_lyrics_payload(raw);
+        assert_eq!(payload.display_lines.len(), 2, "应解析出 2 条主轨行");
+        assert_eq!(
+            payload.display_lines[0].translation.as_str(),
+            "我爱上了你妙曼的姿态"
+        );
+        assert_eq!(
+            payload.display_lines[1].translation.as_str(),
+            "我爱上了你的轮廓"
+        );
+        // 主轨逐字时间不受影响
+        assert!(
+            payload.display_lines[0]
+                .words
+                .as_ref()
+                .is_some_and(|w| !w.is_empty()),
+            "主轨应保留词级时间"
+        );
+    }
+
+    /// 真实复现载荷：酷狗《Shape of You》KRC 逐字主词 + 哨兵 + 明文 LRC
+    /// 翻译（由 test/baka_translation_e2e_test.dart 落盘）。样本不存在时跳过。
+    #[test]
+    fn merges_sentinel_translation_track_kg_shape_of_you() {
+        let Ok(raw) = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/data/kg_shape_of_you_lyrics_raw.txt"
+        )) else {
+            println!("tests/data/kg_shape_of_you_lyrics_raw.txt 不存在，跳过");
+            return;
+        };
+        let payload = build_structured_lyrics_payload(raw);
+        let total = payload.display_lines.len();
+        let with_translation = payload
+            .display_lines
+            .iter()
+            .filter(|l| !l.translation.is_empty())
+            .count();
+        println!("kg payload: total={total}, with_translation={with_translation}");
+        assert!(total > 50, "主轨行数过少: {total}");
+        assert!(with_translation > 0, "哨兵翻译轨未合并进任何主轨行");
     }
 
     /// QQ 音乐 QRC 容器 XML（`<QrcInfos>…<Lyric_1 LyricContent="…"/>`）此前

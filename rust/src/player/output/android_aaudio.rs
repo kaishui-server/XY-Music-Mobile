@@ -63,7 +63,7 @@ extern "C" {
     fn animefx_reset(ep: *mut core::ffi::c_void);
 }
 
-struct AnimeFxEngine {
+pub(crate) struct AnimeFxEngine {
     handle: *mut core::ffi::c_void,
     sample_rate: u32,
     /// 管线声道数（1/2，与 create 时传给引擎的一致）。
@@ -81,7 +81,7 @@ struct AnimeFxEngine {
 unsafe impl Send for AnimeFxEngine {}
 
 impl AnimeFxEngine {
-    fn new(sample_rate: u32, channels: u16) -> Self {
+    pub(crate) fn new(sample_rate: u32, channels: u16) -> Self {
         let handle = unsafe {
             animefx_create(sample_rate as std::os::raw::c_int, channels as std::os::raw::c_int)
         };
@@ -98,7 +98,7 @@ impl AnimeFxEngine {
 
     /// 更新音效参数。params 为 None/空 = 停用（淡出后直通）；Some = 启用
     /// （12ms 淡入）。
-    fn set_params_json(&mut self, params: Option<&str>) {
+    pub(crate) fn set_params_json(&mut self, params: Option<&str>) {
         match params.map(str::trim).filter(|p| !p.is_empty()) {
             Some(json) => {
                 if self.handle.is_null() {
@@ -121,14 +121,14 @@ impl AnimeFxEngine {
         }
     }
 
-    fn reset(&mut self) {
+    pub(crate) fn reset(&mut self) {
         if !self.handle.is_null() {
             unsafe { animefx_reset(self.handle) };
         }
     }
 
     /// 过引擎处理一块 f32 交错样本。未激活且无淡出余量时零开销直通。
-    fn process_block(&mut self, block: Vec<f32>) -> Vec<f32> {
+    pub(crate) fn process_block(&mut self, block: Vec<f32>) -> Vec<f32> {
         if !self.active && self.fade_out_frames_left == 0 {
             return block;
         }
@@ -169,6 +169,7 @@ impl Drop for AnimeFxEngine {
 }
 
 /// 流缓存 Reader 的 MediaSource 适配：`Box<dyn ReadSeek>` 不自动实现
+/// （供 android_opensl.rs 复用其 open 逻辑，自身无需额外导出）
 /// Read/Seek 超 trait，用具体 newtype 转发以满足 symphonia 的
 /// `MediaSource` blanket impl。`total_shared` 为共享总长槽位（0 = 未知）：
 /// symphonia FLAC/MP3 demuxer 的 seek 依赖 `byte_len()` 提供二分上界。
@@ -392,7 +393,7 @@ impl AAudioLib {
 // =========================================================================
 
 #[derive(Clone, Copy, PartialEq)]
-enum DeviceFormat {
+pub(crate) enum DeviceFormat {
     Float32,
     Int16,
 }
@@ -414,7 +415,7 @@ impl DeviceFormat {
 }
 
 /// f32 → 设备格式字节（小端 LE）。
-fn push_sample_bytes(buf: &mut Vec<u8>, sample: f32, fmt: DeviceFormat) {
+pub(crate) fn push_sample_bytes(buf: &mut Vec<u8>, sample: f32, fmt: DeviceFormat) {
     let clamped = sample.clamp(-1.0, 1.0);
     match fmt {
         DeviceFormat::Float32 => {
@@ -431,13 +432,13 @@ fn push_sample_bytes(buf: &mut Vec<u8>, sample: f32, fmt: DeviceFormat) {
 // Symphonia 解码器（BlockProducer）
 // =========================================================================
 
-struct SymphoniaDecoder {
+pub(crate) struct SymphoniaDecoder {
     format_reader: Box<dyn symphonia::core::formats::FormatReader>,
     decoder: Box<dyn symphonia::core::codecs::Decoder>,
     track_id: u32,
-    sample_rate: u32,
-    channels: u16,
-    total_duration: Option<Duration>,
+    pub(crate) sample_rate: u32,
+    pub(crate) channels: u16,
+    pub(crate) total_duration: Option<Duration>,
     sample_buf: Option<symphonia::core::audio::SampleBuffer<f32>>,
     sample_buf_frames: usize,
     leftover: Vec<f32>,
@@ -447,7 +448,7 @@ struct SymphoniaDecoder {
 impl SymphoniaDecoder {
     /// `stream_reader`：预构建的流缓存 Reader（在线直读）。Some 时
     /// 跳过本地文件构造，`path` 仅用于扩展名探测提示（应为直链 URL）。
-    fn open(
+    pub(crate) fn open(
         path: &str,
         stream_reader: Option<
             Box<dyn crate::player::stream_cache::ReadSeek + Send + Sync>,
@@ -647,16 +648,16 @@ impl BlockProducer for SymphoniaDecoder {
 // 进度跟踪
 // =========================================================================
 
-struct ExclusiveProgress {
-    samples_played: AtomicU64,
-    sample_rate: AtomicU32,
-    channels: AtomicU32,
+pub(crate) struct ExclusiveProgress {
+    pub(crate) samples_played: AtomicU64,
+    pub(crate) sample_rate: AtomicU32,
+    pub(crate) channels: AtomicU32,
     /// 源总时长（毫秒），供 Flutter 侧在 DSP 管线播放时更新进度条。
-    duration_ms: AtomicU64,
+    pub(crate) duration_ms: AtomicU64,
 }
 
 impl ExclusiveProgress {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             samples_played: AtomicU64::new(0),
             sample_rate: AtomicU32::new(0),
@@ -670,7 +671,7 @@ impl ExclusiveProgress {
 // 运行时命令
 // =========================================================================
 
-enum ExclusiveCommand {
+pub(crate) enum ExclusiveCommand {
     Seek { time_secs: f64, is_playing: bool },
     Stop,
     Pause,
@@ -964,13 +965,19 @@ fn run_exclusive_playback(
     running: Arc<AtomicBool>,
     last_error: Arc<Mutex<Option<String>>>,
 ) {
-    // 1. 加载 AAudio 库
+    // 1. 加载 AAudio 库；失败（API<26 无 libaaudio.so 等）自动降级到
+    // OpenSL ES 后端（API 21+），保证 DSP 共享管线在低版本设备同样出声。
     let lib = match AAudioLib::load() {
         Some(l) => l,
         None => {
-            let _ = init_tx.send(Err(
-                "无法加载 libaaudio.so（需要 Android API 26+）".to_string()
-            ));
+            super::android_opensl::run_opensl_exclusive_playback(
+                request,
+                cmd_rx,
+                init_tx,
+                progress,
+                running,
+                last_error,
+            );
             return;
         }
     };
@@ -1438,7 +1445,7 @@ fn map_channels(samples: &[f32], from: u16, to: u16) -> Vec<f32> {
 /// 常见为 48000）。本管线按源采样率产出样本，若直接写入会整体变速走调；
 /// 用 `in_rate / out_rate` 的帧步进做线性插值，把样本转换到流采样率域。
 /// 线性插值与管线内变调处理器一致，不引入额外依赖。
-struct LinearResampler {
+pub(crate) struct LinearResampler {
     channels: usize,
     /// 每个输出帧在输入域推进的帧数 = in_rate / out_rate。
     step: f64,
@@ -1449,7 +1456,7 @@ struct LinearResampler {
 }
 
 impl LinearResampler {
-    fn new(channels: usize, step: f64) -> Self {
+    pub(crate) fn new(channels: usize, step: f64) -> Self {
         Self {
             channels: channels.max(1),
             step: step.max(1e-6),
@@ -1459,7 +1466,7 @@ impl LinearResampler {
     }
 
     /// 追加一块输入并产出尽可能多的输出帧；不足两帧的尾巴留到下一块。
-    fn process(&mut self, input: &[f32]) -> Vec<f32> {
+    pub(crate) fn process(&mut self, input: &[f32]) -> Vec<f32> {
         let ch = self.channels;
         self.buf.extend_from_slice(input);
         let frames = self.buf.len() / ch;

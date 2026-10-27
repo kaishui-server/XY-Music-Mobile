@@ -113,7 +113,11 @@ class _BatchActionSheet extends ConsumerStatefulWidget {
 }
 
 class _BatchActionSheetState extends ConsumerState<_BatchActionSheet> {
-  late final Set<String> _selected;
+  /// 选中集合按「列表下标」记录。此前按 song.path 记录：在线歌曲（云端
+  /// 歌单/搜索结果）path 为空或重复，670 首会被并成 1 个键——表现为
+  /// 「已选 1/670」且所有行都显示勾选、底部按钮只有“收藏(1 首)”。
+  /// 面板生命周期内歌曲列表不可变，下标即稳定身份。
+  late final Set<int> _selected;
 
   // 下载：音质档位。
   late String _quality;
@@ -127,14 +131,16 @@ class _BatchActionSheetState extends ConsumerState<_BatchActionSheet> {
   void initState() {
     super.initState();
     // 进入批量面板默认全选，用户再按需取消。
-    _selected = {for (final song in widget.songs) song.path};
+    _selected = {
+      for (var i = 0; i < widget.songs.length; i++) i,
+    };
     _quality =
         ref.read(settingsProvider).valueOrNull?.downloadQuality ?? '320k';
   }
 
-  void _toggle(Song song) {
+  void _toggle(int index) {
     setState(() {
-      if (!_selected.add(song.path)) _selected.remove(song.path);
+      if (!_selected.add(index)) _selected.remove(index);
     });
   }
 
@@ -148,14 +154,14 @@ class _BatchActionSheetState extends ConsumerState<_BatchActionSheet> {
       } else {
         _selected
           ..clear()
-          ..addAll(widget.songs.map((song) => song.path));
+          ..addAll({for (var i = 0; i < widget.songs.length; i++) i});
       }
     });
   }
 
   List<Song> get _selectedSongs => [
-    for (final song in widget.songs)
-      if (_selected.contains(song.path)) song,
+    for (var i = 0; i < widget.songs.length; i++)
+      if (_selected.contains(i)) widget.songs[i],
   ];
 
   String get _title => switch (widget.kind) {
@@ -431,12 +437,12 @@ class _BatchActionSheetState extends ConsumerState<_BatchActionSheet> {
       itemCount: widget.songs.length,
       itemBuilder: (context, index) {
         final song = widget.songs[index];
-        final checked = _selected.contains(song.path);
+        final checked = _selected.contains(index);
         final subtitle = [song.artist, song.album]
             .where((part) => part.trim().isNotEmpty)
             .join(' · ');
         return InkWell(
-          onTap: () => _toggle(song),
+          onTap: () => _toggle(index),
           child: Padding(
             padding: const EdgeInsets.fromLTRB(16, 6, 8, 6),
             child: Row(
@@ -477,7 +483,7 @@ class _BatchActionSheetState extends ConsumerState<_BatchActionSheet> {
                 const SizedBox(width: 8),
                 Checkbox(
                   value: checked,
-                  onChanged: (_) => _toggle(song),
+                  onChanged: (_) => _toggle(index),
                   visualDensity: VisualDensity.compact,
                 ),
               ],

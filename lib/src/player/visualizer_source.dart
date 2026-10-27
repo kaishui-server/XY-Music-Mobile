@@ -245,6 +245,11 @@ class VisualizerSource {
   /// [ratePerSecond]：对齐 sonic-topography 的响应速率
   /// responseRate = lerp(2.2, 60, motionSpeed/100)——统一指数趋近，
   /// 不区分 attack/release；为空时走默认 30ms/180ms 攻丝释放。
+  ///
+  /// 数据过期（播放停止后检测链路停推 FFT/波形）超过 250ms 时目标频段
+  /// 视为 0——否则 target 冻结在最后值，地形方块永久悬停不回落；下降
+  /// 走不低于 0.10s 时间常数的快速回落（motionRate 低速时统一趋近回落
+  /// 过慢，用户反馈「音乐停止时方块不能及时恢复」）。
   List<double> stepSmoothed(double dt, {double? ratePerSecond}) {
     final double attack;
     final double release;
@@ -254,10 +259,19 @@ class VisualizerSource {
       attack = 1.0 - math.exp(-dt / 0.03);
       release = 1.0 - math.exp(-dt / 0.18);
     }
+    final stale =
+        DateTime.now().difference(_lastDataAt).inMilliseconds > 250;
+    final fall = 1.0 - math.exp(-dt / 0.10);
+    if (stale) {
+      // 停止/停推：频段与响度都归零（rms 冻结高位会拖住地平线辉光与流星判定）。
+      rms = 0;
+      _lastWaveRms = 0;
+    }
     for (int i = 0; i < kVisBandCount; i++) {
-      final target = _targetBands[i];
+      final target = stale ? 0.0 : _targetBands[i];
       final cur = _smoothedBands[i];
-      _smoothedBands[i] = cur + (target - cur) * (target > cur ? attack : release);
+      final k = target > cur ? attack : math.max(release, fall);
+      _smoothedBands[i] = cur + (target - cur) * k;
     }
     return _smoothedBands;
   }

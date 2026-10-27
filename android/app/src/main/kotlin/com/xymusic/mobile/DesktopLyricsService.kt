@@ -1,8 +1,14 @@
 package com.xymusic.mobile
 
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
 import android.app.Service
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.PixelFormat
@@ -11,7 +17,9 @@ import android.graphics.drawable.GradientDrawable
 import android.graphics.drawable.ColorDrawable
 import android.media.AudioManager
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.os.SystemClock
 import android.os.VibrationEffect
 import android.os.Vibrator
@@ -66,6 +74,13 @@ class DesktopLyricsService : Service() {
         const val ACTION_SHOW = "com.xymusic.mobile.desktop_lyrics.SHOW"
         const val ACTION_UPDATE = "com.xymusic.mobile.desktop_lyrics.UPDATE"
         const val ACTION_STOP = "com.xymusic.mobile.desktop_lyrics.STOP"
+
+        /** 控制通知单击（锁定态）触发的解锁广播。锁定时窗口完全穿透、
+         * 无任何触摸交互，解锁只能走通知栏或设置页开关。 */
+        const val ACTION_UNLOCK = "com.xymusic.mobile.desktop_lyrics.UNLOCK"
+
+        private const val NOTIFY_CHANNEL = "desktop_lyrics_control"
+        private const val NOTIFY_ID = 0x5101
 
         /** 与 Dart 侧 LyricWordEffectMode 枚举序号保持一致。 */
         const val EFFECT_WORD_BY_WORD = 0
@@ -135,12 +150,19 @@ class DesktopLyricsService : Service() {
     /** 已应用到浮窗的纵向位置（百分制）：0 = 顶端、50 = 居中、100 = 底端。
      * 作为位置唯一真源，浮窗高度/整屏高度变化后都据此重算，不会漂移。 */
     private var appliedPercent = DEFAULT_PERCENT
+    /** 百分制真源是否被改动、需要按 [appliedPercent] 重算浮窗 y。
+     * 只有「百分制值真的变了」才置位（设置页滑块/补偿回写）；浮窗高度
+     * 变化（操作栏显隐、歌词行数增减）导致的纯布局变化**不**重算位置，
+     * 否则手动拖拽后的位置会被旧百分制换算拉走（拖后自动位移）。 */
+    private var positionDirty = false
     /** 已应用的自定义字体路径（空 = 系统默认），避免重复创建 Typeface。 */
     private var appliedFontPath: String? = null
 
     // ---- 锁定与字号（操作栏 ↔ Dart 设置双向同步） ----
-    /** 浮窗侧锁定状态：锁定 = 禁止拖动并隐藏操作栏，窗口收窄为歌词内容
-     * 宽度（窗口框之外触摸穿透到桌面），长按歌词 600ms 唤出快捷键栏。 */
+    /** 浮窗侧锁定状态：锁定 = 禁止拖动（拖拽失效），双击歌词仍唤出控制
+     * 栏但仅显示锁定键（其余按键隐藏，单击锁定键解锁并恢复完整 8 键）；
+     * 窗口收窄为歌词内容宽度（框外触摸穿透到桌面），控制栏显示期间窗口
+     * 消费全部触摸（穿透失效）。长按仅为拖拽手势，无编辑行为。 */
     private var localLocked = false
     /** 浮窗侧字号（sp）：操作栏 A-/A+ 即时应用，随后回传 Dart 持久化。 */
     private var localFontSize = 24f
@@ -164,21 +186,90 @@ class DesktopLyricsService : Service() {
     private var playKey: ImageView? = null
     private var lastPlayingIcon = true
 
-    /** 操作栏与分隔线：默认隐藏，单击歌词行切换显隐。 */
+    /** 操作栏与分隔线：默认隐藏，双击歌词行唤出，2.5s 无操作自动隐藏。 */
     private var dividerRow: View? = null
     private var barVisible = false
 
-    /// 按当前状态应用操作栏/分隔线可见性：未呼出时隐藏。锁定态由
-    /// setLocked 强制收栏；锁定时长按歌词重新唤出（快捷键栏含解锁键）。
+    /** 锁定态控制栏仅保留解锁键：锁定后其余按键消失（barKeys 逐个 GONE），
+     * 仅 lockKey 可见作为解锁入口；双击歌词只唤起操作栏（不解锁），
+     * 解锁须点击锁定图标（lockKey）。 */
+    private val barKeys = mutableListOf<View>()
+    private var lockKey: ImageView? = null
+
+    /** 控制栏自动隐藏计时：唤出后无交互 2.5s 自动收起（与图片交互规则
+     * “控制栏 2~3 秒自动隐藏”一致）；任何交互（按钮点击/双击/拖动结束）
+     * 重置计时。锁定态同样参与自动隐藏（仅锁定键常驻到 2.5s 超时）。 */
+    private val controlBarAutoHideMs = 2500L
+    private val controlBarHideRunnable = Runnable { hideControlBar() }
+    private val mainHandler = Handler(Looper.getMainLooper())
+
+    /** 双击检测：正常态双击唤出控制栏；控制栏已显示时双击重置自动隐藏
+     * 计时；锁定态双击只唤起操作栏（仅锁定键），解锁须点击锁定图标。
+     * 单击（快速抬起、位移在 slop 内）仅作为双击的前半拍，不响应歌词
+     * 本身（近似点击穿透）。 */
+    private var lastTapTime = 0L
+    private var lastTapX = 0f
+    private var lastTapY = 0f
+
+    // ---- 触摸代理窗（千问式真穿透架构） ----
+    /** 主窗栏隐藏时挂 FLAG_NOT_TOUCHABLE 完全穿透（单击直达下层应用），
+     * 双击/长按唤栏由本代理窗承载：透明 View、尺寸与位置跟随主窗内容
+     * 矩形、恒可触摸。控制栏显示期间代理窗隐藏、主窗恢复可触摸（按钮
+     * 可点、拖拽可用）。 */
+    private var proxyView: View? = null
+    private var proxyParams: WindowManager.LayoutParams? = null
+    private var proxyLastTapTime = 0L
+    private var proxyLastTapX = 0f
+    private var proxyLastTapY = 0f
+    private var proxyDownX = 0f
+    private var proxyDownY = 0f
+    /** 拖拽起始时主窗位置（x 中心偏移 / y 绝对 px），MOVE 按原始差值重算。 */
+    private var proxyStartMainX = 0
+    private var proxyStartMainY = 0
+    private var proxyTouchSlop = 0
+    /** 代理窗长按唤栏计时：DOWN 起 550ms 位移未超 slop 判定长按。 */
+    private val proxyLongPressRunnable = Runnable { showControlBar() }
+
+    /// 按当前状态应用操作栏/分隔线可见性：
+    /// - 锁定态：控制栏可见但仅保留锁定键，其余按键消失；
+    /// - 未锁定：按 barVisible 控制整栏/分隔线显隐，恢复全部按键。
+    /// 联动：主窗触摸 flags（栏隐藏=完全穿透）与触摸代理窗同步。
     private fun applyBarVisibility() {
-        controlBar?.visibility = if (barVisible) View.VISIBLE else View.GONE
-        dividerRow?.visibility = if (barVisible) View.VISIBLE else View.GONE
+        if (localLocked) {
+            controlBar?.visibility = if (barVisible) View.VISIBLE else View.GONE
+            dividerRow?.visibility = if (barVisible) View.VISIBLE else View.GONE
+            barKeys.forEach { it.visibility = View.GONE }
+            lockKey?.visibility = if (barVisible) View.VISIBLE else View.GONE
+        } else {
+            controlBar?.visibility = if (barVisible) View.VISIBLE else View.GONE
+            dividerRow?.visibility = if (barVisible) View.VISIBLE else View.GONE
+            barKeys.forEach { it.visibility = View.VISIBLE }
+            lockKey?.visibility = View.VISIBLE
+        }
+        applyWindowFlags()
+        syncProxyPanel()
     }
 
-    /// 单击歌词行：切换操作栏呼出/收起。
-    private fun toggleControlBar() {
-        barVisible = !barVisible
+    /// 唤出控制栏（正常态/锁定态双击触发）：置可见并启动 2.5s 自动隐藏计时。
+    private fun showControlBar() {
+        barVisible = true
         applyBarVisibility()
+        resetControlBarAutoHide()
+    }
+
+    /// 收起控制栏（自动隐藏超时/服务销毁触发）：隐藏并取消计时。
+    private fun hideControlBar() {
+        barVisible = false
+        applyBarVisibility()
+        mainHandler.removeCallbacks(controlBarHideRunnable)
+    }
+
+    /// 重置自动隐藏计时：控制栏显示期间任何交互（按钮点击、双击歌词、
+    /// 拖动结束）重新从 2.5s 开始倒数，保证操作不被中途打断。
+    /// 锁定态同样启动计时：锁定后操作栏（仅锁定键）2.5s 无操作自动收起。
+    private fun resetControlBarAutoHide() {
+        mainHandler.removeCallbacks(controlBarHideRunnable)
+        mainHandler.postDelayed(controlBarHideRunnable, controlBarAutoHideMs)
     }
 
     /** 歌词内容层（承载背景色/圆角）。外层 root 只做容器，设在外层会被
@@ -243,10 +334,17 @@ class DesktopLyricsService : Service() {
                     return START_NOT_STICKY
                 }
                 ensurePanel()
+                ensureUnlockReceiver()
+                refreshNotify()
                 intent?.let { applyUpdate(paramsFromIntent(it)) }
             }
         }
-        return START_STICKY
+        // START_NOT_STICKY：进程被系统回收后不自动重启服务。START_STICKY
+        // 会在内存压力回收进程后用 null intent 重建服务并立即创建浮窗，
+        // 导致用户明明没操作（或开着「软件内不显示桌面歌词」）浮窗却
+        // 莫名冒出来。桌面歌词的显示完全由 Dart 的 setEnabled 驱动，
+        // 用户回到 App 后播放层会重新同步并主动拉起服务。
+        return START_NOT_STICKY
     }
 
     private fun canDrawOverlays(): Boolean =
@@ -340,6 +438,16 @@ class DesktopLyricsService : Service() {
             content.getChildAt(3) as? LinearLayout
         // 分隔线随操作栏一起显隐（包一层行容器控制 visibility 更稳）。
         dividerRow = content.getChildAt(2)
+        // 登记控制栏按键：锁定态仅保留锁定键（tag=lockKey），其余按键
+        // 逐个 GONE 消失（见 applyBarVisibility），解锁后恢复。
+        barKeys.clear()
+        lockKey = null
+        controlBar?.let { bar ->
+            for (i in 0 until bar.childCount) {
+                val v = bar.getChildAt(i)
+                if (v.tag == "lockKey") lockKey = v as? ImageView else barKeys.add(v)
+            }
+        }
         applyBarVisibility()
         panelContent = content
         panel = content
@@ -389,21 +497,23 @@ class DesktopLyricsService : Service() {
                     startX = params.x
                     startY = baseY
                     if (localLocked) {
-                        // 锁定态完全穿透：FLAG_NOT_TOUCHABLE 已让窗口脱离触摸命中，
-                        // 正常收不到事件；此处防御性不消费，确保点击/滑动事件流整体
-                        // 归属下层窗口，不启动任何计时、不唤栏。
-                        return@setOnTouchListener false
+                        // 锁定态：不进入拖动（拖拽失效）。本监听仅在控制栏
+                        // 显示期间收到事件（栏隐藏时主窗 FLAG_NOT_TOUCHABLE
+                        // 完全穿透，触摸由代理窗承载）。
                     } else {
                         // 进入拖动：期间忽略按百分制重算位置，保证拖动连续不吸附。
                         dragging = true
+                        // 拖动期间重置自动隐藏计时：拖拽调整位置耗时长于 2.5s
+                        // 时控制栏不能中途消失（栏消失主窗即穿透、拖拽中断）。
+                        if (barVisible) resetControlBarAutoHide()
                     }
                     true
                 }
                 MotionEvent.ACTION_MOVE -> {
                     if (localLocked) {
-                        // 锁定态完全穿透：事件流归属下层，本窗口收不到 MOVE，
-                        // 防御性放行。
-                        return@setOnTouchListener false
+                        // 锁定态拖拽失效：消费事件但不移动窗口位置，
+                        // 单击/双击判定仍可正常完成（双击解锁用）。
+                        return@setOnTouchListener true
                     }
                     params.x = startX + (event.rawX - downX).toInt()
                     // 拖动直接写浮窗位置；拖动结束后再换算回百分制回传。
@@ -419,16 +529,45 @@ class DesktopLyricsService : Service() {
                     true
                 }
                 MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
-                    if (localLocked) {
-                        // 锁定态完全穿透：事件归属下层，本窗口收不到 UP/CANCEL，
-                        // 防御性放行。
-                        return@setOnTouchListener false
-                    }
-                    // 单击（位移在 slop 内）切换操作栏显隐；拖动结束照旧存位置。
+                    // 交互规则（用户澄清）：
+                    // - 单击：不响应歌词本身（近似点击穿透），仅记录为双击前半拍；
+                    // - 双击：正常态/锁定态都只唤起控制栏（锁定态仅显示锁定键），
+                    //   不解锁；解锁必须点击锁定图标；控制栏已显示时双击重置
+                    //   自动隐藏计时；
+                    // - 拖动：正常态拖拽浮窗，锁定态拖拽失效（不移动位置）；
+                    //   拖动结束若控制栏已显示则重置自动隐藏计时。
+                    // - 控制栏显示期间窗口消费全部触摸：点按钮不会漏到下层应用。
+                    val now = SystemClock.uptimeMillis()
+                    val tapDist = abs(event.rawX - lastTapX) + abs(event.rawY - lastTapY)
                     val moved = abs(event.rawX - downX) > touchSlop ||
                         abs(event.rawY - downY) > touchSlop
-                    if (!moved && event.actionMasked == MotionEvent.ACTION_UP) {
-                        toggleControlBar()
+                    // 双击判定放宽：时间窗 300→400ms、位移容差 slop*2→slop*3，
+                    // 且本击轻微移动（moved）不再吞掉双击——抖动/小幅滑动照常判双击。
+                    val doubleTap = event.actionMasked == MotionEvent.ACTION_UP &&
+                        now - lastTapTime < 400L && tapDist < touchSlop * 3
+                    if (doubleTap) {
+                        // 双击：锁定态只唤起操作栏（仅锁定键），不解锁——
+                        // 解锁必须点击锁定图标；正常态唤栏，显示态重置自动隐藏计时。
+                        lastTapTime = 0L
+                        if (localLocked) {
+                            showControlBar()
+                        } else if (barVisible) {
+                            resetControlBarAutoHide()
+                        } else {
+                            showControlBar()
+                        }
+                    } else {
+                        // 单击/拖动统一处理：记录本击（含轻微移动）作为下次双击
+                        // 前半拍，明显拖动（远超双击容差）不记录避免误判；
+                        // 拖动结束且控制栏显示时重置自动隐藏计时。
+                        if (!moved || tapDist < touchSlop * 4) {
+                            lastTapTime = now
+                            lastTapX = event.rawX
+                            lastTapY = event.rawY
+                        }
+                        if (moved && barVisible && !localLocked) {
+                            resetControlBarAutoHide()
+                        }
                     }
                     // 先退出拖动态，后续同步即可按新的百分制值校正（值已一致）。
                     dragging = false
@@ -438,10 +577,12 @@ class DesktopLyricsService : Service() {
                         .apply()
                     // 把拖动结果换算成纵向位置（百分制）回传 Dart：设置页滑块
                     // 跟随实际位置，且随后的更新不会再用旧滑块值把浮窗拉回去。
+                    // 锁定态拖拽失效不移动位置，直接返回不再回传位置。
+                    if (localLocked) return@setOnTouchListener true
                     reportPercent()
                     true
                 }
-                else -> !localLocked
+                else -> true
             }
         }
         // 浮窗首次测量/内容高度变化时重算 y：整屏钳制的上边界依赖浮窗
@@ -449,6 +590,7 @@ class DesktopLyricsService : Service() {
         content.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ ->
             compensateLockLayout()
             applyWindowPosition()
+            syncProxyPanel()
         }
         windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
         try {
@@ -462,12 +604,14 @@ class DesktopLyricsService : Service() {
             overlayParams = null
             stopSelf()
         }
+        // 触摸代理窗（真穿透架构）：主窗完全穿透时承载双击/长按唤栏。
+        ensureProxyPanel()
     }
 
     /// 底部操作栏（一行 8 键）：播放三键 + 字号调节 + 锁定 + 设置 + 关闭。
     /// 样式对齐 MusicFree 桌面版：Material 线性图标键集中居中、小间距
-    /// （字号键用 A−/A+ 文字）。锁定态整栏隐藏（窗口完全穿透，不响应
-    /// 触摸），解锁走设置页开关。
+    /// （字号键用 A−/A+ 文字）。锁定态整栏保留但仅显示锁定键（其余按键
+    /// GONE 消失，见 applyBarVisibility），解锁须点击锁定键（双击只唤栏）。
     private fun buildControlBar(): LinearLayout {
         val density = resources.displayMetrics.density
         fun icon(resId: Int, onClick: () -> Unit): ImageView =
@@ -476,7 +620,11 @@ class DesktopLyricsService : Service() {
                 val pad = (6 * density).toInt()
                 setPadding(pad, pad, pad, pad)
                 background = null
-                setOnClickListener { onClick() }
+                // 控制栏显示期间点击按钮算交互：重置自动隐藏计时，操作不被中途收起。
+                setOnClickListener {
+                    onClick()
+                    resetControlBarAutoHide()
+                }
             }
         fun textKey(label: String, onClick: () -> Unit): TextView =
             TextView(this).apply {
@@ -494,7 +642,10 @@ class DesktopLyricsService : Service() {
                     LinearLayout.LayoutParams.WRAP_CONTENT,
                     (36 * density).toInt(),
                 )
-                setOnClickListener { onClick() }
+                setOnClickListener {
+                    onClick()
+                    resetControlBarAutoHide()
+                }
             }
         fun gapView(): View = Space(this).apply {
             layoutParams = LinearLayout.LayoutParams((4 * density).toInt(), 1)
@@ -520,8 +671,18 @@ class DesktopLyricsService : Service() {
             addView(textKey("A−") { adjustFontSize(-2f) })
             addView(textKey("A+") { adjustFontSize(2f) })
             addView(gapView())
-            // 锁定 / 设置 / 关闭（锁定键按当前状态切换：锁定态下即解锁）
-            addView(icon(R.drawable.ic_dlyr_lock) { setLocked(!localLocked) })
+            // 锁定 / 设置 / 关闭（锁定键：仅未锁定态可见——点击=锁定；
+            // 锁定态窗口完全穿透收不到触摸，解锁走通知栏单击或设置页开关）
+            addView(
+                icon(R.drawable.ic_dlyr_lock) {
+                    if (localLocked) {
+                        setLocked(false)
+                        showControlBar()
+                    } else {
+                        setLocked(true)
+                    }
+                }.apply { tag = "lockKey" },
+            )
             addView(icon(R.drawable.ic_dlyr_settings) { openSettings() })
             addView(icon(R.drawable.ic_dlyr_close) {
                 closeReporter?.invoke()
@@ -555,22 +716,121 @@ class DesktopLyricsService : Service() {
         if (abs(view.textSize - scaled) > .5f) view.textSize = sp
     }
 
-    /// 锁定切换：锁定时强制收起操作栏 + 回传 Dart 同步设置页开关。
+    /// 锁定切换（千问式交互定稿）：锁定=整窗 FLAG_NOT_TOUCHABLE 完全真
+    /// 穿透——歌词区域与全屏单击都直达下层应用，控制栏不出现、拖拽/双击
+    /// 全失效；解锁只走通知栏单击（解锁广播）或设置页开关。解锁后恢复
+    /// 可触摸（拖拽、双击唤栏），通知刷新为「单击进入软件」。回传 Dart
+    /// 同步设置页开关。
     private fun setLocked(value: Boolean) {
         localLocked = value
-        if (value) {
-            barVisible = false
-        }
+        // 锁定态无控制栏（穿透下也收不到触摸）；解锁后由用户双击唤出。
+        barVisible = false
+        mainHandler.removeCallbacks(controlBarHideRunnable)
         pendingLockedEcho = value
         pendingLockedEchoAt = SystemClock.elapsedRealtime()
         lockedReporter?.invoke(value)
         applyLockedState()
+        refreshNotify()
     }
 
-    /// 锁定状态渲染：操作栏隐藏、窗口加 FLAG_NOT_TOUCHABLE 完全穿透
-    /// （触摸事件整体归属下层窗口，点击/滑动不再被歌词横幅拦截），窗口
-    /// 保持全宽 MATCH_PARENT——歌词水平位置与未锁定时完全一致，不会
-    /// 出现左偏/右侧空白；解锁走设置页开关。
+    // ---- 控制通知：单击行为随锁定态切换（未锁定=打开软件 / 锁定=解锁）----
+
+    private var notifyShown = false
+    private var unlockReceiver: BroadcastReceiver? = null
+
+    /// 解锁广播接收：通知栏单击（锁定态 contentIntent）→ 解锁并刷新通知。
+    private fun ensureUnlockReceiver() {
+        if (unlockReceiver != null) return
+        val receiver = object : BroadcastReceiver() {
+            override fun onReceive(context: Context, intent: Intent) {
+                if (intent.action == ACTION_UNLOCK && localLocked) {
+                    setLocked(false)
+                }
+            }
+        }
+        val filter = IntentFilter(ACTION_UNLOCK)
+        try {
+            if (Build.VERSION.SDK_INT >= 33) {
+                registerReceiver(receiver, filter, Context.RECEIVER_EXPORTED)
+            } else {
+                registerReceiver(receiver, filter)
+            }
+            unlockReceiver = receiver
+        } catch (_: Exception) {
+            // 通知/广播不可用时解锁退路=设置页开关。
+        }
+    }
+
+    /// 发布/刷新控制通知（IMPORTANCE_LOW 静默常驻）：文本与单击行为随
+    /// 锁定态切换——锁定=「单击解锁桌面歌词」（发 ACTION_UNLOCK 广播）；
+    /// 解锁=「单击进入软件」（打开 App），不再残留解锁提示。
+    private fun refreshNotify() {
+        try {
+            val nm = getSystemService(NotificationManager::class.java)
+            if (nm == null) return
+            if (Build.VERSION.SDK_INT >= 26 &&
+                nm.getNotificationChannel(NOTIFY_CHANNEL) == null
+            ) {
+                nm.createNotificationChannel(
+                    NotificationChannel(
+                        NOTIFY_CHANNEL, "桌面歌词",
+                        NotificationManager.IMPORTANCE_LOW,
+                    ),
+                )
+            }
+            // 控制通知仅在锁定态存在（解锁后即销毁，重新锁定时再发布）；
+            // 解锁入口只对锁定态有意义。
+            if (!localLocked) {
+                if (notifyShown) {
+                    try {
+                        nm.cancel(NOTIFY_ID)
+                    } catch (_: Exception) {
+                        // 通知服务异常时忽略。
+                    }
+                    notifyShown = false
+                }
+                return
+            }
+            val contentIntent = PendingIntent.getBroadcast(
+                this, 1,
+                Intent(ACTION_UNLOCK).setPackage(packageName),
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+            )
+            val builder = if (Build.VERSION.SDK_INT >= 26) {
+                Notification.Builder(this, NOTIFY_CHANNEL)
+            } else {
+                @Suppress("DEPRECATION")
+                Notification.Builder(this).setPriority(Notification.PRIORITY_LOW)
+            }
+            val notification = builder
+                .setSmallIcon(applicationInfo.icon)
+                .setContentTitle("桌面歌词已锁定")
+                .setContentText("单击解锁桌面歌词")
+                .setContentIntent(contentIntent)
+                .setOngoing(true)
+                .setShowWhen(false)
+                .build()
+            nm.notify(NOTIFY_ID, notification)
+            notifyShown = true
+        } catch (_: Exception) {
+            // 通知不可用（如关闭通知权限）时忽略：解锁走设置页开关。
+        }
+    }
+
+    private fun cancelNotify() {
+        if (!notifyShown) return
+        try {
+            getSystemService(NotificationManager::class.java)?.cancel(NOTIFY_ID)
+        } catch (_: Exception) {
+            // 系统回收时忽略。
+        }
+        notifyShown = false
+    }
+
+    /// 锁定状态渲染：锁定=整窗完全穿透（无控制栏、无触摸交互），解锁=
+    /// 恢复可触摸（拖拽、双击/长按唤栏，栏隐藏时主窗穿透、代理窗承载
+    /// 唤栏）。位置补偿逻辑保留——锁定切换前后的布局变化仍需补偿，避免
+    /// 「锁定后位置偏移」。
     private fun applyLockedState() {
         // 记录切换前的屏幕绝对位置：操作栏显隐（高度变化）引起的
         // relayout 会让 applyWindowPosition 按旧百分制把歌词拉到新位置
@@ -596,6 +856,12 @@ class DesktopLyricsService : Service() {
             }
             val loc = IntArray(2)
             it.getLocationOnScreen(loc)
+            // 记录基准也做有效性检查：窗口尚未完成首次布局（GONE 期/
+            // 新增视图）时 loc 读到 (0,0)，以它为基准的补偿会把窗口拉
+            // 向屏幕左上角——此时不登记补偿（下次布局落定后的路径兜底）。
+            if (it.width <= 0 || it.height <= 0 || (loc[0] == 0 && loc[1] == 0)) {
+                return
+            }
             lockCompensateCenter = loc[0] + it.width / 2f
             lockCompensateTop = loc[1]
             lockCompensatePending = true
@@ -610,24 +876,22 @@ class DesktopLyricsService : Service() {
         panel?.postDelayed({ compensateLockLayout(force = true) }, 120)
     }
 
-    /// 应用窗口触摸 flags 与宽度：
-    /// - 锁定：加 FLAG_NOT_TOUCHABLE——窗口彻底脱离触摸命中，点击/滑动
-    ///   100% 直达下层窗口（修复「点击仍显示按钮」「无法点击后方」）；
-    ///   宽度保持 MATCH_PARENT 不变，歌词水平位置与未锁定态完全一致
-    ///   （修复「左偏 + 右侧空白」，不再依赖水平补偿的 relayout 竞态）。
-    /// - 非锁定：去除 FLAG_NOT_TOUCHABLE，恢复可交互，便于拖动与操作栏。
-    /// - 宽度恒为 MATCH_PARENT：锁定仅隐藏操作栏 + 触摸穿透，不改横幅宽度。
+    /// 应用窗口触摸 flags：锁定态恒 FLAG_NOT_TOUCHABLE 完全穿透（解锁走
+    /// 通知栏/设置页）；未锁定时控制栏显示期间可触摸（按钮可点、拖拽可用、
+    /// 双击重置自动隐藏计时），栏隐藏时完全穿透——单击直达下层应用，
+    /// 双击/长按唤栏由触摸代理窗承载（[ensureProxyPanel]）。宽度恒为
+    /// MATCH_PARENT（视觉不变）。
     private fun applyWindowFlags() {
         overlayParams?.let { params ->
             val desiredFlags =
                 WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
                 WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
                 WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
-                (if (localLocked) {
+                if (localLocked || !barVisible) {
                     WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
                 } else {
                     0
-                })
+                }
             val desiredWidth = WindowManager.LayoutParams.MATCH_PARENT
             if (params.flags != desiredFlags || params.width != desiredWidth) {
                 params.flags = desiredFlags
@@ -637,6 +901,188 @@ class DesktopLyricsService : Service() {
                 } catch (_: Exception) {
                     // 浮窗已被系统回收时忽略状态更新。
                 }
+            }
+        }
+    }
+
+    /// 构建触摸代理窗（双窗口真穿透架构）：透明 View、恒可触摸，尺寸与
+    /// 位置跟随主窗内容矩形（[syncProxyPanel]）。触摸行为对齐千问交互：
+    /// 双击/长按唤出控制栏（锁定态同样，栏内仅锁定键）；单击不响应。
+    private fun ensureProxyPanel() {
+        if (proxyView != null || panel == null) return
+        proxyTouchSlop = android.view.ViewConfiguration.get(this).scaledTouchSlop
+        val type = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+        } else {
+            @Suppress("DEPRECATION")
+            WindowManager.LayoutParams.TYPE_PHONE
+        }
+        val view = View(this).apply {
+            setOnTouchListener { _, event ->
+                when (event.actionMasked) {
+                    MotionEvent.ACTION_DOWN -> {
+                        proxyDownX = event.rawX
+                        proxyDownY = event.rawY
+                        overlayParams?.let {
+                            proxyStartMainX = it.x
+                            proxyStartMainY = baseY
+                        }
+                        mainHandler.postDelayed(proxyLongPressRunnable, 550)
+                        true
+                    }
+                    MotionEvent.ACTION_MOVE -> {
+                        val beyondSlop = abs(event.rawX - proxyDownX) > proxyTouchSlop ||
+                            abs(event.rawY - proxyDownY) > proxyTouchSlop
+                        if (beyondSlop) {
+                            // 位移超 slop：取消长按判定，进入拖拽（未锁定）——
+                            // 栏隐藏时主窗 FLAG_NOT_TOUCHABLE 收不到触摸，
+                            // 拖拽由代理窗承载（主窗+代理窗同步平移）。
+                            mainHandler.removeCallbacks(proxyLongPressRunnable)
+                            if (!localLocked && overlayParams != null) {
+                                dragging = true
+                            }
+                        }
+                        if (dragging) {
+                            val op = overlayParams ?: return@setOnTouchListener true
+                            // 主窗与代理窗 x 均为 CENTER_HORIZONTAL 中心偏移
+                            // （同量纲），按手指原始差值直接平移即可保持对齐。
+                            val dx = (event.rawX - proxyDownX).toInt()
+                            val dy = (event.rawY - proxyDownY).toInt()
+                            op.x = proxyStartMainX + dx
+                            baseY = clampY(proxyStartMainY + dy)
+                            op.y = baseY
+                            try {
+                                panel?.let { windowManager?.updateViewLayout(it, op) }
+                            } catch (_: Exception) {
+                                // 系统回收浮窗时忽略本次拖动。
+                            }
+                            proxyParams?.let { pr ->
+                                pr.x += dx
+                                pr.y += dy
+                                try {
+                                    proxyView?.let { windowManager?.updateViewLayout(it, pr) }
+                                } catch (_: Exception) {
+                                    // 代理窗被回收时仅保留主窗移动。
+                                }
+                            }
+                            proxyStartMainX = op.x
+                            proxyStartMainY = baseY
+                            proxyDownX = event.rawX
+                            proxyDownY = event.rawY
+                        }
+                        true
+                    }
+                    MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                        mainHandler.removeCallbacks(proxyLongPressRunnable)
+                        val wasDragging = dragging
+                        dragging = false
+                        if (wasDragging && event.actionMasked == MotionEvent.ACTION_UP) {
+                            // 拖动结束：持久化 x 并换算百分制回传 Dart（设置页
+                            // 滑块跟随，后续更新不会用旧滑块值拉回浮窗）。
+                            overlayParams?.let {
+                                getSharedPreferences("desktop_lyrics", MODE_PRIVATE)
+                                    .edit()
+                                    .putInt("x", it.x)
+                                    .apply()
+                            }
+                            reportPercent()
+                        } else if (event.actionMasked == MotionEvent.ACTION_UP &&
+                            !wasDragging
+                        ) {
+                            // 未拖动的抬手走双击判定：400ms 窗口、位移 slop×3。
+                            val now = SystemClock.uptimeMillis()
+                            val tapDist = abs(event.rawX - proxyLastTapX) +
+                                abs(event.rawY - proxyLastTapY)
+                            val doubleTap =
+                                now - proxyLastTapTime < 400L && tapDist < proxyTouchSlop * 3
+                            if (doubleTap) {
+                                proxyLastTapTime = 0L
+                                showControlBar()
+                            } else {
+                                proxyLastTapTime = now
+                                proxyLastTapX = event.rawX
+                                proxyLastTapY = event.rawY
+                            }
+                        }
+                        true
+                    }
+                    else -> true
+                }
+            }
+        }
+        val params = WindowManager.LayoutParams(
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            type,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+            PixelFormat.TRANSLUCENT,
+        ).apply {
+            gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
+        }
+        proxyView = view
+        proxyParams = params
+        try {
+            windowManager?.addView(view, params)
+            syncProxyPanel()
+        } catch (_: Exception) {
+            // 系统回收时放弃代理窗（主窗回退为始终可触摸的旧交互）。
+            proxyView = null
+            proxyParams = null
+        }
+    }
+
+    /// 同步触摸代理窗：位置/尺寸=主窗内容矩形的屏幕矩形；锁定态、控制栏
+    /// 显示期间或暂停隐藏整窗时代理窗 GONE（锁定整窗穿透，无触摸交互；
+    /// 栏显示时主窗可触摸承载交互，避免隐形拦截）。未锁定栏隐藏时代理窗
+    /// 承载双击/长按唤栏与拖拽。
+    private fun syncProxyPanel() {
+        // 拖拽期间跳过：拖拽路径自身按手指增量同步主窗与代理窗；此时
+        // updateViewLayout 与内容布局回调异步交错，按内容矩形重算会把
+        // 代理窗拉回旧位置（与拖拽增量写打架 → 松手后飘位）。
+        if (dragging) return
+        val view = proxyView ?: return
+        val pr = proxyParams ?: return
+        val content = panelContent ?: return
+        if (!localLocked && !barVisible && content.visibility == View.VISIBLE &&
+            content.width > 0 && content.height > 0
+        ) {
+            val loc = IntArray(2)
+            content.getLocationOnScreen(loc)
+            val targetW = content.width
+            val targetH = content.height
+            // gravity TOP|CENTER_HORIZONTAL：x 为窗口中心相对屏幕中心的偏移。
+            val sw = resources.displayMetrics.widthPixels
+            val nx = (loc[0] + targetW / 2f - sw / 2f).toInt()
+            var changed = false
+            if (pr.width != targetW || pr.height != targetH) {
+                pr.width = targetW
+                pr.height = targetH
+                changed = true
+            }
+            if (pr.x != nx || pr.y != loc[1]) {
+                pr.x = nx
+                pr.y = loc[1]
+                changed = true
+            }
+            if (view.visibility != View.VISIBLE) {
+                view.visibility = View.VISIBLE
+                changed = true
+            }
+            if (changed) {
+                try {
+                    windowManager?.updateViewLayout(view, pr)
+                } catch (_: Exception) {
+                    // 代理窗已被系统回收时忽略。
+                }
+            }
+        } else if (view.visibility != View.GONE) {
+            view.visibility = View.GONE
+            try {
+                windowManager?.updateViewLayout(view, pr)
+            } catch (_: Exception) {
+                // 代理窗已被系统回收时忽略。
             }
         }
     }
@@ -683,6 +1129,7 @@ class DesktopLyricsService : Service() {
             lastHideLyrics = hideLyrics
             panelContent?.visibility =
                 if (hideLyrics) View.GONE else View.VISIBLE
+            syncProxyPanel()
         }
 
         // 位置/字体类参数：纵向位置百分制、自定义字体。这些参数变化频率
@@ -703,8 +1150,9 @@ class DesktopLyricsService : Service() {
             if (p.locked == pendingLockedEcho) pendingLockedEcho = null
         } else if (p.locked != localLocked) {
             localLocked = p.locked
-            if (p.locked) {
-                barVisible = false
+            if (p.locked && barVisible) {
+                // 锁定态：控制栏仅保留锁定键，仍参与 2.5s 自动隐藏计时。
+                resetControlBarAutoHide()
             }
             applyLockedState()
         }
@@ -987,35 +1435,61 @@ class DesktopLyricsService : Service() {
     private fun clampY(value: Int): Int = value.coerceIn(0, availableHeightPx())
 
     /** 百分制纵向位置 → 浮窗 y（px，自屏幕顶边起算）。
-     * 0 = 屏幕最顶端（y=0，浮窗顶边贴屏顶）；100 = 屏幕最底端。 */
+     * 0 = 屏幕最顶端（y=0，浮窗顶边贴屏顶）；100 = 屏幕最底端。
+     * 分母用纯整屏高（物理屏恒定）：此前分母含浮窗自身高度，进出软件
+     * 时歌词行数/翻译副行显隐使浮窗高度变化 → 同一 y 换算出不同
+     * percent 并持久化 → 回桌面后按新 percent 反算出偏移位置（漂移）。
+     * 浮窗高度只参与 [clampY] 的可见性钳制，不参与 percent 换算。 */
     private fun percentToY(percent: Float): Int {
-        val available = availableHeightPx()
-        return (available * (percent.coerceIn(0f, 100f) / 100f)).toInt()
+        val screen = screenHeightPx()
+        return (screen * (percent.coerceIn(0f, 100f) / 100f)).toInt()
     }
 
     /** 浮窗 y（px，自顶边起算）→ 百分制纵向位置，与 [percentToY] 互为反算。 */
     private fun yToPercent(y: Int): Float {
-        val available = availableHeightPx()
-        if (available <= 0) return appliedPercent
-        return ((y.toFloat() / available) * 100f).coerceIn(0f, 100f)
+        val screen = screenHeightPx()
+        if (screen <= 0) return appliedPercent
+        return ((y.toFloat() / screen) * 100f).coerceIn(0f, 100f)
     }
 
-    /** 浮窗高度变化后重新按当前百分制位置摆放（可移动范围依赖浮窗高度）。
+    /** 浮窗高度变化后重新摆放位置。可移动范围依赖浮窗高度，但**不能**
+     * 每次布局变化都按当前百分制重算 y：
+     * - 百分制真源被改动（设置页滑块、锁定补偿回写）时才按
+     *   [appliedPercent] 换算目标 y（[positionDirty] 门控）；
+     * - 纯布局变化（操作栏显隐、歌词行数增减导致的浮窗高度变化）只做
+     *   越界钳制，保持用户手动拖拽后的实际位置不变——旧实现每次 layout
+     *   都按百分制重算，拖拽后一唤控制栏/换行就被拉走（拖后自动位移）。
      * 手动拖动期间必须跳过：否则每 500ms 的进度同步会按「上一次已应用的
      * 百分制值」重算 y，把浮窗吸回滑块刻度（整十）位置。 */
     private fun applyWindowPosition() {
         if (dragging) return
         val params = overlayParams ?: return
-        val target = clampY(percentToY(appliedPercent))
-        if (params.y != target) {
-            params.y = target
-            baseY = target
+        if (positionDirty) {
+            positionDirty = false
+            val target = clampY(percentToY(appliedPercent))
+            if (params.y != target) {
+                params.y = target
+                baseY = target
+                try {
+                    panel?.let { windowManager?.updateViewLayout(it, params) }
+                } catch (_: Exception) {
+                    // 浮窗已被系统回收时忽略位置更新。
+                }
+            }
+            return
+        }
+        // 纯布局变化：不按百分制重算，只保证浮窗完整可见（钳制越界）。
+        val clamped = clampY(params.y)
+        if (clamped != params.y) {
+            params.y = clamped
+            baseY = clamped
             try {
                 panel?.let { windowManager?.updateViewLayout(it, params) }
             } catch (_: Exception) {
                 // 浮窗已被系统回收时忽略位置更新。
             }
         }
+        syncProxyPanel()
     }
 
     /** 锁定切换的位置补偿：布局稳定后把歌词拉回切换前的屏幕绝对位置
@@ -1045,7 +1519,13 @@ class DesktopLyricsService : Service() {
             changed = true
         }
         val dy = lockCompensateTop - loc[1]
-        if (abs(dy) >= 1) {
+        // 5566：dy 与 dx 同规则钳制——5552 只钳了 x 轴，y 轴漏防。部分
+        // ROM 在窗口隐藏恢复/布局未落定期 getLocationOnScreen 会读到
+        // 0 或旧值，dy 放大成整屏偏移并把脏 percent 写进 prefs；此后
+        // 每次进出软件（Dart 重推锁定设置都会走补偿路径）累积漂移。
+        // 超过半屏高的补偿视为读数异常直接丢弃。
+        val sh = resources.displayMetrics.heightPixels
+        if (abs(dy) in 1..(sh / 2)) {
             baseY = clampY(baseY + dy)
             params.y = baseY
             appliedPercent = yToPercent(baseY)
@@ -1071,6 +1551,9 @@ class DesktopLyricsService : Service() {
         val target = incomingPercent.coerceIn(0f, 100f)
         if (abs(target - appliedPercent) < 0.01f) return
         appliedPercent = target
+        // 百分制真源变了：下一次布局变化要按新值重算浮窗 y（门控见
+        // [applyWindowPosition]），避免把手动拖拽后的实际位置覆盖掉。
+        positionDirty = true
         getSharedPreferences("desktop_lyrics", MODE_PRIVATE)
             .edit().putFloat("percent", appliedPercent).apply()
     }
@@ -1110,6 +1593,9 @@ class DesktopLyricsService : Service() {
 
     override fun onDestroy() {
         instance = null
+        // 取消控制栏自动隐藏计时，避免服务销毁后残留回调。
+        mainHandler.removeCallbacks(controlBarHideRunnable)
+        mainHandler.removeCallbacks(proxyLongPressRunnable)
         Choreographer.getInstance().removeFrameCallback(frameCallback)
         frameCallbackPosted = false
         panel?.let { view ->
@@ -1119,6 +1605,22 @@ class DesktopLyricsService : Service() {
                 // 浮窗已被系统回收。
             }
         }
+        proxyView?.let { view ->
+            try {
+                windowManager?.removeView(view)
+            } catch (_: Exception) {
+                // 代理窗已被系统回收。
+            }
+        }
+        cancelNotify()
+        unlockReceiver?.let { receiver ->
+            try {
+                unregisterReceiver(receiver)
+            } catch (_: Exception) {
+                // 接收器已被注销。
+            }
+        }
+        unlockReceiver = null
         panel = null
         panelContent = null
         lyricView = null
@@ -1126,6 +1628,8 @@ class DesktopLyricsService : Service() {
         controlBar = null
         playKey = null
         overlayParams = null
+        proxyView = null
+        proxyParams = null
         wordText = null
         wordSpans = emptyList()
         wordColorSpans = emptyArray()

@@ -96,6 +96,10 @@ class _VisualizerPageState extends ConsumerState<VisualizerPage>
   // UI 状态。
   _DrawerSection _drawer = _DrawerSection.none;
   final ValueNotifier<int> _frameTick = ValueNotifier<int>(0);
+  /// 活帧：painter 持有它的引用，_onTick 每帧原地更新 time/kickEnvelope/
+  /// rms/blockPulse 等字段，使暂停/无音频（无 rebuild）时画面时间流仍推进
+  /// （否则 painter 停留在 build 时快照，脉冲冻结不回落）。
+  VisFrame? _liveFrame;
   int _lyricsOffsetTenths = 0;
   String? _offsetLoadedFor;
 
@@ -271,6 +275,15 @@ class _VisualizerPageState extends ConsumerState<VisualizerPage>
       _noAudioHint = true;
     }
 
+    // 活帧字段原地更新：painter 持有 _liveFrame 引用、repaint 每帧触发
+    // paint()，因此这里刷新时间流即可让地形/星云动画持续推进——不再依赖
+    // build 重建 painter（暂停/无音频时无 rebuild，旧实现会冻结）。
+    final live = _liveFrame ??= _frame(settings);
+    live.time = _shaderTime;
+    live.kickEnvelope = settings.kickEnabled ? _kickEnv : 0;
+    live.rms = VisualizerSource.instance.rms;
+    live.blockPulse = _blockPulse;
+
     _frameTick.value++;
   }
 
@@ -358,19 +371,30 @@ class _VisualizerPageState extends ConsumerState<VisualizerPage>
                   _pressAt = null;
                   _pressPos = null;
                 },
-                child: CustomPaint(
-                  painter: settings.form == VisualizerForm.terrain
-                      ? TerrainScenePainter(
-                          _frame(settings),
-                          repaint: _frameTick, // Ticker 每帧驱动重绘
-                        )
-                      : NebulaScenePainter(
-                          _frame(settings),
-                          repaint: _frameTick,
-                        ),
-                  isComplex: true,
-                  willChange: true,
-                ),
+                child: Builder(builder: (context) {
+                  // 活帧：settings/form 或封面纹理变化时重建，否则复用
+                  // _onTick 每帧原地更新的同一实例——暂停/无音频无 rebuild
+                  // 时动画时间流仍由 repaint 驱动持续推进（脉冲正常回落）。
+                  if (_liveFrame == null ||
+                      _liveFrame!.settings != settings ||
+                      _liveFrame!.coverImage != _coverImage) {
+                    _liveFrame = _frame(settings);
+                  }
+                  final visFrame = _liveFrame!;
+                  return CustomPaint(
+                    painter: settings.form == VisualizerForm.terrain
+                        ? TerrainScenePainter(
+                            visFrame,
+                            repaint: _frameTick, // Ticker 每帧驱动重绘
+                          )
+                        : NebulaScenePainter(
+                            visFrame,
+                            repaint: _frameTick,
+                          ),
+                    isComplex: true,
+                    willChange: true,
+                  );
+                }),
               ),
             ),
             // 歌词覆盖层（设置驱动：模式/字号/颜色/字体）。

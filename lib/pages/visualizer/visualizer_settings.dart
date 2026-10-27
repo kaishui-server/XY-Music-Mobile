@@ -26,13 +26,16 @@ class VisTheme {
 }
 
 const kVisThemes = <VisTheme>[
-  VisTheme('ink', '墨韵', 0xFFE8EAED, 0xFF4E5257, 0xFFFFFFFF),
-  VisTheme('night', '暗夜', 0xFF7FD8F5, 0xFF2E6E86, 0xFFB8ECFF),
-  VisTheme('neon', '霓虹', 0xFFC0A6FF, 0xFF4A3B73, 0xFFE2D6FF),
-  VisTheme('cyber', '赛博', 0xFFB8E986, 0xFF4E6B33, 0xFFE0F7C0),
-  VisTheme('minimal', '极简', 0xFFB9BDC4, 0xFF3A3E44, 0xFF8E959E),
-  // 烈焰（5540 新增，对齐 LX-X 火焰橙红紫观感；追加末位保持旧 themeIndex 稳定）。
-  VisTheme('ember', '烈焰', 0xFFFFB05C, 0xFF6E2440, 0xFFFF5A36),
+  // 色值对齐 Desktop/sonic-topography 内置主题（ink-wash/nocturnal/neon-tokyo/cyber-forest/minimal-monochrome）
+  // 墨韵（ink）已移除。
+  VisTheme('night', '暗夜', 0xFF3377FF, 0xFF0B1E45, 0xFF33E6FF),
+  // 霓虹（采用原烈焰的火焰橙红观感：火焰橙红主色/紫红暗部/橙红强调，对齐 LX-X 火焰橙红紫）。
+  VisTheme('neon', '霓虹', 0xFFFFB05C, 0xFF6E2440, 0xFFFF5A36),
+  // 赛博（对齐 sonic cyber-forest：亮翡翠 coolCore + 柠黄绿暖系 + 深绿黑底）。
+  VisTheme('cyber', '赛博', 0xFF99FF4D, 0xFF020A04, 0xFF1AFF80),
+  VisTheme('minimal', '极简', 0xFFF2F2F2, 0xFF3A3E44, 0xFFFFFFFF),
+  // 幻紫（提饱和提亮、增强对比：亮紫罗兰主色/深紫黑暗部/白强调）。
+  VisTheme('phantom', '幻紫', 0xFF9D4EFF, 0xFF2A0A45, 0xFFFFFFFF),
 ];
 
 /// 触发器模式（脉冲/流星共用）。

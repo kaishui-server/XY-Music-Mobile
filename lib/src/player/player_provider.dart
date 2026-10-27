@@ -1009,6 +1009,11 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
     // 「打开设置」消息曾被暂存——回调就位后补执行（首帧后 push），
     // 否则用户点一次 ⚙ 只拉起 app 停在原页面，要再点一次才能进设置。
     DesktopLyricsBridge.flushPendingAction();
+    // 冷启动场景（进程冷启、原生 configureFlutterEngine 执行早于 Dart
+    // 的 setMethodCallHandler 安装）：原生不再立即 invoke 补发（通道无
+    // 接收端时消息会静默丢失），改由这里在回调全部就位后主动拉取原生
+    // 暂存的打开设置/通知双击动作，保证一次命中。
+    unawaited(DesktopLyricsBridge.ensureReady());
     // 浮窗操作栏 A-/A+：字号回写设置（设置页滑块跟随 + 持久化）。
     DesktopLyricsBridge.onFontScaleChanged = (size) {
       final current = _ref.read(settingsProvider).valueOrNull;
@@ -1392,16 +1397,15 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
     // 记 60s 冷却并回退原生输出（静音时钟音量恢复），不影响正常播放。
     // content:// 等无直读地址的源由 [_startDspPipeline] 内部兜底为原生输出。
     //
-    // 在线流除外：Rust 共享管线启动时会对同一 URL 另开一路
-    // start_streaming_download（512KB 最小缓冲、8s 超时），与 ExoPlayer
-    // 的首次缓冲互相抢带宽——未缓存的歌起播被拖到十几秒；接管成功瞬间
-    // 时钟静音（setVolume(0)）后管线 seek 对齐进度，而流缓存刚从 0 字节
-    // 开始下载、尚未追上播放位置，弱网下静音窗口长达数十秒甚至彻底无声
-    //（现场日志：playing=true 进度停滞 + isMusicActive=false + dsp 全程
-    // false）。本地文件无此问题（直读本地缓存/文件，建流即就绪），保持
-    // 默认接管；在线歌保持原生 ExoPlayer 输出（EQ/响度/变速变调原生路径
-    // 已覆盖），播放速度优先。
-    if (_dspStreamUrl != null) return false;
+    // 在线流也纳入接管（5566）：此前在线流恒走原生输出，anime 音效
+    // （仅存在于 Rust DSP 管线）对在线歌完全无效——用户反馈「打开音效
+    // 听不出变化」的根因之一。策略：起播仍走 ExoPlayer（满带宽缓冲），
+    // just_audio ready 后延迟 3s 再接管（见 [_scheduleDeferredDspTakeover]），
+    // 接管瞬间时钟静音、管线从当前进度位置拉流追实时——切换有短促
+    // 静音窗口，属预期行为；接管失败仍走 60s 冷却回退原生输出。
+    if (_dspStreamUrl != null) {
+      playbackChainLog('[DSP] 在线流纳入接管（延迟3s）: $_dspStreamUrl');
+    }
     return true;
   }
 
@@ -1437,15 +1441,21 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
         _dspPipelineActive) {
       return;
     }
-    // 再等一小段：ready 只是刚够最小缓冲，让 ExoPlayer 把缓冲拉出领先量，
-    // 接管下载才不会一上来就把带宽分走、导致起播后立刻卡一下。
+    // 在线流给 ExoPlayer 拉出更长缓冲领先量（3s vs 本地 1.2s）：接管
+    // 下载从当前进度位置开始追实时，领先量越大静音切换窗口越短；
+    // 本地文件建流即就绪无需等待。
+    final delay = _dspStreamUrl != null ? 3000 : 1200;
     _dspDeferredTakeoverTimer?.cancel();
-    _dspDeferredTakeoverTimer = Timer(const Duration(milliseconds: 1200), () {
+    _dspDeferredTakeoverTimer = Timer(Duration(milliseconds: delay), () {
       _dspDeferredTakeoverTimer = null;
       if (pending.requestId != _playRequestId ||
           state.current?.path != pending.itemPath ||
           _dspPipelineActive ||
           !state.isPlaying) {
+        playbackChainLog(
+          '[DSP] 延迟接管到期待办失效: 切歌=${pending.requestId != _playRequestId || state.current?.path != pending.itemPath}, '
+          '已激活=${_dspPipelineActive}, 未播放=${!state.isPlaying}',
+        );
         return;
       }
       unawaited(_takeOverDspInBackground(pending.requestId, pending.itemPath));
@@ -1511,6 +1521,7 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
     }
     if (!ok) {
       // 接管失败：静音时钟已按真实音量出声，保持原生输出即可。
+      playbackChainLog('[DSP] 后台接管未成功，保持原生输出');
       return;
     }
     // 管线建流耗时期间时钟已推进，先把管线对齐到当前进度，再恢复音量
@@ -1537,6 +1548,10 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
     bool startMuted = false,
   }) async {
     if (_dspFailUntil != null && DateTime.now().isBefore(_dspFailUntil!)) {
+      playbackChainLog(
+        '[DSP] 冷却期内跳过接管（剩'
+        '${_dspFailUntil!.difference(DateTime.now()).inSeconds}s）',
+      );
       return false;
     }
     // DSP 源信息由各音源设置点记录（本地文件/在线直链）。
@@ -1545,7 +1560,7 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
     if (streamUrl == null && localPath == null) {
       // content://（SAF/网盘直链等 Rust 无法直读的源）没有可直读地址，
       // 管线不接管，保持在原生输出。
-      debugPrint('[DSP] 无可直读播放源（$itemPath），不接管，走原生输出');
+      playbackChainLog('[DSP] 无可直读播放源（$itemPath），不接管，走原生输出');
       return false;
     }
     try {
@@ -1571,11 +1586,14 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
       _dspPipelinePlaying = isPlaying;
       dspPipelineOwnsEffects = true;
       _startDspWatchdog();
-      debugPrint('[DSP] 共享管线接管成功: $deviceName');
+      playbackChainLog(
+        '[DSP] 共享管线接管成功: $deviceName, '
+        'anime参数=${_ref.read(effectsProvider).valueOrNull?.animeEffectId ?? '无'}',
+      );
       return true;
     } catch (error) {
       _dspFailUntil = DateTime.now().add(const Duration(seconds: 60));
-      debugPrint('[DSP] 共享管线启动失败(60s冷却)，回退原生输出: $error');
+      playbackChainLog('[DSP] 共享管线启动失败(60s冷却)，回退原生输出: $error');
       return false;
     }
   }
@@ -1796,7 +1814,13 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
       await setUsbExclusiveSoundEffect(
         settingsJson: jsonEncode(_dspSoundEffectJson(fx)),
       );
-    } catch (_) {}
+      playbackChainLog(
+        '[DSP] 运行时音效更新: anime=${fx.animeEffectId?.toString() ?? '无'}, '
+        'animeParams非空=${fx.animeParams.isNotEmpty}',
+      );
+    } catch (error) {
+      playbackChainLog('[DSP] 运行时音效更新失败: $error');
+    }
   }
 
   /// DSP 管线激活时的静音时钟音量（0）；普通输出用用户音量。
@@ -2287,6 +2311,11 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
       _attachPositionStream();
     }
     _guardVideoSessionOnLifecycle(state);
+    // 前后台切换立即重判定桌面歌词显隐：hideInApp 开启时，回前台瞬间
+    // 若还保留着后台态推的 enabled:true，浮窗会继续悬浮在 App 内直到
+    // 下一次随机 sync（可能很久不来）——这里强制立即同步一次，按
+    // resumed 状态发 enabled:false 隐藏 / 退后台发 enabled:true 显示。
+    _requestDesktopLyricsSync(immediate: true);
   }
 
   /// 后台久置挂起视频（应用级守护）。挂在 PlayerNotifier 而非播放
@@ -2336,6 +2365,9 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
         !settings.desktopLyricsEnabled ||
         item == null ||
         (settings.desktopLyricsHideInApp && isAppForeground)) {
+      // 禁用/隐藏同步：verticalPercent 必须沿用用户真实位置（设置值），
+      // 不能写死默认 90——否则进出软件（软件内隐藏）会把 Kotlin 侧位置
+      // 真源 appliedPercent 覆盖成 90%，回到桌面歌词从顶部漂到底部。
       await DesktopLyricsBridge.sync(
         enabled: false,
         title: '',
@@ -2353,7 +2385,7 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
         backgroundOpacity: .85,
         wordEffectMode: LyricWordEffectMode.none.index,
         locked: false,
-        verticalPercent: 90,
+        verticalPercent: settings?.desktopLyricsVerticalPercent ?? 90,
         lyricFontPath: '',
       );
       return;
@@ -3873,6 +3905,16 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
         }
         final host = Uri.tryParse(url)?.host ?? '';
         final viaProxy = host == '127.0.0.1' || host == 'localhost';
+        // 5569：QMC 加密流（ekey 非空）此前把 DSP 源置空——Rust 直读
+        // .mflac 只能拿到密文。但加密流走本地回环代理时，代理已边拉
+        // 边解密转发明文，Rust 流缓存直读本机代理 URL 拿到的就是明文，
+        // 与 ExoPlayer 同源。登记成功即回填 DSP 源，anime 音效在
+        // QMC 加密歌上恢复生效。
+        if (ekey != null && viaProxy) {
+          _dspStreamUrl = url;
+          _dspStreamHeaders = const <String, String>{};
+          playbackChainLog('[DSP] QMC加密流经本地代理解密，纳入接管');
+        }
         playbackChainLog(
           '[播放链路] setUrl 开始 ${viaProxy ? '本地代理通道' : host} '
           '(${headers == null ? (viaProxy ? '头由代理注入' : '无头直连') : '直连 ${headers?.length ?? 0} 头'})'

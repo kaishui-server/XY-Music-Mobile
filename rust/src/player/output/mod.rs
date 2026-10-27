@@ -11,6 +11,12 @@ use serde::{Deserialize, Serialize};
 #[cfg(target_os = "android")]
 pub(crate) mod android_aaudio;
 
+/// OpenSL ES 降级后端：AAudio 加载失败（API<26 等）时由
+/// android_aaudio::run_exclusive_playback 自动切换，保证 DSP 共享管线
+/// 在低版本设备同样出声（API 21+，libOpenSLES.so 系统库）。
+#[cfg(target_os = "android")]
+pub(crate) mod android_opensl;
+
 /// 独占播放启动请求。
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ExclusivePlayRequest {

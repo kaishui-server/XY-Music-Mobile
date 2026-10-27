@@ -26,6 +26,7 @@ import '../../src/favorites/favorites_provider.dart';
 import '../../src/library/library_provider.dart';
 import '../../src/lyrics/lyrics_models.dart';
 import '../../src/navigation/animated_page_route.dart';
+import '../../src/navigation/player_sheet_morph.dart';
 import '../../src/player/player_provider.dart';
 import '../../src/player/desktop_lyrics.dart';
 import '../../src/player/download_history_store.dart';
@@ -55,6 +56,21 @@ const _pluginLyricsSearchMemoryKey = 'pluginLyricsSearchQueriesV1';
 /// 有些插件会把 QRC/KRC 等歌词的密文直接放进播放结果，解码逻辑统一
 /// 放在 download_lyrics.dart，单曲下载与批量下载共用。
 enum _LyricsSourceAction { plugin, local, cancel }
+
+/// 详情页统一手势仲裁模式（见 _PlayerPageState._detailGestureMode）。
+enum _DetailGestureMode {
+  /// 位移未过斜率或处于斜向模糊带：继续观察，松手回退到翻页距离判定。
+  undecided,
+
+  /// 横向主导：交给松手时的横划翻页判定。
+  flip,
+
+  /// 纵向主导下移（仅竖屏封面页）：驱动底栏预览层收起。
+  collapse,
+
+  /// 纵向主导下移但预览层建立失败（底栏不存在/动画未收尾）：本手势作废。
+  none,
+}
 
 enum _SleepTimerOption {
   off,
@@ -289,6 +305,29 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
   int? _detailPointerId;
   Offset? _detailPointerStart;
   Offset? _detailPointerLast;
+
+  /// 详情页统一手势仲裁模式。横划翻页由外层 Listener 裸指针驱动（不进
+  /// 手势竞技场）；封面页下滑收起若再用 GestureDetector(onVerticalDrag)
+  /// 就会叠成两套体系——竞技场里没有水平识别器竞争，右划/左划切歌词时
+  /// 手指带一点纵向漂移垂直识别器就会获胜，收起被误触发。因此收起也
+  /// 收敛到裸指针：一根手指一个模式，位移首次过斜率时按主导方向一次性
+  /// 锁向，翻页与收起构造上互斥。
+  _DetailGestureMode _detailGestureMode = _DetailGestureMode.undecided;
+
+  /// 收起模式下的路由转场值（1 → 0，与展开拖动同一比例换算）：
+  /// 直接驱动 `/player` 路由的动画控制器（见 XyPlayerSheetRoute.dragValue），
+  /// 页面实时跟随手指，与单击收起共用同一路由转场。
+  double _collapseProgress = 1.0;
+
+  /// 当前承载本页的播放详情页路由（含手势驱动接口）；本页只挂在
+  /// `/player` 路由上，取不到时（理论不可达）收起手势整体作废。
+  XyPlayerSheetRoute? get _sheetRoute =>
+      ModalRoute.of(context) as XyPlayerSheetRoute?;
+
+  /// 收起方向速度采样（事件时间戳 + 累计 dy），松手时替代
+  /// DragEndDetails.primaryVelocity 计算滑动速度。
+  final List<(Duration, double)> _collapseSamples = [];
+
   String? _lyricsOffsetSongPath;
   int _lyricsOffsetTenths = 0;
   int _lyricsOffsetLoadRequest = 0;
@@ -362,9 +401,17 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
     super.initState();
     // 详情页常驻沉浸：隐藏状态栏，顶部下划短暂呼出（sticky 由系统在
     // 数秒无操作后自动收回），不影响下拉通知栏/控制中心手势；退出页面
-    // 在 dispose 恢复 edgeToEdge。
+    // 在 dispose 恢复 edgeToEdge。注意：切换 SystemUiMode 会重置系统栏
+    // 样式（Android 上 statusBarColor 回落为不透明黑），呼出状态栏时
+    // 黑条会盖住沉浸式封面顶部，模式生效后必须重新声明透明样式。
     unawaited(
-      SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky),
+      SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky).then(
+        (_) {
+          SystemChrome.setSystemUIOverlayStyle(
+            const SystemUiOverlayStyle(statusBarColor: Colors.transparent),
+          );
+        },
+      ),
     );
     _playingSubscription = ref.listenManual<bool>(
       playerProvider.select((state) => state.isPlaying),
@@ -549,21 +596,106 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
     _detailPointerId = event.pointer;
     _detailPointerStart = event.position;
     _detailPointerLast = event.position;
+    _detailGestureMode = _DetailGestureMode.undecided;
+    _collapseProgress = 1.0;
+    _collapseSamples.clear();
   }
 
   void _updateDetailSwipe(PointerMoveEvent event) {
-    if (_detailPointerId == event.pointer) {
-      _detailPointerLast = event.position;
+    if (_detailPointerId != event.pointer) return;
+    _detailPointerLast = event.position;
+    final start = _detailPointerStart;
+    if (start == null) return;
+    final offset = event.position - start;
+    final dy = offset.dy;
+    final dx = offset.dx.abs();
+    switch (_detailGestureMode) {
+      case _DetailGestureMode.undecided:
+        // 位移过斜率（24px）后按主导方向一次性锁向；斜向 1.3 倍模糊带
+        // 内继续等待，直到出现主导方向或松手（松手回退到翻页距离判定）。
+        // 收起仅限竖屏封面页（歌词页让位给滚动，横屏无收起手势）。
+        // 锁向距离 12 → 24px：12px 处主导轴尚不可靠，横划起手常见的
+        // 轻微下弧线会先满足「纵向主导」误锁收起（页面被拖动、翻页
+        // 被吞）；反向下滑起手带横向漂移也会误锁翻页。24px 处主导轴已
+        // 稳定，且收起转场值仅走到 ≈0.99，页面与静止详情页视觉重合，
+        // 锁向延迟无感知成本，横划与收起因此真正互斥。
+        if (dy <= 24 && dx <= 24) return;
+        // 收起手势：全页任意位置下滑响应（用户确认的最终行为）。
+        if (dy > 24 && dy > dx * 1.3) {
+          final size = MediaQuery.sizeOf(context);
+          if (size.height >= size.width &&
+              !_showLyrics &&
+              !widget.coverHidden) {
+            // 收起直接驱动 /player 路由转场控制器（XyPlayerSheetRoute），
+            // 路由必然存在；取不到时（理论不可达）本手势作废。
+            _detailGestureMode = _sheetRoute != null
+                ? _DetailGestureMode.collapse
+                : _DetailGestureMode.none;
+          }
+        } else if (dx > 24 && dx > dy * 1.3) {
+          _detailGestureMode = _DetailGestureMode.flip;
+        }
+      case _DetailGestureMode.collapse:
+        // 误锁自愈：快速滑动的单帧跳变仍可能把横划误锁进收起。若收起
+        // 尚未产生可见位移（累计纵向 <24px）而当前样本已强横向主导，
+        // 回弹路由转场并作废收起（mode=none），松手走翻页距离判定。
+        if (dy < 24 && dx > 40 && dx > dy * 1.5) {
+          _sheetRoute?.springBack();
+          _detailGestureMode = _DetailGestureMode.none;
+          break;
+        }
+        // 手势直接驱动路由形变转场（转场值 1 → 0），页面实时跟随手指；
+        // 壳层静止由转场冻结标记保证。
+        final route = _sheetRoute;
+        if (route == null) {
+          _detailGestureMode = _DetailGestureMode.none;
+          break;
+        }
+        // 面板顶边跟随手指：进度 = 1 - 手指Y / 播放栏顶边（形变起点），
+        // 手指滑到播放栏顶边时面板恰好缩回播放栏矩形。无起点信息
+        // （深链直达详情页）时退回屏高估算。
+        final barTop =
+            xyPlayerSheetOrigin?.barRect.top ??
+            MediaQuery.sizeOf(context).height * .85;
+        final value = dy <= 0 ? 1.0 : (1 - dy / barTop).clamp(0.0, 1.0);
+        route.dragValue = value;
+        _collapseProgress = value;
+        _collapseSamples.add((event.timeStamp, dy));
+        if (_collapseSamples.length > 32) _collapseSamples.removeAt(0);
+      case _DetailGestureMode.flip || _DetailGestureMode.none:
+        break;
     }
   }
 
   void _finishDetailSwipe(PointerEvent event, double viewportWidth) {
     if (_detailPointerId != event.pointer) return;
+    final mode = _detailGestureMode;
     final start = _detailPointerStart;
     final end = event is PointerCancelEvent
         ? null
         : (_detailPointerLast ?? event.position);
     _clearDetailSwipe();
+      // 收起模式：松手按速度/进度决定收起或回弹；被系统取消（如通知栏
+      // 手势抢走指针）时回弹。阈值与展开侧灵敏度对齐：快速下滑，或拖过
+      // 96px（约 1/8 屏）即收起——短距轻拖也能收回，仅极短误触弹回；
+      // 收起提交走 pop，转场从当前值反向播放——与单击收起同一条动画。
+      if (mode == _DetailGestureMode.collapse) {
+        if (event is PointerCancelEvent) {
+          _sheetRoute?.springBack();
+          return;
+        }
+        final barTop =
+            xyPlayerSheetOrigin?.barRect.top ??
+            MediaQuery.sizeOf(context).height * .85;
+        final collapse = _collapseVelocity() > 180 ||
+            _collapseProgress <= 1 - 96 / barTop;
+        if (collapse) {
+          Navigator.of(context).pop();
+        } else {
+          _sheetRoute?.springBack();
+        }
+        return;
+      }
     if (start == null || end == null) return;
 
     final delta = end - start;
@@ -592,6 +724,29 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
     _detailPointerId = null;
     _detailPointerStart = null;
     _detailPointerLast = null;
+    _detailGestureMode = _DetailGestureMode.undecided;
+    _collapseSamples.clear();
+  }
+
+  /// 收起松手速度：取最近 ≤100ms 采样估算（px/s），正值表示向下滑动。
+  double _collapseVelocity() {
+    final samples = _collapseSamples;
+    if (samples.length < 2) return 0;
+    final (t1, y1) = samples.last;
+    var t0 = t1;
+    var y0 = y1;
+    for (final (t, y) in samples.reversed) {
+      if (t1 - t >= const Duration(milliseconds: 100)) {
+        t0 = t;
+        y0 = y;
+        break;
+      }
+      t0 = t;
+      y0 = y;
+    }
+    final ms = (t1 - t0).inMilliseconds;
+    if (ms <= 0) return 0;
+    return (y1 - y0) / ms * 1000;
   }
 
   /// 启动视频画面。B 站插件歌曲走 [resolveVideoSource]；其他插件歌曲
@@ -2024,6 +2179,10 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
           : DeviceOrientation.values,
     );
     await SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
+    // 模式切换会重置系统栏样式，重新声明透明状态栏（同 initState 注释）。
+    SystemChrome.setSystemUIOverlayStyle(
+      const SystemUiOverlayStyle(statusBarColor: Colors.transparent),
+    );
   }
 
   /// 视频关闭或页面退出时解除横屏锁定。播放详情页仍在前台（视频关闭
@@ -2034,7 +2193,13 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
     _videoLandscape = false;
     unawaited(SystemChrome.setPreferredOrientations(DeviceOrientation.values));
     unawaited(
-      SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky),
+      SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky).then(
+        (_) {
+          SystemChrome.setSystemUIOverlayStyle(
+            const SystemUiOverlayStyle(statusBarColor: Colors.transparent),
+          );
+        },
+      ),
     );
   }
 
@@ -3033,7 +3198,13 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
     // 横屏锁定跟随详情页生命周期，离开页面即解除；同时恢复系统状态栏
     // （initState 进入详情页时切换到了 immersiveSticky 常驻沉浸）。
     _resetVideoOrientation();
-    unawaited(SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge));
+    unawaited(
+      SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge).then((_) {
+        SystemChrome.setSystemUIOverlayStyle(
+          const SystemUiOverlayStyle(statusBarColor: Colors.transparent),
+        );
+      }),
+    );
     VideoPlaybackSession.revision.removeListener(_syncVideoSession);
     _playingSubscription?.close();
     _playingSubscription = null;
@@ -3115,7 +3286,10 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
     final isLandscape = viewport.width > viewport.height;
 
     final detailHeader = Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 4),
+      // 竖屏沉浸态下系统状态栏隐藏，SafeArea 顶部内边距为 0，顶栏会贴着
+      // 屏幕上缘；额外增加 16px 下移留白（状态栏呼出时 SafeArea 会叠加，
+      // 视觉上仍协调）。横屏空间紧张，维持原样。
+      padding: EdgeInsets.fromLTRB(4, isLandscape ? 0 : 16, 4, 0),
       child: Row(
         children: [
           IconButton(
@@ -3124,6 +3298,8 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
               size: 28,
               color: Colors.white,
             ),
+            // 单击收起与下滑收起共用同一路由反向转场（页面从当前位置
+            // 滑回屏幕底部，见 XyPlayerSheetRoute）。
             onPressed: () => Navigator.of(context).pop(),
           ),
           // 竖屏封面页顶栏不显示歌名/歌手（标题由底部控制卡承载）；
@@ -3188,6 +3364,12 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
         : 2;
     final miniLyricReserveRows = immersiveMiniLyrics ? 4 : 2;
 
+    // 封面页下滑收起不再挂 GestureDetector：收起与横划翻页统一由外层
+    // Listener 的裸指针仲裁（见 _updateDetailSwipe 的 _DetailGestureMode）。
+    // 此前的 GestureDetector(onVerticalDrag) 在竞技场里没有水平识别器
+    // 竞争，横划切歌词时手指带纵向漂移就会获胜而误建预览层，吞掉整屏
+    // 手势（右划切歌词失效）。
+
     final detailPager = LayoutBuilder(
       builder: (context, constraints) => Listener(
         behavior: HitTestBehavior.translucent,
@@ -3214,36 +3396,36 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
           children: [
             if (coverStyle == PlayerCoverStyle.immersive)
               _ImmersiveCoverPage(
-                key: ValueKey('cover:${current?.path ?? ''}'),
-                item: current,
-                offsetTenths: _lyricsOffsetTenths,
-                // 竖屏时封面本体铺到屏幕顶端（见 _ImmersiveTopCover），
-                // 这里退化为透明手势占位（横屏由左侧封面栏直接绘制）。
-                // 预览层隐藏封面时同样保持透明占位并挂锚点。
-                paintCover: !widget.coverHidden,
-                coverAnchorKey: widget.coverAnchorKey,
-                miniLyricRows: miniLyricRows,
-                miniLyricReserveRows: miniLyricReserveRows,
-                onTap: current == null ? null : _toggleLyrics,
-                onLongPress: current == null
-                    ? null
-                    : () => unawaited(_showMoreMenu(current)),
+                  key: ValueKey('cover:${current?.path ?? ''}'),
+                  item: current,
+                  offsetTenths: _lyricsOffsetTenths,
+                  // 竖屏时封面本体由外层 Stack 的 _ImmersiveTopCover 绘制
+                  //（铺到屏幕顶端），这里恒为透明手势占位。此前 paintCover
+                  // 随 coverHidden 翻转：真实详情页把封面在内容区又画一遍，
+                  // 与顶部封面错位叠放——顶部出现两份错位裁切（重复裁切），
+                  // 且与 _ImmersiveTopCover 重复挂同一 coverAnchorKey。
+                  miniLyricRows: miniLyricRows,
+                  miniLyricReserveRows: miniLyricReserveRows,
+                  onTap: current == null ? null : _toggleLyrics,
+                  onLongPress: current == null
+                      ? null
+                      : () => unawaited(_showMoreMenu(current)),
               )
             else
               _BigCover(
-                key: ValueKey('cover:${current?.path ?? ''}'),
-                item: current,
-                offsetTenths: _lyricsOffsetTenths,
-                style: coverStyle,
-                coverHidden: widget.coverHidden,
-                coverAnchorKey: widget.coverAnchorKey,
-                miniLyricRows: miniLyricRows,
-                miniLyricReserveRows: miniLyricReserveRows,
-                onTap: current == null ? null : _toggleLyrics,
-                // 长按封面直接弹出“更多”菜单，与右上角更多按钮一致。
-                onLongPress: current == null
-                    ? null
-                    : () => unawaited(_showMoreMenu(current)),
+                  key: ValueKey('cover:${current?.path ?? ''}'),
+                  item: current,
+                  offsetTenths: _lyricsOffsetTenths,
+                  style: coverStyle,
+                  coverHidden: widget.coverHidden,
+                  coverAnchorKey: widget.coverAnchorKey,
+                  miniLyricRows: miniLyricRows,
+                  miniLyricReserveRows: miniLyricReserveRows,
+                  onTap: current == null ? null : _toggleLyrics,
+                  // 长按封面直接弹出“更多”菜单，与右上角更多按钮一致。
+                  onLongPress: current == null
+                      ? null
+                      : () => unawaited(_showMoreMenu(current)),
               ),
             if (current == null)
               const Center(
@@ -7295,7 +7477,7 @@ class _BigCover extends ConsumerWidget {
                                 side,
                               ),
                               // 黑胶唱片（参考 BakaMusic）：盘面 24 秒一圈。
-                              PlayerCoverStyle.vinyl => _VinylCover(
+                              PlayerCoverStyle.vinyl => VinylCover(
                                 item: item,
                                 playing: playing,
                                 size: side,
@@ -7553,8 +7735,6 @@ class _ImmersiveCoverPage extends StatelessWidget {
     required this.offsetTenths,
     this.onTap,
     this.onLongPress,
-    this.paintCover = true,
-    this.coverAnchorKey,
     this.miniLyricRows = 2,
     this.miniLyricReserveRows = 2,
   });
@@ -7563,13 +7743,6 @@ class _ImmersiveCoverPage extends StatelessWidget {
   final int offsetTenths;
   final VoidCallback? onTap;
   final VoidCallback? onLongPress;
-
-  /// false 时封面区域退化为透明占位（保留手势与尺寸，迷你歌词位置
-  /// 不变）：封面本体由播放页外层 Stack 绘制，铺到屏幕顶端。
-  final bool paintCover;
-
-  /// 封面占位锚点：拖动预览时读取封面最终矩形，与放大层目标对齐。
-  final GlobalKey? coverAnchorKey;
 
   /// 迷你歌词当前展示行数（沉浸模式播放栏隐藏 4 行、弹出 2 行）。
   final int miniLyricRows;
@@ -7593,63 +7766,19 @@ class _ImmersiveCoverPage extends StatelessWidget {
         );
         return Column(
           children: [
-            // 顶部 62% 清晰可见，之下渐隐（MusicFree
-            // IMMERSIVE_CLEAR_VISIBLE_RATIO = 0.62）。
+            // 透明手势占位：尺寸与封面一致，迷你歌词位置稳定；封面本体
+            // 由外层 Stack 的 _ImmersiveTopCover 绘制（铺到屏幕顶端），
+            // 整页只有一份封面裁切。
             Semantics(
               button: onTap != null,
               label: onTap == null ? null : '显示歌词',
               child: SizedBox(
-                key: coverAnchorKey,
                 width: side,
                 height: side,
-                child: paintCover
-                    ? ShaderMask(
-                        blendMode: BlendMode.dstIn,
-                        shaderCallback: (bounds) => const LinearGradient(
-                          begin: Alignment.topCenter,
-                          end: Alignment.bottomCenter,
-                          colors: [
-                            Colors.white,
-                            Colors.white,
-                            Colors.transparent,
-                          ],
-                          stops: [0, .62, 1],
-                        ).createShader(bounds),
-                        child: Material(
-                          color: Colors.transparent,
-                          clipBehavior: Clip.antiAlias,
-                          child: InkWell(
-                            onTap: onTap,
-                            onLongPress: onLongPress,
-                            child: current == null
-                                ? const ColoredBox(
-                                    color: Color(0xFF272A31),
-                                    child: Center(
-                                      child: Icon(
-                                        Icons.music_note_rounded,
-                                        color: Colors.white54,
-                                      ),
-                                    ),
-                                  )
-                                : CoverImage(
-                                    key: ValueKey(
-                                      'immersive:${current.path}:${current.coverUrl ?? ''}',
-                                    ),
-                                    songPath: current.path,
-                                    imageUrl: current.coverUrl,
-                                    width: side,
-                                    height: side,
-                                    radius: 0,
-                                    highQuality: true,
-                                    icon: Icons.music_note_rounded,
-                                  ),
-                          ),
-                        ),
-                      )
-                    : Material(
-                        color: Colors.transparent,
-                        child: InkWell(onTap: onTap, onLongPress: onLongPress),
-                      ),
+                child: Material(
+                  color: Colors.transparent,
+                  child: InkWell(onTap: onTap, onLongPress: onLongPress),
+                ),
               ),
             ),
             if (current != null)
@@ -7744,9 +7873,11 @@ class _ImmersiveTopCover extends StatelessWidget {
 }
 
 /// 黑胶唱片封面（参考 BakaMusic）：旋转唱片（盘面纹理 + 61.8% 标签，
-/// 对齐网易手机版无中心孔）。
-class _VinylCover extends StatelessWidget {
-  const _VinylCover({
+/// 对齐网易手机版无中心孔）。公开给播放栏预览层复用：展开/收起动画中
+/// 放大层必须绘制完整黑胶（盘体镶封面），否则收口瞬间与真实页「分家」。
+class VinylCover extends StatelessWidget {
+  const VinylCover({
+    super.key,
     this.item,
     required this.playing,
     required this.size,
