@@ -467,6 +467,21 @@ class _SearchPageState extends ConsumerState<SearchPage>
     PluginCatalogResult item,
   ) async {
     final raw = item.rawData;
+    // 洛雪歌单（searchPlaylists LX 分支）：rawData 带 lxSource，走宿主
+    // 直连导入（音源脚本没有 importMusicSheet 动作）。
+    final lxSource = raw['lxSource']?.toString().trim() ?? '';
+    if (lxSource.isNotEmpty) {
+      final playlistId =
+          raw['playlistId']?.toString().trim() ??
+          raw['id']?.toString().trim() ??
+          '';
+      final imported = await runtime.importLxPlaylistDirect(
+        plugin,
+        lxSource,
+        playlistId,
+      );
+      return imported.songs;
+    }
     final input = <String>[
       for (final key in const [
         'id',
@@ -517,6 +532,7 @@ class _SearchPageState extends ConsumerState<SearchPage>
           plugin,
           keyword,
           includeAlbums: false,
+          lxSource: lxSource,
         ),
         _SearchCategory.songs => const <PluginCatalogResult>[],
       };

@@ -456,6 +456,37 @@ class PlaylistsNotifier extends StateNotifier<List<MobilePlaylist>> {
     await _save();
   }
 
+  /// 设置/清除歌单自定义封面（封面编辑页专用）。
+  ///
+  /// [coverUrl] 非空时设为自定义封面（可为网络 URL 或本地 `file://` 路径）；
+  /// 空串表示清除自定义封面，[MobilePlaylist.effectiveCoverUrl] 回退为
+  /// 第一首歌的封面。
+  Future<void> setCover(String id, String coverUrl) async {
+    await _loaded;
+    final index = state.indexWhere((item) => item.id == id);
+    if (index < 0) return;
+    final trimmed = coverUrl.trim();
+    final current = state[index];
+    final next = [...state];
+    // copyWith 的 coverUrl 语义是「null = 保持原值」，清除必须重建实例。
+    next[index] = trimmed.isEmpty
+        ? MobilePlaylist(
+            id: current.id,
+            name: current.name,
+            songPaths: current.songPaths,
+            createdAt: current.createdAt,
+            coverUrl: null,
+            songSnapshots: current.songSnapshots,
+            customOrder: current.customOrder,
+            importSources: current.importSources,
+            songSources: current.songSources,
+            favorited: current.favorited,
+          )
+        : current.copyWith(coverUrl: trimmed);
+    state = next;
+    await _save();
+  }
+
   /// 切换歌单收藏状态（歌单级收藏，与歌曲级「已收藏」互不影响），
   /// 返回切换后的结果（true 表示已收藏）。
   Future<bool> toggleFavorite(String id) async {

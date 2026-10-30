@@ -26,7 +26,12 @@ import 'ghost_cover.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/scheduler.dart';
 import 'package:flutter/services.dart'
-    show SystemChrome, SystemUiOverlayStyle, DeviceOrientation;
+    show
+        MethodChannel,
+        SystemChrome,
+        SystemUiMode,
+        SystemUiOverlayStyle,
+        DeviceOrientation;
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -44,7 +49,7 @@ import 'visualizer_settings.dart';
 /// 歌词偏移存取 key（与播放页共用同一份配置）。
 const String _lyricsOffsetsKey = 'playerLyricsOffsetsTenthsV1';
 
-enum _DrawerSection { none, theme, groundEq, blocks, pulse, meteor, lyrics, detect }
+enum _DrawerSection { none, theme, groundEq, blocks, pulse, meteor, lyrics, bar, detect }
 
 class VisualizerPage extends ConsumerStatefulWidget {
   const VisualizerPage({super.key});
@@ -54,7 +59,12 @@ class VisualizerPage extends ConsumerStatefulWidget {
 }
 
 class _VisualizerPageState extends ConsumerState<VisualizerPage>
-    with SingleTickerProviderStateMixin {
+    with SingleTickerProviderStateMixin, WidgetsBindingObserver {
+  /// 状态栏原生兜底通道：Android 15 强制 edge-to-edge 后 SystemChrome 的
+  /// immersiveSticky 在部分机型（荣耀等）失效，API 30+ 用原生
+  /// WindowInsetsController 硬隐藏状态栏。
+  static const _systemUiChannel = MethodChannel('com.xymusic.mobile/system_ui');
+
   Ticker? _ticker;
   Duration _lastElapsed = Duration.zero;
   double _time = 0; // 真实秒（按压时长/冷却计时）
@@ -103,24 +113,79 @@ class _VisualizerPageState extends ConsumerState<VisualizerPage>
   int _lyricsOffsetTenths = 0;
   String? _offsetLoadedFor;
 
+  // 底部播放栏自动隐藏：开启后 3 秒无触摸淡出。可见时任意触摸刷新计时；
+  // 隐藏后只有单击播放栏区域唤起（_revealBar），点场景/其它区域不唤起。
+  // Listener 在 build 的 Stack 外层监听，不消费事件。
+  Timer? _barHideTimer;
+  bool _barVisible = true;
+
+  void _touchActivity() {
+    // 隐藏期间触摸不算活动：唤起只认播放栏区域的单击。
+    if (!_barVisible) return;
+    _barHideTimer?.cancel();
+    _barHideTimer = null;
+    if (ref.read(visualizerSettingsProvider).autoHideBar) {
+      _barHideTimer = Timer(const Duration(seconds: 3), () {
+        if (mounted && _barVisible) setState(() => _barVisible = false);
+      });
+    }
+  }
+
+  /// 单击播放栏区域唤起：显示并立即启动 3 秒隐藏计时。
+  void _revealBar() {
+    setState(() => _barVisible = true);
+    _touchActivity();
+  }
+
+  /// 沉浸式隐藏状态栏：SystemChrome 兜底旧机型，API 30+ 原生硬隐藏。
+  /// 路由过渡/前台恢复后 insets 状态可能被重置，帧后与 resume 各调一次。
+  Future<void> _hideStatusBar() async {
+    await SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
+    await _systemUiChannel.invokeMethod<bool>('setStatusBarHidden', {
+      'hidden': true,
+    });
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      unawaited(_hideStatusBar());
+    }
+  }
+
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     // 可视化仅限横屏：进入锁横屏，退出恢复。
     SystemChrome.setPreferredOrientations(
         const [DeviceOrientation.landscapeLeft, DeviceOrientation.landscapeRight]);
+    // 沉浸式：隐藏状态栏（从屏幕边缘下滑可临时呼出，sticky 自动回收）。
+    unawaited(_hideStatusBar());
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) unawaited(_hideStatusBar());
+    });
     _ticker = createTicker(_onTick)..start();
     unawaited(_bootSource());
   }
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _ticker?.dispose();
     _frameTick.dispose();
+    _barHideTimer?.cancel();
     _coverImage?.dispose();
     _coverImage = null;
     unawaited(VisualizerSource.instance.stop());
     SystemChrome.setPreferredOrientations(DeviceOrientation.values);
+    // 恢复全局边到边布局（与应用其余页面一致，状态栏回归）。
+    SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
+    unawaited(
+      _systemUiChannel.invokeMethod<bool>('setStatusBarHidden', {
+        'hidden': false,
+      }),
+    );
     super.dispose();
   }
 
@@ -336,6 +401,8 @@ class _VisualizerPageState extends ConsumerState<VisualizerPage>
     final settings = ref.watch(visualizerSettingsProvider);
     final player = ref.watch(playerProvider);
     final current = player.current;
+    // 关闭自动隐藏时立即唤起播放栏（build 内直接改标志，本次渲染即生效）。
+    if (!settings.autoHideBar && !_barVisible) _barVisible = true;
 
     // 歌曲切换时重载歌词偏移 + 封面幽灵层。
     final songPath = current?.path ?? '';
@@ -353,113 +420,138 @@ class _VisualizerPageState extends ConsumerState<VisualizerPage>
       backgroundColor: Colors.black,
       body: AnnotatedRegion<SystemUiOverlayStyle>(
         value: SystemUiOverlayStyle.light,
-        child: Stack(
-          fit: StackFit.expand,
-          children: [
-            // 场景层（Ticker 驱动，不随 riverpod 重建）+ 轨道相机手势。
-            RepaintBoundary(
-              child: GestureDetector(
-                behavior: HitTestBehavior.opaque,
-                onScaleStart: _onScaleStart,
-                onScaleUpdate: _onScaleUpdate,
-                onTapDown: (d) {
-                  _pressAt = _time;
-                  _pressPos = d.localPosition;
-                },
-                onTapUp: _onTapRelease,
-                onTapCancel: () {
-                  _pressAt = null;
-                  _pressPos = null;
-                },
-                child: Builder(builder: (context) {
-                  // 活帧：settings/form 或封面纹理变化时重建，否则复用
-                  // _onTick 每帧原地更新的同一实例——暂停/无音频无 rebuild
-                  // 时动画时间流仍由 repaint 驱动持续推进（脉冲正常回落）。
-                  if (_liveFrame == null ||
-                      _liveFrame!.settings != settings ||
-                      _liveFrame!.coverImage != _coverImage) {
-                    _liveFrame = _frame(settings);
-                  }
-                  final visFrame = _liveFrame!;
-                  return CustomPaint(
-                    painter: settings.form == VisualizerForm.terrain
-                        ? TerrainScenePainter(
-                            visFrame,
-                            repaint: _frameTick, // Ticker 每帧驱动重绘
-                          )
-                        : NebulaScenePainter(
-                            visFrame,
-                            repaint: _frameTick,
-                          ),
-                    isComplex: true,
-                    willChange: true,
-                  );
-                }),
-              ),
-            ),
-            // 歌词覆盖层（设置驱动：模式/字号/颜色/字体）。
-            // 5547：左右手势分区废除——歌词层不参与任何手势
-            // （IgnorePointer），全屏手势统一控制脉冲方块地形图
-            // （拖动=轨道视角旋转，单击/长按=涟漪波纹）。
-            Positioned(
-              left: 16,
-              top: 0,
-              bottom: 140,
-              width: MediaQuery.of(context).size.width * 0.40,
-              child: IgnorePointer(
-                child: _LyricsOverlay(
-                  offsetTenths: _lyricsOffsetTenths,
-                  settings: settings,
+        // Listener 只监听不消费：可见时任意触摸（拖动/单击/设置面板操作）
+        // 都刷新 3 秒隐藏计时；隐藏期间触摸不唤起（唤起只认播放栏区域
+        // 单击，见 _revealBar）。
+        child: Listener(
+          onPointerDown: (_) => _touchActivity(),
+          child: Stack(
+            fit: StackFit.expand,
+            children: [
+              // 场景层（Ticker 驱动，不随 riverpod 重建）+ 轨道相机手势。
+              RepaintBoundary(
+                child: GestureDetector(
+                  behavior: HitTestBehavior.opaque,
+                  onScaleStart: _onScaleStart,
+                  onScaleUpdate: _onScaleUpdate,
+                  onTapDown: (d) {
+                    _pressAt = _time;
+                    _pressPos = d.localPosition;
+                  },
+                  onTapUp: _onTapRelease,
+                  onTapCancel: () {
+                    _pressAt = null;
+                    _pressPos = null;
+                  },
+                  child: Builder(builder: (context) {
+                    // 活帧：settings/form 或封面纹理变化时重建，否则复用
+                    // _onTick 每帧原地更新的同一实例——暂停/无音频无 rebuild
+                    // 时动画时间流仍由 repaint 驱动持续推进（脉冲正常回落）。
+                    if (_liveFrame == null ||
+                        _liveFrame!.settings != settings ||
+                        _liveFrame!.coverImage != _coverImage) {
+                      _liveFrame = _frame(settings);
+                    }
+                    final visFrame = _liveFrame!;
+                    return CustomPaint(
+                      painter: settings.form == VisualizerForm.terrain
+                          ? TerrainScenePainter(
+                              visFrame,
+                              repaint: _frameTick, // Ticker 每帧驱动重绘
+                            )
+                          : NebulaScenePainter(
+                              visFrame,
+                              repaint: _frameTick,
+                            ),
+                      isComplex: true,
+                      willChange: true,
+                    );
+                  }),
                 ),
               ),
-            ),
-            // 底部毛玻璃播放条（循环/上一/播放/下一/队列/设置，对齐参考图）。
-            Positioned(
-              left: 16,
-              right: 16,
-              bottom: 18,
-              child: _GlassPlayBar(
-                songPath: songPath,
-                title: current?.title ?? '未在播放',
-                coverPath: _coverSourcePath,
-                onOpenSettings: () => setState(() {
-                  _drawer =
-                      _drawer == _DrawerSection.none ? _DrawerSection.theme : _DrawerSection.none;
-                }),
-              ),
-            ),
-            // 右侧设置抽屉。
-            _SettingsDrawer(
-              section: _drawer,
-              onClose: () => setState(() => _drawer = _DrawerSection.none),
-              onFormChanged: (f) {
-                // 切换形态时清空 ripple（两形态坐标系不同）。
-                _ripples.clear();
-                ref
-                    .read(visualizerSettingsProvider.notifier)
-                    .update((s) => s.copyWith(form: f));
-              },
-              onSectionChanged: (s) => setState(() => _drawer = s),
-            ),
-            // 数据源失败/无音频输出提示（居左下，短暂显示）。
-            if (_sourceFailed)
+              // 歌词覆盖层（设置驱动：模式/字号/颜色/字体）。
+              // 5547：左右手势分区废除——歌词层不参与任何手势
+              // （IgnorePointer），全屏手势统一控制脉冲方块地形图
+              // （拖动=轨道视角旋转，单击/长按=涟漪波纹）。
               Positioned(
                 left: 16,
-                bottom: 150,
-                child: _SourceFailHint(
-                  text: '频谱采集不可用（需要麦克风权限）',
-                  onRetry: _retrySource,
-                ),
-              )
-            else if (_noAudioHint)
-              Positioned(
-                left: 16,
-                bottom: 150,
-                child: _SourceFailHint(
-                  text: '未检测到音频输出，请播放音乐后重试',
+                top: 0,
+                bottom: 140,
+                width: MediaQuery.of(context).size.width * 0.40,
+                child: IgnorePointer(
+                  child: _LyricsOverlay(
+                    offsetTenths: _lyricsOffsetTenths,
+                    settings: settings,
+                  ),
                 ),
               ),
-          ],
+              // 底部毛玻璃播放条（对齐图一：左封面+歌名+歌手 / 中进度条 /
+              // 右控制按钮；支持 3 秒无操作自动隐藏，隐藏后单击本区域
+              // 唤起——GestureDetector 常驻占位命中，可见时把单击让给
+              // 播放栏内部按钮）。
+              Positioned(
+                left: 16,
+                right: 16,
+                bottom: 18,
+                child: AnimatedOpacity(
+                  opacity: _barVisible ? 1 : 0,
+                  duration: const Duration(milliseconds: 260),
+                  curve: Curves.easeOutCubic,
+                  child: GestureDetector(
+                    behavior: HitTestBehavior.opaque,
+                    // 可见时不拦截（onTap=null，命中落到内部按钮）；
+                    // 隐藏时 IgnorePointer 让单击落到这里唤起。
+                    onTap: _barVisible ? null : _revealBar,
+                    child: IgnorePointer(
+                      ignoring: !_barVisible,
+                      child: _GlassPlayBar(
+                        songPath: songPath,
+                        title: current?.title ?? '未在播放',
+                        artist: current?.artist ?? '',
+                        coverPath: _coverSourcePath,
+                        onOpenSettings: () => setState(() {
+                          _drawer = _drawer == _DrawerSection.none
+                              ? _DrawerSection.theme
+                              : _DrawerSection.none;
+                        }),
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+              // 右侧设置抽屉。
+              _SettingsDrawer(
+                section: _drawer,
+                onClose: () => setState(() => _drawer = _DrawerSection.none),
+                onFormChanged: (f) {
+                  // 切换形态时清空 ripple（两形态坐标系不同）。
+                  _ripples.clear();
+                  ref
+                      .read(visualizerSettingsProvider.notifier)
+                      .update((s) => s.copyWith(form: f));
+                },
+                onSectionChanged: (s) => setState(() => _drawer = s),
+              ),
+              // 数据源失败/无音频输出提示（居左下，短暂显示）。
+              if (_sourceFailed)
+                Positioned(
+                  left: 16,
+                  bottom: 150,
+                  child: _SourceFailHint(
+                    text: '频谱采集不可用（需要麦克风权限）',
+                    onRetry: _retrySource,
+                  ),
+                )
+              else if (_noAudioHint)
+                Positioned(
+                  left: 16,
+                  bottom: 150,
+                  child: _SourceFailHint(
+                    text: '未检测到音频输出，请播放音乐后重试',
+                  ),
+                ),
+            ],
+          ),
         ),
       ),
     );
@@ -661,8 +753,9 @@ class _LyricsOverlayState extends ConsumerState<_LyricsOverlay> {
   final ScrollController _scroll = ScrollController();
   int _lastActive = -1;
 
+  // 行距系数（5581 从 2.6 收紧到 2.0，对齐参考图的紧凑排版）。
   double _rowExtent(VisualizerSettings s) =>
-      math.max(s.lyricsActiveSize, s.lyricsInactiveSize) * 2.6;
+      math.max(s.lyricsActiveSize, s.lyricsInactiveSize) * 2.0;
 
   @override
   void dispose() {
@@ -840,11 +933,13 @@ class _LyricsOverlayState extends ConsumerState<_LyricsOverlay> {
 class _GlassPlayBar extends ConsumerStatefulWidget {
   final String songPath;
   final String title;
+  final String artist;
   final String? coverPath; // 原始封面文件路径（缩略图）
   final VoidCallback onOpenSettings;
   const _GlassPlayBar({
     required this.songPath,
     required this.title,
+    required this.artist,
     required this.coverPath,
     required this.onOpenSettings,
   });
@@ -949,162 +1044,196 @@ class _GlassPlayBarState extends ConsumerState<_GlassPlayBar> {
     final cover = widget.coverPath;
 
     return ClipRRect(
-      borderRadius: BorderRadius.circular(22),
+      borderRadius: BorderRadius.circular(26),
       child: BackdropFilter(
         filter: ImageFilter.blur(sigmaX: 18, sigmaY: 18),
         child: Container(
-          padding: const EdgeInsets.fromLTRB(18, 10, 18, 12),
+          padding: const EdgeInsets.fromLTRB(14, 10, 14, 10),
           decoration: BoxDecoration(
-            color: Colors.white.withValues(alpha: 0.07),
-            borderRadius: BorderRadius.circular(22),
+            color: Colors.black.withValues(alpha: 0.42),
+            borderRadius: BorderRadius.circular(26),
             border: Border.all(
               color: Colors.white.withValues(alpha: 0.10),
             ),
           ),
+          // 对齐图一的单行大圆角胶囊：左侧封面+歌名+歌手，中间进度条
+          // （两端时间），右侧模式/上一曲/大圆播放/下一曲/队列/设置。
           child: Row(
             crossAxisAlignment: CrossAxisAlignment.center,
             children: [
-              // 封面缩略图。
+              // 左：封面缩略图 + 歌名/歌手。
               ClipRRect(
-                borderRadius: BorderRadius.circular(12),
+                borderRadius: BorderRadius.circular(10),
                 child: cover != null && File(cover).existsSync()
                     ? Image.file(
                         File(cover),
-                        width: 46,
-                        height: 46,
+                        width: 44,
+                        height: 44,
                         fit: BoxFit.cover,
                         gaplessPlayback: true,
                       )
                     : Container(
-                        width: 46,
-                        height: 46,
+                        width: 44,
+                        height: 44,
                         color: Colors.white.withValues(alpha: 0.08),
                         child: const Icon(Icons.music_note_rounded,
                             size: 20, color: Colors.white38),
                       ),
               ),
-              const SizedBox(width: 14),
-              Expanded(
+              const SizedBox(width: 10),
+              ConstrainedBox(
+                constraints: const BoxConstraints(maxWidth: 190),
                 child: Column(
                   mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    Row(
-                      children: [
-                        Text(_fmt(position),
-                            style: TextStyle(
-                              color: Colors.white.withValues(alpha: 0.65),
-                              fontSize: 11,
-                              fontFeatures: const [FontFeature.tabularFigures()],
-                            )),
-                        Expanded(
-                          child: SliderTheme(
-                            data: SliderTheme.of(context).copyWith(
-                              trackHeight: 2.5,
-                              overlayShape: SliderComponentShape.noOverlay,
-                              thumbShape:
-                                  const RoundSliderThumbShape(enabledThumbRadius: 5),
-                              activeTrackColor: Colors.white.withValues(alpha: 0.85),
-                              inactiveTrackColor:
-                                  Colors.white.withValues(alpha: 0.16),
-                              thumbColor: Colors.white,
-                            ),
-                            child: Slider(
-                              value: _dragValue ??
-                                  position.clamp(0.0, duration > 0 ? duration : 1),
-                              max: duration > 0 ? duration : 1,
-                              onChanged: duration > 0
-                                  ? (v) => setState(() => _dragValue = v)
-                                  : null,
-                              onChangeEnd: (v) {
-                                _dragValue = null;
-                                unawaited(
-                                    ref.read(playerProvider.notifier).seek(v));
-                              },
-                            ),
-                          ),
-                        ),
-                        Text(_fmt(duration),
-                            style: TextStyle(
-                              color: Colors.white.withValues(alpha: 0.65),
-                              fontSize: 11,
-                              fontFeatures: const [FontFeature.tabularFigures()],
-                            )),
-                      ],
+                    Text(
+                      widget.title,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                        color: Colors.white,
+                        fontSize: 13.5,
+                        fontWeight: FontWeight.bold,
+                        height: 1.15,
+                      ),
                     ),
-                    const SizedBox(height: 2),
-                    Row(
-                      mainAxisAlignment: MainAxisAlignment.center,
-                      children: [
-                        // 播放顺序（循环模式三态）。
-                        IconButton(
-                          tooltip: '播放顺序',
-                          onPressed: () =>
-                              unawaited(notifier.cyclePlayMode()),
-                          icon: Icon(
-                            loopIcons[playMode.clamp(0, 2)],
-                            size: 22,
-                            color: Colors.white.withValues(alpha: 0.85),
-                          ),
+                    if (widget.artist.trim().isNotEmpty)
+                      Text(
+                        widget.artist,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                          color: Colors.white.withValues(alpha: 0.55),
+                          fontSize: 11,
+                          height: 1.2,
                         ),
-                        const SizedBox(width: 10),
-                        IconButton(
-                          onPressed: () =>
-                              unawaited(notifier.previous()),
-                          icon: const Icon(Icons.skip_previous_rounded,
-                              color: Colors.white, size: 28),
-                        ),
-                        const SizedBox(width: 10),
-                        Material(
-                          color: Colors.white.withValues(alpha: 0.14),
-                          shape: const CircleBorder(),
-                          child: InkWell(
-                            customBorder: const CircleBorder(),
-                            onTap: () =>
-                                unawaited(notifier.toggle()),
-                            child: SizedBox(
-                              width: 50,
-                              height: 50,
-                              child: Icon(
-                                isPlaying
-                                    ? Icons.pause_rounded
-                                    : Icons.play_arrow_rounded,
-                                color: Colors.white,
-                                size: 30,
-                              ),
-                            ),
-                          ),
-                        ),
-                        const SizedBox(width: 10),
-                        IconButton(
-                          onPressed: () => unawaited(notifier.next()),
-                          icon: const Icon(Icons.skip_next_rounded,
-                              color: Colors.white, size: 28),
-                        ),
-                        const SizedBox(width: 10),
-                        IconButton(
-                          tooltip: '播放队列',
-                          onPressed: queueLen > 0 ? _showQueue : null,
-                          icon: Icon(
-                            Icons.queue_music_rounded,
-                            size: 24,
-                            color: Colors.white.withValues(
-                                alpha: queueLen > 0 ? 0.85 : 0.3),
-                          ),
-                        ),
-                        const SizedBox(width: 10),
-                        IconButton(
-                          tooltip: '可视化设置',
-                          onPressed: widget.onOpenSettings,
-                          icon: Icon(
-                            Icons.tune_rounded,
-                            size: 23,
-                            color: Colors.white.withValues(alpha: 0.85),
-                          ),
-                        ),
-                      ],
-                    ),
+                      ),
                   ],
                 ),
+              ),
+              const SizedBox(width: 12),
+              // 中：进度条（两端时间标注）。
+              Expanded(
+                child: Row(
+                  children: [
+                    Text(_fmt(position),
+                        style: TextStyle(
+                          color: Colors.white.withValues(alpha: 0.65),
+                          fontSize: 11,
+                          fontFeatures: const [FontFeature.tabularFigures()],
+                        )),
+                    Expanded(
+                      child: SliderTheme(
+                        data: SliderTheme.of(context).copyWith(
+                          trackHeight: 2.5,
+                          overlayShape: SliderComponentShape.noOverlay,
+                          thumbShape:
+                              const RoundSliderThumbShape(enabledThumbRadius: 5),
+                          activeTrackColor: Colors.white.withValues(alpha: 0.85),
+                          inactiveTrackColor:
+                              Colors.white.withValues(alpha: 0.16),
+                          thumbColor: Colors.white,
+                        ),
+                        child: Slider(
+                          value: _dragValue ??
+                              position.clamp(0.0, duration > 0 ? duration : 1),
+                          max: duration > 0 ? duration : 1,
+                          onChanged: duration > 0
+                              ? (v) => setState(() => _dragValue = v)
+                              : null,
+                          onChangeEnd: (v) {
+                            _dragValue = null;
+                            unawaited(
+                                ref.read(playerProvider.notifier).seek(v));
+                          },
+                        ),
+                      ),
+                    ),
+                    Text(_fmt(duration),
+                        style: TextStyle(
+                          color: Colors.white.withValues(alpha: 0.65),
+                          fontSize: 11,
+                          fontFeatures: const [FontFeature.tabularFigures()],
+                        )),
+                  ],
+                ),
+              ),
+              const SizedBox(width: 10),
+              // 右：控制按钮组（模式/上一曲/播放/下一曲/队列/设置）。
+              Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  IconButton(
+                    tooltip: '播放顺序',
+                    visualDensity: VisualDensity.compact,
+                    onPressed: () => unawaited(notifier.cyclePlayMode()),
+                    icon: Icon(
+                      loopIcons[playMode.clamp(0, 2)],
+                      size: 21,
+                      color: Colors.white.withValues(alpha: 0.85),
+                    ),
+                  ),
+                  const SizedBox(width: 2),
+                  IconButton(
+                    tooltip: '上一首',
+                    visualDensity: VisualDensity.compact,
+                    onPressed: () => unawaited(notifier.previous()),
+                    icon: const Icon(Icons.skip_previous_rounded,
+                        color: Colors.white, size: 26),
+                  ),
+                  const SizedBox(width: 2),
+                  // 大圆播放钮：白底黑图标（对齐图一）。
+                  Material(
+                    color: Colors.white,
+                    shape: const CircleBorder(),
+                    child: InkWell(
+                      customBorder: const CircleBorder(),
+                      onTap: () => unawaited(notifier.toggle()),
+                      child: SizedBox(
+                        width: 46,
+                        height: 46,
+                        child: Icon(
+                          isPlaying
+                              ? Icons.pause_rounded
+                              : Icons.play_arrow_rounded,
+                          color: Colors.black,
+                          size: 27,
+                        ),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 2),
+                  IconButton(
+                    tooltip: '下一首',
+                    visualDensity: VisualDensity.compact,
+                    onPressed: () => unawaited(notifier.next()),
+                    icon: const Icon(Icons.skip_next_rounded,
+                        color: Colors.white, size: 26),
+                  ),
+                  const SizedBox(width: 2),
+                  IconButton(
+                    tooltip: '播放队列',
+                    visualDensity: VisualDensity.compact,
+                    onPressed: queueLen > 0 ? _showQueue : null,
+                    icon: Icon(
+                      Icons.queue_music_rounded,
+                      size: 22,
+                      color: Colors.white.withValues(
+                          alpha: queueLen > 0 ? 0.85 : 0.3),
+                    ),
+                  ),
+                  IconButton(
+                    tooltip: '可视化设置',
+                    visualDensity: VisualDensity.compact,
+                    onPressed: widget.onOpenSettings,
+                    icon: Icon(
+                      Icons.tune_rounded,
+                      size: 21,
+                      color: Colors.white.withValues(alpha: 0.85),
+                    ),
+                  ),
+                ],
               ),
             ],
           ),
@@ -1133,7 +1262,7 @@ class _SettingsDrawer extends ConsumerWidget {
   });
 
   static const _sectionLabels = [
-    '主题配色', '地形均衡器', '悬浮方块', '脉冲触发', '流星触发', '歌词设置', '音频检测',
+    '主题配色', '地形均衡器', '悬浮方块', '脉冲触发', '流星触发', '歌词设置', '播放栏', '音频检测',
   ];
   static const _sectionOrder = [
     _DrawerSection.theme,
@@ -1142,6 +1271,7 @@ class _SettingsDrawer extends ConsumerWidget {
     _DrawerSection.pulse,
     _DrawerSection.meteor,
     _DrawerSection.lyrics,
+    _DrawerSection.bar,
     _DrawerSection.detect,
   ];
   // 图标栏（对齐参考图：垂直图标列，选中项圆角描边高亮）。
@@ -1152,6 +1282,7 @@ class _SettingsDrawer extends ConsumerWidget {
     Icons.monitor_heart_outlined, // 脉冲触发
     Icons.auto_awesome_outlined, // 流星触发
     Icons.music_note_outlined, // 歌词设置
+    Icons.slideshow_rounded, // 播放栏
     Icons.graphic_eq_rounded, // 音频检测
   ];
 
@@ -1593,6 +1724,16 @@ class _SettingsDrawer extends ConsumerWidget {
                                 .update((s) => s.copyWith(lyricsOffsetX: v)),
                             label: settings.lyricsOffsetX.round().toString(),
                           ),
+                        ]
+                        // —— 播放栏 ——
+                        else if (section == _DrawerSection.bar) ...[
+                          _switchTile(
+                            '自动隐藏播放栏',
+                            settings.autoHideBar,
+                            (v) => notifier
+                                .update((s) => s.copyWith(autoHideBar: v)),
+                          ),
+                          hint('开启后 3 秒内无任何触摸自动隐藏，单击屏幕即可唤起。'),
                         ]
                         // —— 音频检测 ——
                         else if (section == _DrawerSection.detect) ...[

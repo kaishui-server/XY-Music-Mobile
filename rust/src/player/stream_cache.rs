@@ -1402,3 +1402,52 @@ pub fn clear_all() {
         }
     }
 }
+
+/// 流缓存目录路径（供前端统计占用）。
+pub fn stream_cache_dir() -> String {
+    cache_dir().to_string_lossy().to_string()
+}
+
+/// 将流缓存按 LRU 淘汰到目标大小（字节）：按最后访问时间从最旧开始
+/// 删除，直到当前占用 <= `target_bytes`。最近 60 秒内访问过的条目跳过，
+/// 保护正在播放/下载中的缓存；删除失败（如 Windows 上被播放器句柄占用）
+/// 时停止，避免死循环。不修改用户配置的上限，返回实际释放的字节数。
+pub fn evict_stream_cache_to(target_bytes: u64) -> u64 {
+    let mut mgr = cache().lock().unwrap_or_else(|e| e.into_inner());
+    if mgr.current_size <= target_bytes {
+        return 0;
+    }
+    let now = SystemTime::now();
+    let mut freed: u64 = 0;
+    while mgr.current_size > target_bytes && !mgr.entries.is_empty() {
+        let oldest_key = mgr
+            .entries
+            .iter()
+            .filter(|(_, entry)| {
+                let age = now
+                    .duration_since(entry.last_accessed)
+                    .unwrap_or(Duration::ZERO);
+                age >= Duration::from_secs(60)
+            })
+            .min_by_key(|(_, entry)| entry.last_accessed)
+            .map(|(k, _)| k.clone());
+        let Some(key) = oldest_key else {
+            break;
+        };
+        if let Some(entry) = mgr.entries.remove(&key) {
+            match std::fs::remove_file(&entry.path) {
+                Ok(_) => {
+                    mgr.current_size = mgr.current_size.saturating_sub(entry.size);
+                    freed += entry.size;
+                }
+                Err(_) => {
+                    // 删除失败（如 Windows 上被播放器句柄占用）：
+                    // 放回索引并停止，避免死循环。
+                    mgr.entries.insert(key, entry);
+                    break;
+                }
+            }
+        }
+    }
+    freed
+}

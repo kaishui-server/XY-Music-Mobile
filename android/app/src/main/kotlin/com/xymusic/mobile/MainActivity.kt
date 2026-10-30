@@ -1,19 +1,25 @@
 package com.xymusic.mobile
 
 import android.app.Activity
+import android.content.ComponentCallbacks2
 import android.content.ContentValues
 import android.content.Intent
 import android.media.projection.MediaProjectionManager
 import android.net.Uri
 import android.net.wifi.WifiManager
 import android.os.Build
+import android.os.Debug
 import android.os.Environment
+import android.os.Handler
+import android.os.Looper
 import android.os.PowerManager
 import android.provider.MediaStore
 import android.provider.DocumentsContract
 import android.provider.Settings
 import android.view.KeyEvent
 import android.view.WindowManager
+import android.view.WindowInsets
+import android.view.WindowInsetsController
 import android.webkit.MimeTypeMap
 import android.media.AudioManager
 import android.media.MediaScannerConnection
@@ -45,6 +51,8 @@ class MainActivity : AudioServiceActivity() {
         private const val MEDIA_BUTTON_CHANNEL = "com.xymusic.mobile/media_buttons"
         private const val VOLUME_KEY_CHANNEL = "com.xymusic.mobile/volume_keys"
         private const val MINI_PLAYER_CHANNEL = "com.xymusic.mobile/mini_player"
+        private const val SYSTEM_UI_CHANNEL = "com.xymusic.mobile/system_ui"
+        private const val MEMORY_PRESSURE_CHANNEL = "com.xymusic.mobile/memory_pressure"
         private const val CAPTURE_REQUEST = 4217
         private const val DIRECTORY_REQUEST = 4218
     }
@@ -53,6 +61,36 @@ class MainActivity : AudioServiceActivity() {
     private var pendingDirectoryResult: MethodChannel.Result? = null
     private var deepLinkChannel: MethodChannel? = null
     private var pendingDeepLink: String? = null
+    private var memoryPressureChannel: MethodChannel? = null
+    // 内存治理 ⑪：Native Heap 周期监控（60s）。超阈值时向 Dart 发事件，
+    // 由 Dart 侧重建播放器/清缓存降级；小米机型阈值单独下调（⑫）。
+    private val memoryMonitorHandler = Handler(Looper.getMainLooper())
+    private val memoryMonitorRunnable = object : Runnable {
+        override fun run() {
+            try {
+                val info = Debug.MemoryInfo()
+                Debug.getMemoryInfo(info)
+                val thresholdMb = if (isXiaomiDevice()) 700 else 900
+                if (info.nativePss > thresholdMb * 1024) {
+                    memoryPressureChannel?.invokeMethod(
+                        "nativePressure",
+                        mapOf(
+                            "nativePssKb" to info.nativePss,
+                            "isXiaomi" to isXiaomiDevice(),
+                        ),
+                    )
+                }
+            } catch (_: Exception) {
+            }
+            memoryMonitorHandler.postDelayed(this, 60_000)
+        }
+    }
+
+    private fun isXiaomiDevice(): Boolean {
+        val m = Build.MANUFACTURER?.lowercase() ?: return false
+        return m.contains("xiaomi") || m.contains("redmi") || m.contains("poco")
+    }
+
     private var mediaButtonChannel: MethodChannel? = null
 
     /// 迷你播放器悬浮窗通道：Dart 侧据此启停浮窗、同步播放状态，并接收
@@ -100,6 +138,20 @@ class MainActivity : AudioServiceActivity() {
         // 通知栏双击（自动开桌面歌词）/浮窗 ⚙ 设置键的冷启动转发。
         handleDesktopLyricsIntent(intent)
         acquirePlaybackWifiLock()
+        // 内存治理 ⑪：Native Heap 周期监控启动（首个周期 60s 后）。
+        memoryMonitorHandler.postDelayed(memoryMonitorRunnable, 60_000)
+    }
+
+    override fun onTrimMemory(level: Int) {
+        super.onTrimMemory(level)
+        // 内存治理 ⑥：系统内存压力回调，通知 Dart 清理非关键缓存；
+        // 后台未播放时 Dart 侧会彻底释放播放器（stop→reset→release）。
+        if (level >= ComponentCallbacks2.TRIM_MEMORY_RUNNING_MODERATE) {
+            memoryPressureChannel?.invokeMethod(
+                "onTrimMemory",
+                mapOf("level" to level, "isXiaomi" to isXiaomiDevice()),
+            )
+        }
     }
 
     override fun onDestroy() {
@@ -108,8 +160,13 @@ class MainActivity : AudioServiceActivity() {
         } catch (_: Exception) {
         }
         wifiLock = null
+        memoryMonitorHandler.removeCallbacks(memoryMonitorRunnable)
         super.onDestroy()
     }
+
+    private fun canDrawOverlaysCompat(): Boolean =
+        Build.VERSION.SDK_INT < Build.VERSION_CODES.M ||
+            Settings.canDrawOverlays(this)
 
     /// 播放期 Wi-Fi 锁使用 WIFI_MODE_FULL_HIGH_PERF：禁用 Wi-Fi 省电，
     /// 保持天线高性能收发。API 34 起该模式被标记废弃（系统认为默认
@@ -137,34 +194,39 @@ class MainActivity : AudioServiceActivity() {
         extractDeepLink(intent)?.let { raw ->
             deepLinkChannel?.invokeMethod("onDeepLink", raw)
         }
-        // 通知栏双击（自动开桌面歌词）/浮窗 ⚙ 设置键的热启动转发。
-        // 单击进软件由 Receiver 直接拉起 Activity，无需额外动作。
+        // 浮窗 ⚙ 设置键的热启动转发（通知点击/胶囊单击进软件由 Receiver
+        // 直接拉起 Activity，无需额外动作）。
         handleDesktopLyricsIntent(intent)
     }
 
     /// 分发桌面歌词相关的启动意图：
-    /// - extra `auto_enable_desktop_lyrics`：通知栏双击 → 请求 Dart 开启
-    ///   桌面歌词悬浮窗（走设置开关链路，权限校验/状态同步全在 Dart）；
     /// - extra `open_desktop_lyrics_settings`：浮窗 ⚙ 设置键 → 请求 Dart
     ///   打开桌面歌词设置页。
     /// 通道未就绪（冷启动早于 Flutter 引擎）时暂存动作名。
+    /// 历史上的 `auto_enable_desktop_lyrics`（通知双击自动开歌词）已移除：
+    /// MagicOS 胶囊单击常被拆成两次广播误入双击链，无权限时会弹授权页。
     private fun handleDesktopLyricsIntent(intent: Intent?) {
-        val method = when {
-            intent?.getBooleanExtra("auto_enable_desktop_lyrics", false) == true ->
-                "onOpenRequested"
-            intent?.getBooleanExtra("open_desktop_lyrics_settings", false) == true ->
-                "onOpenSettings"
-            else -> return
-        }
-        val channel = desktopLyricsChannelRef
-        if (channel == null) {
-            pendingDesktopLyricsAction = method
+        if (intent?.getBooleanExtra("open_desktop_lyrics_settings", false) != true) {
             return
         }
-        try {
-            channel.invokeMethod(method, null)
-        } catch (_: Exception) {
-            // 引擎已销毁时忽略。
+        val method = "onOpenSettings"
+        val channel = desktopLyricsChannelRef
+        val dartReady = channel != null &&
+            flutterEngine?.dartExecutor?.isExecutingDart == true
+        if (dartReady) {
+            // 热启动：Dart 侧 handler 必然已装好（PlayerNotifier 构造时
+            // ensureReady），invoke 直达（pending 不暂存——否则残留会在
+            // 下次冷启动被 ensureReady 重复拉取，误开一次设置页）。
+            try {
+                channel!!.invokeMethod(method, null)
+            } catch (_: Exception) {
+                // 引擎已销毁时忽略。
+            }
+        } else {
+            // 冷启动早期：configureFlutterEngine 早于 Dart 侧
+            // setMethodCallHandler 安装，invoke 到达时通道无接收端会静默
+            // 丢失——暂存给 Dart ensureReady 启动时主动拉取（拉取即清空）。
+            pendingDesktopLyricsAction = method
         }
     }
 
@@ -589,6 +651,20 @@ class MainActivity : AudioServiceActivity() {
                 }
             }
         }
+        // 内存治理通道：Dart 侧注册后主动拉取机型信息（getInitialInfo）；
+        // 原生 onTrimMemory / Native Heap 监控超限时向 Dart 发事件。
+        memoryPressureChannel = MethodChannel(
+            flutterEngine.dartExecutor.binaryMessenger,
+            MEMORY_PRESSURE_CHANNEL,
+        ).also { channel ->
+            channel.setMethodCallHandler { call, result ->
+                if (call.method == "getInitialInfo") {
+                    result.success(mapOf("isXiaomi" to isXiaomiDevice()))
+                } else {
+                    result.notImplemented()
+                }
+            }
+        }
         val miniChannel = MethodChannel(
             flutterEngine.dartExecutor.binaryMessenger,
             MINI_PLAYER_CHANNEL,
@@ -615,8 +691,28 @@ class MainActivity : AudioServiceActivity() {
         }
         miniChannel.setMethodCallHandler { call, result ->
             when (call.method) {
+                "hasOverlayPermission" -> {
+                    result.success(
+                        Build.VERSION.SDK_INT < Build.VERSION_CODES.M ||
+                            Settings.canDrawOverlays(this)
+                    )
+                }
+                "requestOverlayPermission" -> {
+                    startActivity(
+                        Intent(
+                            Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                            Uri.parse("package:$packageName"),
+                        ),
+                    )
+                    result.success(null)
+                }
                 "setEnabled" -> {
                     val enabled = call.argument<Boolean>("enabled") == true
+                    // 仅「设置页手动开启」允许拉起授权页；自动同步链路（进
+                    // app 恢复状态等）必须静默，否则开关残留为开 + 权限未授
+                    // 时，用户每次打开 app 都会被拉到悬浮窗授权页。
+                    val requestPermission =
+                        call.argument<Boolean>("requestPermission") != false
                     if (!enabled) {
                         stopService(Intent(this, MiniPlayerOverlayService::class.java))
                         result.success(true)
@@ -625,12 +721,14 @@ class MainActivity : AudioServiceActivity() {
                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M &&
                         !Settings.canDrawOverlays(this)
                     ) {
-                        startActivity(
-                            Intent(
-                                Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
-                                Uri.parse("package:$packageName"),
-                            ),
-                        )
+                        if (requestPermission) {
+                            startActivity(
+                                Intent(
+                                    Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                                    Uri.parse("package:$packageName"),
+                                ),
+                            )
+                        }
                         result.success(false)
                         return@setMethodCallHandler
                     }
@@ -735,6 +833,33 @@ class MainActivity : AudioServiceActivity() {
                         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
                     } else {
                         window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                    }
+                    result.success(true)
+                }
+            }
+        // 系统栏沉浸控制：API 30+ 用 WindowInsetsController 硬隐藏状态栏
+        // （Android 15 强制 edge-to-edge 后 SystemChrome 的 immersive 在
+        // 部分机型失效，此为可视化页兜底）；API < 30 由 Dart 侧
+        // SystemChrome 兜底，这里返回 false。
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, SYSTEM_UI_CHANNEL)
+            .setMethodCallHandler { call, result ->
+                if (call.method != "setStatusBarHidden") {
+                    result.notImplemented()
+                    return@setMethodCallHandler
+                }
+                val hidden = call.argument<Boolean>("hidden") == true
+                runOnUiThread {
+                    val controller: WindowInsetsController? = window.insetsController
+                    if (controller == null || Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
+                        result.success(false)
+                        return@runOnUiThread
+                    }
+                    if (hidden) {
+                        controller.systemBarsBehavior =
+                            WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+                        controller.hide(WindowInsets.Type.statusBars())
+                    } else {
+                        controller.show(WindowInsets.Type.statusBars())
                     }
                     result.success(true)
                 }
@@ -1180,15 +1305,21 @@ class MainActivity : AudioServiceActivity() {
                             result.success(true)
                             return@setMethodCallHandler
                         }
+                        // 仅手动开启（requestPermission != false）才允许拉起
+                        // 授权页；自动链路静默失败，规范见 setEnabled 文档。
+                        val requestPermission =
+                            call.argument<Boolean>("requestPermission") != false
                         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M &&
                             !Settings.canDrawOverlays(this)
                         ) {
-                            startActivity(
-                                Intent(
-                                    Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
-                                    Uri.parse("package:$packageName"),
-                                ),
-                            )
+                            if (requestPermission) {
+                                startActivity(
+                                    Intent(
+                                        Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                                        Uri.parse("package:$packageName"),
+                                    ),
+                                )
+                            }
                             result.success(false)
                             return@setMethodCallHandler
                         }

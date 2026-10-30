@@ -346,11 +346,14 @@ Map<String, dynamic> _kwTypes(String mInfo) {
 
 // ---------------------------------------------------------------------------
 // 酷狗：对齐 lx-music-mobile kg/songList.js（master 版）。老式
-// special/single HTML 页接口已失效，改用 v5 接口族：
+// special/single HTML 页接口已失效，v5 接口族对云收藏歌单（collection_
+// 形态）也返回 1001，改用多通道兜底：
 //   纯数字 ID/酷狗码 → t.kugou.com/command 解码
-//   gcid_ 链接       → t.kugou.com/v1/songlist/batch_decode 解码
+//                      → kucodeAndShare type:3 取歌曲列表
+//   gcid_ 链接       → m3ws.kugou.com 分享页内嵌 window.$output 直抓
+//                      → t.kugou.com/v1/songlist/batch_decode 解码
 //   chain=/分享页     → m.kugou.com/schain/transfer
-//   歌单详情         → mobiles.kugou.com/api/v5/special/info_v2 + song_v2
+//   歌单详情兜底     → mobiles.kugou.com/api/v5/special/info_v2 + song_v2
 //   歌曲信息         → gateway 批量接口补全
 // ---------------------------------------------------------------------------
 
@@ -390,17 +393,17 @@ Future<LxPlaylistImportResult> _importKg(http.Client client, String input) async
   final trimmed = input.trim();
   // 纯数字：酷狗码或歌单 ID，经 t.kugou.com/command 解码。
   if (RegExp(r'^\d+$').hasMatch(trimmed)) {
-    return _kgByCode(client, trimmed);
+    return await _kgByCode(client, trimmed);
   }
   // 裸 global_collection_id 直接进 v5 歌单详情。
   if (RegExp(r'^collection_\w+$').hasMatch(trimmed)) {
-    return _kgDetail2(client, trimmed);
+    return await _kgDetail2(client, trimmed);
   }
   // lx-music 的 id_ 前缀 specialid。
   final idPrefixed = RegExp(r'^id_(\d+)$').firstMatch(trimmed);
   if (idPrefixed != null) {
     final converted = await _kgSpecialIdToGlobal(client, idPrefixed.group(1)!);
-    if (converted != null) return _kgDetail2(client, converted);
+    if (converted != null) return await _kgDetail2(client, converted);
     throw Exception('酷狗歌单不存在或已失效，请检查歌单 ID');
   }
   return _kgByLink(client, trimmed);
@@ -451,57 +454,75 @@ Future<LxPlaylistImportResult> _kgByCode(http.Client client, String id) async {
     if (cover.contains('{size}')) cover = cover.replaceAll('{size}', '240');
     if (cover.isEmpty) cover = _text(info['img']);
     final meta = (name: _text(info['name']), cover: _normalizeCover(cover));
-
-    final gcid = _text(info['global_collection_id']);
-    if (gcid.isNotEmpty) return _kgDetail2(client, gcid);
-
-    // 无 gcid：先尝试 specialid → global_specialid 换算。
     final specialId = _text(info['id']);
-    if (specialId.isNotEmpty) {
-      final converted = await _kgSpecialIdToGlobal(client, specialId);
-      if (converted != null) return _kgDetail2(client, converted);
+    final userid = _text(info['userid']);
+
+    // 优先：kucodeAndShare type:3 直接返回歌曲列表。v5 详情接口族对
+    // 云收藏歌单已失效（1001），command 解码出的歌单大多走此通道。
+    // 注意响应的顶层 data 数组才是歌曲列表（info 键为空）。
+    if (specialId.isNotEmpty && userid.isNotEmpty) {
+      final count = _toInt(info['count']);
+      try {
+        final listBody = await _postJson(
+          client,
+          Uri.parse('http://www2.kugou.kugou.com/apps/kucodeAndShare/app/'),
+          {
+            'appid': 1001,
+            'clientver': 9020,
+            'mid': '21511157a05844bd085308bc76ef3343',
+            'clienttime': 640612895,
+            'key': '36164c4015e704673c588ee202b9ecb8',
+            'data': {
+              'id': specialId,
+              'type': 3,
+              'userid': userid,
+              'collect_type': 0,
+              'page': 1,
+              'pagesize': count > 300 ? count : 300,
+            },
+          },
+          headers: _kgCommandHeaders,
+        );
+        final hashes = _kgHashesFromList(
+          listBody is Map ? listBody['data'] : null,
+        );
+        if (hashes.isNotEmpty) {
+          return await _kgSongsFromHashes(
+            client,
+            name: meta.name,
+            cover: meta.cover,
+            hashes: hashes,
+          );
+        }
+      } catch (_) {
+        // type:3 失败继续走 gcid / specialid 兜底。
+      }
     }
 
-    // 用户收藏歌单：kucodeAndShare 接口直接返回歌曲列表。
-    final userid = _text(info['userid']);
-    if (userid.isNotEmpty) {
-      final listBody = await _postJson(
-        client,
-        Uri.parse('http://www2.kugou.kugou.com/apps/kucodeAndShare/app/'),
-        {
-          'appid': 1001,
-          'clientver': 9020,
-          'mid': '21511157a05844bd085308bc76ef3343',
-          'clienttime': 640612895,
-          'key': '36164c4015e704673c588ee202b9ecb8',
-          'data': {
-            'id': specialId,
-            'type': 3,
-            'userid': userid,
-            'collect_type': 0,
-            'page': 1,
-            'pagesize': _toInt(info['count'], 300),
-          },
-        },
-        headers: _kgCommandHeaders,
-      );
-      final hashes = _kgHashesFromList(
-        listBody is Map ? listBody['info'] : null,
-      );
-      if (hashes.isNotEmpty) {
-        return _kgSongsFromHashes(
-          client,
-          name: meta.name,
-          cover: meta.cover,
-          hashes: hashes,
-        );
+    // gcid 详情（gcid_ 形态可在 _kgDetail2 内部走分享页直抓）。
+    final gcid = _text(info['global_collection_id']);
+    if (gcid.isNotEmpty) {
+      try {
+        return await _kgDetail2(client, gcid);
+      } catch (_) {
+        // 继续兜底。
+      }
+    }
+
+    // 无 gcid / 兜底失败：specialid → global_specialid 换算。
+    if (specialId.isNotEmpty) {
+      final converted = await _kgSpecialIdToGlobal(client, specialId);
+      if (converted != null) {
+        try {
+          return await _kgDetail2(client, converted);
+        } catch (_) {}
       }
     }
 
     // command 响应自带歌曲列表（如别人的播放队列）。
     final hashes = _kgHashesFromList(rawList);
     if (hashes.isNotEmpty) {
-      return _kgSongsFromHashes(
+      return await _kgSongsFromHashes(
         client,
         name: meta.name,
         cover: meta.cover,
@@ -512,7 +533,7 @@ Future<LxPlaylistImportResult> _kgByCode(http.Client client, String id) async {
 
   // 酷狗码无效：把输入当老式 specialid 尝试换算。
   final converted = await _kgSpecialIdToGlobal(client, id);
-  if (converted != null) return _kgDetail2(client, converted);
+  if (converted != null) return await _kgDetail2(client, converted);
   throw Exception('酷狗歌单不存在或已失效，请检查 ID / 酷狗码 / 链接');
 }
 
@@ -529,34 +550,44 @@ Future<LxPlaylistImportResult?> _kgResolveLink(
   String url,
 ) async {
   final gcidParam = RegExp(r'global_collection_id=(\w+)').firstMatch(url);
-  if (gcidParam != null) return _kgDetail2(client, gcidParam.group(1)!);
+  if (gcidParam != null) return await _kgDetail2(client, gcidParam.group(1)!);
 
   final gcidToken = RegExp(r'gcid_(\w+)').firstMatch(url);
   if (gcidToken != null) {
-    final decoded = await _kgDecodeGcid(client, 'gcid_${gcidToken.group(1)}');
-    if (decoded != null) return _kgDetail2(client, decoded);
-    // 解码失败时把 gcid 串当 chain 再试（对齐 WalnutBai decodeGcid 兜底）。
-    return _kgByChain(client, gcidToken.group(1)!);
+    final token = 'gcid_${gcidToken.group(1)}';
+    // m 站分享页直抓最快（_kgDetail2 内部优先走此通道）。
+    try {
+      return await _kgDetail2(client, token);
+    } catch (_) {}
+    // 直抓失败：解码 gcid 后走 v5 详情，仍失败按 chain 再试
+    // （对齐 WalnutBai decodeGcid 兜底）。
+    final decoded = await _kgDecodeGcid(client, token);
+    if (decoded != null) {
+      try {
+        return await _kgDetail2(client, decoded);
+      } catch (_) {}
+    }
+    return await _kgByChain(client, gcidToken.group(1)!);
   }
 
   final chain = RegExp(r'[?&]chain=(\w+)').firstMatch(url);
-  if (chain != null) return _kgByChain(client, chain.group(1)!);
+  if (chain != null) return await _kgByChain(client, chain.group(1)!);
 
   final special = RegExp(r'special/single/(\d+)').firstMatch(url);
   if (special != null) {
     final converted = await _kgSpecialIdToGlobal(client, special.group(1)!);
-    if (converted != null) return _kgDetail2(client, converted);
+    if (converted != null) return await _kgDetail2(client, converted);
   }
 
   // xxx.html 分享页（song.html 除外）：文件名即 chain。
   if (url.contains('.html') && !url.contains('song.html')) {
     final page = RegExp(r'/(\w+)\.html').firstMatch(url);
     if (page != null && page.group(1)!.length > 4) {
-      return _kgByChain(client, page.group(1)!);
+      return await _kgByChain(client, page.group(1)!);
     }
   }
 
-  return _kgByShortLink(client, url);
+  return await _kgByShortLink(client, url);
 }
 
 /// 短链：手动跟随重定向，在 location 与落地页中找歌单标识。
@@ -576,22 +607,27 @@ Future<LxPlaylistImportResult?> _kgByShortLink(
       if (location == null || location.isEmpty) return null;
       current = Uri.parse(current).resolve(location).toString();
       final gcid = RegExp(r'global_collection_id=(\w+)').firstMatch(current);
-      if (gcid != null) return _kgDetail2(client, gcid.group(1)!);
+      if (gcid != null) return await _kgDetail2(client, gcid.group(1)!);
       final gcidToken = RegExp(r'gcid_(\w+)').firstMatch(current);
       if (gcidToken != null) {
-        final decoded = await _kgDecodeGcid(
-          client,
-          'gcid_${gcidToken.group(1)}',
-        );
-        if (decoded != null) return _kgDetail2(client, decoded);
+        final token = 'gcid_${gcidToken.group(1)}';
+        try {
+          return await _kgDetail2(client, token);
+        } catch (_) {}
+        final decoded = await _kgDecodeGcid(client, token);
+        if (decoded != null) {
+          try {
+            return await _kgDetail2(client, decoded);
+          } catch (_) {}
+        }
       }
       final chain = RegExp(r'[?&]chain=(\w+)').firstMatch(current);
-      if (chain != null) return _kgByChain(client, chain.group(1)!);
+      if (chain != null) return await _kgByChain(client, chain.group(1)!);
       // xxx.html 分享页（song.html 除外）：文件名即 chain。
       if (current.contains('.html') && !current.contains('song.html')) {
         final page = RegExp(r'/(\w+)\.html').firstMatch(current);
         if (page != null && page.group(1)!.length > 4) {
-          return _kgByChain(client, page.group(1)!);
+          return await _kgByChain(client, page.group(1)!);
         }
       }
       continue;
@@ -600,14 +636,19 @@ Future<LxPlaylistImportResult?> _kgByShortLink(
     final gcid = RegExp(r'"global_collection_id"\s*:\s*"(\w+)"')
             .firstMatch(page) ??
         RegExp(r'global_collection_id=(\w+)').firstMatch(page);
-    if (gcid != null) return _kgDetail2(client, gcid.group(1)!);
+    if (gcid != null) return await _kgDetail2(client, gcid.group(1)!);
     final gcidToken = RegExp(r'gcid_(\w+)').firstMatch(page);
     if (gcidToken != null) {
-      final decoded = await _kgDecodeGcid(
-        client,
-        'gcid_${gcidToken.group(1)}',
-      );
-      if (decoded != null) return _kgDetail2(client, decoded);
+      final token = 'gcid_${gcidToken.group(1)}';
+      try {
+        return await _kgDetail2(client, token);
+      } catch (_) {}
+      final decoded = await _kgDecodeGcid(client, token);
+      if (decoded != null) {
+        try {
+          return await _kgDetail2(client, decoded);
+        } catch (_) {}
+      }
     }
     return null;
   }
@@ -629,7 +670,7 @@ Future<LxPlaylistImportResult> _kgByChain(
   );
   if (body is! Map) throw Exception('酷狗歌单加载失败');
   final gcid = _text(body['global_collection_id']);
-  if (gcid.isNotEmpty) return _kgDetail2(client, gcid);
+  if (gcid.isNotEmpty) return await _kgDetail2(client, gcid);
   final info = body['info'] is Map
       ? Map<String, dynamic>.from(body['info'] as Map)
       : const <String, dynamic>{};
@@ -637,9 +678,9 @@ Future<LxPlaylistImportResult> _kgByChain(
   if (hashes.isEmpty) {
     // schain/transfer 无列表时回退 PC 分享页解析（对齐 WalnutBai
     // getUserListDetail5：m 分享页取元信息 + www 分享页取歌曲）。
-    return _kgByPcShare(client, chain);
+    return await _kgByPcShare(client, chain);
   }
-  return _kgSongsFromHashes(
+  return await _kgSongsFromHashes(
     client,
     name: _text(info['name']),
     cover: _normalizeCover(_text(info['img'])),
@@ -691,7 +732,7 @@ Future<LxPlaylistImportResult> _kgByPcShare(
     // 歌曲列表解析失败走统一报错。
   }
   if (hashes.isEmpty) throw Exception('酷狗歌单不存在或已失效');
-  return _kgSongsFromHashes(
+  return await _kgSongsFromHashes(
     client,
     name: name,
     cover: cover,
@@ -699,11 +740,85 @@ Future<LxPlaylistImportResult> _kgByPcShare(
   );
 }
 
-Future<String> _kgGetPage(http.Client client, String url) async {
+Future<String> _kgGetPage(
+  http.Client client,
+  String url, {
+  Map<String, String> headers = _browserHeaders,
+}) async {
   final response = await client
-      .get(Uri.parse(url), headers: _browserHeaders)
+      .get(Uri.parse(url), headers: headers)
       .timeout(_timeout);
   return utf8.decode(response.bodyBytes, allowMalformed: true);
+}
+
+/// m 站分享页直抓：GET https://m3ws.kugou.com/songlist/gcid_xxx/ 返回的
+/// HTML 内嵌 `window.$output = {...}` JSON，info.listinfo 提供歌单名与
+/// 封面，info.songs 提供全部歌曲（含大写 hash）。页面只认 gcid_ 分享
+/// 形态（collection_ / 纯数字路径返回 200 空 body），失败或无歌曲时
+/// 返回 null 由调用方走其他通道。
+Future<LxPlaylistImportResult?> _kgFromMPage(
+  http.Client client,
+  String gcidToken,
+) async {
+  if (!gcidToken.startsWith('gcid_')) return null;
+  final page = await _kgGetPage(
+    client,
+    'https://m3ws.kugou.com/songlist/$gcidToken/',
+    headers: _phoneHeaders,
+  );
+  final marker = page.indexOf(r'window.$output');
+  if (marker < 0) return null;
+  final brace = page.indexOf('{', marker);
+  if (brace < 0) return null;
+  // 括号平衡扫描提取 JSON（字符串感知，跳过引号内的花括号与转义）。
+  var depth = 0;
+  var inStr = false;
+  var escape = false;
+  for (var i = brace; i < page.length; i++) {
+    final ch = page[i];
+    if (inStr) {
+      if (escape) {
+        escape = false;
+      } else if (ch == '\\') {
+        escape = true;
+      } else if (ch == '"') {
+        inStr = false;
+      }
+      continue;
+    }
+    if (ch == '"') {
+      inStr = true;
+    } else if (ch == '{') {
+      depth++;
+    } else if (ch == '}') {
+      depth--;
+      if (depth != 0) continue;
+      final dynamic decoded;
+      try {
+        decoded = jsonDecode(page.substring(brace, i + 1));
+      } catch (_) {
+        return null;
+      }
+      if (decoded is! Map) return null;
+      final info = decoded['info'] is Map
+          ? Map<String, dynamic>.from(decoded['info'] as Map)
+          : const <String, dynamic>{};
+      final listinfo = info['listinfo'] is Map
+          ? Map<String, dynamic>.from(info['listinfo'] as Map)
+          : const <String, dynamic>{};
+      final hashes = _kgHashesFromList(info['songs']);
+      if (hashes.isEmpty) return null;
+      var cover = _text(listinfo['pic']);
+      if (cover.contains('{size}')) cover = cover.replaceAll('{size}', '240');
+      return await _kgSongsFromHashes(
+        client,
+        name: _text(listinfo['name']),
+        cover: _normalizeCover(cover),
+        hashes: hashes,
+      );
+    }
+  }
+  return null;
 }
 
 /// gcid_ 分享标识 → global_collection_id。
@@ -743,7 +858,11 @@ Future<String?> _kgDecodeGcid(http.Client client, String gcid) async {
   return null;
 }
 
-/// 老式 specialid → global_specialid 换算。
+/// 老式 specialid → global_collection_id 换算（公开入口，供平台歌单页
+/// 在走登录态取曲前把自建歌单的 `id_<specialid>` 形态还原成 gcid）。
+Future<String?> kgSpecialIdToGlobal(http.Client client, String specialId) =>
+    _kgSpecialIdToGlobal(client, specialId);
+
 Future<String?> _kgSpecialIdToGlobal(
   http.Client client,
   String specialId,
@@ -771,11 +890,105 @@ Future<String?> _kgSpecialIdToGlobal(
   }
 }
 
+/// 酷狗在线歌单曲目公开取曲链（在线歌单页登录态取曲失败时的回退，
+/// 复测于 2026-10：pubsongs 网关对无效/过期 token 一律返回 20010）。
+///
+/// [id] 支持 `id_<specialid>` / `collection_*` / `gcid_*` 三种形态：
+///   `id_<specialid>` → v5 special/info 主键换算出 gcid（探针验证：
+///     无效 specialid 返回空，不会兜底）
+///   `collection_<n>_<userid>_<listid>_<seq>` → kucodeAndShare type:3
+///     公开主键查询（云收藏与自建歌单均验证有效，无效 listid 返回
+///     空列表不兜底）
+///   `gcid_<token>` → m 站分享页直抓（仅认真实分享歌单）
+/// 全链路均为主键查询，无兜底热门歌单的张冠李戴风险；取不到曲目
+/// 时抛异常（宁可导入失败不能导错歌单）。
+/// 返回的 name/cover 为空字符串，由调用方使用列表页的元信息。
+Future<LxPlaylistImportResult> kgOnlinePlaylistTracks(String id) async {
+  final client = http.Client();
+  try {
+    var gcid = id;
+    if (id.startsWith('id_')) {
+      final converted = await _kgSpecialIdToGlobal(client, id.substring(3));
+      if (converted == null || converted.isEmpty) {
+        throw Exception('酷狗歌单 ID 换算失败，请稍后重试');
+      }
+      gcid = converted;
+    }
+    if (gcid.startsWith('collection_')) {
+      final parts = gcid.split('_');
+      final userid = parts.length >= 4 ? parts[2] : '';
+      final listid = parts.length >= 4 ? parts[3] : '';
+      if (userid.isEmpty || listid.isEmpty) {
+        throw Exception('酷狗歌单标识无效，无法取曲');
+      }
+      final hashes = <String>[];
+      final seen = <String>{};
+      for (
+        var page = 1;
+        page <= 10 && hashes.length < _maxImportSongs;
+        page++
+      ) {
+        final listBody = await _postJson(
+          client,
+          Uri.parse('http://www2.kugou.kugou.com/apps/kucodeAndShare/app/'),
+          {
+            'appid': 1001,
+            'clientver': 9020,
+            'mid': '21511157a05844bd085308bc76ef3343',
+            'clienttime': 640612895,
+            'key': '36164c4015e704673c588ee202b9ecb8',
+            'data': {
+              'id': listid,
+              'type': 3,
+              'userid': userid,
+              'collect_type': 0,
+              'page': page,
+              'pagesize': 300,
+            },
+          },
+          headers: _kgCommandHeaders,
+        );
+        var added = 0;
+        for (final hash
+            in _kgHashesFromList(listBody is Map ? listBody['data'] : null)) {
+          if (seen.add(hash)) {
+            hashes.add(hash);
+            added++;
+          }
+        }
+        if (added == 0) break; // 空页：首页即空或已取全。
+      }
+      if (hashes.isEmpty) throw Exception('酷狗歌单为空或已失效');
+      return await _kgSongsFromHashes(
+        client,
+        name: '',
+        cover: '',
+        hashes: hashes,
+      );
+    }
+    // gcid_ 分享形态：m 站分享页直抓。
+    final fromPage = await _kgFromMPage(client, gcid);
+    if (fromPage != null) return fromPage;
+    throw Exception('酷狗歌单为空或已失效');
+  } finally {
+    client.close();
+  }
+}
+
 /// v5 歌单详情：info_v2 拿基本信息，song_v2 分页拿 hash 列表。
+/// v5 接口对云收藏歌单（collection_ 形态）已失效，优先走 m 站分享页
+/// 直抓（gcid_ 形态），失败再回退本接口族。
 Future<LxPlaylistImportResult> _kgDetail2(
   http.Client client,
   String globalCollectionId,
 ) async {
+  try {
+    final fromPage = await _kgFromMPage(client, globalCollectionId);
+    if (fromPage != null) return fromPage;
+  } catch (_) {
+    // 分享页直抓失败继续走 v5 接口族。
+  }
+
   final infoParams =
       'appid=1058&specialid=0&global_specialid=$globalCollectionId&format=jsonp'
       '&srcappid=2919&clientver=20000&clienttime=1586163242519&mid=1586163242519'
@@ -828,7 +1041,7 @@ Future<LxPlaylistImportResult> _kgDetail2(
   if (hashes.isEmpty) throw Exception('酷狗歌单为空或歌单不存在');
   var cover = _text(info['imgurl']);
   if (cover.contains('{size}')) cover = cover.replaceAll('{size}', '240');
-  return _kgSongsFromHashes(
+  return await _kgSongsFromHashes(
     client,
     name: _text(info['specialname']),
     cover: _normalizeCover(cover),

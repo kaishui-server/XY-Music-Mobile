@@ -156,6 +156,9 @@ class AccountPluginSync {
     final enabled = (prefs.getStringList(_enabledKey) ?? const <String>[])
         .toSet();
     final sourceUrls = _readSourceUrls(prefs);
+    // 插件用户变量（baka 等插件的 QQ音乐 L1/L2 token 等）必须随云同步
+    // 一并恢复，否则脚本虽在、来源却不可用，歌单来源标签一直无效。
+    final userVariables = readPluginUserVariables(prefs);
 
     for (final value in raw.whereType<Map>()) {
       final item = Map<String, dynamic>.from(value);
@@ -183,12 +186,12 @@ class AccountPluginSync {
           final localMeta = PluginMetadata.parse(await file.readAsString());
           if (_compareVersion(localMeta.version ?? '0', incomingVersion) >= 0) {
             // 同版本不覆盖本地脚本，但仍然恢复云端启用状态和来源地址。
-            _restoreState(item, id, enabled, sourceUrls);
+            _restoreState(item, id, enabled, sourceUrls, userVariables);
             continue;
           }
         }
         await savePluginScript(dataDir: dataDir, id: id, script: script);
-        _restoreState(item, id, enabled, sourceUrls);
+        _restoreState(item, id, enabled, sourceUrls, userVariables);
         result.downloadedPlugins++;
       } catch (error) {
         result.errors.add('${item['name'] ?? item['id'] ?? '未知插件'}恢复失败：$error');
@@ -196,6 +199,11 @@ class AccountPluginSync {
     }
     await prefs.setStringList(_enabledKey, enabled.toList());
     await prefs.setString(_sourceUrlsKey, jsonEncode(sourceUrls));
+    // 下载批次全部处理完后统一持久化用户变量，避免中途失败留下半套变量。
+    await prefs.setString(
+      pluginUserVariablesKey,
+      jsonEncode(userVariables),
+    );
     container.invalidate(enabledMusicPluginsProvider);
     container.invalidate(pluginRuntimeProvider);
     return result;
@@ -206,6 +214,7 @@ class AccountPluginSync {
     String id,
     Set<String> enabled,
     Map<String, String> sourceUrls,
+    Map<String, Map<String, String>> userVariables,
   ) {
     if (item['enabled'] == true) {
       enabled.add(id);
@@ -218,6 +227,15 @@ class AccountPluginSync {
             .trim() ??
         '';
     if (source.isNotEmpty) sourceUrls[id] = source;
+    // 云端携带的用户变量以云端为准整体覆盖该插件，保留其它插件变量。
+    final remoteVariables = item['userVariables'] ?? item['user_variables'];
+    if (remoteVariables is Map) {
+      final restored = <String, String>{
+        for (final entry in remoteVariables.entries)
+          entry.key.toString(): entry.value.toString(),
+      };
+      if (restored.isNotEmpty) userVariables[id] = restored;
+    }
   }
 
   static Future<List<Map<String, dynamic>>> _readLocalPlugins(
@@ -230,6 +248,8 @@ class AccountPluginSync {
     final enabled = (prefs.getStringList(_enabledKey) ?? const <String>[])
         .toSet();
     final sourceUrls = _readSourceUrls(prefs);
+    // 上传时携带用户变量，供其它设备云同步后恢复（账号云同步-插件）。
+    final userVariables = readPluginUserVariables(prefs);
     final result = <Map<String, dynamic>>[];
     for (final file in directory.listSync().whereType<File>()) {
       if (p.extension(file.path).toLowerCase() != '.js') continue;
@@ -251,6 +271,7 @@ class AccountPluginSync {
           'enabled': enabled.contains(id),
           'sources': const <String>[],
           'sourceUrl': sourceUrls[id] ?? '',
+          'userVariables': userVariables[id] ?? const <String, String>{},
           'script': _encodeScript(script),
           'scriptEncoded': true,
           if (lower.contains('lx.event')) 'isLx': true,

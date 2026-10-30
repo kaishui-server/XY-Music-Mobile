@@ -233,6 +233,7 @@ class MiniPlayerOverlayService : Service() {
             }
             ACTION_SHOW, ACTION_UPDATE, null -> {
                 if (!canDrawOverlays()) {
+                    // 无权限静默停服（不跳授权页）：自动链路永不弹页。
                     stopSelf()
                     return START_NOT_STICKY
                 }
@@ -790,6 +791,7 @@ class MiniPlayerOverlayService : Service() {
      * 只做进度校正，不重建视图。 */
     fun applyUpdate(p: MiniPlayerUpdateParams) {
         if (!canDrawOverlays()) {
+            // 无权限静默停服（不跳授权页）：自动链路永不弹页。
             stopSelf()
             return
         }

@@ -8,6 +8,7 @@ import 'package:go_router/go_router.dart';
 import 'package:video_player/video_player.dart';
 
 import '../core/settings.dart';
+import '../library/online_cover_overrides.dart';
 import '../lyrics/lyrics_models.dart';
 import '../navigation/animated_page_route.dart';
 import '../navigation/player_sheet_morph.dart';
@@ -277,9 +278,15 @@ class _MiniPlayerBarState extends ConsumerState<MiniPlayerBar> {
                         width: 50,
                         height: 50,
                         child: CoverImage(
-                          key: ValueKey('mini:${current.path}'),
+                          key: ValueKey(
+                            'mini:${current.path}:'
+                            '${resolveOnlineCoverUrl(current.coverUrl, current.path) ?? ''}',
+                          ),
                           songPath: current.path,
-                          imageUrl: current.coverUrl,
+                          imageUrl: resolveOnlineCoverUrl(
+                            current.coverUrl,
+                            current.path,
+                          ),
                           width: 50,
                           height: 50,
                           radius: 25,

@@ -10,7 +10,14 @@ import 'package:just_audio_background/just_audio_background.dart';
 
 import 'app.dart';
 import 'src/core/custom_font.dart';
+import 'src/library/online_cover_overrides.dart';
 import 'src/logging/app_log_store.dart';
+import 'src/services/cache_auto_clean.dart';
+
+/// 缓存自动清理的生命周期监听：切后台/隐藏时触发一次阈值检查。
+/// 顶层持有引用，避免监听器在启动流程结束后被 GC 导致失效。
+/// 在 [_bootstrapApp] 中赋值（此时 WidgetsBinding 已初始化）。
+AppLifecycleListener? cacheCleanLifecycleListener;
 
 Future<void> main() async {
   // runZonedGuarded 兜住 zone 内逃逸的异步异常，交给日志系统落盘
@@ -48,6 +55,8 @@ Future<void> _bootstrapApp() async {
   }
   AppLogStore.instance.install();
   await AppLogStore.instance.initialize();
+  // 在线歌曲自定义封面覆盖表：启动即加载，列表/播放页按 revision 刷新。
+  unawaited(initOnlineCoverOverrides());
   if (!kIsWeb && defaultTargetPlatform == TargetPlatform.android) {
     try {
       // Android 平板与手机统一使用边到边布局，状态栏由 Flutter 页面背景承载。
@@ -79,6 +88,21 @@ Future<void> _bootstrapApp() async {
   // PlayerProvider 构造时即创建 just_audio_background 的 AudioPlayer，
   // 其初始化必须先完成；失败已在上层捕获，不会阻断启动。
   await audioInit;
+
+  // 缓存自动清理：启动后检查一次（超过 256MB 自动清理），并注册
+  // 生命周期监听（切后台/隐藏时检查）与 30 分钟周期兜底，保证长时间
+  // 前台使用也能触发。带节流与并发保护，扫描在后台异步执行不阻塞 UI。
+  cacheCleanLifecycleListener = AppLifecycleListener(
+    onStateChange: (state) {
+      if (state == AppLifecycleState.paused ||
+          state == AppLifecycleState.hidden) {
+        unawaited(CacheAutoCleanService.instance.checkAndCleanIfNeeded());
+      }
+    },
+  );
+  unawaited(CacheAutoCleanService.instance.checkAndCleanIfNeeded());
+  CacheAutoCleanService.instance.startPeriodicCheck();
+
   runApp(
     ProviderScope(child: XyMusicApp(startupBackground: startupBackground)),
   );

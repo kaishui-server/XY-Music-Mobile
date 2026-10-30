@@ -23,9 +23,6 @@ class DesktopLyricsBridge {
   /// 关闭（浮窗本身已由原生移除）。未注册时忽略该回调。
   static void Function()? onCloseRequested;
 
-  /// 通知栏双击：请求开启桌面歌词悬浮窗（走设置开关完整链路）。
-  static void Function()? onOpenRequested;
-
   /// 浮窗操作栏 ⚙ 设置键：请求打开桌面歌词设置页。
   static void Function()? onOpenSettings;
 
@@ -40,7 +37,7 @@ class DesktopLyricsBridge {
 
   static bool _handlerInstalled = false;
 
-  /// 冷启动期间原生补发的动作（onOpenRequested/onOpenSettings）到达时，
+  /// 冷启动期间原生补发的动作（onOpenSettings）到达时，
   /// 播放层尚未注册回调（PlayerNotifier 构造晚于原生 configureFlutterEngine
   /// 的补发），消息若直接丢弃用户就得再点一次浮窗按键。暂存到注册后执行。
   static String? _pendingAction;
@@ -58,12 +55,6 @@ class DesktopLyricsBridge {
           if (value != null) onPositionChanged?.call(value);
         case 'onCloseRequested':
           onCloseRequested?.call();
-        case 'onOpenRequested':
-          if (onOpenRequested != null) {
-            onOpenRequested!.call();
-          } else {
-            _pendingAction = 'onOpenRequested';
-          }
         case 'onOpenSettings':
           if (onOpenSettings != null) {
             onOpenSettings!.call();
@@ -84,9 +75,8 @@ class DesktopLyricsBridge {
     });
   }
 
-  /// 播放层注册完 onOpenRequested/onOpenSettings 回调后调用：把冷启动
-  /// 期间暂存的动作补执行。推迟到首帧渲染后，避免 GoRouter 尚未挂载
-  /// 时 push 失败。
+  /// 播放层注册完 onOpenSettings 回调后调用：把冷启动期间暂存的动作
+  /// 补执行。推迟到首帧渲染后，避免 GoRouter 尚未挂载时 push 失败。
   static void flushPendingAction() {
     final action = _pendingAction;
     if (action == null) return;
@@ -94,8 +84,6 @@ class DesktopLyricsBridge {
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (action == 'onOpenSettings') {
         onOpenSettings?.call();
-      } else if (action == 'onOpenRequested') {
-        onOpenRequested?.call();
       }
     });
   }
@@ -104,8 +92,8 @@ class DesktopLyricsBridge {
   /// 冷启动场景原生 configureFlutterEngine 执行远早于本桥接的
   /// setMethodCallHandler 安装，原生当时立即 invoke 的消息会静默丢失
   /// （通道无 Dart 接收端，且 pending 已被清空）——原生侧已不再立即
-  /// 补发，改由这里在 handler 就绪后拉取，保证「浮窗 ⚙ 设置键 / 通知
-  /// 双击」在冷启动后一次命中，不用再点第二次。
+  /// 补发，改由这里在 handler 就绪后拉取，保证「浮窗 ⚙ 设置键」在
+  /// 冷启动后一次命中，不用再点第二次。
   static Future<void> ensureReady() async {
     if (!Platform.isAndroid) return;
     _ensureHandler();
@@ -119,8 +107,6 @@ class DesktopLyricsBridge {
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (action == 'onOpenSettings') {
           onOpenSettings?.call();
-        } else if (action == 'onOpenRequested') {
-          onOpenRequested?.call();
         }
       });
     } on PlatformException {
@@ -162,12 +148,21 @@ class DesktopLyricsBridge {
     }
   }
 
-  static Future<bool> setEnabled(bool enabled) async {
+  /// 启停桌面歌词。开启时原生会校验悬浮窗权限；[requestPermission] 为
+  /// true（手动开启）时未授权会拉起授权页并返回 false，false 时静默
+  /// 返回 false——权限弹页只允许发生在用户主动开启小窗类功能时。
+  static Future<bool> setEnabled(
+    bool enabled, {
+    bool requestPermission = true,
+  }) async {
     if (!Platform.isAndroid) return false;
     try {
       final result = await _channel.invokeMethod<bool>(
         'setEnabled',
-        <String, dynamic>{'enabled': enabled},
+        <String, dynamic>{
+          'enabled': enabled,
+          'requestPermission': requestPermission,
+        },
       );
       final accepted = result == true;
       if (accepted) {
@@ -211,7 +206,12 @@ class DesktopLyricsBridge {
     _ensureHandler();
     final generation = ++_syncGeneration;
     if (_lastEnabled != enabled) {
-      final accepted = await setEnabled(enabled);
+      // 自动同步链路（切后台/回前台的 hideInApp 显隐、进度循环等）永远
+      // 静默：未授权时不弹授权页（否则 app 退后台后每轮 sync 重试都会
+      // startActivity 拉起授权页，用户切回 app 时权限页正好盖在最上面，
+      // 表现为「点胶囊/点图标回来就进了悬浮窗权限页」）。手动开启走设置
+      // 页/播放页开关的 setEnabled（默认 requestPermission: true）。
+      final accepted = await setEnabled(enabled, requestPermission: false);
       if (generation != _syncGeneration || !accepted || !enabled) return;
     }
     if (!enabled) {

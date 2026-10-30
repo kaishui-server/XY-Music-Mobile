@@ -2260,12 +2260,23 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
   ) async {
     final notifier = ref.read(settingsProvider.notifier);
     if (enabled) {
+      // 权限规范：手动开启小窗类功能时才检测并询问跳转授权页（与迷你
+      // 播放器浮窗一致）。
+      if (!await MiniPlayerOverlayBridge.hasOverlayPermission()) {
+        if (context.mounted) {
+          ScaffoldMessenger.of(
+            context,
+          ).showSnackBar(const SnackBar(content: Text('请授予悬浮窗权限后再开启桌面歌词')));
+          await MiniPlayerOverlayBridge.requestOverlayPermission();
+        }
+        return;
+      }
       final started = await DesktopLyricsBridge.setEnabled(true);
       if (!started) {
         if (context.mounted) {
           ScaffoldMessenger.of(
             context,
-          ).showSnackBar(const SnackBar(content: Text('请授予悬浮窗权限后再开启桌面歌词')));
+          ).showSnackBar(const SnackBar(content: Text('桌面歌词启动失败，请重试')));
         }
         return;
       }
@@ -2297,20 +2308,30 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
     await notifier.setBluetoothLyricsEnabled(enabled);
   }
 
-  /// 迷你播放器浮窗开关：开启前先让原生校验悬浮窗权限（未授权会拉起授权
-  /// 页），通过后再写入设置；写入设置会触发根节点同步显示浮窗。
+  /// 迷你播放器浮窗开关：开启前先查悬浮窗权限——未授权则拉起授权页并
+  /// 提示（不写入设置），授权后需回到本页重新打开；已授权才写入设置，
+  /// 由根节点同步显示浮窗。自动同步链路（进 app）不会拉授权页。
   Future<void> _setMiniPlayerOverlay(
     BuildContext context,
     WidgetRef ref,
     bool enabled,
   ) async {
     if (enabled) {
+      if (!await MiniPlayerOverlayBridge.hasOverlayPermission()) {
+        if (context.mounted) {
+          ScaffoldMessenger.of(
+            context,
+          ).showSnackBar(const SnackBar(content: Text('请授予悬浮窗权限后再开启迷你播放器浮窗')));
+          await MiniPlayerOverlayBridge.requestOverlayPermission();
+        }
+        return;
+      }
       final accepted = await MiniPlayerOverlayBridge.setEnabled(true);
       if (!accepted) {
         if (context.mounted) {
           ScaffoldMessenger.of(
             context,
-          ).showSnackBar(const SnackBar(content: Text('请授予悬浮窗权限后再开启迷你播放器浮窗')));
+          ).showSnackBar(const SnackBar(content: Text('浮窗启动失败，请重试')));
         }
         return;
       }

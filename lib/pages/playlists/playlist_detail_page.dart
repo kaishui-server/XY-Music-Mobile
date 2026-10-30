@@ -1,10 +1,13 @@
 import 'dart:async';
+import 'dart:io';
 
+import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 import 'package:lpinyin/lpinyin.dart';
 
+import '../../src/core/db_path.dart';
 import '../../src/favorites/favorites_provider.dart';
 import '../../src/library/library_provider.dart';
 import '../../src/playlists/playlists_provider.dart';
@@ -14,9 +17,11 @@ import '../../src/widgets/batch_action_sheet.dart';
 import '../../src/widgets/batch_download.dart';
 import '../../src/widgets/batch_source_switch.dart';
 import '../../src/widgets/cover_image.dart';
+import '../../src/widgets/cover_search_sheet.dart';
 import '../../src/widgets/frosted_search_field.dart';
 import '../../src/widgets/song_list_view.dart';
 import '../../src/widgets/top_notice.dart' show XyNotice, XyNoticeType;
+import 'package:http/http.dart' as http;
 
 /// 歌单页右上角「更多」菜单项。
 enum _PlaylistMenuAction {
@@ -27,6 +32,9 @@ enum _PlaylistMenuAction {
   batchDelete,
   refresh,
 }
+
+/// 歌单封面编辑面板的动作。
+enum _PlaylistCoverAction { view, pick, search, reset }
 
 class PlaylistDetailPage extends ConsumerStatefulWidget {
   const PlaylistDetailPage({
@@ -429,6 +437,11 @@ class _PlaylistDetailPageState extends ConsumerState<PlaylistDetailPage> {
                                       ref,
                                       playlist!,
                                     ),
+                              onEditCover: () => _editPlaylistCover(
+                                context,
+                                ref,
+                                playlist!,
+                              ),
                             ),
                             if (songs.isNotEmpty && visibleSongs.isNotEmpty)
                               Padding(
@@ -661,12 +674,171 @@ class _PlaylistDetailPageState extends ConsumerState<PlaylistDetailPage> {
   }
 }
 
+/// 歌单封面编辑面板：查看大图 / 从相册选择 / 搜索并关联封面 / 恢复默认。
+///
+/// 自定义封面统一落盘到应用数据目录 `playlist_covers/<歌单ID>.jpg`，
+/// coverUrl 存 `file://` 绝对路径——本机文件不受网络图失效影响，展示
+/// 与云同步字段（仅存字符串）保持兼容。
+Future<void> _editPlaylistCover(
+  BuildContext context,
+  WidgetRef ref,
+  MobilePlaylist playlist,
+) async {
+  void toast(String message, {XyNoticeType type = XyNoticeType.info}) =>
+      XyNotice.show(context, message: message, type: type);
+
+  final action = await showModalBottomSheet<_PlaylistCoverAction>(
+    context: context,
+    useRootNavigator: true,
+    showDragHandle: true,
+    builder: (sheetContext) => SafeArea(
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          ListTile(
+            leading: const Icon(Icons.zoom_in_rounded),
+            title: const Text('查看大图'),
+            onTap: () => Navigator.pop(sheetContext, _PlaylistCoverAction.view),
+          ),
+          ListTile(
+            leading: const Icon(Icons.photo_library_outlined),
+            title: const Text('从相册选择'),
+            onTap: () => Navigator.pop(sheetContext, _PlaylistCoverAction.pick),
+          ),
+          ListTile(
+            leading: const Icon(Icons.image_search_rounded),
+            title: const Text('搜索并关联封面'),
+            onTap: () =>
+                Navigator.pop(sheetContext, _PlaylistCoverAction.search),
+          ),
+          if (playlist.coverUrl?.trim().isNotEmpty == true)
+            ListTile(
+              leading: const Icon(Icons.restart_alt_rounded),
+              title: const Text('恢复默认封面'),
+              onTap: () => Navigator.pop(sheetContext, _PlaylistCoverAction.reset),
+            ),
+        ],
+      ),
+    ),
+  );
+  if (action == null || !context.mounted) return;
+
+  switch (action) {
+    case _PlaylistCoverAction.view:
+      final url = playlist.effectiveCoverUrl?.trim() ?? '';
+      if (url.isEmpty) {
+        toast('还没有封面', type: XyNoticeType.warning);
+        return;
+      }
+      await showDialog<void>(
+        context: context,
+        useRootNavigator: true,
+        builder: (dialogContext) => Dialog.fullscreen(
+          backgroundColor: Colors.black87,
+          child: Stack(
+            children: [
+              Center(
+                child: InteractiveViewer(
+                  maxScale: 5,
+                  child: url.startsWith('file://')
+                      ? Image.file(File.fromUri(Uri.parse(url)))
+                      : Image.network(url),
+                ),
+              ),
+              Positioned(
+                top: MediaQuery.paddingOf(dialogContext).top + 8,
+                right: 12,
+                child: IconButton(
+                  icon: const Icon(Icons.close, color: Colors.white),
+                  onPressed: () => Navigator.pop(dialogContext),
+                ),
+              ),
+            ],
+          ),
+        ),
+      );
+      return;
+    case _PlaylistCoverAction.pick:
+      final result = await FilePicker.platform.pickFiles(
+        type: FileType.image,
+        withData: true,
+      );
+      final bytes = result?.files.singleOrNull?.bytes;
+      if (bytes == null || bytes.isEmpty || !context.mounted) return;
+      final saved = await _savePlaylistCoverFile(
+        ref,
+        playlist.id,
+        bytes,
+      );
+      if (saved == null) {
+        toast('封面保存失败', type: XyNoticeType.error);
+        return;
+      }
+      await ref.read(playlistsProvider.notifier).setCover(playlist.id, saved);
+      toast('封面已更新', type: XyNoticeType.success);
+      return;
+    case _PlaylistCoverAction.search:
+      final url = await showCoverSearchSheet(
+        context,
+        initialQuery: playlist.name,
+      );
+      if (url == null || !context.mounted) return;
+      try {
+        final response = await http
+            .get(Uri.parse(url))
+            .timeout(const Duration(seconds: 20));
+        if (response.statusCode != 200 || response.bodyBytes.isEmpty) {
+          throw Exception('HTTP ${response.statusCode}');
+        }
+        final saved = await _savePlaylistCoverFile(
+          ref,
+          playlist.id,
+          response.bodyBytes,
+        );
+        if (saved == null) {
+          toast('封面保存失败', type: XyNoticeType.error);
+          return;
+        }
+        await ref
+            .read(playlistsProvider.notifier)
+            .setCover(playlist.id, saved);
+        toast('封面已关联', type: XyNoticeType.success);
+      } catch (e) {
+        toast('封面下载失败：$e', type: XyNoticeType.error);
+      }
+      return;
+    case _PlaylistCoverAction.reset:
+      await ref.read(playlistsProvider.notifier).setCover(playlist.id, '');
+      toast('已恢复默认封面', type: XyNoticeType.success);
+      return;
+  }
+}
+
+/// 把封面字节写入应用数据目录，返回 `file://` 封面地址；失败返回 null。
+Future<String?> _savePlaylistCoverFile(
+  WidgetRef ref,
+  String playlistId,
+  List<int> bytes,
+) async {
+  try {
+    final appDir = await ref.read(appDataDirProvider.future);
+    final dir = Directory('$appDir/playlist_covers');
+    if (!dir.existsSync()) dir.createSync(recursive: true);
+    final file = File('${dir.path}/$playlistId.jpg');
+    await file.writeAsBytes(bytes);
+    return 'file://${file.path}';
+  } catch (_) {
+    return null;
+  }
+}
+
 class _PlaylistHeroHeader extends StatelessWidget {
   const _PlaylistHeroHeader({
     required this.playlist,
     required this.songs,
     required this.onPlayAll,
     this.onSyncSource,
+    this.onEditCover,
   });
 
   final MobilePlaylist playlist;
@@ -675,6 +847,9 @@ class _PlaylistHeroHeader extends StatelessWidget {
 
   /// 存在导入来源时的「同步来源」回调（拉取来源最新内容）。
   final VoidCallback? onSyncSource;
+
+  /// 封面编辑入口（点按封面触发）。
+  final VoidCallback? onEditCover;
 
   @override
   Widget build(BuildContext context) {
@@ -687,14 +862,17 @@ class _PlaylistHeroHeader extends StatelessWidget {
       child: Row(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          CoverImage(
-            songPath: coverPath,
-            imageUrl: playlist.effectiveCoverUrl,
-            width: 124,
-            height: 124,
-            radius: 18,
-            highQuality: true,
-            icon: Icons.queue_music_rounded,
+          GestureDetector(
+            onTap: onEditCover,
+            child: CoverImage(
+              songPath: coverPath,
+              imageUrl: playlist.effectiveCoverUrl,
+              width: 124,
+              height: 124,
+              radius: 18,
+              highQuality: true,
+              icon: Icons.queue_music_rounded,
+            ),
           ),
           const SizedBox(width: 16),
           Expanded(

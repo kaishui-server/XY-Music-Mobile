@@ -2,7 +2,6 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
-import 'package:audio_service/audio_service.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
@@ -20,7 +19,11 @@ import 'player_provider.dart';
 /// 界面互动）有本质区别。
 ///
 /// 数据单向：Dart 推送播放状态到原生（`update`），原生把窗口内的操作回传
-/// （`onAction`/`onCloseRequested`/`onNotificationClick`），由播放层执行。
+/// （`onAction`/`onCloseRequested`），由播放层执行。
+///
+/// 注意：通知栏/灵动胶囊的点击不在此处理——点击只走进程内广播恢复播放
+/// 状态展示，绝不能触发浮窗启停（否则未授权悬浮窗权限的机型会频繁跳转
+/// 「显示在其他应用上层」授权页）。
 class MiniPlayerOverlayBridge {
   MiniPlayerOverlayBridge._();
 
@@ -28,25 +31,10 @@ class MiniPlayerOverlayBridge {
 
   static WidgetRef? _ref;
   static bool _handlerInstalled = false;
-  static bool _notificationSubscribed = false;
 
   static void init(WidgetRef ref) {
     _ref = ref;
     if (!Platform.isAndroid) return;
-    if (!_notificationSubscribed) {
-      _notificationSubscribed = true;
-      // 媒体通知的 contentIntent 被改成进程内广播（见 audio_service 定制），
-      // 单击通知不会拉起 Activity，而是通过该事件流到达这里；首个事件是
-      // BehaviorSubject 的回放值，跳过以免误开浮窗。
-      var first = true;
-      AudioService.notificationClicked.listen((clicked) {
-        if (first) {
-          first = false;
-          return;
-        }
-        if (clicked) _syncSetting(true);
-      });
-    }
     if (_handlerInstalled) return;
     _handlerInstalled = true;
     _channel.setMethodCallHandler((call) async {
@@ -55,8 +43,6 @@ class MiniPlayerOverlayBridge {
           _dispatchAction(call.arguments);
         case 'onCloseRequested':
           _syncSetting(false);
-        case 'onNotificationClick':
-          _syncSetting(true);
       }
       return null;
     });
@@ -91,7 +77,7 @@ class MiniPlayerOverlayBridge {
     }
   }
 
-  /// 关闭按钮 / 通知栏单击：把设置里的开关同步为对应的状态。写入设置会触发
+  /// 浮窗关闭按钮：把设置里的开关同步为关闭。写入设置会触发
   /// 根节点的监听，由统一的 [requestSync] 链路完成浮窗启停（单一真源）。
   static void _syncSetting(bool enabled) {
     final ref = _ref;
@@ -140,13 +126,18 @@ class MiniPlayerOverlayBridge {
     _coverPath = '';
   }
 
-  /// 启停悬浮窗。开启时原生会校验悬浮窗权限，未授权则拉起授权页并返回
-  /// false（此时不会显示浮窗）。
-  static Future<bool> setEnabled(bool enabled) async {
+  /// 启停悬浮窗。开启时原生会校验悬浮窗权限；[requestPermission] 为
+  /// true（设置页手动开启）时未授权会拉起授权页并返回 false，false
+  /// （自动同步链路）时静默返回 false，避免进 app 就被拉去授权页。
+  static Future<bool> setEnabled(
+    bool enabled, {
+    bool requestPermission = true,
+  }) async {
     if (!Platform.isAndroid) return false;
     try {
       final result = await _channel.invokeMethod<bool>('setEnabled', {
         'enabled': enabled,
+        'requestPermission': requestPermission,
       });
       final accepted = result == true;
       if (accepted) {
@@ -158,6 +149,34 @@ class MiniPlayerOverlayBridge {
       return false;
     } on MissingPluginException {
       return false;
+    }
+  }
+
+  /// 查询悬浮窗权限状态（Android 11 以下恒有权限）。
+  ///
+  /// 这是全局唯一的系统悬浮窗权限（`canDrawOverlays`），迷你播放器浮窗、
+  /// 桌面歌词等一切小窗功能共用；权限弹页规范：只在用户手动开启小窗类
+  /// 功能时检测并询问跳转授权页，自动链路一律静默。
+  static Future<bool> hasOverlayPermission() async {
+    if (!Platform.isAndroid) return false;
+    try {
+      return await _channel.invokeMethod<bool>('hasOverlayPermission') == true;
+    } on PlatformException {
+      return false;
+    } on MissingPluginException {
+      return false;
+    }
+  }
+
+  /// 拉起系统悬浮窗授权页（仅设置页手动开启时调用）。
+  static Future<void> requestOverlayPermission() async {
+    if (!Platform.isAndroid) return;
+    try {
+      await _channel.invokeMethod<void>('requestOverlayPermission');
+    } on PlatformException {
+      // 授权页拉起失败时静默，开关保持原状。
+    } on MissingPluginException {
+      // 非 Android 构建没有对应原生实现。
     }
   }
 
@@ -220,11 +239,12 @@ class MiniPlayerOverlayBridge {
     }
     final generation = ++_syncGeneration;
     if (_lastEnabled != true) {
-      final accepted = await setEnabled(true);
+      // 自动同步链路（进 app 恢复状态等）永远静默：进 APP 不需要悬浮窗
+      // 权限，未授权时不弹授权页，直接把开关同步回关闭；用户想开启时到
+      // 设置页/播放页手动打开（手动链路才会检测并询问跳转授权页）。
+      final accepted = await setEnabled(true, requestPermission: false);
       if (generation != _syncGeneration) return;
       if (!accepted) {
-        // 未授予悬浮窗权限（原生已拉起授权页）：把开关同步回关闭，避免后续
-        // 每次同步都重复拉起授权页。
         _hiddenSent = true;
         _lastEnabled = false;
         final latest = ref.read(settingsProvider).valueOrNull;

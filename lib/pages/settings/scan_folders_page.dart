@@ -20,10 +20,33 @@ class ScanFoldersPage extends ConsumerStatefulWidget {
 
 class _ScanFoldersPageState extends ConsumerState<ScanFoldersPage> {
   bool _adding = false;
+  bool _scanning = false;
 
   void _toast(String msg) {
     if (!mounted) return;
     XyNotice.show(context, message: msg, duration: const Duration(seconds: 2));
+  }
+
+  /// 重新扫描全部已添加目录：删除歌曲后无需重新添加目录即可找回文件
+  /// （扫描是幂等的，已入库歌曲只做增量更新）。
+  Future<void> _rescan() async {
+    if (_scanning) return;
+    setState(() => _scanning = true);
+    _toast('开始重新扫描...');
+    try {
+      final count = await ref.read(libraryProvider.notifier).scanAllFolders();
+      if (!mounted) return;
+      if (count == 0) {
+        _toast('扫描完成，未发现新歌曲');
+      } else {
+        _toast('扫描完成，共扫描到 $count 首歌曲');
+      }
+    } on Exception catch (e) {
+      if (!mounted) return;
+      _toast('扫描失败：${e.toString().replaceFirst('Exception: ', '')}');
+    } finally {
+      if (mounted) setState(() => _scanning = false);
+    }
   }
 
   Future<void> _addFolder() async {
@@ -113,7 +136,23 @@ class _ScanFoldersPageState extends ConsumerState<ScanFoldersPage> {
     // 「添加目录」改为悬浮在页面正中央。
     final folders = foldersAsync.valueOrNull ?? const [];
     return Scaffold(
-      appBar: AppBar(title: const Text('扫描文件夹')),
+      appBar: AppBar(
+        title: const Text('扫描文件夹'),
+        actions: [
+          // 重新扫描入口：删除歌曲后不必重新添加目录，一键找回全部文件。
+          IconButton(
+            tooltip: '重新扫描',
+            onPressed: _scanning ? null : _rescan,
+            icon: _scanning
+                ? const SizedBox(
+                    width: 20,
+                    height: 20,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  )
+                : const Icon(Icons.refresh),
+          ),
+        ],
+      ),
       floatingActionButton: folders.isEmpty
           ? null
           : FloatingActionButton.extended(

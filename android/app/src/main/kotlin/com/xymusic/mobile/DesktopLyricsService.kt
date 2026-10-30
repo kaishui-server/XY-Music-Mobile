@@ -330,6 +330,7 @@ class DesktopLyricsService : Service() {
             }
             ACTION_SHOW, ACTION_UPDATE, null -> {
                 if (!canDrawOverlays()) {
+                    // 无权限静默停服（不跳授权页）：自动链路永不弹页。
                     stopSelf()
                     return START_NOT_STICKY
                 }
@@ -1115,6 +1116,7 @@ class DesktopLyricsService : Service() {
     ///    大偏差（seek）才重置基准。
     fun applyUpdate(p: DesktopLyricsUpdateParams) {
         if (!canDrawOverlays()) {
+            // 无权限静默停服（不跳授权页）：自动链路永不弹页。
             stopSelf()
             return
         }

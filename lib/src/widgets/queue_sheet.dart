@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../library/online_cover_overrides.dart';
 import '../player/player_provider.dart';
 import 'cover_image.dart';
 
@@ -348,7 +349,7 @@ class QueueRowCard extends StatelessWidget {
       height: 46,
       child: CoverImage(
         songPath: item.path,
-        imageUrl: item.coverUrl,
+        imageUrl: resolveOnlineCoverUrl(item.coverUrl, item.path),
         width: 46,
         height: 46,
         radius: 10,

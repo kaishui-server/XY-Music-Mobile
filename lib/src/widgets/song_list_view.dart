@@ -6,8 +6,11 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../core/settings.dart';
 import '../favorites/favorites_provider.dart';
 import '../library/library_provider.dart';
+import '../library/online_cover_overrides.dart';
 import '../navigation/shell.dart';
 import '../player/player_provider.dart';
+import '../../pages/library/online_cover_edit_page.dart';
+import '../../pages/library/song_edit_page.dart';
 import '../playlists/playlist_picker_sheet.dart';
 import '../playlists/playlists_provider.dart';
 import '../plugins/plugin_runtime.dart';
@@ -455,6 +458,9 @@ class _SongsListViewState extends ConsumerState<SongsListView> {
     // 网络歌曲才提供下载与换源；本地文件没有插件音源可切换，
     // 批量下载流程本身也会跳过本地文件。
     final isNetworkSong = song.pluginId?.trim().isNotEmpty == true;
+    // 本地文件（真实路径，无 :// scheme）支持 tag 编辑，菜单升级为
+    // 「编辑歌曲信息」；网络歌曲没有文件可写，保留只读「歌曲信息」。
+    final isLocalFile = !song.path.contains('://');
     if (!context.mounted) return;
     final action = await showModalBottomSheet<_SongAction>(
       context: context,
@@ -555,9 +561,16 @@ class _SongsListViewState extends ConsumerState<SongsListView> {
               _actionTile(
                 context,
                 _SongAction.info,
-                Icons.info_outline,
-                '歌曲信息',
+                isLocalFile ? Icons.edit_outlined : Icons.info_outline,
+                isLocalFile ? '编辑歌曲信息' : '歌曲信息',
               ),
+              if (!isLocalFile)
+                _actionTile(
+                  context,
+                  _SongAction.editCover,
+                  Icons.image_outlined,
+                  '编辑封面',
+                ),
               if (widget.onRemoveAction != null)
                 _actionTile(
                   context,
@@ -600,7 +613,25 @@ class _SongsListViewState extends ConsumerState<SongsListView> {
         }
         return;
       case _SongAction.info:
-        if (context.mounted) await _showSongInfo(context, song);
+        if (context.mounted) {
+          // 本地文件打开编辑页（tag 读写）；网络歌曲保留只读信息面板。
+          if (!song.path.contains('://')) {
+            await SongEditPage.open(context, song.path);
+          } else {
+            await _showSongInfo(context, song);
+          }
+        }
+        return;
+      case _SongAction.editCover:
+        if (context.mounted) {
+          await OnlineCoverEditPage.open(
+            context,
+            songPath: song.path,
+            title: song.title,
+            artist: song.artist,
+            coverUrl: song.coverUrl,
+          );
+        }
         return;
       case _SongAction.removeFromRecent:
         await widget.onRemoveAction?.call(song);
@@ -829,19 +860,30 @@ class SongCover extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    if (!loadNetworkCover && song.coverUrl?.trim().isNotEmpty == true) {
-      return _CoverPlaceholder(size: size);
-    }
-    return CoverImage(
-      songPath: song.path,
-      imageUrl: song.coverUrl,
-      width: size,
-      height: size,
-      radius: 10,
-      // 按 3 倍逻辑像素解码即可覆盖主流高清屏；不限制会把 480px 级别的
-      // 网络封面整张解码进纹理，长列表滚动时明显增加内存与解码开销。
-      cacheWidth: (size * 3).round(),
-      icon: Icons.music_note,
+    // 在线歌曲自定义封面：编辑页保存后 revision 自增，此处随之刷新
+    // （覆盖值 file:// 本地图或网络 URL）。
+    return ValueListenableBuilder<int>(
+      valueListenable: onlineCoverRevision,
+      builder: (context, _, _) {
+        final overrideUrl = resolveOnlineCoverUrl(song.coverUrl, song.path);
+        final hasOverride = overrideUrl != song.coverUrl;
+        if (!loadNetworkCover &&
+            overrideUrl?.trim().isNotEmpty == true &&
+            !hasOverride) {
+          return _CoverPlaceholder(size: size);
+        }
+        return CoverImage(
+          songPath: song.path,
+          imageUrl: overrideUrl,
+          width: size,
+          height: size,
+          radius: 10,
+          // 按 3 倍逻辑像素解码即可覆盖主流高清屏；不限制会把 480px 级别的
+          // 网络封面整张解码进纹理，长列表滚动时明显增加内存与解码开销。
+          cacheWidth: (size * 3).round(),
+          icon: Icons.music_note,
+        );
+      },
     );
   }
 }
@@ -1169,6 +1211,7 @@ enum _SongAction {
   download,
   switchSource,
   info,
+  editCover, // 在线歌曲封面编辑（本地歌曲用 info 打开完整编辑页）
   removeFromRecent,
 }
 

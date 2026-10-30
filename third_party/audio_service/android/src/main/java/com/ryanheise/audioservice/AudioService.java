@@ -424,12 +424,21 @@ public class AudioService extends MediaBrowserServiceCompat {
                 contentIntent = null;
             }
         } else {
-            // XY Music 定制：单击通知不拉起 Activity（否则会把应用切到前台），
-            // 改为向进程内广播单击事件，由 NotificationClickReceiver 转交 Dart
-            // 的 AudioHandler，从而只弹出迷你播放器悬浮窗。
-            intent.setClass(context, NotificationClickReceiver.class);
-            intent.setAction(NOTIFICATION_CLICK_ACTION);
-            contentIntent = PendingIntent.getBroadcast(context, REQUEST_CONTENT_INTENT, intent, flags);
+            // XY Music 定制：单击通知/灵动胶囊 = 直接拉起 MainActivity（进软件）。
+            // 此前经 NotificationClickReceiver 广播转发再 startActivity：Android 12+
+            // 对广播 receiver 里的后台 startActivity 有 BAL 限制，SYSTEM_ALERT_WINDOW
+            // （悬浮窗权限）是少数豁免项之一——未授权悬浮窗时点胶囊进不了应用。
+            // 改为 Activity PendingIntent：通知点击属于用户交互，天然豁免后台
+            // 启动限制，不再依赖悬浮窗权限。
+            if (config.activityClassName != null) {
+                intent.setComponent(new ComponentName(context, config.activityClassName));
+            } else {
+                intent.setClassName(context, context.getPackageName() + ".MainActivity");
+            }
+            intent.setAction(Intent.ACTION_MAIN);
+            intent.addCategory(Intent.CATEGORY_LAUNCHER);
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_SINGLE_TOP);
+            contentIntent = PendingIntent.getActivity(context, REQUEST_CONTENT_INTENT, intent, flags);
         }
         if (!config.androidResumeOnClick) {
             mediaSession.setMediaButtonReceiver(null);

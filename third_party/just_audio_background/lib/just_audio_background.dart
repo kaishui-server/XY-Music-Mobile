@@ -19,6 +19,18 @@ late JustAudioPlatform _platform;
 /// 未初始化（JustAudioBackground.init 尚未调用）时抛出 LateInitializationError。
 SwitchAudioHandler get xySwitchAudioHandler => _audioHandler;
 
+/// XY Music 本地补丁：平台播放 handler 就位探测（混淆安全）。
+///
+/// 混淆构建（--obfuscate）会把 Dart 类名替换成无意义符号，
+/// 宿主不能用 `runtimeType.toString() == '_PlayerAudioHandler'`
+/// 识别平台 handler（恒 false，导致媒体会话桥接永远装不上、
+/// 通知栏只剩默认三键）。补丁包与宿主同程序编译，`is` 类型判断
+/// 不受混淆影响，故经此扩展暴露判断。
+extension XySwitchAudioHandlerProbe on SwitchAudioHandler {
+  /// inner 是否已是内部 _PlayerAudioHandler（平台播放器完成初始化）。
+  bool get xyInnerPlayerReady => inner is _PlayerAudioHandler;
+}
+
 /// XY Music 本地补丁：跨代理链的均衡器门面。
 ///
 /// 真实平台播放器在 [_initPlayer] 时被注入原生 AndroidEqualizer（默认

@@ -197,6 +197,11 @@ class _CoverImageState extends ConsumerState<CoverImage> {
     final imageUrl = normalizeCoverImageUrl(widget.imageUrl);
     final decodeWidth = widget.cacheWidth?.clamp(1, 2048);
     final proxyBytes = _proxyBytes;
+    // `file://` 前缀 = 本地自定义图片（如歌单封面编辑保存的文件），
+    // 直接走文件解码，绝不进 Image.network（本地路径必挂）。
+    final localFileUri = imageUrl.startsWith('file://')
+        ? Uri.tryParse(imageUrl)
+        : null;
     return ClipRRect(
       borderRadius: BorderRadius.circular(widget.radius),
       child: SizedBox(
@@ -205,6 +210,13 @@ class _CoverImageState extends ConsumerState<CoverImage> {
         child: proxyBytes != null
             ? Image.memory(
                 proxyBytes,
+                cacheWidth: decodeWidth,
+                fit: BoxFit.cover,
+                errorBuilder: (_, _, _) => _placeholder(),
+              )
+            : localFileUri != null
+            ? Image.file(
+                File.fromUri(localFileUri),
                 cacheWidth: decodeWidth,
                 fit: BoxFit.cover,
                 errorBuilder: (_, _, _) => _placeholder(),

@@ -311,8 +311,11 @@ class XyPlayerSheetRoute<T> extends PageRouteBuilder<T> {
   double? _dragTarget;
 
   /// 拖动实时驱动：详情页下滑收起为 1 → 0，播放栏上滑展开为 0 → 1。
+  /// 置位跟手标记（morph 层线性映射，不叠加缓动曲线），保证面板严格
+  /// 跟随手指。
   set dragValue(double value) {
     _dragTarget = value.clamp(0.0, 1.0);
+    xyPlayerSheetGestureDriving = true;
     final controller = this.controller;
     if (controller == null) return;
     if (controller.isAnimating) controller.stop();
@@ -321,6 +324,7 @@ class XyPlayerSheetRoute<T> extends PageRouteBuilder<T> {
 
   /// 松手回弹到全屏：时长按剩余距离等比缩短，避免短距回弹拖沓。
   void springBack() {
+    xyPlayerSheetGestureDriving = false;
     final controller = this.controller;
     if (controller == null) return;
     if (controller.isAnimating) controller.stop();
@@ -342,6 +346,7 @@ class XyPlayerSheetRoute<T> extends PageRouteBuilder<T> {
   /// 松手收回：面板缩回播放栏矩形，动画完成后移除路由（此时转场值
   /// 已为 0，路由离场无视觉跳变）。
   void collapseAndPop() {
+    xyPlayerSheetGestureDriving = false;
     final controller = this.controller;
     if (controller == null) {
       _popSelf();
@@ -394,6 +399,8 @@ class XyPlayerSheetRoute<T> extends PageRouteBuilder<T> {
     // 兜底复位冻结标记：正常路径由转场落定复位，这里覆盖转场被异常
     // 中断（路由被外部直接移除等）的情况，避免壳层二级转场被永久冻结。
     xySecondaryTransitionFrozen = false;
+    // 同步复位跟手标记，防止下一轮正常补间动画被误判为手势驱动。
+    xyPlayerSheetGestureDriving = false;
     super.dispose();
   }
 }

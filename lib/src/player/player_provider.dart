@@ -42,7 +42,6 @@ import 'cloud_play_context.dart';
 import 'cloud_proxy.dart';
 import 'lx_lyrics_builder.dart';
 import 'playback_chain_log.dart';
-import 'playback_probe.dart';
 import 'video_playback_session.dart';
 
 // playbackChainLog 已抽至独立文件 playback_chain_log.dart（cloud_proxy
@@ -967,6 +966,47 @@ class _MediaSessionBridge extends audio_service.CompositeAudioHandler {
 class PlayerNotifier extends StateNotifier<PlaybackState>
     with WidgetsBindingObserver {
   PlayerNotifier(this._ref) : super(const PlaybackState()) {
+    // 内存治理 ⑦：播放器实例以收紧缓冲的 load 配置创建（见
+    // [_buildLoadConfiguration]，非 final 便于 [_rebuildPlayer] 重建）。
+    _player = AudioPlayer(
+      handleInterruptions: false,
+      audioLoadConfiguration: _buildLoadConfiguration(),
+    );
+    // 内存治理 ②：封面/歌词图走 Flutter imageCache（天然 LRU），收紧
+    // 容量上限并配合 onTrimMemory 全清（见 [_handleMemoryPressure]）。
+    PaintingBinding.instance.imageCache.maximumSize = 240;
+    PaintingBinding.instance.imageCache.maximumSizeBytes = 100 << 20;
+    // 内存治理 ⑥⑪⑫：原生 onTrimMemory / Native Heap 监控 / 机型信息。
+    _memoryChannel.setMethodCallHandler((call) async {
+      try {
+        final args =
+            call.arguments is Map ? (call.arguments as Map).cast<String, dynamic>() : const <String, dynamic>{};
+        switch (call.method) {
+          case 'onTrimMemory':
+            _nativeIsXiaomi = args['isXiaomi'] == true;
+            _handleMemoryPressure(
+              level: (args['level'] as num?)?.toInt() ?? 80,
+            );
+            break;
+          case 'nativePressure':
+            _nativeIsXiaomi = args['isXiaomi'] == true;
+            _handleNativeHeapPressure();
+            break;
+          default:
+            break;
+        }
+      } catch (_) {
+        // 内存治理回调失败仅影响降级效果，不影响播放。
+      }
+      return null;
+    });
+    // 冷启动：Dart handler 安装前原生的 invoke 会静默丢失，注册后主动
+    // 拉取一次初始机型信息（⑫ 小米缓冲档位尽早生效）。
+    unawaited(_memoryChannel.invokeMethod<Object?>('getInitialInfo').then((v) {
+      if (v is Map && v['isXiaomi'] == true) {
+        _nativeIsXiaomi = true;
+      }
+    }).catchError((_) {}));
     WidgetsBinding.instance.addObserver(this);
     // 原生浮窗手动拖动结束后回传纵向位置（百分制），写回设置让滑块跟随
     // 实际位置。否则下一次同步会用旧滑块值把浮窗拉回（拖动后复位）。
@@ -992,19 +1032,10 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
         _ref.read(settingsProvider.notifier).setDesktopLyricsEnabled(false),
       );
     };
-    // 通知栏双击：请求开启桌面歌词悬浮窗（走设置开关链路，权限校验、
-    // 浮窗启动与数据同步全在 setEnabled(true) 一条链上完成）。
-    DesktopLyricsBridge.onOpenRequested = () {
-      final current = _ref.read(settingsProvider).valueOrNull;
-      if (current == null || current.desktopLyricsEnabled) return;
-      unawaited(
-        _ref.read(settingsProvider.notifier).setDesktopLyricsEnabled(true),
-      );
-    };
     // 浮窗操作栏 ⚙ 设置键：打开桌面歌词设置子页。
-    DesktopLyricsBridge.onOpenSettings = () {
-      appRouter.push('/settings/desktop-lyrics');
-    };
+    // （通知双击自动开歌词的链路已移除：MagicOS 胶囊单击常被拆成两次
+    // 广播误入双击分支，无权限时会弹「显示在其他应用上层」授权页。）
+    DesktopLyricsBridge.onOpenSettings = _openDesktopLyricsSettings;
     // 冷启动场景：原生 configureFlutterEngine 的补发早于本构造，浮窗
     // 「打开设置」消息曾被暂存——回调就位后补执行（首帧后 push），
     // 否则用户点一次 ⚙ 只拉起 app 停在原页面，要再点一次才能进设置。
@@ -1169,8 +1200,11 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
         return;
       }
       // 只有 just_audio_background 的内部 handler 就位后才安装，避免把
-      // 桥接套在初始空 handler 上，随后又被平台初始化覆盖。
-      if (current.runtimeType.toString() != '_PlayerAudioHandler') return;
+      // 桥接套在初始空 handler 上，随后又被平台初始化覆盖。必须用补丁包
+      // 的类型判断（is）而非 runtimeType 字符串比较：--obfuscate 构建下
+      // 类名被混淆，字符串比较恒 false，桥接永远装不上（通知栏五键变
+      // 三键的根因）。
+      if (!handler.xyInnerPlayerReady) return;
       _mediaSessionBridge?.detach();
       final bridge = _MediaSessionBridge(current)
         ..onSkipToNext = next
@@ -1637,22 +1671,13 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
     _dspWatchdogTimer = null;
   }
 
-  Future<void> _checkDspPipelineAlive() async {
-    if (!_dspPipelineActive || !state.isPlaying) return;
-    final path = _dspPipelinePath;
-    if (path == null || state.current?.path != path) return;
-    // 曲终窗口（尾部 1.5s）不重建：管线 EOF 退出属正常路径。
-    if (state.duration > 0 && state.position >= state.duration - 1.5) return;
-    try {
-      if (await isUsbExclusiveActive()) return;
-    } catch (_) {
-      return;
-    }
-    if (!_dspPipelineActive || state.current?.path != path) return;
-    debugPrint('[DSP] 管线异常退出（断流/设备切换），按当前进度重建');
+  /// 按当前进度重建 DSP 管线（断流/时钟停滞共用入口）。
+  Future<void> _rebuildDspPipelineAtCurrentPosition() async {
+    final path = _dspPipelinePath ?? state.current?.path;
     _dspPipelineActive = false;
     dspPipelineOwnsEffects = false;
     _stopDspWatchdog();
+    if (path == null || path != state.current?.path) return;
     final ok = await _startDspPipeline(
       itemPath: path,
       startAtSecs: state.position,
@@ -1663,6 +1688,150 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
       try {
         await _player.setVolume(_ref.read(volumeProvider));
       } catch (_) {}
+    }
+  }
+
+  /// 回前台自愈：后台久置期间进程被冻结/音频流被回收，解冻后引擎线程
+  /// 会在 500ms 内检测断流退出，但恢复播放的重建要等 2s 看门狗——回
+  /// 前台立即查一次，已退出则马上按当前进度重建，避免首次点播放无声。
+  Future<void> _healDspAfterResume() async {
+    try {
+      if (await isUsbExclusiveActive()) return;
+    } catch (_) {
+      return;
+    }
+    if (!_dspPipelineActive || !state.isPlaying) return;
+    debugPrint('[DSP] 回前台发现管线已退出（后台断流），按当前进度重建');
+    await _rebuildDspPipelineAtCurrentPosition();
+  }
+
+  double _watchdogLastPos = -1;
+  int _watchdogStallRounds = 0;
+
+  Future<void> _checkDspPipelineAlive() async {
+    if (!_dspPipelineActive || !state.isPlaying) {
+      _watchdogLastPos = -1;
+      _watchdogStallRounds = 0;
+      return;
+    }
+    final path = _dspPipelinePath;
+    if (path == null || state.current?.path != path) return;
+    // 曲终窗口（尾部 1.5s）不重建：管线 EOF 退出属正常路径。
+    if (state.duration > 0 && state.position >= state.duration - 1.5) {
+      _watchdogLastPos = -1;
+      _watchdogStallRounds = 0;
+      return;
+    }
+    // 静音时钟停滞检测：isPlaying 而进度连续两个周期（约 4s）不动。
+    // 后台久置后时钟（just_audio）可能被内存治理释放/焦点回收，此时
+    // 引擎侧 isUsbExclusiveActive 仍为 true，仅靠引擎存活判定发现不了
+    // 「状态在播但无声无进度」；第一轮补拉时钟，仍停滞则完整重建。
+    final stalled =
+        _watchdogLastPos >= 0 && (state.position - _watchdogLastPos).abs() < 0.05;
+    _watchdogLastPos = state.position;
+    if (stalled) {
+      _watchdogStallRounds++;
+      if (_watchdogStallRounds == 1) {
+        unawaited(_player.play());
+        return;
+      }
+      if (_watchdogStallRounds >= 2) {
+        _watchdogStallRounds = 0;
+        debugPrint('[DSP] 静音时钟停滞（isPlaying 但进度不动），重建管线');
+        await _rebuildDspPipelineAtCurrentPosition();
+        return;
+      }
+    } else {
+      _watchdogStallRounds = 0;
+    }
+    try {
+      if (await isUsbExclusiveActive()) return;
+    } catch (_) {
+      return;
+    }
+    if (!_dspPipelineActive || state.current?.path != path) return;
+    debugPrint('[DSP] 管线异常退出（断流/设备切换），按当前进度重建');
+    await _rebuildDspPipelineAtCurrentPosition();
+  }
+
+  /// 内存治理 ⑦⑫：构建收紧的 ExoPlayer 缓冲配置。just_audio 默认
+  /// min/max 各 50s，长时播放会累积大量解码缓冲（匿名堆/Native Heap
+  /// 增长）；普通机型收紧到 15s/20s，小米机型进一步降到 8s/12s。
+  AudioLoadConfiguration _buildLoadConfiguration() {
+    return AudioLoadConfiguration(
+      androidLoadControl: AndroidLoadControl(
+        minBufferDuration:
+            Duration(seconds: _nativeIsXiaomi ? 8 : 15),
+        maxBufferDuration:
+            Duration(seconds: _nativeIsXiaomi ? 12 : 20),
+        bufferForPlaybackAfterRebufferDuration:
+            const Duration(seconds: 3),
+        backBufferDuration: Duration.zero,
+      ),
+    );
+  }
+
+  /// 内存治理 ⑥：onTrimMemory 处理。清理非关键图片缓存；后台且未在
+  /// 播放时彻底释放播放器（stop→reset→release 语义由 dispose 完成）。
+  void _handleMemoryPressure({int level = 80}) {
+    // 清理 Flutter imageCache（封面/歌词图等非关键位图缓存）。
+    try {
+      PaintingBinding.instance.imageCache.clearLiveImages();
+      PaintingBinding.instance.imageCache.clear();
+    } catch (_) {}
+    final backgrounded = WidgetsBinding.instance.lifecycleState !=
+        AppLifecycleState.resumed;
+    if (backgrounded && !state.isPlaying && !_rebuildingPlayer) {
+      unawaited(_releasePlayerForMemory());
+    }
+    // 前台仍在播放：不打断，仅靠收紧缓冲 + 图片缓存清理兜底。
+  }
+
+  /// 内存治理 ⑪：Native Heap 超限事件。强制重建播放器释放
+  /// Codec/AudioTrack 累积（播放中时逐曲重建会打断，但 Native 溢出
+  /// 优先于瞬时打断）；同时清理图片缓存。
+  void _handleNativeHeapPressure() {
+    _handleMemoryPressure(level: 80);
+    if (state.isPlaying && !_rebuildingPlayer) {
+      unawaited(_rebuildPlayer('Native Heap 压力（原生 dumpsys 监控）'));
+    }
+  }
+
+  /// 内存治理 ①：彻底释放播放器实例（等价 stop→reset→release），
+  /// 保留状态以便回前台/再播时由 [_playAt] 重建。
+  Future<void> _releasePlayerForMemory() async {
+    if (_rebuildingPlayer) return;
+    _rebuildingPlayer = true;
+    try {
+      _posSub?.cancel();
+      _posSub = null;
+      _durSub?.cancel();
+      _durSub = null;
+      _stateSub?.cancel();
+      _stateSub = null;
+      _audioInterruptionSub?.cancel();
+      _audioInterruptionSub = null;
+      _becomingNoisySub?.cancel();
+      _becomingNoisySub = null;
+      try {
+        await _player.dispose().timeout(const Duration(seconds: 3));
+      } catch (_) {
+        // dispose 卡死/超时也继续：旧实例交由 GC 回收。
+      }
+      _player = AudioPlayer(
+        handleInterruptions: false,
+        audioLoadConfiguration: _buildLoadConfiguration(),
+      );
+      _attachPlayerStreams();
+      unawaited(_stopDspPipeline());
+      _playbackSinceRebuild = Duration.zero;
+      // 音源已随旧播放器销毁：必须使「音源已就绪」标记失效。否则回前台
+      // 点播放时 toggle 误判就绪走直接 play 分支，打在空播放器上——
+      // 无声、进度不走、状态却显示播放中。置空后 toggle 改走 _playAt
+      // 完整重载并按当前进度续播。
+      _preparedSourceRequestId = null;
+    } finally {
+      _rebuildingPlayer = false;
     }
   }
 
@@ -1718,8 +1887,13 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
       } catch (_) {
         // dispose 卡死/超时也继续重建：旧实例交由 GC 回收。
       }
-      _player = AudioPlayer(handleInterruptions: false);
+      _player = AudioPlayer(
+        handleInterruptions: false,
+        audioLoadConfiguration: _buildLoadConfiguration(),
+      );
       _attachPlayerStreams();
+      // 重建即重置长时播放累计（⑨）：新实例缓冲从零开始。
+      _playbackSinceRebuild = Duration.zero;
       try {
         await _player.setVolume(_effectiveClockVolume());
       } catch (_) {
@@ -1752,12 +1926,54 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
 
   /// 播放心跳：播放中每 20s 探测一次主线程响应。正常时开销极小
   /// （一次 MethodChannel 往返），仅响应超时才触发重建。
+  ///
+  /// 心跳同时承担「进度停滞」兜底（覆盖 DSP/普通两种输出模式）：
+  /// 后台久置进程被冻结后，ExoPlayer/静音时钟可能出现「状态在播、
+  /// 无声、进度卡死」的死锁——主线程响应正常（audioProbe 探不出），
+  /// 只有 position 不前进能识别。两个心跳周期（约 40s，扣除一个
+  /// 确认周期）内进度前进不足 2s 且不在曲终窗口，按当前进度重建
+  /// 播放器恢复（DSP 管线另有 2s 存活/停滞看门狗更快自愈）。
+  double _heartbeatLastPos = -1;
+
   void _startPlayerHeartbeat() {
     _playerHeartbeatTimer?.cancel();
     _playerHeartbeatTimer = Timer.periodic(const Duration(seconds: 20), (_) {
       if (_rebuildingPlayer) return;
       final current = state.current;
-      if (current == null || !state.isPlaying) return;
+      if (current == null) return;
+      if (state.isPlaying) {
+        // 内存治理 ⑨：连续播放满 1.5h 择机重建播放器，避开系统
+        // Codec/AudioTrack 缓存累积（重建即重置累计）。
+        _playbackSinceRebuild += const Duration(seconds: 20);
+        if (_playbackSinceRebuild >= _rebuildAfterPlay) {
+          _heartbeatLastPos = -1;
+          unawaited(_rebuildPlayer('长时播放缓冲累积（≥90 分钟）'));
+          return;
+        }
+      }
+      if (!state.isPlaying) {
+        // 暂停期间不检测停滞：恢复播放心跳重新从下一周期起算，
+        // 避免用暂停前的旧 position 误判。
+        _heartbeatLastPos = -1;
+        return;
+      }
+      // 进度停滞检测（通用，双周期确认）。
+      final pos = state.position;
+      final last = _heartbeatLastPos;
+      _heartbeatLastPos = pos;
+      if (last >= 0) {
+        final advanced = pos - last;
+        final nearEnd = state.duration > 0 && pos >= state.duration - 2.0;
+        if (advanced < 2.0 && !nearEnd) {
+          _heartbeatLastPos = -1;
+          unawaited(
+            _rebuildPlayer(
+              '播放进度停滞（20s 仅前进 ${advanced.toStringAsFixed(1)}s）',
+            ),
+          );
+          return;
+        }
+      }
       unawaited(_probeAndRebuild('播放心跳探测超时（主线程疑似楔死）'));
     });
   }
@@ -1776,23 +1992,7 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
         // 不等 2 秒看门狗的静音窗口。
         if (!await isUsbExclusiveActive()) {
           debugPrint('[DSP] resume 时管线已死（暂停期间断流），按当前进度重建');
-          final path = _dspPipelinePath ?? state.current?.path;
-          _dspPipelineActive = false;
-          dspPipelineOwnsEffects = false;
-          _stopDspWatchdog();
-          if (path != null && path == state.current?.path) {
-            final ok = await _startDspPipeline(
-              itemPath: path,
-              startAtSecs: state.position,
-              isPlaying: true,
-            );
-            if (!ok) {
-              // 重建失败：解除静音时钟，回退原生输出。
-              try {
-                await _player.setVolume(_ref.read(volumeProvider));
-              } catch (_) {}
-            }
-          }
+          await _rebuildDspPipelineAtCurrentPosition();
         }
       } else {
         await pauseUsbExclusivePlayback();
@@ -1893,7 +2093,20 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
   // 创建，空指针会中断 setPlatform 使播放卡死。
   // 非 final：主线程楔死自愈会重建播放器实例（见 [_rebuildPlayer]），
   // 新实例同样以 handleInterruptions:false 创建，行为与原实例一致。
-  late AudioPlayer _player = AudioPlayer(handleInterruptions: false);
+  // 内存治理 ⑦：创建时收紧 ExoPlayer 缓冲（见 [_buildLoadConfiguration]）。
+  late AudioPlayer _player;
+
+  // ---- 内存治理（图1/图2 方案落地）----
+  /// 原生内存压力通道：onTrimMemory（⑥）/ Native Heap 监控（⑪）事件。
+  static const _memoryChannel =
+      MethodChannel('com.xymusic.mobile/memory_pressure');
+  /// 小米机型单独降低缓冲（⑫）：匿名堆/Native Heap 增长在小米 ROM 上
+  /// 不回退，缓冲再收紧一档（见 [_buildLoadConfiguration]）。
+  bool _nativeIsXiaomi = false;
+  /// 长时播放累计时长：连续播放满 [_rebuildAfterPlay] 后重建播放器（⑨），
+  /// 避开系统 Codec/AudioTrack 缓存累积。
+  Duration _playbackSinceRebuild = Duration.zero;
+  static const _rebuildAfterPlay = Duration(minutes: 90);
   /// 正在重建播放器（防止 probe 重入）。
   bool _rebuildingPlayer = false;
   /// 主线程心跳探测定时器（见 [_startPlayerHeartbeat]）。
@@ -2012,34 +2225,12 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
   final Stopwatch _statsWallClock = Stopwatch()..start();
   int _statsLastFlushElapsedMs = 0;
 
-  // 久播卡死探针（小米澎湃等机型长时间播放后无声卡住）：仅在异常时
-  // 把播放快照与原生音频输出层信号写进日志，用于区分媒体层停滞与
-  // AudioTrack/AAudio 停摆。常态开销只有每 5s 一次读取。
-  late final PlaybackProbe _playbackProbe = PlaybackProbe(
-    sample: _probeSample,
-  );
-
   // ---- 播放中重缓冲（卡顿）事件记录 ----
   /// 上一次 playerStateStream 事件的处理状态：识别「ready→buffering」跌落。
   ProcessingState? _lastStreamProcessingState;
   /// 当前曲的重缓冲次数与本次进入时间（null 表示当前不在缓冲中）。
   int _rebufferCount = 0;
   DateTime? _rebufferEnteredAt;
-
-  /// 探针采样：无歌曲时返回 null（不采样）；有歌曲时给出进度、缓冲、
-  /// 解码状态与 DSP 管线占用情况。
-  PlaybackProbeSample? _probeSample() {
-    if (state.current == null) return null;
-    return PlaybackProbeSample(
-      positionMs: _player.position.inMilliseconds,
-      bufferedMs: _player.bufferedPosition.inMilliseconds,
-      durationMs: _player.duration?.inMilliseconds ?? 0,
-      processingState: _player.processingState.name,
-      playing: state.isPlaying,
-      dspActive: _dspPipelineActive,
-      dspPlaying: _dspPipelinePlaying,
-    );
-  }
 
   Future<void> _init() async {
     final allowOtherAudio =
@@ -2061,7 +2252,6 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
       });
     }
     _attachPlayerStreams();
-    _playbackProbe.start();
     _startPlayerHeartbeat();
     await _restoreSession();
   }
@@ -2293,6 +2483,11 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
     // 避免系统回收进程后丢失最后一段播放时长。
     if (state != AppLifecycleState.resumed) {
       _flushCurrentPlaybackStats();
+      // 内存治理 ⑩：后台且未在播放时停止 DSP/频谱计算管线，避免
+      // 后台持续占用 Native 内存。
+      if (!this.state.isPlaying) {
+        unawaited(_stopDspPipeline());
+      }
       // 退出/切后台前把引擎实时进度并入状态并强制落库。只靠播放中的 5s
       // 防抖写入，退出瞬间最后一段进度会丢；进程被系统回收时更是整段丢失，
       // 表现为重进后“记不住上次播放位置”。
@@ -2302,6 +2497,8 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
       // 回前台：统计周期刷写后台暂停期间累积的时长一次补齐（见
       // _statsFlushTimer 的后台静默分支）。
       _flushCurrentPlaybackStats();
+      // 浮窗 ⚙ 挂起的「打开桌面歌词设置页」：Activity 恢复前台后补 push。
+      _consumePendingDesktopLyricsSettings();
     }
     // 前后台切换时重挂 position 流，按当前生命周期选择采样周期
     // （后台降频，降低后台 CPU 占用）；尚未挂接时忽略。
@@ -2316,6 +2513,32 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
     // 下一次随机 sync（可能很久不来）——这里强制立即同步一次，按
     // resumed 状态发 enabled:false 隐藏 / 退后台发 enabled:true 显示。
     _requestDesktopLyricsSync(immediate: true);
+  }
+
+  /// 浮窗 ⚙ 打开桌面歌词设置页：app 尚未恢复前台（原生 startActivity
+  /// 拉起 MainActivity 的过程中）时 push 的页面转场不渲染——用户切回
+  /// app 只看到空白页，要二次进入才正常。非 resumed 时先挂起，等
+  /// didChangeAppLifecycleState 回前台再 push。
+  bool _pendingDesktopLyricsSettings = false;
+
+  void _openDesktopLyricsSettings() {
+    if (_pendingDesktopLyricsSettings) return;
+    _pendingDesktopLyricsSettings = true;
+    if (WidgetsBinding.instance.lifecycleState == AppLifecycleState.resumed) {
+      _consumePendingDesktopLyricsSettings();
+    }
+  }
+
+  /// 消费挂起的「打开桌面歌词设置页」：延后到下一帧绘制完成后 push。
+  /// 回前台过渡期/冷启动早期 shell navigator 尚未挂载完成，此刻 push
+  /// 的页面会渲染空白（二次进入才正常），随后按返回键还会触发
+  /// go_router `_findCurrentNavigators` 空指针崩溃。
+  void _consumePendingDesktopLyricsSettings() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!_pendingDesktopLyricsSettings) return;
+      _pendingDesktopLyricsSettings = false;
+      appRouter.push('/settings/desktop-lyrics');
+    });
   }
 
   /// 后台久置挂起视频（应用级守护）。挂在 PlayerNotifier 而非播放
@@ -2335,6 +2558,11 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
       case AppLifecycleState.hidden:
         if (hasVideo) _videoBackgroundedAt = DateTime.now();
       case AppLifecycleState.resumed:
+        // 后台久置解冻后管线可能已断流退出：正在播放时立即自愈，
+        // 不等 2s 看门狗（回前台首次点播放无声的直接来源）。
+        if (_dspPipelineActive && this.state.isPlaying) {
+          unawaited(_healDspAfterResume());
+        }
         final backgroundedAt = _videoBackgroundedAt;
         _videoBackgroundedAt = null;
         if (backgroundedAt == null || !hasVideo) break;
@@ -3416,6 +3644,8 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
     _mediaSessionBridge?.syncMediaItem(item);
     try {
       await _player.stop();
+      // 内存治理 ①⑨：切歌 stop 已释放旧曲缓冲，重置长时播放累计。
+      _playbackSinceRebuild = Duration.zero;
       final plugin = await _prepareAudioSource(
         item,
         queueIndex: index,
@@ -3497,6 +3727,10 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
   /// 系统的省电策略可能拖慢网络线程；播放期间的空闲预取让切歌时
   /// 直接命中缓存，仅需 setUrl 连接 CDN。
   Future<void> _prefetchNextSource() async {
+    // 内存治理 ⑩：后台停止预加载（回前台/切歌时再走预解析）。
+    if (WidgetsBinding.instance.lifecycleState != AppLifecycleState.resumed) {
+      return;
+    }
     final queue = state.queue;
     final nextIndex = state.queueIndex + 1;
     if (nextIndex < 0 || nextIndex >= queue.length) return;
@@ -6935,7 +7169,6 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
     _stateSub?.cancel();
     _dspTakeoverTimer?.cancel();
     _dspDeferredTakeoverTimer?.cancel();
-    _playbackProbe.stop();
     unawaited(_stopDspPipeline());
     _playerHeartbeatTimer?.cancel();
     _player.dispose();

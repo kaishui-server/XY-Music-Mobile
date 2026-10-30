@@ -86,38 +86,54 @@ pub fn get_cover_cache_dir(cache_root: &Path) -> PathBuf {
 
 pub fn run_cache_cleanup(cache_dir: &Path) {
     let cache_dir = cache_dir.to_path_buf();
-    let max_size = COVER_CACHE_MAX_SIZE_BYTES;
-
     std::thread::spawn(move || {
-        if let Ok(read_dir) = fs::read_dir(&cache_dir) {
-            let mut files: Vec<_> = read_dir
-                .filter_map(|entry| entry.ok())
-                .filter_map(|entry| {
-                    let metadata = entry.metadata().ok()?;
-                    let len = metadata.len();
-                    let accessed = metadata
-                        .accessed()
-                        .or(metadata.modified())
-                        .unwrap_or(SystemTime::now());
-                    Some((entry.path(), len, accessed))
-                })
-                .collect();
-
-            files.sort_by_key(|&(_, _, time)| time);
-            let mut total_size: u64 = files.iter().map(|&(_, len, _)| len).sum();
-
-            if total_size > max_size {
-                for (path, len, _) in files {
-                    if total_size <= max_size {
-                        break;
-                    }
-                    if fs::remove_file(&path).is_ok() {
-                        total_size = total_size.saturating_sub(len);
-                    }
-                }
-            }
-        }
+        let _ = run_cache_cleanup_sync(&cache_dir, COVER_CACHE_MAX_SIZE_BYTES);
     });
+}
+
+/// 同步执行封面缓存 LRU 清理：总大小超过 `max_size` 时按最后访问时间
+/// 从最旧开始删除，直到不超过 `max_size`。返回实际释放的字节数。
+///
+/// 只处理目录下的文件（缩略图/全尺寸封面/头像/.ref 别名/.tmp 原子写临时
+/// 文件均为一层平铺，不递归子目录），按访问时间淘汰最旧文件，保留最近
+/// 使用的内容；`.tmp` 为写入中断残留，也一并按最旧规则淘汰。
+pub fn run_cache_cleanup_sync(cache_dir: &Path, max_size: u64) -> u64 {
+    let Ok(read_dir) = fs::read_dir(cache_dir) else {
+        return 0;
+    };
+    let mut files: Vec<_> = read_dir
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| {
+            let metadata = entry.metadata().ok()?;
+            if !metadata.is_file() {
+                return None;
+            }
+            let len = metadata.len();
+            let accessed = metadata
+                .accessed()
+                .or(metadata.modified())
+                .unwrap_or(SystemTime::now());
+            Some((entry.path(), len, accessed))
+        })
+        .collect();
+
+    files.sort_by_key(|&(_, _, time)| time);
+    let mut total_size: u64 = files.iter().map(|&(_, len, _)| len).sum();
+    if total_size <= max_size {
+        return 0;
+    }
+
+    let mut freed: u64 = 0;
+    for (path, len, _) in files {
+        if total_size <= max_size {
+            break;
+        }
+        if fs::remove_file(&path).is_ok() {
+            total_size = total_size.saturating_sub(len);
+            freed += len;
+        }
+    }
+    freed
 }
 
 fn remove_cache_dir_contents(cache_dir: &Path) -> Result<(), String> {

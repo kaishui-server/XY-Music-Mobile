@@ -96,6 +96,8 @@ class VisualizerSettings {
   final double lyricsOffsetX; // 空间偏移
   // —— 音频检测 ——
   final double detectLevel; // 0..100 节拍检测灵敏度
+  // —— 播放栏 ——
+  final bool autoHideBar; // 3 秒无操作自动隐藏底部播放栏（任意触摸唤起）
   // —— Advanced 触发频段（共用） ——
   final int bandStart;
   final int bandEnd;
@@ -105,6 +107,7 @@ class VisualizerSettings {
   const VisualizerSettings({
     this.themeIndex = 1, // 默认暗夜（对齐参考版默认观感）
     this.showCover = true,
+    this.autoHideBar = true,
     this.groundEq = const [
       VisEqBand(value: 50), VisEqBand(value: 50), VisEqBand(value: 50),
       VisEqBand(value: 50), VisEqBand(value: 50), VisEqBand(value: 50),
@@ -158,6 +161,7 @@ class VisualizerSettings {
   VisualizerSettings copyWith({
     int? themeIndex,
     bool? showCover,
+    bool? autoHideBar,
     List<VisEqBand>? groundEq,
     double? motionSpeed,
     double? amplitude,
@@ -195,6 +199,7 @@ class VisualizerSettings {
     return VisualizerSettings(
       themeIndex: themeIndex ?? this.themeIndex,
       showCover: showCover ?? this.showCover,
+      autoHideBar: autoHideBar ?? this.autoHideBar,
       groundEq: groundEq ?? this.groundEq,
       motionSpeed: motionSpeed ?? this.motionSpeed,
       amplitude: amplitude ?? this.amplitude,
@@ -235,6 +240,7 @@ class VisualizerSettings {
         'v': kVisSettingsVersion,
         'themeIndex': themeIndex,
         'showCover': showCover,
+        'autoHideBar': autoHideBar,
         'groundEq': [
           for (final b in groundEq) {'on': b.on, 'v': b.value}
         ],
@@ -293,6 +299,7 @@ class VisualizerSettings {
     return VisualizerSettings(
       themeIndex: (j['themeIndex'] as num?)?.toInt() ?? 1,
       showCover: j['showCover'] is bool ? j['showCover'] : true,
+      autoHideBar: j['autoHideBar'] is bool ? j['autoHideBar'] : true,
       groundEq: eq.length == 8
           ? eq
           : const [

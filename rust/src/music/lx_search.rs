@@ -225,7 +225,7 @@ fn decode_numeric_entities(s: &str) -> String {
 }
 
 /// HTML 实体解码（覆盖常见命名实体 + 数字实体，前缀等价于前端 `he` 库的常用场景）
-fn decode_name(s: &str) -> String {
+pub fn decode_name(s: &str) -> String {
     let named = s
         .replace("&amp;", "&")
         .replace("&lt;", "<")
@@ -287,7 +287,7 @@ fn build_kugou_cover_url(url: &str, size: u32) -> Option<String> {
 /// 保持默认 TLS 证书校验，避免搜索和解析链路被中间人篡改。
 static HTTP_CLIENT: OnceLock<Result<reqwest::Client, String>> = OnceLock::new();
 
-fn http_client() -> &'static Result<reqwest::Client, String> {
+pub fn http_client() -> &'static Result<reqwest::Client, String> {
     HTTP_CLIENT.get_or_init(|| {
         reqwest::Client::builder()
             .timeout(Duration::from_secs(15))
@@ -296,7 +296,7 @@ fn http_client() -> &'static Result<reqwest::Client, String> {
     })
 }
 
-async fn http_get_json(url: &str, headers: &[(&str, &str)]) -> Result<serde_json::Value, String> {
+pub async fn http_get_json(url: &str, headers: &[(&str, &str)]) -> Result<serde_json::Value, String> {
     let client = http_client().as_ref().map_err(|e| e.clone())?;
     let mut req = client.get(url);
     for (key, value) in headers {
@@ -314,7 +314,7 @@ async fn http_get_json(url: &str, headers: &[(&str, &str)]) -> Result<serde_json
     serde_json::from_str(&body).map_err(|e| format!("Invalid JSON: {}", e))
 }
 
-async fn http_post_json(
+pub async fn http_post_json(
     url: &str,
     body: &str,
     headers: &[(&str, &str)],
@@ -357,7 +357,7 @@ fn pick_hash_by_idx(hash: &str, indexes: &[usize]) -> String {
 }
 
 /// TX 签名（与前端 zzcSign 一致）
-fn zzc_sign(text: &str) -> String {
+pub fn zzc_sign(text: &str) -> String {
     let hash = sha1_hex(text);
     let part1 = pick_hash_by_idx(&hash, &TX_PART_1_INDEXES);
     let part2 = pick_hash_by_idx(&hash, &TX_PART_2_INDEXES);
@@ -380,7 +380,7 @@ fn zzc_sign(text: &str) -> String {
     format!("zzc{}{}{}", part1, b64_clean, part2).to_lowercase()
 }
 
-fn mg_create_signature(time: &str, text: &str) -> (String, String) {
+pub fn mg_create_signature(time: &str, text: &str) -> (String, String) {
     let device_id = "963B7AA0D21511ED807EE5846EC87D20";
     let signature_md5 = "6cdc72a439cef99a3418d2a78aa28c73";
     let input = format!(

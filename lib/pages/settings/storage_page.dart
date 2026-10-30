@@ -7,22 +7,25 @@ import 'package:path_provider/path_provider.dart';
 
 import '../../src/core/db_path.dart';
 import '../../src/rust/api.dart';
+import '../../src/services/cache_auto_clean.dart';
 import '../../src/widgets/top_notice.dart';
 
 /// 各类缓存的占用统计（字节）。
 class _StorageUsage {
   const _StorageUsage({
     required this.coverBytes,
+    required this.streamCacheBytes,
     required this.stagingBytes,
     required this.tempBytes,
   });
 
   final int coverBytes;
+  final int streamCacheBytes;
   final int stagingBytes;
   final int tempBytes;
 
   int get totalBytes =>
-      coverBytes + stagingBytes + tempBytes;
+      coverBytes + streamCacheBytes + stagingBytes + tempBytes;
 }
 
 /// 递归统计目录占用（目录不存在按 0 处理）。
@@ -66,15 +69,26 @@ final _storageUsageProvider =
       final dataDir = await ref.watch(appDataDirProvider.future);
       final supportDir = await getApplicationSupportDirectory();
       final tempDir = await getTemporaryDirectory();
+      final streamCacheDir = Platform.isWindows
+          ? p.join(
+              Platform.environment['APPDATA'] ?? '',
+              'com.xymusic.desktop',
+              'stream_cache',
+            )
+          : null;
       final results = await Future.wait([
         _dirSize(p.join(dataDir, 'covers')),
+        streamCacheDir == null || streamCacheDir.isEmpty
+            ? Future.value(0)
+            : _dirSize(streamCacheDir),
         _dirSize(p.join(supportDir.path, 'download_staging')),
         _dirSize(tempDir.path),
       ]);
       return _StorageUsage(
         coverBytes: results[0],
-        stagingBytes: results[1],
-        tempBytes: results[2],
+        streamCacheBytes: results[1],
+        stagingBytes: results[2],
+        tempBytes: results[3],
       );
     });
 
@@ -158,10 +172,18 @@ class StoragePage extends ConsumerWidget {
                     ),
                     const SizedBox(height: 4),
                     Text(
-                      '含封面、下载中转与临时文件',
+                      '含封面、播放流、下载中转与临时文件',
                       style: TextStyle(
                         fontSize: 12,
                         color: scheme.onSurfaceVariant,
+                      ),
+                    ),
+                    const SizedBox(height: 10),
+                    Text(
+                      '自动清理：缓存超过 ${_formatBytes(kAutoCleanThresholdBytes)} 时自动清理最旧缓存',
+                      style: TextStyle(
+                        fontSize: 12,
+                        color: scheme.primary,
                       ),
                     ),
                     const SizedBox(height: 14),
@@ -185,6 +207,13 @@ class StoragePage extends ConsumerWidget {
                   _clearCovers(context, ref),
             ),
             _CacheTile(
+              icon: Icons.stream_outlined,
+              title: '播放流缓存',
+              description: '在线播放时缓存的音频流文件',
+              bytes: usageData.streamCacheBytes,
+              onClear: (context, ref) => _clearStreamCache(context, ref),
+            ),
+            _CacheTile(
               icon: Icons.download_outlined,
               title: '下载中转文件',
               description: '下载失败或取消时残留的中转文件',
@@ -201,7 +230,7 @@ class StoragePage extends ConsumerWidget {
             _CacheTile(
               icon: Icons.memory_outlined,
               title: '内存缓存',
-              description: '搜索结果与播放流缓冲，清理后重新加载',
+              description: '搜索结果与界面缓存，清理后重新加载',
               bytes: null,
               onClear: (context, ref) => _clearMemory(context, ref),
             ),
@@ -311,10 +340,34 @@ class StoragePage extends ConsumerWidget {
     await _refresh(ref);
   }
 
+  Future<void> _clearStreamCache(BuildContext context, WidgetRef ref) async {
+    if (!await _confirm(
+      context,
+      title: '清理播放流缓存？',
+      message: '已缓存的在线音频流将被删除，再次播放时会重新缓冲下载。',
+    )) {
+      return;
+    }
+    try {
+      await clearStreamCache();
+      if (context.mounted) {
+        XyNotice.show(context, message: '播放流缓存已清理');
+      }
+    } catch (error) {
+      if (context.mounted) {
+        XyNotice.show(
+          context,
+          message: '清理失败：$error',
+          type: XyNoticeType.error,
+        );
+      }
+    }
+    await _refresh(ref);
+  }
+
   Future<void> _clearMemory(BuildContext context, WidgetRef ref) async {
     try {
       await lxClearCache();
-      await clearStreamCache();
       if (context.mounted) {
         XyNotice.show(context, message: '内存缓存已释放');
       }

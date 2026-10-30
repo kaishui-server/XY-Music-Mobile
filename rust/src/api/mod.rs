@@ -154,6 +154,26 @@ pub async fn lx_search(source: String, keyword: String, limit: u32) -> Result<St
     serde_json::to_string(&items).map_err(|e| e.to_string())
 }
 
+/// LX 歌单搜索（kw/kg/tx/wy/mg 原生歌单接口，对齐桌面端 searchLxPlaylists）。
+/// 返回归一化 [`crate::music::lx_catalog::LxPlaylistItem`] 数组的 JSON。
+pub async fn lx_search_playlists(
+    source: String,
+    keyword: String,
+    page: u32,
+    limit: u32,
+) -> Result<String, String> {
+    let items =
+        crate::music::lx_catalog::lx_search_playlists(&source, &keyword, page, limit).await?;
+    serde_json::to_string(&items).map_err(|e| e.to_string())
+}
+
+/// QQ 专辑搜索（签名 Desktop 接口 search_type=2，对齐桌面端）。
+/// 返回原始专辑条目数组的 JSON；失败返回错误信息。
+pub async fn tx_search_albums(keyword: String, page: u32, limit: u32) -> Result<String, String> {
+    let items = crate::music::lx_catalog::tx_search_albums(&keyword, page, limit).await?;
+    serde_json::to_string(&items).map_err(|e| e.to_string())
+}
+
 /// 清除 LX 缓存（URL + 搜索）。
 pub async fn lx_clear_cache() -> Result<(), String> {
     crate::music::lx_search::clear_lx_all_cache().await
@@ -1305,6 +1325,24 @@ pub async fn get_song_cover(
 pub fn run_cover_cache_cleanup(cache_root: String) {
     let cache_dir = crate::music::covers::get_cover_cache_dir(std::path::Path::new(&cache_root));
     crate::music::covers::run_cache_cleanup(&cache_dir);
+}
+
+/// 将封面缓存同步 LRU 清理到目标大小（字节）：超过 `max_size` 时按最后
+/// 访问时间从最旧删除，直到不超过该值。返回实际释放的字节数。
+pub fn run_cover_cache_cleanup_to(cache_root: String, max_size: u64) -> u64 {
+    let cache_dir = crate::music::covers::get_cover_cache_dir(std::path::Path::new(&cache_root));
+    crate::music::covers::run_cache_cleanup_sync(&cache_dir, max_size)
+}
+
+/// 流式播放缓存目录（供前端统计占用）。
+pub fn get_stream_cache_dir() -> String {
+    crate::player::stream_cache::stream_cache_dir()
+}
+
+/// 将流式播放缓存 LRU 淘汰到目标大小（字节），返回释放的字节数。
+/// 最近 60 秒内访问的条目会被跳过（保护正在播放/下载中的缓存）。
+pub fn evict_stream_cache_to(target_bytes: u64) -> u64 {
+    crate::player::stream_cache::evict_stream_cache_to(target_bytes)
 }
 
 /// 清空封面缓存目录。

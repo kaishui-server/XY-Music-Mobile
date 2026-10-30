@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../core/settings.dart';
+import '../library/online_cover_overrides.dart';
 import '../../pages/player/player_page.dart' show VinylCover;
 import '../player/player_provider.dart';
 import '../ui/xy_theme.dart';
@@ -46,6 +47,13 @@ XyPlayerSheetOrigin? xyPlayerSheetOrigin;
 /// [MiniPlayerBar] 实例（壳层/搜索页/在线目录页）据此在转场期间
 /// 隐藏本体，避免毛玻璃面板下方透出多实例文字重影。
 final ValueNotifier<bool> xySheetRouteActive = ValueNotifier<bool>(false);
+
+/// 形变是否处于手势跟手驱动中：由 [XyPlayerSheetRoute.dragValue] 置位、
+/// 松手转场（springBack/collapseAndPop）复位。跟手期间 morph 层直接
+/// 使用线性转场值（不再叠加 easeOutCubic），否则手指拖 20% 面板已生长
+/// 49%（easeOutCubic 前段斜率约 3 倍），观感严重超前于手指、拖回时
+/// 又反向迟滞——这是此前展开/收起「不丝滑」的主因。
+bool xyPlayerSheetGestureDriving = false;
 
 /// 详情页封面最终矩形的通用估算：形变封面的终点（buildPlayerSheetOrigin）
 /// 与详情页下滑/上滑收起手势的分区判定共用同一来源，保证两者一致。
@@ -125,10 +133,13 @@ class XyPlayerSheetMorph extends ConsumerWidget {
   ) {
     final origin = xyPlayerSheetOrigin;
     if (origin == null) return child!;
-    // 正向 easeOutCubic / 反向 easeInCubic，与全局页面曲线语义一致；
-    // 手势驱动（status 为 completed 时手动改值）沿用正向分支。
+    // 手势跟手驱动：线性值直接映射面板位置（严格跟手）；松手后的
+    // 补间动画仍按方向套曲线（正向 easeOutCubic / 反向 easeInCubic，
+    // 与全局页面曲线语义一致）。
     final raw = animation.value;
-    final t = animation.status == AnimationStatus.reverse
+    final t = xyPlayerSheetGestureDriving
+        ? raw.clamp(0.0, 1.0)
+        : animation.status == AnimationStatus.reverse
         ? Curves.easeInCubic.transform(raw)
         : Curves.easeOutCubic.transform(raw);
     // 屏幕尺寸取自 View：overlay 子树的 MediaQuery 可能被 SafeArea 裁剪。
@@ -144,6 +155,75 @@ class XyPlayerSheetMorph extends ConsumerWidget {
     final coverFade = 1 - ((t - .75) / .25).clamp(0.0, 1.0);
     final dark = Theme.of(context).brightness == Brightness.dark;
     final current = player.current;
+    // 毛玻璃 sigma 随面板生长衰减：面板越大、面板色覆盖越多，模糊的
+    // 可见收益越小而采样成本越高（BackdropFilter 是全屏最贵操作）。
+    // sigma 低于阈值时整层不挂载（空 filter 也会产生一次全屏 saveLayer）。
+    final blurSigma = 30 * (1 - t);
+    final useBlur = blurSigma > 1.5;
+
+    // 面板内容体：面板色装饰 + 详情页本体 + 栏内容复刻。
+    // 详情页页面体（全屏尺寸、底边对齐面板底边，随面板生长逐步露出）。
+    final pageBody = OverflowBox(
+      alignment: Alignment.bottomLeft,
+      minWidth: screen.width,
+      maxWidth: screen.width,
+      minHeight: screen.height,
+      maxHeight: screen.height,
+      child: SizedBox(
+        width: screen.width,
+        height: screen.height,
+        child: RepaintBoundary(child: child),
+      ),
+    );
+    final panelContent = DecoratedBox(
+      decoration: BoxDecoration(
+        color: Theme.of(context).colorScheme.surface.withValues(
+          alpha: dark ? .86 : .92,
+        ),
+        borderRadius: BorderRadius.circular(radius),
+        border: Border.all(
+          color: dark ? XyColors.darkBorder : XyColors.lightBorder,
+        ),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black.withValues(alpha: dark ? .3 : .09),
+            blurRadius: 24,
+            offset: const Offset(0, 8),
+          ),
+        ],
+      ),
+      child: Stack(
+        children: [
+          // 详情页本体：后段整体淡入。pageT<=0 时不构建页面子树
+          // （省整页布局，此前 Opacity(0) 仍会跑全屏 OverflowBox 布局）；
+          // pageT>=1 时裸放（无 Opacity saveLayer，t=1 瞬间 morph 会被
+          // 上游短路，此处仅覆盖手势直接拖到端的边缘情况）。
+          if (pageT > 0)
+            Positioned.fill(
+              child: pageT >= 1
+                  ? pageBody
+                  : Opacity(
+                      opacity: pageT,
+                      child: IgnorePointer(ignoring: true, child: pageBody),
+                    ),
+            ),
+          // 栏内容复刻：面板内的底部还原播放栏内容，早段淡出。
+          if (barT > 0 && current != null)
+            Positioned(
+              left: 0,
+              right: 0,
+              bottom: 0,
+              height: origin.barRect.height,
+              child: Opacity(
+                opacity: barT,
+                child: RepaintBoundary(
+                  child: _buildReplica(context, ref, player, current),
+                ),
+              ),
+            ),
+        ],
+      ),
+    );
 
     return Stack(
       children: [
@@ -152,65 +232,17 @@ class XyPlayerSheetMorph extends ConsumerWidget {
           child: ClipRRect(
             borderRadius: BorderRadius.circular(radius),
             clipBehavior: radius > .5 ? Clip.antiAlias : Clip.none,
-            child: BackdropFilter(
-              filter: ui.ImageFilter.blur(sigmaX: 30, sigmaY: 30),
-              child: DecoratedBox(
-                decoration: BoxDecoration(
-                  color: Theme.of(context).colorScheme.surface.withValues(
-                    alpha: dark ? .86 : .92,
-                  ),
-                  borderRadius: BorderRadius.circular(radius),
-                  border: Border.all(
-                    color: dark ? XyColors.darkBorder : XyColors.lightBorder,
-                  ),
-                  boxShadow: [
-                    BoxShadow(
-                      color: Colors.black.withValues(alpha: dark ? .3 : .09),
-                      blurRadius: 24,
-                      offset: const Offset(0, 8),
+            // sigma 衰减到阈值以下后不再挂 BackdropFilter：空 filter 也
+            // 会产生一次全屏 saveLayer；面板后期已基本不透明，模糊无感。
+            child: useBlur
+                ? BackdropFilter(
+                    filter: ui.ImageFilter.blur(
+                      sigmaX: blurSigma,
+                      sigmaY: blurSigma,
                     ),
-                  ],
-                ),
-                child: Stack(
-                  children: [
-                    // 详情页本体：全屏尺寸、底边对齐面板底边，随面板生长
-                    // 逐步露出（顶部溢出部分被裁剪），后段整体淡入。
-                    Positioned.fill(
-                      child: Opacity(
-                        opacity: pageT,
-                        child: IgnorePointer(
-                          ignoring: pageT < 1,
-                          child: OverflowBox(
-                            alignment: Alignment.bottomLeft,
-                            minWidth: screen.width,
-                            maxWidth: screen.width,
-                            minHeight: screen.height,
-                            maxHeight: screen.height,
-                            child: SizedBox(
-                              width: screen.width,
-                              height: screen.height,
-                              child: RepaintBoundary(child: child),
-                            ),
-                          ),
-                        ),
-                      ),
-                    ),
-                    // 栏内容复刻：面板内的底部还原播放栏内容，早段淡出。
-                    if (barT > 0 && current != null)
-                      Positioned(
-                        left: 0,
-                        right: 0,
-                        bottom: 0,
-                        height: origin.barRect.height,
-                        child: Opacity(
-                          opacity: barT,
-                          child: _buildReplica(context, ref, player, current),
-                        ),
-                      ),
-                  ],
-                ),
-              ),
-            ),
+                    child: panelContent,
+                  )
+                : panelContent,
           ),
         ),
         // 封面连续变形层：形态跟随封面风格——经典方形收平到 24 圆角
@@ -231,7 +263,10 @@ class XyPlayerSheetMorph extends ConsumerWidget {
                     )
                   : CoverImage(
                       songPath: current.path,
-                      imageUrl: current.coverUrl,
+                      imageUrl: resolveOnlineCoverUrl(
+                        current.coverUrl,
+                        current.path,
+                      ),
                       width: coverRect.width,
                       height: coverRect.height,
                       radius: switch (origin.style) {

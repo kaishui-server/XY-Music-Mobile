@@ -12,6 +12,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'src/core/rust_init.dart';
 import 'src/deeplink/deep_link_handler.dart';
 import 'src/core/settings.dart';
+import 'src/logging/app_log_store.dart';
 import 'src/navigation/animated_page_route.dart';
 import 'src/library/library_provider.dart';
 import 'src/plugins/plugin_runtime.dart';
@@ -25,6 +26,29 @@ import 'src/widgets/welcome_overlay.dart';
 
 /// 应用固定中文 locale：系统组件（长按菜单等）与应用文案保持一致。
 const _zhLocale = Locale('zh', 'CN');
+
+/// 兜底返回键分发（单例，MaterialApp.router 重建时复用同一实例）。
+/// go_router 的 shell navigator 在回前台过渡期/冷启动早期尚未挂载完成时，
+/// popRoute 会触发 `_findCurrentNavigators` 空指针崩溃（5587 日志符号化
+/// 定位：delegate.dart:125）。这里在 router 未就绪或内部异常时吞掉该次
+/// 返回事件避免进程崩溃，下一帧 router 挂载完成后返回键自然恢复。
+final _backButtonDispatcher = _GuardedBackButtonDispatcher();
+
+class _GuardedBackButtonDispatcher extends RootBackButtonDispatcher {
+  @override
+  Future<bool> invokeCallback(Future<bool> defaultRouteAction) async {
+    try {
+      return await super.invokeCallback(defaultRouteAction);
+    } catch (error) {
+      AppLogStore.instance.add(
+        '[BackButton] router 未就绪，吞掉本次返回事件：$error',
+        level: AppLogLevel.warning,
+      );
+      // true = 声明已处理，阻止系统在 router 异常态下直接退出应用。
+      return true;
+    }
+  }
+}
 
 /// 在 Flutter 第一帧之前读取并解码自定义背景。
 ///
@@ -415,6 +439,7 @@ class _XyMusicAppState extends ConsumerState<XyMusicApp>
             themeMode: themeMode,
             routerConfig: appRouter,
             builder: appBuilder,
+            backButtonDispatcher: _backButtonDispatcher,
             // 应用内文案全部为中文，固定中文 locale 让系统组件（长按
             // 文本菜单、日期选择器等）也显示中文。
             locale: _zhLocale,

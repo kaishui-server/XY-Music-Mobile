@@ -24,11 +24,13 @@ import '../../src/auth/auth_provider.dart';
 import '../../src/effects/effects_provider.dart';
 import '../../src/favorites/favorites_provider.dart';
 import '../../src/library/library_provider.dart';
+import '../../src/library/online_cover_overrides.dart';
 import '../../src/lyrics/lyrics_models.dart';
 import '../../src/navigation/animated_page_route.dart';
 import '../../src/navigation/player_sheet_morph.dart';
 import '../../src/player/player_provider.dart';
 import '../../src/player/desktop_lyrics.dart';
+import '../../src/player/mini_player_overlay.dart';
 import '../../src/player/download_history_store.dart';
 import '../../src/player/downloaded_song_store.dart';
 import '../../src/player/android_storage.dart';
@@ -2115,12 +2117,24 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
         }
         return;
       }
+      // 权限规范：手动开启小窗类功能时才检测并询问跳转授权页。
+      if (!await MiniPlayerOverlayBridge.hasOverlayPermission()) {
+        if (mounted) {
+          XyNotice.show(
+            context,
+            message: '请授予悬浮窗权限后再开启桌面歌词',
+            type: XyNoticeType.warning,
+          );
+          await MiniPlayerOverlayBridge.requestOverlayPermission();
+        }
+        return;
+      }
       final started = await DesktopLyricsBridge.setEnabled(true);
       if (!started) {
         if (mounted) {
           XyNotice.show(
             context,
-            message: '请授予悬浮窗权限后再开启桌面歌词',
+            message: '桌面歌词启动失败，请重试',
             type: XyNoticeType.warning,
           );
         }
@@ -4523,7 +4537,10 @@ class _PlayerMoreSheetState extends ConsumerState<_PlayerMoreSheet> {
                         children: [
                           CoverImage(
                             songPath: widget.item.path,
-                            imageUrl: widget.item.coverUrl,
+                            imageUrl: resolveOnlineCoverUrl(
+                              widget.item.coverUrl,
+                              widget.item.path,
+                            ),
                             width: 48,
                             height: 48,
                             radius: 10,
@@ -6703,9 +6720,12 @@ class _FlowingLightBackgroundState
         child: ImageFiltered(
           imageFilter: ui.ImageFilter.blur(sigmaX: 32, sigmaY: 32),
           child: CoverImage(
-            key: ValueKey('flowing:${item.path}:${item.coverUrl}'),
+            key: ValueKey(
+              'flowing:${item.path}:'
+              '${resolveOnlineCoverUrl(item.coverUrl, item.path)}',
+            ),
             songPath: item.path,
-            imageUrl: item.coverUrl,
+            imageUrl: resolveOnlineCoverUrl(item.coverUrl, item.path),
             width: double.infinity,
             height: double.infinity,
             radius: 0,
@@ -7622,9 +7642,11 @@ class _BigCover extends ConsumerWidget {
       );
     }
     return CoverImage(
-      key: ValueKey('main:${current.path}:${current.coverUrl ?? ''}'),
+      key: ValueKey(
+        'main:${current.path}:${resolveOnlineCoverUrl(current.coverUrl, current.path) ?? ''}',
+      ),
       songPath: current.path,
-      imageUrl: current.coverUrl,
+      imageUrl: resolveOnlineCoverUrl(current.coverUrl, current.path),
       width: size,
       height: size,
       radius: radius,
@@ -7844,10 +7866,11 @@ class _ImmersiveTopCover extends StatelessWidget {
                 children: [
                   CoverImage(
                     key: ValueKey(
-                      'immersiveTop:${item.path}:${item.coverUrl ?? ''}',
+                      'immersiveTop:${item.path}:'
+                      '${resolveOnlineCoverUrl(item.coverUrl, item.path) ?? ''}',
                     ),
                     songPath: item.path,
-                    imageUrl: item.coverUrl,
+                    imageUrl: resolveOnlineCoverUrl(item.coverUrl, item.path),
                     width: side,
                     height: side,
                     radius: 0,
@@ -7998,10 +8021,14 @@ class _VinylLabel extends StatelessWidget {
                       ]),
                       child: CoverImage(
                         key: ValueKey(
-                          'vinyl:${current.path}:${current.coverUrl ?? ''}',
+                          'vinyl:${current.path}:'
+                          '${resolveOnlineCoverUrl(current.coverUrl, current.path) ?? ''}',
                         ),
                         songPath: current.path,
-                        imageUrl: current.coverUrl,
+                        imageUrl: resolveOnlineCoverUrl(
+                          current.coverUrl,
+                          current.path,
+                        ),
                         width: label * .92,
                         height: label * .92,
                         radius: label * .46,
@@ -8479,13 +8506,18 @@ class _LyricsViewState extends ConsumerState<_LyricsView>
   /// 行切换时变化，因此整个歌词页只在换行时重建（约数秒一次），而不是
   /// 每个进度 tick 全量重建。O(n) 的行查找每 tick 一次，几百行的代价
   /// 在微秒级，可忽略。
+  ///
+  /// 行判定带 0.22s 提前量：进度 tick（约 250ms 粒度）+ 滚动动画
+  /// （340ms 起）叠加会让换行视觉滞后近半秒（「换行跟不上、像卡了」，
+  /// 而行内逐字按词时间轴渲染不受影响）。提前切行后，新行逐字高亮
+  /// 仍从真实播放进度起步（首词未唱则等待），不会出现抢拍感。
   int _activeIndex(List<LyricLine> lines) {
     final raw = ref.watch(
       playerProvider.select(
         (state) => lines.lastIndexWhere(
           (line) =>
               line.time <=
-              applyLyricsOffset(state.position, widget.offsetTenths),
+              applyLyricsOffset(state.position, widget.offsetTenths) + .22,
         ),
       ),
     );

@@ -1125,6 +1125,10 @@ class KugouApi {
           item['global_collection_id'] ?? item['gcid'] ?? item['gid'],
         );
         final name = _text(item['name'] ?? item['special_name']);
+        // 酷狗云收藏把「我喜欢」在 cloudlist 体系里镜像为「默认收藏」
+        // 条目（与 special 体系的「我喜欢」内容相同），列表会出现两个
+        // 重复歌单——固定命名的「默认收藏」剔除，保留「我喜欢」。
+        if (name == '默认收藏') continue;
         // 收藏歌单直接用 gcid；自建歌单（含我喜欢的）通常没有 gcid，
         // 用 id_<specialid> 形式让导入层经 specialid→global 换算。
         final specialId = _text(item['specialid']);
@@ -1152,5 +1156,132 @@ class KugouApi {
       if (list.length < 30) break;
     }
     return playlists;
+  }
+
+  /// v5 special song：按 specialid 取歌单曲目（公开 GET 接口）。
+  ///
+  /// special 体系的自建歌单（含「我喜欢」）用 specialid 直接主键查询，
+  /// 是洛雪导入框时代即验证可靠的取曲路径；不依赖 pubsongs 网关的
+  /// 登录态签名参数组合（get_other_list_file_nofilt 对参数组合极其
+  /// 挑剔，20010 即其参数/路由校验失败码）。主键查询无数据返回空
+  /// 列表，不会像 info_v2/song_v2 那样兜底热门歌单。
+  Future<List<Map<String, dynamic>>> fetchSpecialTracks(
+    String specialId, {
+    int maxSongs = 1000,
+  }) async {
+    final tracks = <Map<String, dynamic>>[];
+    final seen = <String>{};
+    const pageSize = 300;
+    for (var page = 1; page <= 10; page++) {
+      final uri = Uri.https('mobilecdn.kugou.com', '/api/v5/special/song', {
+        'specialid': specialId,
+        'page': '$page',
+        'pagesize': '$pageSize',
+      });
+      final response = await _client
+          .get(uri, headers: {'User-Agent': 'KuGouAndroid'})
+          .timeout(const Duration(seconds: 15));
+      final decoded = jsonDecode(utf8.decode(response.bodyBytes));
+      if (decoded is! Map) {
+        if (tracks.isEmpty) throw const PlatformApiException('酷狗接口返回异常');
+        break;
+      }
+      if (_toInt(decoded['status']) != 1) {
+        if (tracks.isEmpty) {
+          throw PlatformApiException(
+            '酷狗歌单曲目加载失败（${_toInt(decoded['error_code'], -1)}）',
+          );
+        }
+        break;
+      }
+      final data = decoded['data'] is Map
+          ? Map<String, dynamic>.from(decoded['data'] as Map)
+          : const <String, dynamic>{};
+      final List list = switch (data['info']) {
+        final List value => value,
+        _ => const [],
+      };
+      if (list.isEmpty) break;
+      var added = 0;
+      for (final value in list.whereType<Map>()) {
+        final item = Map<String, dynamic>.from(value);
+        final hash = _text(item['hash']).toUpperCase();
+        if (hash.isEmpty || !seen.add(hash)) continue;
+        tracks.add(item);
+        added++;
+        if (tracks.length >= maxSongs) return tracks;
+      }
+      // 翻页参数未被识别时每页都是同一批，added=0 即首页已取全。
+      if (added == 0 || list.length < pageSize) break;
+    }
+    return tracks;
+  }
+
+  /// 拉取云收藏歌单的曲目列表（登录态网关接口，对齐 KuGouMusicApi
+  /// playlist_track_all：/pubsongs/v2/get_other_list_file_nofilt）。
+  ///
+  /// 导入此前走 mobiles 公开接口（info_v2/song_v2），自建/私密歌单在
+  /// 公开库查不到时该接口会兜底返回热门歌单，导致「歌单名与数量正确、
+  /// 导入内容张冠李戴」。本方法按 global_collection_id 走登录态取曲，
+  /// 私密歌单也能正确返回。
+  ///
+  /// 业务参数必须放 POST body（签名覆盖 body）——此前放在 query 且
+  /// body 为空，网关按缺参处理会返回与目标歌单无关的兜底歌单内容，
+  /// 造成「列表名称正确、导入内容不相干」。无 gcid 的自建条目
+  /// （`id_<specialid>` 形态）由导入层先经 specialid→global 换算。
+  Future<List<Map<String, dynamic>>> fetchCloudPlaylistTracks(
+    MusicPlatformAccount account,
+    String globalCollectionId, {
+    int maxSongs = 1000,
+  }) async {
+    final token = account.credentials['token'] ?? '';
+    final tracks = <Map<String, dynamic>>[];
+    final seen = <String>{};
+    const pageSize = 300;
+    for (var page = 0; page < 10; page++) {
+      // 业务参数全部放 POST body（签名覆盖 body）。pubsongs 服务必须
+      // 经 x-router 路由——直接拼 /pubsongs/ 路径前缀网关不识别，
+      // 会按缺参处理返回兜底歌单或报错。
+      final body = await _androidRequest(
+        '/v2/get_other_list_file_nofilt',
+        xRouter: 'pubsongs.kugou.com',
+        body: {
+          'userid': account.userId,
+          'token': token,
+          'area_code': 1,
+          'plat': 1,
+          'type': 1,
+          'mode': 1,
+          'personal_switch': 1,
+          'global_collection_id': globalCollectionId,
+          'begin_idx': page * pageSize,
+          'pagesize': pageSize,
+        },
+      );
+      if (_toInt(body['status']) != 1) {
+        if (tracks.isEmpty) {
+          final code = _toInt(body['error_code'], -1);
+          throw PlatformApiException('酷狗歌单曲目加载失败（$code）');
+        }
+        break;
+      }
+      final data = body['data'] is Map ? body['data'] as Map : const {};
+      final List list = switch (data['info'] ?? data['list'] ?? data) {
+        final List value => value,
+        _ => const [],
+      };
+      if (list.isEmpty) break;
+      var added = 0;
+      for (final value in list.whereType<Map>()) {
+        final item = Map<String, dynamic>.from(value);
+        final hash = _text(item['hash']).toUpperCase();
+        if (hash.isEmpty || !seen.add(hash)) continue;
+        tracks.add(item);
+        added++;
+        if (tracks.length >= maxSongs) return tracks;
+      }
+      if (added == 0) break;
+    }
+    return tracks;
   }
 }

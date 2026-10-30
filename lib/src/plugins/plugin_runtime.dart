@@ -17,6 +17,7 @@ import '../core/db_path.dart';
 import '../logging/app_log_store.dart';
 import '../rust/api.dart';
 import '../player/lx_lyrics_builder.dart';
+import 'lx_playlist_import.dart';
 import 'plugin_metadata.dart';
 import 'qq_source_api.dart';
 import 'qrc_decrypt.dart';
@@ -532,56 +533,109 @@ Future<List<EnabledMusicPlugin>> loadEnabledMusicPlugins(Ref ref) async {
   final displayNames = readPluginDisplayNames(prefs);
   final sourceLabels = readPluginSourceLabels(prefs);
   final kinds = readPluginKinds(prefs);
-  final plugins = <EnabledMusicPlugin>[];
-  for (final file in directory.listSync().whereType<File>()) {
-    if (p.extension(file.path).toLowerCase() != '.js') continue;
-    final id = p.basenameWithoutExtension(file.path);
-    if (!enabled.contains(id)) continue;
-    final source = await file.readAsString();
-    final isLx = _looksLikeLxPlugin(source);
-    final isAnimemusic = !isLx && _looksLikeAnimemusicPlugin(source);
-    final animemusicMeta =
-        isAnimemusic ? _extractAnimemusicMeta(source) : const <String, String>{};
-    final metadata = PluginMetadata.parse(source);
-    // animemusic 的 module.exports 导出的是变量而非对象字面量，
-    // PluginMetadata 取不到名称时回退 META.name。
-    var pluginName = metadata.name ?? id;
-    final metaName = animemusicMeta['name']?.trim() ?? '';
-    if (isAnimemusic && metaName.isNotEmpty) pluginName = metaName;
-    // 订阅索引声明的显示名优先：脚本混淆/无元信息时也能显示正确名称。
-    final overrideName = displayNames[id]?.trim() ?? '';
-    if (overrideName.isNotEmpty) pluginName = overrideName;
-    // 分类优先级与插件管理页一致：LX > BakaMusic > animemusic。BakaMusic
-    // 兼容 MusicFree 协议，先看内容证据（metadata.isBaka），不中时用订阅类型
-    // 提示，再兜底来源 URL——同 ID 插件被另一族覆盖时来源 URL 会从旧插件
-    // 继承，若 URL 优先会把 MusicFree 插件误标成 BakaMusic。
-    var isBaka = !isLx && !isAnimemusic && metadata.isBaka;
-    if (!isLx && !isAnimemusic) {
-      final kindHint = kinds[id];
-      if (kindHint == pluginKindBaka) {
-        isBaka = true;
-      } else if (kindHint == pluginKindOther) {
-        // 手动归入「其他」的插件按 MusicFree 族处理，不强制 Baka 契约。
-        isBaka = false;
-      } else if (kindHint == pluginKindMusicFree) {
-        // 内容已判定为 Baka 契约时不采纳 musicfree 提示（同插件管理页）：
-        // 该提示多半只是「导入时所在分栏」，压不住内容证据。
-        if (!metadata.isBaka) isBaka = false;
-      } else if (PluginMetadata.isBakaSourceUrl(sourceUrls[id] ?? '')) {
-        isBaka = true;
-      }
-    }
-    plugins.add(
+  final orderedIds = prefs.getStringList(pluginOrderKey) ?? const [];
+  // 解析（同步 IO + 多条正则全文扫描）整体移入后台 isolate：导入/切换插件
+  // 后 invalidate 触发全量重载时，主线程不再执行同步正则解析，避免阻塞 UI
+  // 帧导致偶发卡顿（根因：脚本越大、启用插件越多，单次加载同步耗时越长）。
+  final maps = await _loadEnabledMusicPluginsInIsolate(
+    directoryPath: directory.path,
+    enabledIds: enabled.toList(),
+    savedVariables: savedVariables,
+    sourceUrls: sourceUrls,
+    displayNames: displayNames,
+    sourceLabels: sourceLabels,
+    kinds: kinds,
+    orderedIds: orderedIds,
+  );
+  return [
+    for (final m in maps)
       EnabledMusicPlugin(
-        id: id,
-        name: pluginName,
-        path: file.path,
-        isLx: isLx,
-        lxSources: isLx ? _detectLxSources(source, name: pluginName) : const [],
-        isBaka: isBaka,
-        isAnimemusic: isAnimemusic,
-        sourceLabel: sourceLabels[id],
-        animemusicApi:
+        id: m['id']! as String,
+        name: m['name']! as String,
+        path: m['path']! as String,
+        isLx: m['isLx']! as bool,
+        lxSources: (m['lxSources'] as List).cast<String>(),
+        isBaka: m['isBaka']! as bool,
+        isAnimemusic: m['isAnimemusic']! as bool,
+        sourceLabel: m['sourceLabel'] as String?,
+        animemusicApi: m['animemusicApi']! as String,
+        animemusicPlatform: m['animemusicPlatform']! as String,
+        animemusicQualities: (m['animemusicQualities'] as List).cast<String>(),
+        userVariables: (m['userVariables'] as Map).cast<String, String>(),
+        sourceUrl: m['sourceUrl']! as String,
+        availableMethods: (m['availableMethods'] as List).cast<String>(),
+      ),
+  ];
+}
+
+/// 在后台 isolate 中完成启用插件的「读取 + 分类正则扫描 + 元信息解析」，
+/// 返回可 send 的 Map 列表（主 isolate 据此重建 [EnabledMusicPlugin]）。
+/// 与原实现行为一致：仅把同步 CPU 密集段移出主 isolate。
+Future<List<Map<String, Object?>>> _loadEnabledMusicPluginsInIsolate({
+  required String directoryPath,
+  required List<String> enabledIds,
+  required Map<String, Map<String, String>> savedVariables,
+  required Map<String, String> sourceUrls,
+  required Map<String, String> displayNames,
+  required Map<String, String> sourceLabels,
+  required Map<String, String> kinds,
+  required List<String> orderedIds,
+}) {
+  return Isolate.run(() {
+    final directory = Directory(directoryPath);
+    final enabled = enabledIds.toSet();
+    final plugins = <Map<String, Object?>>[];
+    for (final file in directory.listSync().whereType<File>()) {
+      if (p.extension(file.path).toLowerCase() != '.js') continue;
+      final id = p.basenameWithoutExtension(file.path);
+      if (!enabled.contains(id)) continue;
+      final source = file.readAsStringSync();
+      final isLx = _looksLikeLxPlugin(source);
+      final isAnimemusic = !isLx && _looksLikeAnimemusicPlugin(source);
+      final animemusicMeta = isAnimemusic
+          ? _extractAnimemusicMeta(source)
+          : const <String, String>{};
+      final metadata = PluginMetadata.parse(source);
+      // animemusic 的 module.exports 导出的是变量而非对象字面量，
+      // PluginMetadata 取不到名称时回退 META.name。
+      var pluginName = metadata.name ?? id;
+      final metaName = animemusicMeta['name']?.trim() ?? '';
+      if (isAnimemusic && metaName.isNotEmpty) pluginName = metaName;
+      // 订阅索引声明的显示名优先：脚本混淆/无元信息时也能显示正确名称。
+      final overrideName = displayNames[id]?.trim() ?? '';
+      if (overrideName.isNotEmpty) pluginName = overrideName;
+      // 分类优先级与插件管理页一致：LX > BakaMusic > animemusic。BakaMusic
+      // 兼容 MusicFree 协议，先看内容证据（metadata.isBaka），不中时用订阅类型
+      // 提示，再兜底来源 URL——同 ID 插件被另一族覆盖时来源 URL 会从旧插件
+      // 继承，若 URL 优先会把 MusicFree 插件误标成 BakaMusic。
+      var isBaka = !isLx && !isAnimemusic && metadata.isBaka;
+      if (!isLx && !isAnimemusic) {
+        final kindHint = kinds[id];
+        if (kindHint == pluginKindBaka) {
+          isBaka = true;
+        } else if (kindHint == pluginKindOther) {
+          // 手动归入「其他」的插件按 MusicFree 族处理，不强制 Baka 契约。
+          isBaka = false;
+        } else if (kindHint == pluginKindMusicFree) {
+          // 内容已判定为 Baka 契约时不采纳 musicfree 提示（同插件管理页）：
+          // 该提示多半只是「导入时所在分栏」，压不住内容证据。
+          if (!metadata.isBaka) isBaka = false;
+        } else if (PluginMetadata.isBakaSourceUrl(sourceUrls[id] ?? '')) {
+          isBaka = true;
+        }
+      }
+      plugins.add(<String, Object?>{
+        'id': id,
+        'name': pluginName,
+        'path': file.path,
+        'isLx': isLx,
+        'lxSources': isLx
+            ? _detectLxSources(source, name: pluginName)
+            : const <String>[],
+        'isBaka': isBaka,
+        'isAnimemusic': isAnimemusic,
+        'sourceLabel': sourceLabels[id],
+        'animemusicApi':
             (savedVariables[id]?['api']?.trim().isNotEmpty == true
                 ? savedVariables[id]!['api']!.trim()
                 : _rewriteAnimemusicApiPort(
@@ -592,11 +646,11 @@ Future<List<EnabledMusicPlugin>> loadEnabledMusicPlugins(Ref ref) async {
                         : _extractAnimemusicFallbackApi(source),
                     sourceUrls[id] ?? '',
                   )),
-        animemusicPlatform:
+        'animemusicPlatform':
             animemusicMeta['platform']?.trim().isNotEmpty == true
             ? animemusicMeta['platform']!.trim()
             : 'wy',
-        animemusicQualities:
+        'animemusicQualities':
             animemusicMeta['qualities']?.trim().isNotEmpty == true
             ? (animemusicMeta['qualities']!
                   .split(',')
@@ -604,30 +658,35 @@ Future<List<EnabledMusicPlugin>> loadEnabledMusicPlugins(Ref ref) async {
                   .where((item) => item.isNotEmpty)
                   .toList())
             : const ['128k', '192k', '320k', 'flac'],
-        userVariables: _defaultedUserVariables(
+        'userVariables': _defaultedUserVariables(
           metadata,
           id,
-          savedVariables[id] ?? const {},
+          savedVariables[id] ?? const <String, String>{},
         ),
-        sourceUrl: sourceUrls[id] ?? '',
-        availableMethods: metadata.availableMethods,
-      ),
+        'sourceUrl': sourceUrls[id] ?? '',
+        'availableMethods': metadata.availableMethods,
+      });
+    }
+    // 插件管理页拖拽保存的顺序即搜索页 Tab 的优先级；未记录顺序的插件
+    // （新安装）按名称排序追加在末尾。
+    if (orderedIds.isNotEmpty) {
+      final byId = {
+        for (final plugin in plugins) plugin['id']! as String: plugin,
+      };
+      final ordered = <Map<String, Object?>>[
+        for (final id in orderedIds)
+          if (byId.containsKey(id)) byId.remove(id)!,
+      ];
+      ordered.addAll(
+        plugins.where((plugin) => byId.containsKey(plugin['id']! as String)),
+      );
+      return ordered;
+    }
+    plugins.sort(
+      (a, b) => (a['name']! as String).compareTo(b['name']! as String),
     );
-  }
-  // 插件管理页拖拽保存的顺序即搜索页 Tab 的优先级；未记录顺序的插件
-  // （新安装）按名称排序追加在末尾。
-  final orderedIds = prefs.getStringList(pluginOrderKey) ?? const [];
-  if (orderedIds.isNotEmpty) {
-    final byId = {for (final plugin in plugins) plugin.id: plugin};
-    final ordered = <EnabledMusicPlugin>[
-      for (final id in orderedIds)
-        if (byId.containsKey(id)) byId.remove(id)!,
-    ];
-    ordered.addAll(plugins.where((plugin) => byId.containsKey(plugin.id)));
-    return ordered;
-  }
-  plugins.sort((a, b) => a.name.compareTo(b.name));
-  return plugins;
+    return plugins;
+  });
 }
 
 /// QQ 音源插件的默认用户变量：**仅 L2** 的 `USE_SPONSORED_MV_API` 未填
@@ -2201,12 +2260,19 @@ class PluginRuntimeService {
   /// 搜索插件歌单/专辑，用于探索页的个性化歌单推荐和搜索页歌单分类。
   /// 不同 MusicFree 插件对歌单类型的命名并不完全一致，优先尝试
   /// sheet，空结果时再回退 playlist；推荐场景可额外回退 album。
+  ///
+  /// 洛雪系插件此前直接短路返回空（音源脚本没有 sheet/playlist 动作），
+  /// 现走 Rust 侧 lxSearchPlaylists 直连五平台原生歌单接口；
+  /// [lxSource] 为空时用酷我兜底（探索页推荐场景无音源上下文）。
   Future<List<PluginCatalogResult>> searchPlaylists(
     EnabledMusicPlugin plugin,
     String keyword, {
     bool includeAlbums = true,
+    String? lxSource,
   }) async {
-    if (plugin.isLx) return const [];
+    if (plugin.isLx) {
+      return _searchLxPlaylists(plugin, keyword, lxSource);
+    }
     if (plugin.isAnimemusic) return const [];
     List<Map<String, dynamic>> list = const [];
     final types = includeAlbums
@@ -2230,6 +2296,91 @@ class PluginRuntimeService {
         )
         .where((item) => item.title.isNotEmpty)
         .toList();
+  }
+
+  /// 洛雪歌单搜索：Rust lxSearchPlaylists 直连平台原生接口
+  /// （kw/kg/tx/wy/mg，对齐桌面端 searchLxPlaylists），返回归一化
+  /// 条目（id 为 `{source}:playlist:{原生ID}` 复合 ID）。rawData 携带
+  /// `lxSource` + `playlistId`，搜索页据此走 [importLxPlaylistDirect]
+  /// 加载曲目。
+  Future<List<PluginCatalogResult>> _searchLxPlaylists(
+    EnabledMusicPlugin plugin,
+    String keyword,
+    String? lxSource,
+  ) async {
+    final source =
+        lxSource != null && kLxSourceIds.contains(lxSource) ? lxSource : 'kw';
+    try {
+      final rawJson = await lxSearchPlaylists(
+        source: source,
+        keyword: keyword,
+        page: 1,
+        limit: 30,
+      ).timeout(const Duration(seconds: 20));
+      final decoded = jsonDecode(rawJson);
+      if (decoded is! List) return const [];
+      final results = <PluginCatalogResult>[];
+      for (final value in decoded.whereType<Map>()) {
+        final item = Map<String, dynamic>.from(value);
+        final title = item['title']?.toString().trim() ?? '';
+        final playlistId = item['playlist_id']?.toString().trim() ?? '';
+        if (title.isEmpty || playlistId.isEmpty) continue;
+        final artist = item['artist']?.toString().trim() ?? '';
+        final trackCount = item['track_count'];
+        final countLabel = trackCount is num && trackCount > 0
+            ? '${trackCount.toInt()}首'
+            : '';
+        results.add(
+          PluginCatalogResult(
+            pluginId: plugin.id,
+            id: item['id']?.toString() ?? '$source:playlist:$playlistId',
+            title: title,
+            subtitle: [
+              artist,
+              countLabel,
+            ].where((s) => s.isNotEmpty).join(' · '),
+            coverUrl: item['cover_url']?.toString() ?? '',
+            rawData: {
+              'id': playlistId,
+              'playlistId': playlistId,
+              'lxSource': source,
+              'title': title,
+              'cover': item['cover_url']?.toString() ?? '',
+            },
+          ),
+        );
+      }
+      return results;
+    } catch (error) {
+      // 某平台歌单接口不可用时不阻断搜索页（酷我维护中/接口变更等），
+      // 记入应用日志便于诊断。
+      AppLogStore.instance.add(
+        '[LX歌单搜索] 平台$source 搜索"$keyword"失败: '
+        '${_friendlyError(error.toString())}',
+        level: AppLogLevel.error,
+      );
+      return const [];
+    }
+  }
+
+  /// 直接导入洛雪平台歌单（绕过 QuickJS 音源脚本：脚本没有
+  /// importMusicSheet 动作）。供搜索页歌单分类结果点开时使用。
+  Future<PluginPlaylistImport> importLxPlaylistDirect(
+    EnabledMusicPlugin plugin,
+    String source,
+    String playlistId,
+  ) async {
+    final result = await importLxPlaylist(
+      source: source,
+      idOrUrl: playlistId,
+    );
+    return PluginPlaylistImport(
+      name: result.name,
+      coverUrl: result.coverUrl,
+      songs: result.songs
+          .map((raw) => _toSearchSong(plugin.id, raw))
+          .toList(),
+    );
   }
 
   /// 获取插件提供的热门榜单。MusicFree 插件统一通过 getTopLists 暴露榜单，

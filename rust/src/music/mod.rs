@@ -3,6 +3,7 @@ pub mod covers;
 pub mod cue;
 pub mod files;
 pub mod library;
+pub mod lx_catalog;
 pub mod lx_search;
 pub mod lyric_fetcher;
 pub mod lyrics;
