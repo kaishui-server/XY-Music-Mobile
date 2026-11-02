@@ -128,6 +128,15 @@ class MainActivity : AudioServiceActivity() {
         } catch (_: Exception) {
         }
         super.onCreate(savedInstanceState)
+        // 华为挖孔屏沉浸黑条修复：EMUI/HarmonyOS 部分版本会忽略 manifest
+        // 里 activity 属性形式的 windowLayoutInDisplayCutoutMode，状态栏
+        // 隐藏（沉浸）后窗口不延伸进挖孔区，系统把挖孔那一行填充成黑条。
+        // 运行时直接写 window attributes 是各厂商最终读取的权威值；
+        // API < 28 无此属性。
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            window.attributes.layoutInDisplayCutoutMode =
+                WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+        }
         // 尽早安装，捕获进程内所有线程的未捕获异常并写入崩溃文件。
         CrashHandler.install(this)
         // 久播卡死诊断：独立线程采集退出原因/主线程卡顿/内存趋势，

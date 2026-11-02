@@ -7995,22 +7995,26 @@ class VinylCover extends StatelessWidget {
             child: Stack(
               clipBehavior: Clip.none,
           children: [
-            // 唱片本体：播放时 24 秒匀速转一圈，暂停时停住。
-            _SpinningCover(
-              playing: playing,
-              period: const Duration(seconds: 24),
-              child: DecoratedBox(
-                decoration: const BoxDecoration(
-                  shape: BoxShape.circle,
-                  boxShadow: [
-                    BoxShadow(
-                      color: Color(0xB2000000),
-                      blurRadius: 44,
-                      spreadRadius: -10,
-                      offset: Offset(0, 22),
-                    ),
-                  ],
-                ),
+            // 投影固定在屏幕空间：真实黑胶的投影由固定光源决定，始终朝
+            // 下方，不随盘面旋转。此前阴影包在旋转子树内，模糊黑影随
+            // 盘 24 秒一圈游走（Skia 模糊层的 saveLayer 边界是方形），
+            // 表现为唱片外围一块边界可见的方形浅黑模糊。
+            DecoratedBox(
+              decoration: const BoxDecoration(
+                shape: BoxShape.circle,
+                boxShadow: [
+                  BoxShadow(
+                    color: Color(0xB2000000),
+                    blurRadius: 44,
+                    spreadRadius: -10,
+                    offset: Offset(0, 22),
+                  ),
+                ],
+              ),
+              // 唱片本体：播放时 24 秒匀速转一圈，暂停时停住。
+              child: _SpinningCover(
+                playing: playing,
+                period: const Duration(seconds: 24),
                 child: CustomPaint(
                   size: Size.square(side),
                   painter: _VinylDiscPainter(),
