@@ -351,7 +351,19 @@ class _SearchPageState extends ConsumerState<SearchPage>
         );
       }
     }
-    await Future.wait(tabs.map((tab) => _searchTabSource(tab, keyword, token)));
+    // 搜索并发数（搜索线程）：0=全部并行（默认），1~5=最多同时请求 N 个
+    // 平台/插件，弱网下减少同时请求数、节省调用次数。
+    final concurrency =
+        ref.read(settingsProvider).valueOrNull?.searchConcurrency ?? 0;
+    if (concurrency > 0) {
+      await runWithConcurrency(
+        tabs,
+        concurrency,
+        (tab) => _searchTabSource(tab, keyword, token),
+      );
+    } else {
+      await Future.wait(tabs.map((tab) => _searchTabSource(tab, keyword, token)));
+    }
   }
 
   Future<void> _searchTabSource(
@@ -1046,14 +1058,22 @@ class _SearchPageState extends ConsumerState<SearchPage>
     // 动画期间即可完全遮挡下层页面。
     return DefaultTabController(
       length: tabs.isEmpty ? 1 : tabs.length,
-      child: !widget.embeddedInShell
-          ? XyAppBackground(
-              imagePath: backgroundSettings.path,
-              blur: backgroundSettings.blur,
-              fade: backgroundSettings.fade,
-              child: scaffold,
-            )
-          : scaffold,
+      // 点击搜索框以外的空白处：收起键盘并取消输入框选中态。没有这层
+      // 时焦点一直滞留在搜索框，失焦回调迟迟不触发，表现为「输入完点
+      // 其他地方搜索框不取消选中、反复触发搜索」。translucent：空白处
+      // 的点击由这里接管失焦；按钮/列表项等子节点仍优先响应自身点击。
+      child: GestureDetector(
+        onTap: () => FocusScope.of(context).unfocus(),
+        behavior: HitTestBehavior.translucent,
+        child: !widget.embeddedInShell
+            ? XyAppBackground(
+                imagePath: backgroundSettings.path,
+                blur: backgroundSettings.blur,
+                fade: backgroundSettings.fade,
+                child: scaffold,
+              )
+            : scaffold,
+      ),
     );
   }
 }

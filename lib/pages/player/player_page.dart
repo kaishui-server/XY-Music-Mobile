@@ -282,6 +282,11 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
     'com.xymusic.mobile/screen_awake',
   );
   static const _galleryChannel = MethodChannel('com.xymusic.mobile/gallery');
+  /// 状态栏原生兜底通道（与可视化页同款）：Android 15 强制 edge-to-edge
+  /// 后 SystemChrome 的 immersiveSticky 在部分机型失效，API 30+ 用原生
+  /// WindowInsetsController 硬隐藏状态栏；否则沉浸式下状态栏残留为
+  /// 不透明黑条（挖孔屏上表现为挖孔高度一条黑）。
+  static const _systemUiChannel = MethodChannel('com.xymusic.mobile/system_ui');
 
   late final PageController _detailPageController = PageController();
   ProviderSubscription<bool>? _playingSubscription;
@@ -398,23 +403,45 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
     }
   }
 
+  /// 沉浸式隐藏状态栏：SystemChrome 兜底旧机型，API 30+ 用原生
+  /// WindowInsetsController 硬隐藏（Android 15 强制 edge-to-edge 后
+  /// SystemChrome 的 immersiveSticky 在部分机型失效，visualizer 页已用
+  /// 同款兜底）；切换 SystemUiMode 会重置系统栏样式，需重新声明透明
+  /// 状态栏，呼出状态栏时不出现黑条。
+  Future<void> _hideStatusBar() async {
+    await SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
+    await _systemUiChannel.invokeMethod<bool>('setStatusBarHidden', {
+      'hidden': true,
+    });
+    SystemChrome.setSystemUIOverlayStyle(
+      const SystemUiOverlayStyle(statusBarColor: Colors.transparent),
+    );
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    // 前台恢复/路由过渡后 insets 状态可能被重置，重新声明沉浸隐藏。
+    if (state == AppLifecycleState.resumed) {
+      unawaited(_hideStatusBar());
+    }
+  }
+
   @override
   void initState() {
     super.initState();
     // 详情页常驻沉浸：隐藏状态栏，顶部下划短暂呼出（sticky 由系统在
     // 数秒无操作后自动收回），不影响下拉通知栏/控制中心手势；退出页面
-    // 在 dispose 恢复 edgeToEdge。注意：切换 SystemUiMode 会重置系统栏
-    // 样式（Android 上 statusBarColor 回落为不透明黑），呼出状态栏时
-    // 黑条会盖住沉浸式封面顶部，模式生效后必须重新声明透明样式。
-    unawaited(
-      SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky).then(
-        (_) {
-          SystemChrome.setSystemUIOverlayStyle(
-            const SystemUiOverlayStyle(statusBarColor: Colors.transparent),
-          );
-        },
-      ),
-    );
+    // 在 dispose 恢复 edgeToEdge。切换 SystemUiMode 会重置系统栏样式
+    // （Android 上 statusBarColor 回落为不透明黑），且 Android 15 强制
+    // edge-to-edge 后 SystemChrome 的 immersiveSticky 在部分机型失效，
+    // 因此统一走 _hideStatusBar：SystemChrome 兜底旧机型 + 原生
+    // WindowInsetsController 硬隐藏 + 重新声明透明样式，避免状态栏残留
+    // 为不透明黑条（挖孔屏上表现为挖孔高度一条黑）。
+    unawaited(_hideStatusBar());
+    WidgetsBinding.instance.addObserver(this);
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) unawaited(_hideStatusBar());
+    });
     _playingSubscription = ref.listenManual<bool>(
       playerProvider.select((state) => state.isPlaying),
       (_, playing) => unawaited(_setScreenAwake(playing)),
@@ -2193,7 +2220,11 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
           : DeviceOrientation.values,
     );
     await SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
-    // 模式切换会重置系统栏样式，重新声明透明状态栏（同 initState 注释）。
+    // 模式切换会重置系统栏样式，重新声明透明状态栏（同 initState 注释）；
+    // 同时叠加原生硬隐藏兜底（Android 15 部分机型 SystemChrome 失效）。
+    await _systemUiChannel.invokeMethod<bool>('setStatusBarHidden', {
+      'hidden': true,
+    });
     SystemChrome.setSystemUIOverlayStyle(
       const SystemUiOverlayStyle(statusBarColor: Colors.transparent),
     );
@@ -2206,15 +2237,7 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
     if (!_videoLandscape) return;
     _videoLandscape = false;
     unawaited(SystemChrome.setPreferredOrientations(DeviceOrientation.values));
-    unawaited(
-      SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky).then(
-        (_) {
-          SystemChrome.setSystemUIOverlayStyle(
-            const SystemUiOverlayStyle(statusBarColor: Colors.transparent),
-          );
-        },
-      ),
-    );
+    unawaited(_hideStatusBar());
   }
 
   Future<void> _addToPlaylist(QueueItem item) async {
@@ -3212,11 +3235,18 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
     // 横屏锁定跟随详情页生命周期，离开页面即解除；同时恢复系统状态栏
     // （initState 进入详情页时切换到了 immersiveSticky 常驻沉浸）。
     _resetVideoOrientation();
+    WidgetsBinding.instance.removeObserver(this);
     unawaited(
       SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge).then((_) {
         SystemChrome.setSystemUIOverlayStyle(
           const SystemUiOverlayStyle(statusBarColor: Colors.transparent),
         );
+      }),
+    );
+    // 恢复状态栏显示（与沉浸时隐藏成对）。
+    unawaited(
+      _systemUiChannel.invokeMethod<bool>('setStatusBarHidden', {
+        'hidden': false,
       }),
     );
     VideoPlaybackSession.revision.removeListener(_syncVideoSession);
@@ -3446,11 +3476,16 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
                 child: Text('暂无歌词', style: TextStyle(color: Colors.white54)),
               )
             else
-              _LyricsView(
-                key: ValueKey('lyrics:${current.path}'),
-                item: current,
-                offsetTenths: _lyricsOffsetTenths,
-                onLinkLyrics: () => unawaited(_linkLyrics(current)),
+              // RepaintBoundary 隔离歌词页：换行重建、逐字动画与渐隐
+              // ShaderMask 只重绘本层，不波及封面页/背景层。渐变绘制
+              // 基于自身布局矩形，不跨边界，视觉不受影响。
+              RepaintBoundary(
+                child: _LyricsView(
+                  key: ValueKey('lyrics:${current.path}'),
+                  item: current,
+                  offsetTenths: _lyricsOffsetTenths,
+                  onLinkLyrics: () => unawaited(_linkLyrics(current)),
+                ),
               ),
           ],
         ),
@@ -3536,11 +3571,16 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
           child: Text('暂无歌词', style: TextStyle(color: Colors.white54)),
         );
       }
-      return _LyricsView(
-        key: ValueKey('lyrics:${current.path}'),
-        item: current,
-        offsetTenths: _lyricsOffsetTenths,
-        onLinkLyrics: () => unawaited(_linkLyrics(current)),
+      // RepaintBoundary 隔离横屏歌词区（同竖屏策略）：换行重建与逐字
+      // 动画只重绘本层，不波及封面/控制栏。ShaderMask 渐变基于自身
+      // 布局矩形，不跨边界，视觉不受影响。
+      return RepaintBoundary(
+        child: _LyricsView(
+          key: ValueKey('lyrics:${current.path}'),
+          item: current,
+          offsetTenths: _lyricsOffsetTenths,
+          onLinkLyrics: () => unawaited(_linkLyrics(current)),
+        ),
       );
     }
 
@@ -7449,6 +7489,9 @@ class _BigCover extends ConsumerWidget {
         }
         return Stack(
           fit: StackFit.expand,
+          // 唱臂/高光/反光会伸出封面边界，默认 Clip.hardEdge 会把唱臂
+          // 截断；沉浸式布局概率性“唱臂消失/盘面残缺”与此相关。
+          clipBehavior: Clip.none,
           children: [
             Align(
               alignment: Alignment(0, portraitImmersiveActive ? -.4 : 0),
@@ -7481,7 +7524,12 @@ class _BigCover extends ConsumerWidget {
                     Positioned(
                       top: 0,
                       left: 0,
-                      child: coverHidden
+                      // RepaintBoundary 隔离封面动画层：圆形旋转/黑胶旋转
+                      // 与唱针动画每帧重绘只局限在本层，不波及歌词页与
+                      // 背景层。RepaintBoundary 不裁剪，唱臂/阴影/高光
+                      // 伸出封面边界的绘制不受影响。
+                      child: RepaintBoundary(
+                        child: coverHidden
                           // 预览层：封面区域留空，仅保留同尺寸透明占位
                           //（放大层持续提供封面视觉，占位用于锚定目标矩形）。
                           ? SizedBox(
@@ -7507,6 +7555,7 @@ class _BigCover extends ConsumerWidget {
                               ),
                               _ => _buildClassic(side),
                             },
+                          ),
                     ),
                     if (item != null && showCoverExtras)
                       Positioned(
@@ -7515,11 +7564,16 @@ class _BigCover extends ConsumerWidget {
                         left: 0,
                         right: 0,
                         height: lyricArea,
-                        child: AbsorbPointer(
-                          child: _MiniLyrics(
-                            item: item!,
-                            offsetTenths: offsetTenths,
-                            maxRows: miniLyricRows,
+                        // RepaintBoundary 隔离迷你歌词层：换行重建与
+                        // AnimatedSize/AnimatedSwitcher 动画只重绘本层，
+                        // 不与封面动画层互相污染。
+                        child: RepaintBoundary(
+                          child: AbsorbPointer(
+                            child: _MiniLyrics(
+                              item: item!,
+                              offsetTenths: offsetTenths,
+                              maxRows: miniLyricRows,
+                            ),
                           ),
                         ),
                       ),
@@ -7921,11 +7975,25 @@ class VinylCover extends StatelessWidget {
     return Semantics(
       button: onTap != null,
       label: onTap == null ? null : '显示歌词',
-      child: SizedBox(
-        width: size,
-        height: size,
-        child: Stack(
-          clipBehavior: Clip.none,
+      child: LayoutBuilder(
+        builder: (context, constraints) {
+          // 防御非正方形父级约束（转场中间帧/外部容器可能给矩形）：
+          // 盘面与唱臂按内切正方形绘制并居中，任何输入矩形都只等比缩放，
+          // 不会把唱片拉成椭圆（用户实测黑胶盘面/唱臂变形、比例失调）。
+          final bounded =
+              constraints.hasBoundedWidth && constraints.hasBoundedHeight;
+          final boxWidth = bounded && constraints.maxWidth.isFinite
+              ? constraints.maxWidth
+              : size;
+          final boxHeight = bounded && constraints.maxHeight.isFinite
+              ? constraints.maxHeight
+              : size;
+          final side = math.min(boxWidth, boxHeight);
+          return SizedBox(
+            width: side,
+            height: side,
+            child: Stack(
+              clipBehavior: Clip.none,
           children: [
             // 唱片本体：播放时 24 秒匀速转一圈，暂停时停住。
             _SpinningCover(
@@ -7944,10 +8012,10 @@ class VinylCover extends StatelessWidget {
                   ],
                 ),
                 child: CustomPaint(
-                  size: Size.square(size),
+                  size: Size.square(side),
                   painter: _VinylDiscPainter(),
                   child: Center(
-                    child: _VinylLabel(item: item, size: size),
+                    child: _VinylLabel(item: item, size: side),
                   ),
                 ),
               ),
@@ -7968,8 +8036,10 @@ class VinylCover extends StatelessWidget {
             Positioned.fill(
               child: InkWell(onTap: onTap, onLongPress: onLongPress),
             ),
-          ],
-        ),
+              ],
+            ),
+          );
+        },
       ),
     );
   }
@@ -8980,10 +9050,42 @@ class _TimedLyricTextState extends ConsumerState<_TimedLyricText>
     super.dispose();
   }
 
+  @override
+  void didUpdateWidget(_TimedLyricText oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    // 换行 / 切歌 / 歌词偏移调整：旧曲进度基准对新时间轴无意义，整体
+    // 重置，防止旧 position 污染新行首帧（久播跨曲累积漂移）。
+    if (oldWidget.line != widget.line ||
+        oldWidget.offsetTenths != widget.offsetTenths) {
+      _basePositionMs = 0;
+      _baseClock = Duration.zero;
+      _lastElapsed = Duration.zero;
+      _calibratedOnce = false;
+      _positionNotifier.value = 0;
+      return;
+    }
+    // 行恢复为活动行（selected false→true，同歌上下行切换）：立即用
+    // 当前播放快照校准，避免沿用旧行的过期进度。
+    if (!oldWidget.selected && widget.selected) {
+      final pos = ref.read(playerProvider).position;
+      _basePositionMs = pos * 1000.0;
+      _baseClock = Duration.zero;
+      _lastElapsed = Duration.zero;
+      _calibratedOnce = true;
+      _positionNotifier.value = applyLyricsOffset(pos, widget.offsetTenths);
+    }
+  }
+
   void _ensureTicker() {
     if (_tickerStarted) return;
     _tickerStarted = true;
     _ticker.start();
+  }
+
+  void _stopTicker() {
+    if (!_tickerStarted) return;
+    _tickerStarted = false;
+    _ticker.stop();
   }
 
   /// 每帧推进：非活动行 / 非逐字效果模式 / 暂停态直接早退（成本趋近 0）。
@@ -9068,6 +9170,18 @@ class _TimedLyricTextState extends ConsumerState<_TimedLyricText>
         _basePositionMs = ref.read(playerProvider).position * 1000.0;
         _calibratedOnce = true;
       }
+      // 暂停即停 Ticker：暂停态进度冻结、无动画可推，60fps 空转只会
+      // 持续占帧预算（久播/低端机尤其明显）。恢复播放时 Ticker 重启、
+      // 基准时钟归零（elapsed 重新从 0 起算），推算从暂停点继续，由
+      // position 采样照常平滑校准。
+      ref.listen(playerProvider.select((state) => state.isPlaying), (_, playing) {
+        if (playing) {
+          _baseClock = Duration.zero;
+          _ensureTicker();
+        } else {
+          _stopTicker();
+        }
+      });
       _ensureTicker();
       // 两种效果模式自此分道：逐字=整字依次淡入（无字内过渡）；逐词=
       // 渐进填充 + 填充前沿一道渐变扫光带（字内可见填充过程）。此前两者
@@ -9182,14 +9296,23 @@ class _ProgressiveLyricWordState extends State<_ProgressiveLyricWord> {
   /// 已唱词上浮：位移随扫光进度推进——stage1 填充期间按 0~1 进度渐进
   /// 上浮（easeOutCubic 缓动：填充前段上浮稍快、后段趋缓），唱到
   /// stage2 时已自然达到最大量并稳定，不再需要切换时触发动画；
-  /// seek/换行回退时位移随进度回退复位。仅绘制期位移
-  /// （Transform.translate），不改布局、不触发行高变化。
+  /// seek/换行回退时位移随进度回退复位。仅绘制期位移（stage1 由扫光
+  /// Painter 的 canvas.translate 完成、stage2 由 Transform.translate），
+  /// 不改布局、不触发行高变化。
   static const double _liftPx = 1.8;
 
   /// 扫光亮档排版缓存（跨帧复用；文本/样式变化才重排，每帧仅 1 次亮区
   /// clipRect draw + 带内窄条 saveLayer，零重复排版）。
   List<TextPainter>? _tpStops;
-  String? _tpKey;
+  // 暗底文字排版缓存（stage1 由 Painter 一并绘制，child 透明占位）。
+  TextPainter? _tpDim;
+  // 缓存比对字段（文本/样式/双色），避免每帧拼接 key 字符串：久播逐字
+  // 60fps 持续触发 _ensureSweepPainters，字符串拼接会累积每帧小对象
+  // 分配，加重低端机 GC 压力。
+  String? _tpText;
+  TextStyle? _tpStyle;
+  Color? _tpPlayed;
+  Color? _tpUnplayed;
 
   /// 扫光总时长：两种模式都跟随词的演唱时长（词唱多久填多久；快字下限
   /// 0.15s 防一闪而过，长词上限 0.45s 防迟迟填不满）。区别在过渡带宽度
@@ -9211,15 +9334,24 @@ class _ProgressiveLyricWordState extends State<_ProgressiveLyricWord> {
   void _invalidateSweepPainters() {
     _tpStops?.forEach((tp) => tp.dispose());
     _tpStops = null;
-    _tpKey = null;
+    _tpDim?.dispose();
+    _tpDim = null;
+    _tpText = null;
+    _tpStyle = null;
+    _tpPlayed = null;
+    _tpUnplayed = null;
   }
 
   void _ensureSweepPainters() {
     final style = _resolved ?? widget.style;
-    // key 携带已播色：颜色设置变化时强制重建亮档排版缓存。
-    final key =
-        '${widget.text}|${style.hashCode}|${widget.playedColor.toARGB32()}';
-    if (_tpKey == key && _tpStops != null) return;
+    // 字段级比对（文本/样式引用/双色），避免每帧拼接 key 字符串。
+    if (_tpStops != null &&
+        _tpText == widget.text &&
+        _tpStyle == style &&
+        _tpPlayed == widget.playedColor &&
+        _tpUnplayed == widget.unplayedColor) {
+      return;
+    }
     _invalidateSweepPainters();
     _tpStops = [
       TextPainter(
@@ -9230,7 +9362,17 @@ class _ProgressiveLyricWordState extends State<_ProgressiveLyricWord> {
         textDirection: TextDirection.ltr,
       )..layout(),
     ];
-    _tpKey = key;
+    _tpDim = TextPainter(
+      text: TextSpan(
+        text: widget.text,
+        style: style.copyWith(color: widget.unplayedColor),
+      ),
+      textDirection: TextDirection.ltr,
+    )..layout();
+    _tpText = widget.text;
+    _tpStyle = style;
+    _tpPlayed = widget.playedColor;
+    _tpUnplayed = widget.unplayedColor;
   }
 
   /// DefaultTextStyle 合并后的最终渲染样式（一次合并跨帧复用）。
@@ -9302,13 +9444,10 @@ class _ProgressiveLyricWordState extends State<_ProgressiveLyricWord> {
 
   void _onPositionChanged() {
     if (!mounted) return;
+    // 只做阶段切换（低频）；填充中的词进度推进由扫光 Painter 的
+    // repaint: position 直接驱动 markNeedsPaint，不再每帧 setState
+    // 重建整词子树（消除久播逐字每帧 60fps rebuild 的持续开销）。
     _recomputeStage();
-    // 填充中的词每帧 setState（Painter 前沿插值 + 上浮位移随扫光进度
-    // 推进）；未唱/已唱为静态阶段（已唱已到最大上浮量并稳定），不触发
-    // 整词重建。
-    if (_stage == 1) {
-      setState(() {});
-    }
   }
 
   @override
@@ -9336,16 +9475,17 @@ class _ProgressiveLyricWordState extends State<_ProgressiveLyricWord> {
         ),
       );
     }
-    // 扫光填充（两种效果模式共用，参数不同）：底为暗色静态 Text（提供
-    // 尺寸与基线），亮档与带内两档灰度由 foregroundPainter 按填充前沿
-    // clipRect 叠画——零离屏、Paragraph 跨帧缓存复用，每帧仅 3 次 clip
-    // draw call，重绘被词级 RepaintBoundary 圈在词内。上浮位移同步随
-    // 扫光进度推进（唱的过程中慢慢上浮）。
-    return Transform.translate(
-      offset: Offset(0, -_liftOffset),
-      child: CustomPaint(
-        foregroundPainter: _SweepWordPainter(this),
-        child: Text(widget.text, style: resolved.copyWith(color: dimColor)),
+    // 扫光填充（两种效果模式共用，参数不同）：暗底、亮区与过渡带全部
+    // 由 Painter 按填充前沿绘制（child 仅作透明占位提供尺寸与基线），
+    // 上浮位移并入 Painter 的 canvas.translate（绘制期位移，与原
+    // Transform.translate 视觉完全一致、同样不占布局）。Painter 通过
+    // repaint: position 绑定进度，每帧推进只触发词级 RepaintBoundary
+    // 内重绘，零 Widget 重建——久播逐字不再每帧 60fps 重建词子树。
+    return CustomPaint(
+      painter: _SweepWordPainter(this, repaint: widget.position),
+      child: Text(
+        widget.text,
+        style: resolved.copyWith(color: Colors.transparent),
       ),
     );
   }
@@ -9360,7 +9500,7 @@ class _ProgressiveLyricWordState extends State<_ProgressiveLyricWord> {
 /// 模式窄带干脆。零重复排版：亮区零离屏，saveLayer 仅覆盖带内窄条；
 /// 重绘被词级 RepaintBoundary 圈在词内，不传播到整页。
 class _SweepWordPainter extends CustomPainter {
-  _SweepWordPainter(this.state);
+  _SweepWordPainter(this.state, {super.repaint});
   final _ProgressiveLyricWordState state;
 
   @override
@@ -9388,6 +9528,13 @@ class _SweepWordPainter extends CustomPainter {
       canvas.restore();
     }
 
+    // 上浮位移并入绘制：与原先 Transform.translate(0, -_liftOffset) 完全
+    // 等效（绘制期位移、不占布局），暗底、亮区、过渡带整体上浮。
+    canvas.save();
+    canvas.translate(0, -state._liftOffset);
+    // 暗底文字：child 已改为透明占位（仅提供尺寸与基线），实际暗底由
+    // 缓存 TextPainter 绘制，亮区/过渡带叠画其上（层次与原布局一致）。
+    state._tpDim?.paint(canvas, Offset.zero);
     // 亮区（前沿渐变带之前）：直接 clipRect 叠亮档，零离屏。
     seg(0, math.min(front - band, size.width), stops[0]);
     // 过渡带：带内小范围 saveLayer + 白→透明渐变遮罩（dstIn）做连续
@@ -9415,6 +9562,7 @@ class _SweepWordPainter extends CustomPainter {
       canvas.restore();
       canvas.restore();
     }
+    canvas.restore();
   }
 
   @override
@@ -9839,12 +9987,96 @@ class _ProgressBar extends ConsumerStatefulWidget {
   ConsumerState<_ProgressBar> createState() => _ProgressBarState();
 }
 
-class _ProgressBarState extends ConsumerState<_ProgressBar> {
+class _ProgressBarState extends ConsumerState<_ProgressBar>
+    with SingleTickerProviderStateMixin {
   // 拖动中的本地预览位置：拖动期间滑块只跟随手指，暂时隔离进度流
   // 的更新；松手（onChangeEnd）才真正 seek。旧实现把 onChanged 直接
   // 接到原生 seek，每个拖动 tick 都执行一次 seek，既造成音频卡顿，
   // 又让滑块在手指位置与流式位置之间来回打架（表现为拖拽失误）。
   double? _dragValue;
+
+  // 本地时钟推算基准：界面可见且在播时，进度条显示不依赖 position 流
+  // 事件频率。悬浮窗抢焦点会把宿主 Activity 打成 paused/hidden，导致
+  // Flutter 帧调度暂停或 position 流退化为 2 秒档；应用内长时间无触摸
+  // 时引擎推算也可能周期性失效（playing/processingState 抖动使 just_audio
+  // position getter 退回原生最后上报值），流事件变成 2 秒一跳。Ticker
+  // 每帧计算「基准 + 流逝时间」，position 流只做校准（大偏差硬同步、
+  // 小漂移渐进收敛），保证「界面可见且在播」时进度条始终平滑走动。
+  double? _basePosSec;
+  DateTime? _baseAt;
+  bool _wasPlaying = false;
+  double _lastStreamPos = 0;
+  double? _lastShownPos;
+  late final Ticker _ticker;
+
+  @override
+  void initState() {
+    super.initState();
+    _ticker = createTicker(_onTick)..start();
+  }
+
+  @override
+  void dispose() {
+    _ticker.dispose();
+    super.dispose();
+  }
+
+  void _onTick(Duration _) {
+    final shown = _displayPos();
+    if (shown == null) return;
+    final last = _lastShownPos;
+    // 每 100ms 至少刷新一次（约 10Hz 节拍），避免每帧 setState 造成
+    // 无谓重建；RepaintBoundary 已隔离本层，不连带重绘控制卡其余区域。
+    if (last == null || (shown - last).abs() >= 0.1) {
+      _lastShownPos = shown;
+      if (mounted) setState(() {});
+    }
+  }
+
+  /// 当前应显示的位置（秒）：拖动中返回手指位置；播放态本地推算；
+  /// 非播放态回退基准位置；基准未建立时回退最近流位置。
+  double? _displayPos() {
+    if (_dragValue != null) return _dragValue;
+    final base = _basePosSec;
+    final at = _baseAt;
+    if (base == null || at == null) return null;
+    final playing = ref.read(playerProvider.select((s) => s.isPlaying));
+    if (!playing) return base;
+    return base + DateTime.now().difference(at).inMilliseconds / 1000.0;
+  }
+
+  /// position 流校准：大偏差（seek/切歌/恢复）硬同步基准；小漂移渐进
+  /// 收敛 30%，保持推算单调平滑；暂停/起播直接以流位置为基准。
+  void _calibrate(double streamPos, bool playing) {
+    _lastStreamPos = streamPos;
+    final now = DateTime.now();
+    final base = _basePosSec;
+    final at = _baseAt;
+    if (base != null && at != null && playing && _wasPlaying) {
+      final estimate = base + now.difference(at).inMilliseconds / 1000.0;
+      final drift = streamPos - estimate;
+      if (drift.abs() > 0.5) {
+        _basePosSec = streamPos;
+        _baseAt = now;
+      } else if (drift > 0.03) {
+        _basePosSec = base + drift * 0.3;
+        _baseAt = now;
+      }
+      // drift <= 0.03：推算与流一致，保持不动。
+    } else {
+      _basePosSec = streamPos;
+      _baseAt = now;
+    }
+    _wasPlaying = playing;
+    final shown = _displayPos();
+    if (shown != null && mounted) {
+      final last = _lastShownPos;
+      if (last == null || (shown - last).abs() >= 0.03) {
+        _lastShownPos = shown;
+        setState(() {});
+      }
+    }
+  }
 
   String _fmt(double s) {
     if (!s.isFinite || s < 0) s = 0;
@@ -9855,20 +10087,34 @@ class _ProgressBarState extends ConsumerState<_ProgressBar> {
 
   @override
   Widget build(BuildContext context) {
-    final progress = ref.watch(
+    // 校准不触发本组件重建：监听 position 与播放态变化刷新本地推算基准，
+    // 显示由 Ticker/校准 setState 驱动，不再逐 position 事件重建。
+    ref.listen(
       playerProvider.select(
-        (state) => (position: state.position, duration: state.duration),
+        (state) => (position: state.position, isPlaying: state.isPlaying),
+      ),
+      (prev, next) => _calibrate(next.position, next.isPlaying),
+    );
+    // 低频 watch：duration 变化（切歌/元数据到达）才重建本层。
+    final meta = ref.watch(
+      playerProvider.select(
+        (state) => (duration: state.duration, isPlaying: state.isPlaying),
       ),
     );
-    return _buildProgress(
-      context,
-      _dragValue ?? progress.position,
-      progress.duration,
-      onChanged: (value) => setState(() => _dragValue = value),
-      onChangeEnd: (value) {
-        setState(() => _dragValue = null);
-        widget.notifier.seek(value);
-      },
+    final shown = _dragValue ?? (_displayPos() ?? _lastStreamPos);
+    // RepaintBoundary 隔离进度条：滑块/时间文本重绘只局限在本层，不连带
+    // 重绘标题/按钮等控制卡其余区域。
+    return RepaintBoundary(
+      child: _buildProgress(
+        context,
+        shown.clamp(0.0, meta.duration > 0 ? meta.duration : double.infinity),
+        meta.duration,
+        onChanged: (value) => setState(() => _dragValue = value),
+        onChangeEnd: (value) {
+          setState(() => _dragValue = null);
+          widget.notifier.seek(value);
+        },
+      ),
     );
   }
 

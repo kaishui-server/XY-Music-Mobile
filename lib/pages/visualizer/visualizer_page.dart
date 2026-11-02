@@ -399,8 +399,9 @@ class _VisualizerPageState extends ConsumerState<VisualizerPage>
   @override
   Widget build(BuildContext context) {
     final settings = ref.watch(visualizerSettingsProvider);
-    final player = ref.watch(playerProvider);
-    final current = player.current;
+    // 细粒度订阅：本 build 仅使用 current 字段（切歌/队列变化才重建），
+    // 不再随 position 10Hz / 播放状态流转整页 rebuild。
+    final current = ref.watch(playerProvider.select((state) => state.current));
     // 关闭自动隐藏时立即唤起播放栏（build 内直接改标志，本次渲染即生效）。
     if (!settings.autoHideBar && !_barVisible) _barVisible = true;
 

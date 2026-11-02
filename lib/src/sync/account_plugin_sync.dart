@@ -160,8 +160,21 @@ class AccountPluginSync {
     // 一并恢复，否则脚本虽在、来源却不可用，歌单来源标签一直无效。
     final userVariables = readPluginUserVariables(prefs);
 
+    // 云端条目按归一化 id 去重：后端可能因重复上传/追加保留同一插件的
+    // 多条记录，逐条处理会把同一插件恢复成多份，导致“云同步插件数”在
+    // 重登后异常翻倍（用户实测 9 个插件重登后显示 17 个）。
+    final uniqueItems = <String, Map<String, dynamic>>{};
     for (final value in raw.whereType<Map>()) {
       final item = Map<String, dynamic>.from(value);
+      final requestedId = item['id']?.toString().trim() ?? '';
+      final key = requestedId.isNotEmpty
+          ? _safePluginId(requestedId)
+          : '${item['name']?.toString() ?? 'plugin'}-'
+                '${item['version']?.toString() ?? '0'}';
+      uniqueItems[key] = item;
+    }
+
+    for (final item in uniqueItems.values) {
       final encoded =
           item['scriptEncoded'] == true || item['script_encoded'] == true;
       final rawScript = item['script']?.toString() ?? '';
@@ -182,6 +195,45 @@ class AccountPluginSync {
         final file = File(p.join(pluginDir.path, '$id.js'));
         final incomingVersion =
             item['version']?.toString() ?? metadata.version ?? '0';
+        // 本地可能残留旧命名副本（早期版本曾按原始名称落盘，未归一化
+        // 成小写连字符 id），扫描同 metadata id 的旧文件：同一插件只保留
+        // 一份，避免重登后目录里新旧命名并存导致插件数翻倍。
+        File? legacyFile;
+        if (!file.existsSync()) {
+          for (final f in pluginDir.listSync().whereType<File>()) {
+            if (p.extension(f.path).toLowerCase() != '.js') continue;
+            if (p.basenameWithoutExtension(f.path) == id) {
+              legacyFile = f;
+              break;
+            }
+            try {
+              final localMeta =
+                  PluginMetadata.parse(await f.readAsString());
+              if ((localMeta.id ?? '').isNotEmpty &&
+                  _safePluginId(localMeta.id!) == id) {
+                legacyFile = f;
+                break;
+              }
+            } catch (_) {
+              // 损坏脚本不视为同插件副本。
+            }
+          }
+        }
+        if (legacyFile != null && legacyFile.path != file.path) {
+          final legacyMeta =
+              PluginMetadata.parse(await legacyFile.readAsString());
+          if (_compareVersion(
+                legacyMeta.version ?? '0',
+                incomingVersion,
+              ) >=
+              0) {
+            // 旧副本版本不低于云端：保留本地，只恢复云端状态。
+            _restoreState(item, id, enabled, sourceUrls, userVariables);
+            continue;
+          }
+          // 云端版本更新：删除旧命名副本，统一写入归一化文件名。
+          await legacyFile.delete();
+        }
         if (file.existsSync()) {
           final localMeta = PluginMetadata.parse(await file.readAsString());
           if (_compareVersion(localMeta.version ?? '0', incomingVersion) >= 0) {
@@ -191,7 +243,16 @@ class AccountPluginSync {
           }
         }
         await savePluginScript(dataDir: dataDir, id: id, script: script);
-        _restoreState(item, id, enabled, sourceUrls, userVariables);
+        // 新下载插件：云端未明确禁用时默认启用，避免重装登录后全部插件
+        // 不可用（用户需逐个手动重装才能播放）。
+        _restoreState(
+          item,
+          id,
+          enabled,
+          sourceUrls,
+          userVariables,
+          defaultEnabled: true,
+        );
         result.downloadedPlugins++;
       } catch (error) {
         result.errors.add('${item['name'] ?? item['id'] ?? '未知插件'}恢复失败：$error');
@@ -214,12 +275,17 @@ class AccountPluginSync {
     String id,
     Set<String> enabled,
     Map<String, String> sourceUrls,
-    Map<String, Map<String, String>> userVariables,
-  ) {
+    Map<String, Map<String, String>> userVariables, {
+    bool defaultEnabled = false,
+  }) {
     if (item['enabled'] == true) {
       enabled.add(id);
-    } else if (item.containsKey('enabled')) {
+    } else if (item.containsKey('enabled') && item['enabled'] == false) {
       enabled.remove(id);
+    } else if (defaultEnabled) {
+      // 云端未携带启用状态（旧数据/后端裁剪字段）时，新恢复的插件默认
+      // 启用，避免重装登录后出现“全部插件不可用”而必须手动重装。
+      enabled.add(id);
     }
     final source =
         (item['sourceUrl'] ?? item['source_url'] ?? item['url'])

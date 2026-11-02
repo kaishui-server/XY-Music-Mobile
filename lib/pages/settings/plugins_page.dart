@@ -13,6 +13,7 @@ import '../../src/favorites/favorites_provider.dart';
 import '../../src/player/player_provider.dart';
 import '../../src/playlists/playlists_provider.dart';
 import '../../src/plugins/plugin_metadata.dart';
+import '../../src/plugins/plugin_meta_loader.dart';
 import '../../src/plugins/plugin_reference_migration.dart';
 import '../../src/plugins/plugin_runtime.dart';
 import '../../src/recent/recent_provider.dart';
@@ -211,87 +212,56 @@ class _PluginsNotifier extends AsyncNotifier<List<_PluginInfo>> {
     final displayNames = readPluginDisplayNames(prefs);
     final sourceLabels = readPluginSourceLabels(prefs);
     final kinds = readPluginKinds(prefs);
-    final files =
-        directory
-            .listSync()
-            .whereType<File>()
-            .where((file) => p.extension(file.path).toLowerCase() == '.js')
-            .toList()
-          ..sort((a, b) => a.path.compareTo(b.path));
-    // 逐文件异步读取：脚本可达数百 KB，批量装了几十个后若同步读完整个
-    // 目录会长时间阻塞主线程；await 读取会在文件之间让出事件循环。
-    final items = <_PluginInfo>[];
-    for (final file in files) {
-      final script = await file.readAsString();
-      final metadata = PluginMetadata.parse(script);
-      final id = p.basenameWithoutExtension(file.path);
-      // 分类优先级：LX 契约 > BakaMusic 契约 > animemusic 后端 >
-      // 标准 MusicFree。v2 洛雪版虽直连 animemusic 后端但属 LX 契约；
-      // baka 版兜底地址同样指向 animemusic 域名，需先判 Baka。
-      var kind = metadata.isLx
-          ? _PluginKind.lx
-          : metadata.isBaka
-          ? _PluginKind.baka
-          : metadata.isAnimemusic
-          ? _PluginKind.animemusic
-          : _PluginKind.musicfree;
-      // BakaMusic 与 MusicFree 脚本大量同构，分类顺序：内容证据
-      // （metadata.isBaka 的 animeSrc / MV 组合标记）> 已记录的订阅类型提示
-      // > 来源 URL。内容判为 Baka 时不被 musicfree 提示压回（见下）；
-      // 内容判不中时用提示——它来自订阅结构判定或插件信息弹窗的手动改类，
-      // 是明确意图；URL 仅作提示缺失时的兜底。
-      //
-      // URL 不能优先：同 ID 插件被另一族的插件覆盖时来源 URL 会从旧插件
-      // 继承（本地导入不写 http 来源，旧的 Baka 订阅 URL 会留存），此时
-      // Baka URL 会把新装的 MusicFree 插件错误顶到 BakaMusic 分栏，手动
-      // 改类也会被它反复覆盖、看似无效。
-      // 手动归入「其他」是明确的用户意图，优先于自动识别（含 LX/animemusic），
-      // 只影响分栏展示，不改播放契约。
-      if (kinds[id] == pluginKindOther) {
-        kind = _PluginKind.other;
-      } else if (kind == _PluginKind.musicfree || kind == _PluginKind.baka) {
-        final kindHint = kinds[id];
-        if (kindHint == pluginKindBaka) {
-          kind = _PluginKind.baka;
-        } else if (kindHint == pluginKindMusicFree) {
-          // 内容已判定为 Baka 契约（animeSrc / getMvSource+supportedVideo
-          // Qualities）时不采纳 musicfree 提示：该提示多半只是「导入时所在
-          // 分栏」，而插件本身是 Baka 契约（QQ音乐[L1]/[L2] 单文件导入即如此）。
-          if (kind != _PluginKind.baka) kind = _PluginKind.musicfree;
-        } else if (PluginMetadata.isBakaSourceUrl(sourceUrls[id] ?? '')) {
-          kind = _PluginKind.baka;
-        }
-      }
-      items.add(
-        _PluginInfo(
-          id: id,
-          name: displayNames[id] ?? metadata.name ?? id,
-          version: metadata.version ?? '未知版本',
-          author: metadata.author,
-          remark: metadata.remark,
-          path: file.path,
-          enabled: enabled.contains(id),
-          sourceUrl: sourceUrls[id],
-          sourceLabel: sourceLabels[id],
-          userVariables: metadata.userVariables,
-          isStarSea: metadata.isStarSea,
-          kind: kind,
-        ),
-      );
-    }
-    // 拖拽保存的顺序优先；未记录过的插件（新安装）按文件名顺序追加在后。
     final orderedIds = prefs.getStringList(pluginOrderKey) ?? const [];
-    if (orderedIds.isNotEmpty) {
-      final byId = {for (final item in items) item.id: item};
-      final ordered = <_PluginInfo>[
-        for (final id in orderedIds)
-          if (byId.containsKey(id)) byId.remove(id)!,
-      ];
-      ordered.addAll(items.where((item) => byId.containsKey(item.id)));
-      return ordered;
-    }
-    return items;
+    // 列目录 → 读脚本 → 元数据正则解析 → 分类判定 → 排序整体放到后台
+    // isolate 并带「文件名+size+mtime」持久化缓存（见 plugin_meta_loader）：
+    // 几十个插件时主线程逐个 readAsString + PluginMetadata.parse 会卡出
+    // 数秒白屏转圈（脚本可达数百 KB，解析是纯 CPU）；缓存命中后进页面
+    // 毫秒级，只有安装/更新过的文件才重新解析一次。
+    final rows = await loadPluginRowsInBackground(
+      pluginsDir: directory.path,
+      enabled: enabled,
+      sourceUrls: sourceUrls,
+      displayNames: displayNames,
+      sourceLabels: sourceLabels,
+      kinds: kinds,
+      orderedIds: orderedIds,
+    );
+    return [
+      for (final row in rows)
+        _PluginInfo(
+          id: row['id'] as String,
+          name: row['name'] as String,
+          version: row['version'] as String,
+          author: row['author'] as String?,
+          remark: row['remark'] as String?,
+          path: row['path'] as String,
+          enabled: row['enabled'] as bool,
+          sourceUrl: row['sourceUrl'] as String?,
+          sourceLabel: row['sourceLabel'] as String?,
+          userVariables: [
+            for (final raw in (row['userVariables'] as List? ?? const []))
+              if (raw is Map)
+                PluginUserVariable(
+                  key: raw['key']?.toString() ?? '',
+                  name: raw['name']?.toString(),
+                  hint: raw['hint']?.toString(),
+                ),
+          ],
+          isStarSea: row['isStarSea'] == true,
+          kind: _kindFromKey(row['kind'] as String),
+        ),
+    ];
   }
+
+  /// 分类标识字符串 → 枚举（后台 loader 返回 plain map 用的桥接）。
+  static _PluginKind _kindFromKey(String key) => switch (key) {
+    'baka' => _PluginKind.baka,
+    'lx' => _PluginKind.lx,
+    'animemusic' => _PluginKind.animemusic,
+    'other' => _PluginKind.other,
+    _ => _PluginKind.musicfree,
+  };
 
   static Map<String, String> _readSourceUrls(SharedPreferences prefs) {
     try {

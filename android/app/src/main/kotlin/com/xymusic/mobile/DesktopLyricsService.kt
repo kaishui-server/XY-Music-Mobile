@@ -79,7 +79,7 @@ class DesktopLyricsService : Service() {
          * 无任何触摸交互，解锁只能走通知栏或设置页开关。 */
         const val ACTION_UNLOCK = "com.xymusic.mobile.desktop_lyrics.UNLOCK"
 
-        private const val NOTIFY_CHANNEL = "desktop_lyrics_control"
+        private const val NOTIFY_CHANNEL = "desktop_lyrics_control_v2"
         private const val NOTIFY_ID = 0x5101
 
         /** 与 Dart 侧 LyricWordEffectMode 枚举序号保持一致。 */
@@ -218,6 +218,13 @@ class DesktopLyricsService : Service() {
      * 可点、拖拽可用）。 */
     private var proxyView: View? = null
     private var proxyParams: WindowManager.LayoutParams? = null
+
+    /** 代理窗是否已挂到 WindowManager：隐藏时直接 removeView 摘除整窗，
+     * 而不是 View.GONE——GONE 只影响绘制/布局，窗口层仍留在 WMS，一加
+     * /ColorOS 等 ROM 下可能不收缩窗口，残留拦截歌词矩形区域下层应用
+     * 的点击（「锁定后偶尔点不到歌词后面的应用」根因）。摘除整窗后
+     * 该区域触摸必然穿透。 */
+    private var proxyAttached = false
     private var proxyLastTapTime = 0L
     private var proxyLastTapX = 0f
     private var proxyLastTapY = 0f
@@ -762,22 +769,35 @@ class DesktopLyricsService : Service() {
         }
     }
 
-    /// 发布/刷新控制通知（IMPORTANCE_LOW 静默常驻）：文本与单击行为随
-    /// 锁定态切换——锁定=「单击解锁桌面歌词」（发 ACTION_UNLOCK 广播）；
-    /// 解锁=「单击进入软件」（打开 App），不再残留解锁提示。
+    /// 发布/刷新控制通知：文本与单击行为随锁定态切换——锁定=
+    /// 「单击解锁桌面歌词」（发 ACTION_UNLOCK 广播）；解锁后即销毁
+    /// （重新锁定时再发布）。
     private fun refreshNotify() {
         try {
             val nm = getSystemService(NotificationManager::class.java)
             if (nm == null) return
-            if (Build.VERSION.SDK_INT >= 26 &&
-                nm.getNotificationChannel(NOTIFY_CHANNEL) == null
-            ) {
-                nm.createNotificationChannel(
-                    NotificationChannel(
-                        NOTIFY_CHANNEL, "桌面歌词",
-                        NotificationManager.IMPORTANCE_LOW,
-                    ),
-                )
+            // 通道 v2：旧通道以 IMPORTANCE_LOW 创建，一加/ColorOS 等 ROM
+            // 会把静默档通知折叠进「静默通知」分组，用户在通知栏看不到
+            // 「单击解锁」入口（通道重要性创建后不可更改，只能换 ID
+            // 重建）。新通道用 DEFAULT 重要性保证正常显示，显式置空
+            // 声音/振动避免打扰；旧通道删除清理。
+            if (Build.VERSION.SDK_INT >= 26) {
+                try {
+                    nm.deleteNotificationChannel("desktop_lyrics_control")
+                } catch (_: Exception) {
+                    // 旧通道不存在时忽略。
+                }
+                if (nm.getNotificationChannel(NOTIFY_CHANNEL) == null) {
+                    nm.createNotificationChannel(
+                        NotificationChannel(
+                            NOTIFY_CHANNEL, "桌面歌词",
+                            NotificationManager.IMPORTANCE_DEFAULT,
+                        ).apply {
+                            setSound(null, null)
+                            enableVibration(false)
+                        },
+                    )
+                }
             }
             // 控制通知仅在锁定态存在（解锁后即销毁，重新锁定时再发布）；
             // 解锁入口只对锁定态有意义。
@@ -810,6 +830,8 @@ class DesktopLyricsService : Service() {
                 .setContentIntent(contentIntent)
                 .setOngoing(true)
                 .setShowWhen(false)
+                .setOnlyAlertOnce(true)
+                .setCategory(Notification.CATEGORY_SERVICE)
                 .build()
             nm.notify(NOTIFY_ID, notification)
             notifyShown = true
@@ -1026,18 +1048,21 @@ class DesktopLyricsService : Service() {
         proxyParams = params
         try {
             windowManager?.addView(view, params)
+            proxyAttached = true
             syncProxyPanel()
         } catch (_: Exception) {
             // 系统回收时放弃代理窗（主窗回退为始终可触摸的旧交互）。
             proxyView = null
             proxyParams = null
+            proxyAttached = false
         }
     }
 
     /// 同步触摸代理窗：位置/尺寸=主窗内容矩形的屏幕矩形；锁定态、控制栏
-    /// 显示期间或暂停隐藏整窗时代理窗 GONE（锁定整窗穿透，无触摸交互；
-    /// 栏显示时主窗可触摸承载交互，避免隐形拦截）。未锁定栏隐藏时代理窗
-    /// 承载双击/长按唤栏与拖拽。
+    /// 显示期间或暂停隐藏整窗时代理窗**整窗摘除**（锁定整窗穿透，无触摸
+    /// 交互；栏显示时主窗可触摸承载交互，避免隐形拦截——GONE 挂残留窗口
+    /// 在部分 ROM 会拦截下层点击，见 proxyAttached 注释）。未锁定栏隐藏
+    /// 时代理窗承载双击/长按唤栏与拖拽。
     private fun syncProxyPanel() {
         // 拖拽期间跳过：拖拽路径自身按手指增量同步主窗与代理窗；此时
         // updateViewLayout 与内容布局回调异步交错，按内容矩形重算会把
@@ -1071,20 +1096,31 @@ class DesktopLyricsService : Service() {
                 view.visibility = View.VISIBLE
                 changed = true
             }
-            if (changed) {
+            if (!proxyAttached) {
+                // 上一轮被摘除（锁定/唤栏/暂停隐藏后重新需要）：重新挂载。
+                try {
+                    windowManager?.addView(view, pr)
+                    proxyAttached = true
+                } catch (_: Exception) {
+                    // 系统回收时放弃本帧挂载，下一轮同步重试。
+                }
+            } else if (changed) {
                 try {
                     windowManager?.updateViewLayout(view, pr)
                 } catch (_: Exception) {
                     // 代理窗已被系统回收时忽略。
                 }
             }
-        } else if (view.visibility != View.GONE) {
-            view.visibility = View.GONE
+        } else if (proxyAttached) {
+            // 锁定/控制栏显示/内容隐藏：整窗摘除，歌词矩形区域的触摸
+            // 必然直达下层应用（GONE 不足以保证穿透）。
             try {
-                windowManager?.updateViewLayout(view, pr)
+                windowManager?.removeView(view)
             } catch (_: Exception) {
-                // 代理窗已被系统回收时忽略。
+                // 窗口已被系统回收。
             }
+            proxyAttached = false
+            view.visibility = View.GONE
         }
     }
 
@@ -1157,6 +1193,11 @@ class DesktopLyricsService : Service() {
                 resetControlBarAutoHide()
             }
             applyLockedState()
+            // 锁定状态由 Dart 侧（设置页/面板开关）写回时同步发布/销毁
+            // 控制通知：此前该分支只 applyLockedState 未 refreshNotify，
+            // 设置页锁定的场景下通知栏不会出现「单击解锁」入口（用户实测
+            // 一加 Ace5 锁定后通知栏无解锁入口的根因）。
+            refreshNotify()
         }
 
         // 播放/暂停键图标动态切换：播放中显示 ⏸（点按暂停），暂停显示 ▶。
@@ -1614,6 +1655,7 @@ class DesktopLyricsService : Service() {
                 // 代理窗已被系统回收。
             }
         }
+        proxyAttached = false
         cancelNotify()
         unlockReceiver?.let { receiver ->
             try {

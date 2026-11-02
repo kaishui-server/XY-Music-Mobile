@@ -520,6 +520,10 @@ int sleepTimerRemainingSeconds(DateTime? endsAt, {DateTime? now}) {
 class PlaybackState {
   final QueueItem? current;
   final List<QueueItem> queue;
+  /// 原始歌单顺序（歌曲 path 列表）：随机模式洗牌前的快照，用于从
+  /// 随机切回列表/单曲时按原顺序重建队列。未开随机时与 queue 顺序一致。
+  /// 仅存 path 而不存完整 QueueItem，避免与队列元数据重复膨胀。
+  final List<String> queueOriginal;
   final int queueIndex;
   final bool isPlaying;
   final double position;
@@ -533,6 +537,7 @@ class PlaybackState {
   const PlaybackState({
     this.current,
     this.queue = const [],
+    this.queueOriginal = const [],
     this.queueIndex = -1,
     this.isPlaying = false,
     this.position = 0,
@@ -548,6 +553,7 @@ class PlaybackState {
   PlaybackState copyWith({
     QueueItem? current,
     List<QueueItem>? queue,
+    List<String>? queueOriginal,
     int? queueIndex,
     bool? isPlaying,
     double? position,
@@ -562,6 +568,7 @@ class PlaybackState {
     return PlaybackState(
       current: current ?? this.current,
       queue: queue ?? this.queue,
+      queueOriginal: queueOriginal ?? this.queueOriginal,
       queueIndex: queueIndex ?? this.queueIndex,
       isPlaying: isPlaying ?? this.isPlaying,
       position: position ?? this.position,
@@ -603,6 +610,11 @@ LoopMode audioLoopModeForPlayMode(int playMode) =>
 ///   由应用自己的播放队列决定切歌行为。
 class _MediaSessionBridge extends audio_service.CompositeAudioHandler {
   _MediaSessionBridge(super.inner) : _innerRef = inner;
+
+  /// 宿主注入的封面完整解析器（HTTPS 升级 + 图床防盗链 headers + 本地
+  /// 歌曲内嵌封面缩略图）。[syncMediaItem] 优先用它构造媒体项，未注入
+  /// 或解析抛错时回退 [_toMediaItem] 的简化转换。
+  Future<audio_service.MediaItem> Function(QueueItem)? mediaItemResolver;
 
   /// 被包装的 handler（CompositeAudioHandler 不公开 inner 访问器）。
   final audio_service.AudioHandler _innerRef;
@@ -729,9 +741,26 @@ class _MediaSessionBridge extends audio_service.CompositeAudioHandler {
 
   /// 单曲增量同步：把当前曲目推给媒体会话（标题/艺术家/封面/时长），
   /// 供通知栏与锁屏即时刷新；不触发整表队列重建。
-  void syncMediaItem(QueueItem item) {
+  ///
+  /// 封面复用 [_systemMediaItem] 的完整解析（HTTPS 升级、网易云/酷狗/
+  /// QQ/B站图床防盗链 headers、本地歌曲内嵌封面缩略图 file URI）。原
+  /// 实现用裸 coverUrl 构造 artUri 且不带 artHeaders，图床 Referer
+  /// 校验或明文 URL 会让 flutter_cache_manager 下载失败，媒体卡片
+  /// （ColorOS/鸿蒙播控）永远显示占位音符。异步解析完成前先推无封面
+  /// 元数据（audio_service 的 _observeMediaItem 行为），标题/歌手仍
+  /// 即时上屏。
+  Future<void> syncMediaItem(QueueItem item) async {
     if (_currentMediaItem.isClosed) return;
-    _currentMediaItem.add(_toMediaItem(item));
+    audio_service.MediaItem mediaItem;
+    try {
+      mediaItem = await (mediaItemResolver?.call(item) ??
+          Future.value(_toMediaItem(item)));
+    } catch (_) {
+      if (_currentMediaItem.isClosed) return;
+      mediaItem = _toMediaItem(item);
+    }
+    if (_currentMediaItem.isClosed) return;
+    _currentMediaItem.add(mediaItem);
   }
 
   /// 上次同步过的应用队列引用（identical 检测，避免每次状态广播
@@ -1207,6 +1236,7 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
       if (!handler.xyInnerPlayerReady) return;
       _mediaSessionBridge?.detach();
       final bridge = _MediaSessionBridge(current)
+        ..mediaItemResolver = _systemMediaItem
         ..onSkipToNext = next
         ..onSkipToPrevious = previous
         ..queueSource = () {
@@ -1964,7 +1994,12 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
       if (last >= 0) {
         final advanced = pos - last;
         final nearEnd = state.duration > 0 && pos >= state.duration - 2.0;
-        if (advanced < 2.0 && !nearEnd) {
+        // 进度倒退（advanced<0）是切歌/单曲循环回绕/拖动进度条的合法
+        // 表现：20s 心跳窗口跨过切歌点时，position 会从旧曲尾部直接跳回
+        // 新曲开头（日志实测 -177s~-251s）。把它误判成「停滞」会在切歌
+        // 瞬间重建播放器，与切歌流程竞争造成突然停播无声。倒退只重置
+        // 基准，真实停滞（advanced≈0）交给下一周期判定。
+        if (advanced >= 0 && advanced < 2.0 && !nearEnd) {
           _heartbeatLastPos = -1;
           unawaited(
             _rebuildPlayer(
@@ -2213,6 +2248,14 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
   // 脏回跳过滤的解卡状态：连续被过滤事件的上一值与计数。
   int _staleStreakPrevMs = -1;
   int _staleStreakCount = 0;
+
+  /// 引擎推算失效诊断：上一次 position 流事件位置（ms）。播放态下连续
+  /// 事件增量异常大（正常 200ms 档前进 ~0.2s；>1.2s 且 <10s 且非 seek）
+  /// 说明 just_audio 的 position getter 走了「playing/processingState
+  /// 异常」分支、退回原生最后上报值（updatePosition），进度条退化为一跳
+  /// 一跳。此检测只打日志辅助定位，不自动修复（seek/循环/脏回跳已有
+  /// 各自豁免，避免误伤）。
+  int _lastTickPosMs = -1;
   // 听歌统计按会话增量刷写，避免定时刷写把累计 position 重复计算。
   String? _statsSessionPath;
   int _statsRecordedPositionMs = 0;
@@ -2231,6 +2274,13 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
   /// 当前曲的重缓冲次数与本次进入时间（null 表示当前不在缓冲中）。
   int _rebufferCount = 0;
   DateTime? _rebufferEnteredAt;
+
+  // ---- 流断自动恢复 ----
+  /// 播放中流被上游掐断（音源 URL 时效过期/CDN 断流）后的自动重解析
+  /// 恢复：连续恢复计数（正常起播 ready 后清零）与重缓冲卡死看门狗。
+  int _streamRecoverCount = 0;
+  Timer? _bufferingWatchdog;
+  StreamSubscription<PlayerException>? _errorSub;
 
   Future<void> _init() async {
     final allowOtherAudio =
@@ -2256,20 +2306,27 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
     await _restoreSession();
   }
 
-  /// position 采样周期随前后台自适应（内存卡顿修复放宽后）：
+  /// position 采样周期随界面可见性自适应（内存卡顿修复放宽后）：
   /// - 前台逐字歌词需要比默认 200ms 更细的进度采样，但 40ms 会让全局播放
   ///   状态在手机上以 25fps 重建，首页、底栏和歌词页会同时承受不必要的
   ///   开销；200~250ms 已足够逐词/渐进效果使用，能明显降低主 isolate 的
   ///   重建频率与逐字 saveLayer 重绘负担（长期播放时内存与 CPU 双降）。
-  /// - 退到后台后界面不再刷新，高频广播只会持续唤醒渲染引擎（后台 CPU
-  ///   高占用的主因）。无桌面歌词时放宽到 2~3s，仅够进度持久化/睡眠
+  /// - 仅「确定不可见」（AppLifecycleState.hidden：切走全屏 App / 锁屏 /
+  ///   onStop）才降频：界面不再刷新，高频广播只会持续唤醒渲染引擎（后台
+  ///   CPU 高占用的主因）。无桌面歌词时放宽到 2~3s，仅够进度持久化/睡眠
   ///   定时器使用；开启桌面歌词才保留 250~300ms（原生浮窗需平滑驱动，
   ///   且歌词内容本身已做增量推送，低频位置校正不会拖累主 isolate）。
+  /// - paused/inactive 不降频：其他应用悬浮窗/分屏/小窗抢焦点时宿主
+  ///   Activity 会 paused，但播放页仍可见，若此时退到 2s 后台档进度条
+  ///   会 2 秒一跳（一加 Ace5 ColorOS 实测）。Trae CN 旧修复（7a28eb3
+  ///   position 流降频）只按 resumed 判前后台，未覆盖此场景。
   ({Duration min, Duration max}) _positionStreamPeriods() {
     final lifecycle = WidgetsBinding.instance.lifecycleState;
-    final inForeground =
-        lifecycle == null || lifecycle == AppLifecycleState.resumed;
-    if (inForeground) {
+    // 降频只看 hidden：paused/inactive（悬浮窗抢焦点但界面仍可见）必须
+    // 保持前台采样档，否则播放页进度条退化为 2 秒一跳。lifecycle 为
+    // null（启动早期）视为可见，与旧逻辑一致。
+    final definitelyHidden = lifecycle == AppLifecycleState.hidden;
+    if (!definitelyHidden) {
       return (
         min: const Duration(milliseconds: 200),
         max: const Duration(milliseconds: 250),
@@ -2289,9 +2346,61 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
     );
   }
 
+  /// 上一次 position 流事件到达时间（前台 2s 采样档滞留自愈用）。
+  DateTime? _lastPositionEventAt;
+
+  /// 自愈重挂连击数：若重挂后的流仍是 2s 档（异常持续），连击达 3 次
+  /// 后停止自愈，避免无限重挂循环；正常节奏（间隔 <1.5s）会重置连击。
+  int _posSubHealStreak = 0;
+
+  /// 上一次 position 流事件到达时是否处于播放态（排除暂停间隙的间隔）。
+  bool _lastPositionEventWasPlaying = false;
+
+  /// 前台进度兜底泵：每 250ms 直接读引擎推算进度，发现 UI 落后 >=0.35s
+  /// 就地校正。position 流（200ms 前台 / 2s 后台采样档）无论因何种路径
+  /// 在界面可见时丢更新（后台档滞留、悬浮窗 paused 判定、事件降频、
+  /// 重挂间隙），泵都能保证播放页进度条平滑走动；流健康时泵静默空转。
+  /// 只推前进方向（引擎推算基准被污染的回跳交给流监听里的回跳过滤
+  /// 处理，泵不参与以免放大脏数据）。
+  ///
+  /// 泵频率与阈值按「应用内长时间无触摸 / 悬浮窗抢焦点」实测收紧：
+  /// 200ms 采样档若因引擎推算周期性失效（playing/processingState 抖动
+  /// 时 position getter 退回原生最后上报值，进度随原生事件频率一跳一跳）
+  /// 而丢失平滑性，500ms/0.9s 的旧泵只能在落后半秒以上才介入，观感上
+  /// 仍会出现 2 秒一跳；250ms/0.35s 保证流失效后至多 250ms 即被引擎
+  /// 平滑推算值校正，进度条不出现可感知跳档。
+  Timer? _positionFallbackTimer;
+
+  /// 启动前台进度兜底泵（起播/回前台时调用，泵自身按播放态空转）。
+  void _startPositionFallbackPump() {
+    _positionFallbackTimer?.cancel();
+    _positionFallbackTimer = Timer.periodic(
+      const Duration(milliseconds: 250),
+      (_) {
+        if (!state.isPlaying) return;
+        final lifecycle = WidgetsBinding.instance.lifecycleState;
+        // 兜底泵只服务「UI 仍可能可见」的窗口：确定不可见（hidden）才
+        // 空转。paused/inactive 悬浮窗场景仍须校正——若此处按 resumed
+        // 判定，position 流滞留 2s 后台档时播放页进度条依旧 2 秒一跳。
+        if (lifecycle == AppLifecycleState.hidden) return;
+        if (_videoMediaBridgeActive &&
+            VideoPlaybackSession.isFor(state.current?.path)) {
+          return;
+        }
+        final enginePos = _player.position.inMilliseconds / 1000.0;
+        if (enginePos > state.position + 0.35) {
+          state = state.copyWith(position: enginePos);
+        }
+      },
+    );
+  }
+
   /// 单独挂接 position 流：前后台切换时仅重挂这一条订阅（见
   /// [_handleAppLifecycleChanged]），duration/playerState 订阅不受影响。
   void _attachPositionStream() {
+    // 新流建立，重置事件间隔基准，避免把旧流的间隔带入自愈判定。
+    _lastPositionEventAt = null;
+    _lastPositionEventWasPlaying = false;
     final periods = _positionStreamPeriods();
     _posSub = _player
         .createPositionStream(
@@ -2300,6 +2409,43 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
           maxPeriod: periods.max,
         )
         .listen((p) {
+          // 2s 采样档滞留自愈：后台降频档（min 2s）的流若在界面仍可见
+          // 时滞留（悬浮窗抢焦点触发 paused、个别机型 lifecycle 事件
+          // 丢失或迟到、App 与其他应用同时开始悬浮窗的竞态等），表现为
+          // 播放中事件间隔稳定 ≈2s（进度条 2 秒 2 秒地跳，音频不受影响）。
+          // 检测到该特征立即重挂为当前可见性对应档位，进度条恢复平滑。
+          final now = DateTime.now();
+          final lastEventAt = _lastPositionEventAt;
+          final wasPlaying = _lastPositionEventWasPlaying;
+          _lastPositionEventAt = now;
+          _lastPositionEventWasPlaying = state.isPlaying;
+          // 仅当前后两个事件都处于播放态才参与自愈判定：暂停几秒再
+          // 恢复的间隔（1.5~5s）是正常现象，不能当成 2s 档滞留。
+          if (wasPlaying && state.isPlaying && lastEventAt != null) {
+            final gap = now.difference(lastEventAt);
+            final lifecycle = WidgetsBinding.instance.lifecycleState;
+            // 自愈不看 resumed：ColorOS 悬浮窗场景宿主 App 会长时间停在
+            // paused（界面仍可见），按 resumed 判定永远不会触发重挂，
+            // 2s 后台档会一直滞留。仅确定不可见（hidden）才允许滞留。
+            final uiMayBeVisible = lifecycle != AppLifecycleState.hidden;
+            if (gap < const Duration(milliseconds: 1500)) {
+              // 正常节奏，重置自愈连击。
+              _posSubHealStreak = 0;
+            } else if (uiMayBeVisible &&
+                gap <= const Duration(seconds: 5) &&
+                _posSubHealStreak < 3) {
+              _posSubHealStreak++;
+              debugPrint(
+                '[播放链路] 前台检测到 2s 采样档滞留'
+                '（事件间隔 ${gap.inMilliseconds}ms，'
+                '连击 $_posSubHealStreak/3），重挂 position 流',
+              );
+              _posSub?.cancel();
+              _posSub = null;
+              _attachPositionStream();
+              return;
+            }
+          }
           // B 站视频播放时，just_audio 只是供系统媒体会话使用的静音时钟。
           // 它与视频解码时钟存在微小偏差，不能再反向更新歌词位置，否则在
           // 句子边界会在上一句和下一句之间反复横跳。
@@ -2308,6 +2454,23 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
             return;
           }
           final positionMs = p.inMilliseconds;
+          // 引擎推算失效诊断（见 _lastTickPosMs 注释）：播放态下事件
+          // 增量异常大（非 seek/循环/回跳）时提示原生只按事件频率上报。
+          if (state.isPlaying) {
+            final prevTick = _lastTickPosMs;
+            _lastTickPosMs = positionMs;
+            final deltaMs = positionMs - prevTick;
+            if (prevTick >= 0 && deltaMs > 1200 && deltaMs < 10000) {
+              debugPrint(
+                '[播放链路] position 事件增量异常 ${deltaMs}ms'
+                '（${prevTick}ms → $positionMs，引擎推算疑似失效，'
+                '进度随原生事件频率一跳），若伴随 2 秒一跳请抓取'
+                ' processingState/playing 变化日志',
+              );
+            }
+          } else {
+            _lastTickPosMs = -1;
+          }
           // 大幅回跳过滤（纯过滤，不做 seek 修复——旧方案的修复 seek 会
           // 重写原生基准引发新问题，已移除）：
           // - 单曲循环的自然回绕（上次可信进度已逼近末尾、新进度回到
@@ -2377,6 +2540,16 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
       if (dur <= 0 && state.duration > 0) return;
       state = state.copyWith(duration: dur);
     });
+    // 播放器错误（ExoPlayer Source error/网络流中断）自动重解析恢复。
+    // 不恢复的表现：卡在暂停态，用户点播放只是 play() 复用旧源——
+    // 音源 URL 已失效时进度与声音都不会恢复（单曲循环第二遍音源
+    // URL 过期后流断的典型场景）。
+    _errorSub = _player.errorStream.listen((error) {
+      if (_manualPause) return;
+      _recoverFromStalledStream(
+        '播放器错误 code=${error.code} ${error.message}',
+      );
+    });
     _stateSub = _player.playerStateStream.listen((ps) {
       final playing = ps.playing;
       final completed = ps.processingState == ProcessingState.completed;
@@ -2391,6 +2564,10 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
           !state.isLoading) {
         _rebufferCount++;
         _rebufferEnteredAt = DateTime.now();
+        // 卡死看门狗：重缓冲持续 30s 无任何状态跃迁即视为流已断
+        // （上游掐流后 ExoPlayer 可能不上报 error，只无限 buffering），
+        // 强制重新解析当前曲。
+        _armBufferingWatchdog();
         // 防刷屏：每首歌前 6 次逐条记录，之后每 6 次留一条汇总线索。
         if (_rebufferCount <= 6 || _rebufferCount % 6 == 0) {
           final posMs = _player.position.inMilliseconds;
@@ -2403,6 +2580,7 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
         }
       } else if (_rebufferEnteredAt != null &&
           ps.processingState != ProcessingState.buffering) {
+        _cancelBufferingWatchdog();
         final tookMs =
             DateTime.now().difference(_rebufferEnteredAt!).inMilliseconds;
         _rebufferEnteredAt = null;
@@ -2424,6 +2602,7 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
         _pendingDspTakeover = null;
         _dspDeferredTakeoverTimer?.cancel();
         _dspDeferredTakeoverTimer = null;
+        _cancelBufferingWatchdog();
         // 重缓冲计数随新歌清零：防刷屏的「前 6 次逐条」窗口对新歌重新生效。
         _rebufferCount = 0;
         _rebufferEnteredAt = null;
@@ -2432,6 +2611,7 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
         // 首次 ready 且已起播：此时 ExoPlayer 已拿到最小缓冲，可以安全
         // 启动 Rust 管线（见 [_scheduleDeferredDspTakeover]）。
         if (playing && ps.processingState == ProcessingState.ready) {
+          _streamRecoverCount = 0;
           _scheduleDeferredDspTakeover();
         }
         unawaited(_syncDspPipelinePlaying(playing));
@@ -2501,12 +2681,14 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
       _consumePendingDesktopLyricsSettings();
     }
     // 前后台切换时重挂 position 流，按当前生命周期选择采样周期
-    // （后台降频，降低后台 CPU 占用）；尚未挂接时忽略。
-    if (_posSub != null) {
-      _posSub?.cancel();
-      _posSub = null;
-      _attachPositionStream();
-    }
+    // （后台降频，降低后台 CPU 占用）。无条件重挂：若此前因播放器
+    // 重建等原因流未挂上（_posSub == null），旧逻辑回前台不会补挂。
+    _posSub?.cancel();
+    _posSub = null;
+    _attachPositionStream();
+    // 回前台重跑兜底泵：覆盖「后台起播（泵被 lifecycle 判定挡住）→
+    // 回前台」路径，泵在回前台后的第一个 500ms tick 即恢复校正能力。
+    _startPositionFallbackPump();
     _guardVideoSessionOnLifecycle(state);
     // 前后台切换立即重判定桌面歌词显隐：hideInApp 开启时，回前台瞬间
     // 若还保留着后台态推的 enabled:true，浮窗会继续悬浮在 App 内直到
@@ -3335,6 +3517,8 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
       final startIndex = currentPath == null ? 0 : paths.indexOf(currentPath);
       final idx = startIndex < 0 ? 0 : startIndex;
       final mode = normalizePlayMode((j['playMode'] as num?)?.toInt() ?? 0);
+      final originalPaths = (j['queueOriginalPaths'] as List? ?? const [])
+          .cast<String>();
       final pos = (j['currentPositionSecs'] as num?)?.toDouble() ?? 0;
       final restoredQuality =
           j['sessionQualityOverride']?.toString().trim().isNotEmpty == true
@@ -3346,6 +3530,10 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
       // 数秒甚至超时，阻塞在 loading 态会让用户以为起播卡死。
       state = state.copyWith(
         queue: items,
+        // 恢复原始顺序快照：随机模式下洗牌会丢失原序，切回列表时需
+        // 此快照还原；旧会话没有该字段时置空，切出随机走兜底分支。
+        queueOriginal:
+            originalPaths.isNotEmpty ? List<String>.of(originalPaths) : const [],
         queueIndex: idx,
         current: items[idx],
         playMode: mode,
@@ -3455,6 +3643,9 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
   }) async {
     if (items.isEmpty) return;
     var queue = List<QueueItem>.of(items);
+    // 记录本次入队的歌单原始顺序：随机模式下洗牌后会丢失原序，此快照
+    // 供切回列表/单曲时还原；未开随机时与 queue 顺序保持一致。
+    final original = items.map((q) => q.path).toList();
     var effectiveStartIndex = startIndex.clamp(0, queue.length - 1).toInt();
     if (normalizePlayMode(state.playMode) == 2) {
       if (randomizeStart) {
@@ -3467,7 +3658,7 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
         effectiveStartIndex = 0;
       }
     }
-    state = state.copyWith(queue: queue);
+    state = state.copyWith(queue: queue, queueOriginal: original);
     await _playAt(effectiveStartIndex);
   }
 
@@ -3486,14 +3677,26 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
     final queue = [...state.queue];
     final insertAt = state.queueIndex < 0 ? queue.length : state.queueIndex + 1;
     queue.insert(insertAt.clamp(0, queue.length).toInt(), item);
-    state = state.copyWith(queue: queue);
+    // 原始顺序同步插入：随机模式下切回列表时新增歌曲仍需保留。
+    // 以当前曲在原始顺序中的位置定位，避免随机序与原始序下标错位。
+    final original = [...state.queueOriginal];
+    final currentPath = state.current?.path;
+    final currentOrigIndex = currentPath == null
+        ? -1
+        : original.indexOf(currentPath);
+    final origInsertAt = currentOrigIndex < 0
+        ? original.length
+        : currentOrigIndex + 1;
+    original.insert(origInsertAt.clamp(0, original.length).toInt(), item.path);
+    state = state.copyWith(queue: queue, queueOriginal: original);
     await _persistSession();
   }
 
   /// 将歌曲追加到播放队列末尾。
   Future<void> addToQueue(QueueItem item) async {
     final queue = [...state.queue, item];
-    state = state.copyWith(queue: queue);
+    final original = [...state.queueOriginal, item.path];
+    state = state.copyWith(queue: queue, queueOriginal: original);
     await _persistSession();
   }
 
@@ -3544,7 +3747,17 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
         currentIndex += 1;
       }
     }
-    state = state.copyWith(queue: queue, queueIndex: currentIndex);
+    // 原始顺序同步移动，保证切回列表后手动排序结果仍然保留。
+    final original = [...state.queueOriginal];
+    if (oldIndex < original.length) {
+      final origItem = original.removeAt(oldIndex);
+      original.insert(target.clamp(0, original.length).toInt(), origItem);
+    }
+    state = state.copyWith(
+      queue: queue,
+      queueIndex: currentIndex,
+      queueOriginal: original,
+    );
     await _persistSession();
   }
 
@@ -3565,10 +3778,14 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
     } else if (index < currentIndex) {
       currentIndex -= 1;
     }
+    // 原始顺序同步移除，保持快照与队列长度一致。
+    final original = [...state.queueOriginal];
+    if (index < original.length) original.removeAt(index);
     state = state.copyWith(
       queue: queue,
       queueIndex: currentIndex,
       current: wasCurrent ? queue[currentIndex] : state.current,
+      queueOriginal: original,
     );
     await _persistSession();
     if (wasCurrent) await _playAt(currentIndex);
@@ -3576,7 +3793,11 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
 
   /// [startPositionSecs] 非空时从指定进度继续播放（恢复会话后重试起播用）；
   /// 为空表示从头播放，普通切歌/点播行为不变。
-  Future<void> _playAt(int index, {double? startPositionSecs}) async {
+  Future<void> _playAt(
+    int index, {
+    double? startPositionSecs,
+    String? qualityOverride,
+  }) async {
     if (index < 0 || index >= state.queue.length) return;
     _installMediaSessionBridge();
     // 重新点播歌曲（包括正在以视频形式播放的 B 站歌曲）时，先结束
@@ -3596,7 +3817,11 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
       final queue = [...state.queue];
       queue[index] = associated.item;
       item = associated.item;
-      state = state.copyWith(queue: queue);
+      // 换源后歌曲 path 可能变化：同步原始顺序快照中的路径，避免切回
+      // 列表重建队列时该曲因路径失配被追加到末尾。
+      final original = [...state.queueOriginal];
+      if (index < original.length) original[index] = associated.item.path;
+      state = state.copyWith(queue: queue, queueOriginal: original);
     }
     // 音源失败自动回退产生的关联（autoLocal）不在此替换：先按原音源
     // 正常起播，原音源已恢复时自然走回音源；仍失败则由失败处理链
@@ -3649,6 +3874,9 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
       final plugin = await _prepareAudioSource(
         item,
         queueIndex: index,
+        // 本曲音质覆盖（手动切音质/播放失败降档重试）：仅对当前歌曲
+        // 生效，不写回设置里的默认音质——每次切歌都按默认音质重新解析。
+        preferredQualityOverride: qualityOverride,
         requestId: requestId,
       );
       if (requestId != _playRequestId) return;
@@ -3727,10 +3955,12 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
   /// 系统的省电策略可能拖慢网络线程；播放期间的空闲预取让切歌时
   /// 直接命中缓存，仅需 setUrl 连接 CDN。
   Future<void> _prefetchNextSource() async {
-    // 内存治理 ⑩：后台停止预加载（回前台/切歌时再走预解析）。
-    if (WidgetsBinding.instance.lifecycleState != AppLifecycleState.resumed) {
-      return;
-    }
+    // 治无声卡死：回退内存治理 ⑩ 的「后台停止预加载」极端逻辑。后台
+    // 切歌（列表/单曲循环自动下一首）若无预取，需临时走完整解析链，
+    // 而 HyperOS 等系统的省电策略会显著拖慢后台网络线程，表现为切歌
+    // 后长时间无声转圈。预取仅解析下一首音源 URL 写入运行时短时缓存
+    // （不下载音频、不解码封面），内存/流量开销极小，改为前后台常开；
+    // 播放中的内存治理仍由缓冲收紧 + 定时重建兜底，不受影响。
     final queue = state.queue;
     final nextIndex = state.queueIndex + 1;
     if (nextIndex < 0 || nextIndex >= queue.length) return;
@@ -3807,9 +4037,10 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
             preferredQuality: preferredQuality,
           );
         } catch (error) {
-          // 默认音质是跨歌曲保存的，当前歌曲可能并不支持上首歌使用的
+          // 默认音质是跨歌曲的，当前歌曲可能并不支持上首歌使用的
           // super/母带档位。若插件明确返回“不支持音质”，自动降到 320k
-          // 重试，并更新默认值，避免后续歌曲继续重复失败。
+          // 重试（仅本曲生效并同步 UI，不改全局默认音质），后续歌曲
+          // 仍按默认音质尝试，避免默认值被偶发的降档请求永久污染。
           final lower = error.toString().toLowerCase();
           final unsupportedQuality =
               lower.contains('不支持') && lower.contains('音质');
@@ -3821,9 +4052,7 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
             pluginData,
             preferredQuality: '320k',
           );
-          await _ref
-              .read(settingsProvider.notifier)
-              .setOnlineDefaultQuality('320k');
+          state = state.copyWith(currentQuality: '320k');
         }
         playbackChainLog(
           '[播放链路] ${item.path} 音源解析 ${resolveStopwatch.elapsedMilliseconds}ms',
@@ -3893,10 +4122,53 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
           throw Exception('识曲结果缺少播放元数据');
         }
         final plugins = await _ref.read(enabledMusicPluginsProvider.future);
+        // 存量洛雪歌曲（修复前持久化，队列项 pluginId 为空）此前会落到
+        // 通用回退链按插件管理页顺序解析，同一首歌的音源跟着插件顺序
+        // 漂移。改为按音源代号推断归属插件（MusicFree 式来源固定），
+        // 推断出的插件解析成功后才固化到队列项与收藏/歌单快照；失败
+        // 仍走通用回退链，不会把歌曲锁死在解析不了的插件上。
+        var ownedItem = item;
+        if (item.pluginId?.trim().isEmpty ?? true) {
+          final inferredId = inferRecognizedLxPluginId(
+            path: item.path,
+            pluginData: item.pluginData,
+            lxPlugins: plugins.where((candidate) => candidate.isLx).toList(),
+          );
+          if (inferredId != null) {
+            final inferred = plugins
+                .where(
+                  (candidate) =>
+                      candidate.id == inferredId && candidate.isLx,
+                )
+                .firstOrNull;
+            if (inferred != null) {
+              try {
+                final media = await _ref
+                    .read(pluginRuntimeProvider)
+                    .resolveMediaSource(
+                      inferred,
+                      item.pluginData ?? const <String, dynamic>{},
+                      preferredQuality: preferredQuality,
+                    )
+                    .timeout(const Duration(seconds: 30));
+                if (media.url.trim().isNotEmpty) {
+                  _cacheRecognizedPluginSource(
+                    queueIndex,
+                    inferred,
+                    item.pluginData ?? const <String, dynamic>{},
+                  );
+                  ownedItem = state.queue[queueIndex];
+                }
+              } catch (_) {
+                // 推断插件解析失败：保持原样落入通用回退链。
+              }
+            }
+          }
+        }
         // 洛雪插件自有歌曲只走洛雪命名空间（见 _resolveOwnedLxSource）。
         final resolveStopwatch = Stopwatch()..start();
         var owned = await _resolveOwnedLxSource(
-          item,
+          ownedItem,
           Map<String, dynamic>.from(rawLx),
           plugins,
           preferredQuality: preferredQuality,
@@ -5650,6 +5922,21 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
     } catch (error) {
       debugPrint('系统媒体封面提取失败：$error');
     }
+    // 兜底：无可用封面时用应用图标占位，保证 MediaSession 元数据始终
+    // 携带 bitmap——鸿蒙播控中心（com.huawei.mediacontr）对无 bitmap
+    // 的媒体会话整个不渲染条目（实测 XY 完全不出现在播控列表），
+    // ColorOS 等其他 ROM 也能借 bitmap 稳定显示封面区。
+    try {
+      final cacheRoot = await _ref.read(appDataDirProvider.future);
+      final fallback = File(p.join(cacheRoot, 'media_fallback_art.png'));
+      if (!fallback.existsSync()) {
+        final data = await rootBundle.load('assets/icon/app_icon.png');
+        await fallback.writeAsBytes(data.buffer.asUint8List(), flush: true);
+      }
+      if (fallback.existsSync()) {
+        return (uri: Uri.file(fallback.path), headers: null);
+      }
+    } catch (_) {}
     return (uri: null, headers: null);
   }
 
@@ -5683,6 +5970,12 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
   }
 
   Future<void> _startPlayback(int requestId, String itemPath) async {
+    // 起播即重置停滞检测基准：上一曲的心跳基准对新曲毫无意义（新曲从
+    // 0 起播时 advanced 为大负数），不重置会与「进度倒退不判停滞」的
+    // 修正叠加造成一次多余的空窗口。双保险。
+    _heartbeatLastPos = -1;
+    // 起播即启动前台进度兜底泵（每切歌都会重新起跑，幂等）。
+    _startPositionFallbackPump();
     // 真正起播前确保媒体会话桥接已安装。此前只在 _playAt（切歌链）里安装，
     // 而恢复会话后点播放走的是 toggle() → _startPlayback 的直连 resume 分支，
     // 绕过了 _playAt；构造期的 1s 兜底定时器又可能在平台 handler 就位前触发
@@ -6119,20 +6412,17 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
     if (_lastFailureKey == failureKey) return;
 
     // 有些插件会先返回一个看似有效的 URL，真正开始播放时才返回
-    // “不支持 super 音质”。这类错误无法在解析阶段发现，先把跨歌曲
-    // 保存的偏好降到 320k 并重试当前歌曲，避免误跳到下一首。
+    // “不支持 super 音质”。这类错误无法在解析阶段发现，先按 320k
+    // 重试当前歌曲（仅本曲生效，不改全局默认音质），避免误跳到下一首。
     final currentQuality = state.currentQuality.trim();
     if (_isUnsupportedQualityError(error) &&
         currentQuality.isNotEmpty &&
         currentQuality.toLowerCase() != '320k') {
       _lastFailureKey = failureKey;
-      await _ref
-          .read(settingsProvider.notifier)
-          .setOnlineDefaultQuality('320k');
       if (requestId != _playRequestId || state.queueIndex != queueIndex) {
         return;
       }
-      await _playAt(queueIndex);
+      await _playAt(queueIndex, qualityOverride: '320k');
       return;
     }
     _lastFailureKey = failureKey;
@@ -6208,15 +6498,14 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
           _publishNotice(
             '当前音质播放失败，自动降到「${qualityDisplayLabel(nextTier)}」重试',
           );
-          // 改默认音质后重播当前歌；再失败会回到本策略链逐档下降
-          //（已试档位会被 _qualityDropAttemptedTiers 跳过）。
-          await _ref
-              .read(settingsProvider.notifier)
-              .setOnlineDefaultQuality(nextTier);
+          // 降档仅对本曲生效（qualityOverride 覆盖解析音质并同步 UI），
+          // 不写全局默认音质；再失败会回到本策略链逐档下降（已试档位
+          // 会被 _qualityDropAttemptedTiers 跳过）。
+          state = state.copyWith(currentQuality: nextTier);
           if (requestId != _playRequestId || state.queueIndex != queueIndex) {
             return;
           }
-          await _playAt(queueIndex);
+          await _playAt(queueIndex, qualityOverride: nextTier);
           return;
         case PlaybackFailureStep.switchSource:
           if (failedItem == null ||
@@ -6520,9 +6809,9 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
   Future<void> setCurrentQuality(String quality) async {
     final normalized = quality.trim();
     if (normalized.isEmpty) return;
-    await _ref
-        .read(settingsProvider.notifier)
-        .setOnlineDefaultQuality(normalized);
+    // 手动切音质仅对当前歌曲生效（preferredQualityOverride），不再
+    // 改写设置里的「在线默认音质」——默认音质只在设置页修改，每次
+    // 切歌都按默认音质重新解析，避免上一首的音质被带进下一首。
     final item = state.current;
     final index = state.queueIndex;
     if (item == null ||
@@ -6970,13 +7259,19 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
   }
 
   Future<void> cyclePlayMode() async {
-    final next = (normalizePlayMode(state.playMode) + 1) % 3;
+    final current = normalizePlayMode(state.playMode);
+    final next = (current + 1) % 3;
     if (next == 2 && state.queue.length > 1) {
-      final current = state.current;
+      // 进入随机：先保存原始顺序快照（已存在则沿用，避免覆盖歌单原序），
+      // 再对队列洗牌并把当前曲置顶。
+      final original = state.queueOriginal.isNotEmpty
+          ? List<String>.of(state.queueOriginal)
+          : state.queue.map((q) => q.path).toList();
+      final currentItem = state.current;
       final queue = List<QueueItem>.of(state.queue);
-      final currentIndex = current == null
+      final currentIndex = currentItem == null
           ? -1
-          : queue.indexWhere((item) => item.path == current.path);
+          : queue.indexWhere((item) => item.path == currentItem.path);
       if (currentIndex >= 0) {
         final selected = queue.removeAt(currentIndex);
         _shuffleInPlace(queue);
@@ -6987,8 +7282,38 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
       state = state.copyWith(
         playMode: next,
         queue: queue,
-        queueIndex: current == null ? state.queueIndex : 0,
+        queueOriginal: original,
+        queueIndex: currentItem == null ? state.queueIndex : 0,
       );
+    } else if (current == 2) {
+      // 从随机切回列表/单曲：按保存的原始顺序重建队列，当前曲定位到
+      // 其在原始顺序中的位置；原始顺序缺失（旧会话等）时保留现状。
+      if (state.queueOriginal.isNotEmpty) {
+        final currentItem = state.current;
+        final byPath = {for (final q in state.queue) q.path: q};
+        final originalQueue = <QueueItem>[];
+        final seen = <String>{};
+        for (final p in state.queueOriginal) {
+          final q = byPath[p];
+          if (q == null) continue;
+          originalQueue.add(q);
+          seen.add(p);
+        }
+        // 原始快照缺失的项（如洗牌后才入队的歌曲）追加到末尾，保证队列完整。
+        for (final q in state.queue) {
+          if (!seen.contains(q.path)) originalQueue.add(q);
+        }
+        final idx = currentItem == null
+            ? state.queueIndex
+            : originalQueue.indexWhere((item) => item.path == currentItem.path);
+        state = state.copyWith(
+          playMode: next,
+          queue: originalQueue,
+          queueIndex: idx < 0 ? 0 : idx,
+        );
+      } else {
+        state = state.copyWith(playMode: next);
+      }
     } else {
       state = state.copyWith(playMode: next);
     }
@@ -7034,6 +7359,61 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
     unawaited(_handleTrackEndOnce());
   }
 
+  /// 流断自动恢复：重新走 [_playAt] 全链路解析当前曲（拿到新 URL/新流）。
+  ///
+  /// 适用场景：单曲循环第二遍流被上游掐断（音源 URL 时效过期、CDN
+  /// 断流、代理转发失败）后，ExoPlayer 停在 buffering/error 态，play()
+  /// 复用旧源无法自愈。连续恢复超过 5 次停止自动重试（坏源/断网时
+  /// 防止无限循环），正常起播 ready 后计数清零。自定义播放区间开启时
+  /// 重解析后落回头部起播点。
+  void _recoverFromStalledStream(String reason) {
+    _cancelBufferingWatchdog();
+    final index = state.queueIndex;
+    if (index < 0 || state.queue.isEmpty) return;
+    if (_manualPause) return;
+    // 起播链进行中（_playAt 加载态）的错误由起播链自身的失败处理上报，
+    // 这里不再叠加一次重解析，避免两条 _playAt 并发竞争。
+    if (state.isLoading) return;
+    if (_streamRecoverCount >= 5) {
+      AppLogStore.instance.add(
+        '[卡顿] 流断自动恢复已达上限（连续 $_streamRecoverCount 次），'
+        '停止自动重试：$reason',
+        level: AppLogLevel.warning,
+      );
+      return;
+    }
+    _streamRecoverCount++;
+    AppLogStore.instance.add(
+      '[卡顿] 流断自动恢复 #$_streamRecoverCount：$reason，'
+      '重新解析当前曲「${state.current?.title ?? state.current?.path}」',
+      level: AppLogLevel.warning,
+    );
+    unawaited(() async {
+      await _playAt(index);
+      final restartSecs = _restartSeekSeconds();
+      if (restartSecs > 0) {
+        await seek(restartSecs);
+      }
+    }());
+  }
+
+  /// 重缓冲卡死看门狗：进入 buffering 后 30s 内无任何状态跃迁
+  /// （仍在 buffering）即视为流已断，强制重解析。
+  void _armBufferingWatchdog() {
+    _cancelBufferingWatchdog();
+    _bufferingWatchdog = Timer(const Duration(seconds: 30), () {
+      if (_lastStreamProcessingState == ProcessingState.buffering &&
+          _rebufferEnteredAt != null) {
+        _recoverFromStalledStream('重缓冲持续 30s 未恢复（流疑似已断）');
+      }
+    });
+  }
+
+  void _cancelBufferingWatchdog() {
+    _bufferingWatchdog?.cancel();
+    _bufferingWatchdog = null;
+  }
+
   Future<void> _handleTrackEndOnce() async {
     if (_handlingTrackEnd) return;
     _handlingTrackEnd = true;
@@ -7046,14 +7426,21 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
 
   Future<void> _onTrackEnd() async {
     if (normalizePlayMode(state.playMode) == 1) {
-      // 单曲循环：重播当前曲。自定义播放区间开启时落回头部起播点
-      // （skipHead），而不是 0——与 _playAt 起播语义保持一致。
-      await seek(_restartSeekSeconds());
-      _statsPlayEventRecorded = false;
-      final current = state.current;
-      if (current != null) {
+      // 单曲循环：重播当前曲。原生 LoopMode.one 正常循环时 completed
+      // 不会触发这里；走到此分支说明引擎已离开播放态（loop 失效或流
+      // 提前断开），复用旧源 play() 无法自愈（音源 URL 时效过期后流
+      // 断会无声卡死），必须重新走 _playAt 全链路解析新 URL。自定义
+      // 播放区间开启时落回头部起播点（skipHead），与 _playAt 起播语义
+      // 保持一致。
+      final index = state.queueIndex;
+      if (index >= 0) {
         _manualPause = false;
-        _startPlayback(_playRequestId, current.path);
+        _statsPlayEventRecorded = false;
+        await _playAt(index);
+        final restartSecs = _restartSeekSeconds();
+        if (restartSecs > 0) {
+          await seek(restartSecs);
+        }
       }
       return;
     }
@@ -7162,11 +7549,14 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
     _statsFlushTimer?.cancel();
     _desktopLyricsSyncTimer?.cancel();
     _dspWatchdogTimer?.cancel();
+    _positionFallbackTimer?.cancel();
     _audioInterruptionSub?.cancel();
     _becomingNoisySub?.cancel();
     _posSub?.cancel();
     _durSub?.cancel();
     _stateSub?.cancel();
+    _errorSub?.cancel();
+    _bufferingWatchdog?.cancel();
     _dspTakeoverTimer?.cancel();
     _dspDeferredTakeoverTimer?.cancel();
     unawaited(_stopDspPipeline());
@@ -7320,6 +7710,9 @@ Map<String, dynamic> buildPlaybackSessionPayload({
   return {
     'currentSongPath': item?.path,
     'playQueuePaths': state.queue.map((q) => q.path).toList(),
+    // 原始歌单顺序：随机模式下洗牌队列会丢失原序，落盘快照供恢复后
+    // 切回列表/单曲时还原；未开随机时与 playQueuePaths 一致。
+    'queueOriginalPaths': state.queueOriginal,
     'sourceSongPaths': const <String>[],
     'playMode': normalizePlayMode(state.playMode),
     'volume': volume,

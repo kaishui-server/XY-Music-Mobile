@@ -193,37 +193,19 @@ class CloudPlaybackProxy {
         await req.response.close();
         return;
       }
-      // 零缓冲流式转发：CDN → Dart → 播放器逐块搬运，不整段落内存。
-      // QMC 加密流（QQ *.mflac）：逐块原位解密后回放。解密起点 = 本段
-      // 响应在完整文件中的绝对偏移（Content-Range bytes N-M/T 的 N，
-      // 200 全量则 0），RC4/MapL 模式按全局 offset 定位密钥流，seek 的
-      // Range 请求同样正确（qmc_crypto 与 MusicFree Kotlin 实现对齐）。
-      if (task.ekey != null) {
-        var start = 0;
-        final cr = resp.headers.value(HttpHeaders.contentRangeHeader);
-        final m = RegExp(r'bytes\s+(\d+)-').firstMatch(cr ?? '');
-        if (m != null) start = int.parse(m.group(1)!);
-        try {
-          final decoder = QmcDecoder.fromRawKey(task.resolveRawKey());
-          var consumed = 0;
-          playbackChainLog(
-            '[播放链路] QMC 解密启动 offset=$start '
-            'keyLen=${task.resolveRawKey().length}',
-          );
-          final decrypted = resp.cast<List<int>>().map((chunk) {
-            final buf = Uint8List.fromList(chunk);
-            decoder.decryptChunk(buf, start + consumed);
-            consumed += buf.length;
-            return buf;
-          });
-          await req.response.addStream(decrypted);
-        } catch (e) {
-          playbackChainLog('[播放链路] QMC 解密失败（原样透传）: $e');
-          await req.response.addStream(resp);
-        }
-      } else {
-        await req.response.addStream(resp);
-      }
+      // 零缓冲流式转发 + 断流接力：CDN → Dart → 播放器逐块搬运，不整段
+      // 落内存。QQ ws.stream 等 CDN 会中途掐断 Dart 网络栈的连接（实测
+      // ~10s 掐一次：Connection closed while receiving data），单次转发
+      // 会把提前 EOF 透传给播放器，表现为「播到某节点突然无声卡死」。
+      // 改为逐块接力：上游断流后按已转发偏移发起新 Range 请求续传，
+      // 直到本段内容完整或重试耗尽。QMC 加密流（QQ *.mflac）逐块原位
+      // 解密，解密起点 = Content-Range bytes N-M/T 的 N（200 全量则 0），
+      // RC4/MapL 按全局 offset 定位密钥流，续传/seek 的 Range 同样正确。
+      var start = 0;
+      final cr = resp.headers.value(HttpHeaders.contentRangeHeader);
+      final m = RegExp(r'bytes\s+(\d+)-').firstMatch(cr ?? '');
+      if (m != null) start = int.parse(m.group(1)!);
+      await _relayResponse(req, task, resp, start);
       await req.response.close();
     } catch (e) {
       // 转发层异常（TLS 握手/连接重置/上游中断）在此处对 Dart 完全可见
@@ -232,6 +214,103 @@ class CloudPlaybackProxy {
       try {
         await req.response.close();
       } catch (_) {}
+    }
+  }
+
+  /// 单响应接力转发：把上游数据逐块搬运给播放器。
+  ///
+  /// 上游中途断流（Connection closed while receiving data）时，按已转发
+  /// 的绝对偏移重新发起 Range 请求续传（每次重连是一条新 TCP 连接，
+  /// CDN 掐的是连接而非 URL），直到本段声明的长度转发完整或重试耗尽。
+  /// QMC 流逐块解密（绝对偏移定位密钥流）。逐块 flush 提供背压，防止
+  /// 播放器消费慢时响应缓冲无限堆积。
+  Future<void> _relayResponse(
+    HttpRequest req,
+    _ProxyTask task,
+    HttpClientResponse first,
+    int startOffset,
+  ) async {
+    final decoder = task.ekey != null
+        ? QmcDecoder.fromRawKey(task.resolveRawKey())
+        : null;
+    if (decoder != null) {
+      playbackChainLog(
+        '[播放链路] QMC 解密启动 offset=$startOffset '
+        'keyLen=${task.resolveRawKey().length}',
+      );
+    }
+    // 本段目标长度：首个响应声明的 Content-Length（206 时为剩余段长，
+    // 200 为全量；chunked 为 -1，仅靠正常 EOF 判断）。
+    final declared = first.contentLength;
+    var resp = first;
+    var offset = startOffset; // 本段起点在完整文件中的绝对偏移
+    var consumed = 0; // 当前接力段已转发字节
+    var attempts = 0;
+    while (true) {
+      var broken = false;
+      var writeBroken = false;
+      try {
+        await for (final chunk in resp) {
+          var buf = Uint8List.fromList(chunk);
+          if (decoder != null) {
+            decoder.decryptChunk(buf, offset + consumed);
+          }
+          consumed += buf.length;
+          req.response.add(buf);
+          try {
+            await req.response.flush();
+          } catch (_) {
+            // 播放器侧断开（切歌/seek abort）：立即停止搬运，不接力。
+            writeBroken = true;
+            break;
+          }
+        }
+      } catch (e) {
+        broken = true;
+      }
+      if (writeBroken) return;
+      // 完成判断：累计绝对偏移（offset 跨接力段推进，consumed 每段重置）
+      // 达到首个响应声明的段尾即完整——断流发生在段尾属正常收尾。
+      final totalDone = offset + consumed;
+      if (declared >= 0 && totalDone >= startOffset + declared) {
+        return;
+      }
+      if (!broken && declared < 0) {
+        // chunked（无长度声明）正常 EOF：直接结束。
+        return;
+      }
+      // 段未转发完（上游提前 EOF 或断流）：接力续传。
+      attempts++;
+      if (attempts > 10) {
+        playbackChainLog(
+          '[播放链路] 代理接力失败：重试达上限（$attempts 次）'
+          'offset=$totalDone/'
+          '${declared < 0 ? '?' : startOffset + declared}',
+        );
+        return;
+      }
+      final resumeAt = totalDone;
+      playbackChainLog(
+        '[播放链路] 上游断流，接力续传 #$attempts '
+        'offset=$resumeAt/段长=${declared < 0 ? '?' : declared} '
+        'host=${Uri.tryParse(task.url)?.host ?? '未知'}'
+        '${broken ? '' : '（提前EOF）'}',
+      );
+      final (next, errBody) = await _openUpstream(
+        task,
+        req.method,
+        'bytes=$resumeAt-',
+      );
+      if (errBody != null) {
+        playbackChainLog(
+          '[播放链路] 代理接力终止：上游续传失败 HTTP '
+          '${next.statusCode} offset=$resumeAt',
+        );
+        return;
+      }
+      resp = next;
+      consumed = 0;
+      offset = resumeAt;
     }
   }
 

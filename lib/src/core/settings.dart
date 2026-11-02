@@ -243,6 +243,10 @@ class AppSettings {
     this.qqSourceApiKey = '',
     this.qqSourceApiUrl = '',
     this.libraryMinDurationSeconds = 0,
+    // 网络搜索并发数（搜索线程）：0 = 全部并行（默认），1~5 = 最多同时
+    // 请求 N 个平台/插件。洛雪插件选「全部平台」时默认并行请求全部
+    // 5 个平台，弱网下影响运行且浪费调用次数，可限制并发。
+    this.searchConcurrency = 0,
     this.showLyricsTranslation = true,
     this.showLyricsRomaji = true,
     // 播放详情页歌词页：单击歌词行调整播放进度（默认开启）。
@@ -376,6 +380,10 @@ class AppSettings {
   /// Source API 接口地址，留空使用默认地址。
   final String qqSourceApiUrl;
   final int libraryMinDurationSeconds;
+
+  /// 网络搜索并发数（搜索线程）：0 = 全部并行，1~5 = 最多同时请求
+  /// N 个平台/插件（作用于洛雪多平台搜索与多插件 tab 并行）。
+  final int searchConcurrency;
   final bool showLyricsTranslation;
 
   /// 播放详情页歌词是否显示罗马音/音译行（有罗马音数据时）。
@@ -494,6 +502,7 @@ class AppSettings {
     String? qqSourceApiKey,
     String? qqSourceApiUrl,
     int? libraryMinDurationSeconds,
+    int? searchConcurrency,
     bool? showLyricsTranslation,
     bool? showLyricsRomaji,
     bool? lyricTapSeek,
@@ -589,6 +598,7 @@ class AppSettings {
       qqSourceApiUrl: qqSourceApiUrl ?? this.qqSourceApiUrl,
       libraryMinDurationSeconds:
           libraryMinDurationSeconds ?? this.libraryMinDurationSeconds,
+      searchConcurrency: searchConcurrency ?? this.searchConcurrency,
       showLyricsTranslation:
           showLyricsTranslation ?? this.showLyricsTranslation,
       showLyricsRomaji: showLyricsRomaji ?? this.showLyricsRomaji,
@@ -737,6 +747,8 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
       qqSourceApiKey: prefs.getString('qqSourceApiKey') ?? '',
       qqSourceApiUrl: prefs.getString('qqSourceApiUrl') ?? '',
       libraryMinDurationSeconds: prefs.getInt('libraryMinDurationSeconds') ?? 0,
+      searchConcurrency:
+          (prefs.getInt('searchConcurrency') ?? 0).clamp(0, 5),
       showLyricsTranslation: prefs.getBool('showLyricsTranslation') ?? true,
       showLyricsRomaji: prefs.getBool('showLyricsRomaji') ?? true,
       lyricTapSeek: prefs.getBool('lyricTapSeek') ?? true,
@@ -995,6 +1007,7 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
       prefs.setString('qqSourceApiKey', next.qqSourceApiKey),
       prefs.setString('qqSourceApiUrl', next.qqSourceApiUrl),
       prefs.setInt('libraryMinDurationSeconds', next.libraryMinDurationSeconds),
+      prefs.setInt('searchConcurrency', next.searchConcurrency),
       prefs.setBool('showLyricsTranslation', next.showLyricsTranslation),
       prefs.setBool('showLyricsRomaji', next.showLyricsRomaji),
       prefs.setBool('lyricTapSeek', next.lyricTapSeek),
@@ -1287,6 +1300,13 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
   Future<void> setLibraryMinDurationSeconds(int s) => _save(
     (state.valueOrNull ?? const AppSettings()).copyWith(
       libraryMinDurationSeconds: s,
+    ),
+  );
+
+  /// 搜索并发数（搜索线程）：0=全部并行，1~5=最多同时 N 个请求。
+  Future<void> setSearchConcurrency(int v) => _save(
+    (state.valueOrNull ?? const AppSettings()).copyWith(
+      searchConcurrency: v.clamp(0, 5),
     ),
   );
   Future<void> setShowLyricsTranslation(bool v) => _save(

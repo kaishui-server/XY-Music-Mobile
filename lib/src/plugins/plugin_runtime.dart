@@ -22,6 +22,33 @@ import 'plugin_metadata.dart';
 import 'qq_source_api.dart';
 import 'qrc_decrypt.dart';
 
+/// 有限并发地执行 [task]，结果按 [items] 的输入顺序返回。
+///
+/// 搜索并发数（searchConcurrency 1~5）的共享实现：同时最多 [concurrency]
+/// 个任务在跑，一个任务失败不影响其他任务（由调用方捕获处理）。
+/// [concurrency] 会被收敛到 1..items.length，空列表直接返回空。
+Future<List<R>> runWithConcurrency<T, R>(
+  List<T> items,
+  int concurrency,
+  Future<R> Function(T item) task,
+) async {
+  if (items.isEmpty) return const [];
+  final results = List<R?>.filled(items.length, null);
+  var next = 0;
+  Future<void> worker() async {
+    while (true) {
+      final index = next++;
+      if (index >= items.length) return;
+      results[index] = await task(items[index]);
+    }
+  }
+
+  await Future.wait(
+    List.generate(concurrency.clamp(1, items.length), (_) => worker()),
+  );
+  return [for (final result in results) result as R];
+}
+
 class EnabledMusicPlugin {
   const EnabledMusicPlugin({
     required this.id,
@@ -1246,7 +1273,10 @@ class PluginRuntimeService {
   // 连接级错误（服务器不可达）与歌曲无关：一次失败即熔断，不用等第二首
   // 再白撞一遍（每首歌数秒）。业务失败（无版权/需要会员）不计数。
   static const int _lxCircuitThreshold = 1;
-  static const Duration _lxCircuitCooldown = Duration(minutes: 5);
+  // 熔断冷却：换网络/服务恢复后应尽快自动重试。原先 5 分钟导致用户
+  // 切换 WiFi 后插件持续“不可用”（华为 Mate30Pro 实测），缩短至 45 秒，
+  // 并在后续任意一次成功解析时立即解除熔断。
+  static const Duration _lxCircuitCooldown = Duration(seconds: 45);
 
   /// 判断 LX 解析错误是否为连接级（服务器不可达/超时），用于熔断计数。
   bool _isLxConnectivityError(String message) {
@@ -1499,7 +1529,7 @@ class PluginRuntimeService {
     // 抛错让上层立即换源，不再白撞死服务器。
     if (_lxCircuitOpen(plugin)) {
       throw Exception(
-        '音源「${plugin.name}」近期连接失败，已临时跳过（约 5 分钟后自动重试）',
+        '音源「${plugin.name}」近期连接失败，已临时跳过（约 45 秒后自动重试）',
       );
     }
     _activeRuntimeOperations++;
@@ -2096,7 +2126,11 @@ class PluginRuntimeService {
     // （如 qishui）时接口报错，返回空列表优雅降级。
     if (plugin.isAnimemusic) {
       try {
-        return await _searchAnimemusicCatalog(plugin, keyword, artist: true);
+        final artists = await _searchAnimemusicCatalog(plugin, keyword, artist: true);
+        if (_isNeteasePlugin(plugin) && artists.isNotEmpty) {
+          return await _patchNeteaseArtistAvatars(artists, keyword);
+        }
+        return artists;
       } catch (_) {
         return const [];
       }
@@ -2110,7 +2144,12 @@ class PluginRuntimeService {
           keyword,
           artist: true,
         );
-        if (artists.isNotEmpty) return artists;
+        if (artists.isNotEmpty) {
+          if (_isNeteasePlugin(plugin)) {
+            return await _patchNeteaseArtistAvatars(artists, keyword);
+          }
+          return artists;
+        }
       } catch (_) {
         // suggest 不可用时回退插件 artist 类型搜索。
       }
@@ -2145,7 +2184,7 @@ class PluginRuntimeService {
       }
     }
     if (list.isEmpty && lastError != null) throw lastError;
-    return list
+    final results = list
         .map(
           (raw) => _toCatalogResult(
             plugin.id,
@@ -2155,6 +2194,138 @@ class PluginRuntimeService {
         )
         .where((item) => item.title.isNotEmpty)
         .toList();
+    // 网易系插件的 artist 结果常缺头像（插件只回 name/id），按名补齐。
+    if (_isNeteasePlugin(plugin)) {
+      return await _patchNeteaseArtistAvatars(results, keyword);
+    }
+    return results;
+  }
+
+  /// 网易歌手头像兜底缓存（歌手名 → 头像 URL）。
+  static final Map<String, String> _neteaseArtistAvatarCache = {};
+
+  static bool _isNeteasePlugin(EnabledMusicPlugin plugin) {
+    final name = plugin.name.toLowerCase();
+    final url = plugin.sourceUrl.toLowerCase();
+    return name.contains('网易') ||
+        name.contains('netease') ||
+        url.contains('netease') ||
+        url.contains('网易');
+  }
+
+  /// 网易系歌手结果头像兜底：官方搜索接口（type=100）按搜索词一次
+  /// 可取回带 img1v1Url 的歌手数组，按名字（name/alias/trans）匹配
+  /// 回填；命中结果按歌手名缓存，避免重复搜索都打接口。接口不可用
+  /// 时静默降级（保持无头像原样返回），不阻塞搜索。
+  Future<List<PluginCatalogResult>> _patchNeteaseArtistAvatars(
+    List<PluginCatalogResult> items,
+    String keyword,
+  ) async {
+    final missing = items
+        .where((item) => item.coverUrl.isEmpty && item.title.isNotEmpty)
+        .map((item) => item.title)
+        .toSet()
+        .toList();
+    if (missing.isEmpty) return items;
+
+    final unfetched = <String>[];
+    for (final title in missing) {
+      if (!_neteaseArtistAvatarCache.containsKey(title)) unfetched.add(title);
+    }
+    if (unfetched.isNotEmpty) {
+      try {
+        final url =
+            'https://music.163.com/api/search/get/web?s=${Uri.encodeComponent(keyword)}&type=100&limit=30';
+        final response = await http
+            .get(
+              Uri.parse(url),
+              headers: const {
+                'Cookie': 'os=pc',
+                'Referer': 'https://music.163.com',
+              },
+            )
+            .timeout(const Duration(seconds: 4));
+        if (response.statusCode == 200) {
+          final decoded = jsonDecode(response.body);
+          final result = decoded is Map ? decoded['result'] : null;
+          final artists = result is Map ? result['artists'] : null;
+          if (artists is List) {
+            // 归一化名 → 头像（精确 name 优先入表，alias/trans 随后补位）。
+            final nameToAvatar = <String, String>{};
+            for (final entry in artists) {
+              if (entry is! Map) continue;
+              final raw = Map<String, dynamic>.from(entry);
+              final avatar = _pickNeteaseArtistAvatar(raw);
+              if (avatar.isEmpty) continue;
+              final names = _neteaseArtistNames(raw);
+              for (var i = 0; i < names.length; i++) {
+                nameToAvatar.putIfAbsent(names[i], () => avatar);
+              }
+            }
+            for (final title in unfetched) {
+              _neteaseArtistAvatarCache[title] = nameToAvatar[title] ?? '';
+            }
+            // 缓存上限保护：超量直接清空（歌手名量级小，极少触发）。
+            if (_neteaseArtistAvatarCache.length > 300) {
+              _neteaseArtistAvatarCache.clear();
+            }
+          }
+        }
+      } catch (_) {
+        // 网易接口失败：静默降级，维持原样。
+      }
+    }
+
+    final patched = <PluginCatalogResult>[];
+    for (final item in items) {
+      if (item.coverUrl.isEmpty) {
+        final avatar = _neteaseArtistAvatarCache[item.title] ?? '';
+        if (avatar.isNotEmpty) {
+          patched.add(PluginCatalogResult(
+            pluginId: item.pluginId,
+            id: item.id,
+            title: item.title,
+            subtitle: item.subtitle,
+            coverUrl: avatar,
+            rawData: item.rawData,
+          ));
+          continue;
+        }
+      }
+      patched.add(item);
+    }
+    return patched;
+  }
+
+  /// 从网易歌手搜索结果挑头像：img1v1Url/picUrl 均为真实头像，
+  /// 过滤官方默认灰色占位图（5639395138885805）。
+  static String _pickNeteaseArtistAvatar(Map<String, dynamic> raw) {
+    for (final key in const ['img1v1Url', 'picUrl']) {
+      final value = raw[key];
+      if (value is String && value.isNotEmpty) {
+        if (!value.toLowerCase().contains('5639395138885805')) return value;
+      }
+    }
+    return '';
+  }
+
+  /// 网易歌手的可匹配名集合：name 优先，其次 alias 数组与 trans。
+  static List<String> _neteaseArtistNames(Map<String, dynamic> raw) {
+    final names = <String>[];
+    void add(dynamic value) {
+      final text = value?.toString().trim() ?? '';
+      if (text.isNotEmpty && !names.contains(text)) names.add(text);
+    }
+
+    add(raw['name']);
+    final alias = raw['alias'];
+    if (alias is List) {
+      for (final item in alias) {
+        add(item);
+      }
+    }
+    add(raw['trans']);
+    return names;
   }
 
   static bool _looksLikeBilibiliUser(Map<String, dynamic> raw) {
@@ -2777,20 +2948,38 @@ class PluginRuntimeService {
     // 各平台并行请求：串行时总耗时为全部平台网络延迟之和（默认 5 个
     // 平台在弱网/低端机上搜索明显偏慢）。失败平台不影响其余平台，
     // 错误语义与原串行实现一致（全部失败且存在错误时抛出）。
-    final responses = await Future.wait(
-      sources.map((source) async {
-        try {
-          final rawJson = await lxSearch(
-            source: source,
-            keyword: keyword,
-            limit: 30,
-          ).timeout(const Duration(seconds: 20));
-          return (source, rawJson, null as Object?);
-        } catch (error) {
-          return (source, null, error as Object?);
-        }
-      }),
-    );
+    // 设置里限制搜索并发数（searchConcurrency 1~5）时改为并发池：
+    // 选「全部平台」不再一次请求全部 5 个平台，节省调用次数。
+    final prefs = await SharedPreferences.getInstance();
+    final concurrency =
+        (prefs.getInt('searchConcurrency') ?? 0).clamp(0, 5);
+    final responses = concurrency > 0
+        ? await runWithConcurrency(sources, concurrency, (source) async {
+            try {
+              final rawJson = await lxSearch(
+                source: source,
+                keyword: keyword,
+                limit: 30,
+              ).timeout(const Duration(seconds: 20));
+              return (source, rawJson, null as Object?);
+            } catch (error) {
+              return (source, null, error as Object?);
+            }
+          })
+        : await Future.wait(
+            sources.map((source) async {
+              try {
+                final rawJson = await lxSearch(
+                  source: source,
+                  keyword: keyword,
+                  limit: 30,
+                ).timeout(const Duration(seconds: 20));
+                return (source, rawJson, null as Object?);
+              } catch (error) {
+                return (source, null, error as Object?);
+              }
+            }),
+          );
     final results = <PluginSearchSong>[];
     final seen = <String>{};
     Object? lastError;
@@ -5135,7 +5324,7 @@ class PluginRuntimeService {
     final songInfo = Map<String, dynamic>.from(value);
     if (_lxCircuitOpen(plugin)) {
       throw Exception(
-        '音源「${plugin.name}」近期连接失败，已临时跳过（约 5 分钟后自动重试）',
+        '音源「${plugin.name}」近期连接失败，已临时跳过（约 45 秒后自动重试）',
       );
     }
     Object? lastError;
@@ -5198,6 +5387,9 @@ class PluginRuntimeService {
             apiUrl: qqApiUrl,
           );
           _lxConnectivityFailures.remove(plugin.id);
+          // 解析成功即视为网络恢复：立即解除熔断，避免换网络/服务恢复
+          // 后仍被旧熔断冷却拦截（华为 Mate30Pro 换 WiFi 后插件不可用）。
+          _lxCircuitCooldownUntil.remove(plugin.id);
           AppLogStore.instance.add(
             '[播放链路] Source API解析成功 音质$quality '
             '${sourceApiResult.filename}',
@@ -5236,6 +5428,9 @@ class PluginRuntimeService {
             throw Exception('LX返回假音质（$quality 实际下发内容不符）');
           }
           _lxConnectivityFailures.remove(plugin.id);
+          // 解析成功即视为网络恢复：立即解除熔断，避免换网络/服务恢复
+          // 后仍被旧熔断冷却拦截（华为 Mate30Pro 换 WiFi 后插件不可用）。
+          _lxCircuitCooldownUntil.remove(plugin.id);
           if (attemptStopwatch.elapsedMilliseconds > 3000) {
             AppLogStore.instance.add(
               '[播放链路] LX解析成功 ${plugin.name} 音质$quality '
@@ -5319,6 +5514,9 @@ class PluginRuntimeService {
             continue;
           }
           _lxConnectivityFailures.remove(plugin.id);
+          // 解析成功即视为网络恢复：立即解除熔断，避免换网络/服务恢复
+          // 后仍被旧熔断冷却拦截（华为 Mate30Pro 换 WiFi 后插件不可用）。
+          _lxCircuitCooldownUntil.remove(plugin.id);
           if (attemptStopwatch.elapsedMilliseconds > 3000) {
             AppLogStore.instance.add(
               '[播放链路] LX公共解析成功 ${plugin.name} 音质$quality '
@@ -5351,7 +5549,7 @@ class PluginRuntimeService {
         _lxConnectivityFailures[plugin.id] = 0;
         AppLogStore.instance.add(
           '[播放链路] 音源「${plugin.name}」连续连接失败，'
-          '已临时熔断 ${_lxCircuitCooldown.inMinutes} 分钟',
+          '已临时熔断 ${_lxCircuitCooldown.inSeconds} 秒',
           level: AppLogLevel.warning,
         );
       }

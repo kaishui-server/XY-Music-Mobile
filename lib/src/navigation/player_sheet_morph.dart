@@ -1,3 +1,4 @@
+import 'dart:math' as math;
 import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart';
@@ -249,37 +250,54 @@ class XyPlayerSheetMorph extends ConsumerWidget {
         // 方图（对齐真实页）、圆形全程保持正圆（半径随矩形宽度过渡）、
         // 沉浸式收平为直角全宽、黑胶直接复用完整黑胶盘（盘面镶中心
         // 封面，避免封面与盘「分家」）；t>0.75 淡出由真实页封面接管。
-        if (coverFade > 0 && current != null)
-          Positioned.fromRect(
-            rect: coverRect,
+        // 黑胶/圆图必须按内切正方形绘制：VinylCover 内部画布与唱臂坐标
+        // 按正方形盘面设计，若 coverRect 中间帧宽高不等（50×50 迷你封面
+        // lerp 到沉浸式 w×w 时速率不同），tight 约束会把盘面拉成椭圆、
+        // 唱臂比例失调（用户实测黑胶变形）。此处统一取 min 边长居中。
+        if (coverFade > 0 && current != null) ...[
+          // 黑胶/圆图必须按内切正方形绘制：VinylCover 内部画布与唱臂坐标
+          // 按正方形盘面设计，若 coverRect 中间帧宽高不等（50×50 迷你封面
+          // lerp 到沉浸式 w×w 时速率不同），tight 约束会把盘面拉成椭圆、
+          // 唱臂比例失调（用户实测黑胶变形）。此处统一取 min 边长居中。
+          Positioned(
+            left: coverRect.left + (coverRect.width - math.min(coverRect.width, coverRect.height)) / 2,
+            top: coverRect.top + (coverRect.height - math.min(coverRect.width, coverRect.height)) / 2,
+            width: math.min(coverRect.width, coverRect.height),
+            height: math.min(coverRect.width, coverRect.height),
             child: Opacity(
               opacity: coverFade,
-              child: origin.style == PlayerCoverStyle.vinyl
-                  ? VinylCover(
-                      item: current,
-                      playing: player.isPlaying,
-                      size: coverRect.width,
-                      showTonearm: false,
-                    )
-                  : CoverImage(
-                      songPath: current.path,
-                      imageUrl: resolveOnlineCoverUrl(
-                        current.coverUrl,
-                        current.path,
-                      ),
-                      width: coverRect.width,
-                      height: coverRect.height,
-                      radius: switch (origin.style) {
-                        // 起点迷你图 25 = 50/2，随矩形宽度自然成正圆。
-                        PlayerCoverStyle.circle => coverRect.width / 2,
-                        PlayerCoverStyle.immersive =>
-                          ui.lerpDouble(25, 0, coverT)!,
-                        _ => ui.lerpDouble(25, 24, coverT)!,
-                      },
-                      icon: Icons.music_note_rounded,
-                    ),
+              child: Builder(
+                builder: (context) {
+                  final side = math.min(coverRect.width, coverRect.height);
+                  return origin.style == PlayerCoverStyle.vinyl
+                      ? VinylCover(
+                          item: current,
+                          playing: player.isPlaying,
+                          size: side,
+                          showTonearm: false,
+                        )
+                      : CoverImage(
+                          songPath: current.path,
+                          imageUrl: resolveOnlineCoverUrl(
+                            current.coverUrl,
+                            current.path,
+                          ),
+                          width: side,
+                          height: side,
+                          radius: switch (origin.style) {
+                            // 起点迷你图 25 = 50/2，随矩形宽度自然成正圆。
+                            PlayerCoverStyle.circle => side / 2,
+                            PlayerCoverStyle.immersive =>
+                              ui.lerpDouble(25, 0, coverT)!,
+                            _ => ui.lerpDouble(25, 24, coverT)!,
+                          },
+                          icon: Icons.music_note_rounded,
+                        );
+                },
+              ),
             ),
           ),
+        ],
       ],
     );
   }

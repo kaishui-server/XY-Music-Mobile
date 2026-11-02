@@ -258,6 +258,13 @@ const settingsSearchEntries = <SettingsSearchEntry>[
     keywords: '入队 播放队列 整个列表 仅此歌曲 单曲',
   ),
   SettingsSearchEntry(
+    title: '搜索并发数',
+    path: ['播放', '搜索并发数'],
+    route: '/settings/playback',
+    icon: Icons.travel_explore_rounded,
+    keywords: '搜索线程 并发 同时请求 平台 串行 全部并行',
+  ),
+  SettingsSearchEntry(
     title: '显示音质标识',
     path: ['播放', '显示音质标识'],
     route: '/settings/playback',
@@ -1127,6 +1134,34 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
                     ref
                         .read(settingsProvider.notifier)
                         .setPlaySongQueueMode(mode),
+                  );
+                }
+              },
+            ),
+          ),
+        ),
+        _tile(
+          context,
+          icon: Icons.travel_explore_rounded,
+          title: '搜索并发数',
+          trailing: DropdownButtonHideUnderline(
+            child: DropdownButton<int>(
+              value: (settings?.searchConcurrency ?? 0).clamp(0, 5),
+              isDense: true,
+              alignment: AlignmentDirectional.centerEnd,
+              items: [
+                for (var i = 0; i <= 5; i++)
+                  DropdownMenuItem<int>(
+                    value: i,
+                    child: Text(_searchConcurrencyLabel(i)),
+                  ),
+              ],
+              onChanged: (value) {
+                if (value != null) {
+                  unawaited(
+                    ref
+                        .read(settingsProvider.notifier)
+                        .setSearchConcurrency(value),
                   );
                 }
               },
@@ -2143,6 +2178,13 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
       short ? '整个列表' : '将整个列表加入到播放队列',
     PlaySongQueueMode.singleSong =>
       short ? '仅此歌曲' : '仅将此歌曲加入到播放队列',
+  };
+
+  /// 搜索并发数（搜索线程）的下拉文案：0=全部并行，1~5=最多同时 N 个。
+  String _searchConcurrencyLabel(int value) => switch (value) {
+    0 => '全部并行',
+    1 => '串行（1）',
+    _ => '$value 个并发',
   };
 
   Future<void> _setPlayerDetailBackground(

@@ -348,10 +348,14 @@ Map<String, dynamic> _kwTypes(String mInfo) {
 // 酷狗：对齐 lx-music-mobile kg/songList.js（master 版）。老式
 // special/single HTML 页接口已失效，v5 接口族对云收藏歌单（collection_
 // 形态）也返回 1001，改用多通道兜底：
-//   纯数字 ID/酷狗码 → t.kugou.com/command 解码
-//                      → kucodeAndShare type:3 取歌曲列表
-//   gcid_ 链接       → m3ws.kugou.com 分享页内嵌 window.$output 直抓
+//   gateway get_other_list_file_nofilt 分页（主通道，全量）
+//   纯数字 ID/酷狗码 → t.kugou.com/command 解码 → global_collection_id
+//                      → gateway 分页全量
+//                      → kucodeAndShare type:3（服务端 500 条上限，兜底）
+//   gcid_ 链接       → gateway 分页
 //                      → t.kugou.com/v1/songlist/batch_decode 解码
+//                      → m3ws.kugou.com 分享页内嵌 window.$output 直抓
+//                        （服务端只渲染首屏 10 首，仅小歌单可用）
 //   chain=/分享页     → m.kugou.com/schain/transfer
 //   歌单详情兜底     → mobiles.kugou.com/api/v5/special/info_v2 + song_v2
 //   歌曲信息         → gateway 批量接口补全
@@ -457,9 +461,21 @@ Future<LxPlaylistImportResult> _kgByCode(http.Client client, String id) async {
     final specialId = _text(info['id']);
     final userid = _text(info['userid']);
 
-    // 优先：kucodeAndShare type:3 直接返回歌曲列表。v5 详情接口族对
-    // 云收藏歌单已失效（1001），command 解码出的歌单大多走此通道。
-    // 注意响应的顶层 data 数组才是歌曲列表（info 键为空）。
+    // 主通道：command 解码出的 global_collection_id 走 gateway 分页
+    // 全量（kucodeAndShare 服务端 500 条上限、v5 对云收藏失效，
+    // 见 _kgGatewayDetail 注释）。
+    final gcid = _text(info['global_collection_id']);
+    if (gcid.isNotEmpty) {
+      try {
+        return await _kgGatewayDetail(client, gcid);
+      } catch (_) {
+        // gateway 不可用时回落 kucodeAndShare / v5。
+      }
+    }
+
+    // 兜底：kucodeAndShare type:3 直接返回歌曲列表（服务端硬上限
+    // 500 条，大歌单会导入不全）。注意响应的顶层 data 数组才是歌曲
+    // 列表（info 键为空）。
     if (specialId.isNotEmpty && userid.isNotEmpty) {
       final count = _toInt(info['count']);
       try {
@@ -499,8 +515,7 @@ Future<LxPlaylistImportResult> _kgByCode(http.Client client, String id) async {
       }
     }
 
-    // gcid 详情（gcid_ 形态可在 _kgDetail2 内部走分享页直抓）。
-    final gcid = _text(info['global_collection_id']);
+    // gcid 详情（gateway 失败后经 v5 / m 站直抓兜底）。
     if (gcid.isNotEmpty) {
       try {
         return await _kgDetail2(client, gcid);
@@ -808,6 +823,11 @@ Future<LxPlaylistImportResult?> _kgFromMPage(
           : const <String, dynamic>{};
       final hashes = _kgHashesFromList(info['songs']);
       if (hashes.isEmpty) return null;
+      // m 站服务端只渲染首屏（实测 2398 首歌单仅给 10 首），页内
+      // listinfo.count 是真实总数：数量对不上说明被截断，返回 null
+      // 让调用方走 gateway / v5 全量通道，避免把首屏当全量导入。
+      final declaredTotal = _toInt(listinfo['count']);
+      if (declaredTotal > 0 && hashes.length < declaredTotal) return null;
       var cover = _text(listinfo['pic']);
       if (cover.contains('{size}')) cover = cover.replaceAll('{size}', '240');
       return await _kgSongsFromHashes(
@@ -915,6 +935,13 @@ Future<LxPlaylistImportResult> kgOnlinePlaylistTracks(String id) async {
       gcid = converted;
     }
     if (gcid.startsWith('collection_')) {
+      // 主通道：gateway 分页全量（kucodeAndShare 服务端 500 条上限，
+      // 大歌单取不全，见 _kgGatewayDetail 注释）。
+      try {
+        return await _kgGatewayDetail(client, gcid);
+      } catch (_) {
+        // gateway 不可用回落 kucodeAndShare。
+      }
       final parts = gcid.split('_');
       final userid = parts.length >= 4 ? parts[2] : '';
       final listid = parts.length >= 4 ? parts[3] : '';
@@ -966,87 +993,189 @@ Future<LxPlaylistImportResult> kgOnlinePlaylistTracks(String id) async {
         hashes: hashes,
       );
     }
-    // gcid_ 分享形态：m 站分享页直抓。
-    final fromPage = await _kgFromMPage(client, gcid);
-    if (fromPage != null) return fromPage;
-    throw Exception('酷狗歌单为空或已失效');
+    // gcid_ 分享形态：gateway / v5 / m 站直抓多通道（_kgDetail2）。
+    // m 站服务端只渲染首屏 10 首，大歌单必须走 gateway / v5 全量。
+    return await _kgDetail2(client, gcid);
   } finally {
     client.close();
   }
 }
 
-/// v5 歌单详情：info_v2 拿基本信息，song_v2 分页拿 hash 列表。
-/// v5 接口对云收藏歌单（collection_ 形态）已失效，优先走 m 站分享页
-/// 直抓（gcid_ 形态），失败再回退本接口族。
-Future<LxPlaylistImportResult> _kgDetail2(
+/// gateway 全量通道（对齐 XianYu 移动端 kg_sheet_import 的
+/// get_other_list_file_nofilt 分页）：酷狗 App 同款网关接口，按
+/// global_collection_id 主键分页拉全量 hash。
+///
+/// kucodeAndShare type:3 服务端硬上限 500 条且翻页参数被忽略；
+/// v5 info_v2/song_v2 对云收藏歌单（collection_ 形态）返回空 data；
+/// m 站分享页只渲染首屏 10 首——三者都无法取全大歌单（探针实测
+/// 2398 首「我喜欢」歌单分别只拿到 500/0/10 首），本接口分页取全
+/// 2398 首。失败或为空时抛异常，由调用方回落旧通道。
+Future<LxPlaylistImportResult> _kgGatewayDetail(
   http.Client client,
   String globalCollectionId,
 ) async {
-  try {
-    final fromPage = await _kgFromMPage(client, globalCollectionId);
-    if (fromPage != null) return fromPage;
-  } catch (_) {
-    // 分享页直抓失败继续走 v5 接口族。
+  if (globalCollectionId.length > 1000) {
+    throw Exception('酷狗歌单标识无效');
   }
-
-  final infoParams =
-      'appid=1058&specialid=0&global_specialid=$globalCollectionId&format=jsonp'
-      '&srcappid=2919&clientver=20000&clienttime=1586163242519&mid=1586163242519'
-      '&uuid=1586163242519&dfid=-';
-  final infoBody = await _getJson(
-    client,
-    Uri.parse(
-      'https://mobiles.kugou.com/api/v5/special/info_v2?$infoParams'
-      '&signature=${_kgSignature(infoParams)}',
-    ),
-    headers: _kgV5Headers('1586163242519'),
-  );
-  final info = infoBody is Map && infoBody['data'] is Map
-      ? Map<String, dynamic>.from(infoBody['data'] as Map)
-      : const <String, dynamic>{};
-  final total = _toInt(info['songcount']);
-
   final hashes = <String>[];
   final seen = <String>{};
-  var page = 1;
-  var remaining = total > 0 ? total : 300;
-  while (remaining > 0 && hashes.length < _maxImportSongs) {
-    final limit = remaining > 300 ? 300 : remaining;
+  var beginIdx = 0;
+  var total = -1;
+  var name = '';
+  var cover = '';
+  // page 仅作异常保护；正常按 begin_idx/count 与空页终止。
+  for (var page = 1; page <= 200; page++) {
+    if (total > 0 && beginIdx >= total) break;
+    final clienttime = (DateTime.now().millisecondsSinceEpoch ~/ 1000)
+        .toString();
     final params =
-        'appid=1058&global_specialid=$globalCollectionId&specialid=0&plat=0'
-        '&version=8000&page=$page&pagesize=$limit&srcappid=2919&clientver=20000'
-        '&clienttime=1586163263991&mid=1586163263991&uuid=1586163263991&dfid=-';
+        'area_code=1&appid=1005&begin_idx=$beginIdx&clienttime=$clienttime'
+        '&clientver=20489&extend_fields=abtags,hot_cmt,popularization'
+        '&global_collection_id=${Uri.encodeComponent(globalCollectionId)}'
+        '&mode=1&pagesize=300&personal_switch=1&plat=1&type=1&uuid=-';
     final body = await _getJson(
       client,
       Uri.parse(
-        'https://mobiles.kugou.com/api/v5/special/song_v2?$params'
-        '&signature=${_kgSignature(params)}',
+        'https://gateway.kugou.com/pubsongs/v2/get_other_list_file_nofilt'
+        '?$params&signature=${_kgSignature(params, platform: 'android')}',
       ),
-      headers: _kgV5Headers('1586163263991'),
+      headers: const {
+        'User-Agent': 'Android15-1070-11083-46-0-DiscoveryDRADProtocol-wifi',
+        'kg-rc': '1',
+        'kg-thash': '5d816a0',
+        'kg-rec': '1',
+        'kg-rf': 'B9EDA08A64250DEFFBCADDEE00F8F25F',
+      },
     );
-    final data = body is Map && body['data'] is Map
-        ? Map<String, dynamic>.from(body['data'] as Map)
+    if (body is! Map ||
+        _toInt(body['status'], -1) != 1 ||
+        body['data'] is! Map) {
+      throw Exception('酷狗 gateway 通道不可用');
+    }
+    final data = Map<String, dynamic>.from(body['data'] as Map);
+    final listInfo = data['list_info'] is Map
+        ? Map<String, dynamic>.from(data['list_info'] as Map)
         : const <String, dynamic>{};
+    if (name.isEmpty) {
+      name = _decodeJsName(_text(listInfo['name']));
+      var pic = _text(listInfo['pic']);
+      if (pic.contains('{size}')) pic = pic.replaceAll('{size}', '240');
+      cover = _normalizeCover(pic);
+    }
+    final songs = data['songs'] is List ? data['songs'] as List : const [];
     var added = 0;
-    for (final hash in _kgHashesFromList(data['info'])) {
+    for (final hash in _kgHashesFromList(songs)) {
       if (seen.add(hash)) {
         hashes.add(hash);
         added++;
       }
     }
-    if (added == 0) break; // 接口返回空页时终止分页。
-    remaining -= limit;
-    page++;
+    final count = _toInt(data['count']);
+    if (count > total) total = count;
+    if (added == 0) break; // 空页或全是重复：已取全。
+    beginIdx += songs.length;
+    if (songs.length < 300) break; // 非整页：下一页必空。
+    if (hashes.length >= _maxImportSongs) break;
   }
-  if (hashes.isEmpty) throw Exception('酷狗歌单为空或歌单不存在');
-  var cover = _text(info['imgurl']);
-  if (cover.contains('{size}')) cover = cover.replaceAll('{size}', '240');
+  if (hashes.isEmpty) throw Exception('酷狗 gateway 通道无歌曲');
   return await _kgSongsFromHashes(
     client,
-    name: _text(info['specialname']),
-    cover: _normalizeCover(cover),
+    name: name,
+    cover: cover,
     hashes: hashes,
   );
+}
+
+/// v5 歌单详情：info_v2 拿基本信息，song_v2 分页拿 hash 列表。
+/// v5 接口对云收藏歌单（collection_ 形态）已失效，主通道改为
+/// gateway 分页全量（见 _kgGatewayDetail），m 站分享页直抓（服务端
+/// 只渲染首屏 10 首，仅作最后兜底）与本接口族次之。
+Future<LxPlaylistImportResult> _kgDetail2(
+  http.Client client,
+  String globalCollectionId,
+) async {
+  // 主通道：gateway 分页全量（kucode 500 上限 / v5 对云收藏失效 /
+  // m 站首屏 10 首，均无法取全，见 _kgGatewayDetail 注释）。
+  try {
+    return await _kgGatewayDetail(client, globalCollectionId);
+  } catch (_) {
+    // 继续走 v5 接口族。
+  }
+
+  // v5 接口族（普通 gcid 歌单仍有效；云收藏歌单返回空 data）。
+  final hashes = <String>[];
+  try {
+    final infoParams =
+        'appid=1058&specialid=0&global_specialid=$globalCollectionId&format=jsonp'
+        '&srcappid=2919&clientver=20000&clienttime=1586163242519&mid=1586163242519'
+        '&uuid=1586163242519&dfid=-';
+    final infoBody = await _getJson(
+      client,
+      Uri.parse(
+        'https://mobiles.kugou.com/api/v5/special/info_v2?$infoParams'
+        '&signature=${_kgSignature(infoParams)}',
+      ),
+      headers: _kgV5Headers('1586163242519'),
+    );
+    final info = infoBody is Map && infoBody['data'] is Map
+        ? Map<String, dynamic>.from(infoBody['data'] as Map)
+        : const <String, dynamic>{};
+    final total = _toInt(info['songcount']);
+
+    final seen = <String>{};
+    var page = 1;
+    var remaining = total > 0 ? total : 300;
+    while (remaining > 0 && hashes.length < _maxImportSongs) {
+      final limit = remaining > 300 ? 300 : remaining;
+      final params =
+          'appid=1058&global_specialid=$globalCollectionId&specialid=0&plat=0'
+          '&version=8000&page=$page&pagesize=$limit&srcappid=2919&clientver=20000'
+          '&clienttime=1586163263991&mid=1586163263991&uuid=1586163263991&dfid=-';
+      final body = await _getJson(
+        client,
+        Uri.parse(
+          'https://mobiles.kugou.com/api/v5/special/song_v2?$params'
+          '&signature=${_kgSignature(params)}',
+        ),
+        headers: _kgV5Headers('1586163263991'),
+      );
+      final data = body is Map && body['data'] is Map
+          ? Map<String, dynamic>.from(body['data'] as Map)
+          : const <String, dynamic>{};
+      var added = 0;
+      for (final hash in _kgHashesFromList(data['info'])) {
+        if (seen.add(hash)) {
+          hashes.add(hash);
+          added++;
+        }
+      }
+      if (added == 0) break; // 接口返回空页时终止分页。
+      remaining -= limit;
+      page++;
+    }
+    if (hashes.isNotEmpty) {
+      var cover = _text(info['imgurl']);
+      if (cover.contains('{size}')) cover = cover.replaceAll('{size}', '240');
+      return await _kgSongsFromHashes(
+        client,
+        name: _text(info['specialname']),
+        cover: _normalizeCover(cover),
+        hashes: hashes,
+      );
+    }
+  } catch (_) {
+    // v5 接口异常（已下线 / 网络）：继续 m 站兜底。
+  }
+  // v5 拿不到歌曲（老接口已下线 / 非常规 gcid）：m 站分享页直抓最后
+  // 兜底。m 站服务端只渲染首屏 10 首（_kgFromMPage 内有数量校验），
+  // 大歌单仍会失败并抛出下方异常。
+  try {
+    final fromPage = await _kgFromMPage(client, globalCollectionId);
+    if (fromPage != null) return fromPage;
+  } catch (_) {
+    // 直抓失败走统一报错。
+  }
+  throw Exception('酷狗歌单为空或歌单不存在');
 }
 
 /// 从接口返回的歌曲列表中提取去重后的 hash。
