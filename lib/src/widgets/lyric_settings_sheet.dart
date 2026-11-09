@@ -106,6 +106,15 @@ class _LyricSettingsSheetState extends ConsumerState<LyricSettingsSheet> {
                         fontSize: fontSize,
                         height: 1.3,
                         fontWeight: FontWeight.w600,
+                        // 发光效果预览：与逐字渲染同一参数（已播色 65% 辉光）。
+                        shadows: settings.lyricGlowEnabled
+                            ? [
+                                Shadow(
+                                  color: playedColor.withValues(alpha: .65),
+                                  blurRadius: 8,
+                                ),
+                              ]
+                            : null,
                       ),
                     ),
                     const SizedBox(height: 5),
@@ -213,6 +222,17 @@ class _LyricSettingsSheetState extends ConsumerState<LyricSettingsSheet> {
                     ),
               ),
               const SizedBox(height: 10),
+              SwitchListTile(
+                contentPadding: EdgeInsets.zero,
+                secondary: Icon(
+                  Icons.auto_awesome_rounded,
+                  color: scheme.primary,
+                ),
+                title: const Text('发光效果'),
+                subtitle: const Text('逐字歌词按逐字进度发光；无逐字时间戳时激活行整行发光'),
+                value: settings.lyricGlowEnabled,
+                onChanged: (value) => notifier.setLyricGlowEnabled(value),
+              ),
               _segmentRow(
                 title: '对齐方式',
                 labels: const {0: '靠左', 1: '居中', 2: '靠右'},

@@ -53,6 +53,7 @@ class MainActivity : AudioServiceActivity() {
         private const val MINI_PLAYER_CHANNEL = "com.xymusic.mobile/mini_player"
         private const val SYSTEM_UI_CHANNEL = "com.xymusic.mobile/system_ui"
         private const val MEMORY_PRESSURE_CHANNEL = "com.xymusic.mobile/memory_pressure"
+        private const val PLAYBACK_WIFI_CHANNEL = "com.xymusic.mobile/playback_wifi"
         private const val CAPTURE_REQUEST = 4217
         private const val DIRECTORY_REQUEST = 4218
     }
@@ -76,8 +77,7 @@ class MainActivity : AudioServiceActivity() {
                         "nativePressure",
                         mapOf(
                             "nativePssKb" to info.nativePss,
-                            "isXiaomi" to isXiaomiDevice(),
-                        ),
+                        ) + deviceFlags(),
                     )
                 }
             } catch (_: Exception) {
@@ -90,6 +90,21 @@ class MainActivity : AudioServiceActivity() {
         val m = Build.MANUFACTURER?.lowercase() ?: return false
         return m.contains("xiaomi") || m.contains("redmi") || m.contains("poco")
     }
+
+    /// B7：荣耀机型判定。荣耀独立后 MANUFACTURER 为 "HONOR"，早期机型
+    /// （MagicOS 之前的荣耀）仍报 "HUAWEI" 但 brand 为 "HONOR"，两个字段
+    /// 都看一遍，避免漏判。
+    private fun isHonorDevice(): Boolean {
+        val manufacturer = Build.MANUFACTURER?.lowercase() ?: ""
+        val brand = Build.BRAND?.lowercase() ?: ""
+        return manufacturer.contains("honor") || brand.contains("honor")
+    }
+
+    /// 机型信息打包：内存监控与播放链路共用同一份判定，避免多处漂移。
+    private fun deviceFlags(): Map<String, Boolean> = mapOf(
+        "isXiaomi" to isXiaomiDevice(),
+        "isHonor" to isHonorDevice(),
+    )
 
     private var mediaButtonChannel: MethodChannel? = null
 
@@ -116,6 +131,11 @@ class MainActivity : AudioServiceActivity() {
     /// 因系统持有性能锁而恢复正常。App 主动持锁等价于常驻该状态。
     @Suppress("DEPRECATION")
     private var wifiLock: WifiManager.WifiLock? = null
+    // 耗电优化：Wi-Fi 高性能锁改为与播放态联动。原实现 onCreate 无条件
+    // acquire、onDestroy 才 release，等于进程活着 Wi-Fi 就进不了省电模式。
+    // 暂停/停止后延迟 3s 释放，避免切歌与瞬时缓冲造成 acquire/release 抖动。
+    private val wifiLockHandler = Handler(Looper.getMainLooper())
+    private val releaseWifiLockRunnable = Runnable { releasePlaybackWifiLock() }
 
     override fun onCreate(savedInstanceState: android.os.Bundle?) {
         // Rust std::env::temp_dir() 在 Android 上默认解析为 /data/local/tmp
@@ -146,7 +166,9 @@ class MainActivity : AudioServiceActivity() {
         pendingDeepLink = extractDeepLink(intent)
         // 通知栏双击（自动开桌面歌词）/浮窗 ⚙ 设置键的冷启动转发。
         handleDesktopLyricsIntent(intent)
-        acquirePlaybackWifiLock()
+        // 耗电优化：不再在 onCreate 无条件持有 Wi-Fi 高性能锁。改由 Dart 侧
+        // 按播放态经 PLAYBACK_WIFI_CHANNEL 驱动（起播 acquire / 暂停停止后
+        // 延迟 3s release），闲置与熄屏时不再阻止 Wi-Fi 省电。
         // 内存治理 ⑪：Native Heap 周期监控启动（首个周期 60s 后）。
         memoryMonitorHandler.postDelayed(memoryMonitorRunnable, 60_000)
     }
@@ -158,17 +180,14 @@ class MainActivity : AudioServiceActivity() {
         if (level >= ComponentCallbacks2.TRIM_MEMORY_RUNNING_MODERATE) {
             memoryPressureChannel?.invokeMethod(
                 "onTrimMemory",
-                mapOf("level" to level, "isXiaomi" to isXiaomiDevice()),
+                mapOf("level" to level) + deviceFlags(),
             )
         }
     }
 
     override fun onDestroy() {
-        try {
-            wifiLock?.release()
-        } catch (_: Exception) {
-        }
-        wifiLock = null
+        wifiLockHandler.removeCallbacks(releaseWifiLockRunnable)
+        releasePlaybackWifiLock()
         memoryMonitorHandler.removeCallbacks(memoryMonitorRunnable)
         super.onDestroy()
     }
@@ -194,6 +213,17 @@ class MainActivity : AudioServiceActivity() {
             }
         } catch (_: Exception) {
             // 持锁失败不影响正常功能，仅回退到系统默认调度。
+        }
+    }
+
+    /// 耗电优化：释放播放期 Wi-Fi 锁（幂等，重复调用安全）。
+    private fun releasePlaybackWifiLock() {
+        val lock = wifiLock ?: return
+        wifiLock = null
+        try {
+            if (lock.isHeld) lock.release()
+        } catch (_: Exception) {
+            // 已释放/系统回收，忽略。
         }
     }
 
@@ -668,7 +698,7 @@ class MainActivity : AudioServiceActivity() {
         ).also { channel ->
             channel.setMethodCallHandler { call, result ->
                 if (call.method == "getInitialInfo") {
-                    result.success(mapOf("isXiaomi" to isXiaomiDevice()))
+                    result.success(deviceFlags())
                 } else {
                     result.notImplemented()
                 }
@@ -845,6 +875,24 @@ class MainActivity : AudioServiceActivity() {
                     }
                     result.success(true)
                 }
+            }
+        // 耗电优化：播放态驱动 Wi-Fi 高性能锁。arguments 为布尔值：
+        // true = 起播（立即 acquire，并取消待执行的延迟释放）；
+        // false = 暂停/停止（延迟 3s 释放，吸收切歌与瞬时缓冲）。
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, PLAYBACK_WIFI_CHANNEL)
+            .setMethodCallHandler { call, result ->
+                if (call.method != "setPlaying") {
+                    result.notImplemented()
+                    return@setMethodCallHandler
+                }
+                val playing = call.arguments == true
+                wifiLockHandler.removeCallbacks(releaseWifiLockRunnable)
+                if (playing) {
+                    acquirePlaybackWifiLock()
+                } else {
+                    wifiLockHandler.postDelayed(releaseWifiLockRunnable, 3_000)
+                }
+                result.success(true)
             }
         // 系统栏沉浸控制：API 30+ 用 WindowInsetsController 硬隐藏状态栏
         // （Android 15 强制 edge-to-edge 后 SystemChrome 的 immersive 在
@@ -1144,6 +1192,16 @@ class MainActivity : AudioServiceActivity() {
                     result.success(payload)
                     return@setMethodCallHandler
                 }
+                // Dart 侧「本轮不探测」声明：暂停播放 / 无音源 / 退后台 /
+                // 重建中时，audioProbe 不会发出，但 Dart 事件循环是活的。
+                // 与 audioProbe 一样刷新探针时间戳（这条调用同为主线程往返，
+                // 能到达即证明主 isolate 未停摆），并带上原因供日志解释空档。
+                if (call.method == "dartProbeIdle") {
+                    val reason = call.argument<String>("reason") ?: "idle"
+                    FreezeProbe.noteDartProbeIdle(reason)
+                    result.success(null)
+                    return@setMethodCallHandler
+                }
                 if (call.method == "getStorageRoots") {
                     // 枚举可用的存储卷根（含外置 SD 卡）：getExternalFilesDirs
                     // 返回每个卷上的应用专属目录，从其路径推出卷根
@@ -1180,10 +1238,19 @@ class MainActivity : AudioServiceActivity() {
                     result.notImplemented()
                     return@setMethodCallHandler
                 }
-                val versionName = try {
-                    packageManager.getPackageInfo(packageName, 0).versionName ?: ""
+                // versionCode 一并下发：崩溃记录头部只有 versionName 无法
+                // 区分同一天连续交付的构建（5610~5615 都是 2.6.0），
+                // 符号化堆栈必须先对准构建号。
+                val versionInfo = try {
+                    packageManager.getPackageInfo(packageName, 0)
                 } catch (_: Exception) {
-                    ""
+                    null
+                }
+                val versionName = versionInfo?.versionName ?: ""
+                val versionCode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                    versionInfo?.longVersionCode ?: 0L
+                } else {
+                    versionInfo?.versionCode?.toLong() ?: 0L
                 }
                 result.success(
                     mapOf(
@@ -1192,6 +1259,7 @@ class MainActivity : AudioServiceActivity() {
                         "osVersion" to Build.VERSION.RELEASE,
                         "sdkInt" to Build.VERSION.SDK_INT,
                         "appVersion" to versionName,
+                        "appBuild" to versionCode,
                     ),
                 )
             }

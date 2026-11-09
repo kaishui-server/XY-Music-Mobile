@@ -765,18 +765,53 @@ class _RecommendationTabs extends ConsumerStatefulWidget {
 
 class _RecommendationTabsState extends ConsumerState<_RecommendationTabs>
     with SingleTickerProviderStateMixin {
-  late final TabController _controller;
+  late TabController _controller;
   var _index = 0;
+
+  /// 上一次构建时是否存在支持每日推荐的 Baka 插件
+  /// （决定「每日30首」Tab 显隐）。didChangeDependencies 中对比，
+  /// 变化时才重建 TabController。
+  var _hasDaily30Plugin = false;
 
   @override
   void initState() {
     super.initState();
     _controller = TabController(length: 2, vsync: this)
-      ..addListener(() {
-        if (_index != _controller.index && !_controller.indexIsChanging) {
-          setState(() => _index = _controller.index);
-        }
-      });
+      ..addListener(_onControllerChanged);
+  }
+
+  void _onControllerChanged() {
+    if (_index != _controller.index && !_controller.indexIsChanging) {
+      setState(() => _index = _controller.index);
+    }
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    // 插件列表异步加载完成前 valueOrNull 为 null，按无 Baka 处理；
+    // 数据到达后本回调会再次触发，届时再补齐第三个 Tab。
+    // 与 dailyRecommendationsProvider 的选型条件保持一致：必须是
+    // Baka 协议且可能声明 getDailyRecommendations 的插件才显示入口。
+    final hasDaily30 = ref
+            .watch(enabledMusicPluginsProvider)
+            .valueOrNull
+            ?.any(
+              (plugin) =>
+                  plugin.isBaka &&
+                  plugin.mayHaveMethod('getDailyRecommendations'),
+            ) ??
+        false;
+    if (hasDaily30 == _hasDaily30Plugin) return;
+    _hasDaily30Plugin = hasDaily30;
+    final target = hasDaily30 ? 3 : 2;
+    if (_controller.length == target) return;
+    final oldIndex = _index;
+    _controller.dispose();
+    _controller = TabController(length: target, vsync: this)
+      ..addListener(_onControllerChanged);
+    // Baka 插件被卸载导致 Tab 数收缩时，把当前页切回「歌单」。
+    if (oldIndex >= target) _index = 0;
   }
 
   @override
@@ -798,16 +833,19 @@ class _RecommendationTabsState extends ConsumerState<_RecommendationTabs>
           tabAlignment: TabAlignment.start,
           labelColor: theme.colorScheme.primary,
           unselectedLabelColor: theme.colorScheme.onSurfaceVariant,
-          tabs: const [
-            Tab(text: '歌曲'),
-            Tab(text: '歌单'),
+          tabs: [
+            const Tab(text: '歌曲'),
+            const Tab(text: '歌单'),
+            if (_hasDaily30Plugin) const Tab(text: '每日30首'),
           ],
         ),
         const SizedBox(height: 8),
         if (_index == 0)
           _RecommendedSongsContent(onMore: widget.onMore)
+        else if (_index == 1)
+          _RecommendedPlaylistsContent(onMore: widget.onMore)
         else
-          _RecommendedPlaylistsContent(onMore: widget.onMore),
+          _Daily30RecommendationContent(),
       ],
     );
   }
@@ -871,6 +909,93 @@ class _RecommendedPlaylistsContent extends ConsumerWidget {
                   playlists: playlists,
                   onMore: onMore,
                 ),
+        );
+  }
+}
+
+/// 「每日30首」Tab 内容：拉取 Baka QQ 音乐插件的每日歌单。
+///
+/// 按插件返回的 state 分流：ready 展示歌单卡片（点击进入详情/播放）；
+/// unconfigured / login_required 引导去插件设置填写用户 ID；其余状态
+/// 给出可重试或可刷新的提示。
+class _Daily30RecommendationContent extends ConsumerWidget {
+  const _Daily30RecommendationContent();
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    return ref.watch(dailyRecommendationsProvider).when(
+          loading: () => const Padding(
+            padding: EdgeInsets.symmetric(vertical: 44),
+            child: Center(child: CircularProgressIndicator()),
+          ),
+          error: (error, _) => _RecommendationMessage(
+            message: '每日 30 首暂时不可用',
+            detail: '$error',
+            onRetry: () => ref.invalidate(dailyRecommendationsProvider),
+          ),
+          data: (state) {
+            if (state == null) {
+              // 正常路径下无 Baka 插件时不显示该 Tab，这里是防御性兜底。
+              return const _RecommendationMessage(
+                message: '暂无每日 30 首推荐',
+                detail: '当前没有支持每日推荐的 Baka QQ 音乐插件，安装后即可使用',
+              );
+            }
+            final result = state.result;
+            switch (result.state) {
+              case 'ready':
+                final playlist = state.playlist;
+                if (playlist == null) {
+                  return _RecommendationMessage(
+                    message: '今日歌单加载失败',
+                    detail: '返回的歌单数据不完整，请稍后重试',
+                    onRetry: () =>
+                        ref.invalidate(dailyRecommendationsProvider),
+                  );
+                }
+                return Padding(
+                  padding: const EdgeInsets.only(top: 4),
+                  child: _RecommendationPlaylistTile(playlist: playlist),
+                );
+              case 'unconfigured':
+                return _RecommendationMessage(
+                  message: '尚未配置 QQ 音乐用户 ID',
+                  detail: '进入插件设置，填写 Baka QQ 音乐插件中的"用户 ID"，即可开启你的每日 30 首',
+                  onRetry: () => context.push<void>('/settings/plugins'),
+                  actionLabel: '去设置',
+                );
+              case 'login_required':
+                return _RecommendationMessage(
+                  message: 'QQ 音乐用户 ID 已失效',
+                  detail: '请重新获取用户 ID 后到插件设置中更新',
+                  onRetry: () => context.push<void>('/settings/plugins'),
+                  actionLabel: '去设置',
+                );
+              case 'blocked':
+                return const _RecommendationMessage(
+                  message: '每日推荐暂不可用',
+                  detail: '该账号的每日推荐请求暂时受限，请稍后再试',
+                );
+              case 'updating':
+                return _RecommendationMessage(
+                  message: '今日歌单正在生成',
+                  detail: '每日 30 首需要一点时间生成，稍后刷新查看',
+                  onRetry: () => ref.invalidate(dailyRecommendationsProvider),
+                  actionLabel: '刷新',
+                );
+              case 'unsupported':
+                return const _RecommendationMessage(
+                  message: '暂无每日 30 首推荐',
+                  detail: '当前插件不支持每日推荐，安装支持该功能的 Baka QQ 音乐插件后即可使用',
+                );
+              default:
+                return _RecommendationMessage(
+                  message: '每日推荐加载失败',
+                  detail: '请检查网络后重试',
+                  onRetry: () => ref.invalidate(dailyRecommendationsProvider),
+                );
+            }
+          },
         );
   }
 }
@@ -1504,11 +1629,13 @@ class _RecommendationMessage extends StatelessWidget {
     required this.message,
     this.detail,
     this.onRetry,
+    this.actionLabel = '重试',
   });
 
   final String message;
   final String? detail;
   final VoidCallback? onRetry;
+  final String actionLabel;
 
   @override
   Widget build(BuildContext context) {
@@ -1537,7 +1664,7 @@ class _RecommendationMessage extends StatelessWidget {
           ],
           if (onRetry != null) ...[
             const SizedBox(height: 8),
-            TextButton(onPressed: onRetry, child: const Text('重试')),
+            TextButton(onPressed: onRetry, child: Text(actionLabel)),
           ],
         ],
       ),

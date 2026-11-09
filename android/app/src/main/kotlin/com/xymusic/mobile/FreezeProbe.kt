@@ -1,8 +1,11 @@
 package com.xymusic.mobile
 
+import android.app.Activity
 import android.app.ActivityManager
+import android.app.Application
 import android.content.Context
 import android.os.Build
+import android.os.Bundle
 import android.os.Debug
 import android.os.Handler
 import android.os.HandlerThread
@@ -53,8 +56,17 @@ object FreezeProbe {
     /** 主线程延迟超过该值记一条事件。 */
     private const val MAIN_LAG_EVENT_MS = 8_000L
 
-    /** Dart 探针超过该值未刷新即判定 Dart 主 isolate 停摆。 */
-    private const val DART_LAG_EVENT_MS = 20_000L
+    /**
+     * Dart 探针超过该值未刷新即判定 Dart 主 isolate 停摆。
+     *
+     * 【口径修正】必须显著大于 Dart 侧播放心跳周期（player_provider 的
+     * _playerHeartbeatTimer = 20s）。早先取 20_000 恰好等于一个心跳周期，
+     * 只要错开一拍（切前后台、暂停、切歌间隙、一次长 GC）就必然触发：
+     * 荣耀 AAP-AN00 实测 20144ms / 20284ms 两条「停摆」即为此误报，
+     * 当时 mainLag 全程 0~1ms、探针自身连续采样，进程根本没冻结。
+     * 取 3 个心跳周期（60s）留足余量。
+     */
+    private const val DART_LAG_EVENT_MS = 60_000L
 
     /** 进程 PSS 超过该值、且系统可用内存见底，才判定内存异常。 */
     private const val MEMORY_EVENT_MB = 2048L
@@ -98,9 +110,45 @@ object FreezeProbe {
     @Volatile
     private var lastDartProbeAt = 0L
 
+    /**
+     * 最近一次 Dart 侧「主动声明不探测」的原因（后台/暂停/无音源/重建中）。
+     *
+     * 早先只有 audioProbe 一种心跳，而 Dart 播放心跳在三处早退
+     * （非 resumed、current==null、!isPlaying）时根本不会发 probe，于是
+     * 停止观测被误判成「isolate 停摆」。让 Dart 把「我不探测」也上报一次，
+     * 时间戳照常刷新——能上报本身就证明「Dart 事件循环 + 原生主线程都活着」，
+     * 语义完全等价，只是原因不同。
+     */
+    @Volatile
+    private var lastDartIdleReason: String = ""
+
+    /** 上一个采样周期的投递时刻，用于自证「探针自身是否被系统冻结」。 */
+    @Volatile
+    private var lastSampleAt = 0L
+
     /** 最近一次测得的主线程延迟（ms）。 */
     @Volatile
     private var lastMainLagMs = 0L
+
+    /** 前台可见 Activity 计数（>0 即前台），用于区分「后台被系统冻结」与「前台真停摆」。 */
+    @Volatile
+    private var foregroundActivities = 0
+
+    private val lifecycleTracker = object : Application.ActivityLifecycleCallbacks {
+        override fun onActivityResumed(activity: Activity) {
+            foregroundActivities++
+        }
+
+        override fun onActivityPaused(activity: Activity) {
+            if (foregroundActivities > 0) foregroundActivities--
+        }
+
+        override fun onActivityCreated(activity: Activity, savedInstanceState: Bundle?) {}
+        override fun onActivityStarted(activity: Activity) {}
+        override fun onActivityStopped(activity: Activity) {}
+        override fun onActivitySaveInstanceState(activity: Activity, outState: Bundle) {}
+        override fun onActivityDestroyed(activity: Activity) {}
+    }
 
     private val mainHandler = Handler(Looper.getMainLooper())
     private val lock = Any()
@@ -120,6 +168,9 @@ object FreezeProbe {
     /** 首次判定停摆时是否已落盘线程状态快照（只落一次，避免刷屏）。 */
     private var threadDumpDone = false
 
+    /** 后台停摆提示行是否已记过（每段停摆只记一条，避免刷屏）。 */
+    private var bgStallNoted = false
+
     /** 正常采样行的内存环形缓冲：命中异常时整段刷盘还原卡死过程。 */
     private val ring = ArrayDeque<String>()
     private var headerLines: List<String> = emptyList()
@@ -131,6 +182,12 @@ object FreezeProbe {
         startedAtMs = SystemClock.uptimeMillis()
         val app = context.applicationContext
         logFile = File(CrashHandler.crashDir(app), FILE_NAME)
+        // 前后台判定：后台被 MagicOS/ColorOS 等冻结 Dart isolate 属正常
+        // 省电行为，停摆判定必须区分前后台（见 sample）。
+        try {
+            (app as? Application)?.registerActivityLifecycleCallbacks(lifecycleTracker)
+        } catch (_: Throwable) {
+        }
         // 上一次进程若是「正常退出」（用户划掉/系统常规回收/升级安装），说明
         // 现有的 crash-freeze.txt 是运行期误报——真卡死/被低内存击杀才会留下
         // 有价值的现场。此时直接清掉，避免用户反复看到一份「没崩溃却有崩溃
@@ -144,6 +201,15 @@ object FreezeProbe {
             add(
                 "进程启动 pid=${Process.myPid()} uptime=${SystemClock.uptimeMillis()}ms " +
                     "设备=${Build.MANUFACTURER} ${Build.MODEL} API=${Build.VERSION.SDK_INT}",
+            )
+            // 判定口径随现场一起落盘：日后翻日志时不必再回头倒推阈值与
+            // 「为什么这条算异常」。Dart 侧每条采样行带 dartLag/probeGap/
+            // dartIdle 三项自证数据，据此可直接区分「isolate 真停摆」与
+            // 「Dart 主动不探测 / 整机冻结 / 探针自己也被冻结」。
+            add(
+                "判定口径 采样间隔=${INTERVAL_MS}ms Dart心跳=20s " +
+                    "停摆阈值=${DART_LAG_EVENT_MS}ms " +
+                    "（需同时满足：前台 + 本探针采样间隔正常）",
             )
             addAll(previousExitInfo(app))
         }
@@ -166,28 +232,78 @@ object FreezeProbe {
     /** Dart 探针每次采样（audioProbe）时调用，用于推算 Dart 主 isolate 是否停摆。 */
     fun noteDartProbe() {
         lastDartProbeAt = SystemClock.uptimeMillis()
+        lastDartIdleReason = ""
+    }
+
+    /**
+     * Dart 侧主动声明「本轮不探测」时调用（后台/暂停/无音源/重建中）。
+     *
+     * 与 [noteDartProbe] 一样刷新心跳时间戳：这条调用同样是一次 MethodChannel
+     * 主线程往返，能到达就说明 Dart 事件循环与原生主线程都还在跑，只是本次
+     * 没有探测的必要。否则"暂停播放 60 秒"就会被写成一份崩溃记录。
+     */
+    fun noteDartProbeIdle(reason: String) {
+        lastDartProbeAt = SystemClock.uptimeMillis()
+        lastDartIdleReason = reason
     }
 
     private fun sample(context: Context) {
         val postedAt = SystemClock.uptimeMillis()
         val inGrace = postedAt - startedAtMs < STARTUP_GRACE_MS
-        // 主线程调度延迟：从投递到真正执行的时间差。
+        val inForeground = foregroundActivities > 0
+        // 主线程调度延迟：从投递到真正执行的时间差。进程被冻结期间投递的
+        // 回调会在解冻瞬间立刻执行（lag≈0），不会误报；仅前台卡顿才落盘。
         mainHandler.post {
             val lag = SystemClock.uptimeMillis() - postedAt
             lastMainLagMs = lag
-            if (lag >= MAIN_LAG_EVENT_MS) {
+            if (lag >= MAIN_LAG_EVENT_MS && foregroundActivities > 0) {
                 record("[${timeFormat.format(Date())}] 主线程卡顿 ${lag}ms pid=${Process.myPid()}", force = true)
             }
         }
+        // 探针自证：记录相邻两次采样的真实间隔。进程被系统整体冻结时，这个
+        // 采样回调会一起停，间隔必然出现 ≥2 个周期的空档——此时期间累积的
+        // dartLag 是「整机冻结」，不能算 Dart 单独停摆（旧口径一边写「系统
+        // 冻结，非故障」一边按 20s 阈值判停摆，自己和自己打架）。
+        val probeGap = if (lastSampleAt == 0L) 0L else postedAt - lastSampleAt
+        lastSampleAt = postedAt
+        val proberFrozen = probeGap >= INTERVAL_MS * 2
+
         val dartLag = if (lastDartProbeAt == 0L) -1L else postedAt - lastDartProbeAt
-        val line = memoryLine(context, dartLag)
+        val dartIdle = lastDartIdleReason.ifEmpty { "active" }
+        val line = memoryLine(context, dartLag, probeGap, dartIdle)
         val dartStalled = dartLag >= DART_LAG_EVENT_MS
-        if (dartStalled) {
-            record("[${timeFormat.format(Date())}] Dart 主 isolate 停摆 ${dartLag}ms", force = true)
-            // 首次判停摆时抓一次全线程状态：直接区分「被锁/IO 阻塞」与「CPU 空转」。
+        // 停摆判定三档，必须先排除「不该归咎于 Dart」的两种情况：
+        // ① 进程在后台：MagicOS/ColorOS 等冻结 Dart isolate 是省电行为
+        //    （native 音频线程不受影响，歌照常出声）；
+        // ② 探针自身也被冻结（probeGap ≥ 2 个采样周期）：整机冻结，与 Dart 无关。
+        // 只有「前台 + 探针自身仍在按周期采样 + Dart 心跳仍不动」才算真故障
+        // （ANR 级），才落盘现场——否则正常后台播放/暂停都会留下一份「崩溃
+        // 记录」，把真卡死淹没（荣耀 AAP-AN00 实测 37 分钟假停摆即此误报）。
+        val dartStallAbnormal = dartStalled && inForeground && !proberFrozen
+        if (dartStalled && !dartStallAbnormal && !bgStallNoted) {
+            bgStallNoted = true
+            val cause = if (proberFrozen) {
+                "探针自身也被冻结 ${probeGap}ms，整机冻结，非故障"
+            } else {
+                "进程在后台，系统冻结 Dart isolate，非故障"
+            }
+            record("[${timeFormat.format(Date())}] Dart isolate 停摆 ${dartLag}ms（$cause）")
+        }
+        if (!dartStalled) bgStallNoted = false
+        if (dartStallAbnormal) {
+            record(
+                "[${timeFormat.format(Date())}] Dart 主 isolate 停摆 ${dartLag}ms" +
+                    "（probeGap=${probeGap}ms dartIdle=$dartIdle）",
+                force = true,
+            )
+            // 首次判停摆时抓一次全线程状态：直接区分「被锁/IO 阻塞」
+            // 与「CPU 空转」。整段一次性写入，避免逐线程开关文件。
             if (!threadDumpDone) {
                 threadDumpDone = true
-                readThreadStates().forEach { record(it, force = true) }
+                record(
+                    readThreadStates().joinToString(separator = "\n"),
+                    force = true,
+                )
             }
         }
         // 内存/线程数暴涨同样视为异常：整包缓存或线程栈泄漏会让进程被系统
@@ -199,13 +315,13 @@ object FreezeProbe {
         memoryStreak = if (!inGrace && memHigh) memoryStreak + 1 else 0
         threadStreak = if (!inGrace && threadHigh) threadStreak + 1 else 0
         val sustained = memoryStreak >= ANOMALY_STREAK || threadStreak >= ANOMALY_STREAK
-        val anomaly = dartStalled || sustained
+        val anomaly = dartStallAbnormal || sustained
         record(line, force = anomaly)
         // 区域归属明细要解析整份 smaps（较贵），只在异常路径上按 60s 节流记录：
         // 用来在内存异常时锁定究竟是哪一块映射吃掉了几个 G，以及这块到底是
         // Dart VM 堆还是原生分配（见 readVmaStats）。
         sampleCount++
-        if (dartStalled || (anomaly && sampleCount % 6L == 0L)) {
+        if (anomaly && sampleCount % 6L == 0L) {
             val vmas = readVmaStats()
             record("  [regions]${regionSummary(vmas)}", force = true)
             topRegions(vmas, 8).forEach { record(it, force = true) }
@@ -237,7 +353,7 @@ object FreezeProbe {
     private fun intField(line: String, key: String): Int =
         Regex("$key=(\\d+)").find(line)?.groupValues?.get(1)?.toIntOrNull() ?: 0
 
-    private fun memoryLine(context: Context, dartLag: Long): String {
+    private fun memoryLine(context: Context, dartLag: Long, probeGap: Long, dartIdle: String): String {
         val am = context.getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager
         var pssKb = 0L
         var detail = ""
@@ -263,11 +379,18 @@ object FreezeProbe {
         // 共享/文件页增长 = mmap 的文件（如整包音频缓存）未释放；
         // 线程数持续上涨 = 线程栈泄漏。三者处置方式完全不同。
         val detailRollup = readSmapsRollup()
-        return "[${timeFormat.format(Date())}] mem pss=${pssKb / 1024}MB$detail " +
+        val pssMb = pssKb / 1024
+        return "[${timeFormat.format(Date())}] mem pss=${pssMb}MB$detail " +
             "javaHeap=${javaUsedMb}MB " +
             "sysAvail=${info.availMem / 1048576L}MB low=${info.lowMemory} " +
             "threads=${readThreadCount()}$detailRollup${readSwapInfo()} " +
-            "mainLag=${lastMainLagMs}ms dartLag=${dartLag}ms"
+            "mainLag=${lastMainLagMs}ms dartLag=${dartLag}ms " +
+            // probeGap：相邻两次采样的真实间隔。持续 ≈INTERVAL_MS 说明探针
+            // 自己在正常跑；出现 >=2 个周期的空档则说明整个进程被冻结过
+            // （此时 dartLag 的增长是整机冻结所致，不能当作 Dart 单独停摆）。
+            // dartIdle：Dart 最近一次主动声明的不探测原因（paused/no-source/
+            // background/rebuilding/app-alive），空串代表仍在正常发 audioProbe。
+            "probeGap=${probeGap}ms dartIdle=${dartIdle.ifEmpty { "active" }}"
     }
 
     /**
@@ -672,7 +795,9 @@ object FreezeProbe {
                     ""
                 }
                 out.add(
-                    "    ${comm.ifEmpty { "?" }} tid=$tid state=$state" +
+                    "    ${comm.ifEmpty { "?" }}" +
+                        " tid=$tid state=$state" +
+                        " tid=$tid state=$state" +
                         " wchan=${wchan.ifEmpty { "-" }}",
                 )
             }
@@ -696,7 +821,14 @@ object FreezeProbe {
                 if (!flushed) {
                     file.parentFile?.mkdirs()
                     file.appendText(headerLines.joinToString(separator = "\n", postfix = "\n"))
-                    file.appendText(ring.joinToString(separator = "\n", postfix = "\n"))
+                    // 环形缓冲里混着自我说明性质的「非故障」行（后台停摆、
+                    // 整机冻结等）。它们只该留在内存里解释上下文，不该进崩溃
+                    // 文件——否则导出的「崩溃记录」里出现「非故障」字样与真
+                    // 现场并列，既误导判断，也让这份文件的意义失效。
+                    file.appendText(
+                        ring.filterNot { it.contains("非故障") }
+                            .joinToString(separator = "\n", postfix = "\n"),
+                    )
                     flushed = true
                 } else {
                     file.appendText(line + "\n")

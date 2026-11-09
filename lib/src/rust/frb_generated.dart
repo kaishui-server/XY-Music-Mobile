@@ -662,7 +662,7 @@ abstract class RustLibApi extends BaseApi {
     int? minimumDurationSeconds,
   });
 
-  Future<String> crateApiScanMusicFolder({
+  Future<int> crateApiScanMusicFolder({
     required String dbPath,
     required String folderPath,
     int? minimumDurationSeconds,
@@ -5740,7 +5740,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   );
 
   @override
-  Future<String> crateApiScanMusicFolder({
+  Future<int> crateApiScanMusicFolder({
     required String dbPath,
     required String folderPath,
     int? minimumDurationSeconds,
@@ -5762,7 +5762,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           );
         },
         codec: SseCodec(
-          decodeSuccessData: sse_decode_String,
+          decodeSuccessData: sse_decode_u_32,
           decodeErrorData: sse_decode_String,
         ),
         constMeta: kCrateApiScanMusicFolderConstMeta,

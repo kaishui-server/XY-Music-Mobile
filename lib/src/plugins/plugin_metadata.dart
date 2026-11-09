@@ -73,8 +73,9 @@ class PluginMetadata {
 
   static PluginMetadata parse(String script) {
     final constants = _parseStringConstants(script);
+    final bindings = _parseBindings(script);
     final header = _parseHeader(script);
-    final exported = _parseExportedObject(script, constants);
+    final exported = _parseExportedObject(script, constants, bindings);
     final json = _parseJsonObject(script);
     final constMeta = _parseConstMeta(script);
     final author = _clean(
@@ -319,6 +320,7 @@ class PluginMetadata {
     'importMusicSheet',
     'importMusicItem',
     'importPlaylist',
+    'getDailyRecommendations',
     'getArtistWorks',
     'getArtistInfo',
     'getAlbumInfo',
@@ -555,6 +557,12 @@ class PluginMetadata {
         r'''(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*"([^"\r\n]*)"\s*;''',
       ),
       RegExp(r"(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*'([^'\r\n]*)'\s*;"),
+      // 数字常量（如服务器注入的 QQ_SOURCE_LEVEL = 1）：部分插件用它从
+      // 配置表里选出 platform，成员链求值（见 [_resolveStaticNodeInternal]）
+      // 需要把它还原成字符串索引。
+      RegExp(
+        r'(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(-?\d+(?:\.\d+)?)\s*;',
+      ),
     ];
     for (final pattern in patterns) {
       for (final match in pattern.allMatches(scope)) {
@@ -567,6 +575,7 @@ class PluginMetadata {
   static Map<String, String> _parseExportedObject(
     String script,
     Map<String, String> constants,
+    Map<String, String> bindings,
   ) {
     final exportPatterns = [
       RegExp(r'module\.exports\s*=\s*\{'),
@@ -585,10 +594,11 @@ class PluginMetadata {
       final result = _parseExportFields(
         _extractExportObjectBody(script, lastMatch.end),
         constants,
+        bindings,
       );
       if (result.isNotEmpty) return result;
     }
-    return _parseVariableExport(script, constants);
+    return _parseVariableExport(script, constants, bindings);
   }
 
   /// `module.exports = MF_PLUGIN;`（导出的是变量而非对象字面量，
@@ -597,6 +607,7 @@ class PluginMetadata {
   static Map<String, String> _parseVariableExport(
     String script,
     Map<String, String> constants,
+    Map<String, String> bindings,
   ) {
     final variablePatterns = [
       RegExp(r'module\.exports\s*=\s*([A-Za-z_$][\w$]*)\s*;'),
@@ -613,6 +624,7 @@ class PluginMetadata {
         final result = _parseExportFields(
           _extractExportObjectBody(script, declaration.end),
           constants,
+          bindings,
         );
         if (result.isNotEmpty) return result;
       }
@@ -680,6 +692,7 @@ class PluginMetadata {
   static Map<String, String> _parseExportFields(
     String scope,
     Map<String, String> constants,
+    Map<String, String> bindings,
   ) {
     final result = <String, String>{};
     for (final key in const [
@@ -698,7 +711,7 @@ class PluginMetadata {
         multiLine: true,
       ).firstMatch(_maskNestedScope(scope));
       if (field == null) continue;
-      final value = _resolveExpression(field.group(1)!, constants);
+      final value = _resolveExpression(field.group(1)!, constants, bindings);
       if (value != null && value.isNotEmpty) result[key] = value;
     }
     return result;
@@ -778,8 +791,16 @@ class PluginMetadata {
 
   static String? _resolveExpression(
     String expression,
-    Map<String, String> constants,
-  ) {
+    Map<String, String> constants, [
+    Map<String, String>? bindings,
+  ]) {
+    // 优先做成员链静态求值：platform: qqSourceProfile.platform 这类间接
+    // 取值只看字面量会得到 null，进而回退成插件 ID（表现为 qq-l1）。
+    if (bindings != null) {
+      final resolved = _resolveStaticNode(expression, bindings, constants, 0);
+      if (resolved != null) return resolved;
+    }
+
     final quoted = RegExp(r'''["']([^"']*)["']''').firstMatch(expression);
     String? result = quoted?.group(1);
 
@@ -796,6 +817,316 @@ class PluginMetadata {
       }
     }
     return result;
+  }
+
+  /// 收集顶层 const/let/var 的右值原文（含对象/数组字面量），供
+  /// [_resolveStaticNodeInternal] 还原间接取值（如 `A[LEVEL].platform`）。
+  ///
+  /// 只匹配行首声明，避免把函数体内的局部常量当成插件级配置；脚本前
+  /// 128 KB 之外的部分不参与（元数据声明不会出现在那么靠后的位置）。
+  static Map<String, String> _parseBindings(String script) {
+    final result = <String, String>{};
+    final scope = script.substring(0, math.min(script.length, 128 * 1024));
+    final pattern = RegExp(
+      r'^(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*',
+      multiLine: true,
+    );
+    for (final match in pattern.allMatches(scope)) {
+      var i = match.end;
+      while (i < scope.length && scope[i].trim().isEmpty) {
+        i++;
+      }
+      if (i >= scope.length) continue;
+      String? value;
+      if (scope[i] == '{' || scope[i] == '[') {
+        final end = _balancedEnd(scope, i);
+        if (end != null) value = scope.substring(i, end + 1);
+      } else if (scope[i] == '"' || scope[i] == "'") {
+        final literal = _readStringLiteral(scope, i);
+        if (literal != null) value = scope.substring(i, literal.$2);
+      } else {
+        var j = i;
+        while (j < scope.length &&
+            scope[j] != ';' &&
+            scope[j] != '\n' &&
+            scope[j] != '\r') {
+          j++;
+        }
+        value = scope.substring(i, j).trim();
+      }
+      if (value != null && value.isNotEmpty) {
+        result[match.group(1)!] = value;
+      }
+    }
+    return result;
+  }
+
+  /// 成员链静态求值入口：命中字符串字面量时返回其内容，否则返回 null
+  /// （交由调用方按原有「字面量 + 字符串常量拼接」规则兜底）。
+  static String? _resolveStaticNode(
+    String expression,
+    Map<String, String> bindings,
+    Map<String, String> constants,
+    int depth,
+  ) {
+    return _resolveStaticNodeInternal(
+      expression,
+      bindings,
+      constants,
+      depth,
+    )?.value;
+  }
+
+  /// 有限求值 `IDENT.prop` / `IDENT["prop"]` / `IDENT[CONST]` 及其后续
+  /// `.prop`：支持对象/数组字面量常量与别名声明（如
+  /// `const qqSourceProfile = qqSourceProfiles[QQ_SOURCE_LEVEL]`）。
+  /// 不执行脚本、不做运算，只沿声明与字面量取值，深度受限防环。
+  static _StaticNode? _resolveStaticNodeInternal(
+    String expression,
+    Map<String, String> bindings,
+    Map<String, String> constants,
+    int depth,
+  ) {
+    if (depth > 6) return null;
+    final trimmed = expression.trim();
+    if (trimmed.isEmpty) return null;
+    if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+      return _StaticNode.composite(trimmed);
+    }
+    if (trimmed.startsWith('"') || trimmed.startsWith("'")) {
+      final literal = _readStringLiteral(trimmed, 0);
+      if (literal == null || trimmed.substring(literal.$2).trim().isNotEmpty) {
+        return null;
+      }
+      return _StaticNode.literal(literal.$1);
+    }
+
+    final baseMatch = RegExp(r'^[A-Za-z_$][\w$]*').firstMatch(trimmed);
+    if (baseMatch == null) return null;
+    final base = baseMatch.group(0)!;
+    var rest = trimmed.substring(base.length);
+
+    _StaticNode? node;
+    final raw = bindings[base];
+    if (raw != null) {
+      node = _resolveStaticNodeInternal(raw, bindings, constants, depth + 1);
+    } else {
+      final scalar = constants[base];
+      if (scalar == null) return null;
+      node = _StaticNode.literal(scalar);
+    }
+    if (node == null) return null;
+
+    while (true) {
+      rest = rest.trimLeft();
+      if (rest.isEmpty) return node;
+      final current = node!;
+      // 已解析成字符串后不能再取成员（说明表达式不是纯静态引用）。
+      if (current.value != null) return null;
+      final step = _matchMemberStep(rest, constants);
+      if (step == null) return null;
+      final text = current.text!;
+      final valueExpression = _topLevelValue(
+        text.substring(1, text.length - 1),
+        step.$1,
+      );
+      if (valueExpression == null) return null;
+      node = _resolveStaticNodeInternal(
+        valueExpression,
+        bindings,
+        constants,
+        depth + 1,
+      );
+      if (node == null) return null;
+      rest = rest.substring(step.$2);
+    }
+  }
+
+  /// 解析一次成员访问：`.prop` 或 `["prop"]` / `[CONST]` / `[0]`。
+  /// 返回（最终键名，访问结束后的偏移）。
+  static (String, int)? _matchMemberStep(
+    String text,
+    Map<String, String> constants,
+  ) {
+    if (text.startsWith('.')) {
+      final match = RegExp(r'^\.\s*([A-Za-z_$][\w$]*)').firstMatch(text);
+      return match == null ? null : (match.group(1)!, match.end);
+    }
+    if (!text.startsWith('[')) return null;
+    final close = text.indexOf(']');
+    if (close < 0) return null;
+    final token = text.substring(1, close).trim();
+    String? key;
+    if (token.startsWith('"') || token.startsWith("'")) {
+      final literal = _readStringLiteral(token, 0);
+      if (literal == null || token.substring(literal.$2).trim().isNotEmpty) {
+        return null;
+      }
+      key = literal.$1;
+    } else {
+      key =
+          constants[token] ??
+          (RegExp(r'^-?\d+(?:\.\d+)?$').hasMatch(token) ? token : null);
+    }
+    return key == null ? null : (key, close + 1);
+  }
+
+  /// 从对象字面量正文（不含外层括号）中读取顶层键 [key] 的值表达式。
+  /// 只扫描顶层，嵌套对象/数组按配对括号整体跳过，避免内部同名字段污染。
+  static String? _topLevelValue(String body, String key) {
+    final n = body.length;
+    var i = 0;
+    while (i < n) {
+      while (i < n && (body[i] == ',' || body[i].trim().isEmpty)) {
+        i++;
+      }
+      if (i >= n) return null;
+      final readKey = _readObjectKey(body, i);
+      if (readKey == null) return null;
+      i = readKey.$2;
+      while (i < n && body[i].trim().isEmpty) {
+        i++;
+      }
+      if (i >= n || body[i] != ':') return null;
+      i++;
+      final value = _readObjectValue(body, i);
+      if (value == null) return null;
+      if (readKey.$1 == key) return value.$1;
+      i = value.$2;
+    }
+    return null;
+  }
+
+  static (String, int)? _readObjectKey(String text, int start) {
+    if (start >= text.length) return null;
+    final ch = text[start];
+    if (ch == '"' || ch == "'") {
+      final literal = _readStringLiteral(text, start);
+      return literal == null ? null : (literal.$1, literal.$2);
+    }
+    var i = start;
+    while (i < text.length && _isKeyChar(text.codeUnitAt(i))) {
+      i++;
+    }
+    return i == start ? null : (text.substring(start, i), i);
+  }
+
+  /// 读取一个值表达式：对象/数组返回含括号原文，字符串保留引号原文，
+  /// 其余读到顶层分隔符为止。
+  static (String, int)? _readObjectValue(String text, int start) {
+    var i = start;
+    while (i < text.length && text[i].trim().isEmpty) {
+      i++;
+    }
+    if (i >= text.length) return null;
+    final ch = text[i];
+    if (ch == '{' || ch == '[') {
+      final end = _balancedEnd(text, i);
+      if (end == null) return null;
+      return (text.substring(i, end + 1), end + 1);
+    }
+    if (ch == '"' || ch == "'") {
+      final literal = _readStringLiteral(text, i);
+      if (literal == null) return null;
+      return (text.substring(i, literal.$2), literal.$2);
+    }
+    var j = i;
+    while (j < text.length) {
+      final c = text[j];
+      if (c == ',' || c == '\n' || c == '\r' || c == '}' || c == ']') break;
+      j++;
+    }
+    return (text.substring(i, j).trim(), j);
+  }
+
+  static bool _isKeyChar(int codeUnit) {
+    return (codeUnit >= 0x30 && codeUnit <= 0x39) || // 0-9
+        (codeUnit >= 0x41 && codeUnit <= 0x5A) || // A-Z
+        (codeUnit >= 0x61 && codeUnit <= 0x7A) || // a-z
+        codeUnit == 0x5F || // _
+        codeUnit == 0x24 || // $
+        codeUnit == 0x2D || // -
+        codeUnit == 0x2E; // .
+  }
+
+  /// 读取一个引号字符串字面量，返回（内容，结束后偏移）。转义仅还原
+  /// 字符本身；元数据名称不需要 \uXXXX 展开。
+  static (String, int)? _readStringLiteral(String text, int start) {
+    if (start >= text.length) return null;
+    final quote = text[start];
+    if (quote != '"' && quote != "'") return null;
+    final buffer = StringBuffer();
+    var i = start + 1;
+    while (i < text.length) {
+      final ch = text[i];
+      if (ch == '\\') {
+        if (i + 1 >= text.length) return null;
+        buffer.write(text[i + 1]);
+        i += 2;
+        continue;
+      }
+      if (ch == quote) return (buffer.toString(), i + 1);
+      buffer.write(ch);
+      i++;
+    }
+    return null;
+  }
+
+  /// 返回 [start] 处 `{`/`[` 对应闭合符的下标；跳过字符串与注释。
+  static int? _balancedEnd(String text, int start) {
+    if (start >= text.length) return null;
+    final open = text[start];
+    final close = open == '{' ? '}' : ']';
+    var depth = 0;
+    var i = start;
+    final n = text.length;
+    while (i < n) {
+      final code = text.codeUnitAt(i);
+      if (code == 0x27 || code == 0x22 || code == 0x60) {
+        final quote = code;
+        i++;
+        while (i < n) {
+          final c = text.codeUnitAt(i);
+          if (c == 0x5C) {
+            i += 2;
+            continue;
+          }
+          if (c == quote) {
+            i++;
+            break;
+          }
+          i++;
+        }
+        continue;
+      }
+      if (code == 0x2F && i + 1 < n) {
+        final next = text.codeUnitAt(i + 1);
+        if (next == 0x2F || next == 0x2A) {
+          i += 2;
+          if (next == 0x2A) {
+            while (i + 1 < n &&
+                !(text.codeUnitAt(i) == 0x2A &&
+                    text.codeUnitAt(i + 1) == 0x2F)) {
+              i++;
+            }
+            i += 2;
+          } else {
+            while (i < n && text.codeUnitAt(i) != 0x0A) {
+              i++;
+            }
+          }
+          continue;
+        }
+      }
+      if (text[i] == open) {
+        depth++;
+      } else if (text[i] == close) {
+        depth--;
+        if (depth == 0) return i;
+      }
+      i++;
+    }
+    return null;
   }
 
   static Map<String, String> _parseJsonObject(String script) {
@@ -827,4 +1158,14 @@ class PluginMetadata {
     final cleaned = value?.replaceFirst(RegExp(r'\s*\*/\s*$'), '').trim();
     return cleaned == null || cleaned.isEmpty ? null : cleaned;
   }
+}
+
+/// 静态求值的中间值：字符串字面量（[value]）或对象/数组字面量原文
+/// （[text]）。成员链求值在这两种形态之间推进。
+class _StaticNode {
+  const _StaticNode.literal(this.value) : text = null;
+  const _StaticNode.composite(this.text) : value = null;
+
+  final String? value;
+  final String? text;
 }

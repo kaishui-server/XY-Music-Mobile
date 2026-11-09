@@ -6,7 +6,8 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../core/settings.dart';
 import '../library/online_cover_overrides.dart';
-import '../../pages/player/player_page.dart' show VinylCover;
+import '../../pages/player/player_page.dart'
+    show PlayerDetailBackground, VinylCover;
 import '../player/player_provider.dart';
 import '../ui/xy_theme.dart';
 import '../widgets/cover_image.dart';
@@ -154,13 +155,28 @@ class XyPlayerSheetMorph extends ConsumerWidget {
     final coverT = Curves.easeOut.transform(t);
     final coverRect = Rect.lerp(origin.coverRect, origin.pageCoverRect, coverT)!;
     final coverFade = 1 - ((t - .75) / .25).clamp(0.0, 1.0);
-    final dark = Theme.of(context).brightness == Brightness.dark;
+    final scheme = Theme.of(context).colorScheme;
+    final dark = scheme.brightness == Brightness.dark;
     final current = player.current;
-    // 毛玻璃 sigma 随面板生长衰减：面板越大、面板色覆盖越多，模糊的
-    // 可见收益越小而采样成本越高（BackdropFilter 是全屏最贵操作）。
-    // sigma 低于阈值时整层不挂载（空 filter 也会产生一次全屏 saveLayer）。
-    final blurSigma = 30 * (1 - t);
-    final useBlur = blurSigma > 1.5;
+    // 背景连续性（两种主题都要）：面板底色是 scheme.surface（浅色主题下
+    // 即纯白）@.86/.92，而详情页真实背景恒为「封面模糊 + 深色压暗」的
+    // 暗色调，页面正文又要到 t≈0.55 才淡入——中间整段是一块近白/近黑面板，
+    // 展开与收起都会在面板底色↔页面暗背景之间来回扫，这正是用户看到的
+    // 「闪白」（浅色主题是纯白面板扫暗底，深色主题是面板底色与封面氛围色
+    // 不一致，在部分机型上同样明显）。
+    // 这里在面板内垫一层与详情页完全同源的背景（同一组件、同样底部对齐、
+    // 同样按全屏尺寸溢出裁切），在转场前段由透明交叉淡入：起始帧仍是播放
+    // 栏的毛玻璃观感，随后直接过渡到页面真实背景（不再出现比两端都亮的
+    // 白色中间态）；页面正文 t≥0.55 淡入时，其背景与本层逐像素一致，
+    // 交叠期间背景完全不变。
+    final backdropT = ((t - .02) / .5).clamp(0.0, 1.0);
+    // 页面完全不透明后不再构建垫层：详情页自身背景是重度的封面模糊
+    // （ImageFiltered sigma 32），Stack 不会对被子节点完全遮挡的层做剔除，
+    // 转场结束后仍保留垫层等于整场播放期间都多画一遍全屏模糊。t=1 时
+    // 页面正文（Opacity 1，直接透传）与其背景已逐像素覆盖垫层，此时
+    // 移除垫层既不改变任何一帧的画面，也把转场结束后的额外开销降为 0；
+    // 收起动画 t<1 时垫层按原值重新出现，全程背景仍连续。
+    final showPageBackdrop = current != null && pageT < 1;
 
     // 面板内容体：面板色装饰 + 详情页本体 + 栏内容复刻。
     // 详情页页面体（全屏尺寸、底边对齐面板底边，随面板生长逐步露出）。
@@ -176,11 +192,34 @@ class XyPlayerSheetMorph extends ConsumerWidget {
         child: RepaintBoundary(child: child),
       ),
     );
+    // 与详情页同源的背景垫层，从透明交叉淡入到完全不透明。
+    // 底下的 ColoredBox 与详情页 Scaffold 兜底色取同一个值，保证封面模糊层
+    // 淡入/未就绪时两处透出的都是同一个不透明底色，而不是面板的纯白。
+    final pageBackdrop = showPageBackdrop
+        ? Positioned.fill(
+            child: Opacity(
+              opacity: backdropT,
+              child: ColoredBox(
+                color: playerBackdropBaseColor(scheme),
+                child: OverflowBox(
+                  alignment: Alignment.bottomLeft,
+                  minWidth: screen.width,
+                  maxWidth: screen.width,
+                  minHeight: screen.height,
+                  maxHeight: screen.height,
+                  child: SizedBox(
+                    width: screen.width,
+                    height: screen.height,
+                    child: PlayerDetailBackground(current: current),
+                  ),
+                ),
+              ),
+            ),
+          )
+        : null;
     final panelContent = DecoratedBox(
       decoration: BoxDecoration(
-        color: Theme.of(context).colorScheme.surface.withValues(
-          alpha: dark ? .86 : .92,
-        ),
+        color: scheme.surface.withValues(alpha: dark ? .86 : .92),
         borderRadius: BorderRadius.circular(radius),
         border: Border.all(
           color: dark ? XyColors.darkBorder : XyColors.lightBorder,
@@ -195,18 +234,22 @@ class XyPlayerSheetMorph extends ConsumerWidget {
       ),
       child: Stack(
         children: [
+          // 页面背景垫层（两种主题）：在页面正文之前先接管背景色，
+          // 消除「面板底色 → 页面暗背景」之间的闪白中间态。
+          ?pageBackdrop,
           // 详情页本体：后段整体淡入。pageT<=0 时不构建页面子树
-          // （省整页布局，此前 Opacity(0) 仍会跑全屏 OverflowBox 布局）；
-          // pageT>=1 时裸放（无 Opacity saveLayer，t=1 瞬间 morph 会被
-          // 上游短路，此处仅覆盖手势直接拖到端的边缘情况）。
+          // （省整页布局，此前 Opacity(0) 仍会跑全屏 OverflowBox 布局）。
+          // 这里始终用 Opacity 包住页面体（不按 pageT>=1 切裸放），
+          // 避免中途切换 widget 类型导致整页 element 被重建：重建会触发
+          // PlayerPage.dispose/initState（沉浸式状态栏一收一放、曲目状态
+          // 重载），在部分机型上表现为动画中途闪白/抖动。alpha=255 时
+          // RenderOpacity 本身就会直接透传，无额外 saveLayer。
           if (pageT > 0)
             Positioned.fill(
-              child: pageT >= 1
-                  ? pageBody
-                  : Opacity(
-                      opacity: pageT,
-                      child: IgnorePointer(ignoring: true, child: pageBody),
-                    ),
+              child: Opacity(
+                opacity: pageT,
+                child: IgnorePointer(ignoring: true, child: pageBody),
+              ),
             ),
           // 栏内容复刻：面板内的底部还原播放栏内容，早段淡出。
           if (barT > 0 && current != null)
@@ -233,17 +276,18 @@ class XyPlayerSheetMorph extends ConsumerWidget {
           child: ClipRRect(
             borderRadius: BorderRadius.circular(radius),
             clipBehavior: radius > .5 ? Clip.antiAlias : Clip.none,
-            // sigma 衰减到阈值以下后不再挂 BackdropFilter：空 filter 也
-            // 会产生一次全屏 saveLayer；面板后期已基本不透明，模糊无感。
-            child: useBlur
-                ? BackdropFilter(
-                    filter: ui.ImageFilter.blur(
-                      sigmaX: blurSigma,
-                      sigmaY: blurSigma,
-                    ),
-                    child: panelContent,
-                  )
-                : panelContent,
+            // 注意：这里刻意不再挂 BackdropFilter。
+            // 1) 面板色本来就 86%~92% 不透明，模糊只剩 8%~14% 的可见收益，
+            //    却要付一次全屏 saveLayer + 大半径采样；
+            // 2) 形变路由是 opaque:false，BackdropFilter 采样的是跨路由/跨
+            //    RepaintBoundary 的背景层，属于「取不到就是未定义内容」的
+            //    路径（本工程其余毛玻璃都改用 BackdropFilter.grouped）；
+            //    在部分 GPU/驱动（如用户反馈的荣耀机型）上可能读到未初始化
+            //    的白色底，表现为深色主题下也闪白；
+            // 3) 旧的 sigma 衰减分支会在 t≈0.95 切换 widget 类型，导致整块
+            //    panelContent（含整个详情页）被重建，中途重新挂载页面。
+            // 去掉后转场层级结构全程恒定，背景由上面的 pageBackdrop 负责。
+            child: panelContent,
           ),
         ),
         // 封面连续变形层：形态跟随封面风格——经典方形收平到 24 圆角

@@ -17,6 +17,7 @@ import 'dart:io';
 
 import 'package:flutter/foundation.dart';
 
+import '../logging/app_log_store.dart';
 import 'playback_chain_log.dart';
 import 'qmc_crypto.dart';
 
@@ -49,6 +50,33 @@ class CloudPlaybackProxy {
   static const int _maxTasks = 8;
 
   HttpClient? _client;
+
+  /// 转发异常日志去重：断网/网络切换瞬间，同一代理任务的多条并发转发
+  /// 连接会各自抛出相同异常（荣耀 AAP-AN00 实测 10ms 内 7 条 Connection
+  /// closed），逐条落盘只会刷屏。2s 窗口内相同文本只记 1 条，窗口关闭
+  /// 时补一条抑制计数。
+  final Map<String, ({DateTime at, int suppressed})> _recentProxyErrors = {};
+
+  void _logProxyError(String message) {
+    final now = DateTime.now();
+    final recent = _recentProxyErrors[message];
+    if (recent != null &&
+        now.difference(recent.at) < const Duration(seconds: 2)) {
+      _recentProxyErrors[message] = (at: recent.at, suppressed: recent.suppressed + 1);
+      return;
+    }
+    final suppressed = recent?.suppressed ?? 0;
+    _recentProxyErrors[message] = (at: now, suppressed: 0);
+    // 防表无限增长：文本种类异常多时清掉早已过窗口的旧键。
+    if (_recentProxyErrors.length > 16) {
+      _recentProxyErrors.removeWhere(
+        (_, v) => now.difference(v.at) >= const Duration(seconds: 10),
+      );
+    }
+    playbackChainLog(
+      suppressed > 0 ? '$message（此前抑制 $suppressed 条重复）' : message,
+    );
+  }
 
   HttpClient get _http => _client ??= HttpClient()
         ..connectionTimeout = const Duration(seconds: 10)
@@ -138,6 +166,18 @@ class CloudPlaybackProxy {
       }
       task.lastUsed = DateTime.now();
 
+      // 日志打点⑧：ExoPlayer 在 AudioSink 失活或内部 reset 后会重新发起
+      // 一次不带 Range 的全量请求（实测两次失活后各出现一次，且均紧跟
+      // 191s / 188s 的后台窗口）。这条请求本身无害，但它是「音频链路已被
+      // 播放器内部重置」的可靠信号，升级为 warning 便于事后与停播时刻对时。
+      if (req.headers.value(HttpHeaders.rangeHeader) == null) {
+        AppLogStore.instance.add(
+          '[播放链路] 播放中收到全量 Range=无 请求（疑似 ExoPlayer reset）'
+          'path=${req.uri.path}',
+          level: AppLogLevel.warning,
+        );
+      }
+
       // 百度 d.pcs 等 CDN 对无 Range 的请求直接 403（防盗链策略：web 播放
       // 器场景恒带 Range）。无 Range 一律补 bytes=0-（HTTP 语义等价全量
       // 文件，206 响应播放器照收）。
@@ -209,8 +249,9 @@ class CloudPlaybackProxy {
       await req.response.close();
     } catch (e) {
       // 转发层异常（TLS 握手/连接重置/上游中断）在此处对 Dart 完全可见
-      // ——这是定位网盘播放失败根因的关键日志通道。
-      playbackChainLog('[播放链路] 代理转发异常: $e');
+      // ——这是定位网盘播放失败根因的关键日志通道。断网瞬间多条并发
+      // 连接抛相同异常，经去重节流后落盘。
+      _logProxyError('[播放链路] 代理转发异常: $e');
       try {
         await req.response.close();
       } catch (_) {}

@@ -5,6 +5,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../auth/auth_provider.dart';
+import '../core/app_refresh.dart';
 import '../core/db_path.dart';
 import '../library/library_provider.dart';
 import '../recent/recent_provider.dart';
@@ -54,18 +55,28 @@ HotComment parseHotComment(String raw) {
   );
 }
 
-/// 热评接口失败退避：上游接口挂掉时避免每次进入首页/3 分钟轮换都重试
-/// （长时间使用下产生大量无效请求与日志噪音），失败后 30 分钟内直接
-/// 抛错不再发请求，冷却结束后恢复尝试；成功即清除冷却。
+/// 热评接口失败退避：只对「网络 / 超时 / HTTP 非 2xx」这类真故障退避，
+/// 避免上游抖动时每次进入首页与 3 分钟轮换都白打请求；退避时长与轮换
+/// 周期对齐（3 分钟），到点自动恢复，成功即清除退避。
+///
+/// 解析失败（上游偶发返回空内容 / 非 JSON）不参与退避，否则一次空包
+/// 就会把热评冻结很久。
 DateTime? _hotCommentCooldownUntil;
-const Duration _hotCommentRetryCooldown = Duration(minutes: 30);
+const Duration _hotCommentRetryCooldown = Duration(minutes: 3);
+
+/// 清掉失败退避。供「换一下」「点击重试」与下拉刷新这类**用户主动**
+/// 重试入口调用：主动重试必须真正发出请求，否则会被退避直接拦下，
+/// 表现为「点了没反应、要等一会儿才自己好」。
+void clearHotCommentCooldown() {
+  _hotCommentCooldownUntil = null;
+}
 
 final hotCommentProvider = FutureProvider.autoDispose<HotComment>((ref) async {
   final cooldownUntil = _hotCommentCooldownUntil;
   if (cooldownUntil != null && DateTime.now().isBefore(cooldownUntil)) {
-    final remainMinutes =
-        cooldownUntil.difference(DateTime.now()).inMinutes + 1;
-    throw StateError('热评接口暂时不可用，约 $remainMinutes 分钟后自动重试');
+    final remainSeconds =
+        cooldownUntil.difference(DateTime.now()).inSeconds + 1;
+    throw StateError('热评接口暂时不可用，约 $remainSeconds 秒后自动重试');
   }
   try {
     final cacheBuster = DateTime.now().microsecondsSinceEpoch;
@@ -84,12 +95,18 @@ final hotCommentProvider = FutureProvider.autoDispose<HotComment>((ref) async {
     }
     final result = parseHotComment(response['body']?.toString() ?? '');
     _hotCommentCooldownUntil = null;
-    final timer = Timer(const Duration(minutes: 3), ref.invalidateSelf);
-    ref.onDispose(timer.cancel);
+    // 后台不刷新：到点若 App 在 hidden 则顺延，回前台后的下一个检查点
+    // 才真正重拉热评，避免在后台按 3 分钟周期拉接口唤醒网络。
+    ref.onDispose(
+      scheduleRefreshWhenVisible(const Duration(minutes: 3), ref.invalidateSelf),
+    );
     return result;
-  } catch (_) {
+  } on FormatException catch (error) {
+    // 上游偶发返回空内容 / 非 JSON：不退避，等下次轮换或用户重试即可恢复。
+    throw StateError('热评内容解析失败（${error.message}）');
+  } catch (error) {
     _hotCommentCooldownUntil = DateTime.now().add(_hotCommentRetryCooldown);
-    rethrow;
+    throw StateError('热评接口请求失败（$error）');
   }
 });
 
@@ -164,8 +181,12 @@ class HomeStatisticsData {
 }
 
 final homeStatisticsProvider = FutureProvider<HomeStatisticsData>((ref) async {
-  final refreshTimer = Timer(const Duration(minutes: 1), ref.invalidateSelf);
-  ref.onDispose(refreshTimer.cancel);
+  // 后台不刷新：首页统计 5 分钟一刷（原 1 分钟，耗电优化），App 不可见时
+  // 到点顺延，回前台再重算。每次重算都要串行跑 3 个 stats 接口（Rust 侧
+  // 各开一次连接 + 20 条 DDL），1 分钟档在前台上也属于纯浪费。
+  ref.onDispose(
+    scheduleRefreshWhenVisible(const Duration(minutes: 5), ref.invalidateSelf),
+  );
   final songs = ref.watch(libraryProvider.select((state) => state.songs));
   final dbPath = await ref.read(dbPathProvider.future);
   // 首次进入时统计接口可能执行数据库迁移，串行请求避免 SQLite 写锁冲突。

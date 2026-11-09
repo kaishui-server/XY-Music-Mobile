@@ -4,6 +4,7 @@ import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../../src/core/app_refresh.dart';
 import '../../src/core/db_path.dart';
 import '../../src/library/library_provider.dart';
 import '../../src/recent/recent_provider.dart';
@@ -32,8 +33,10 @@ class _StatisticsData {
 final _statisticsProvider = FutureProvider.autoDispose<_StatisticsData>((
   ref,
 ) async {
-  final refreshTimer = Timer(const Duration(minutes: 1), ref.invalidateSelf);
-  ref.onDispose(refreshTimer.cancel);
+  // 后台不刷新：统计页不可见时到点顺延，回前台后再重算。
+  ref.onDispose(
+    scheduleRefreshWhenVisible(const Duration(minutes: 1), ref.invalidateSelf),
+  );
   final dbPath = await ref.watch(dbPathProvider.future);
   // 这些接口首次打开数据库时会执行 schema 检查和旧版本迁移。串行读取可
   // 避免多个连接同时抢占 SQLite 写锁，尤其是首次进入统计页时。

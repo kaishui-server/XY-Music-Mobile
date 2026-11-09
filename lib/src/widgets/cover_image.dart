@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:collection';
 import 'dart:convert';
 import 'dart:io';
@@ -8,6 +9,8 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../core/db_path.dart';
 import '../rust/api.dart';
+import 'cover_disk_cache.dart';
+import 'cover_fade_in.dart';
 
 /// 封面加载组件：经 Rust 缩略图接口取本地缓存封面，无封面/失败时回退渐变占位。
 class CoverImage extends ConsumerStatefulWidget {
@@ -22,6 +25,7 @@ class CoverImage extends ConsumerStatefulWidget {
     this.highQuality = false,
     this.gradient = const [Color(0xFFEC4141), Color(0xFFFF8A5C)],
     this.icon = Icons.music_note,
+    this.placeholder,
   });
 
   final String songPath;
@@ -30,8 +34,9 @@ class CoverImage extends ConsumerStatefulWidget {
   final double height;
   final double radius;
 
-  /// 图片解码宽度（物理像素）。只供明确需要低分辨率纹理的页面使用；
-  /// 普通封面不强制 ResizeImage，避免影响所有列表和播放底栏。
+  /// 图片解码宽度（物理像素）。不传时按显示宽度 × 设备像素比自动推导，
+  /// 避免列表里的小封面按原图全尺寸解码（一张 2000×2000 的专辑图会占用
+  /// 约 16MB 解码纹理，一屏几十张就是内存暴涨的主因）。
   final int? cacheWidth;
 
   /// 本地歌曲的大尺寸封面使用高清缓存，避免将列表缩略图放大后模糊。
@@ -39,6 +44,11 @@ class CoverImage extends ConsumerStatefulWidget {
   final bool highQuality;
   final List<Color> gradient;
   final IconData icon;
+
+  /// 自定义占位内容（如歌手头像的人形图标）。不传时使用渐变 + 图标
+  /// 占位。图片加载完成前保持该占位，再淡入真实图片，避免直接替换
+  /// 占位造成闪烁。
+  final Widget? placeholder;
 
   @override
   ConsumerState<CoverImage> createState() => _CoverImageState();
@@ -52,15 +62,115 @@ class _CoverImageState extends ConsumerState<CoverImage> {
   static final LinkedHashMap<String, Uint8List> _proxyCache = LinkedHashMap();
   static final Map<String, Future<Uint8List?>> _proxyTasks = {};
   static const _proxyCacheLimit = 64;
+
+  /// 跨实例的「最近已渲染封面 provider」表（按封面身份，不按解码尺寸）。
+  /// 播放栏与详情页是两棵互相独立的 CoverImage 子树，进详情页时新 State
+  /// 没有上一帧可复用；有了这份表，只要封面在任一页面画过（磁盘/内存
+  /// 缓存已热），新实例首帧即可拿它垫底，不会先闪占位图。
+  static final LinkedHashMap<String, ImageProvider> _recentProviders =
+      LinkedHashMap();
+  static const _recentProviderLimit = 24;
+
+  static ImageProvider? _recentGet(String key) {
+    final hit = _recentProviders.remove(key);
+    if (hit == null) return null;
+    _recentProviders[key] = hit;
+    return hit;
+  }
+
+  static void _recentPut(String key, ImageProvider provider) {
+    _recentProviders.remove(key);
+    _recentProviders[key] = provider;
+    while (_recentProviders.length > _recentProviderLimit) {
+      _recentProviders.remove(_recentProviders.keys.first);
+    }
+  }
+
+  /// 同步取代理图缓存（命中时维持 LRU 顺序）。
+  static Uint8List? _proxyCacheGet(String url) {
+    final hit = _proxyCache.remove(url);
+    if (hit == null) return null;
+    _proxyCache[url] = hit;
+    return hit;
+  }
+
+  /// 代理图字节预算：只按条数（64）限制时，CDN 返原图会撑到几十 MB，
+  /// 这里再叠一层总量上限，超预算按最旧优先淘汰。
+  static const _proxyCacheBytesLimit = 24 << 20;
+  static int _proxyCacheBytes = 0;
+
+  static void _putProxyCache(String key, Uint8List bytes) {
+    final old = _proxyCache.remove(key);
+    if (old != null) _proxyCacheBytes -= old.length;
+    _proxyCache[key] = bytes;
+    _proxyCacheBytes += bytes.length;
+    while (_proxyCache.isNotEmpty &&
+        (_proxyCache.length > _proxyCacheLimit ||
+            _proxyCacheBytes > _proxyCacheBytesLimit)) {
+      final evicted = _proxyCache.remove(_proxyCache.keys.first);
+      if (evicted == null) break;
+      _proxyCacheBytes -= evicted.length;
+    }
+    if (_proxyCacheBytes < 0) _proxyCacheBytes = 0;
+  }
+
+  /// 解码宽度槽位。同一条目在不同页面（列表 44 / 详情 124 / 播放页 300）
+  /// 会请求不同宽度，向上取整到固定槽位可以让相邻尺寸复用同一份解码纹理，
+  /// 减少 ImageCache 碎片。
+  static const List<int> _decodeSlots = <int>[
+    32, 48, 64, 96, 128, 160, 192, 256, 384, 512, 768, 1024,
+  ];
+
   String? _path;
   Uint8List? _proxyBytes;
   bool _proxyLoading = false;
   bool _proxyFailed = false;
 
+  /// 网络封面的本地磁盘缓存路径。命中后直接按文件解码，不再触网。
+  String? _netPath;
+  String? _netResolvingUrl;
+  String? _cacheRoot;
+
+  /// 本实例上一次真正画出画面的图片 provider：切歌时把它作为新封面的
+  /// 垫底层，等新图首帧到达后再交叉淡入，避免中间先闪一帧占位图。
+  ImageProvider? _lastRenderedProvider;
+
+  /// 当前垫底画面。优先上一曲已渲染的图，其次跨实例最近渲染的图。
+  ImageProvider? _retainedProvider;
+
+  /// 新曲目已确认没有任何可显示封面时置位：此时不能再用旧封面垫底，
+  /// 否则切到无封面的歌会一直显示上一首的图。
+  bool _noImage = false;
+
+  String get _identityKey =>
+      '${normalizeCoverImageUrl(widget.imageUrl)}|${widget.songPath}';
+
   @override
   void initState() {
     super.initState();
+    // 详情页/播放栏是彼此独立的实例：进页面前封面已在另一棵子树画过时，
+    // 直接用那份 provider 垫底，缓存命中就无需等首帧。
+    _retainedProvider = _recentGet(_identityKey);
+    _primeSyncCaches();
     _load();
+    _loadNetwork();
+  }
+
+  /// 不等待异步 IO，先用已有的同步缓存把本帧能确定的字段填好：
+  /// 磁盘缓存索引命中 / 代理图字节命中 / 本地缩略图路径命中时，首帧
+  /// 直接就是真实封面，不再先渲染占位图。
+  void _primeSyncCaches() {
+    final imageUrl = normalizeCoverImageUrl(widget.imageUrl);
+    if (imageUrl.isEmpty) {
+      final cached = _cacheGet(_cacheKey);
+      if (cached != null) {
+        _path = cached.isEmpty ? null : cached;
+        _noImage = cached.isEmpty;
+      }
+    } else if (!imageUrl.startsWith('file://')) {
+      _netPath = CoverDiskCache.peek(imageUrl);
+      _proxyBytes = _proxyCacheGet(imageUrl);
+    }
   }
 
   @override
@@ -69,25 +179,41 @@ class _CoverImageState extends ConsumerState<CoverImage> {
     if (oldWidget.songPath != widget.songPath ||
         oldWidget.imageUrl != widget.imageUrl ||
         oldWidget.highQuality != widget.highQuality) {
+      // 先留一帧「上一曲已渲染画面」作为垫底，再清空异步加载状态。
+      _retainedProvider = _lastRenderedProvider ?? _recentGet(_identityKey);
+      _lastRenderedProvider = null;
+      _noImage = false;
       _path = null;
       _proxyBytes = null;
       _proxyLoading = false;
       _proxyFailed = false;
+      _netPath = null;
+      _netResolvingUrl = null;
+      _primeSyncCaches();
       _load();
+      _loadNetwork();
     }
   }
 
   Future<void> _load() async {
     final imageUrl = normalizeCoverImageUrl(widget.imageUrl);
     if (imageUrl.isNotEmpty) return;
-    final cached = _cacheGet(_cacheKey);
+    final key = _cacheKey;
+    final songPath = widget.songPath;
+    final cached = _cacheGet(key);
     if (cached != null) {
-      if (mounted) setState(() => _path = cached.isEmpty ? null : cached);
+      if (mounted) {
+        setState(() {
+          _path = cached.isEmpty ? null : cached;
+          _noImage = cached.isEmpty;
+        });
+      }
       return;
     }
     try {
       final dbPath = await ref.read(dbPathProvider.future);
       final cacheRoot = await ref.read(appDataDirProvider.future);
+      _cacheRoot = cacheRoot;
       final p = await (widget.highQuality
           ? getSongCover(
               dbPath: dbPath,
@@ -99,11 +225,75 @@ class _CoverImageState extends ConsumerState<CoverImage> {
               cacheRoot: cacheRoot,
               path: widget.songPath,
             ));
-      _cachePut(_cacheKey, p);
-      if (mounted) setState(() => _path = p.isEmpty ? null : p);
+      _cachePut(key, p);
+      if (!mounted || songPath != widget.songPath) return;
+      setState(() {
+        _path = p.isEmpty ? null : p;
+        _noImage = p.isEmpty;
+      });
     } catch (_) {
-      _cachePut(_cacheKey, '');
-      if (mounted) setState(() => _path = null);
+      _cachePut(key, '');
+      if (!mounted || songPath != widget.songPath) return;
+      setState(() {
+        _path = null;
+        _noImage = true;
+      });
+    }
+  }
+
+  /// 网络封面优先走磁盘缓存：命中后是纯本地文件解码，冷启动也不用重新
+  /// 走网络请求。这是「歌单封面加载慢」最直接的解法——原先每次
+  /// `ImageCache.clear()`（退后台、系统内存压力）都会让所有在线封面
+  /// 重新走一遍 HTTP。
+  Future<void> _loadNetwork() async {
+    final imageUrl = normalizeCoverImageUrl(widget.imageUrl);
+    if (imageUrl.isEmpty) return;
+    if (imageUrl.startsWith('file://')) return;
+    if (_netResolvingUrl == imageUrl) return;
+    _netResolvingUrl = imageUrl;
+
+    final hit = CoverDiskCache.peek(imageUrl);
+    if (hit != null) {
+      if (mounted && imageUrl == normalizeCoverImageUrl(widget.imageUrl)) {
+        setState(() {
+          _netPath = hit;
+          _noImage = false;
+        });
+      }
+      return;
+    }
+
+    try {
+      final resolvedRoot = _cacheRoot ?? await ref.read(appDataDirProvider.future);
+      if (resolvedRoot == null || resolvedRoot.isEmpty) return;
+      final cacheRoot = resolvedRoot;
+      _cacheRoot = cacheRoot;
+      final path = await CoverDiskCache.resolve(
+        imageUrl,
+        headers: coverImageNetworkHeaders(imageUrl),
+        cacheRoot: cacheRoot,
+      );
+      if (!mounted || imageUrl != normalizeCoverImageUrl(widget.imageUrl)) {
+        return;
+      }
+      if (path == null) {
+        // 网易云 CDN 直连 403 时与电脑端一致改走 Rust 图片代理。
+        if (needsCoverImageProxy(imageUrl)) {
+          unawaited(_loadProxiedImage(imageUrl));
+        } else {
+          // 明确拿不到封面：新曲目不再用上一曲的图垫底。
+          setState(() => _noImage = true);
+        }
+        return;
+      }
+      setState(() {
+        _netPath = path;
+        _noImage = false;
+      });
+    } catch (_) {
+      if (mounted && imageUrl == normalizeCoverImageUrl(widget.imageUrl)) {
+        setState(() => _noImage = true);
+      }
     }
   }
 
@@ -151,10 +341,7 @@ class _CoverImageState extends ConsumerState<CoverImage> {
           }
           final decoded = base64Decode(dataUrl.substring(comma + 1));
           if (decoded.isEmpty) return null;
-          _proxyCache[imageUrl] = decoded;
-          while (_proxyCache.length > _proxyCacheLimit) {
-            _proxyCache.remove(_proxyCache.keys.first);
-          }
+          _putProxyCache(imageUrl, decoded);
           return decoded;
         } finally {
           _proxyTasks.remove(imageUrl);
@@ -178,70 +365,130 @@ class _CoverImageState extends ConsumerState<CoverImage> {
     }
   }
 
-  Widget _networkError(String imageUrl) {
-    if (needsCoverImageProxy(imageUrl) && !_proxyLoading && !_proxyFailed) {
-      // errorBuilder 可能处于当前 build 阶段，延后到本帧结束后
-      // 再回写状态，避免 build scope 异常。
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        if (mounted && imageUrl == normalizeCoverImageUrl(widget.imageUrl)) {
-          _loadProxiedImage(imageUrl);
-        }
-      });
+  /// 解码宽度：显式传入优先；否则按「显示宽 × 设备像素比」推导，
+  /// 非高清场景向上取到固定槽位，高清场景取精确值（封顶 2048）。
+  int? get _decodeWidth {
+    final forced = widget.cacheWidth;
+    if (forced != null) return forced.clamp(1, 2048);
+    final logical = widget.width;
+    if (!logical.isFinite || logical <= 0) return null;
+    final dpr = MediaQuery.maybeOf(context)?.devicePixelRatio ?? 3.0;
+    final raw = (logical * dpr).round();
+    if (raw <= 0) return null;
+    if (widget.highQuality) return raw.clamp(1, 2048);
+    for (final slot in _decodeSlots) {
+      if (raw <= slot) return slot;
     }
-    return _placeholder();
+    return _decodeSlots.last;
   }
+
+  static ImageProvider _fileProvider(File file, int? cacheWidth) =>
+      ResizeImage.resizeIfNeeded(cacheWidth, null, FileImage(file));
+
+  static ImageProvider _memoryProvider(Uint8List bytes, int? cacheWidth) =>
+      ResizeImage.resizeIfNeeded(cacheWidth, null, MemoryImage(bytes));
 
   @override
   Widget build(BuildContext context) {
     final path = _path;
     final imageUrl = normalizeCoverImageUrl(widget.imageUrl);
-    final decodeWidth = widget.cacheWidth?.clamp(1, 2048);
+    final decodeWidth = _decodeWidth;
+    final netPath = _netPath;
     final proxyBytes = _proxyBytes;
+    final placeholder = _placeholder();
     // `file://` 前缀 = 本地自定义图片（如歌单封面编辑保存的文件），
-    // 直接走文件解码，绝不进 Image.network（本地路径必挂）。
+    // 直接走文件解码，绝不走网络。
     final localFileUri = imageUrl.startsWith('file://')
         ? Uri.tryParse(imageUrl)
         : null;
+
+    // 垫底画面：上一曲（或跨实例最近）已真正画过的封面优先，其次才是
+    // 占位图。新图首帧到达前显示它、到达后与它交叉淡入，因此切歌/进
+    // 详情页都不会出现「占位图一闪」。
+    final retained = _retainedProvider;
+    final Widget base = retained != null && !_noImage
+        ? Image(
+            image: retained,
+            fit: BoxFit.cover,
+            gaplessPlayback: true,
+            filterQuality: FilterQuality.low,
+            // 垫底图若未在 ImageCache 中（极端情况：刚被系统清理），宁可
+            // 显示占位图也不要留一帧透明——透明会透出页面底色（浅色主题
+            // 即纯白），依旧是一次闪白。
+            frameBuilder: (_, child, frame, _) =>
+                frame == null ? placeholder : child,
+            errorBuilder: (_, _, _) => placeholder,
+          )
+        : placeholder;
+    final frameBuilder = CoverFadeIn.frameBuilder(placeholder: base);
+
+    ImageProvider? provider;
+    Widget? content;
+    if (netPath != null) {
+      provider = _fileProvider(File(netPath), decodeWidth);
+      content = Image(
+        image: provider,
+        fit: BoxFit.cover,
+        gaplessPlayback: true,
+        frameBuilder: frameBuilder,
+        errorBuilder: (_, _, _) {
+          // 缓存文件被系统清理：踢掉索引，回落到占位并允许重新下载。
+          CoverDiskCache.forget(imageUrl);
+          return placeholder;
+        },
+      );
+    } else if (proxyBytes != null) {
+      provider = _memoryProvider(proxyBytes, decodeWidth);
+      content = Image(
+        image: provider,
+        fit: BoxFit.cover,
+        gaplessPlayback: true,
+        frameBuilder: frameBuilder,
+        errorBuilder: (_, _, _) => placeholder,
+      );
+    } else if (localFileUri != null) {
+      provider = _fileProvider(File.fromUri(localFileUri), decodeWidth);
+      content = Image(
+        image: provider,
+        fit: BoxFit.cover,
+        gaplessPlayback: true,
+        frameBuilder: frameBuilder,
+        errorBuilder: (_, _, _) => placeholder,
+      );
+    } else if (path != null) {
+      provider = _fileProvider(File(path), decodeWidth);
+      content = Image(
+        image: provider,
+        fit: BoxFit.cover,
+        gaplessPlayback: true,
+        frameBuilder: frameBuilder,
+        errorBuilder: (_, _, _) => placeholder,
+      );
+    }
+
+    if (provider != null) {
+      // 记录本实例/跨实例可复用的真实封面，供下一次切歌或新页面垫底。
+      _lastRenderedProvider = provider;
+      _recentPut(_identityKey, provider);
+    } else {
+      _lastRenderedProvider = null;
+      // 还没有任何画面：确定无图时用占位图，否则先垫上一张可复用画面。
+      content = _noImage ? placeholder : base;
+    }
+
     return ClipRRect(
       borderRadius: BorderRadius.circular(widget.radius),
       child: SizedBox(
         width: widget.width,
         height: widget.height,
-        child: proxyBytes != null
-            ? Image.memory(
-                proxyBytes,
-                cacheWidth: decodeWidth,
-                fit: BoxFit.cover,
-                errorBuilder: (_, _, _) => _placeholder(),
-              )
-            : localFileUri != null
-            ? Image.file(
-                File.fromUri(localFileUri),
-                cacheWidth: decodeWidth,
-                fit: BoxFit.cover,
-                errorBuilder: (_, _, _) => _placeholder(),
-              )
-            : imageUrl.isNotEmpty && !_proxyLoading && !_proxyFailed
-            ? Image.network(
-                imageUrl,
-                headers: _networkImageHeaders(imageUrl),
-                cacheWidth: decodeWidth,
-                fit: BoxFit.cover,
-                errorBuilder: (_, _, _) => _networkError(imageUrl),
-              )
-            : (path != null)
-            ? Image.file(
-                File(path),
-                cacheWidth: decodeWidth,
-                fit: BoxFit.cover,
-                errorBuilder: (_, _, _) => _placeholder(),
-              )
-            : _placeholder(),
+        child: content,
       ),
     );
   }
 
   Widget _placeholder() {
+    final custom = widget.placeholder;
+    if (custom != null) return custom;
     return DecoratedBox(
       decoration: BoxDecoration(
         gradient: LinearGradient(
@@ -343,6 +590,3 @@ String _applyNeteaseCoverScale(String url) {
   final merged = <String, String>{...query, 'param': '800y800'};
   return uri.replace(queryParameters: merged).toString();
 }
-
-Map<String, String>? _networkImageHeaders(String imageUrl) =>
-    coverImageNetworkHeaders(imageUrl);

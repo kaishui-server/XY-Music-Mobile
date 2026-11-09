@@ -7,7 +7,7 @@ import 'frb_generated.dart';
 import 'music/types.dart';
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
-// These functions are ignored because they are not marked as `pub`: `global_playback_session`, `open_scan_conn`, `open_stats_conn`, `parse_headers_json`, `parse_remote_source`, `parse_song_path_sort_mode`
+// These functions are ignored because they are not marked as `pub`: `db_base_schema_ready`, `db_schema_version`, `global_playback_session`, `open_db_conn`, `open_scan_conn`, `open_stats_conn`, `parse_headers_json`, `parse_remote_source`, `parse_song_path_sort_mode`
 
 /// 对一整块 QMC 加密音频字节做解密，返回解密后的字节。
 /// `ekey` 为 base64 编码的 QMC2 key（EncV2 已自动处理）。
@@ -444,12 +444,17 @@ Future<String> statsImportStatisticsFile({
   optionsJson: optionsJson,
 );
 
-/// 增量扫描一个音乐文件夹，将新增/更新/删除写入数据库，返回该文件夹全部歌曲 JSON。
+/// 增量扫描一个音乐文件夹，将新增/更新/删除写入数据库，返回该文件夹歌曲数量。
+///
+/// 这里只回传数量而不是全部歌曲 JSON：整库序列化后经桥接传给 Dart 再
+/// `jsonDecode`，会额外产生数倍于原始字符串的临时对象图，是冷启动与批量
+/// 扫描时内存峰值的主要来源之一，而调用方（`LocalScanner.scanAll`）只需要
+/// 一个计数用于进度与结果提示。歌曲数据本身已落库，由曲库查询接口读取。
 ///
 /// - `db_path`：SQLite 数据库文件路径
 /// - `folder_path`：要扫描的文件夹路径
 /// - `minimum_duration_seconds`：低于该时长的歌曲被过滤（0 表示不过滤）
-Future<String> scanMusicFolder({
+Future<int> scanMusicFolder({
   required String dbPath,
   required String folderPath,
   int? minimumDurationSeconds,

@@ -538,15 +538,68 @@ impl Default for BufferedMonitorHandle {
 // 听歌统计（第五批）
 // =========================================================================
 
+// -------------------------------------------------------------------------
+// 数据库连接公共逻辑
+// -------------------------------------------------------------------------
+
+/// schema/迁移版本号，记录在库文件的 `PRAGMA user_version` 中。
+///
+/// 只要 [`crate::database::migrations`] 中新增或修改了迁移步骤，必须同时
+/// 递增此值，否则老库不会重新执行迁移。
+const SCHEMA_VERSION: i64 = 1;
+
+/// 打开连接并应用「每个连接都必须生效」的配置。
+///
+/// `busy_timeout` 是连接级设置，SQLite 默认 0，即一旦遇到写锁立刻返回
+/// `SQLITE_BUSY`。启动阶段扫描、统计、曲库查询会并发打开十数个连接，
+/// 必须让它们排队等待而不是直接失败。
+fn open_db_conn(db_path: &str) -> Result<rusqlite::Connection, String> {
+    let conn = rusqlite::Connection::open(db_path).map_err(|e| e.to_string())?;
+    conn.busy_timeout(std::time::Duration::from_millis(5000))
+        .map_err(|e| e.to_string())?;
+    crate::database::schema::configure_connection(&conn)?;
+    Ok(conn)
+}
+
+/// 读取库文件记录的 schema 版本号（从未初始化时为 0）。
+fn db_schema_version(conn: &rusqlite::Connection) -> i64 {
+    conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+        .unwrap_or(0)
+}
+
+/// 基础表是否已经建好。
+///
+/// 用一次 `sqlite_master` 查询取代 20 条 `CREATE TABLE IF NOT EXISTS`：
+/// 语义等价，但前者在本模块启动阶段被调用数十次时开销低一个数量级。
+fn db_base_schema_ready(conn: &rusqlite::Connection) -> bool {
+    conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master \
+         WHERE type = 'table' AND name IN ('songs', 'library_folders')",
+        [],
+        |row| row.get::<_, i64>(0),
+    )
+    .map(|count| count >= 2)
+    .unwrap_or(false)
+}
+
 /// 打开统计数据库连接并确保 schema 存在。
 fn open_stats_conn(db_path: &str) -> Result<rusqlite::Connection, String> {
-    let conn = rusqlite::Connection::open(db_path).map_err(|e| e.to_string())?;
-    crate::database::schema::configure_connection(&conn)?;
-    crate::database::schema::ensure_base_schema(&conn)?;
+    let conn = open_db_conn(db_path)?;
     // 旧版数据库中的表虽然已经存在，但可能缺少统计查询依赖的新字段。
-    // 只执行 CREATE TABLE IF NOT EXISTS 不会补齐字段，因此每次打开统计库
-    // 都要运行幂等迁移，避免听歌统计页因 no such column 直接加载失败。
-    crate::database::migrations::run_migrations(&conn)?;
+    // 只执行 CREATE TABLE IF NOT EXISTS 不会补齐字段，因此统计库必须跑迁移，
+    // 否则听歌统计页会因 no such column 直接加载失败。
+    //
+    // 迁移对同一库是幂等的，但每次都要多次 PRAGMA table_info 探列；启动阶段
+    // 本函数被调用 20 余次，累计开销可观。用 user_version 打标后只跑一次，
+    // 清数据或重建库会让版本回到 0，自动重新初始化。
+    if db_schema_version(&conn) < SCHEMA_VERSION {
+        if !db_base_schema_ready(&conn) {
+            crate::database::schema::ensure_base_schema(&conn)?;
+        }
+        crate::database::migrations::run_migrations(&conn)?;
+        conn.pragma_update(None, "user_version", SCHEMA_VERSION)
+            .map_err(|e| e.to_string())?;
+    }
     Ok(conn)
 }
 
@@ -799,9 +852,12 @@ fn parse_song_path_sort_mode(s: &str) -> Result<crate::statistics::SongPathSortM
 
 /// 打开扫描/曲库数据库连接并确保 schema 存在。
 fn open_scan_conn(db_path: &str) -> Result<rusqlite::Connection, String> {
-    let conn = rusqlite::Connection::open(db_path).map_err(|e| e.to_string())?;
-    crate::database::schema::configure_connection(&conn)?;
-    crate::database::schema::ensure_base_schema(&conn)?;
+    let conn = open_db_conn(db_path)?;
+    // 曲库侧只依赖基础表，不跑统计迁移，因此单独用 sqlite_master 判断，
+    // 不与统计侧的 user_version 互相压制（两边可先后打开同一个库）。
+    if !db_base_schema_ready(&conn) {
+        crate::database::schema::ensure_base_schema(&conn)?;
+    }
     Ok(conn)
 }
 
@@ -809,7 +865,12 @@ fn open_scan_conn(db_path: &str) -> Result<rusqlite::Connection, String> {
 // 音乐库扫描（第六批）
 // =========================================================================
 
-/// 增量扫描一个音乐文件夹，将新增/更新/删除写入数据库，返回该文件夹全部歌曲 JSON。
+/// 增量扫描一个音乐文件夹，将新增/更新/删除写入数据库，返回该文件夹歌曲数量。
+///
+/// 这里只回传数量而不是全部歌曲 JSON：整库序列化后经桥接传给 Dart 再
+/// `jsonDecode`，会额外产生数倍于原始字符串的临时对象图，是冷启动与批量
+/// 扫描时内存峰值的主要来源之一，而调用方（`LocalScanner.scanAll`）只需要
+/// 一个计数用于进度与结果提示。歌曲数据本身已落库，由曲库查询接口读取。
 ///
 /// - `db_path`：SQLite 数据库文件路径
 /// - `folder_path`：要扫描的文件夹路径
@@ -819,7 +880,7 @@ pub fn scan_music_folder(
     folder_path: String,
     minimum_duration_seconds: Option<u32>,
     allowed_formats: Option<Vec<String>>,
-) -> Result<String, String> {
+) -> Result<u32, String> {
     let conn = open_scan_conn(&db_path)?;
     let db_conn = std::sync::Arc::new(std::sync::Mutex::new(conn));
     let options =
@@ -833,7 +894,7 @@ pub fn scan_music_folder(
         1,
         options,
     )?;
-    serde_json::to_string(&songs).map_err(|e| e.to_string())
+    Ok(songs.len() as u32)
 }
 
 /// 解析指定音频文件路径并返回歌曲（不写库）。

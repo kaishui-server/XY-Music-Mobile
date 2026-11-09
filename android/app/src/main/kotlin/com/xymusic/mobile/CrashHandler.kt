@@ -48,10 +48,18 @@ object CrashHandler {
         val time = SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(Date())
         val file = File(dir, "crash-$time.txt")
         val stack = StringWriter().also { throwable.printStackTrace(PrintWriter(it)) }.toString()
-        val versionName = try {
-            context.packageManager.getPackageInfo(context.packageName, 0).versionName ?: ""
+        // versionCode 与 versionName 一起落盘：同一 versionName 会有多个
+        // 构建（5610~5615 均为 2.6.0），符号化混淆堆栈必须先对准构建号。
+        val versionInfo = try {
+            context.packageManager.getPackageInfo(context.packageName, 0)
         } catch (_: Exception) {
-            ""
+            null
+        }
+        val versionName = versionInfo?.versionName ?: ""
+        val versionCode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            versionInfo?.longVersionCode ?: 0L
+        } else {
+            versionInfo?.versionCode?.toLong() ?: 0L
         }
         file.writeText(
             buildString {
@@ -59,7 +67,7 @@ object CrashHandler {
                 appendLine("时间: $time")
                 appendLine("线程: ${thread.name}")
                 appendLine("设备: ${Build.MANUFACTURER} ${Build.MODEL} (Android ${Build.VERSION.RELEASE}, API ${Build.VERSION.SDK_INT})")
-                appendLine("版本: $versionName")
+                appendLine("版本: $versionName (构建 $versionCode)")
                 appendLine("============================")
                 appendLine(stack)
             },

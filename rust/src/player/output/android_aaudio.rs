@@ -10,7 +10,9 @@
 
 #![allow(dead_code)]
 
-use crate::player::buffered_source::{BlockProducer, BufferedSource};
+use crate::player::buffered_source::{
+    elevate_thread_priority, BlockProducer, BufferedMonitor, BufferedSource,
+};
 use crate::player::equalizer::{Equalizer, EqualizerHandle, EqualizerSettings};
 use crate::player::loudness::VolumeNormalizer;
 use crate::player::qmc2::{
@@ -695,6 +697,8 @@ struct AndroidExclusivePlayback {
     running: Arc<AtomicBool>,
     /// 工作线程退出原因（供 Flutter 侧日志诊断；空=正常 Stop 或曲终 EOF）。
     last_error: Arc<Mutex<Option<String>>>,
+    /// 缓冲饥饿监控（Flutter 侧轮询 bufferedStarved）。
+    monitor: Arc<BufferedMonitor>,
 }
 
 impl Drop for AndroidExclusivePlayback {
@@ -734,6 +738,10 @@ pub fn start_exclusive_playback(
     let running_clone = running.clone();
     let last_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let last_error_clone = last_error.clone();
+    // 缓冲饥饿监控：BufferedSource 的消费线程置饥饿标志，Flutter 侧轮询
+    // get_exclusive_device_info 的 bufferedStarved 做「暂停→缓冲→恢复」降级。
+    let monitor = Arc::new(BufferedMonitor::new());
+    let monitor_clone = monitor.clone();
 
     // 共享模式标记先取出：request 即将整体 move 进播放线程。
     let shared_mode = request.shared_mode;
@@ -751,6 +759,7 @@ pub fn start_exclusive_playback(
                 progress_clone,
                 running_clone,
                 last_error_clone,
+                monitor_clone,
             );
         })
         .map_err(|e| e.to_string())?;
@@ -788,6 +797,7 @@ pub fn start_exclusive_playback(
         device_name: device_name.clone(),
         running,
         last_error,
+        monitor,
     };
 
     let mut guard = instance().lock().map_err(|e| e.to_string())?;
@@ -888,7 +898,7 @@ pub fn resume_exclusive() {
 /// 查询当前独占播放输出设备/格式信息（JSON），用于前端展示与进度驱动。
 /// `active` 反映工作线程真实运行态；`durationSecs` 供 Flutter 侧更新进度条。
 pub fn get_exclusive_device_info() -> String {
-    let (active, device_name, sample_rate, channels, duration_ms, last_error) =
+    let (active, device_name, sample_rate, channels, duration_ms, last_error, starved) =
         if let Ok(guard) = instance().lock() {
             if let Some(playback) = guard.as_ref() {
                 (
@@ -903,12 +913,13 @@ pub fn get_exclusive_device_info() -> String {
                         .ok()
                         .and_then(|e| e.clone())
                         .unwrap_or_default(),
+                    playback.monitor.starved.load(Ordering::Relaxed),
                 )
             } else {
-                (false, String::new(), 0, 0, 0, String::new())
+                (false, String::new(), 0, 0, 0, String::new(), false)
             }
         } else {
-            (false, String::new(), 0, 0, 0, String::new())
+            (false, String::new(), 0, 0, 0, String::new(), false)
         };
     serde_json::json!({
         "active": active,
@@ -917,6 +928,9 @@ pub fn get_exclusive_device_info() -> String {
         "channels": channels,
         "durationSecs": duration_ms as f64 / 1000.0,
         "lastError": last_error,
+        // 缓冲饥饿（在线流下载追不上播放）：Flutter 侧轮询此字段做降级，
+        // 避免静音块静默填充被用户听成「偶发卡顿」。
+        "bufferedStarved": starved,
     })
     .to_string()
 }
@@ -964,12 +978,27 @@ fn run_exclusive_playback(
     progress: Arc<ExclusiveProgress>,
     running: Arc<AtomicBool>,
     last_error: Arc<Mutex<Option<String>>>,
+    monitor: Arc<BufferedMonitor>,
 ) {
+    // 0. 提升本工作线程（AAudio 轮询写 / OpenSL 入队）优先级：荣耀等机型在
+    //    系统繁忙或后台治理下会把这路普通线程挤掉，写线程拿不到数据即
+    //    出现「画面不卡但音频偶发卡顿」。
+    elevate_thread_priority();
+
     // 1. 加载 AAudio 库；失败（API<26 无 libaaudio.so 等）自动降级到
     // OpenSL ES 后端（API 21+），保证 DSP 共享管线在低版本设备同样出声。
     let lib = match AAudioLib::load() {
         Some(l) => l,
         None => {
+            // 诊断：记录降级原因（A2）。dlopen 返回空通常是系统库缺失/被
+            // SELinux 拒绝，与播放内容无关，属资源类错误。
+            if let Ok(mut le) = last_error.lock() {
+                *le = Some(
+                    "[RESOURCE] libaaudio.so 加载失败（dlopen 返回空），已降级 OpenSL ES。\
+                     常见原因：API<26 或系统库裁剪"
+                        .to_string(),
+                );
+            }
             super::android_opensl::run_opensl_exclusive_playback(
                 request,
                 cmd_rx,
@@ -977,6 +1006,7 @@ fn run_exclusive_playback(
                 progress,
                 running,
                 last_error,
+                monitor,
             );
             return;
         }
@@ -998,7 +1028,7 @@ fn run_exclusive_playback(
                 ) {
                     Ok(s) => s,
                     Err(e) => {
-                        let _ = init_tx.send(Err(format!("流缓存启动失败: {e}")));
+                        let _ = init_tx.send(Err(format!("[NETWORK] 流缓存启动失败: {e}")));
                         return;
                     }
                 };
@@ -1007,11 +1037,11 @@ fn run_exclusive_playback(
                 let deadline = std::time::Instant::now() + Duration::from_secs(8);
                 while !crate::player::stream_cache::is_buffer_ready(&state) {
                     if let Some(err) = state.download_error() {
-                        let _ = init_tx.send(Err(format!("流缓存下载失败: {err}")));
+                        let _ = init_tx.send(Err(format!("[NETWORK] 流缓存下载失败: {err}")));
                         return;
                     }
                     if !running.load(Ordering::Relaxed) || std::time::Instant::now() >= deadline {
-                        let _ = init_tx.send(Err("流缓存缓冲超时".to_string()));
+                        let _ = init_tx.send(Err("[NETWORK] 流缓存缓冲超时".to_string()));
                         return;
                     }
                     std::thread::sleep(Duration::from_millis(20));
@@ -1019,7 +1049,7 @@ fn run_exclusive_playback(
                 match state.new_reader_with_decryption() {
                     Ok(r) => Some(r),
                     Err(e) => {
-                        let _ = init_tx.send(Err(format!("流缓存读取失败: {e}")));
+                        let _ = init_tx.send(Err(format!("[NETWORK] 流缓存读取失败: {e}")));
                         return;
                     }
                 }
@@ -1034,7 +1064,7 @@ fn run_exclusive_playback(
     ) {
         Ok(d) => d,
         Err(e) => {
-            let _ = init_tx.send(Err(format!("打开音频文件失败: {e}")));
+            let _ = init_tx.send(Err(format!("[CODEC] 打开音频文件失败: {e}")));
             return;
         }
     };
@@ -1054,15 +1084,33 @@ fn run_exclusive_playback(
     };
     let downmix_active = playback_channels != source_channels;
 
-    // 3. 创建 BufferedSource（后台预读取）
-    let mut buffered =
-        BufferedSource::new(decoder, source_sample_rate, source_channels, total_duration);
+    // 3. 创建 BufferedSource（后台预读取，接入缓冲监控：供 Flutter 侧
+    //    轮询饥饿状态做「暂停→缓冲→恢复」降级）。
+    let mut buffered = BufferedSource::new_tracked(
+        decoder,
+        source_sample_rate,
+        source_channels,
+        total_duration,
+        Some(monitor.clone()),
+    );
 
-    // 4. 跳到起始位置
-    if request.start_time_secs > 0.0 {
-        if let Err(e) = buffered.try_seek(Duration::from_secs_f64(request.start_time_secs)) {
-            let _ = init_tx.send(Err(format!("跳转失败: {e}")));
-            return;
+    // 4. 跳到起始位置。
+    //
+    // 续播（startAtSecs>0）时在线流的 seek 需要下载进度追到目标位置，2s
+    // rendezvous 超时即 try_seek 失败。旧实现直接 init_tx.send(Err) 放弃
+    // 整个接管 —— 结果是续播场景本曲全程退回原生输出（音效全失效），
+    // 这是日志里「续播 seek 超时 → 接管失败」的主因。
+    // 改为降级：seek 失败就从 0 开始建流继续接管（音效仍生效，代价是
+    // 播放位置从头开始，由 Dart 侧把管线 seek 回实时进度修正）。
+    let mut actual_start_secs = request.start_time_secs.max(0.0);
+    if actual_start_secs > 0.0 {
+        if let Err(e) = buffered.try_seek(Duration::from_secs_f64(actual_start_secs)) {
+            if let Ok(mut le) = last_error.lock() {
+                *le = Some(format!(
+                    "[SEEK] 起始跳转失败({e})，降级从头建流继续接管"
+                ));
+            }
+            actual_start_secs = 0.0;
         }
     }
 
@@ -1111,7 +1159,7 @@ fn run_exclusive_playback(
     ) {
         Ok(result) => result,
         Err(e) => {
-            let _ = init_tx.send(Err(e));
+            let _ = init_tx.send(Err(format!("[RESOURCE] AAudio 建流失败: {e}")));
             return;
         }
     };
@@ -1144,7 +1192,7 @@ fn run_exclusive_playback(
         Ordering::Relaxed,
     );
     progress.samples_played.store(
-        (request.start_time_secs * source_sample_rate as f64 * playback_channels as f64) as u64,
+        (actual_start_secs * source_sample_rate as f64 * playback_channels as f64) as u64,
         Ordering::Relaxed,
     );
 
@@ -1155,7 +1203,7 @@ fn run_exclusive_playback(
     let start_result = unsafe { (lib.stream_request_start)(stream) };
     if start_result != AAUDIO_OK {
         let msg = unsafe { lib.result_text(start_result) };
-        let _ = init_tx.send(Err(format!("AAudio 启动失败: {msg}")));
+        let _ = init_tx.send(Err(format!("[RESOURCE] AAudio 启动失败: {msg}")));
         unsafe { (lib.stream_close)(stream) };
         return;
     }
@@ -1302,6 +1350,8 @@ fn run_exclusive_playback(
                 break;
             }
         };
+        // B4：本块是否为饥饿兜底静音（通道为空时的占位块，非真实内容）。
+        let starvation_gap = buffered.take_silence_fallback();
         let block = if downmix_active {
             crate::player::channel_downmix::downmix_block(&raw_block, source_channels)
         } else {
@@ -1350,9 +1400,14 @@ fn run_exclusive_playback(
             }
         }
 
-        progress
-            .samples_played
-            .fetch_add(produced, Ordering::Relaxed);
+        // B4：静音兜底块照常写入（保输出连续、不爆音），但不推进已播
+        // 样本数——饥饿期间的静音不是真实播放内容，计入会让管线进度
+        // 超前于出声位置（对齐/歌词/曲终全部错位）。
+        if !starvation_gap {
+            progress
+                .samples_played
+                .fetch_add(produced, Ordering::Relaxed);
+        }
 
         // 写入 AAudio
         let frames_written = unsafe {
@@ -1576,7 +1631,11 @@ unsafe fn try_open_stream(
         (lib.builder_set_sharing_mode)(builder, AAUDIO_SHARING_MODE_EXCLUSIVE);
         (lib.builder_set_performance_mode)(builder, AAUDIO_PERFORMANCE_MODE_LOW_LATENCY);
     }
-    (lib.builder_set_buffer_capacity)(builder, 4096);
+    // 缓冲容量（帧）：共享模式即在线流/普通设备输出的默认路径，容量翻倍到
+    // 8192 帧（48kHz 下约 170ms），给 Dart/网络侧抖动留出吸收空间；荣耀等
+    // 机型在系统调度抖动下 4096 帧（约 85ms）容易被 write 循环一次抽干，
+    // 表现为「画面不卡、音频偶发咔哒」。独占模式保持 4096 不动（低延迟优先）。
+    (lib.builder_set_buffer_capacity)(builder, if shared { 8192 } else { 4096 });
 
     let mut stream: *mut AAudioStream = std::ptr::null_mut();
     let result = (lib.builder_open_stream)(builder, &mut stream);

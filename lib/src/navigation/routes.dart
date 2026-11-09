@@ -1,6 +1,7 @@
 import 'package:flutter/widgets.dart';
 import 'package:go_router/go_router.dart';
 
+import '../logging/error_context.dart';
 import '../../pages/home/home_page.dart';
 import '../../pages/explore/explore_page.dart';
 import '../../pages/library/library_page.dart';
@@ -78,6 +79,9 @@ Page<void> _playerSheetPage(GoRouterState state, Widget child) =>
 /// 主路由：使用 StatefulShellRoute 保持各一级页面状态。
 final appRouter = GoRouter(
   initialLocation: '/home',
+  // 崩溃上下文：记录最近一次导航与当前栈顶页面。release AOT 下异步异常的
+  // 堆栈只有几帧挂起点，没有它就无法判断崩在哪一页。
+  observers: [ErrorContextObserver()],
   routes: [
     StatefulShellRoute(
       builder: (context, state, navigationShell) {

@@ -19,6 +19,15 @@ import 'src/services/cache_auto_clean.dart';
 /// 在 [_bootstrapApp] 中赋值（此时 WidgetsBinding 已初始化）。
 AppLifecycleListener? cacheCleanLifecycleListener;
 
+/// 启动阶段各项初始化的等待上限。
+///
+/// 这些工作原先都是无上限的 `await`：只要其中任何一项（Binder 绑定、大图
+/// 解码、日志反序列化）在个别 ROM 上一直不返回，`runApp` 就永远不会执行，
+/// 用户看到的就是「开屏卡住」。统一加上限，超时只降级不阻断首帧。
+const _logRestoreTimeout = Duration(seconds: 3);
+const _startupAssetTimeout = Duration(milliseconds: 2500);
+const _audioInitTimeout = Duration(seconds: 5);
+
 Future<void> main() async {
   // runZonedGuarded 兜住 zone 内逃逸的异步异常，交给日志系统落盘
   // （崩溃文件），避免进程被静默杀死而无任何记录。
@@ -54,7 +63,16 @@ Future<void> _bootstrapApp() async {
     }
   }
   AppLogStore.instance.install();
-  await AppLogStore.instance.initialize();
+  // 启动日志恢复：读 SharedPreferences 后要把整串 JSON 反序列化成日志对象
+  // （探针通道配额已提到 3000 条），低端机上可能耗时数百毫秒到秒级。
+  // 日志属于「有更好、没有也能用」的能力，不能挡在首帧之前，超时先放行，
+  // 历史记录由后台任务自行补完（_load 内部不会覆盖运行期新增的条目）。
+  await AppLogStore.instance.initialize().timeout(
+    _logRestoreTimeout,
+    onTimeout: () {
+      debugPrint('启动日志恢复超时，跳过等待继续启动');
+    },
+  );
   // 在线歌曲自定义封面覆盖表：启动即加载，列表/播放页按 revision 刷新。
   unawaited(initOnlineCoverOverrides());
   if (!kIsWeb && defaultTargetPlatform == TargetPlatform.android) {
@@ -77,14 +95,31 @@ Future<void> _bootstrapApp() async {
   // 启动卡顿修复：音频服务绑定（Binder IPC，慢 ROM 上可达秒级）、自定义
   // 背景读取解码、自定义字体注册原先串行 await，耗时全部累加在首帧之前。
   // 三者互不依赖，改为并行执行，首帧只需等待最慢的一个完成。
-  final audioInit = _initBackgroundAudio();
+  final audioInit = _initBackgroundAudio().timeout(
+    _audioInitTimeout,
+    onTimeout: () {
+      // 少数 ROM 上媒体服务绑定（Binder IPC）会一直不返回。继续等下去，
+      // 用户看到的就是启动画面永久卡死；这里放弃等待直接进前台，播放相关
+      // 异常交给播放器自身的错误处理兜底，远好过开不了应用。
+      AppLogStore.instance.add(
+        '[Startup] 后台音频服务初始化超过 ${_audioInitTimeout.inSeconds}s，'
+        '跳过等待继续启动',
+        level: AppLogLevel.warning,
+      );
+    },
+  );
   final backgroundFuture = loadXyStartupBackground();
   final fontFuture = restoreCustomFontAtStartup();
   // 自定义背景必须在第一帧之前加载。否则设置 Provider 完成异步读取前，
   // 页面会短暂使用默认底色，表现为每次恢复或切页时闪一下。
-  final startupBackground = await backgroundFuture;
+  // 但「读文件 + instantiateImageCodec 解码」同样可能长时间不返回，
+  // 超时就退回默认底色优先出首帧——少一次背景，好过永远进不去界面。
+  final startupBackground = await backgroundFuture.timeout(
+    _startupAssetTimeout,
+    onTimeout: () => const XyStartupBackground(),
+  );
   // 自定义字体同理：必须在第一帧之前注册，避免首屏闪回系统默认字体。
-  await fontFuture;
+  await fontFuture.timeout(_startupAssetTimeout, onTimeout: () {});
   // PlayerProvider 构造时即创建 just_audio_background 的 AudioPlayer，
   // 其初始化必须先完成；失败已在上层捕获，不会阻断启动。
   await audioInit;

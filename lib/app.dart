@@ -158,14 +158,31 @@ class _XyMusicAppState extends ConsumerState<XyMusicApp>
     super.dispose();
   }
 
+  /// 前台/后台两组图片解码缓存水位。
+  ///
+  /// 退后台不再 `imageCache.clear()` 整清：整清之后一旦回前台，歌单里
+  /// 所有封面都要重新解码（网络封面还要重新走一遍 HTTP，因为
+  /// NetworkImage 不落盘），表现为"切回应用封面一片白、要等好几秒"。
+  /// 改为只把水位收紧到后台档，由 ImageCache 自身的 LRU 淘汰掉最冷
+  /// 的那部分，既把后台常驻内存压下去，又保住了近期用过的封面。
+  static const int _fgImageCacheEntries = 512;
+  static const int _fgImageCacheBytes = 64 << 20;
+  static const int _bgImageCacheEntries = 128;
+  static const int _bgImageCacheBytes = 16 << 20;
+
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    // 退到后台时清空解码图片缓存：封面解码纹理是后台常驻内存的大头。
-    // 正在显示的图片由各自的 ImageStream 句柄继续持有，不受清空影响；
-    // 回前台后列表滚动到不可见再恢复的条目按需重新解码（本地封面有
-    // 磁盘缓存，网络封面走 HTTP 缓存）。
-    if (state == AppLifecycleState.hidden) {
-      PaintingBinding.instance.imageCache.clear();
+    final cache = PaintingBinding.instance.imageCache;
+    switch (state) {
+      case AppLifecycleState.hidden:
+      case AppLifecycleState.paused:
+      case AppLifecycleState.detached:
+        cache.maximumSize = _bgImageCacheEntries;
+        cache.maximumSizeBytes = _bgImageCacheBytes;
+      case AppLifecycleState.resumed:
+      case AppLifecycleState.inactive:
+        cache.maximumSize = _fgImageCacheEntries;
+        cache.maximumSizeBytes = _fgImageCacheBytes;
     }
   }
 
@@ -550,11 +567,56 @@ class _RefreshingDynamicColorBuilderState
   Widget build(BuildContext context) => widget.builder(_light, _dark);
 }
 
-class _InitLoadingScreen extends StatelessWidget {
+class _InitLoadingScreen extends StatefulWidget {
   const _InitLoadingScreen();
+
+  @override
+  State<_InitLoadingScreen> createState() => _InitLoadingScreenState();
+}
+
+class _InitLoadingScreenState extends State<_InitLoadingScreen> {
+  Timer? _slowHintTimer;
+  bool _slow = false;
+
+  @override
+  void initState() {
+    super.initState();
+    // 正常机型这里一闪而过；超过 4 秒仍在转圈说明本次启动明显偏慢，
+    // 补一行说明文字。原实现只有一个空白转圈，卡住时用户完全无法判断
+    // 应用是在加载还是已经死了（这正是「开屏卡住」的观感来源）。
+    _slowHintTimer = Timer(const Duration(seconds: 4), () {
+      if (mounted) setState(() => _slow = true);
+    });
+  }
+
+  @override
+  void dispose() {
+    _slowHintTimer?.cancel();
+    super.dispose();
+  }
+
   @override
   Widget build(BuildContext context) {
-    return const Scaffold(body: Center(child: CircularProgressIndicator()));
+    return Scaffold(
+      body: Center(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const SizedBox(
+              width: 36,
+              height: 36,
+              child: CircularProgressIndicator(strokeWidth: 3),
+            ),
+            const SizedBox(height: 20),
+            Text(
+              _slow ? '启动较慢，仍在等待核心就绪…' : '正在启动…',
+              textAlign: TextAlign.center,
+              style: Theme.of(context).textTheme.bodyMedium,
+            ),
+          ],
+        ),
+      ),
+    );
   }
 }
 
@@ -562,8 +624,13 @@ class _InitErrorScreen extends StatelessWidget {
   const _InitErrorScreen({required this.error, required this.onRetry});
   final Object error;
   final VoidCallback onRetry;
+
   @override
   Widget build(BuildContext context) {
+    // 「超时」与「失败」分开表达：超时说明底层加载可能仍在进行，
+    // 直接重试大概率能立刻恢复；失败则通常是库加载/版本校验异常。
+    final timedOut = error is RustInitTimeoutException;
+    final theme = Theme.of(context);
     return Scaffold(
       body: Center(
         child: Padding(
@@ -571,14 +638,27 @@ class _InitErrorScreen extends StatelessWidget {
           child: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
-              const Icon(Icons.error_outline, size: 48),
+              Icon(
+                timedOut
+                    ? Icons.hourglass_disabled_outlined
+                    : Icons.error_outline,
+                size: 48,
+              ),
               const SizedBox(height: 16),
-              const Text(
-                '核心初始化失败',
-                style: TextStyle(fontWeight: FontWeight.w600),
+              Text(
+                timedOut ? '核心初始化超时' : '核心初始化失败',
+                style: const TextStyle(fontWeight: FontWeight.w600),
               ),
               const SizedBox(height: 8),
               Text('$error', textAlign: TextAlign.center),
+              if (timedOut) ...[
+                const SizedBox(height: 8),
+                Text(
+                  '可以先点「重试」；若反复超时，请确认应用具备存储权限后重启应用。',
+                  textAlign: TextAlign.center,
+                  style: theme.textTheme.bodySmall,
+                ),
+              ],
               const SizedBox(height: 16),
               FilledButton.icon(
                 onPressed: onRetry,

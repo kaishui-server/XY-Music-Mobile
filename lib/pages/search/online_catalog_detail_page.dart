@@ -7,6 +7,7 @@ import '../../src/favorites/favorites_provider.dart';
 import '../../src/library/library_provider.dart';
 import '../../src/player/player_provider.dart';
 import '../../src/playlists/playlists_provider.dart';
+import '../../src/plugins/artist_avatar_resolver.dart';
 import '../../src/plugins/plugin_runtime.dart';
 import '../../src/widgets/batch_action_sheet.dart';
 import '../../src/widgets/batch_download.dart';
@@ -37,6 +38,7 @@ class OnlineCatalogDetailPage extends ConsumerStatefulWidget {
     required this.coverUrl,
     required this.categoryLabel,
     required this.loadSongs,
+    this.resolveCoverUrl,
   });
 
   final String title;
@@ -44,6 +46,10 @@ class OnlineCatalogDetailPage extends ConsumerStatefulWidget {
   final String coverUrl;
   final String categoryLabel;
   final Future<List<Song>> Function() loadSongs;
+
+  /// 歌手/UP 主封面缺失时按名补查（平台自带优先、不覆盖；失败回退占位）。
+  /// null 表示该分类不补查（专辑/歌单等）。
+  final Future<String> Function(String name)? resolveCoverUrl;
 
   @override
   ConsumerState<OnlineCatalogDetailPage> createState() =>
@@ -60,6 +66,9 @@ class _OnlineCatalogDetailPageState
   var _visibleSongCount = _pageSize;
   final ScrollController _songsController = ScrollController();
 
+  /// 当前展示封面：平台值优先，缺失时由补查结果补齐。
+  late String _coverUrl;
+
   // 批量换源进度（右上角「更多」菜单触发）。
   bool _switchingSource = false;
   int _switchingDone = 0;
@@ -68,7 +77,27 @@ class _OnlineCatalogDetailPageState
   @override
   void initState() {
     super.initState();
+    _coverUrl = widget.coverUrl;
     _loadSongs();
+    // 跟随页面自身加载流程：只在这一页首次打开时补查一次，重建/翻页
+    // 不重复请求；解析器侧还有缓存与并发去重。
+    unawaited(_resolveCover());
+  }
+
+  /// 歌手页封面补查：只补缺、不覆盖。
+  ///
+  /// 平台已带头像时不发请求；缺失时按名补查，失败/无结果保持原占位。
+  Future<void> _resolveCover() async {
+    final resolve = widget.resolveCoverUrl;
+    if (resolve == null) return;
+    final name = widget.title.trim();
+    final entries = [(name: name, avatar: widget.coverUrl)];
+    if (missingArtistAvatarNames(entries).isEmpty) return;
+    final resolved = await resolveMissingArtistAvatars(entries, resolve);
+    if (!mounted) return;
+    final cover = effectiveArtistAvatar(widget.coverUrl, resolved[name]);
+    if (cover.isEmpty || cover == _coverUrl) return;
+    setState(() => _coverUrl = cover);
   }
 
   Future<void> _loadSongs() async {
@@ -167,7 +196,7 @@ class _OnlineCatalogDetailPageState
                   ? _OnlinePlaylistHero(
                       title: widget.title,
                       subtitle: widget.subtitle,
-                      coverUrl: widget.coverUrl,
+                      coverUrl: _coverUrl,
                       songCount: _songs.length,
                       loading: _loading,
                       onPlayAll: _loading || _songs.isEmpty
@@ -185,7 +214,7 @@ class _OnlineCatalogDetailPageState
                         crossAxisAlignment: CrossAxisAlignment.center,
                         children: [
                           _CatalogCover(
-                            coverUrl: widget.coverUrl,
+                            coverUrl: _coverUrl,
                             isArtist:
                                 widget.categoryLabel == '歌手' ||
                                 widget.categoryLabel == 'UP主',
@@ -600,43 +629,33 @@ class _CatalogCover extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
-    return ClipRRect(
-      borderRadius: BorderRadius.circular(isArtist ? size / 2 : 12),
-      child: SizedBox(
-        width: size,
-        height: size,
-        child: coverUrl.trim().isEmpty
-            ? ColoredBox(
-                color: scheme.surfaceContainerHighest,
-                child: Icon(
-                  isArtist
-                      ? Icons.person_outline_rounded
-                      : isPlaylist
-                      ? Icons.queue_music_rounded
-                      : Icons.album_outlined,
-                  size: 38,
-                  color: scheme.onSurfaceVariant,
-                ),
-              )
-            : Image.network(
-                coverUrl,
-                // 网易等音源 CDN 对 Dart 默认 UA 返回 403，需带浏览器请求头。
-                headers: coverImageNetworkHeaders(coverUrl),
-                fit: BoxFit.cover,
-                errorBuilder: (_, _, _) => ColoredBox(
-                  color: scheme.surfaceContainerHighest,
-                  child: Icon(
-                    isArtist
-                        ? Icons.person_outline_rounded
-                        : isPlaylist
-                        ? Icons.queue_music_rounded
-                        : Icons.album_outlined,
-                    size: 38,
-                    color: scheme.onSurfaceVariant,
-                  ),
-                ),
-              ),
-      ),
+    final radius = isArtist ? size / 2 : 12.0;
+    final icon = isArtist
+        ? Icons.person_outline_rounded
+        : isPlaylist
+        ? Icons.queue_music_rounded
+        : Icons.album_outlined;
+    // 占位头像与 CoverImage 的加载占位保持一致，补查到头像后原地淡入，
+    // 不出现布局跳动或额外闪烁。
+    final placeholder = ColoredBox(
+      color: scheme.surfaceContainerHighest,
+      child: Icon(icon, size: 38, color: scheme.onSurfaceVariant),
+    );
+    final url = coverUrl.trim();
+    if (url.isEmpty) {
+      return ClipRRect(
+        borderRadius: BorderRadius.circular(radius),
+        child: SizedBox(width: size, height: size, child: placeholder),
+      );
+    }
+    return CoverImage(
+      songPath: '',
+      imageUrl: url,
+      width: size,
+      height: size,
+      radius: radius,
+      icon: icon,
+      placeholder: placeholder,
     );
   }
 }

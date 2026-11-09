@@ -708,6 +708,12 @@ class _SongsListViewState extends ConsumerState<SongsListView> {
     );
     if (picked == null || !context.mounted) return;
     final (plugin, replacement) = picked;
+    // 必须在 await 之前取 notifier：同步换源会改动收藏集合，收藏页的
+    // FutureBuilder（旧版按收藏集合做 key）会因此整树重建，本列表 State
+    // 会在等待期间被销毁；await 之后再走 ref 就会抛
+    // 「Bad state: Cannot use "ref" after the widget was disposed.」
+    // （5623/7623 崩溃现场就是此处的 ref.read）。
+    final playerNotifier = ref.read(playerProvider.notifier);
     // 收藏与歌单里的同一首歌同步原位换源，避免列表仍显示旧音源。
     await syncReplacementToCollections(
       ref,
@@ -715,9 +721,10 @@ class _SongsListViewState extends ConsumerState<SongsListView> {
       plugin: plugin,
       replacement: replacement,
     );
-    final replaced = await ref
-        .read(playerProvider.notifier)
-        .switchSource(song.path, replacementToQueueItem(plugin, replacement));
+    final replaced = await playerNotifier.switchSource(
+      song.path,
+      replacementToQueueItem(plugin, replacement),
+    );
     if (!context.mounted) return;
     if (replaced) {
       XyNotice.show(

@@ -1,8 +1,10 @@
 import 'dart:async';
+import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 
 import '../core/settings.dart';
+import '../debug/performance_probe.dart';
 import 'player_sheet_morph.dart';
 
 const xyPageTransitionDuration = Duration(milliseconds: 300);
@@ -310,35 +312,77 @@ class XyPlayerSheetRoute<T> extends PageRouteBuilder<T> {
   /// install 后应用，保证 push 当帧不丢跟手进度。
   double? _dragTarget;
 
+  /// 收起已提交（collapseAndPop 已调用或路由已 pop）：后续手势写入
+  /// /回弹一律忽略，确保收起动画一路播到 0（dismissed）再移除路由，
+  /// 不被中途 stop 造成半透明面板残留。
+  bool _dismissing = false;
+
+  /// 拖动写入停滞自愈计时器：正常跟手时 move 事件间隔 <100ms，此计时
+  /// 器不断被重置；若停写超时（手指已被系统手势抢断、up/cancel 全部
+  /// 丢失），面板无人驱动永久停在中间态 → 自动按收起收敛。
+  /// 判定条件保守（面板在开区间 + 无补间动画在跑），正常「按住不动
+  /// 观察」超过 1.2s 的场景在收起手势里实际不存在，误收可忽略。
+  Timer? _dragStallTimer;
+
   /// 拖动实时驱动：详情页下滑收起为 1 → 0，播放栏上滑展开为 0 → 1。
   /// 置位跟手标记（morph 层线性映射，不叠加缓动曲线），保证面板严格
   /// 跟随手指。
   set dragValue(double value) {
+    // 收起已提交后忽略残留手势写入：防止 pop 后裸指针 Listener 仍调用
+    // controller.stop() 抢断收起动画（stop 后 direction=dismiss 但 status
+    // 停在 reverse 而非 dismissed，路由永不 dispose 造成半透明面板残留）。
+    if (_dismissing || !isActive) return;
     _dragTarget = value.clamp(0.0, 1.0);
     xyPlayerSheetGestureDriving = true;
     final controller = this.controller;
     if (controller == null) return;
     if (controller.isAnimating) controller.stop();
     controller.value = _dragTarget!;
+    // 拖动写入停滞自愈：刷新停滞计时器，停写超时且面板停在中间态
+    // （无补间在跑）时自动收起，覆盖 up/cancel 被系统手势抢断丢失、
+    // 松手判定整条未执行的路径。
+    _dragStallTimer?.cancel();
+    _dragStallTimer = Timer(const Duration(milliseconds: 1200), () {
+      if (_dismissing || !isActive) return;
+      final c = this.controller;
+      if (c == null || c.isAnimating) return;
+      if (_dragTarget == null || _dragTarget! <= 0 || _dragTarget! >= 1) {
+        return;
+      }
+      collapseAndPop();
+    });
   }
 
   /// 松手回弹到全屏：时长按剩余距离等比缩短，避免短距回弹拖沓。
   void springBack() {
+    // 收起已提交后禁止回弹：面板必须沿收起动画继续走完，避免
+    // 残留手势把面板重新拉回全屏。
+    if (_dismissing || !isActive) return;
     xyPlayerSheetGestureDriving = false;
+    _dragStallTimer?.cancel();
     final controller = this.controller;
     if (controller == null) return;
     if (controller.isAnimating) controller.stop();
-    final remaining = (1.0 - controller.value).clamp(0.0, 1.0);
-    if (remaining <= 0) return;
+    final visual = controller.value.clamp(0.0, 1.0);
+    if (visual <= 0 || visual >= 1) return;
+    // 松手动画起点连续化：跟手阶段形态层按线性映射（t=raw），松手后
+    // 按方向套缓动曲线。若直接以当前 raw 起步，easeOutCubic 会把中间
+    // 值抬高（拖到 50% 松手回弹：easeOutCubic(0.5)=0.875，面板首帧
+    // 上跳 37.5% 屏），即松手瞬间“卡一下”。把视觉位置反解回曲线
+    // 坐标作为动画起点，再以线性驱动 raw，保证「跟手线性 → 动画曲线」
+    // 切换瞬间视觉位置连续、速度不骤变；raw 驱动改用 Curves.linear，
+    // 避免与形态层的 easeOutCubic 叠加成双重缓动（起点速度≈0 的顿挫）。
+    final start = 1 - math.pow(1 - visual, 1 / 3).toDouble();
+    controller.value = start;
     unawaited(
       controller.animateTo(
         1.0,
         duration: Duration(
           milliseconds:
-              (xyPlayerSheetTransitionDuration.inMilliseconds * remaining)
+              (xyPlayerSheetTransitionDuration.inMilliseconds * (1 - start))
                   .round(),
         ),
-        curve: Curves.easeOutCubic,
+        curve: Curves.linear,
       ),
     );
   }
@@ -346,6 +390,11 @@ class XyPlayerSheetRoute<T> extends PageRouteBuilder<T> {
   /// 松手收回：面板缩回播放栏矩形，动画完成后移除路由（此时转场值
   /// 已为 0，路由离场无视觉跳变）。
   void collapseAndPop() {
+    // 收起提交后置位防重入：同一路由的后续手势/重复收起请求一律
+    // 忽略，保证收起动画一路播到 0（dismissed）再移除。
+    if (_dismissing || !isActive) return;
+    _dismissing = true;
+    _dragStallTimer?.cancel();
     xyPlayerSheetGestureDriving = false;
     final controller = this.controller;
     if (controller == null) {
@@ -353,21 +402,45 @@ class XyPlayerSheetRoute<T> extends PageRouteBuilder<T> {
       return;
     }
     if (controller.isAnimating) controller.stop();
-    final remaining = controller.value.clamp(0.0, 1.0);
-    if (remaining <= 0) {
+    final visual = controller.value.clamp(0.0, 1.0);
+    if (visual <= 0) {
       _popSelf();
       return;
     }
+    if (visual >= 1) {
+      // 未拖拽（单击收起）：保持原有 easeInCubic 驱动路径，视觉不变。
+      unawaited(
+        controller
+            .animateTo(
+              0.0,
+              duration: Duration(
+                milliseconds:
+                    (xyPlayerSheetTransitionDuration.inMilliseconds * visual)
+                        .round(),
+              ),
+              curve: Curves.easeInCubic,
+            )
+            .whenComplete(_popSelf),
+      );
+      return;
+    }
+    // 松手动画起点连续化（同 springBack）：跟手阶段线性映射，松手后
+    // 形态层按 easeInCubic 映射，若直接以当前 raw 起步会把中间值压扁
+    // （拖到 50% 松手收起：easeInCubic(0.5)=0.125，面板首帧骤缩 37.5%
+    // 屏），即松手瞬间“卡一下”。将视觉位置反解回曲线坐标作为动画
+    // 起点，raw 用线性驱动，松手瞬间视觉位置连续、速度不骤变。
+    final start = math.pow(visual, 1 / 3).toDouble();
+    controller.value = start;
     unawaited(
       controller
           .animateTo(
             0.0,
             duration: Duration(
               milliseconds:
-                  (xyPlayerSheetTransitionDuration.inMilliseconds * remaining)
+                  (xyPlayerSheetTransitionDuration.inMilliseconds * start)
                       .round(),
             ),
-            curve: Curves.easeInCubic,
+            curve: Curves.linear,
           )
           .whenComplete(_popSelf),
     );
@@ -384,6 +457,10 @@ class XyPlayerSheetRoute<T> extends PageRouteBuilder<T> {
     super.install();
     // install 创建控制器后立即应用暂存的拖动值，didPush 从该值续播。
     final controller = this.controller;
+    // 探针：动画帧回调间隔与掉帧统计（覆盖跟手写值与 animateTo 动画帧）。
+    if (kPerformanceProbeEnabled) {
+      controller?.addListener(PerformanceProbe.instance.onAnimFrame);
+    }
     final value = _dragTarget;
     if (controller != null && value != null && value > 0) {
       controller.value = value;
@@ -392,6 +469,11 @@ class XyPlayerSheetRoute<T> extends PageRouteBuilder<T> {
 
   @override
   void dispose() {
+    _dragStallTimer?.cancel();
+    // 探针：与 install 配对的动画帧监听移除。
+    if (kPerformanceProbeEnabled) {
+      controller?.removeListener(PerformanceProbe.instance.onAnimFrame);
+    }
     if (identical(xyPlayerSheetRouteRef, this)) {
       xyPlayerSheetRouteRef = null;
     }

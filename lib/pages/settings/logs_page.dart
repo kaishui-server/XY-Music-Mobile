@@ -33,9 +33,11 @@ class _LogsPageState extends State<LogsPage> {
   final _store = AppLogStore.instance;
   _LogTimeRange _range = _LogTimeRange.all;
   int _maxEntries = 500;
+  int _maxProbeEntries = 300;
   bool _warningOnly = false;
   bool _loading = true;
   bool _exporting = false;
+  bool _exportingProbe = false;
   List<CrashReport> _crashes = const [];
   bool _exportingCrashes = false;
 
@@ -51,6 +53,7 @@ class _LogsPageState extends State<LogsPage> {
     if (!mounted) return;
     setState(() {
       _maxEntries = _store.maxEntries;
+      _maxProbeEntries = _store.maxProbeEntries;
       _warningOnly = _store.warningOnly;
       _crashes = crashes;
       _loading = false;
@@ -189,6 +192,81 @@ class _LogsPageState extends State<LogsPage> {
     await _store.setWarningOnly(value);
   }
 
+  Future<void> _setMaxProbeEntries(int value) async {
+    setState(() => _maxProbeEntries = value);
+    await _store.setMaxProbeEntries(value);
+  }
+
+  List<AppLogEntry> _probeQuery() => _store.query(
+    since: _range.duration,
+    channels: const {AppLogChannel.probe},
+  );
+
+  Future<void> _exportProbe() async {
+    if (_exportingProbe) return;
+    final entries = _probeQuery();
+    if (entries.isEmpty) {
+      XyNotice.show(context, message: '当前时间范围内没有探针日志');
+      return;
+    }
+    setState(() => _exportingProbe = true);
+    try {
+      final fileName =
+          'xy_music_probe_logs_${DateTime.now().millisecondsSinceEpoch}.txt';
+      final path = await FilePicker.platform.saveFile(
+        dialogTitle: '导出性能探针日志',
+        fileName: fileName,
+        type: FileType.custom,
+        allowedExtensions: const ['txt'],
+        bytes: Uint8List.fromList(
+          utf8.encode(_format(entries, title: 'XY Music 性能探针日志')),
+        ),
+      );
+      if (!mounted || path == null || path.isEmpty) return;
+      XyNotice.show(context, message: '探针日志已导出（${entries.length} 条）');
+    } catch (error) {
+      if (mounted) {
+        XyNotice.show(
+          context,
+          message: '导出探针日志失败：$error',
+          type: XyNoticeType.error,
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _exportingProbe = false);
+    }
+  }
+
+  Future<void> _clearProbeLogs() async {
+    final count = _probeQuery().length;
+    if (count == 0) {
+      XyNotice.show(context, message: '当前没有探针日志');
+      return;
+    }
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('清空性能探针日志？'),
+        content: Text('将删除本机保存的全部性能探针日志（$count 条），业务日志不受影响。'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext, false),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(dialogContext, true),
+            child: const Text('清空'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true) return;
+    await _store.clear(channel: AppLogChannel.probe);
+    if (!mounted) return;
+    setState(() {});
+    XyNotice.show(context, message: '探针日志已清空');
+  }
+
   Future<void> _clearLogs() async {
     if (_store.entries.isEmpty) {
       XyNotice.show(context, message: '当前没有可清空的日志');
@@ -252,9 +330,9 @@ class _LogsPageState extends State<LogsPage> {
     }
   }
 
-  String _format(List<AppLogEntry> entries) {
+  String _format(List<AppLogEntry> entries, {String title = 'XY Music 日志'}) {
     final buffer = StringBuffer()
-      ..writeln('XY Music 日志')
+      ..writeln(title)
       ..writeln('导出时间：${DateTime.now().toIso8601String()}')
       ..writeln('时间范围：${_range.label}')
       ..writeln('日志数量：${entries.length}')
@@ -274,6 +352,7 @@ class _LogsPageState extends State<LogsPage> {
   Widget build(BuildContext context) {
     final allCount = _query().length;
     final errorCount = _query(errorsOnly: true).length;
+    final probeCount = _probeQuery().length;
     return Scaffold(
       appBar: AppBar(title: const Text('日志')),
       body: _loading
@@ -313,10 +392,32 @@ class _LogsPageState extends State<LogsPage> {
                         ),
                       ),
                       const Divider(height: 1, indent: 56),
+                      ListTile(
+                        leading: const Icon(Icons.speed_outlined),
+                        title: const Text('保存探针日志条数'),
+                        subtitle: const Text('性能探针独立配额，不占用上面的业务日志条数'),
+                        trailing: DropdownButtonHideUnderline(
+                          child: DropdownButton<int>(
+                            value: _maxProbeEntries,
+                            items: const [100, 300, 500, 1000, 2000, 5000]
+                                .map(
+                                  (value) => DropdownMenuItem(
+                                    value: value,
+                                    child: Text('$value 条'),
+                                  ),
+                                )
+                                .toList(),
+                            onChanged: (value) {
+                              if (value != null) _setMaxProbeEntries(value);
+                            },
+                          ),
+                        ),
+                      ),
+                      const Divider(height: 1, indent: 56),
                       SwitchListTile(
                         secondary: const Icon(Icons.filter_alt_outlined),
                         title: const Text('只记录警告和报错日志'),
-                        subtitle: const Text('开启后普通运行信息不会保存'),
+                        subtitle: const Text('开启后普通运行信息不会保存；探针日志不受影响'),
                         value: _warningOnly,
                         onChanged: _setWarningOnly,
                       ),
@@ -421,6 +522,57 @@ class _LogsPageState extends State<LogsPage> {
                   ),
                 ),
                 const SizedBox(height: 20),
+                _sectionTitle(context, '性能探针日志'),
+                Card(
+                  child: Column(
+                    children: [
+                      ListTile(
+                        leading: Icon(
+                          Icons.speed_outlined,
+                          color: probeCount == 0
+                              ? Theme.of(context).colorScheme.onSurfaceVariant
+                              : Theme.of(context).colorScheme.primary,
+                        ),
+                        title: Text(
+                          probeCount == 0
+                              ? '当前范围内暂无探针日志'
+                              : '当前范围 $probeCount 条探针日志',
+                        ),
+                        subtitle: const Text(
+                          '帧耗时、掉帧、卡顿、缓冲水位等性能数据，独立配额、独立导出；探针开关未开启时不产生',
+                        ),
+                        trailing: _exportingProbe
+                            ? const SizedBox(
+                                width: 20,
+                                height: 20,
+                                child: CircularProgressIndicator(strokeWidth: 2),
+                              )
+                            : const Icon(Icons.file_download_outlined),
+                        onTap: _exportingProbe ? null : _exportProbe,
+                      ),
+                      if (probeCount > 0) ...[
+                        const Divider(height: 1, indent: 56),
+                        ListTile(
+                          dense: true,
+                          leading: Icon(
+                            Icons.delete_sweep_outlined,
+                            color: Theme.of(context).colorScheme.error,
+                          ),
+                          title: const Text(
+                            '清空探针日志',
+                            style: TextStyle(fontSize: 13),
+                          ),
+                          subtitle: const Text(
+                            '只删除探针通道，业务日志与崩溃记录不受影响',
+                            style: TextStyle(fontSize: 11),
+                          ),
+                          onTap: _clearProbeLogs,
+                        ),
+                      ],
+                    ],
+                  ),
+                ),
+                const SizedBox(height: 20),
                 _sectionTitle(context, '日志管理'),
                 Card(
                   child: ListTile(
@@ -429,7 +581,7 @@ class _LogsPageState extends State<LogsPage> {
                       color: Theme.of(context).colorScheme.error,
                     ),
                     title: const Text('一键清空日志'),
-                    subtitle: const Text('删除本机保存的全部日志，操作不可恢复'),
+                    subtitle: const Text('删除本机保存的全部日志（含探针通道），崩溃记录不受影响'),
                     trailing: const Icon(Icons.chevron_right_rounded),
                     onTap: _clearLogs,
                   ),
@@ -466,7 +618,7 @@ class _LogsPageState extends State<LogsPage> {
                       ListTile(
                         leading: const Icon(Icons.description_outlined),
                         title: Text('导出全部日志（$allCount 条）'),
-                        subtitle: const Text('包含普通信息、警告和错误'),
+                        subtitle: const Text('包含普通信息、警告和错误；不含性能探针'),
                         trailing: const Icon(Icons.file_download_outlined),
                         onTap: _exporting
                             ? null

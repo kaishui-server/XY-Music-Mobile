@@ -14,7 +14,24 @@ abstract final class XyColors {
   static const lightSurface = Color(0xFFFFFFFF);
   static const lightSurfaceRaised = Color(0xFFF0F0F0);
   static const lightBorder = Color(0x14000000);
+
+  /// 播放详情页暗色兜底底色：详情页背景在所有主题下都是「封面模糊 +
+  /// 深色压暗」的暗色调，浅色主题若用 [lightSurface]（纯白）兜底，
+  /// 背景层尚未就绪/淡入期间会透出纯白（形变转场中即表现为闪白）。
+  /// 详情页 Scaffold 与播放栏形变面板的背景垫层共用此值，保证两者
+  /// 在同一帧的底色完全一致。
+  static const playerBackdropBase = Color(0xFF14161B);
 }
+
+/// 播放详情页与播放栏形变面板共用的不透明兜底底色。
+///
+/// 详情页背景在所有主题下都是暗色调：深色主题沿用自身的 surface，
+/// 浅色主题用 [XyColors.playerBackdropBase]（不能是纯白）。两处必须
+/// 取同一个值，转场中页面背景与面板背景才能逐像素一致。
+Color playerBackdropBaseColor(ColorScheme scheme) =>
+    scheme.brightness == Brightness.dark
+    ? scheme.surface
+    : XyColors.playerBackdropBase;
 
 abstract final class XyRadii {
   static const small = 8.0;

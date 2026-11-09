@@ -336,19 +336,27 @@ Future<void> syncReplacementToCollections(
   required PluginSearchSong replacement,
 }) async {
   final song = replacementToSong(plugin, replacement);
+  // 所有 provider 必须在任何 await 之前读取：同步换源会改动收藏集合，
+  // 列表页可能因此在等待期间整树重建、widget 的 ref 随之失效；此时
+  // 在 await 之后 ref.read 会抛「Cannot use "ref" after the widget was
+  // disposed.」。notifier 属于 ProviderContainer，不随 widget 生命周期
+  // 销毁，提前取出后继续 await 是安全的。
+  final favorites = ref.read(favoritesProvider);
+  final favoritesNotifier = ref.read(favoritesProvider.notifier);
+  final playlists = ref.read(playlistsProvider);
+  final playlistsNotifier = ref.read(playlistsProvider.notifier);
   try {
-    if (ref.read(favoritesProvider).contains(originalPath)) {
-      await ref
-          .read(favoritesProvider.notifier)
-          .replacePath(originalPath, FavoriteSongSnapshot.fromSong(song));
+    if (favorites.contains(originalPath)) {
+      await favoritesNotifier.replacePath(
+        originalPath,
+        FavoriteSongSnapshot.fromSong(song),
+      );
     }
   } catch (_) {}
   try {
-    for (final playlist in ref.read(playlistsProvider)) {
+    for (final playlist in playlists) {
       if (playlist.songPaths.contains(originalPath)) {
-        await ref
-            .read(playlistsProvider.notifier)
-            .replaceSong(playlist.id, originalPath, song);
+        await playlistsNotifier.replaceSong(playlist.id, originalPath, song);
       }
     }
   } catch (_) {}

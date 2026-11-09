@@ -3,10 +3,13 @@
 // 数据来源两级（对齐桌面端 CommentPanel / XianYu-Music-Mobile 实现）：
 // 1. MusicFree 插件的 getMusicComments(musicItem, page)——部分插件自带；
 // 2. 平台直连公开评论接口兜底（wy/tx/kg/kw/mg/qishui）。
-// LX（落雪）插件协议没有评论接口，直接按歌曲平台走直连。
+// LX（落雪）自定义源协议只提供 musicUrl/lyric/pic，脚本不实现评论，
+// 因此 LX 歌曲同样按歌曲平台走直连；直连所需的平台专有 id 由
+// _commentMusicInfo 从 LX 音乐信息里映射（wy/kw 的 id 存在 songmid）。
 //
 // 约定：返回 null 表示当前歌曲无法取得评论（平台不受支持或缺少歌曲
-// id），调用方据此展示「不支持」；网络失败等返回空页（展示「暂无评论」）。
+// id），调用方据此展示「不支持」；网络/上游故障抛
+// _CommentNetworkException，调用方展示可重试的错误态。
 import 'dart:convert';
 
 import 'package:crypto/crypto.dart';
@@ -100,8 +103,8 @@ Future<CommentPage?> fetchSongComments({
 }) async {
   final lxInfo = pluginData['lx'];
   final isLx = plugin.isLx || lxInfo is Map;
-  var musicItem = lxInfo is Map
-      ? Map<String, dynamic>.from(lxInfo)
+  final musicItem = lxInfo is Map
+      ? _commentMusicInfo(lxInfo)
       : _normalizeMusicItem(plugin, pluginData);
 
   // MusicFree 插件优先：插件明确返回（即便为空）即不再走兜底。
@@ -134,6 +137,7 @@ Future<CommentPage?> fetchSongComments({
       page: page,
     );
   }
+  Object? directError;
   try {
     final direct = await fetchPlatformComments(
       platform: platform,
@@ -146,16 +150,21 @@ Future<CommentPage?> fetchSongComments({
     // animemusic 后端 music/comment 仍可能返回评论）；普通插件维持
     // 直连结果，避免把「暂无评论」误报成加载失败。
     if (plugin.animemusicApi.trim().isEmpty) return direct;
-  } catch (_) {
-    // 平台直连失败（接口失效/需签名）：惜梦 v2/v3 插件按后端地址兜底。
+  } catch (error) {
+    // 平台直连失败（接口失效/需签名/网络故障）：先记录，惜梦 v2/v3
+    // 插件继续按后端地址兜底；兜底也失败时把错误抛给 UI 展示重试。
+    directError = error;
   }
-  return _fetchAnimemusicComments(
+  final fallback = await _fetchAnimemusicComments(
     plugin: plugin,
     pluginData: pluginData,
     lxInfo: lxInfo,
     runtime: runtime,
     page: page,
   );
+  if (fallback != null) return fallback;
+  if (directError != null) throw directError;
+  return null;
 }
 
 /// 惜梦聚合插件（v2 洛雪版 / v3 MusicFree 版）评论兜底：插件本体不含
@@ -205,6 +214,52 @@ Map<String, dynamic> _normalizeMusicItem(
     musicItem['songmid'] = songInfo['songmid'];
   }
   return musicItem;
+}
+
+/// LX 歌曲的评论元数据：LX 自定义源只提供 musicUrl，评论由宿主按平台
+/// 直连，因此要把 LX 音乐信息里的平台专有 id 映射成评论接口要求的字段。
+/// LX 搜索结果的 wy/kw 数字 id 统一放在 songmid，直连接口却读 id，
+/// 不补齐会被误判为「不支持评论」。
+Map<String, dynamic> _commentMusicInfo(Map<dynamic, dynamic> lxInfo) {
+  final info = Map<String, dynamic>.from(lxInfo);
+  final source = (info['source'] ?? '').toString();
+  final songmid = _textOf(info['songmid']);
+  if (source == 'wy' || source == 'kw') {
+    // 网易云：评论按数字歌曲 id；酷我：评论按 rid。
+    info['id'] ??= songmid;
+    if (source == 'kw') info['rid'] ??= songmid;
+  } else if (source == 'kg') {
+    // 酷狗：评论要先按 hash 换 mixsongid，hash 缺失时用 songmid 兜底。
+    info['hash'] ??= songmid;
+  } else if (source == 'tx') {
+    // QQ：评论优先用数字 songId，缺失时由 songmid（mid）换取。
+    info['songId'] ??= songmid;
+  }
+  // 咪咕的评论 targetId 是 copyrightId，已在 LX 信息里，保持不变。
+  return info;
+}
+
+String? _textOf(Object? value) {
+  if (value == null) return null;
+  final text = value.toString();
+  return text.isEmpty ? null : text;
+}
+
+/// 部分平台接口把数字字段序列化成字符串（如酷我的 like_num/time），
+/// 统一转换，避免 `as num?` 抛异常导致整页评论被丢弃。
+int? _asInt(Object? value) {
+  if (value is num) return value.toInt();
+  if (value == null) return null;
+  return int.tryParse(value.toString());
+}
+
+/// 评论链路网络/上游故障：让 UI 展示可重试的错误态，而不是误报「暂无评论」。
+class _CommentNetworkException implements Exception {
+  const _CommentNetworkException(this.message);
+  final String message;
+
+  @override
+  String toString() => message;
 }
 
 CommentPage? _parsePluginResult(dynamic result) {
@@ -306,10 +361,20 @@ Future<Object?> _httpJson(
           .get(uri, headers: headers)
           .timeout(const Duration(seconds: 18));
     }
-    if (resp.statusCode < 200 || resp.statusCode >= 400) return null;
+    if (resp.statusCode < 200 || resp.statusCode >= 400) {
+      // 5xx 视为上游暂时故障（可重试）；4xx 是业务拒绝，按空结果处理。
+      if (resp.statusCode >= 500) {
+        throw _CommentNetworkException(
+          '评论服务暂时不可用（HTTP ${resp.statusCode}），请稍后重试',
+        );
+      }
+      return null;
+    }
     return jsonDecode(utf8.decode(resp.bodyBytes, allowMalformed: true));
+  } on _CommentNetworkException {
+    rethrow;
   } catch (_) {
-    return null;
+    throw const _CommentNetworkException('评论接口连接失败，请检查网络后重试');
   } finally {
     client.close();
   }
@@ -335,6 +400,8 @@ Future<CommentPage?> fetchPlatformComments({
       'qishui' => await _fetchQishui(musicInfo, page),
       _ => null,
     };
+  } on _CommentNetworkException {
+    rethrow;
   } catch (_) {
     return const CommentPage(items: [], isEnd: true);
   }
@@ -427,21 +494,28 @@ Future<CommentPage?> _fetchWy(Map<String, dynamic> musicInfo, int page) async {
 
 CommentItem _mapTx(Object? raw) {
   final m = raw is Map ? raw.cast<String, dynamic>() : const <String, dynamic>{};
-  String? id;
-  final cid = m['CmId'];
-  if (cid != null) id = cid.toString();
   int? createAt;
-  final pt = m['PubTime'];
-  if (pt is int) createAt = int.parse('${pt}000');
+  final t = m['time'];
+  if (t is num) {
+    createAt = t.toInt() * 1000;
+  } else if (t is String) {
+    final sec = int.tryParse(t);
+    if (sec != null) createAt = sec * 1000;
+  }
+  final middle = m['middlecommentcontent'] ?? m['SubComments'];
   return CommentItem(
-    id: id ?? '',
-    nickName: (m['Nick'] as String?) ?? '',
-    avatar: m['Avatar'] as String?,
-    comment: (m['Content'] as String?) ?? '',
-    like: (m['PraiseNum'] as num?)?.toInt() ?? 0,
+    // 该接口返回的是「根评论 + 楼中楼」，主体作者/内容取 root 字段；
+    // commentid/nick 是楼中楼回复者的信息。
+    id: (m['rootcommentid'] ?? m['commentid'] ?? m['CmId'])?.toString() ?? '',
+    nickName: ((m['rootcommentnick'] ?? m['nick'] ?? m['Nick']) as String?) ?? '',
+    avatar: (m['avatarurl'] ?? m['Avatar']) as String?,
+    comment: ((m['rootcommentcontent'] ?? m['content'] ?? m['Content'])
+            as String?) ??
+        '',
+    like: ((m['praisenum'] ?? m['PraiseNum']) as num?)?.toInt() ?? 0,
     createAt: createAt,
     replies: [
-      for (final r in (m['SubComments'] as List?) ?? const []) _mapTxReply(r),
+      for (final r in middle is List ? middle : const []) _mapTxReply(r),
     ],
   );
 }
@@ -452,10 +526,10 @@ CommentItem _mapTxReply(Object? raw) {
   final pt = m['PubTime'];
   if (pt is int) createAt = int.parse('${pt}000');
   return CommentItem(
-    id: (m['CmId'])?.toString() ?? '',
-    nickName: (m['Nick'] as String?) ?? '',
-    avatar: m['Avatar'] as String?,
-    comment: (m['Content'] as String?) ?? '',
+    id: (m['subcommentid'] ?? m['CmId'])?.toString() ?? '',
+    nickName: ((m['replynick'] ?? m['Nick']) as String?) ?? '',
+    avatar: (m['reply_identity_pic'] ?? m['Avatar']) as String?,
+    comment: ((m['subcommentcontent'] ?? m['Content']) as String?) ?? '',
     like: (m['PraiseNum'] as num?)?.toInt() ?? 0,
     createAt: createAt,
   );
@@ -468,78 +542,61 @@ Future<String?> _resolveTxSongId(Map<String, dynamic> musicInfo) async {
   }
   final songmid = musicInfo['songmid'] ?? musicInfo['mid'];
   if (songmid == null || songmid.toString().isEmpty) return null;
-  final body = jsonEncode({
-    'comm': {'ct': '19', 'cv': '1859', 'uin': '0'},
-    'req': {
-      'module': 'music.trackInfo.UniformRuleCtrl',
-      'method': 'CgiGetTrackInfo',
-      'param': {'types': [1], 'ids': [0], 'mids': [songmid], 'ctx': 0},
+  // musicu 的 CgiGetTrackInfo 需要登录态（无 cookie 返回 500001），
+  // 改用公开的歌曲详情接口按 mid 换数字 id。
+  final data = await _httpJson(
+    'GET',
+    'https://c.y.qq.com/v8/fcg-bin/fcg_play_single_song.fcg'
+        '?songmid=${Uri.encodeComponent(songmid.toString())}'
+        '&format=json&platform=yqq',
+    headers: {
+      'Referer': 'https://y.qq.com/',
+      'User-Agent': _uaChrome,
     },
-  });
-  final data = await _httpJson('POST', 'https://u.y.qq.com/cgi-bin/musicu.fcg',
-      headers: {
-        'Referer': 'https://y.qq.com',
-        'User-Agent': _uaChrome,
-        'Content-Type': 'application/json; charset=utf-8',
-      },
-      body: body);
-  final req = data is Map ? data['req'] : null;
-  final reqMap = req is Map ? req.cast<String, dynamic>() : null;
-  final dd = reqMap?['data'];
-  final tracks = dd is Map ? dd['tracks'] : null;
-  final first = tracks is List && tracks.isNotEmpty ? tracks.first : null;
-  final trackId = first is Map ? first['id'] : null;
-  return trackId?.toString();
+  );
+  final list = data is Map ? data['data'] : null;
+  final first = list is List && list.isNotEmpty ? list.first : null;
+  return first is Map ? first['id']?.toString() : null;
 }
 
 Future<CommentPage?> _fetchTx(Map<String, dynamic> musicInfo, int page) async {
   final empty = const CommentPage(items: [], isEnd: true);
   final songId = await _resolveTxSongId(musicInfo);
   if (songId == null) return empty;
-  final body = jsonEncode({
-    'comm': {
-      'cv': 4747474,
-      'ct': 24,
-      'format': 'json',
-      'inCharset': 'utf-8',
-      'outCharset': 'utf-8',
-      'notice': 0,
-      'platform': 'yqq.json',
-      'needNewCode': 1,
-      'uin': 0,
+  // musicu 的 CommentRead 同样需要登录态，改用公开的全局评论接口
+  // （分页参数 pagenum 从 0 开始）。
+  final data = await _httpJson(
+    'GET',
+    'https://c.y.qq.com/base/fcgi-bin/fcg_global_comment_h5.fcg'
+        '?g_tk=5381&uin=0&format=json&jsonpCallback=callback&loginUin=0'
+        '&hostUin=0&notice=0&platform=yqq.json&needNewCode=0'
+        '&cid=205360772&reqtype=2&biztype=1&topid=${Uri.encodeComponent(songId)}'
+        '&cmd=8&needmusiccrit=0&pagenum=${page - 1}&pagesize=$_pageSize',
+    headers: {
+      'Referer': 'https://y.qq.com/',
+      'User-Agent': _uaChrome,
     },
-    'req': {
-      'module': 'music.globalComment.CommentRead',
-      'method': 'GetHotCommentList',
-      'param': {
-        'BizType': 1,
-        'BizId': songId,
-        'LastCommentSeqNo': '',
-        'PageSize': _pageSize,
-        'PageNum': page - 1,
-        'HotType': 1,
-        'WithAirborne': 0,
-        'PicEnable': 1,
-      },
-    },
-  });
-  final data = await _httpJson('POST', 'https://u.y.qq.com/cgi-bin/musicu.fcg',
-      headers: {
-        'accept': 'application/json',
-        'user-agent': _uaChrome,
-        'referer': 'https://y.qq.com/',
-        'origin': 'https://y.qq.com',
-        'content-type': 'application/json; charset=utf-8',
-      },
-      body: body);
-  final req0 = data is Map ? data['req'] : null;
-  final req = req0 is Map ? req0.cast<String, dynamic>() : null;
-  if (req == null || req['code'] != 0) return empty;
-  final commentsList = req['data'];
-  final comments = commentsList is Map ? commentsList['Comments'] : null;
-  if (comments is! List) return empty;
-  final items = comments.map(_mapTx).toList();
-  return CommentPage(items: items, isEnd: comments.length < _pageSize);
+  );
+  final m = data is Map ? data['comment'] : null;
+  if (m is! Map) return empty;
+  final comments = (m['commentlist'] as List?) ?? const [];
+  if (comments.isEmpty) return empty;
+  final total =
+      num.tryParse((m['commenttotal'] ?? '').toString())?.toInt() ?? 0;
+  // 同一根评论可能因多条楼中楼回复重复出现，按根评论 id 去重。
+  final items = <CommentItem>[];
+  final seen = <String>{};
+  for (final c in comments) {
+    final item = _mapTx(c);
+    if (item.id.isNotEmpty && !seen.add(item.id)) continue;
+    items.add(item);
+  }
+  return CommentPage(
+    items: items,
+    isEnd: total > 0
+        ? page * _pageSize >= total
+        : comments.length < _pageSize,
+  );
 }
 
 // ==================== 酷狗 ====================
@@ -555,54 +612,13 @@ String _kugouSign(String params, {String body = ''}) {
   return _md5Hex(input);
 }
 
-/// 酷狗 hash → mixsongid（res_id），评论接口的必选参数。
-Future<String?> _resolveKgMixsongId(String hash) async {
-  final body = jsonEncode({
-    'area_code': '1',
-    'show_privilege': 1,
-    'show_album_info': '1',
-    'is_publish': '',
-    'appid': 1005,
-    'clientver': 11451,
-    'mid': '1',
-    'dfid': '-',
-    'clienttime': DateTime.now().millisecondsSinceEpoch,
-    'key': _kgSaltAndroid,
-    'fields': 'album_info,author_name,audio_info,ori_audio_name,base,'
-        'songname,classification',
-    'data': [
-      {'hash': hash}
-    ],
-  });
-  final data = await _httpJson(
-    'POST',
-    'http://gateway.kugou.com/v3/album_audio/audio',
-    headers: {
-      'KG-THash': '13a3164',
-      'KG-RC': '1',
-      'KG-Fake': '0',
-      'KG-RF': '00869891',
-      'User-Agent': 'Android712-AndroidPhone-11451-376-0-FeeCacheUpdate-wifi',
-      'x-router': 'kmr.service.kugou.com',
-      'Content-Type': 'application/json',
-    },
-    body: body,
-  );
-  final list = (data is Map ? data['data'] : null) as List?;
-  final audio = list == null || list.isEmpty ? null : list.first;
-  final cls = audio is Map ? (audio['classification'] as List?) : null;
-  final resId = cls == null || cls.isEmpty ? null : cls.first;
-  if (resId == null) return null;
-  return resId is Map ? resId['res_id']?.toString() : resId.toString();
-}
-
 Future<CommentPage?> _fetchKg(Map<String, dynamic> musicInfo, int page) async {
   final empty = const CommentPage(items: [], isEnd: true);
   final hash = musicInfo['hash'] ?? musicInfo['id'];
   if (hash == null || hash.toString().isEmpty) return empty;
-  final mixsongId = await _resolveKgMixsongId(hash.toString());
-  if (mixsongId == null) return empty;
 
+  // 评论接口以 extdata=hash 定位歌曲，mixsongid 传 0 即可；
+  // 原先走 gateway 的 hash→mixsongid 换 id 接口已要求签名，稳定失败。
   final params = [
     'appid=1005',
     'clienttime=${DateTime.now().millisecondsSinceEpoch}',
@@ -610,10 +626,10 @@ Future<CommentPage?> _fetchKg(Map<String, dynamic> musicInfo, int page) async {
     'clientver=11409',
     'code=fc4be23b4e972707f36b8a828a93ba8a',
     'dfid=0',
-    'extdata=$hash',
+    'extdata=${hash.toString()}',
     'kugouid=0',
     'mid=16249512204336365674023395779019',
-    'mixsongid=$mixsongId',
+    'mixsongid=0',
     'p=$page',
     'pagesize=$_pageSize',
     'uuid=0',
@@ -642,7 +658,13 @@ Future<CommentPage?> _fetchKg(Map<String, dynamic> musicInfo, int page) async {
         : null;
     int? createAt;
     final addtime = raw['addtime'];
-    if (addtime is num) createAt = addtime.toInt() * 1000;
+    if (addtime is num) {
+      createAt = addtime.toInt() * 1000;
+    } else if (addtime is String) {
+      // 接口返回 "yyyy-MM-dd HH:mm:ss" 本地时间字符串。
+      createAt =
+          DateTime.tryParse(addtime.replaceFirst(' ', 'T'))?.millisecondsSinceEpoch;
+    }
     items.add(CommentItem(
       id: raw['id']?.toString() ?? '',
       nickName: (raw['user_name'] as String?) ?? '',
@@ -660,18 +682,18 @@ Future<CommentPage?> _fetchKg(Map<String, dynamic> musicInfo, int page) async {
 
 CommentItem _mapKw(Object? raw) {
   final m = raw is Map ? raw.cast<String, dynamic>() : const <String, dynamic>{};
-  int? createAt;
-  final t = m['time'];
-  if (t is num) createAt = t.toInt() * 1000;
+  final t = _asInt(m['time']);
+  final childComments = m['child_comments'];
   return CommentItem(
     id: m['id']?.toString() ?? '',
     nickName: (m['u_name'] as String?) ?? '',
     avatar: m['u_pic'] as String?,
     comment: (m['msg'] as String?) ?? '',
-    like: (m['like_num'] as num?)?.toInt(),
-    createAt: createAt,
+    like: _asInt(m['like_num']),
+    createAt: t == null ? null : t * 1000,
     replies: [
-      for (final c in (m['child_comments'] as List?) ?? const []) _mapKw(c),
+      for (final c in childComments is List ? childComments : const [])
+        _mapKw(c),
     ],
   );
 }

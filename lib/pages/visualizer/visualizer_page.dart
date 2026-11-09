@@ -67,6 +67,12 @@ class _VisualizerPageState extends ConsumerState<VisualizerPage>
 
   Ticker? _ticker;
   Duration _lastElapsed = Duration.zero;
+
+  /// 生命周期可见性（前台=true）与播放态组合决定 Ticker 启停（第二批
+  /// 动画启停优化）：暂停/后台/锁屏任一不满足即停全屏 60fps 场景渲染，
+  /// 满足时重启。_lastElapsed 在启停边界归零，防止恢复瞬间 dt 突跳。
+  bool _lifecycleVisible = true;
+  bool _playingNow = true;
   double _time = 0; // 真实秒（按压时长/冷却计时）
   double _shaderTime = 0; // 场景时间（真实时间流，对齐参考 uTime=clock）
   double _blockPulse = 0; // 悬浮方块脉冲（kick 包络的指数平滑）
@@ -150,6 +156,29 @@ class _VisualizerPageState extends ConsumerState<VisualizerPage>
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.resumed) {
       unawaited(_hideStatusBar());
+      _lifecycleVisible = true;
+      _syncTicker();
+    } else if (state == AppLifecycleState.paused ||
+        state == AppLifecycleState.hidden) {
+      // 不可见即停 Ticker：后台/锁屏无人观看，停掉全屏场景渲染。
+      _lifecycleVisible = false;
+      _syncTicker();
+    }
+  }
+
+  /// 前台且播放中才跑 Ticker；任一不满足即停（幂等）。启停边界重置
+  /// _lastElapsed，恢复后 dt 从 1/60 起平滑续接，避免画面瞬跳。
+  void _syncTicker() {
+    final ticker = _ticker;
+    final wantRun = _lifecycleVisible && _playingNow;
+    if (wantRun) {
+      if (ticker != null && !ticker.isActive) {
+        _lastElapsed = Duration.zero;
+        ticker.start();
+      }
+    } else if (ticker != null && ticker.isActive) {
+      _lastElapsed = Duration.zero;
+      ticker.stop();
     }
   }
 
@@ -165,7 +194,18 @@ class _VisualizerPageState extends ConsumerState<VisualizerPage>
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (mounted) unawaited(_hideStatusBar());
     });
+    _playingNow = ref.read(playerProvider.select((s) => s.isPlaying));
     _ticker = createTicker(_onTick)..start();
+    // 动画启停（第二批）：暂停即停 Ticker，恢复播放时重启。暂停时画面
+    // 定格在最后一帧（脉冲不回落、星云静止）——暂停态动画静止是预期
+    // 行为；恢复时 _lastElapsed 归零，时间流平滑续接。
+    ref.listen(playerProvider.select((s) => s.isPlaying), (_, playing) {
+      _playingNow = playing;
+      _syncTicker();
+    });
+    // 立即按当前播放态校正一次（本项目 Riverpod 版本不支持
+    // fireImmediately，用 read 初值 + 手动同步等效）。
+    _syncTicker();
     unawaited(_bootSource());
   }
 

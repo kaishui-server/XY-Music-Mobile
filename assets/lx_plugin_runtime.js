@@ -20,15 +20,41 @@
         }
       }
       delete opts.follow_max;
+      // LX 的 request 契约支持 timeout（毫秒），插件普遍依赖它在慢/死的
+      // 上游接口上快速失败（例如聚合音源用 Promise.allSettled 等所有源）。
+      // 运行时 fetch 自身不处理 timeout，若不在这里兜住，一个无响应的
+      // 请求会把整首解析拖到宿主 12s 上限，表现为“音源解析超时”。
+      const timeout = Number(opts.timeout);
+      delete opts.timeout;
       opts.headers = headers;
       opts.body = body;
+      let settled = false;
+      let timer = null;
+      const finish = (error, response) => {
+        if (settled) return;
+        settled = true;
+        if (timer != null) {
+          try { clearTimeout(timer); } catch (_) {}
+          timer = null;
+        }
+        if (error) callback(error, null);
+        else callback(null, response);
+      };
+      if (Number.isFinite(timeout) && timeout > 0) {
+        timer = setTimeout(() => {
+          timer = null;
+          const error = new Error('timeout of ' + timeout + 'ms exceeded');
+          error.code = 'ETIMEDOUT';
+          finish(error, null);
+        }, timeout);
+      }
       Promise.resolve()
         .then(() => globalThis.fetch(url, opts))
         .then(async (response) => {
           const text = await response.text();
           let parsed = text;
           try { parsed = JSON.parse(text); } catch (_) {}
-          callback(null, {
+          finish(null, {
             body: parsed,
             status: response.status,
             statusCode: response.status,
@@ -39,7 +65,7 @@
           // LX scripts often fire background update checks without awaiting
           // them. Returning a synthetic response keeps that optional request
           // from becoming an unhandled Promise rejection.
-          callback(null, {
+          finish(null, {
             body: { code: 599, message: String(error && error.message || error) },
             status: 599,
             statusCode: 599,

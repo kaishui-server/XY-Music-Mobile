@@ -10,37 +10,60 @@ import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import 'error_context.dart';
+
 enum AppLogLevel { info, warning, error }
+
+/// 日志通道。业务日志与性能探针日志共用一条时间序，但**各自独立配额、
+/// 独立过滤、独立导出**：探针在久播场景可达数百条（30s 摘要 + 事件节流），
+/// 若与业务日志挤同一个上限，会把真正的报错/崩溃信息挤出缓冲区。
+enum AppLogChannel { general, probe }
 
 class AppLogEntry {
   const AppLogEntry({
     required this.time,
     required this.level,
     required this.message,
+    this.channel = AppLogChannel.general,
   });
 
   final DateTime time;
   final AppLogLevel level;
   final String message;
+  final AppLogChannel channel;
 
   bool get isError => level == AppLogLevel.error;
   bool get isWarning => level == AppLogLevel.warning;
+  bool get isProbe => channel == AppLogChannel.probe;
 
   Map<String, dynamic> toJson() => {
     'time': time.toIso8601String(),
     'level': level.name,
+    'channel': channel.name,
     'message': message,
   };
 
-  factory AppLogEntry.fromJson(Map<String, dynamic> json) => AppLogEntry(
-    time: DateTime.tryParse(json['time']?.toString() ?? '') ?? DateTime.now(),
-    level: switch (json['level']?.toString()) {
-      'error' => AppLogLevel.error,
-      'warning' => AppLogLevel.warning,
-      _ => AppLogLevel.info,
-    },
-    message: json['message']?.toString() ?? '',
-  );
+  factory AppLogEntry.fromJson(Map<String, dynamic> json) {
+    final message = json['message']?.toString() ?? '';
+    final channel = switch (json['channel']?.toString()) {
+      'probe' => AppLogChannel.probe,
+      'general' => AppLogChannel.general,
+      // 旧版本快照没有 channel 字段：探针行统一带 [PROBE] 前缀，据此迁移。
+      _ => message.startsWith('[PROBE]')
+          ? AppLogChannel.probe
+          : AppLogChannel.general,
+    };
+    return AppLogEntry(
+      time: DateTime.tryParse(json['time']?.toString() ?? '') ?? DateTime.now(),
+      level: switch (json['level']?.toString()) {
+        'error' => AppLogLevel.error,
+        'warning' => AppLogLevel.warning,
+        _ => AppLogLevel.info,
+      },
+      message: message,
+      channel: channel,
+    );
+  }
 }
 
 /// 一份崩溃记录文件（含原生崩溃与 Dart 致命异常）。
@@ -71,6 +94,7 @@ class AppLogStore {
 
   static const _entriesKey = 'appLogsV1';
   static const _maxEntriesKey = 'appLogMaxEntries';
+  static const _probeMaxEntriesKey = 'appLogProbeMaxEntries';
   static const _warningOnlyKey = 'appLogWarningOnly';
 
   /// 崩溃文件最多保留数量，与原生 CrashHandler 保持一致。
@@ -82,10 +106,22 @@ class AppLogStore {
   bool _installed = false;
   bool _initialized = false;
   int maxEntries = 500;
+
+  /// 探针日志独立配额，与 [maxEntries] 互不挤占。
+  ///
+  /// 30s 一条摘要 + 5s 节流的告警，300 条只能覆盖约 25 分钟，久播卡顿
+  /// 恰好就发生在更后面的时间段——实测旧包 240 条 POSITION_GAP 就把
+  /// 配额写满，用户真正卡顿时的现场全被覆盖。默认提到 3000。
+  int maxProbeEntries = 3000;
   bool warningOnly = false;
   String? _crashDirPath;
 
   List<AppLogEntry> get entries => List.unmodifiable(_entries);
+
+  /// 仅性能探针通道的条目（按时间序）。
+  List<AppLogEntry> get probeEntries => _query(
+    channels: const {AppLogChannel.probe},
+  );
 
   Future<void> initialize() => _initFuture ??= _load();
 
@@ -131,19 +167,31 @@ class AppLogStore {
       maxEntries = (preferences.getInt(_maxEntriesKey) ?? 500)
           .clamp(50, 5000)
           .toInt();
+      // 探针配额旧默认是 300（久播 25 分钟即被告警刷屏写满，真卡顿现场
+      // 会被挤掉）。读到 <= 300 视为「仍是旧默认/从未调整」，一次性提升
+      // 到 3000；用户手动设过更大值的尊重原值。
+      final rawProbeMax = preferences.getInt(_probeMaxEntriesKey);
+      maxProbeEntries = (rawProbeMax == null || rawProbeMax <= 300
+              ? 3000
+              : rawProbeMax)
+          .clamp(50, 5000)
+          .toInt();
       warningOnly = preferences.getBool(_warningOnlyKey) ?? false;
       final raw = preferences.getString(_entriesKey);
       if (raw != null && raw.isNotEmpty) {
         final decoded = jsonDecode(raw);
         if (decoded is List) {
-          _entries
-            ..clear()
-            ..addAll(
-              decoded.whereType<Map>().map(
+          final restored = decoded
+              .whereType<Map>()
+              .map(
                 (value) =>
                     AppLogEntry.fromJson(Map<String, dynamic>.from(value)),
-              ),
-            );
+              )
+              .toList();
+          // 历史条目插到前面而不是清空后覆盖：启动流程对 initialize()
+          // 设了超时，恢复动作可能晚于首批运行日志入队（见 main.dart），
+          // 整体 clear 会把这几条启动期日志直接吞掉。
+          _entries.insertAll(0, restored);
           _trim();
         }
       }
@@ -231,6 +279,9 @@ class AppLogStore {
         '===== XY Music $kind =====\n'
         '时间: ${now.toIso8601String()}\n'
         '$header'
+        // AOT 堆栈常常只有几帧异步挂起点，光凭它无法定位具体页面；
+        // 附上崩溃前最后的导航与生命周期，才能把范围收窄下来。
+        '${ErrorContext.describe()}'
         '============================\n'
         '$error\n'
         '${stack ?? ''}\n',
@@ -251,7 +302,7 @@ class AppLogStore {
         if (info != null) {
           return '设备: ${info['manufacturer']} ${info['model']} '
               '(Android ${info['osVersion']}, API ${info['sdkInt']})\n'
-              '版本: ${info['appVersion']}\n';
+              '版本: ${info['appVersion']} (构建 ${info['appBuild']})\n';
         }
       }
     } catch (_) {}
@@ -340,13 +391,28 @@ class AppLogStore {
     return buffer.toString();
   }
 
-  void add(String message, {AppLogLevel? level}) {
+  void add(
+    String message, {
+    AppLogLevel? level,
+    AppLogChannel channel = AppLogChannel.general,
+  }) {
     final text = message.trim();
     if (text.isEmpty) return;
     final resolvedLevel = level ?? _inferLevel(text);
-    if (warningOnly && resolvedLevel == AppLogLevel.info) return;
+    // 「只记录警告和报错」只约束业务日志：探针数据本身就是 INFO 级的曲线
+    // 与摘要，一并过滤会让该开关打开后探针彻底失效。
+    if (channel == AppLogChannel.general &&
+        warningOnly &&
+        resolvedLevel == AppLogLevel.info) {
+      return;
+    }
     _entries.add(
-      AppLogEntry(time: DateTime.now(), level: resolvedLevel, message: text),
+      AppLogEntry(
+        time: DateTime.now(),
+        level: resolvedLevel,
+        message: text,
+        channel: channel,
+      ),
     );
     _trim();
     _schedulePersist();
@@ -371,10 +437,27 @@ class AppLogStore {
   }
 
   void _trim() {
-    final keep = maxEntries.clamp(50, 5000).toInt();
-    if (_entries.length > keep) {
-      _entries.removeRange(0, _entries.length - keep);
+    _trimChannel(AppLogChannel.general, maxEntries);
+    _trimChannel(AppLogChannel.probe, maxProbeEntries);
+  }
+
+  /// 按通道各自配额裁剪（从最早的一条开始）。两个通道共用同一条时间序，
+  /// 但配额独立——久播时数百条探针不会再把业务日志挤出缓冲区。
+  void _trimChannel(AppLogChannel channel, int max) {
+    final keep = max.clamp(50, 5000).toInt();
+    // 快速路径：总条数不足单通道配额时肯定不超限，避免高频 add 时的全表遍历。
+    if (_entries.length <= keep) return;
+    var count = 0;
+    for (final entry in _entries) {
+      if (entry.channel == channel) count++;
     }
+    if (count <= keep) return;
+    var toRemove = count - keep;
+    _entries.removeWhere((entry) {
+      if (toRemove <= 0 || entry.channel != channel) return false;
+      toRemove--;
+      return true;
+    });
   }
 
   Future<void> setMaxEntries(int value) async {
@@ -385,6 +468,14 @@ class AppLogStore {
     await _persistNow();
   }
 
+  Future<void> setMaxProbeEntries(int value) async {
+    maxProbeEntries = value.clamp(50, 5000);
+    _trim();
+    final preferences = await SharedPreferences.getInstance();
+    await preferences.setInt(_probeMaxEntriesKey, maxProbeEntries);
+    await _persistNow();
+  }
+
   Future<void> setWarningOnly(bool value) async {
     warningOnly = value;
     final preferences = await SharedPreferences.getInstance();
@@ -392,22 +483,49 @@ class AppLogStore {
   }
 
   /// 清空本地日志并同步删除持久化快照。
-  Future<void> clear() async {
+  /// [channel] 为空时清空全部通道；指定通道时只清该通道，其余保留。
+  Future<void> clear({AppLogChannel? channel}) async {
     _persistTimer?.cancel();
     _persistTimer = null;
-    _entries.clear();
+    if (channel == null) {
+      _entries.clear();
+    } else {
+      _entries.removeWhere((entry) => entry.channel == channel);
+    }
     try {
       final preferences = await SharedPreferences.getInstance();
-      await preferences.remove(_entriesKey);
+      if (_entries.isEmpty) {
+        await preferences.remove(_entriesKey);
+      } else {
+        await _persistNow();
+      }
     } catch (_) {
       // 本地存储失败不应阻止页面立即显示为空；下次写入时会重新创建。
     }
   }
 
-  List<AppLogEntry> query({Duration? since, bool errorsOnly = false}) {
+  /// 查询业务日志（默认**不含**性能探针通道）。
+  ///
+  /// 探针日志高频且体积大，若混入全量/错误导出会淹没真正的报错信息；
+  /// 需要探针数据时显式传 `channels: {AppLogChannel.probe}`。
+  List<AppLogEntry> query({
+    Duration? since,
+    bool errorsOnly = false,
+    Set<AppLogChannel> channels = const {AppLogChannel.general},
+  }) => _query(since: since, errorsOnly: errorsOnly, channels: channels);
+
+  /// [channels] 为空时不做通道过滤（内部使用，如清空/统计）。
+  List<AppLogEntry> _query({
+    Duration? since,
+    bool errorsOnly = false,
+    Set<AppLogChannel>? channels,
+  }) {
     final threshold = since == null ? null : DateTime.now().subtract(since);
     return _entries
         .where((entry) {
+          if (channels != null && !channels.contains(entry.channel)) {
+            return false;
+          }
           final withinTime =
               threshold == null || !entry.time.isBefore(threshold);
           final levelMatches = !errorsOnly || entry.isError;

@@ -200,7 +200,7 @@ const settingsSearchEntries = <SettingsSearchEntry>[
     path: ['外观', '播放详情页背景'],
     route: '/settings/appearance',
     icon: Icons.wallpaper_outlined,
-    keywords: '封面模糊 壁纸模糊 流光 自定义图片',
+    keywords: '封面模糊 壁纸模糊 氛围 自定义图片',
   ),
   SettingsSearchEntry(
     title: '播放页封面样式',
@@ -1204,7 +1204,8 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
           context,
           icon: Icons.screen_lock_rotation,
           title: '保持屏幕常亮',
-          value: settings?.keepScreenOn ?? true,
+          subtitle: '仅在播放页显示并处于前台时生效；关闭后按系统息屏时间自动熄屏，耗电可降一个量级',
+          value: settings?.keepScreenOn ?? false,
           onChanged: (v) => notifier.setKeepScreenOn(v),
         ),
         _switchTile(
@@ -2149,11 +2150,11 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
 
   String _playerDetailBackgroundLabel(PlayerDetailBackgroundMode mode) =>
       switch (mode) {
-        PlayerDetailBackgroundMode.coverBlur => '流光',
+        PlayerDetailBackgroundMode.coverBlur => '氛围',
         PlayerDetailBackgroundMode.wallpaperBlur => '壁纸模糊',
-        PlayerDetailBackgroundMode.flowingLight => '流光',
+        PlayerDetailBackgroundMode.flowingLight => '氛围',
         PlayerDetailBackgroundMode.customImage => '自定义图片',
-        PlayerDetailBackgroundMode.particle => '流光',
+        PlayerDetailBackgroundMode.particle => '氛围',
       };
 
   String _playerCoverStyleLabel(PlayerCoverStyle style) => switch (style) {

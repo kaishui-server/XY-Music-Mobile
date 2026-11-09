@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 
 import '../core/settings.dart';
+import '../debug/performance_probe.dart';
 import 'animated_page_route.dart';
 
 /// 一级页面分支容器。
@@ -32,6 +33,18 @@ class AnimatedBranchContainer extends StatefulWidget {
 class _AnimatedBranchContainerState extends State<AnimatedBranchContainer>
     with SingleTickerProviderStateMixin {
   late final AnimationController _controller;
+
+  /// 缓动曲线：**必须**只建一次。
+  ///
+  /// `CurvedAnimation` 的构造函数会向 parent 注册 status listener
+  /// （用于翻转 curve direction），而它自己从不摘除。旧实现把它写在
+  /// `build()` 里，等于每次重建都往 controller 上挂一个新 listener：
+  /// 一次 280ms 切换在 120Hz 上重建约 34 次，就永久留下 34 个监听器，
+  /// 且随每次切页线性累积——久播/久用后 controller 单次 notify 要遍历
+  /// 上千个闭包，正是「越用越卡、切页单帧 190~235ms」的嫌疑源之一。
+  /// 提到 initState 建一次、dispose 显式释放后，行为与曲线完全不变。
+  late final CurvedAnimation _movement;
+
   int? _previousIndex;
   int _direction = 1;
 
@@ -46,8 +59,26 @@ class _AnimatedBranchContainerState extends State<AnimatedBranchContainer>
         )..addStatusListener((status) {
           if (status == AnimationStatus.completed && _previousIndex != null) {
             setState(() => _previousIndex = null);
+            // 探针：动画落定，清空该来源的上一帧基准，避免下一次切换的
+            // 首帧把中间的空闲期算成帧间隔。
+            if (kPerformanceProbeEnabled) {
+              PerformanceProbe.instance.onAnimStop(AnimSource.branch);
+            }
           }
         });
+    _movement = CurvedAnimation(
+      parent: _controller,
+      curve: Curves.easeOutCubic,
+    );
+    // 探针：底栏一级分页切换的动画帧间隔（此前完全未纳入统计，
+    // 日志里只有播放页转场，底栏切换卡顿无任何数据支撑）。
+    if (kPerformanceProbeEnabled) {
+      _controller.addListener(_onProbeAnimFrame);
+    }
+  }
+
+  void _onProbeAnimFrame() {
+    PerformanceProbe.instance.onAnimFrame(AnimSource.branch);
   }
 
   @override
@@ -58,27 +89,32 @@ class _AnimatedBranchContainerState extends State<AnimatedBranchContainer>
     _direction =
         widget.direction ??
         (widget.currentIndex > oldWidget.currentIndex ? 1 : -1);
+    if (kPerformanceProbeEnabled) {
+      PerformanceProbe.instance.onAnimStart(AnimSource.branch);
+    }
     _controller.forward(from: 0);
   }
 
   @override
   void dispose() {
+    if (kPerformanceProbeEnabled) {
+      _controller.removeListener(_onProbeAnimFrame);
+    }
+    // 先释放曲线再释放 controller：CurvedAnimation.dispose 会去摘除它
+    // 注册在 parent 上的 status listener。
+    _movement.dispose();
     _controller.dispose();
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
-    final movement = CurvedAnimation(
-      parent: _controller,
-      curve: Curves.easeOutCubic,
-    );
     return ClipRect(
       child: Stack(
         fit: StackFit.expand,
         children: [
           for (var index = 0; index < widget.children.length; index++)
-            _branchLayer(index, movement),
+            _branchLayer(index, _movement),
         ],
       ),
     );

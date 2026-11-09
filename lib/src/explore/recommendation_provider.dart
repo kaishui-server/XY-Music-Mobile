@@ -3,6 +3,7 @@ import 'dart:math' as math;
 
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../core/app_refresh.dart';
 import '../favorites/favorites_provider.dart';
 import '../library/library_provider.dart';
 import '../playlists/playlists_provider.dart';
@@ -29,6 +30,12 @@ void preloadExploreData(WidgetRef ref) {
         .read(exploreHotChartsProvider.future)
         .catchError((_) => const <RecommendedPlaylist>[]),
   );
+  // Baka QQ 每日 30 首：与其它推荐一起后台预热，进入 Tab 时直接展示。
+  unawaited(
+    ref
+        .read(dailyRecommendationsProvider.future)
+        .catchError((_) => null),
+  );
 }
 
 /// 本地偏好生成的网络歌曲推荐。
@@ -36,8 +43,10 @@ void preloadExploreData(WidgetRef ref) {
 /// 只读取本地播放/收藏/歌单数据，搜索候选时才把歌手或专辑关键词交给
 /// 已启用插件；不会把完整播放记录上传到服务端。
 final exploreRecommendationsProvider = FutureProvider<List<Song>>((ref) async {
-  final refreshTimer = Timer(const Duration(minutes: 30), ref.invalidateSelf);
-  ref.onDispose(refreshTimer.cancel);
+  // 后台不刷新：到点若 App 在 hidden 则顺延，回前台后再重算推荐。
+  ref.onDispose(
+    scheduleRefreshWhenVisible(const Duration(minutes: 30), ref.invalidateSelf),
+  );
 
   final library = ref.read(libraryProvider).songs;
   final localByPath = {for (final song in library) song.path: song};
@@ -422,6 +431,75 @@ class RecommendedPlaylist {
   final bool isChart;
 }
 
+/// Baka QQ 音乐插件的每日 30 首推荐状态。
+///
+/// [result] 为插件 getDailyRecommendations 的原始结果；ready 且歌单数据
+/// 完整时额外构造 [playlist]，探索页直接复用它进入歌单详情/播放。
+class DailyRecommendationState {
+  const DailyRecommendationState({
+    required this.plugin,
+    required this.result,
+    this.playlist,
+  });
+
+  final EnabledMusicPlugin plugin;
+  final DailyRecommendationResult result;
+  final RecommendedPlaylist? playlist;
+}
+
+/// 从已启用的 Baka 插件中挑出支持每日推荐的 QQ 音源，拉取其今日
+/// 30 首歌单。仅 Baka 协议插件会命中；无插件或插件不支持时返回 null，
+/// 探索页据此隐藏「每日30首」Tab 或显示引导提示。
+final dailyRecommendationsProvider =
+    FutureProvider<DailyRecommendationState?>((ref) async {
+  final plugins = await ref.read(enabledMusicPluginsProvider.future);
+  EnabledMusicPlugin? target;
+  for (final plugin in plugins) {
+    // 只认 BakaMusic 契约插件；musicfree/洛雪/animemusic 一律跳过。
+    if (!plugin.isBaka) continue;
+    if (!plugin.mayHaveMethod('getDailyRecommendations')) continue;
+    target = plugin;
+    break;
+  }
+  if (target == null) return null;
+
+  final runtime = ref.read(pluginRuntimeProvider);
+  final result = await runtime.getDailyRecommendations(target);
+  RecommendedPlaylist? playlist;
+  if (result.isReady && result.sheetItem != null) {
+    final sheet = result.sheetItem!;
+    final rawData = Map<String, dynamic>.from(sheet);
+    final id = sheet['id']?.toString() ?? '';
+    if (id.isNotEmpty) {
+      final title = result.title.isNotEmpty
+          ? result.title
+          : (sheet['title']?.toString().trim().isNotEmpty == true
+              ? sheet['title']!.toString()
+              : '每日三十首');
+      final account = result.accountName.isNotEmpty
+          ? result.accountName
+          : 'QQ 音乐';
+      playlist = RecommendedPlaylist(
+        plugin: target,
+        result: PluginCatalogResult(
+          pluginId: target.id,
+          id: id,
+          title: title,
+          subtitle: '$account · 每日推荐',
+          coverUrl:
+              (sheet['cover'] ?? sheet['artwork'])?.toString() ?? '',
+          rawData: rawData,
+        ),
+      );
+    }
+  }
+  return DailyRecommendationState(
+    plugin: target,
+    result: result,
+    playlist: playlist,
+  );
+});
+
 /// 从已启用插件的热门榜单拉取大众热门歌曲，与个人偏好无关，
 /// 用于在“猜你想听”中掺入比较火的内容（参考 BakaMusic 推荐歌单思路）。
 Future<List<Song>> _loadHotChartSongs(
@@ -505,11 +583,13 @@ Future<List<Song>> _loadHotChartSongs(
 
 final explorePlaylistRecommendationsProvider =
     FutureProvider<List<RecommendedPlaylist>>((ref) async {
-      final refreshTimer = Timer(
-        const Duration(minutes: 30),
-        ref.invalidateSelf,
+      // 后台不刷新：到点若 App 在 hidden 则顺延，回前台后再重拉歌单推荐。
+      ref.onDispose(
+        scheduleRefreshWhenVisible(
+          const Duration(minutes: 30),
+          ref.invalidateSelf,
+        ),
       );
-      ref.onDispose(refreshTimer.cancel);
       final profile = await _loadTasteProfile(ref);
       if (profile == null) return const [];
 
@@ -665,8 +745,10 @@ final explorePlaylistRecommendationsProvider =
 final exploreHotChartsProvider = FutureProvider<List<RecommendedPlaylist>>((
   ref,
 ) async {
-  final refreshTimer = Timer(const Duration(minutes: 30), ref.invalidateSelf);
-  ref.onDispose(refreshTimer.cancel);
+  // 后台不刷新：到点若 App 在 hidden 则顺延，回前台后再重拉榜单。
+  ref.onDispose(
+    scheduleRefreshWhenVisible(const Duration(minutes: 30), ref.invalidateSelf),
+  );
 
   // 依赖（watch）插件列表而非一次性 read：订阅更新/卸载/去重合并会
   // 重写或删除插件文件并 invalidate 插件列表，这里必须随之重算，

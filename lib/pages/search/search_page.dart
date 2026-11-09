@@ -11,6 +11,7 @@ import '../../src/library/library_provider.dart';
 import '../../src/navigation/animated_page_route.dart';
 import '../../src/navigation/sidebar_controller.dart';
 import '../../src/player/player_provider.dart';
+import '../../src/plugins/artist_avatar_resolver.dart';
 import '../../src/plugins/plugin_runtime.dart';
 import '../../src/ui/xy_surface.dart';
 import '../../src/widgets/cover_image.dart';
@@ -120,6 +121,11 @@ class _SearchPageState extends ConsumerState<SearchPage>
     text: widget.initialQuery,
   );
   final Map<String, _PluginSearchState> _states = {};
+
+  /// 歌手详情页头像补查：会话级缓存 + 并发去重，重复进入页面不重复打接口。
+  late final ArtistAvatarResolver _artistAvatarResolver = ArtistAvatarResolver(
+    fetchAvatar: _fetchArtistAvatar,
+  );
   // 多平台 LX 插件的当前选中平台：plugin.id → 'all' 或平台 id。
   // 缺省视为“全部平台”。
   final Map<String, String> _lxChoice = {};
@@ -425,6 +431,31 @@ class _SearchPageState extends ConsumerState<SearchPage>
     );
   }
 
+  /// 歌手详情页头像补查：与播放页歌曲信息面板同一套兜底逻辑。
+  Future<String> _fetchArtistAvatar(
+    String pluginId,
+    String artistName,
+  ) async {
+    if (!mounted) return '';
+    final plugins = await ref.read(enabledMusicPluginsProvider.future);
+    if (!mounted) return '';
+    EnabledMusicPlugin? target;
+    for (final plugin in plugins) {
+      if (plugin.id == pluginId) {
+        target = plugin;
+        break;
+      }
+    }
+    if (target == null) return '';
+    final runtime = ref.read(pluginRuntimeProvider);
+    return resolveArtistAvatar(
+      isLx: target.isLx,
+      artistName: artistName,
+      searchPluginArtists: () => runtime.searchArtists(target!, artistName),
+      resolvePublicAvatar: () => runtime.resolveArtistAvatarByName(artistName),
+    );
+  }
+
   Future<void> _openCatalogResult(
     _SearchSourceTab tab,
     _SearchCategory category,
@@ -443,6 +474,11 @@ class _SearchPageState extends ConsumerState<SearchPage>
           subtitle: item.subtitle,
           coverUrl: item.coverUrl,
           categoryLabel: _categoryLabelForPlugin(category, plugin),
+          // 歌手封面缺失时按名补查（LX 走公开搜索，其余走插件歌手搜索）；
+          // 专辑/歌单不补查。
+          resolveCoverUrl: category == _SearchCategory.artists
+              ? (name) => _artistAvatarResolver.resolve(plugin.id, name)
+              : null,
           loadSongs: () async {
             final lxSource = _lxSourceFor(tab);
             final results = switch (category) {

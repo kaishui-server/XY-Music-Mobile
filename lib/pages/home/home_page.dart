@@ -253,12 +253,14 @@ class _HomePageState extends ConsumerState<HomePage> {
       body: XyPageBackground(
         child: RefreshIndicator(
           onRefresh: () async {
+            // 下拉是用户主动重试：先清掉热评失败退避再失效，否则退避期
+            // 内拉取会直接抛错，刷了个寂寞。
+            clearHotCommentCooldown();
             ref.invalidate(hotCommentProvider);
             ref.invalidate(homeStatisticsProvider);
             for (final period in LeaderboardPeriod.values) {
               ref.invalidate(homeLeaderboardProvider(period));
             }
-            // 热评接口有失败冷却（30 分钟），冷却期内拉取会抛错；
             // 单模块失败不阻断其他模块刷新，也不向上抛未捕获异常。
             await Future.wait([
               ref
@@ -674,7 +676,10 @@ class _HotCommentModule extends ConsumerWidget {
               TextButton.icon(
                 onPressed: comment.isLoading
                     ? null
-                    : () => ref.invalidate(hotCommentProvider),
+                    : () {
+                        clearHotCommentCooldown();
+                        ref.invalidate(hotCommentProvider);
+                      },
                 icon: AnimatedRotation(
                   turns: comment.isLoading ? 1 : 0,
                   duration: const Duration(milliseconds: 500),
@@ -687,9 +692,14 @@ class _HotCommentModule extends ConsumerWidget {
           const SizedBox(height: 8),
           comment.when(
             loading: () => const _ModuleLoading(height: 88),
-            error: (_, _) => _InlineError(
-              message: '热评加载失败',
-              onRetry: () => ref.invalidate(hotCommentProvider),
+            error: (error, _) => _InlineError(
+              message: error is StateError
+                  ? error.message.toString()
+                  : '热评加载失败（$error）',
+              onRetry: () {
+                clearHotCommentCooldown();
+                ref.invalidate(hotCommentProvider);
+              },
             ),
             data: (item) => InkWell(
               onTap: item.songTitle == null
@@ -1385,16 +1395,25 @@ class _InlineError extends StatelessWidget {
   final VoidCallback onRetry;
 
   @override
-  Widget build(BuildContext context) => SizedBox(
-    height: 92,
+  Widget build(BuildContext context) => ConstrainedBox(
+    constraints: const BoxConstraints(minHeight: 92),
     child: Center(
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Text(message),
-          const SizedBox(height: 4),
-          TextButton(onPressed: onRetry, child: const Text('点击重试')),
-        ],
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            // 失败原因可能带接口错误详情，允许换行到三行，避免溢出。
+            Text(
+              message,
+              textAlign: TextAlign.center,
+              maxLines: 3,
+              overflow: TextOverflow.ellipsis,
+            ),
+            const SizedBox(height: 4),
+            TextButton(onPressed: onRetry, child: const Text('点击重试')),
+          ],
+        ),
       ),
     ),
   );

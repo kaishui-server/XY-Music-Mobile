@@ -277,11 +277,10 @@ class _MiniPlayerBarState extends ConsumerState<MiniPlayerBar> {
                         key: _coverKey,
                         width: 50,
                         height: 50,
+                        // 不按曲目换 key：换 key 会丢弃 CoverImage 的
+                        // State，切歌首帧必然回到占位图。封面切换由
+                        // CoverImage 内部保留上一帧交叉淡入处理。
                         child: CoverImage(
-                          key: ValueKey(
-                            'mini:${current.path}:'
-                            '${resolveOnlineCoverUrl(current.coverUrl, current.path) ?? ''}',
-                          ),
                           songPath: current.path,
                           imageUrl: resolveOnlineCoverUrl(
                             current.coverUrl,

@@ -16,7 +16,9 @@
 
 #![allow(dead_code)]
 
-use crate::player::buffered_source::{BlockProducer, BufferedSource};
+use crate::player::buffered_source::{
+    elevate_thread_priority, BlockProducer, BufferedMonitor, BufferedSource,
+};
 use crate::player::equalizer::{Equalizer, EqualizerHandle, EqualizerSettings};
 use crate::player::loudness::VolumeNormalizer;
 use crate::player::sound_effect::{SoundEffectBlockProcessor, SoundEffectSettings};
@@ -504,6 +506,8 @@ fn produce_and_enqueue<P: BlockProducer + Send + 'static>(
         Some(block) => block,
         None => return false, // EOF
     };
+    // B4：本块是否为饥饿兜底静音（通道为空时的占位块，非真实内容）。
+    let starvation_gap = buffered.take_silence_fallback();
     let block = if downmix_active {
         crate::player::channel_downmix::downmix_block(&raw_block, source_channels)
     } else {
@@ -541,7 +545,10 @@ fn produce_and_enqueue<P: BlockProducer + Send + 'static>(
             chan_count = 0;
         }
     }
-    progress.samples_played.fetch_add(produced, Ordering::Relaxed);
+    // B4：静音兜底块不计入已播样本数（与 aaudio 写线程一致）。
+    if !starvation_gap {
+        progress.samples_played.fetch_add(produced, Ordering::Relaxed);
+    }
 
     let boxed = Box::into_raw(Box::new(byte_buf));
     shared
@@ -639,22 +646,55 @@ unsafe fn create_audio_player_for_rate(
 
     let player = match engine_create_audio_player(engine, &src, &sink, &iids, &required) {
         Ok(p) => p,
-        Err(r) => return Err(format!("OpenSL CreateAudioPlayer 失败({sample_rate}Hz, res={r})")),
+        Err(r) => {
+            return Err(format!(
+                "[RESOURCE] OpenSL CreateAudioPlayer 失败({sample_rate}Hz, res={r} {})",
+                sl_result_reason(r)
+            ))
+        }
     };
     let r = obj_realize(player);
     if r != SL_RESULT_SUCCESS {
         obj_destroy(player);
-        return Err(format!("OpenSL 音频播放器 realize 失败({sample_rate}Hz, res={r})"));
+        return Err(format!(
+            "[RESOURCE] OpenSL 音频播放器 realize 失败({sample_rate}Hz, res={r} {})",
+            sl_result_reason(r)
+        ));
     }
     let play = obj_get_interface(player, lib.play_iid) as SlPlay;
     let bq = obj_get_interface(player, lib.bq_iid) as SlBufferQueue;
     let volume = obj_get_interface(player, lib.volume_iid) as SlVolume;
     if play.is_null() || bq.is_null() {
         obj_destroy(player);
-        return Err("OpenSL 播放器缺少必要接口(PLAY/BUFFERQUEUE)".to_string());
+        return Err("[RESOURCE] OpenSL 播放器缺少必要接口(PLAY/BUFFERQUEUE)".to_string());
     }
     let volume = if volume.is_null() { None } else { Some(volume) };
     Ok((player, play, bq, volume))
+}
+
+/// SL 结果码 → 可读原因（诊断日志用）。
+///
+/// 注意：日志中出现的 `CreateOutputMix res=12` 并不在 OpenSL ES 1.0.1 的
+/// 标准结果码表内（标准码只到 11），属厂商侧自定义/未公开码，通常对应
+/// 音频 HAL 会话数达上限、设备被独占或系统混音器资源不足。因此这里的
+/// 兜底分支要保留原始数字，定位时优先按「资源类失败」处理，而不是怀疑
+/// 采样率/声道等参数问题。
+fn sl_result_reason(code: u32) -> &'static str {
+    match code {
+        0 => "SL_RESULT_SUCCESS",
+        1 => "SL_RESULT_PRECONDITIONS_VIOLATED",
+        2 => "SL_RESULT_PARAMETER_INVALID",
+        3 => "SL_RESULT_MEMORY_FAILURE",
+        4 => "SL_RESULT_RESOURCE_ERROR(资源不足/设备占用)",
+        5 => "SL_RESULT_INTERNAL_ERROR",
+        6 => "SL_RESULT_UNKNOWN_ERROR",
+        7 => "SL_RESULT_OPERATION_ABORTED",
+        8 => "SL_RESULT_CONTROL_LOST",
+        9 => "SL_RESULT_BUFFER_INSUFFICIENT",
+        10 => "SL_RESULT_CONTENT_UNSUPPORTED",
+        11 => "SL_RESULT_CONTENT_NOT_FOUND",
+        _ => "厂商私有/未定义结果码(按资源类失败排查)",
+    }
 }
 
 /// 尝试 [源采样率, 48000, 44100] 建流；全部失败返回 Err。
@@ -674,18 +714,24 @@ unsafe fn create_session(
         [SL_BOOLEAN_TRUE].as_ptr(),
     );
     if r != SL_RESULT_SUCCESS || engine_obj_raw.is_null() {
-        return Err(format!("slCreateEngine 失败(res={r})"));
+        return Err(format!(
+            "[RESOURCE] slCreateEngine 失败(res={r} {})",
+            sl_result_reason(r)
+        ));
     }
     let engine_obj = engine_obj_raw as SlObject;
     let r = obj_realize(engine_obj);
     if r != SL_RESULT_SUCCESS {
         obj_destroy(engine_obj);
-        return Err(format!("OpenSL engine realize 失败(res={r})"));
+        return Err(format!(
+            "[RESOURCE] OpenSL engine realize 失败(res={r} {})",
+            sl_result_reason(r)
+        ));
     }
     let engine = obj_get_interface(engine_obj, lib.engine_iid) as SlEngine;
     if engine.is_null() {
         obj_destroy(engine_obj);
-        return Err("OpenSL engine 缺少 ENGINE 接口".to_string());
+        return Err("[RESOURCE] OpenSL engine 缺少 ENGINE 接口".to_string());
     }
 
     // 2. output mix
@@ -693,14 +739,20 @@ unsafe fn create_session(
         Ok(m) => m,
         Err(r) => {
             obj_destroy(engine_obj);
-            return Err(format!("OpenSL CreateOutputMix 失败(res={r})"));
+            return Err(format!(
+                "[RESOURCE] OpenSL CreateOutputMix 失败(res={r} {})",
+                sl_result_reason(r)
+            ));
         }
     };
     let r = obj_realize(mix);
     if r != SL_RESULT_SUCCESS {
         obj_destroy(mix);
         obj_destroy(engine_obj);
-        return Err(format!("OpenSL output mix realize 失败(res={r})"));
+        return Err(format!(
+            "[RESOURCE] OpenSL output mix realize 失败(res={r} {})",
+            sl_result_reason(r)
+        ));
     }
 
     // 3. audio player：源率 → 48k → 44.1k 逐级协商
@@ -753,13 +805,19 @@ pub(crate) fn run_opensl_exclusive_playback(
     progress: Arc<ExclusiveProgress>,
     running: Arc<AtomicBool>,
     last_error: Arc<Mutex<Option<String>>>,
+    monitor: Arc<BufferedMonitor>,
 ) {
+    // B2：OpenSL 缓冲回调线程同样在普通调度下运行，系统繁忙时会被挤掉，
+    // 表现为「画面不卡但音频偶发卡顿」。与 AAudio 工作线程一致把 nice
+    // 提到 -10（失败无副作用，不影响原有出音时序）。
+    elevate_thread_priority();
+
     // 1. 加载 OpenSL ES 库
     let lib = match OpenSlLib::load() {
         Some(l) => l,
         None => {
             let _ = init_tx.send(Err(
-                "无法加载 libOpenSLES.so（需要 Android API 9+）".to_string()
+                "[RESOURCE] 无法加载 libOpenSLES.so（需要 Android API 9+）".to_string()
             ));
             return;
         }
@@ -779,7 +837,7 @@ pub(crate) fn run_opensl_exclusive_playback(
                 ) {
                     Ok(s) => s,
                     Err(e) => {
-                        let _ = init_tx.send(Err(format!("流缓存启动失败: {e}")));
+                        let _ = init_tx.send(Err(format!("[NETWORK] 流缓存启动失败: {e}")));
                         return;
                     }
                 };
@@ -787,11 +845,11 @@ pub(crate) fn run_opensl_exclusive_playback(
                 let deadline = std::time::Instant::now() + Duration::from_secs(8);
                 while !crate::player::stream_cache::is_buffer_ready(&state) {
                     if let Some(err) = state.download_error() {
-                        let _ = init_tx.send(Err(format!("流缓存下载失败: {err}")));
+                        let _ = init_tx.send(Err(format!("[NETWORK] 流缓存下载失败: {err}")));
                         return;
                     }
                     if !running.load(Ordering::Relaxed) || std::time::Instant::now() >= deadline {
-                        let _ = init_tx.send(Err("流缓存缓冲超时".to_string()));
+                        let _ = init_tx.send(Err("[NETWORK] 流缓存缓冲超时".to_string()));
                         return;
                     }
                     std::thread::sleep(Duration::from_millis(20));
@@ -799,7 +857,7 @@ pub(crate) fn run_opensl_exclusive_playback(
                 match state.new_reader_with_decryption() {
                     Ok(r) => Some(r),
                     Err(e) => {
-                        let _ = init_tx.send(Err(format!("流缓存读取失败: {e}")));
+                        let _ = init_tx.send(Err(format!("[NETWORK] 流缓存读取失败: {e}")));
                         return;
                     }
                 }
@@ -814,7 +872,7 @@ pub(crate) fn run_opensl_exclusive_playback(
     ) {
         Ok(d) => d,
         Err(e) => {
-            let _ = init_tx.send(Err(format!("打开音频文件失败: {e}")));
+            let _ = init_tx.send(Err(format!("[CODEC] 打开音频文件失败: {e}")));
             return;
         }
     };
@@ -835,13 +893,24 @@ pub(crate) fn run_opensl_exclusive_playback(
     }
     let downmix_active = playback_channels != source_channels;
 
-    // 3. 缓冲源 + 起始跳转
-    let mut buffered =
-        BufferedSource::new(decoder, source_sample_rate, source_channels, total_duration);
-    if request.start_time_secs > 0.0 {
-        if let Err(e) = buffered.try_seek(Duration::from_secs_f64(request.start_time_secs)) {
-            let _ = init_tx.send(Err(format!("跳转失败: {e}")));
-            return;
+    // 3. 缓冲源 + 起始跳转（seek 失败降级从 0 起播，与 AAudio 后端一致：
+    //    续播时在线流 seek 追不上下载进度就放弃整个接管代价过大）
+    let mut buffered = BufferedSource::new_tracked(
+        decoder,
+        source_sample_rate,
+        source_channels,
+        total_duration,
+        Some(monitor.clone()),
+    );
+    let mut actual_start_secs = request.start_time_secs.max(0.0);
+    if actual_start_secs > 0.0 {
+        if let Err(e) = buffered.try_seek(Duration::from_secs_f64(actual_start_secs)) {
+            if let Ok(mut le) = last_error.lock() {
+                *le = Some(format!(
+                    "[SEEK] 起始跳转失败({e})，降级从头建流继续接管"
+                ));
+            }
+            actual_start_secs = 0.0;
         }
     }
 
@@ -909,7 +978,7 @@ pub(crate) fn run_opensl_exclusive_playback(
         Ordering::Relaxed,
     );
     progress.samples_played.store(
-        (request.start_time_secs * source_sample_rate as f64 * playback_channels as f64) as u64,
+        (actual_start_secs * source_sample_rate as f64 * playback_channels as f64) as u64,
         Ordering::Relaxed,
     );
 
@@ -938,7 +1007,10 @@ pub(crate) fn run_opensl_exclusive_playback(
         );
         if r != SL_RESULT_SUCCESS {
             drop(Box::from_raw(shared_ptr));
-            let _ = init_tx.send(Err(format!("OpenSL 注册缓冲回调失败(res={r})")));
+            let _ = init_tx.send(Err(format!(
+                "[RESOURCE] OpenSL 注册缓冲回调失败(res={r} {})",
+                sl_result_reason(r)
+            )));
             unsafe { session.destroy() };
             return;
         }

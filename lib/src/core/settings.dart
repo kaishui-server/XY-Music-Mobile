@@ -170,6 +170,11 @@ enum LyricDisplayAlignment { left, center, right }
 const kDefaultPlayerLyricPlayedColor = 0xFFFFFFFF;
 const kDefaultPlayerLyricUnplayedColor = 0x8CFFFFFF;
 
+/// 歌词辉光模糊半径：播放页与首页迷你播放栏共用，保证两处观感一致。
+/// 对齐 EchoTide 的 `Shadow(activeColor α=0.65, blurRadius=7)`；Flutter 的
+/// `Shadow.blurRadius` 会先折算成高斯 sigma，故取略大的 8 作为等效值。
+const double kLyricGlowBlurRadius = 8;
+
 /// 扫描支持的主流音频格式大类（与 Rust 白名单展开对应）。
 /// wma/ape 与 MusicFree 的本地音乐支持格式对齐（opus 归入 ogg 大类）。
 const kSupportedScanFormats = <String>[
@@ -207,7 +212,10 @@ class AppSettings {
     this.playSongQueueMode = PlaySongQueueMode.wholeList,
     this.playOtherAudioWithoutInterruption = false,
     this.lastTab = 0,
-    this.keepScreenOn = true,
+    // 默认不常亮：屏幕是播放器耗电排行第一项（30~50%），亮屏连播 2 小时
+    // 实测约 18.7mA / 2425mAh，而熄屏放歌只需 2~4mA。需要边看歌词边听时
+    // 由用户在设置里主动打开，且仅在播放页可见 + 前台时才真正生效。
+    this.keepScreenOn = false,
     // 音量键调节应用内音量（不动系统媒体音量，车机上不影响导航等）。
     this.volumeKeyControlsAppVolume = true,
     this.themeMode = ThemeModePreference.system,
@@ -252,6 +260,7 @@ class AppSettings {
     // 播放详情页歌词页：单击歌词行调整播放进度（默认开启）。
     this.lyricTapSeek = true,
     this.lyricWordEffectMode = LyricWordEffectMode.progressive,
+    this.lyricGlowEnabled = false,
     this.lyricDisplayAlignment = LyricDisplayAlignment.left,
     this.lyricFontSize = 22.0,
     this.miniLyricFontSize = 14.0,
@@ -304,6 +313,11 @@ class AppSettings {
   final PlaySongQueueMode playSongQueueMode;
   final bool playOtherAudioWithoutInterruption;
   final int lastTab;
+  /// 播放页可见且前台时保持屏幕常亮。
+  ///
+  /// 默认关闭。仅作为「用户牌」开关：真正生效还要求播放页处于可见状态
+  /// 且 App 在前台（见 player_page 的常亮同步），在列表页浏览时不会因
+  /// 歌在播就把屏幕钉亮。
   final bool keepScreenOn;
 
   /// 音量键调节应用内音量：应用前台时拦截音量键，只调本应用播放音量，
@@ -392,6 +406,10 @@ class AppSettings {
   /// 播放详情页歌词页：单击歌词行调整播放进度。
   final bool lyricTapSeek;
   final LyricWordEffectMode lyricWordEffectMode;
+
+  /// 逐字歌词（卡拉OK式逐字高亮）是否给已唱部分叠加辉光。默认关闭，
+  /// 保持与历史版本一致的纯色渲染。
+  final bool lyricGlowEnabled;
   final LyricDisplayAlignment lyricDisplayAlignment;
 
   /// 播放详情页歌词的基础字号（未选中行）。选中行在此基础上放大。
@@ -507,6 +525,7 @@ class AppSettings {
     bool? showLyricsRomaji,
     bool? lyricTapSeek,
     LyricWordEffectMode? lyricWordEffectMode,
+    bool? lyricGlowEnabled,
     LyricDisplayAlignment? lyricDisplayAlignment,
     double? lyricFontSize,
     double? miniLyricFontSize,
@@ -604,6 +623,7 @@ class AppSettings {
       showLyricsRomaji: showLyricsRomaji ?? this.showLyricsRomaji,
       lyricTapSeek: lyricTapSeek ?? this.lyricTapSeek,
       lyricWordEffectMode: lyricWordEffectMode ?? this.lyricWordEffectMode,
+      lyricGlowEnabled: lyricGlowEnabled ?? this.lyricGlowEnabled,
       lyricDisplayAlignment:
           lyricDisplayAlignment ?? this.lyricDisplayAlignment,
       lyricFontSize: lyricFontSize ?? this.lyricFontSize,
@@ -687,7 +707,7 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
       playOtherAudioWithoutInterruption:
           prefs.getBool('playOtherAudioWithoutInterruption') ?? false,
       lastTab: prefs.getInt('lastTab') ?? 0,
-      keepScreenOn: prefs.getBool('keepScreenOn') ?? true,
+      keepScreenOn: prefs.getBool('keepScreenOn') ?? false,
       volumeKeyControlsAppVolume:
           prefs.getBool('volumeKeyControlsAppVolume') ?? true,
       themeMode: _themeFromInt(prefs.getInt('themeMode') ?? 0),
@@ -753,6 +773,7 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
       showLyricsRomaji: prefs.getBool('showLyricsRomaji') ?? true,
       lyricTapSeek: prefs.getBool('lyricTapSeek') ?? true,
       lyricWordEffectMode: _lyricWordEffectModeFromPrefs(prefs),
+      lyricGlowEnabled: prefs.getBool('lyricGlowEnabled') ?? false,
       lyricDisplayAlignment: _lyricDisplayAlignmentFromPrefs(prefs),
       lyricFontSize:
           (prefs.getDouble('lyricFontSize') ?? 22.0)
@@ -854,7 +875,7 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
 
   PlayerDetailBackgroundMode _playerDetailBackgroundModeFromInt(int value) {
     // coverBlur（旧索引 0）与 particle（旧索引 4，粒子动效）已移除：
-    // 统一迁移为流光背景。
+    // 统一迁移为氛围背景。
     if (value == PlayerDetailBackgroundMode.coverBlur.index ||
         value == PlayerDetailBackgroundMode.particle.index) {
       return PlayerDetailBackgroundMode.flowingLight;
@@ -1012,6 +1033,7 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
       prefs.setBool('showLyricsRomaji', next.showLyricsRomaji),
       prefs.setBool('lyricTapSeek', next.lyricTapSeek),
       prefs.setInt('lyricWordEffectMode', next.lyricWordEffectMode.index),
+      prefs.setBool('lyricGlowEnabled', next.lyricGlowEnabled),
       prefs.setInt('lyricDisplayAlignment', next.lyricDisplayAlignment.index),
       prefs.setDouble('lyricFontSize', next.lyricFontSize),
       prefs.setDouble('miniLyricFontSize', next.miniLyricFontSize),
@@ -1340,6 +1362,9 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
     (state.valueOrNull ?? const AppSettings()).copyWith(
       lyricWordEffectMode: mode,
     ),
+  );
+  Future<void> setLyricGlowEnabled(bool v) => _save(
+    (state.valueOrNull ?? const AppSettings()).copyWith(lyricGlowEnabled: v),
   );
   Future<void> setLyricDisplayAlignment(LyricDisplayAlignment alignment) =>
       _save(

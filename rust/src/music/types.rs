@@ -1,8 +1,17 @@
 use serde::{Deserialize, Serialize};
 use tokio::sync::Semaphore;
 
-pub const THUMBNAIL_IMAGE_CONCURRENCY_LIMIT: usize = 2;
-pub const FULL_COVER_IMAGE_CONCURRENCY_LIMIT: usize = 2;
+/// 缩略图在途任务并发上限。
+///
+/// 原值 2 是"宁少勿多"的保守设定，但缩略图是歌单首屏的主路径，2 个名额
+/// 在 20 条一屏的列表里等于强行串行，是封面逐张慢慢浮现的直接原因。
+/// 提到 6 与封面线程池线程数对齐，内存侧由 Dart 侧 decoded 纹理的宽度
+/// 槽位（列表封面 128~192px）兜底，单张纹理只有几十 KB。
+pub const THUMBNAIL_IMAGE_CONCURRENCY_LIMIT: usize = 6;
+
+/// 高清封面在途任务并发上限。高清封面（800px）单张内存占用远大于缩略图，
+/// 且只在播放页/详情页少量请求，因此给 4 而不是与缩略图齐平。
+pub const FULL_COVER_IMAGE_CONCURRENCY_LIMIT: usize = 4;
 
 /// 缩略图并发控制状态
 pub struct ThumbnailImageConcurrencyLimit(pub Semaphore);
@@ -16,8 +25,8 @@ mod tests {
 
     #[test]
     fn cover_image_concurrency_is_split_between_thumbnail_and_full_cover() {
-        assert_eq!(THUMBNAIL_IMAGE_CONCURRENCY_LIMIT, 2);
-        assert_eq!(FULL_COVER_IMAGE_CONCURRENCY_LIMIT, 2);
+        assert_eq!(THUMBNAIL_IMAGE_CONCURRENCY_LIMIT, 6);
+        assert_eq!(FULL_COVER_IMAGE_CONCURRENCY_LIMIT, 4);
 
         let _thumbnail_limit =
             ThumbnailImageConcurrencyLimit(Semaphore::new(THUMBNAIL_IMAGE_CONCURRENCY_LIMIT));

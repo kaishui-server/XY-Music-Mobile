@@ -244,6 +244,35 @@ module.exports = { platform: "示例音乐" };
     expect(PluginMetadata.isKnownMusicFreeSourceUrl(''), isFalse);
   });
 
+  test('platform 经配置表与数字常量间接取值时仍能解析名称', () {
+    String script(int level) =>
+        '''
+const QQ_SOURCE_LEVEL = $level;
+const qqSourceProfiles = {
+  1: {
+    platform: "QQ音乐[L1]",
+  },
+  2: {
+    platform: "QQ音乐[L2]",
+  },
+};
+const qqSourceProfile = qqSourceProfiles[QQ_SOURCE_LEVEL];
+module.exports = {
+  platform: qqSourceProfile.platform,
+  author: "Toskysun",
+  version: "1.2.4",
+  search: async () => ({ data: [] }),
+};
+''';
+
+    // 服务器按已鉴权地址注入不同 level：显示名应随配置表取值，
+    // 而不是因无法求值回退成 URL 文件名（qq-l1 / qq-l2）。
+    expect(PluginMetadata.parse(script(1)).name, 'QQ音乐[L1]');
+    expect(PluginMetadata.parse(script(2)).name, 'QQ音乐[L2]');
+    expect(PluginMetadata.parse(script(1)).author, 'Toskysun');
+    expect(PluginMetadata.parse(script(1)).version, '1.2.4');
+  });
+
   test('插件 ID 归一化：惜梦 v4 与 baka 不再折叠成同一 ID', () {
     // 回归：剥离中文会让「animemusic聚合」与「animemusic」都归一化成
     // animemusic，批量安装时互相覆盖（提示装了 6 个、列表只剩 3 个）。

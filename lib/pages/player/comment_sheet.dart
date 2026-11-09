@@ -27,6 +27,7 @@ class _CommentSheetState extends ConsumerState<CommentSheet> {
   bool _isEnd = false;
   bool _loading = false;
   bool _loadingMore = false;
+  bool _loadMoreError = false;
   String? _error;
   bool _unsupported = false;
   int _sortMode = 0; // 0 最多赞 1 最新
@@ -52,6 +53,7 @@ class _CommentSheetState extends ConsumerState<CommentSheet> {
             _scroll.position.maxScrollExtent - 200 &&
         !_loading &&
         !_loadingMore &&
+        !_loadMoreError &&
         !_isEnd &&
         _comments.isNotEmpty) {
       _fetch(_page + 1);
@@ -73,6 +75,7 @@ class _CommentSheetState extends ConsumerState<CommentSheet> {
         _unsupported = false;
       } else {
         _loadingMore = true;
+        _loadMoreError = false;
       }
     });
     try {
@@ -134,8 +137,13 @@ class _CommentSheetState extends ConsumerState<CommentSheet> {
       setState(() {
         _loading = false;
         _loadingMore = false;
-        if (page == 1) _error = e.toString();
-        _isEnd = page > 1;
+        // 首页失败展示整页错误态；加载更多失败保留已加载列表，
+        // 底部展示可点击重试的提示。
+        if (page == 1) {
+          _error = e.toString();
+        } else {
+          _loadMoreError = true;
+        }
       });
     }
   }
@@ -325,6 +333,28 @@ class _CommentSheetState extends ConsumerState<CommentSheet> {
                   width: 20,
                   height: 20,
                   child: CircularProgressIndicator(strokeWidth: 2),
+                ),
+              ),
+            );
+          }
+          if (_loadMoreError) {
+            return Padding(
+              padding: const EdgeInsets.all(12),
+              child: Center(
+                child: TextButton.icon(
+                  onPressed: () => _fetch(_page + 1),
+                  icon: Icon(
+                    Icons.refresh,
+                    size: 16,
+                    color: scheme.onSurfaceVariant,
+                  ),
+                  label: Text(
+                    '加载失败，点击重试',
+                    style: TextStyle(
+                      fontSize: 12,
+                      color: scheme.onSurfaceVariant,
+                    ),
+                  ),
                 ),
               ),
             );

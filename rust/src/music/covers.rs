@@ -23,6 +23,10 @@ const FULL_COVER_FALLBACK_EXT: &str = "png";
 const FULL_COVER_CACHE_EXTENSIONS: [&str; 5] = ["jpg", "png", "webp", "gif", "bmp"];
 const CACHE_ALIAS_EXT: &str = "ref";
 
+/// 封面解码/缩放线程池常驻线程数。解码 + Lanczos3 重采样都是 CPU 密集
+/// 操作，线程数直接决定歌单首屏封面能并行出几张。
+const COVER_WORKER_THREADS: usize = 6;
+
 /// 缩略图并发信号量（全局共享，限制解码/缩放时的内存占用）。
 fn thumbnail_semaphore() -> &'static tokio::sync::Semaphore {
     static SEM: OnceLock<tokio::sync::Semaphore> = OnceLock::new();
@@ -37,17 +41,21 @@ fn full_cover_semaphore() -> &'static tokio::sync::Semaphore {
     })
 }
 
-/// 封面解码/缩放的有界线程池（全局共享，常驻 2 个工作线程）。
+/// 封面解码/缩放的有界线程池（全局共享）。
 ///
 /// 原先每次调用 `std::thread::spawn(...).join()` 都会新建一个线程，列表
 /// 滚动/切歌高频触发时造成线程抖动与调度开销（内存卡顿修复 R5 的一部分）。
 /// 改为池化后任务自然排队，线程数固定；内存占用仍由上面的并发信号量
 /// 兜底，不会因池化而放大。
+///
+/// 线程数从 2 提到 [`COVER_WORKER_THREADS`]：解码 + Lanczos3 缩放是纯 CPU
+/// 活，2 条线程在 8 核机上是明显瓶颈，歌单一屏 20 张封面要串成 10 轮。
+/// 在途任务数仍由信号量（缩略图 6 / 高清 4）限制，不会因线程变多失控。
 fn cover_worker_pool() -> &'static rayon::ThreadPool {
     static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
     POOL.get_or_init(|| {
         rayon::ThreadPoolBuilder::new()
-            .num_threads(2)
+            .num_threads(COVER_WORKER_THREADS)
             .thread_name(|idx| format!("cover-worker-{idx}"))
             .build()
             .expect("cover worker pool build failed")
@@ -55,14 +63,18 @@ fn cover_worker_pool() -> &'static rayon::ThreadPool {
 }
 
 /// 在封面线程池中执行阻塞的解码/缩放任务并等待结果（池满时排队）。
-fn run_cover_task<T: Send + 'static>(
+///
+/// 用 `oneshot` + `.await` 等待，**不能**用 `std::sync::mpsc::recv()` 同步
+/// 阻塞：后者会堵死 tokio 的 worker 线程，封面一多就把异步运行时整个拖住，
+/// 连带数据库、插件调用、播放链路的 async 任务全部排队等不到执行。
+async fn run_cover_task<T: Send + 'static>(
     task: impl FnOnce() -> T + Send + 'static,
 ) -> Result<T, String> {
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = tokio::sync::oneshot::channel();
     cover_worker_pool().spawn(move || {
         let _ = tx.send(task());
     });
-    rx.recv().map_err(|_| "封面线程池任务失败".to_string())
+    rx.await.map_err(|_| "封面线程池任务失败".to_string())
 }
 
 #[cfg(test)]
@@ -324,6 +336,25 @@ fn persist_alias_target(alias_path: &Path, target_path: &Path) -> Option<()> {
     Some(())
 }
 
+/// 缩略图缓存命中探测（只做 stat + 读 alias，开销微秒级）。
+///
+/// 抽出来是为了让上层在**申请信号量之前**就能短路返回：封面命中属于
+/// 绝对高频路径（歌单一屏 20 条、每次进页面/滚动重建都会请求），若命中
+/// 也要排在并发名额里，实际并发被 IMAGE_CONCURRENCY_LIMIT 卡成串行，
+/// 表现就是"封面一张一张慢慢冒出来"。
+fn cached_thumbnail_path(cache_dir: &Path, source_path: &str) -> Option<String> {
+    let source_hash = generate_source_hash(Path::new(source_path));
+    let alias_path = thumbnail_alias_path(cache_dir, &source_hash);
+    resolve_alias_target(cache_dir, &alias_path)
+}
+
+/// 高清封面缓存命中探测，语义同 [`cached_thumbnail_path`]。
+fn cached_full_cover_path(cache_dir: &Path, source_path: &str) -> Option<String> {
+    let source_hash = generate_source_hash(Path::new(source_path));
+    let alias_path = full_cover_alias_path(cache_dir, &source_hash);
+    resolve_alias_target(cache_dir, &alias_path)
+}
+
 fn cleanup_invalid_full_cover_variants(cache_dir: &Path, stem: &str) {
     for ext in FULL_COVER_CACHE_EXTENSIONS {
         let candidate = cache_dir.join(format!("{stem}.{ext}"));
@@ -457,6 +488,17 @@ pub async fn get_song_cover_thumbnail(
     db_conn: Arc<Mutex<rusqlite::Connection>>,
     path: String,
 ) -> Result<String, String> {
+    let cache_dir = get_cover_cache_dir(&cache_root);
+
+    // 命中快速路径：本地歌曲且缩略图已落盘时直接返回，不申请信号量、
+    // 不进线程池。歌单页一屏 20 条封面，原先命中也要排队等并发名额，
+    // 相当于人为串行，是"封面加载慢"最直接的成因。
+    if !is_remote_uri(&path) {
+        if let Some(hit) = cached_thumbnail_path(&cache_dir, &path) {
+            return Ok(hit);
+        }
+    }
+
     let _permit = thumbnail_semaphore()
         .acquire()
         .await
@@ -467,11 +509,10 @@ pub async fn get_song_cover_thumbnail(
         path.clone()
     };
 
-    let cache_dir = get_cover_cache_dir(&cache_root);
     let p = Path::new(&source_path);
     let p_buf = p.to_path_buf();
 
-    let result = run_cover_task(move || get_or_create_thumbnail(&p_buf, &cache_dir))?;
+    let result = run_cover_task(move || get_or_create_thumbnail(&p_buf, &cache_dir)).await?;
 
     if let Some(cache_path_str) = result {
         if !cache_path_str.is_empty() {
@@ -493,6 +534,15 @@ pub async fn get_song_cover(
     db_conn: Arc<Mutex<rusqlite::Connection>>,
     path: String,
 ) -> Result<String, String> {
+    let cache_dir = get_cover_cache_dir(&cache_root);
+
+    // 命中快速路径，语义同 [`get_song_cover_thumbnail`]。
+    if !is_remote_uri(&path) {
+        if let Some(hit) = cached_full_cover_path(&cache_dir, &path) {
+            return Ok(hit);
+        }
+    }
+
     let _permit = full_cover_semaphore()
         .acquire()
         .await
@@ -503,11 +553,10 @@ pub async fn get_song_cover(
         path.clone()
     };
 
-    let cache_dir = get_cover_cache_dir(&cache_root);
     let p = Path::new(&source_path);
     let p_buf = p.to_path_buf();
 
-    let result = run_cover_task(move || get_or_create_full_cover(&p_buf, &cache_dir))?;
+    let result = run_cover_task(move || get_or_create_full_cover(&p_buf, &cache_dir)).await?;
 
     if let Some(cache_path_str) = result {
         return Ok(cache_path_str);

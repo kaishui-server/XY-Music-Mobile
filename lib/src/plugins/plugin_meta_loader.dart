@@ -21,7 +21,10 @@ import 'plugin_metadata.dart';
 /// 状态等 prefs 数据由调用方在主 isolate 读取后传入，改类/改名
 /// 仍然即时生效，不受缓存影响。
 const _metaCacheFileName = 'meta_cache.json';
-const _metaCacheVersion = 1;
+
+/// 解析逻辑升级（支持平台名间接取值）后提升版本，使已装插件的旧
+/// meta_cache.json 失效并重新解析，否则列表仍显示缓存里的旧名称。
+const _metaCacheVersion = 2;
 
 /// 后台加载全部插件行（plain map，可跨 isolate 传输）。
 /// 返回的行字段见 [_rowFromMeta]；kind 为分类标识字符串

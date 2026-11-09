@@ -1,5 +1,3 @@
-import 'dart:convert';
-
 import '../rust/api.dart';
 import 'native_storage_permission.dart';
 
@@ -95,13 +93,15 @@ class LocalMusicScanner {
         );
       }
       try {
-        final songsJson = await scanMusicFolder(
+        // Rust 侧直接回传歌曲数量：整库 JSON 经桥接再 jsonDecode 会产生
+        // 数倍于原串的临时对象图，是扫描期间内存峰值的主要来源。
+        final folderSongCount = await scanMusicFolder(
           dbPath: dbPath,
           folderPath: folders[i],
           minimumDurationSeconds: minimumDurationSeconds,
           allowedFormats: allowedFormats,
         );
-        found += (jsonDecode(songsJson) as List).length;
+        found += folderSongCount;
       } catch (e) {
         // 单目录失败不阻断其它目录（MusicFree readDir 容错同款）。
         errors.add('${folders[i]}: $e');

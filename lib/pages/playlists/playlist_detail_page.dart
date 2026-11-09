@@ -770,11 +770,15 @@ Future<void> _editPlaylistCover(
         playlist.id,
         bytes,
       );
+      // 选图/写盘期间用户可能已经返回上一页，此时再碰 ref 会抛
+      // `Cannot use "ref" after the widget was disposed.`——必须逐段守卫。
+      if (!context.mounted) return;
       if (saved == null) {
         toast('封面保存失败', type: XyNoticeType.error);
         return;
       }
       await ref.read(playlistsProvider.notifier).setCover(playlist.id, saved);
+      if (!context.mounted) return;
       toast('封面已更新', type: XyNoticeType.success);
       return;
     case _PlaylistCoverAction.search:
@@ -795,6 +799,9 @@ Future<void> _editPlaylistCover(
           playlist.id,
           response.bodyBytes,
         );
+        // 网络下载最长 20s，超过一次页面生命周期的量级；返回后必须先确认
+        // 页面还在，才允许读 ref / 弹提示。
+        if (!context.mounted) return;
         if (saved == null) {
           toast('封面保存失败', type: XyNoticeType.error);
           return;
@@ -802,13 +809,16 @@ Future<void> _editPlaylistCover(
         await ref
             .read(playlistsProvider.notifier)
             .setCover(playlist.id, saved);
+        if (!context.mounted) return;
         toast('封面已关联', type: XyNoticeType.success);
       } catch (e) {
+        if (!context.mounted) return;
         toast('封面下载失败：$e', type: XyNoticeType.error);
       }
       return;
     case _PlaylistCoverAction.reset:
       await ref.read(playlistsProvider.notifier).setCover(playlist.id, '');
+      if (!context.mounted) return;
       toast('已恢复默认封面', type: XyNoticeType.success);
       return;
   }

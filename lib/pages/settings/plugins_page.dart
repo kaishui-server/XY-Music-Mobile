@@ -1373,7 +1373,16 @@ class _PluginsPageState extends ConsumerState<PluginsPage> {
   }
 
   Future<void> _showUserVariables(_PluginInfo plugin) async {
-    final variables = plugin.userVariables;
+    // 「用户 ID」（qq_user_id）是 Baka QQ 音乐插件专属变量：非 Baka
+    // 协议插件即使脚本声明了该变量也隐藏输入行，避免误导。保存时
+    // 该键随过滤后的 variables 一起被清理，不会残留在其它插件上。
+    final variables = plugin.userVariables
+        .where(
+          (variable) =>
+              !(variable.key == 'qq_user_id' &&
+                  plugin.kind != _PluginKind.baka),
+        )
+        .toList();
     if (variables.isEmpty) return;
     final prefs = await SharedPreferences.getInstance();
     if (!mounted) return;

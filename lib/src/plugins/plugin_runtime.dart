@@ -175,6 +175,34 @@ class PluginPlaylistImport {
   final List<PluginSearchSong> songs;
 }
 
+/// Baka QQ 音乐插件的每日推荐结果（getDailyRecommendations）。
+///
+/// [state] 语义与插件脚本一致：unconfigured（未填用户 ID）/
+/// login_required（ID 失效）/ blocked（风控）/ updating（歌单生成中）/
+/// error（拉取失败）/ ready（可用）。ready 时 [sheetItem] 为今日歌单
+/// 元数据，宿主可交给歌单导入链路加载歌曲。
+class DailyRecommendationResult {
+  const DailyRecommendationResult({
+    required this.state,
+    this.title = '',
+    this.accountName = '',
+    this.connectUrl = '',
+    this.date,
+    this.refreshAt,
+    this.sheetItem,
+  });
+
+  final String state;
+  final String title;
+  final String accountName;
+  final String connectUrl;
+  final String? date;
+  final num? refreshAt;
+  final Map<String, dynamic>? sheetItem;
+
+  bool get isReady => state == 'ready' && sheetItem != null;
+}
+
 class PluginMediaSource {
   const PluginMediaSource({
     required this.url,
@@ -1298,6 +1326,116 @@ class PluginRuntimeService {
     return until != null && DateTime.now().isBefore(until);
   }
 
+  // ==================== 【P0-1】解析失败账本 ====================
+
+  /// 失败账本键：插件 + 歌曲 + 解析路径 + 音质，歌曲主键复用
+  /// `_qualityCacheKey` 的口径（id/mid/hash/标题-歌手兜底），保证同一首歌
+  /// 在各条解析路径上命中同一格账。`route` 用于区分「插件脚本」与
+  /// 「公共解析」两条独立通路，二者互不短路（否则插件路失败会把公共路
+  /// 也一起跳过，等于丢掉兼容兜底）。
+  String _sourceFailureKey(
+    EnabledMusicPlugin plugin,
+    Map<String, dynamic> rawData,
+    String quality, {
+    String route = 'lx',
+  }) =>
+      '${_qualityCacheKey(plugin, rawData)}|$route|$quality';
+
+  /// 整曲级账键：不带音质，用于「该插件解析这首歌已连续失败」的快速判死。
+  String _songFailureKey(
+    EnabledMusicPlugin plugin,
+    Map<String, dynamic> rawData,
+  ) =>
+      _qualityCacheKey(plugin, rawData);
+
+  /// 是否已被判定为确定性失败（本会话永久失败，或窗口内已达重复上限）。
+  bool _sourceFailureBlocked(String key) {
+    if (_sourcePermanentFailures.contains(key)) return true;
+    final count = _sourceFailureCounts[key] ?? 0;
+    if (count < _sourceFailureRepeatLimit) return false;
+    final firstAt = _sourceFailureFirstAt[key];
+    if (firstAt == null) return false;
+    if (DateTime.now().difference(firstAt) > _sourceFailureWindow) {
+      // 窗口已过：清账重新给机会（网络恢复/上游补货后应能正常解析）。
+      _sourceFailureCounts.remove(key);
+      _sourceFailureFirstAt.remove(key);
+      return false;
+    }
+    return true;
+  }
+
+  /// 记账一次失败；脚本级异常直接升级为本会话永久失败。
+  void _noteSourceFailure(String key, Object error) {
+    final now = DateTime.now();
+    final firstAt = _sourceFailureFirstAt[key];
+    if (firstAt == null || now.difference(firstAt) > _sourceFailureWindow) {
+      _sourceFailureFirstAt[key] = now;
+      _sourceFailureCounts[key] = 1;
+    } else {
+      _sourceFailureCounts[key] = (_sourceFailureCounts[key] ?? 0) + 1;
+    }
+    if (_isPermanentSourceError(error.toString())) {
+      _sourcePermanentFailures.add(key);
+    }
+    _pruneSourceFailureLedger();
+  }
+
+  /// 脚本级不可恢复错误：脚本内部数据结构缺失/调用了不存在的方法，
+  /// 换音质、换解析路径、重试都会复现同一异常，只浪费解析预算。
+  static bool _isPermanentSourceError(String message) {
+    final m = message.toLowerCase();
+    return m.contains('cannot read property') ||
+        m.contains('cannot read properties') ||
+        m.contains('is not a function') ||
+        m.contains('is not defined') ||
+        m.contains('undefined is not an object') ||
+        m.contains('null is not an object');
+  }
+
+  /// 账本自清理：过期条目 + 超量丢最旧，防止账本自身变成内存增长点。
+  void _pruneSourceFailureLedger() {
+    if (_sourceFailureFirstAt.length <= _sourceFailureLedgerLimit &&
+        _sourcePermanentFailures.length <= _sourceFailureLedgerLimit) {
+      return;
+    }
+    final cutoff = DateTime.now().subtract(_sourceFailureWindow);
+    final expired = <String>[
+      for (final entry in _sourceFailureFirstAt.entries)
+        if (entry.value.isBefore(cutoff)) entry.key,
+    ];
+    for (final key in expired) {
+      // 过期只清计数窗口；脚本级永久失败标记保留（本会话不再重试同一格）。
+      _sourceFailureFirstAt.remove(key);
+      _sourceFailureCounts.remove(key);
+    }
+    // 超量淘汰按 firstAt 显式取最旧：Map 的迭代顺序是「首次插入」顺序，
+    // 而同一 key 命中后只更新计数、不重排，插入顺序并不等于最早失败时刻。
+    while (_sourceFailureFirstAt.length > _sourceFailureLedgerLimit) {
+      String? oldest;
+      DateTime? oldestAt;
+      for (final entry in _sourceFailureFirstAt.entries) {
+        if (oldestAt == null || entry.value.isBefore(oldestAt)) {
+          oldestAt = entry.value;
+          oldest = entry.key;
+        }
+      }
+      if (oldest == null) break;
+      _sourceFailureFirstAt.remove(oldest);
+      _sourceFailureCounts.remove(oldest);
+    }
+    if (_sourcePermanentFailures.length > _sourceFailureLedgerLimit) {
+      // 永久失败标记无时间信息可淘汰；命中的格子异常地多时整体清空，
+      // 用「下次失败重新标记」换内存确定性，避免它自己变成增长点。
+      _sourcePermanentFailures.clear();
+    }
+  }
+
+  /// 【P0-2】单曲解析预算判定：上游调用次数或总耗时任一超限即放弃。
+  bool _lxResolveBudgetExceeded(Stopwatch stopwatch, int upstreamCalls) {
+    return upstreamCalls >= _lxResolveMaxUpstreamCalls ||
+        stopwatch.elapsed >= _lxResolveBudget;
+  }
+
   /// 校验直链是否真实可用：上游无货时部分 LX 源返回 code=200 但 url 仅剩
   /// host（形如 https://aqqmusic.tc.qq.com/ 的空路径假直链）。host-only
   /// 的 URL 必须视为该档音质失败并降级重试，不能当成功直链交给播放器。
@@ -1387,6 +1525,35 @@ class PluginRuntimeService {
   static const Duration _mediaSourceCacheTtl = Duration(minutes: 5);
   static const int _mediaSourceCacheMaxEntries = 12;
   final Map<String, _MediaSourceCacheEntry> _mediaSourceCache = {};
+
+  // 【P0-1】解析失败账本：同一 (插件|歌曲|音质) 反复失败时不再重跑档位链。
+  //
+  // 现象：LX 脚本级错误（cannot read property 'mdN' of undefined）与上游
+  // 无货都属于「重试也不会变」的确定性失败，而播放器的失败策略链（重试 /
+  // 降档 / 换源 / 下一首）会把整条 8 档 × 2 路解析重跑一遍，单曲可放大
+  // 到上千次上游请求；荣耀机日志里 93 条「LX解析失败」即由此放大而来，
+  // 同时是 RSS 阶梯上涨的主因之一。
+  // 账本按时间窗口计数并带硬上限，避免自身变成新的常驻内存。
+  static const Duration _sourceFailureWindow = Duration(seconds: 90);
+  static const int _sourceFailureLedgerLimit = 256;
+  static const int _sourceFailureRepeatLimit = 2;
+  final Map<String, int> _sourceFailureCounts = {};
+  final Map<String, DateTime> _sourceFailureFirstAt = {};
+  // 脚本级不可恢复失败：换档、换路、重试都只会复现同一异常，本会话内
+  // 直接跳过该 (插件|歌曲|音质)，不再占用解析预算。
+  final Set<String> _sourcePermanentFailures = {};
+
+  // 【P0-2】单曲解析总预算：一次起播最多 12 次上游调用 / 20 秒。
+  // 超出即放弃本次解析交上层换源，避免单曲把整条档位链跑穿（实测未缓存
+  // 歌可跑 16+ 次上游请求，单曲耗时 20s+）。
+  static const int _lxResolveMaxUpstreamCalls = 12;
+  static const Duration _lxResolveBudget = Duration(seconds: 20);
+
+  // 【P1-2】同一插件连续整体失败（整条梯子都没解析出地址）的次数：
+  // 达到阈值说明 JS 侧脚本内部状态或运行时堆已劣化，重建 QuickJS 运行时
+  // 一次性回收（代价是下次解析需重新加载脚本，数百 ms）。
+  static const int _lxRuntimeRecycleStreak = 5;
+  int _lxResolveFailureStreak = 0;
 
   /// 已把插件源码同步给常驻 worker 的插件集合：worker 收到源码后会在
   /// 自身缓存（pluginSources），后续请求无需重复携带——每次搜索/切歌
@@ -2204,6 +2371,9 @@ class PluginRuntimeService {
   /// 网易歌手头像兜底缓存（歌手名 → 头像 URL）。
   static final Map<String, String> _neteaseArtistAvatarCache = {};
 
+  /// 归一化歌手名 → 公开头像（含空结果），供 LX 等无头像字段的场景使用。
+  static final Map<String, String> _artistAvatarNameCache = {};
+
   static bool _isNeteasePlugin(EnabledMusicPlugin plugin) {
     final name = plugin.name.toLowerCase();
     final url = plugin.sourceUrl.toLowerCase();
@@ -2212,6 +2382,61 @@ class PluginRuntimeService {
         url.contains('netease') ||
         url.contains('网易');
   }
+
+  /// 按歌手名查公开歌手头像（网易公开搜索，无需密钥）。
+  ///
+  /// 洛雪（LX）音源的搜索/播放脚本只返回歌手名字，歌曲条目里没有头像
+  /// 字段；歌曲信息面板需要头像时走该兜底。只接受同名歌手（忽略大小写、
+  /// 空白与标点），取不到返回空串，由调用方回退占位。
+  Future<String> resolveArtistAvatarByName(String artistName) async {
+    final name = artistName.trim();
+    if (name.isEmpty) return '';
+    final key = _normalizeArtistName(name);
+    if (key.isEmpty) return '';
+    final cached = _artistAvatarNameCache[key];
+    if (cached != null) return cached;
+    try {
+      final url =
+          'https://music.163.com/api/search/get/web?s=${Uri.encodeComponent(name)}&type=100&limit=10';
+      final response = await http
+          .get(
+            Uri.parse(url),
+            headers: const {
+              'Cookie': 'os=pc',
+              'Referer': 'https://music.163.com',
+            },
+          )
+          .timeout(const Duration(seconds: 4));
+      if (response.statusCode != 200) return '';
+      final decoded = jsonDecode(response.body);
+      final result = decoded is Map ? decoded['result'] : null;
+      final artists = result is Map ? result['artists'] : null;
+      if (artists is! List) return '';
+      var avatar = '';
+      for (final entry in artists) {
+        if (entry is! Map) continue;
+        final raw = Map<String, dynamic>.from(entry);
+        final matched = _neteaseArtistNames(
+          raw,
+        ).any((value) => _normalizeArtistName(value) == key);
+        if (!matched) continue;
+        avatar = _pickNeteaseArtistAvatar(raw);
+        if (avatar.isNotEmpty) break;
+      }
+      // 空结果也缓存，避免同名歌手反复请求；超量直接清空（量级很小）。
+      if (_artistAvatarNameCache.length >= 300) {
+        _artistAvatarNameCache.clear();
+      }
+      _artistAvatarNameCache[key] = avatar;
+      return avatar;
+    } catch (_) {
+      // 接口失败：静默回退，不缓存失败结果，后续仍可重试。
+      return '';
+    }
+  }
+
+  static String _normalizeArtistName(String value) =>
+      value.toLowerCase().replaceAll(RegExp(r'[^a-z0-9\u4e00-\u9fa5]+'), '');
 
   /// 网易系歌手结果头像兜底：官方搜索接口（type=100）按搜索词一次
   /// 可取回带 img1v1Url 的歌手数组，按名字（name/alias/trans）匹配
@@ -2580,6 +2805,45 @@ class PluginRuntimeService {
     } catch (_) {
       // 目录接口容错：未实现/报错的插件返回空榜单，不阻断推荐页。
       return const [];
+    }
+  }
+
+  /// 获取 Baka QQ 音乐插件的每日 30 首推荐（getDailyRecommendations）。
+  ///
+  /// 依赖插件用户变量中的 qq_user_id（用户 ID）换取每日歌单；未填时
+  /// 插件返回 unconfigured，由 UI 提示引导配置。LX / animemusic 协议
+  /// 不提供该接口，直接返回 unsupported，调用方据此隐藏入口。
+  Future<DailyRecommendationResult> getDailyRecommendations(
+    EnabledMusicPlugin plugin,
+  ) async {
+    // 仅 BakaMusic 契约插件提供每日推荐；静态未识别到方法时直接放弃，
+    // 避免对普通 MusicFree 插件发起无谓的跨 isolate 调用。
+    if (!plugin.isBaka || !plugin.mayHaveMethod('getDailyRecommendations')) {
+      return const DailyRecommendationResult(state: 'unsupported');
+    }
+    try {
+      final response = _runsPluginsInBackground
+          ? await _runPluginOperation(plugin, 'getDailyRecommendations', null)
+          : await _callOnCurrentIsolate(plugin, 'getDailyRecommendations', []);
+      if (response is! Map) {
+        return const DailyRecommendationResult(state: 'error');
+      }
+      final sheetRaw = response['sheetItem'];
+      return DailyRecommendationResult(
+        state: response['state']?.toString().trim() ?? 'error',
+        title: response['title']?.toString() ?? '',
+        accountName: response['accountName']?.toString() ?? '',
+        connectUrl: response['connectUrl']?.toString() ?? '',
+        date: response['date']?.toString(),
+        refreshAt:
+            response['refreshAt'] is num ? response['refreshAt'] as num : null,
+        sheetItem: sheetRaw is Map
+            ? Map<String, dynamic>.from(sheetRaw)
+            : null,
+      );
+    } catch (_) {
+      // 跨 isolate 调用失败/脚本异常统一降级为 error，UI 可重试。
+      return const DailyRecommendationResult(state: 'error');
     }
   }
 
@@ -5327,7 +5591,21 @@ class PluginRuntimeService {
         '音源「${plugin.name}」近期连接失败，已临时跳过（约 45 秒后自动重试）',
       );
     }
+    // 【P0-1】整曲判死：此插件解析这首歌短时间内已连续失败，而播放器失败
+    // 策略链（重试/降档/换源/下一首）会把本方法反复调用，每次都完整跑
+    // 8 档 × 2 路。窗口内已达重复上限就直接抛错，让上层立刻换源。
+    final songFailureKey = _songFailureKey(plugin, rawData);
+    if (_sourceFailureBlocked(songFailureKey)) {
+      throw Exception(
+        '音源「${plugin.name}」解析该歌曲已连续失败，暂不再重试'
+        '（窗口 ${_sourceFailureWindow.inSeconds}s 后恢复）',
+      );
+    }
     Object? lastError;
+    // 【P0-2】本次解析的总预算（12 次上游调用 / 20s）：超出即放弃本次
+    // 解析，交由播放器失败策略换源，避免单曲把整条档位梯子跑穿。
+    final resolveStopwatch = Stopwatch()..start();
+    var upstreamCalls = 0;
     var qualities = pluginQualityCandidates(preferredQuality);
     // 已完成的音质探测（discoverQualities）记录了该插件+歌曲真实可解析
     // 的档位；盲试 8 档时每个不支持的高档位都要在插件内部走一遍多接口
@@ -5375,6 +5653,22 @@ class PluginRuntimeService {
     final intervalMs = int.tryParse(
         songInfo['interval']?.toString().split('.').first ?? '');
     for (final quality in qualities) {
+      // 【P0-1】确定性失败短路：该档位在本轮解析里已反复失败，或命中
+      // 脚本级不可恢复错误时直接跳过，不再白占一次上游调用。
+      final failureKey = _sourceFailureKey(plugin, rawData, quality);
+      if (_sourceFailureBlocked(failureKey)) {
+        lastError ??= Exception(
+            '音源「${plugin.name}」音质$quality 已判定不可用（跳过重复重试）');
+        continue;
+      }
+      // 【P0-2】预算耗尽：本次解析不再继续跑档位，交上层换源。
+      if (_lxResolveBudgetExceeded(resolveStopwatch, upstreamCalls)) {
+        lastError ??= Exception(
+            '音源「${plugin.name}」解析超出单曲预算'
+            '（${resolveStopwatch.elapsedMilliseconds}ms/$upstreamCalls 次），已中止本次解析');
+        break;
+      }
+      upstreamCalls += 1;
       if (qqApiKey.isNotEmpty && qqApiConsecutiveFailures < 2) {
         try {
           final sourceApiResult = await QqSourceApi.resolve(
@@ -5387,6 +5681,9 @@ class PluginRuntimeService {
             apiUrl: qqApiUrl,
           );
           _lxConnectivityFailures.remove(plugin.id);
+          // 【P1-2】解析成功即清零连续失败计数：只有真正连续失败的序列
+          // 才值得重建运行时，跨歌曲累计会误伤正常播放。
+          _lxResolveFailureStreak = 0;
           // 解析成功即视为网络恢复：立即解除熔断，避免换网络/服务恢复
           // 后仍被旧熔断冷却拦截（华为 Mate30Pro 换 WiFi 后插件不可用）。
           _lxCircuitCooldownUntil.remove(plugin.id);
@@ -5428,6 +5725,9 @@ class PluginRuntimeService {
             throw Exception('LX返回假音质（$quality 实际下发内容不符）');
           }
           _lxConnectivityFailures.remove(plugin.id);
+          // 【P1-2】解析成功即清零连续失败计数：只有真正连续失败的序列
+          // 才值得重建运行时，跨歌曲累计会误伤正常播放。
+          _lxResolveFailureStreak = 0;
           // 解析成功即视为网络恢复：立即解除熔断，避免换网络/服务恢复
           // 后仍被旧熔断冷却拦截（华为 Mate30Pro 换 WiFi 后插件不可用）。
           _lxCircuitCooldownUntil.remove(plugin.id);
@@ -5457,6 +5757,9 @@ class PluginRuntimeService {
           sameErrorStreak = 1;
           lastErrorMessage = friendly;
         }
+        // 【P0-1】记账：档位级失败（含脚本级永久失败）写入账本，
+        // 后续重试不再重复撞同一格。
+        _noteSourceFailure(failureKey, error);
         AppLogStore.instance.add(
           '[播放链路] LX解析失败 ${plugin.name} 音质$quality '
           '${attemptStopwatch.elapsedMilliseconds}ms '
@@ -5482,6 +5785,18 @@ class PluginRuntimeService {
     // 时，逐档等待超时只会把解析时间拉长数倍（每档最多 15s 超时）。
     var publicConnErrors = 0;
     for (final quality in qualities) {
+      // 【P0-1】公共解析通路按 route=public 独立记账，与插件脚本通路互不
+      // 短路（两路是独立兜底关系）；【P0-2】预算共用，避免两路叠加把单曲
+      // 解析耗时翻倍。
+      final publicFailureKey =
+          _sourceFailureKey(plugin, rawData, quality, route: 'public');
+      if (_sourceFailureBlocked(publicFailureKey)) continue;
+      if (_lxResolveBudgetExceeded(resolveStopwatch, upstreamCalls)) {
+        lastError ??= Exception(
+            '音源「${plugin.name}」公共解析超出单曲预算，已中止本次解析');
+        break;
+      }
+      upstreamCalls += 1;
       final attemptStopwatch = Stopwatch()..start();
       try {
         final response = await lxResolveUrl(
@@ -5514,6 +5829,9 @@ class PluginRuntimeService {
             continue;
           }
           _lxConnectivityFailures.remove(plugin.id);
+          // 【P1-2】解析成功即清零连续失败计数：只有真正连续失败的序列
+          // 才值得重建运行时，跨歌曲累计会误伤正常播放。
+          _lxResolveFailureStreak = 0;
           // 解析成功即视为网络恢复：立即解除熔断，避免换网络/服务恢复
           // 后仍被旧熔断冷却拦截（华为 Mate30Pro 换 WiFi 后插件不可用）。
           _lxCircuitCooldownUntil.remove(plugin.id);
@@ -5530,6 +5848,8 @@ class PluginRuntimeService {
         final friendly = _friendlyError(error.toString());
         final isConnError = _isLxConnectivityError(error.toString());
         if (isConnError) publicConnErrors++;
+        // 【P0-1】公共通路同样记账，重试时不再重复撞同一格。
+        _noteSourceFailure(publicFailureKey, error);
         AppLogStore.instance.add(
           '[播放链路] LX公共解析失败 ${plugin.name} 音质$quality '
           '${attemptStopwatch.elapsedMilliseconds}ms $friendly',
@@ -5553,6 +5873,21 @@ class PluginRuntimeService {
           level: AppLogLevel.warning,
         );
       }
+    }
+    // 【P0-1】整曲记账：两路都失败才算这首歌在该插件解析失败，用于
+    // 上层失败策略链反复调用本方法时快速判死。
+    _noteSourceFailure(songFailureKey, lastError ?? 'LX 没有返回可播放地址');
+    // 【P1-2】连续整体失败计数：达到阈值说明 JS 脚本内部状态或 QuickJS
+    // 堆已劣化（异常对象、脚本内部缓存只增不减），重建运行时一次性回收。
+    _lxResolveFailureStreak += 1;
+    if (_lxResolveFailureStreak >= _lxRuntimeRecycleStreak) {
+      _lxResolveFailureStreak = 0;
+      AppLogStore.instance.add(
+        '[播放链路] 音源连续解析失败 $_lxRuntimeRecycleStreak 次，'
+        '重建插件运行时回收内存',
+        level: AppLogLevel.warning,
+      );
+      _recycleRuntimeForMemory();
     }
     throw Exception(lastError ?? 'LX 没有返回可播放地址');
   }
@@ -8352,6 +8687,13 @@ class PluginRuntimeService {
           ],
         );
         break;
+      case 'getDailyRecommendations':
+        data = await service._callOnCurrentIsolate(
+          plugin,
+          'getDailyRecommendations',
+          [],
+        );
+        break;
       case 'importPlaylist':
         data = await service._importPlaylistOnCurrentIsolate(
           plugin,
@@ -8387,6 +8729,38 @@ class PluginRuntimeService {
     _mediaSourceCache.clear();
     _lxConnectivityFailures.clear();
     _lxCircuitCooldownUntil.clear();
+  }
+
+  /// 【P1-2】解析连续失败后的运行时回收：销毁 QuickJS 运行时并清空
+  /// 「运行时派生」状态（已加载插件、音质探测结果、解析失败账本），下次
+  /// 解析按需重新初始化。与 [dispose] 的区别：保留服务实例与已解析直链
+  /// 缓存 `_mediaSourceCache`，只回收 JS 引擎及其派生内存。
+  /// 有其它运行时调用在飞时不回收（避免销毁正在使用的引擎），留待下次触发。
+  void _recycleRuntimeForMemory() {
+    if (_activeRuntimeOperations > 0) {
+      AppLogStore.instance.add(
+        '[播放链路] 运行时繁忙，跳过本次运行时回收',
+        level: AppLogLevel.info,
+      );
+      return;
+    }
+    _pluginWorker?.kill();
+    _pluginWorker = null;
+    _pluginWorkerTask = null;
+    _runtime?.dispose();
+    _runtime = null;
+    _initializing = null;
+    _loaded.clear();
+    _loadedLx.clear();
+    _loadTasks.clear();
+    _lxCallQueue.clear();
+    _pluginSourceTasks.clear();
+    _pluginSourceSyncedToWorker.clear();
+    _qualityDiscoveryCache.clear();
+    _qualityDiscoveryDone.clear();
+    _sourceFailureCounts.clear();
+    _sourceFailureFirstAt.clear();
+    _sourcePermanentFailures.clear();
   }
 
   /// 预热插件运行时：冷启动要创建 QuickJS 引擎并 evaluate 约 800KB 的

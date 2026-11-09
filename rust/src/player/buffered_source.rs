@@ -85,17 +85,33 @@ extern "system" {
 #[cfg(target_os = "windows")]
 const THREAD_PRIORITY_ABOVE_NORMAL: i32 = 1;
 
-/// 提升当前线程优先级到 ABOVE_NORMAL（仅 Windows，其他平台 no-op）。
+/// 提升当前线程优先级（Windows: ABOVE_NORMAL；Android: nice -10）。
 #[cfg(target_os = "windows")]
-fn elevate_thread_priority() {
+pub(crate) fn elevate_thread_priority() {
     // SAFETY: GetCurrentThread 返回当前线程伪句柄（-2），SetThreadPriority 设置当前线程优先级。
     unsafe {
         let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
     }
 }
-#[cfg(not(target_os = "windows"))]
+
+/// Android 实现：生产者（解码/流缓存拉取）线程在系统繁忙或后台治理时会被
+/// 普通调度抢占，通道 744ms 缓冲排空后播放线程只能返回静音块 → 用户感知
+/// 「偶发音频卡顿」（画面不卡）。此处把线程 nice 提到 -10（介于默认 0 与
+/// 音频线程 THREAD_PRIORITY_AUDIO(-16) 之间）：
+/// - app 进程内对自己线程设负 nice 是允许的（受 cgroup 约束），失败仅返回 -1，
+///   不做任何回退，故不影响原有时序；
+/// - 不做 SCHED_FIFO：需要 CAP_SYS_NICE，普通应用必然失败且不会报错。
+#[cfg(target_os = "android")]
+pub(crate) fn elevate_thread_priority() {
+    // SAFETY: setpriority 只作用于当前线程（PRIO_PROCESS=0, who=0），无内存安全风险。
+    unsafe {
+        let _ = libc::setpriority(0, 0, -10);
+    }
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "android")))]
 #[inline]
-fn elevate_thread_priority() {}
+pub(crate) fn elevate_thread_priority() {}
 
 /// 后台线程命令。
 enum Command {
@@ -162,6 +178,8 @@ pub struct BufferedSource<P> {
     current_block: VecDeque<f32>,
     /// 内部源是否已耗尽（EOF）且缓冲排空。
     exhausted: bool,
+    /// 上一块是否为饥饿兜底静音（B4）：播放线程据此不推进已播样本数。
+    silence_fallback: bool,
     /// 可选：缓冲监控。消费线程置 `starved`（饥饿），生产线程置 `produced`（已补充）。
     monitor: Option<Arc<BufferedMonitor>>,
     /// 后台线程句柄（Drop 时 take + join）。
@@ -238,6 +256,7 @@ where
             total_duration,
             current_block: VecDeque::with_capacity(BLOCK_SAMPLES),
             exhausted: false,
+            silence_fallback: false,
             monitor,
             thread_handle,
             _marker: PhantomData,
@@ -293,6 +312,16 @@ where
         self.total_duration
     }
 
+    /// 取出并清除「上一块是静音兜底」标志（B4）。
+    ///
+    /// 播放线程在每次 [`next_block`](Self::next_block) 之后立即调用：返回 true 表示
+    /// 上一块是饥饿兜底静音（不是真实内容），此时不得推进已播样本数。
+    pub fn take_silence_fallback(&mut self) -> bool {
+        let was_silence = self.silence_fallback;
+        self.silence_fallback = false;
+        was_silence
+    }
+
     /// 块级消费接口：取回下一个样本块（交错 f32，最多 [`BLOCK_SAMPLES`] 样本）。
     ///
     /// - 返回 `Some(block)`：有真实样本。
@@ -328,11 +357,14 @@ where
                 // 通道暂时空：后台线程正在生产或被抢占。返回静音块避免 underrun 爆音，
                 // 同时置饥饿标志：看门狗据此自动暂停/恢复，避免长时间无声。
                 self.set_starvation(true);
+                // B4：标记本次为静音兜底，播放线程不计入已播样本数。
+                self.silence_fallback = true;
                 Some(vec![0.0; BLOCK_SAMPLES])
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 // 后台线程退出（EOF 或 Drop）→ 流结束。
                 self.exhausted = true;
+                self.silence_fallback = false;
                 self.set_starvation(false);
                 None
             }

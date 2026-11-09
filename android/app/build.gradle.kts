@@ -63,6 +63,23 @@ android {
             // 压缩打包原生库（默认不压缩以加快加载），可显著减小 APK 体积
             useLegacyPackaging = true
         }
+        resources {
+            // META-INF 的 *.version 只是 Gradle 依赖版本标记，运行期不读取；
+            // 60 余个条目连同 zip 目录开销约 10KB，剔除以满足 20MiB 上限。
+            excludes += "META-INF/*.version"
+            // 只交付 arm64/arm32：Weibo SDK 自带 x86/x86_64 预编译库在 arm
+            // 设备上永远不会被加载（按 Build.SUPPORTED_ABIS 选同架构那份），
+            // 连同 zip 条目开销约 16KB。
+            excludes += "assets/libwbsafeedit_x86"
+            excludes += "assets/libwbsafeedit_x86_64"
+            // kotlin/**/*.kotlin_builtins 仅供 kotlin-reflect 运行期使用，
+            // 本包 R8 未保留任何 kotlin.reflect 类；DebugProbesKt.bin 与
+            // kotlin-tooling-metadata.json 是编译器/协程调试元数据，运行期
+            // 不读取。三项合计约 13KB。
+            excludes += "kotlin/**"
+            excludes += "DebugProbesKt.bin"
+            excludes += "kotlin-tooling-metadata.json"
+        }
     }
 }
 
