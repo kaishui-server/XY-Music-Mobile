@@ -61,3 +61,31 @@ opt-level = 3
 lto = "fat"
 codegen-units = 1
 strip = "symbols"
+
+# 【体积控制】第三方依赖默认按体积优先优化（"s"），热路径 crate 用下面
+# 的具名覆盖保持 opt-level=3。本项目自身的 DSP/FFT/解密代码不受通配符
+# 影响（package 覆盖只作用于外部依赖），仍走上面的 opt-level=3。
+# 2026-11-12：5656 起汽水歌词跨源聚合等新代码把 arm64 APK 顶破 20MB 上限，
+# 依赖侧改按 "s" 优化。symphonia 音频解码子 crate 也走 "s"（现代手机解码
+# 实时余量充足）。热路径具名覆盖（勿删）：rustfft 频谱、aes 加密流解密、
+# ring TLS、brotli/flate2/miniz_oxide 流缓存压缩解码。
+[profile.release.package."*"]
+opt-level = "s"
+
+[profile.release.package.rustfft]
+opt-level = 3
+
+[profile.release.package.aes]
+opt-level = 3
+
+[profile.release.package.ring]
+opt-level = 3
+
+[profile.release.package.brotli]
+opt-level = 3
+
+[profile.release.package.flate2]
+opt-level = 3
+
+[profile.release.package.miniz_oxide]
+opt-level = 3

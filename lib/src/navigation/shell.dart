@@ -13,6 +13,7 @@ import '../ui/xy_theme.dart';
 import '../ui/xy_surface.dart';
 import '../widgets/mini_player_bar.dart';
 import '../widgets/top_notice.dart';
+import 'player_sheet_morph.dart';
 import 'sidebar_controller.dart';
 
 int? _activeRelinkProposalId;
@@ -174,6 +175,38 @@ class AppShell extends ConsumerWidget {
       );
       ref.read(playbackNoticeEventProvider.notifier).state = null;
     });
+    // 队列中存在「所属插件已停用」的残留歌曲：一次性提示，允许直接清理。
+    ref.listen<ResidualPluginQueueNotice?>(
+      residualPluginQueueNoticeProvider,
+      (previous, next) {
+        if (next == null) return;
+        ref.read(residualPluginQueueNoticeProvider.notifier).state = null;
+        final messengerContext = appScaffoldKey.currentContext ?? context;
+        XyNotice.show(
+          messengerContext,
+          message:
+              '播放队列中有 ${next.songCount} 首来自已停用插件'
+              '「${next.pluginNames}」的歌曲，可一键清理',
+          type: XyNoticeType.warning,
+          duration: const Duration(seconds: 8),
+          actionLabel: '清理',
+          onAction: () async {
+            final removed = await ref
+                .read(playerProvider.notifier)
+                .removeResidualPluginSongs(next.pluginIds);
+            final noticeContext = appScaffoldKey.currentContext;
+            if (noticeContext == null) return;
+            XyNotice.show(
+              noticeContext,
+              message: removed > 0
+                  ? '已清理 $removed 首残留歌曲'
+                  : '没有可清理的残留歌曲',
+              type: removed > 0 ? XyNoticeType.success : XyNoticeType.info,
+            );
+          },
+        );
+      },
+    );
     final safeBottom = MediaQuery.paddingOf(context).bottom;
     final showMiniPlayer = shouldShowMiniPlayerForPath(currentPath);
     // 迷你播放栏仅在「有歌在播」时真正渲染，注入的遮挡高度需同步，
@@ -335,7 +368,93 @@ class AppShell extends ConsumerWidget {
           context.go('/home');
         }
       },
-      child: scaffold,
+      // 壳层转场冻结门（P0-4 + 转场快照）：
+      // 1) 路由落定后整棵停画壳层（P0-4）。播放详情页路由是 opaque:false，
+      //    落定（动画完成）后壳层仍在其下每帧参与布局/光栅化，只是画面被
+      //    完全盖住——这是低端机上「进出播放详情页卡」的固定损耗。此处把
+      //    壳层 Offstage + TickerMode(false)，静止态零绘制开销。
+      // 2) 转场未落定期间（morphing），壳层快照冻结（SnapshotWidget）。
+      //    形变面板半透明，转场中壳层必须画在面板底下；但壳层在转场中本
+      //    就完全静止（二级转场被冻结、迷你播放栏隐藏、Ticker 停转），每帧
+      //    仍对整棵壳层 UI 重新光栅化纯属浪费——5632 探针实测 raster 侧
+      //    卡顿是 UI 侧 3.6 倍（raster=+231 vs ui=+64 / 30s），worstR 单帧
+      //    63ms。SnapshotWidget 在首帧把壳层栅格化为一张纹理，后续帧直接
+      //    合成该纹理，每帧成本从「整棵壳层 UI」降到「一张图」。收起动画
+      //    开始时 morphing 再次置位，快照重新启用（先画一帧实时再冻结）。
+      //    快照遇到不支持的内容（平台视图等）自动回退实时绘制，零风险。
+      // 3) 结构恒定：Offstage/TickerMode/SnapshotWidget 三层常驻包装，只
+      //    切换布尔值，绝不切换 widget 类型——保证壳层 Element 树不重建，
+      //    返回手势、抽屉、各页滚动位置均不受影响。
+      child: AnimatedBuilder(
+        animation: Listenable.merge([
+          xySheetRouteActive,
+          xyPlayerSheetMorphing,
+        ]),
+        builder: (context, _) => _ShellFreezeGate(
+          morphing:
+              xySheetRouteActive.value && xyPlayerSheetMorphing.value,
+          covered:
+              xySheetRouteActive.value && !xyPlayerSheetMorphing.value,
+          child: scaffold,
+        ),
+      ),
+    );
+  }
+}
+
+/// 壳层转场冻结门：morphing 时用快照冻结壳层（单纹理合成），covered 时
+/// Offstage 停画，其余时间实时绘制。见 [AppShell] build 内的完整说明。
+class _ShellFreezeGate extends StatefulWidget {
+  const _ShellFreezeGate({
+    required this.morphing,
+    required this.covered,
+    required this.child,
+  });
+
+  final bool morphing;
+  final bool covered;
+  final Widget child;
+
+  @override
+  State<_ShellFreezeGate> createState() => _ShellFreezeGateState();
+}
+
+class _ShellFreezeGateState extends State<_ShellFreezeGate> {
+  late final SnapshotController _snapshotController = SnapshotController(
+    allowSnapshotting: widget.morphing,
+  );
+
+  @override
+  void didUpdateWidget(covariant _ShellFreezeGate oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.morphing != widget.morphing) {
+      _snapshotController.allowSnapshotting = widget.morphing;
+    }
+  }
+
+  @override
+  void dispose() {
+    _snapshotController.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Offstage(
+      offstage: widget.covered,
+      child: TickerMode(
+        // 转场中壳层完全静止，Ticker 停转避免无意义的帧调度；快照冻结
+        // 期间子树也不需要任何动画产出。
+        enabled: !widget.covered && !widget.morphing,
+        child: SnapshotWidget(
+          controller: _snapshotController,
+          // permissive：子树含平台视图（如个别设置页的 WebView）时快照
+          // 不可用，自动回退实时绘制；normal 模式会直接抛异常，壳层是
+          // 全局容器，绝不能用 normal。
+          mode: SnapshotMode.permissive,
+          child: widget.child,
+        ),
+      ),
     );
   }
 }

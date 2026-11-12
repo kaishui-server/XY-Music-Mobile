@@ -3,7 +3,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../core/settings.dart';
 import '../library/library_provider.dart';
-import '../plugins/lx_playlist_import.dart' show kLxSourceIds, lxSourceLabel;
+import '../plugins/lx_playlist_import.dart' show lxSourceLabel;
 import '../plugins/plugin_runtime.dart';
 import '../playlists/playlists_provider.dart';
 import 'song_list_view.dart' show SongCover;
@@ -371,7 +371,7 @@ class _BatchActionSheetState extends ConsumerState<_BatchActionSheet> {
                 options: [
                   (value: _kAllPlatforms, label: '全部平台'),
                   for (final source in (plugin.lxSources.isEmpty
-                      ? kLxSourceIds
+                      ? kHostLxSearchSources
                       : plugin.lxSources))
                     (value: source, label: lxSourceLabel(source)),
                 ],

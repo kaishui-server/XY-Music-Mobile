@@ -32,7 +32,7 @@ class LogsPage extends StatefulWidget {
 class _LogsPageState extends State<LogsPage> {
   final _store = AppLogStore.instance;
   _LogTimeRange _range = _LogTimeRange.all;
-  int _maxEntries = 500;
+  int _maxEntries = 2000;
   int _maxProbeEntries = 300;
   bool _warningOnly = false;
   bool _loading = true;

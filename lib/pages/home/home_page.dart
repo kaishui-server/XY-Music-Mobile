@@ -10,6 +10,7 @@ import 'package:video_player/video_player.dart';
 import '../../src/auth/auth_provider.dart';
 import '../../src/favorites/favorites_provider.dart';
 import '../../src/home/home_providers.dart';
+import '../../src/home/listen_stats_uploader.dart';
 import '../../src/explore/recommendation_provider.dart';
 import '../../src/navigation/sidebar_controller.dart';
 import '../../src/player/player_provider.dart';
@@ -78,6 +79,9 @@ class _HomePageState extends ConsumerState<HomePage> {
 
   void _refreshLeaderboards() {
     if (!mounted) return;
+    // 先强制上报一次本地实时听歌时长，再拉榜单：否则云端展示的仍是
+    // 上一次上报的旧值（排行榜时长"少一截"的直接原因之一）。
+    unawaited(uploadListenStatsFromWidget(ref, force: true));
     for (final period in LeaderboardPeriod.values) {
       ref.invalidate(homeLeaderboardProvider(period));
     }
@@ -258,6 +262,8 @@ class _HomePageState extends ConsumerState<HomePage> {
             clearHotCommentCooldown();
             ref.invalidate(hotCommentProvider);
             ref.invalidate(homeStatisticsProvider);
+            // 用户主动刷新时立即上报一次实时听歌时长，再拉榜单。
+            unawaited(uploadListenStatsFromWidget(ref, force: true));
             for (final period in LeaderboardPeriod.values) {
               ref.invalidate(homeLeaderboardProvider(period));
             }

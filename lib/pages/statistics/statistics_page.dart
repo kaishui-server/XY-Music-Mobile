@@ -143,8 +143,17 @@ class _StatisticsContent extends StatelessWidget {
         Container(
           padding: const EdgeInsets.all(18),
           decoration: BoxDecoration(
-            gradient: const LinearGradient(
-              colors: [Color(0xFFEC4141), Color(0xFFB92F54)],
+            // 渐变取主题色并向黑色压深 30% 作为收尾色，跟随设置里的
+            // 主题色（此前写死网易云红，用户反馈）。
+            gradient: LinearGradient(
+              colors: [
+                Theme.of(context).colorScheme.primary,
+                Color.lerp(
+                  Theme.of(context).colorScheme.primary,
+                  Colors.black,
+                  .3,
+                )!,
+              ],
               begin: Alignment.topLeft,
               end: Alignment.bottomRight,
             ),
@@ -260,7 +269,8 @@ class _StatisticsContent extends StatelessWidget {
                           top: -6,
                           child: CircleAvatar(
                             radius: 10,
-                            backgroundColor: const Color(0xFFEC4141),
+                            backgroundColor:
+                                Theme.of(context).colorScheme.primary,
                             child: Text(
                               '${i + 1}',
                               style: const TextStyle(
@@ -402,10 +412,15 @@ class _MetricCard extends StatelessWidget {
           width: 42,
           height: 42,
           decoration: BoxDecoration(
-            color: const Color(0x24EC4141),
+            color: Theme.of(
+              context,
+            ).colorScheme.primary.withValues(alpha: .14),
             borderRadius: BorderRadius.circular(12),
           ),
-          child: Icon(icon, color: const Color(0xFFEC4141)),
+          child: Icon(
+            icon,
+            color: Theme.of(context).colorScheme.primary,
+          ),
         ),
         const SizedBox(width: 12),
         Column(
@@ -458,8 +473,10 @@ class _ActivityBars extends StatelessWidget {
                         child: Container(
                           decoration: BoxDecoration(
                             color: i == 6
-                                ? const Color(0xFFEC4141)
-                                : const Color(0x66EC4141),
+                                ? Theme.of(context).colorScheme.primary
+                                : Theme.of(
+                                    context,
+                                  ).colorScheme.primary.withValues(alpha: .4),
                             borderRadius: BorderRadius.circular(7),
                           ),
                         ),

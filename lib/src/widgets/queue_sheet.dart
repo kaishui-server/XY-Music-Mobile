@@ -211,7 +211,8 @@ class QueueRowCard extends StatelessWidget {
   final VoidCallback? onDismissed;
   final VoidCallback? onDelete;
 
-  static const accent = Color(0xFFEC4141);
+  // 强调色跟随主题：直接用 colorScheme.primary（设置里的主题色下发），
+  // 不再写死网易云红（用户反馈播放队列高亮只有固定红色）。
 
   @override
   Widget build(BuildContext context) {
@@ -235,15 +236,15 @@ class QueueRowCard extends StatelessWidget {
   Widget _cardBody(ColorScheme scheme) {
     return Material(
       color: current
-          ? accent.withValues(alpha: .08)
+          ? scheme.primary.withValues(alpha: .08)
           : scheme.surfaceContainerHigh,
       shape: RoundedRectangleBorder(
         borderRadius: BorderRadius.circular(12),
-        side: current
-            ? BorderSide(color: accent.withValues(alpha: .35))
-            : BorderSide(
-                color: scheme.outlineVariant.withValues(alpha: .5),
-              ),
+        // 正在播放项不再用主题色描边：仅保留与普通行一致的描边，
+        // 「正在播放」改由封面中央的白色均衡器条标识（图二）。
+        side: BorderSide(
+          color: scheme.outlineVariant.withValues(alpha: .5),
+        ),
       ),
       clipBehavior: Clip.antiAlias,
       child: InkWell(
@@ -268,7 +269,7 @@ class QueueRowCard extends StatelessWidget {
                       overflow: TextOverflow.ellipsis,
                       style: TextStyle(
                         fontSize: 15,
-                        color: current ? accent : scheme.onSurface,
+                        color: current ? scheme.primary : scheme.onSurface,
                         fontWeight: current
                             ? FontWeight.w700
                             : FontWeight.w500,
@@ -307,7 +308,7 @@ class QueueRowCard extends StatelessWidget {
                   tooltip: '从播放队列删除',
                   visualDensity: VisualDensity.compact,
                   onPressed: onDelete,
-                  icon: const Icon(Icons.delete_outline, color: accent),
+                  icon: Icon(Icons.delete_outline, color: scheme.primary),
                 ),
               const SizedBox(width: 4),
             ],
@@ -342,7 +343,8 @@ class QueueRowCard extends StatelessWidget {
     return parts.isEmpty ? '未知艺术家' : parts.join(' · ');
   }
 
-  /// 歌曲封面图标；正在播放的曲目在右下角叠加红色声波小徽标。
+  /// 歌曲封面图标；正在播放的曲目在封面**中央**叠加白色四竖条均衡器，
+  /// 作为「当前播放」标识（图二），封面右下角不再叠加任何角标。
   Widget _songCover() {
     final cover = SizedBox(
       width: 46,
@@ -361,27 +363,49 @@ class QueueRowCard extends StatelessWidget {
       width: 46,
       height: 46,
       child: Stack(
-        clipBehavior: Clip.none,
+        alignment: Alignment.center,
         children: [
           cover,
-          Positioned(
-            right: -4,
-            bottom: -4,
-            child: Container(
-              padding: const EdgeInsets.all(3),
-              decoration: const BoxDecoration(
-                color: accent,
-                shape: BoxShape.circle,
-              ),
-              child: const Icon(
-                Icons.graphic_eq,
-                size: 10,
-                color: Colors.white,
+          // 压暗层：浅色封面上白条容易糊掉，叠一层半透明黑保证可见。
+          Positioned.fill(
+            child: DecoratedBox(
+              decoration: BoxDecoration(
+                color: Colors.black.withValues(alpha: .32),
+                borderRadius: BorderRadius.circular(10),
               ),
             ),
           ),
+          const _PlayingEqualizerBars(),
         ],
       ),
+    );
+  }
+}
+
+/// 正在播放标识：封面中央的白色四竖条均衡器（对应设计图二）。
+class _PlayingEqualizerBars extends StatelessWidget {
+  const _PlayingEqualizerBars();
+
+  static const List<double> _heights = <double>[9, 15, 6, 12];
+
+  @override
+  Widget build(BuildContext context) {
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.center,
+      children: [
+        for (var i = 0; i < _heights.length; i++) ...[
+          if (i > 0) const SizedBox(width: 2),
+          Container(
+            width: 2.6,
+            height: _heights[i],
+            decoration: BoxDecoration(
+              color: Colors.white,
+              borderRadius: BorderRadius.circular(1.3),
+            ),
+          ),
+        ],
+      ],
     );
   }
 }

@@ -21,6 +21,7 @@ import 'src/player/player_provider.dart';
 import 'src/navigation/routes.dart';
 import 'src/ui/xy_theme.dart';
 import 'src/ui/xy_surface.dart';
+import 'src/ui/xy_video_wallpaper.dart';
 import 'src/widgets/top_notice.dart';
 import 'src/widgets/welcome_overlay.dart';
 
@@ -70,6 +71,12 @@ Future<XyStartupBackground> loadXyStartupBackground() async {
         .clamp(0, 40)
         .toDouble();
     if (path.isEmpty) return XyStartupBackground(blur: blur);
+    // 动态视频壁纸不做启动期预解码：instantiateImageCodec 解不了视频，
+    // 且整段 readAsBytes 会把视频全量读进内存。首帧交给
+    // XyVideoWallpaper 异步初始化，启动瞬间先显示底色。
+    if (xyIsVideoWallpaperPath(path)) {
+      return XyStartupBackground(path: path, blur: blur);
+    }
     final file = File(path);
     if (!await file.exists()) return XyStartupBackground(blur: blur);
     // 只限制解码宽度，不能同时传入固定高度：两者同时指定会把长图
@@ -255,6 +262,18 @@ class _XyMusicAppState extends ConsumerState<XyMusicApp>
       return;
     }
     if (path == _decodedBackgroundPath || path == _precachedBackgroundPath) {
+      return;
+    }
+    // 动态视频壁纸跳过图片解码链路：下面会把整个文件 readAsBytes 再
+    // 交给 instantiateImageCodec，对视频等于把几十 MB 塞进内存换一个
+    // 必然失败的解码。这里只登记路径，首帧由 XyVideoWallpaper 硬解。
+    if (xyIsVideoWallpaperPath(path)) {
+      _backgroundLoadGeneration++;
+      _precachedBackgroundPath = path;
+      _decodedBackgroundPath = path;
+      final oldVideo = _decodedBackgroundImage;
+      _decodedBackgroundImage = null;
+      _disposeBackgroundImage(oldVideo);
       return;
     }
     final generation = ++_backgroundLoadGeneration;

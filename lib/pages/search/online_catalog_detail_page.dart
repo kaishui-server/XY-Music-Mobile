@@ -39,6 +39,7 @@ class OnlineCatalogDetailPage extends ConsumerStatefulWidget {
     required this.categoryLabel,
     required this.loadSongs,
     this.resolveCoverUrl,
+    this.coverIsFallback = false,
   });
 
   final String title;
@@ -50,6 +51,13 @@ class OnlineCatalogDetailPage extends ConsumerStatefulWidget {
   /// 歌手/UP 主封面缺失时按名补查（平台自带优先、不覆盖；失败回退占位）。
   /// null 表示该分类不补查（专辑/歌单等）。
   final Future<String> Function(String name)? resolveCoverUrl;
+
+  /// 初始封面是否只是兜底图（而非真实歌手头像）。洛雪音源的歌手条目由
+  /// 歌曲聚合而来，coverUrl 是歌曲/专辑封面；此时封面必须参与补查，且
+  /// 补查到的真头像要覆盖它（「平台头像优先、补查只补缺」的原则只适用
+  /// 于真实平台头像，见 _resolveCover 内注释。用户反馈详情页一直显示
+  /// 专辑封面的根因就是把兜底图当成了平台头像）。
+  final bool coverIsFallback;
 
   @override
   ConsumerState<OnlineCatalogDetailPage> createState() =>
@@ -91,11 +99,15 @@ class _OnlineCatalogDetailPageState
     final resolve = widget.resolveCoverUrl;
     if (resolve == null) return;
     final name = widget.title.trim();
-    final entries = [(name: name, avatar: widget.coverUrl)];
+    // coverIsFallback（洛雪兜底歌曲封面）不视作平台头像：参与补查，且
+    // 补查结果优先于它。补查失败时 effectiveArtistAvatar 返回空串，
+    // 保持兜底封面展示，视觉不变。
+    final platformAvatar = widget.coverIsFallback ? '' : widget.coverUrl;
+    final entries = [(name: name, avatar: platformAvatar)];
     if (missingArtistAvatarNames(entries).isEmpty) return;
     final resolved = await resolveMissingArtistAvatars(entries, resolve);
     if (!mounted) return;
-    final cover = effectiveArtistAvatar(widget.coverUrl, resolved[name]);
+    final cover = effectiveArtistAvatar(platformAvatar, resolved[name]);
     if (cover.isEmpty || cover == _coverUrl) return;
     setState(() => _coverUrl = cover);
   }

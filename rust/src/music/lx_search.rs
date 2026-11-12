@@ -1592,6 +1592,516 @@ async fn search_mg(keyword: &str, limit: u32) -> Result<Vec<LxSearchItem>, Strin
     Ok(mg_filter_data(result_list))
 }
 
+// ==================== 汽水音乐（qs，LX 代号 qs）====================
+//
+// 汽水音乐（抖音旗下）PC 客户端综合搜索接口：免签名，与桌面版同一 API 族。
+// 端点为「综合搜索」（歌曲/歌单/歌手/专辑混排），此处只取 tracks 分组；
+// cursor 是全局流偏移而非页码，需滚动取数凑满 limit。
+// UA 或 device_* 参数缺失时上游直接返回 ERR_INVALID_PARAM。
+const QS_PC_QUERY: &str = "aid=386088&app_name=luna_pc&region=cn&geo_region=cn&os_region=cn&sim_region=&device_id=3753066532709850&cdid=&iid=3753066532713946&version_name=3.5.2&version_code=30050200&channel=official&build_mode=master&network_carrier=&ac=wifi&tz_name=Asia/Shanghai&resolution=&device_platform=windows&device_type=Windows&os_version=Windows%2010&fp=3753066532709850";
+const QS_UA: &str = "LunaPC/3.5.2(412998333)";
+/// 单次取数的全局流窗口
+const QS_CURSOR_STEP: u32 = 20;
+/// 最多取数轮数（综合搜索的全局流通常 3~4 窗即耗尽）
+const QS_MAX_FETCHES: u32 = 5;
+/// 搜索封面尺寸
+const QS_COVER_SIZE: &str = "500:500";
+
+/// 汽水内部品质 → LX 品质。higher(192k) 在 LX 品质体系无对应，跳过。
+fn qs_quality_type(quality: &str) -> Option<&'static str> {
+    match quality {
+        "medium" => Some("128k"),
+        "highest" => Some("320k"),
+        "lossless" => Some("flac"),
+        "spatial" => Some("spatial"),
+        "hi_res" => Some("hires"),
+        _ => None,
+    }
+}
+
+fn qs_js_string(v: Option<&serde_json::Value>) -> String {
+    match v {
+        None | Some(serde_json::Value::Null) => String::new(),
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(serde_json::Value::Array(_) | serde_json::Value::Object(_)) => {
+            "[object Object]".to_string()
+        }
+        Some(other) => other.to_string(),
+    }
+}
+
+/// 汽水封面：uri + template_prefix 拼静态图 URL，否则取 urls 首个（可能与 uri 拼接）
+fn qs_build_image_url(url_cover: Option<&serde_json::Value>, size: &str) -> String {
+    let Some(v) = url_cover else {
+        return String::new();
+    };
+    match v {
+        serde_json::Value::Null => String::new(),
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Object(obj) => {
+            let uri = qs_js_string(obj.get("uri"));
+            let template_prefix = qs_js_string(obj.get("template_prefix"));
+            if !uri.is_empty() && !template_prefix.is_empty() {
+                return format!(
+                    "https://p3-luna.douyinpic.com/img/{}~{}-resize:{}.png",
+                    uri, template_prefix, size
+                );
+            }
+            if let Some(serde_json::Value::Array(raw_urls)) = obj.get("urls") {
+                let urls: Vec<String> = raw_urls
+                    .iter()
+                    .map(|e| qs_js_string(Some(e)))
+                    .filter(|e| !e.is_empty())
+                    .collect();
+                if let Some(first) = urls.first() {
+                    if uri.is_empty() || first.contains(&uri) {
+                        return first.clone();
+                    }
+                    return format!("{}{}", first, uri);
+                }
+            }
+            String::new()
+        }
+        _ => String::new(),
+    }
+}
+
+/// 单首曲目 → LxSearchItem（songmid 即汽水 track_id，播放取流时原样回传）
+fn qs_item_from_track(track: &serde_json::Value) -> Option<LxSearchItem> {
+    let songmid = track.get("id")?.as_str()?.to_string();
+    if songmid.is_empty() {
+        return None;
+    }
+    let album = track.get("album").unwrap_or(&serde_json::Value::Null);
+    let img = qs_build_image_url(album.get("url_cover"), QS_COVER_SIZE);
+
+    // bit_rates 顺序即低→高，映射后保持顺序（spatial/hires 为汽水特有品质）
+    let mut types = Vec::new();
+    let mut lx_types = HashMap::new();
+    if let Some(brs) = track.get("bit_rates").and_then(|v| v.as_array()) {
+        for br in brs {
+            let quality = br.get("quality").and_then(|v| v.as_str()).unwrap_or("");
+            let Some(lx_q) = qs_quality_type(quality) else {
+                continue;
+            };
+            let size = br.get("size").and_then(|v| v.as_f64()).map(size_formate);
+            types.push(LxTypeTuple {
+                quality_type: lx_q.into(),
+                size: size.clone(),
+                hash: None,
+            });
+            lx_types.insert(lx_q.into(), LxTypeEntry { size, hash: None });
+        }
+    }
+
+    let duration_ms = track
+        .get("duration")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+    Some(LxSearchItem {
+        name: track
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        singer: format_singer_name(
+            track.get("artists").unwrap_or(&serde_json::Value::Null),
+            "name",
+        ),
+        album_name: album
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        album_id: album.get("id").cloned().unwrap_or(serde_json::Value::Null),
+        songmid,
+        source: "qs".into(),
+        interval: format_play_time(duration_ms / 1000.0),
+        img: if img.is_empty() { None } else { Some(img) },
+        hash: None,
+        str_media_mid: None,
+        song_id: None,
+        album_mid: None,
+        copyright_id: None,
+        types,
+        lx_types: Some(lx_types),
+    })
+}
+
+/// 单次综合搜索（cursor 为全局流偏移，返回值仅含 tracks 分组）
+async fn qs_fetch_tracks(keyword: &str, cursor: u32) -> Result<Vec<LxSearchItem>, String> {
+    let url = format!(
+        "https://api.qishui.com/luna/pc/search/all?q={}&cursor={}&search_id={}&search_method=input&{}",
+        urlencoding::encode(keyword),
+        cursor,
+        uuid::Uuid::new_v4(),
+        QS_PC_QUERY,
+    );
+    let result = http_get_json(&url, &[("User-Agent", QS_UA)]).await?;
+
+    let mut out = Vec::new();
+    if let Some(groups) = result.get("result_groups").and_then(|v| v.as_array()) {
+        for group in groups {
+            if group.get("id").and_then(|v| v.as_str()) != Some("tracks") {
+                continue;
+            }
+            let Some(items) = group.get("data").and_then(|v| v.as_array()) else {
+                continue;
+            };
+            for item in items {
+                if item.pointer("/meta/item_type").and_then(|v| v.as_str()) != Some("track") {
+                    continue;
+                }
+                if let Some(track) = item.pointer("/entity/track") {
+                    if let Some(it) = qs_item_from_track(track) {
+                        out.push(it);
+                    }
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// 汽水搜索：综合搜索每关键词仅少量歌曲，滚动全局流凑满 limit（不足即上游耗尽）
+async fn search_qs(keyword: &str, limit: u32) -> Result<Vec<LxSearchItem>, String> {
+    let want = limit.max(1);
+    let mut collected: Vec<LxSearchItem> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for round in 0..QS_MAX_FETCHES {
+        let page = qs_fetch_tracks(keyword, round * QS_CURSOR_STEP).await?;
+        if page.is_empty() {
+            break;
+        }
+        for it in page {
+            if seen.insert(it.songmid.clone()) {
+                collected.push(it);
+            }
+        }
+        if collected.len() as u32 >= want {
+            break;
+        }
+    }
+    if collected.is_empty() {
+        return Err("QS search: no results".to_string());
+    }
+    Ok(collected)
+}
+
+// ==================== JOOX ====================
+// JOOX（腾讯系海外音乐平台）Android 客户端综合搜索：
+// POST avatar.api.joox.com/commonCgi/search/get，body 的 header 必须携带
+// 完整客户端指纹（sAppid/iCv/sOsVer/country 等）。缺字段时上游仍回 200
+// 但 song_aggregation_list 为空，与「该关键词无版权」的空结果无法区分，
+// 所以此处的指纹是硬编码的必需项而非可选优化。
+// 歌曲标识：songid 是数字 ID（评论接口用它），songmid 是 Z 开头的 14 位
+// mid（取流接口用它）。LxSearchItem 只能存一个主 id，故 songmid 存 mid
+// 供取流，数字 ID 放 song_id 供评论；两侧都不可互换。
+const JO_SEARCH_URL: &str = "https://avatar.api.joox.com/commonCgi/search/get";
+const JO_UA: &str = "okhttp/4.12.0";
+/// 后端地区与语言决定曲库；HK+en 是插件默认组合，与插件保持同一曲库
+const JO_BACKEND_COUNTRY: &str = "HK";
+const JO_LANG: &str = "en";
+const JO_PAGE_SIZE: u32 = 30;
+const JO_MAX_PAGES: u32 = 4;
+
+/// JOOX 的文本字段（歌名/歌手/专辑）是 base64 编码的 UTF-8；少数返回已是
+/// 明文。解码结果必须是合法 UTF-8 且不含控制字符才采纳，避免把恰好符合
+/// base64 字母表的明文（如 "abcd"）解成乱码。
+fn jo_decode_text(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let padded = pad_b64(trimmed);
+    if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(padded.as_bytes()) {
+        if let Ok(text) = String::from_utf8(bytes) {
+            if !text.is_empty() && !text.chars().any(|c| c.is_control()) {
+                return text;
+            }
+        }
+    }
+    trimmed.to_string()
+}
+
+fn pad_b64(input: &str) -> String {
+    let mut s = input.to_string();
+    while s.len() % 4 != 0 {
+        s.push('=');
+    }
+    s
+}
+
+/// kbps_map 的某个键取尺寸（值可能是数字或字符串，0/缺失视为该音质不可用）
+fn jo_kbps_size(map: Option<&serde_json::Value>, key: &str) -> Option<f64> {
+    let value = map?.get(key)?;
+    let n = match value {
+        serde_json::Value::Number(n) => n.as_f64().unwrap_or(0.0),
+        serde_json::Value::String(s) => s.parse::<f64>().unwrap_or(0.0),
+        _ => 0.0,
+    };
+    if n > 0.0 {
+        Some(n)
+    } else {
+        None
+    }
+}
+
+fn jo_field_size(raw: &serde_json::Value, key: &str) -> Option<f64> {
+    let n = raw.get(key).and_then(|v| v.as_f64()).unwrap_or(0.0);
+    if n > 0.0 {
+        Some(n)
+    } else {
+        None
+    }
+}
+
+/// JOOX 曲目 → LxSearchItem。songmid 取 Z 开头 mid（取流用），song_id 取
+/// 数字 songid（评论用）；音质尺寸按 kbps_map 逐档判断，未提供的档位不写，
+/// 避免出现「显示有 flac 实际取流失败」的假音质。
+fn jo_item_from_song(raw: &serde_json::Value) -> Option<LxSearchItem> {
+    let numeric_id = raw
+        .get("songid")
+        .map(|v| match v {
+            serde_json::Value::String(s) => s.trim().to_string(),
+            other => other.to_string(),
+        })
+        .filter(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()))
+        .unwrap_or_default();
+    let mid = raw
+        .get("songmid")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let is_mid = mid.len() == 14
+        && mid.starts_with('Z')
+        && mid[1..].chars().all(|c| c.is_ascii_hexdigit());
+    // 没有 mid 时退回数字 ID：能搜到、能评论，取流由插件报错而不是静默失败
+    let songmid = if is_mid {
+        mid.clone()
+    } else if !numeric_id.is_empty() {
+        numeric_id.clone()
+    } else {
+        return None;
+    };
+
+    let img = ["album_url", "albummid", "singer_url", "singermid"]
+        .iter()
+        .filter_map(|key| raw.get(key).and_then(|v| v.as_str()))
+        .map(|s| s.trim())
+        .find(|s| s.starts_with("http"))
+        .map(|s| s.to_string());
+
+    let kbps = raw.get("kbps_map");
+    let mut types = Vec::new();
+    let mut lx_types = HashMap::new();
+    let quality_candidates: [(&str, Option<f64>); 4] = [
+        (
+            "128k",
+            jo_kbps_size(kbps, "128").or_else(|| jo_field_size(raw, "n128Size")),
+        ),
+        (
+            "320k",
+            jo_kbps_size(kbps, "320").or_else(|| jo_field_size(raw, "size320")),
+        ),
+        (
+            "flac",
+            jo_kbps_size(kbps, "flac").or_else(|| jo_field_size(raw, "size")),
+        ),
+        ("hires", jo_kbps_size(kbps, "hires")),
+    ];
+    for (quality, size_bytes) in quality_candidates {
+        let Some(bytes) = size_bytes else { continue };
+        let size = size_formate(bytes);
+        types.push(LxTypeTuple {
+            quality_type: quality.into(),
+            size: Some(size.clone()),
+            hash: None,
+        });
+        lx_types.insert(
+            quality.into(),
+            LxTypeEntry {
+                size: Some(size),
+                hash: None,
+            },
+        );
+    }
+
+    let playtime = raw.get("playtime").and_then(|v| v.as_f64()).unwrap_or(0.0);
+    let singer = {
+        let from_list = jo_decode_singers(raw.get("singerInfo").unwrap_or(&serde_json::Value::Null));
+        if from_list.is_empty() {
+            jo_decode_text(raw.get("singername").and_then(|v| v.as_str()).unwrap_or(""))
+        } else {
+            from_list
+        }
+    };
+
+    Some(LxSearchItem {
+        name: jo_decode_text(raw.get("songname").and_then(|v| v.as_str()).unwrap_or("")),
+        singer,
+        album_name: jo_decode_text(
+            raw.get("albumname").and_then(|v| v.as_str()).unwrap_or(""),
+        ),
+        album_id: raw.get("albumid").cloned().unwrap_or(serde_json::Value::Null),
+        songmid,
+        source: "jo".into(),
+        interval: format_play_time(playtime),
+        img: img.filter(|s| !s.is_empty()),
+        hash: None,
+        str_media_mid: if is_mid { Some(mid) } else { None },
+        song_id: if numeric_id.is_empty() {
+            None
+        } else {
+            Some(serde_json::Value::String(numeric_id))
+        },
+        album_mid: None,
+        copyright_id: None,
+        types,
+        lx_types: Some(lx_types),
+    })
+}
+
+/// singerInfo 数组里的 singername 是 base64，需要逐项解码后 join。
+/// 单曲可能有多位歌手，直接对拼接后的字符串解码会失败。
+fn jo_decode_singers(singers: &serde_json::Value) -> String {
+    let Some(list) = singers.as_array() else {
+        return String::new();
+    };
+    let names: Vec<String> = list
+        .iter()
+        .map(|s| {
+            jo_decode_text(
+                s.get("singername")
+                    .or_else(|| s.get("name"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(""),
+            )
+        })
+        .filter(|s| !s.is_empty())
+        .collect();
+    names.join("、")
+}
+
+fn jo_build_search_body(keyword: &str, sin: u32, ein: u32) -> String {
+    serde_json::json!({
+        "header": {
+            "iUid": "0",
+            "iSid": "0",
+            "iCv": 704643684,
+            "sPhoneType": "Android-M2012K11AC",
+            "sOpenUdid": "fffffffffda6788700000192e18d016e",
+            "iMcc": "65535",
+            "iMnc": "65535",
+            "sCountry": "CN",
+            "sLang": JO_LANG,
+            "iWmid": "0",
+            "iChid": "000",
+            "sBackendCountry": JO_BACKEND_COUNTRY,
+            "iUserType": 2,
+            "sOsVer": "33",
+            "sSkey": "",
+            "iNetType": 1,
+            "iMlid": "0",
+            "iVip": 0,
+            "iVvip": 0,
+            "iAppStoreChannel": 0,
+            "iTerminalType": 1,
+            "sAppid": "1000716",
+            "sDebugInfo": "",
+            "sRegCountry": "",
+        },
+        "type": 0,
+        "keyword": keyword,
+        "keyword_source": 3,
+        "search_id": "1700000000000",
+        "sin": sin,
+        "ein": ein,
+        "search_channel": "",
+        "nqc_flag": 0,
+        "custom_params": {
+            "ambi_data": "",
+            "source": "",
+            "custom_flags": { "search_req_mask_bit": 2, "disable_merge": 1 },
+            "custom_string_flags": {},
+        },
+    })
+    .to_string()
+}
+
+/// 单页综合搜索（type=0 即歌曲）。iRet=503 是上游限流，按失败上抛以触发
+/// 瞬态失败缓存，避免继续放大限流。
+async fn jo_fetch_songs(keyword: &str, page: u32) -> Result<Vec<LxSearchItem>, String> {
+    let sin = page.saturating_sub(1) * JO_PAGE_SIZE;
+    let body = jo_build_search_body(keyword, sin, sin + JO_PAGE_SIZE);
+    let result = http_post_json(
+        JO_SEARCH_URL,
+        &body,
+        &[
+            ("User-Agent", JO_UA),
+            ("Content-Type", "application/json"),
+        ],
+    )
+    .await?;
+
+    if let Some(ret) = result.pointer("/common/iRet").and_then(|v| v.as_i64()) {
+        if ret != 0 {
+            let msg = result
+                .pointer("/common/sMsg")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            return Err(format!("JO search: iRet={} {}", ret, msg));
+        }
+    }
+
+    let mut out = Vec::new();
+    if let Some(groups) = result
+        .get("song_aggregation_list")
+        .and_then(|v| v.as_array())
+    {
+        for group in groups {
+            let Some(items) = group.get("item_list").and_then(|v| v.as_array()) else {
+                continue;
+            };
+            for item in items {
+                let song = item.get("song_info").unwrap_or(item);
+                if let Some(it) = jo_item_from_song(song) {
+                    out.push(it);
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// JOOX 搜索：单页 30 条，不足 limit 时继续翻页（上游 sum 通常封顶 1000）。
+async fn search_jo(keyword: &str, limit: u32) -> Result<Vec<LxSearchItem>, String> {
+    let want = limit.max(1);
+    let mut collected: Vec<LxSearchItem> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for page in 1..=JO_MAX_PAGES {
+        let items = jo_fetch_songs(keyword, page).await?;
+        if items.is_empty() {
+            break;
+        }
+        let page_len = items.len();
+        for it in items {
+            if seen.insert(it.songmid.clone()) {
+                collected.push(it);
+            }
+        }
+        if collected.len() as u32 >= want || (page_len as u32) < JO_PAGE_SIZE {
+            break;
+        }
+    }
+    if collected.is_empty() {
+        return Err("JO search: no results".to_string());
+    }
+    collected.truncate(want as usize);
+    Ok(collected)
+}
+
 /// 搜索 LX 音源
 ///
 /// 优先查询缓存，缓存未命中时执行实际搜索。
@@ -1638,6 +2148,11 @@ pub async fn lx_search(
         "tx" => search_tx(keyword, actual_limit).await,
         "wy" => search_wy(keyword, actual_limit).await,
         "mg" => search_mg(keyword, actual_limit).await,
+        // 汽水音乐：宿主原生搜索（插件只提供 musicUrl 取流，无搜索动作）
+        "qs" => search_qs(keyword, actual_limit).await,
+        // JOOX：宿主原生搜索（插件 search 走同一 commonCgi，宿主直连省一层
+        // JS 沙箱；曲库与插件一致，均为 HK 后端 + en）
+        "jo" => search_jo(keyword, actual_limit).await,
         _ => Err(format!("Unknown LX source: {}", source)),
     };
 
@@ -1683,6 +2198,69 @@ mod tests {
             .await
             .expect("失败缓存应命中");
         assert_eq!(cached, "WY search: code=-460");
+    }
+
+    /// 真联网验证 jo 搜索：JOOX 文本字段是 base64，必须解出中文；mid 与数字
+    /// songid 都要保留（分别供取流与评论），缺一会导致某一环静默失效。
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "依赖网络与 JOOX 接口可用性"]
+    async fn test_search_jo_real_network() {
+        let items = search_jo("七里香 周杰伦", 10).await.expect("jo 搜索应成功");
+        assert!(!items.is_empty(), "jo 搜索结果不应为空");
+        let first = &items[0];
+        assert_eq!(first.source, "jo");
+        assert!(!first.songmid.is_empty(), "songmid(mid) 不应为空");
+        assert!(
+            first.song_id.is_some(),
+            "数字 songid 必须保留给评论接口用"
+        );
+        assert_eq!(first.name, "七里香");
+        assert!(first.singer.contains("周杰倫") || first.singer.contains("周杰伦"));
+        assert!(!first.interval.is_empty(), "时长应已格式化");
+        assert!(first.img.as_deref().unwrap_or("").starts_with("http"));
+        assert!(!first.types.is_empty(), "音质列表不应为空");
+    }
+
+    #[test]
+    fn test_jo_item_from_song_decodes_base64() {
+        // 真实返回片段：songname/singername 为 base64（七里香/周杰倫）
+        let raw = serde_json::json!({
+            "songid": 102065756,
+            "songmid": "ZDE8F7D6B963B4",
+            "songname": "5LiD6YeM6aaZ",
+            "singername": "5ZGo5p2w5YCr",
+            "albumname": "5LiD6YeM6aaZ",
+            "albumid": 20612,
+            "playtime": 299,
+            "n128Size": 4788294,
+            "size320": 11970297,
+            "kbps_map": {"128": 4788294, "320": 11970297, "flac": 35845646, "hires": 0}
+        });
+        let item = jo_item_from_song(&raw).expect("应解析成功");
+        assert_eq!(item.name, "七里香");
+        assert_eq!(item.singer, "周杰倫");
+        assert_eq!(item.album_name, "七里香");
+        assert_eq!(item.songmid, "ZDE8F7D6B963B4");
+        assert_eq!(item.str_media_mid.as_deref(), Some("ZDE8F7D6B963B4"));
+        assert_eq!(
+            item.song_id.as_ref().and_then(|v| v.as_str()),
+            Some("102065756")
+        );
+        assert_eq!(item.interval, "04:59");
+        let qualities: Vec<&str> = item
+            .types
+            .iter()
+            .map(|t| t.quality_type.as_str())
+            .collect();
+        // hires=0 视为不可用，不进列表
+        assert_eq!(qualities, vec!["128k", "320k", "flac"]);
+    }
+
+    #[test]
+    fn test_jo_decode_text_keeps_plain_text() {
+        assert_eq!(jo_decode_text("Hello"), "Hello");
+        assert_eq!(jo_decode_text(""), "");
+        assert_eq!(jo_decode_text("5LiD6YeM6aaZ"), "七里香");
     }
 
     /// 同 key 并发去重：两个并发 lx_search 共享一次实际执行。

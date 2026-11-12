@@ -906,8 +906,16 @@ class MainActivity : AudioServiceActivity() {
                 }
                 val hidden = call.argument<Boolean>("hidden") == true
                 runOnUiThread {
+                    // 必须先判版本再访问 insetsController：该属性编译为
+                    // Window.getInsetsController() 虚调用（API 30 新增），
+                    // Android 10（API 29）上直接抛 NoSuchMethodError——
+                    // vivo Y50 实测闪退，写在后面的判空/判版本永远执行不到。
+                    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
+                        result.success(false)
+                        return@runOnUiThread
+                    }
                     val controller: WindowInsetsController? = window.insetsController
-                    if (controller == null || Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
+                    if (controller == null) {
                         result.success(false)
                         return@runOnUiThread
                     }

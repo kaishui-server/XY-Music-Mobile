@@ -6,7 +6,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../library/library_provider.dart';
 import '../player/player_provider.dart';
-import '../plugins/lx_playlist_import.dart' show kLxSourceIds, lxSourceLabel;
+import '../plugins/lx_playlist_import.dart' show lxSourceLabel;
 import '../plugins/plugin_runtime.dart';
 import '../favorites/favorites_provider.dart';
 import '../playlists/playlists_provider.dart';
@@ -133,12 +133,13 @@ Future<EnabledMusicPlugin?> _pickPlugin(
 }
 
 /// 洛雪子平台二级选择：全部平台（返回空串）+ 插件声明的平台列表
-/// （未声明时用洛雪默认五平台）；取消返回 null。
+/// （未声明时用宿主可搜索平台）；取消返回 null。
 Future<String?> _pickLxSource(
   BuildContext context,
   EnabledMusicPlugin plugin,
 ) {
-  final sources = plugin.lxSources.isEmpty ? kLxSourceIds : plugin.lxSources;
+  final sources =
+      plugin.lxSources.isEmpty ? kHostLxSearchSources : plugin.lxSources;
   return showModalBottomSheet<String?>(
     context: context,
     useRootNavigator: true,

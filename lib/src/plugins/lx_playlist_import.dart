@@ -5,15 +5,26 @@ import 'package:crypto/crypto.dart';
 import 'package:http/http.dart' as http;
 
 /// 洛雪音源 ID 列表（与 lx-music-mobile 一致）。
+///
+/// 注意：这是「歌单导入/同步」维度可用的平台集合，汽水（qs）没有歌单接口，
+/// 不能加入这里，否则歌单导入会请求不存在的接口。需要「可搜索平台」时用
+/// `kHostLxSearchSources`（含 qs），需要「可导入歌单平台」时用本常量。
 const kLxSourceIds = ['kw', 'kg', 'tx', 'wy', 'mg'];
 
 /// 洛雪音源 ID → 展示名。
+///
+/// 除内置五平台外，订阅源可自行扩展平台（ikun 的 git、lx-cit 的 qs/jo），
+/// 这里补上已知的扩展代号；未登记代号直接显示大写代号，避免在来源切换等
+/// 入口被隐藏。
 String lxSourceLabel(String source) => switch (source) {
   'kw' => '酷我',
   'kg' => '酷狗',
   'tx' => 'QQ音乐',
   'wy' => '网易云',
   'mg' => '咪咕',
+  'git' => 'Gitcode',
+  'qs' => '汽水音乐',
+  'jo' => 'JOOX',
   _ => source.toUpperCase(),
 };
 

@@ -923,17 +923,114 @@ bool _looksLikeLxPlugin(String source) {
           ));
 }
 
+/// 宿主内置搜索（Rust `lx_search` / `lx_search_playlists`）真正实现的平台。
+///
+/// 注意：这只是「宿主能搜哪些平台」的能力边界，**不是**插件平台声明的
+/// 白名单。订阅源可能声明更多平台（git/qs/jo 等），UI 必须按声明展示，
+/// 搜索阶段再按这里降级。
+///
+/// `qs`（汽水音乐）已接入 Rust `lx_search` 的 `search_qs`，因此进入本表；
+/// 取流仍由订阅源（lx-cit 的 `source=qs`）按 `musicUrl` 动作解析。
+/// `jo`（JOOX）同理由 Rust `search_jo` 直连官方搜索接口，歌词走
+/// `fetch_jo_lyric`，取流仍由订阅源按 `musicUrl` 解析。
+const kHostLxSearchSources = ['kw', 'kg', 'tx', 'wy', 'mg', 'qs', 'jo'];
+
+/// 宿主内置**歌单**搜索（Rust `lx_search_playlists`）真正实现的平台。
+/// 汽水只做了单曲搜索，歌单侧未实现，单独成表以免选到汽水歌单时
+/// 触发 Rust 的 `Unknown lx source: qs`。
+const kHostLxPlaylistSources = ['kw', 'kg', 'tx', 'wy', 'mg'];
+
+/// 合并多个来源的平台代号：去重、剔除非法标识符，并按宿主五平台的
+/// 固定顺序优先排列（其余平台保持首次出现顺序）。
+List<String> _mergeLxSourceIds(Iterable<String> ids) {
+  final seen = <String>{};
+  final extra = <String>[];
+  final hostOrdered = <String>[];
+  for (final raw in ids) {
+    final id = raw.trim().toLowerCase();
+    if (id.isEmpty || !RegExp(r'^[a-z][a-z0-9_]*$').hasMatch(id)) continue;
+    if (!seen.add(id)) continue;
+    if (kHostLxSearchSources.contains(id)) {
+      hostOrdered.add(id);
+    } else {
+      extra.add(id);
+    }
+  }
+  hostOrdered.sort(
+    (a, b) => kHostLxSearchSources
+        .indexOf(a)
+        .compareTo(kHostLxSearchSources.indexOf(b)),
+  );
+  return [...hostOrdered, ...extra];
+}
+
+/// 从脚本里提取「平台 → 音质数组」映射的顶层 key。
+///
+/// ikun / lx-cit / 聆澜这类订阅源只声明
+/// `MUSIC_QUALITY = {"kg":["128k",...],"qs":[...]}`，再由
+/// `Object.keys(MUSIC_QUALITY)` 动态生成 `sources`，因此
+/// `sources: { ... }` 字面量提取拿不到平台。这里按
+/// `key: [包含音质标识的数组]` 反查，值必须出现 128k/320k 之类的音质
+/// 标识，避免把 `actions: ["musicUrl"]`、`qualitys: [...]` 等无关字段
+/// 误判成平台。
+List<String> _extractLxQualitySourceKeys(String source) {
+  const blocked = {
+    'quality',
+    'qualities',
+    'qualitys',
+    'actions',
+    'sources',
+    'type',
+    'name',
+    'id',
+    'version',
+    'author',
+    'platform',
+  };
+  final keys = <String>[];
+  final pattern = RegExp(
+    r'''['"]?([A-Za-z][A-Za-z0-9_]{0,23})['"]?\s*:\s*\[([^\]]{0,400})\]''',
+  );
+  for (final match in pattern.allMatches(source)) {
+    final key = match.group(1) ?? '';
+    final body = match.group(2) ?? '';
+    if (!body.contains('128k') && !body.contains('320k')) continue;
+    final normalized = key.toLowerCase();
+    if (blocked.contains(normalized)) continue;
+    // 平台代号都是 2~6 位纯小写字母（kw/kg/tx/wy/mg/git/qs/jo…）。
+    // 收紧长度能挡掉 default_quality、extra_qualitys 这类同样带音质数组
+    // 的常量名被误当成平台。
+    if (!RegExp(r'^[a-z]{2,6}$').hasMatch(normalized)) continue;
+    if (!keys.contains(normalized)) keys.add(normalized);
+  }
+  return keys;
+}
+
+@visibleForTesting
+List<String> debugDetectLxSources(String source, {String? name}) =>
+    _detectLxSources(source, name: name);
+
 List<String> _detectLxSources(String source, {String? name}) {
-  const supported = ['kw', 'kg', 'tx', 'wy', 'mg'];
+  const supported = kHostLxSearchSources;
   // 优先取插件自报的音源：LX 插件通过
   // lx.send(lx.EVENT_NAMES.inited, { sources: { <音源>: {...} } }) 声明它
   // 支持哪些音源。照搬 XianYu 读声明音源的做法（本软件不执行脚本，改为
   // 静态提取）；未适配插件可能只支持五平台中的一部分，声明列表比「脚本
-  // 里出现过哪些平台名」更准。宿主内置搜索（Rust lxSearch）只认五平台，
-  // 故与五平台取交集，交集为空时退回后面的兜底。
-  final declared = _extractLxInitedSources(source)
-      .where(supported.contains)
-      .toList();
+  // 里出现过哪些平台名」更准。
+  //
+  // 订阅源声明的平台可能超出宿主内置搜索实现的五平台（ikun 的 git、
+  // lx-cit 的 qs/jo 等）。这类平台此前被「与五平台取交集」这一步直接
+  // 删掉，导致搜索页只显示 QQ/网易/酷狗/酷我/咪咕（用户反馈）。现在全量
+  // 保留声明，搜索阶段再按宿主能力降级，UI 严格按订阅源声明展示。
+  // 声明有两种常见形态：
+  //   1) inited.sources 字面量对象（自定义源模板写法）；
+  //   2) 只声明 MUSIC_QUALITY 平台→音质映射、sources 由 Object.keys 动态
+  //      生成（ikun / lx-cit / 聆澜等主流付费源都属于这一类，字面量提取
+  //      拿不到任何 key）。
+  final declared = _mergeLxSourceIds([
+    ..._extractLxInitedSources(source),
+    ..._extractLxQualitySourceKeys(source),
+  ]);
   if (declared.isNotEmpty) return declared;
   final found = <String>[];
   for (final id in supported) {
@@ -1518,6 +1615,14 @@ class PluginRuntimeService {
   /// 加硬上限并按插入顺序淘汰最旧条目，避免常驻内存随播放时长攀升。
   static const int _neteaseTrackMetaCacheLimit = 256;
   static const int _qualityDiscoveryCacheLimit = 64;
+
+  /// 卡顿修复方案①：预取探测逐档之间的间隔（毫秒）。逐档 musicUrl 是
+  /// 每档一次完整网络解析，背靠背连发会把出口带宽和 QuickJS 引擎一起
+  /// 占满，起播/续缓冲阶段直接被拖成卡顿；留一点间隔把探测摊平。
+  static const int _qualityProbeGapMs = 260;
+
+  /// 挂起待探测队列的硬上限：只在缓冲未达标时暂存，避免常驻内存。
+  static const int _deferredQualityProbeLimit = 6;
 
   /// 已解析播放源的短时缓存：同一首歌曲短时间内重复播放（切歌回切、
   /// 下一首预取）时直接复用 URL，跳过插件网络解析。音源返回的 CDN
@@ -2396,32 +2501,48 @@ class PluginRuntimeService {
     final cached = _artistAvatarNameCache[key];
     if (cached != null) return cached;
     try {
-      final url =
-          'https://music.163.com/api/search/get/web?s=${Uri.encodeComponent(name)}&type=100&limit=10';
-      final response = await http
-          .get(
-            Uri.parse(url),
-            headers: const {
-              'Cookie': 'os=pc',
-              'Referer': 'https://music.163.com',
-            },
-          )
-          .timeout(const Duration(seconds: 4));
-      if (response.statusCode != 200) return '';
-      final decoded = jsonDecode(response.body);
-      final result = decoded is Map ? decoded['result'] : null;
-      final artists = result is Map ? result['artists'] : null;
-      if (artists is! List) return '';
-      var avatar = '';
-      for (final entry in artists) {
-        if (entry is! Map) continue;
-        final raw = Map<String, dynamic>.from(entry);
-        final matched = _neteaseArtistNames(
-          raw,
-        ).any((value) => _normalizeArtistName(value) == key);
-        if (!matched) continue;
-        avatar = _pickNeteaseArtistAvatar(raw);
-        if (avatar.isNotEmpty) break;
+      // 整体名先查（多数歌手名可直接命中）；组合歌手（「林俊杰、G.E.M.
+      // 邓紫棋」这类合作条目）在公开平台不存在同名歌手，拆出各歌手名
+      // 依次补查，取第一个命中者（通常是主歌手）的头像。用户反馈组合
+      // 条目一直显示占位图的根因在此。
+      Future<String> queryNetease(String queryName) async {
+        final url =
+            'https://music.163.com/api/search/get/web?s=${Uri.encodeComponent(queryName)}&type=100&limit=10';
+        final response = await http
+            .get(
+              Uri.parse(url),
+              headers: const {
+                'Cookie': 'os=pc',
+                'Referer': 'https://music.163.com',
+              },
+            )
+            .timeout(const Duration(seconds: 4));
+        if (response.statusCode != 200) return '';
+        final decoded = jsonDecode(response.body);
+        final result = decoded is Map ? decoded['result'] : null;
+        final artists = result is Map ? result['artists'] : null;
+        if (artists is! List) return '';
+        final queryKey = _normalizeArtistName(queryName);
+        if (queryKey.isEmpty) return '';
+        for (final entry in artists) {
+          if (entry is! Map) continue;
+          final raw = Map<String, dynamic>.from(entry);
+          final matched = _neteaseArtistNames(
+            raw,
+          ).any((value) => _normalizeArtistName(value) == queryKey);
+          if (!matched) continue;
+          final avatar = _pickNeteaseArtistAvatar(raw);
+          if (avatar.isNotEmpty) return avatar;
+        }
+        return '';
+      }
+
+      var avatar = await queryNetease(name);
+      if (avatar.isEmpty) {
+        for (final part in _splitCombinedArtistNames(name)) {
+          avatar = await queryNetease(part);
+          if (avatar.isNotEmpty) break;
+        }
       }
       // 空结果也缓存，避免同名歌手反复请求；超量直接清空（量级很小）。
       if (_artistAvatarNameCache.length >= 300) {
@@ -2437,6 +2558,16 @@ class PluginRuntimeService {
 
   static String _normalizeArtistName(String value) =>
       value.toLowerCase().replaceAll(RegExp(r'[^a-z0-9\u4e00-\u9fa5]+'), '');
+
+  /// 组合歌手名拆分：「林俊杰、G.E.M.邓紫棋」「G.E.M.邓紫棋/艾热AIR」
+  /// 「A feat. B」「A & B」等按常见分隔符切开，最多取前 3 个候选
+  /// （避免极端长串发起过多请求）。
+  static List<String> _splitCombinedArtistNames(String value) => value
+      .split(RegExp(r'[、,，/&;；+]|feat\.?|ft\.?'))
+      .map((part) => part.trim())
+      .where((part) => part.isNotEmpty)
+      .take(3)
+      .toList();
 
   /// 网易系歌手结果头像兜底：官方搜索接口（type=100）按搜索词一次
   /// 可取回带 img1v1Url 的歌手数组，按名字（name/alias/trans）匹配
@@ -2704,8 +2835,19 @@ class PluginRuntimeService {
     String keyword,
     String? lxSource,
   ) async {
-    final source =
-        lxSource != null && kLxSourceIds.contains(lxSource) ? lxSource : 'kw';
+    final requested = (lxSource ?? '').trim();
+    if (requested.isNotEmpty &&
+        !kHostLxPlaylistSources.contains(requested)) {
+      // 订阅源声明的扩展平台（git/qs/jo…）没有宿主歌单搜索实现。此前的
+      // 写法是静默改用 'kw'，选中「Gitcode」却显示酷我歌单，等于数据串台；
+      // 现在直接返回空并留日志。
+      AppLogStore.instance.add(
+        '[LX歌单搜索] 平台$requested 未接入宿主歌单搜索，跳过',
+        level: AppLogLevel.warning,
+      );
+      return const [];
+    }
+    final source = requested.isNotEmpty ? requested : 'kw';
     try {
       final rawJson = await lxSearchPlaylists(
         source: source,
@@ -3182,7 +3324,13 @@ class PluginRuntimeService {
         continue;
       }
       final subtitle = artist ? song.album : song.artist;
-      final key = '${title.toLowerCase()}\u0000${subtitle.toLowerCase()}';
+      // 歌手 tab 按歌手名去重（同一歌手只保留一条，副标题取首个出现的
+      // 专辑作代表）：此前 key 含专辑名，洛雪音源下同一歌手会按其每张
+      // 专辑重复成多条，列表看起来像专辑而非歌手，且各行封面取自歌曲
+      // 封面，与歌手详情页头像不一致（用户反馈）。
+      final key = artist
+          ? title.toLowerCase()
+          : '${title.toLowerCase()}\u0000${subtitle.toLowerCase()}';
       seen.putIfAbsent(
         key,
         () => PluginCatalogResult(
@@ -3204,10 +3352,35 @@ class PluginRuntimeService {
     String? onlySource,
   }) async {
     var sources = plugin.lxSources.isEmpty
-        ? const ['kw', 'kg', 'tx', 'wy', 'mg']
+        ? kHostLxSearchSources
         : plugin.lxSources;
     if (onlySource != null && onlySource.isNotEmpty) {
       sources = sources.contains(onlySource) ? [onlySource] : const [];
+    }
+    // 宿主内置搜索（Rust `lx_search`）只实现了 kHostLxSearchSources 内的
+    // 平台，其余平台（ikun 的 git、lx-cit 的 jo 等）只在取播放链接时由订阅
+    // 源解析，搜索没有宿主实现。这里先剥离：
+    //  - 单平台选中时给出明确提示，避免「Unknown LX source: git」这种内部
+    //    报错直接甩到界面上；
+    //  - 「全部平台」时跳过未接入平台继续搜已验证平台，不让一个平台把整轮
+    //    搜索结果拖成失败。
+    final unsupported = sources
+        .where((source) => !kHostLxSearchSources.contains(source))
+        .toList(growable: false);
+    if (unsupported.isNotEmpty) {
+      AppLogStore.instance.add(
+        '[LX搜索] ${plugin.name} 平台${unsupported.join('/')} 未接入宿主搜索，已跳过',
+        level: AppLogLevel.warning,
+      );
+      sources = sources
+          .where(kHostLxSearchSources.contains)
+          .toList(growable: false);
+      if (sources.isEmpty) {
+        throw Exception(
+          '${plugin.name} 声明的平台（${unsupported.join('/')}）暂无搜索能力：'
+          '宿主当前仅支持酷我/酷狗/QQ音乐/网易云/咪咕/汽水',
+        );
+      }
     }
     // 各平台并行请求：串行时总耗时为全部平台网络延迟之和（默认 5 个
     // 平台在弱网/低端机上搜索明显偏慢）。失败平台不影响其余平台，
@@ -5199,6 +5372,28 @@ class PluginRuntimeService {
     }
   }
 
+  /// 挂起中的预取探测：起播瞬间缓冲还不够 3s，探测必须等播放器上报
+  /// 「ready + 提前量达标」后再跑（见 [flushDeferredQualityProbes]）。
+  final Map<String, _DeferredQualityProbe> _deferredQualityProbes = {};
+
+  /// 播放器侧缓冲已达标：补跑一条挂起的预取探测。
+  ///
+  /// 一次只放行一条：两条探测并行会各自跑满整条档位链，等于把卡顿
+  /// 修复又还原回去。当前探测结束时（[preloadQualities] 的
+  /// whenComplete）会再次调用本方法接力下一条。
+  void flushDeferredQualityProbes() {
+    if (_deferredQualityProbes.isEmpty) return;
+    if (_activeResolves > 0) return;
+    if (!QualityProbeGate.instance.settled) return;
+    final entry = _deferredQualityProbes.entries.first;
+    _deferredQualityProbes.remove(entry.key);
+    preloadQualities(
+      entry.value.plugin,
+      entry.value.rawData,
+      preferredQuality: entry.value.preferredQuality,
+    );
+  }
+
   /// 当前歌曲+插件的音质探测是否已完成或已发起过（缓存命中）。
   /// 用于 UI 判断是否跳过「正在读取插件支持的音质…」提示——探测完成落
   /// _qualityDiscoveryDone；探测可能因让位起播/全档失败不落 done，但
@@ -5217,11 +5412,16 @@ class PluginRuntimeService {
     EnabledMusicPlugin plugin,
     Map<String, dynamic> rawData, {
     String? preferredQuality,
+    bool bandwidthAware = false,
   }) {
     final key = _qualityCacheKey(plugin, rawData);
     var future = _qualityDiscoveryCache[key];
     if (future == null) {
-      future = _discoverQualitiesUncached(plugin, rawData);
+      future = _discoverQualitiesUncached(
+        plugin,
+        rawData,
+        bandwidthAware: bandwidthAware,
+      );
       _qualityDiscoveryCache[key] = future;
     }
     while (_qualityDiscoveryCache.length > _qualityDiscoveryCacheLimit) {
@@ -5256,6 +5456,12 @@ class PluginRuntimeService {
   }
 
   /// 在歌曲进入播放流程后预先触发探测，避免打开选择器时再次请求插件。
+  ///
+  /// 卡顿修复方案①：探测改成「智能延后」——起播阶段（processingState
+  /// 未 ready 或缓冲提前量 < 3s）一律先挂起，等播放器上报缓冲达标后
+  /// 由 [flushDeferredQualityProbes] 补跑。原因是逐档 musicUrl 与起播
+  /// 解析抢同一条出口带宽，起播时探测会直接把「起播 3 秒」拖成
+  /// 「起播十秒 + 播放中反复重缓冲」。
   void preloadQualities(
     EnabledMusicPlugin plugin,
     Map<String, dynamic> rawData, {
@@ -5265,12 +5471,39 @@ class PluginRuntimeService {
     // QuickJS 引擎；正在解析播放源时让位，等下一次起播后再补——
     // 探测结果有缓存，晚一轮不影响音质选择器。
     if (_activeResolves > 0) return;
+    final key = _qualityCacheKey(plugin, rawData);
+    if (_qualityDiscoveryCache.containsKey(key) ||
+        _qualityDiscoveryDone.containsKey(key)) {
+      return;
+    }
+    final gate = QualityProbeGate.instance;
+    if (!gate.settled) {
+      _deferredQualityProbes[key] = _DeferredQualityProbe(
+        plugin,
+        rawData,
+        preferredQuality,
+      );
+      while (_deferredQualityProbes.length > _deferredQualityProbeLimit) {
+        _deferredQualityProbes.remove(_deferredQualityProbes.keys.first);
+      }
+      AppLogStore.instance.add(
+        '[播放链路] 音质探测挂起（ready=${gate.ready} '
+        '提前量=${gate.bufferedAheadMs}ms < '
+        '${QualityProbeGate.minBufferedAheadMs}ms）$key',
+      );
+      return;
+    }
     unawaited(
       discoverQualities(
         plugin,
         rawData,
         preferredQuality: preferredQuality,
-      ).catchError((_) => const <String>[]),
+        bandwidthAware: true,
+      ).catchError((_) => const <String>[]).whenComplete(() {
+        // 本次探测结束（或被重缓冲挂起）后再放行下一条挂起项：
+        // 串行化探测，避免并行探测重新把带宽吃满。
+        flushDeferredQualityProbes();
+      }),
     );
   }
 
@@ -5292,9 +5525,15 @@ class PluginRuntimeService {
 
   Future<_QualityProbeOutcome> _discoverQualitiesUncached(
     EnabledMusicPlugin plugin,
-    Map<String, dynamic> rawData,
-  ) async {
+    Map<String, dynamic> rawData, {
+    bool bandwidthAware = false,
+  }) async {
     final key = _qualityCacheKey(plugin, rawData);
+    // 预取探测（bandwidthAware）受播放缓冲闸门约束：逐档之间先等间隔，
+    // 并在每档前复查「就绪 + 缓冲充足 + 期间无重缓冲」。用户主动打开
+    // 音质菜单的探测（UI 在等结果）不设闸门，直接跑完整条档位链。
+    final probeEpoch =
+        bandwidthAware ? QualityProbeGate.instance.rebufferSeq : 0;
     // 历史已确认的档位直接带入：让位中断后的补测只需探测缺失档，
     // 展示侧也始终保有「曾经验证过」的完整下限。
     final probedBefore =
@@ -5307,6 +5546,10 @@ class PluginRuntimeService {
       for (final quality in plugin.animemusicQualities) {
         if (supported.contains(quality)) continue;
         if (_activeResolves > 0) {
+          yielded = true;
+          break;
+        }
+        if (bandwidthAware && !await _awaitProbeWindow(probeEpoch)) {
           yielded = true;
           break;
         }
@@ -5376,6 +5619,12 @@ class PluginRuntimeService {
         yielded = true;
         break;
       }
+      // 逐档间隔 + 重缓冲挂起（卡顿修复方案①）：重缓冲一旦发生，
+      // 继续逐档探测只会让缓冲更追不上，立即挂起等下一轮。
+      if (bandwidthAware && !await _awaitProbeWindow(probeEpoch)) {
+        yielded = true;
+        break;
+      }
       try {
         final ok = plugin.isLx
             ? await _probeLxQuality(plugin, rawData, quality)
@@ -5406,6 +5655,18 @@ class PluginRuntimeService {
       return (qualities: declared, complete: !yielded);
     }
     return (qualities: const ['320k'], complete: !yielded);
+  }
+
+  /// 逐档探测的时间/状态窗口（卡顿修复方案①）。
+  ///
+  /// 先等 [_qualityProbeGapMs] 把逐档请求摊平，再复查闸门：期间若发生
+  /// 重缓冲（[QualityProbeGate.rebufferSeq] 变化）或缓冲提前量跌破 3s，
+  /// 返回 false 让调用方挂起本次探测（剩余档位留给下一轮补测）。
+  Future<bool> _awaitProbeWindow(int epoch) async {
+    final gate = QualityProbeGate.instance;
+    if (gate.rebufferSeq != epoch || !gate.settled) return false;
+    await Future<void>.delayed(const Duration(milliseconds: _qualityProbeGapMs));
+    return gate.rebufferSeq == epoch && gate.settled;
   }
 
   Future<bool> _probeMusicFreeQuality(
@@ -6971,7 +7232,58 @@ class PluginRuntimeService {
         RegExp(r'qq音乐|qqmusic|\bqq\b|(^|[^a-z])tx\b').hasMatch(platformText)) {
       return _getQqLyricsFallback(rawData);
     }
+    if (RegExp(r'汽水|qishui|luna').hasMatch(platformText)) {
+      return _getQishuiLyricsFallback(rawData);
+    }
     return '';
+  }
+
+  /// 汽水歌词兜底（baka 等汽水 MusicFree 插件 / 聚合插件 qs 歌曲共用）。
+  ///
+  /// 汽水官方取词接口（PC track_v2）需要 TTNet 设备签名
+  /// （X-Helios/X-Medusa），插件内嵌签名服务的授权 key 已过期
+  /// （2026-11-12 实测 code=1004「授权已过期」），插件歌词主路径全断、
+  /// legacy 兜底在部分设备也拿不到；宿主直连同样无法实现签名。
+  /// 因此走 Rust 侧 fetchLyricFromSource('qs')：按「歌名+歌手」跨源
+  /// 聚合 kg/wy/tx/kw/mg 词库（与翻译聚合同模式，Rust 侧带缓存）。
+  /// 返回 LyricResult JSON（"null" 表示聚合无命中），歌词/翻译/罗马音
+  /// 按轨道哨兵拼接，与密文解密链路同格式。
+  Future<String> _getQishuiLyricsFallback(Map<String, dynamic> rawData) async {
+    final name = (rawData['title'] ?? rawData['name'])?.toString().trim() ?? '';
+    if (name.isEmpty) return '';
+    final singer = (rawData['artist'] ?? rawData['singer'])?.toString() ?? '';
+    try {
+      final response = await fetchLyricFromSource(
+        source: 'qs',
+        songInfoJson: jsonEncode({
+          'songmid': (rawData['songmid'] ?? rawData['id'] ?? '').toString(),
+          if (rawData['id'] != null && rawData['id'] != rawData['songmid'])
+            'songId': rawData['id'],
+          'name': name,
+          'singer': singer,
+          if (rawData['album'] != null) 'albumName': rawData['album'],
+          'source': 'qs',
+        }),
+      ).timeout(const Duration(seconds: 30));
+      if (response.trim().isEmpty || response.trim() == 'null') return '';
+      final decoded = jsonDecode(response);
+      if (decoded is! Map) return '';
+      final main = decoded['lyric']?.toString() ?? '';
+      if (main.trim().isEmpty) return '';
+      final translation = decoded['tlyric']?.toString() ?? '';
+      final romaji = decoded['rlyric']?.toString() ?? '';
+      if (translation.isEmpty && romaji.isEmpty) return main;
+      return [
+        main,
+        if (translation.isNotEmpty) ...[
+          _kTrackTranslationSentinel,
+          translation,
+        ],
+        if (romaji.isNotEmpty) ...[_kTrackRomanizationSentinel, romaji],
+      ].join('\n');
+    } catch (_) {
+      return '';
+    }
   }
 
   Future<String> _getNeteaseLyricsFallback(Map<String, dynamic> rawData) async {
@@ -8260,6 +8572,8 @@ class PluginRuntimeService {
     'kw' => '酷我',
     'kg' => '酷狗',
     'mg' => '咪咕',
+    'qs' => '汽水',
+    'jo' => 'JOOX',
     'bilibili' => 'B站',
     _ => code.toUpperCase(),
   };
@@ -9301,6 +9615,78 @@ class _PluginProxyHttpClient extends http.BaseClient {
 /// 可能在 JSON.parse 前被二次解释。使用纯 ASCII Base64 作为桥接传输格式。
 String encodePluginHttpBody(String body) =>
     '__XY_HTTP_BODY_BASE64__${base64Encode(utf8.encode(body))}';
+
+/// 音质探测闸门（卡顿修复方案①：智能音质探测）。
+///
+/// 逐档 `musicUrl` 探测是「每档一次完整网络解析」，与起播解析、续缓冲
+/// 共用同一条出口带宽和 QuickJS 引擎。起播阶段探测是把「起播 3 秒」拖
+/// 成「起播十秒 + 播放中反复重缓冲」的直接原因，因此由播放器侧上报真实
+/// 播放就绪度（processingState == ready + 缓冲提前量），探测侧只在就绪
+/// 且缓冲充足时启动，一旦检测到重缓冲立即挂起。
+class QualityProbeGate {
+  QualityProbeGate._();
+
+  /// 全局单例：播放器（写入方）与插件运行时（读取方）共用。
+  static final QualityProbeGate instance = QualityProbeGate._();
+
+  /// 启动探测所需的最小缓冲提前量（图一方案要求 ≥3s）。
+  static const int minBufferedAheadMs = 3000;
+
+  /// 重缓冲后的冷却时间：缓冲刚追回来时出口带宽仍然紧张，
+  /// 此时立刻重启探测极易把播放再次拖进重缓冲。
+  static const Duration rebufferCooldown = Duration(seconds: 3);
+
+  bool _ready = false;
+  int _bufferedAheadMs = 0;
+  int _rebufferSeq = 0;
+  int _lastRebufferAtMs = 0;
+
+  bool get ready => _ready;
+
+  int get bufferedAheadMs => _bufferedAheadMs;
+
+  /// 重缓冲序号：探测循环用它在逐档之间发现「刚刚发生过重缓冲」。
+  int get rebufferSeq => _rebufferSeq;
+
+  /// 播放器上报当前播放就绪度。
+  void report({required bool ready, required int bufferedAheadMs}) {
+    _ready = ready;
+    _bufferedAheadMs = bufferedAheadMs < 0 ? 0 : bufferedAheadMs;
+  }
+
+  /// 播放器上报一次「播放中重缓冲」。
+  void reportRebuffer() {
+    _rebufferSeq++;
+    _lastRebufferAtMs = DateTime.now().millisecondsSinceEpoch;
+  }
+
+  /// 切歌/停止/换源时复位：旧曲的缓冲进度对新曲没有参考价值。
+  void reset() {
+    _ready = false;
+    _bufferedAheadMs = 0;
+  }
+
+  /// 当前是否允许发起（或继续）音质探测。
+  bool get settled {
+    if (!_ready || _bufferedAheadMs < minBufferedAheadMs) return false;
+    if (_lastRebufferAtMs == 0) return true;
+    return DateTime.now().millisecondsSinceEpoch - _lastRebufferAtMs >=
+        rebufferCooldown.inMilliseconds;
+  }
+}
+
+/// 挂起中的预取探测参数（缓冲达标后按此补跑）。
+class _DeferredQualityProbe {
+  const _DeferredQualityProbe(
+    this.plugin,
+    this.rawData,
+    this.preferredQuality,
+  );
+
+  final EnabledMusicPlugin plugin;
+  final Map<String, dynamic> rawData;
+  final String? preferredQuality;
+}
 
 /// 按原始字节 Base64 包装（二进制安全），供插件以 arraybuffer 消费
 /// 二进制响应（酷我 newlyric 等接口）。

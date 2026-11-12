@@ -65,7 +65,7 @@ pub struct LyricSongInfo {
     pub source: Option<String>,
 }
 
-#[derive(Serialize, Clone, Debug, Default)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct LyricResult {
     pub lyric: String,
@@ -2557,6 +2557,130 @@ async fn fetch_mg_lyric(song_info: &LyricSongInfo) -> Result<Option<LyricResult>
     }))
 }
 
+// ---- JOOX ----
+// JOOX 歌词来自 openjoox2 track 详情（与取流、评论不同域），必须带 secret 签名：
+//   secret = MD5("Jo0x@t3Nc3nT" + "country=HK&lang=en&lyric=1&id=<id>")
+// 且 secret 必须排在 country/lang/lyric 之后。缺签名直接 401 "Invalid secret key"。
+// lrc_content 是普通 LRC 的 base64；qrc_content 是 XML 包裹的 QRC 逐字文本的
+// base64。JOOX 的 QRC 明文体例与 QQ 完全一致（[行start,行dur]字(start,dur)...），
+// 因此直接复用 tx_parse 解析，无需第二套逐字解析器。
+const JO_LYRIC_KEY: &str = "Jo0x@t3Nc3nT";
+const JO_OPEN_API2: &str = "https://cache.api.joox.com/openjoox2/v1";
+const JO_LYRIC_UA: &str = "okhttp/4.12.0";
+
+fn jo_lyric_secret(id: &str) -> String {
+    let query = format!("country=HK&lang=en&lyric=1&id={}", id);
+    let digest = md5::compute(format!("{}{}", JO_LYRIC_KEY, query).as_bytes());
+    format!("{:x}", digest)
+}
+
+/// Fastly 返回的歌词字段是 base64（缺 padding），解码失败时按原文返回，
+/// 避免把已经是明文的异常返回整段丢掉。
+fn jo_decode_b64_text(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let padded = pad_base64(trimmed);
+    match base64::engine::general_purpose::STANDARD.decode(padded.as_bytes()) {
+        Ok(bytes) => match String::from_utf8(bytes) {
+            Ok(text) => text,
+            Err(_) => trimmed.to_string(),
+        },
+        Err(_) => trimmed.to_string(),
+    }
+}
+
+/// 从 QRC 的 XML 外壳里剥出 LyricContent 属性正文。JOOX 返回形如
+/// `<Lyric_1 LyricType="1" LyricContent="[ti:..]\n[0,7730]稻(0,552)..."/>`，
+/// 正文里本身带换行与引号，不能按行切。
+fn jo_extract_qrc_content(xml: &str) -> String {
+    let Some(idx) = xml.find("LyricContent=\"") else {
+        return String::new();
+    };
+    let rest = &xml[idx + "LyricContent=\"".len()..];
+    let Some(end) = rest.rfind('"') else {
+        return String::new();
+    };
+    decode_html_entities(rest[..end].trim())
+}
+
+async fn fetch_jo_lyric(song_info: &LyricSongInfo) -> Result<Option<LyricResult>, String> {
+    // 详情接口对数字 songid 的兼容性最好；songmid 是 Z 开头 mid 时退回使用。
+    let id = song_info
+        .song_id
+        .as_ref()
+        .map(|v| match v {
+            serde_json::Value::String(s) => s.trim().to_string(),
+            other => other.to_string(),
+        })
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| song_info.songmid.clone());
+    if id.is_empty() {
+        return Ok(None);
+    }
+
+    let url = format!(
+        "{}/track/{}?country=HK&lang=en&lyric=1&secret={}",
+        JO_OPEN_API2,
+        urlencoding::encode(&id),
+        jo_lyric_secret(&id)
+    );
+    let resp = http_fetch_text(
+        &url,
+        "GET",
+        &[
+            ("User-Agent", JO_LYRIC_UA),
+            ("Accept", "application/json"),
+            ("Referer", "https://www.joox.com/"),
+        ],
+        None,
+    )
+    .await?;
+    if resp.status != 200 {
+        return Err(format!("JO lyric: HTTP {}", resp.status));
+    }
+    let body: serde_json::Value =
+        serde_json::from_str(&resp.body).map_err(|e| format!("JO lyric: invalid JSON {}", e))?;
+    let payload = if body.get("lrc_content").is_some() || body.get("qrc_content").is_some() {
+        body.clone()
+    } else {
+        body.get("data").cloned().unwrap_or_else(|| body.clone())
+    };
+
+    let tlyric_lrc = payload
+        .get("transLrc_content")
+        .and_then(|v| v.as_str())
+        .map(jo_decode_b64_text)
+        .unwrap_or_default();
+
+    if let Some(qrc_b64) = payload.get("qrc_content").and_then(|v| v.as_str()) {
+        let xml = jo_decode_b64_text(qrc_b64);
+        let qrc = jo_extract_qrc_content(&xml);
+        if !qrc.is_empty() {
+            let parsed = tx_parse(&qrc, &tlyric_lrc, "");
+            if !parsed.lyric.trim().is_empty() || !parsed.lxlyric.trim().is_empty() {
+                return Ok(Some(parsed));
+            }
+        }
+    }
+
+    let lyric = payload
+        .get("lrc_content")
+        .and_then(|v| v.as_str())
+        .map(jo_decode_b64_text)
+        .unwrap_or_default();
+    if lyric.trim().is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(LyricResult {
+        lyric: lyric.trim().to_string(),
+        tlyric: tlyric_lrc,
+        rlyric: String::new(),
+        lxlyric: String::new(),
+    }))
+}
+
 // ==================== 对外入口 ====================
 
 // ---- 跨源翻译聚合 ----
@@ -2717,6 +2841,117 @@ async fn fetch_translation_cross_source(origin: &str, song_info: &LyricSongInfo)
         .unwrap_or_default()
 }
 
+/// 汽水（qs）歌词：汽水官方取词走 PC track_v2，需 TTNet 设备签名
+/// （X-Helios/X-Medusa/X-SS-STUB），宿主无法本地实现，外部签名服务的
+/// 授权 key 也已过期（2026-11-12 实测 code=1004「授权已过期」，baka
+/// 汽水插件同样因此主路径全断）。改按「歌名+歌手」跨源聚合：并行搜索
+/// kg/wy/tx/kw/mg 词库，严格匹配（lyric_song_matches）后取首个命中源
+/// 的完整歌词（含翻译/逐字），与 fetch_translation_cross_source 同模式。
+/// 结果进程级缓存（qs-lyric: 命名空间），重复播放同一首不再发起聚合。
+async fn fetch_qs_lyric(song_info: &LyricSongInfo) -> Result<Option<LyricResult>, String> {
+    // 实质内容校验：>40B，排除「纯音乐」等占位行（与主链路同标准）。
+    fn is_substantial(result: &LyricResult) -> bool {
+        result.lyric.trim().len() > 40
+    }
+
+    let cache_key = format!("qs-lyric:{}:{}", song_info.name.trim(), song_info.singer.trim());
+    if let Some(cached) = cache_get_translation(&cache_key) {
+        if let Ok(result) = serde_json::from_str::<LyricResult>(&cached) {
+            return Ok(Some(result));
+        }
+    }
+
+    let keyword = format!("{} {}", song_info.name.trim(), song_info.singer.trim());
+    let (kg, wy, tx, kw, mg) = tokio::join!(
+        fetch_qs_lyric_from_source("kg", song_info, &keyword),
+        fetch_qs_lyric_from_source("wy", song_info, &keyword),
+        fetch_qs_lyric_from_source("tx", song_info, &keyword),
+        fetch_qs_lyric_from_source("kw", song_info, &keyword),
+        fetch_qs_lyric_from_source("mg", song_info, &keyword),
+    );
+    let result = kg.or(wy).or(tx).or(kw).or(mg);
+    if let Some(ref r) = result {
+        if is_substantial(r) {
+            if let Ok(json) = serde_json::to_string(r) {
+                cache_put_translation(cache_key, json);
+            }
+        }
+    }
+    Ok(result)
+}
+
+/// 单个候选源：搜索 → 严格匹配 → 拉取完整歌词。整体 8s 超时，
+/// 失败/无匹配/无实质歌词一律返回 None（聚合是尽力而为）。
+async fn fetch_qs_lyric_from_source(
+    source: &str,
+    song_info: &LyricSongInfo,
+    keyword: &str,
+) -> Option<LyricResult> {
+    tokio::time::timeout(std::time::Duration::from_secs(8), async {
+        let items = crate::music::lx_search::lx_search(source, keyword, 3)
+            .await
+            .ok()?;
+        let origin_name = &song_info.name;
+        let splitters = ['/', ',', '&', '、', ';'];
+        let origin_singers: Vec<String> = song_info
+            .singer
+            .split(splitters)
+            .map(norm_lyric_text)
+            .filter(|s| !s.is_empty())
+            .collect();
+        for item in items {
+            if !lyric_song_matches(origin_name, &origin_singers, &item.name, &item.singer) {
+                continue;
+            }
+            let info = LyricSongInfo {
+                songmid: item.songmid,
+                hash: item.hash,
+                name: item.name.clone(),
+                singer: item.singer.clone(),
+                album_name: if item.album_name.is_empty() {
+                    None
+                } else {
+                    Some(item.album_name)
+                },
+                interval: if item.interval.is_empty() {
+                    None
+                } else {
+                    Some(item.interval)
+                },
+                interval_ms: None,
+                song_id: item.song_id,
+                str_media_mid: item.str_media_mid,
+                album_mid: item.album_mid,
+                album_id: if item.album_id.is_null() {
+                    None
+                } else {
+                    Some(item.album_id)
+                },
+                copyright_id: item.copyright_id,
+                source: Some(source.to_string()),
+            };
+            let fetched = match source {
+                "kg" => fetch_kg_lyric(&info).await,
+                "wy" => fetch_wy_lyric(&info).await,
+                "tx" => fetch_tx_lyric(&info).await,
+                "kw" => fetch_kw_lyric(&info).await,
+                "mg" => fetch_mg_lyric(&info).await,
+                _ => Ok(None),
+            };
+            // 该匹配项无实质歌词时继续试下一个搜索结果（最多 3 条）。
+            if let Ok(Some(r)) = fetched {
+                if r.lyric.trim().len() > 40 {
+                    return Some(r);
+                }
+            }
+        }
+        None
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
 pub async fn fetch_lyric_from_source(
     source: String,
     song_info: LyricSongInfo,
@@ -2727,6 +2962,8 @@ pub async fn fetch_lyric_from_source(
         "tx" => fetch_tx_lyric(&song_info).await?,
         "wy" => fetch_wy_lyric(&song_info).await?,
         "mg" => fetch_mg_lyric(&song_info).await?,
+        "jo" => fetch_jo_lyric(&song_info).await?,
+        "qs" => fetch_qs_lyric(&song_info).await?,
         _ => return Ok(None),
     };
     let Some(mut result) = result else {

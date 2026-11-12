@@ -234,6 +234,21 @@ Map<String, dynamic> _commentMusicInfo(Map<dynamic, dynamic> lxInfo) {
   } else if (source == 'tx') {
     // QQ：评论优先用数字 songId，缺失时由 songmid（mid）换取。
     info['songId'] ??= songmid;
+  } else if (source == 'qs') {
+    // 汽水：评论接口按 group_id（= track id）取，LX 搜索结果的 track id
+    // 存在 songmid 里，补齐到 id 供 _fetchQishui 读取。
+    info['id'] ??= songmid;
+    info['track_id'] ??= songmid;
+  } else if (source == 'jo') {
+    // JOOX：评论接口只认数字 songid 或 base64 歌曲 ID，Z 开头的 mid 不被
+    // 接受。宿主搜索结果把数字 songid 放在 songId，songmid 存的是取流用
+    // mid，因此必须优先取 songId，再回退 songmid（仅当它是数字时）。
+    final numericId = _textOf(info['songId'] ?? info['song_id']) ??
+        _textOf(info['songmid']);
+    if (numericId != null) {
+      info['id'] ??= numericId;
+      info['songId'] ??= numericId;
+    }
   }
   // 咪咕的评论 targetId 是 copyrightId，已在 LX 信息里，保持不变。
   return info;
@@ -290,13 +305,16 @@ String? detectCommentPlatform({
     return null;
   }
 
-  // LX 源 key 即平台码。
+  // LX 源 key 即平台码。qs（汽水）在宿主侧没有独立的评论直连实现名，
+  // 复用汽水官方评论接口的 'qishui' 平台码。
   const lxCodes = {
     'wy': 'wy',
     'tx': 'tx',
     'kg': 'kg',
     'kw': 'kw',
     'mg': 'mg',
+    'qs': 'qishui',
+    'jo': 'jo',
   };
   final sourceKey = musicInfo?['source'];
   if (sourceKey is String && lxCodes.containsKey(sourceKey)) {
@@ -333,6 +351,7 @@ String? detectCommentPlatform({
     ('kw', RegExp(r'酷我|kuwo|\bkw\b', caseSensitive: false)),
     ('mg', RegExp(r'咪咕|migu|\bmg\b', caseSensitive: false)),
     ('qishui', RegExp(r'汽水|qishui', caseSensitive: false)),
+    ('jo', RegExp(r'joox', caseSensitive: false)),
   ];
   for (final (platform, pattern) in patterns) {
     if (pattern.hasMatch(haystack)) return platform;
@@ -398,6 +417,7 @@ Future<CommentPage?> fetchPlatformComments({
       'kw' => await _fetchKw(musicInfo, page),
       'mg' => await _fetchMg(musicInfo, page),
       'qishui' => await _fetchQishui(musicInfo, page),
+      'jo' => await _fetchJo(musicInfo, page),
       _ => null,
     };
   } on _CommentNetworkException {
@@ -825,7 +845,12 @@ Future<CommentPage?> _fetchQishui(
     },
   );
   final m = data is Map ? data.cast<String, dynamic>() : null;
-  if (m == null || (m['status_code'] as num?)?.toInt() != 0) return empty;
+  if (m == null) return empty;
+  // 汽水 PC 评论接口成功时可能不下发 status_code（实测仅返回 status_info），
+  // 旧写法把它当成失败、直接抛空页，导致汽水歌曲「明明有评论却显示暂无」。
+  // 只在明确给出非 0 状态码时判定失败。
+  final statusCode = (m['status_code'] as num?)?.toInt();
+  if (statusCode != null && statusCode != 0) return empty;
   final comments = (m['comments'] as List?) ?? const [];
   final items = <CommentItem>[];
   for (final raw in comments) {
@@ -850,6 +875,101 @@ Future<CommentPage?> _fetchQishui(
   return CommentPage(
     items: items,
     isEnd: m['has_more'] == false || items.length < _pageSize,
+  );
+}
+
+// ==================== JOOX ====================
+
+/// JOOX 评论：`openjoox/v1/get_track_comments` 用 last_seq_id 游标翻页，
+/// 没有 page/cursor 参数——第 N 页只能从第 1 页起按 last_seq_id 连续取。
+/// 因此这里按目标页码串行追链（每页 20 条，最多追 3 页），既保证分页正确，
+/// 又不会因用户反复下拉而无限打上游。
+Future<CommentPage?> _fetchJo(
+  Map<String, dynamic> musicInfo,
+  int page,
+) async {
+  final empty = const CommentPage(items: [], isEnd: true);
+  // 接口只接受数字 songid 或 base64 歌曲 ID；Z 开头 mid 会 401/404。
+  final id = _id(musicInfo, ['songId', 'song_id', 'id', 'songmid']);
+  if (id == null) return null;
+  if (page > 3) return empty;
+
+  var lastSeq = '0';
+  for (var current = 1; current <= page; current++) {
+    final query = Uri(queryParameters: {
+      'id': id,
+      'country': 'HK',
+      'lang': 'en',
+      'last_seq_id': lastSeq,
+      'num': '$_pageSize',
+    }).query;
+    final data = await _httpJson(
+      'GET',
+      'https://cache.api.joox.com/openjoox/v1/get_track_comments?$query',
+      headers: {
+        'Accept': 'application/json',
+        'User-Agent': 'okhttp/4.12.0',
+        'Referer': 'https://www.joox.com/',
+      },
+    );
+    final m = data is Map ? data.cast<String, dynamic>() : null;
+    // 第 1 页就失败视为网络故障（由上层给可重试错误态）；后续页失败则
+    // 认为已到底，不覆盖已取到的上一页结果。
+    if (m == null) {
+      if (current == 1) return null;
+      return empty;
+    }
+    final comments = (m['comments'] as List?) ?? const [];
+    final items = comments
+        .whereType<Map>()
+        .map((raw) => _mapJo(raw.cast<String, dynamic>()))
+        .toList();
+    final hasMoreRaw = m['has_more'];
+    final hasMore = hasMoreRaw == 1 || hasMoreRaw == true || hasMoreRaw == '1';
+    if (current == page) {
+      return CommentPage(
+        items: items,
+        isEnd: !hasMore || items.length < _pageSize,
+      );
+    }
+    if (!hasMore) return empty;
+    final next = m['last_seq_id']?.toString();
+    if (next == null || next.isEmpty) return empty;
+    lastSeq = next;
+  }
+  return empty;
+}
+
+CommentItem _mapJo(Map<String, dynamic> c) {
+  // create_time 是秒级时间戳，统一转毫秒，避免 UI 显示成 1970 年。
+  final rawTime = _asInt(c['create_time']) ?? 0;
+  final createAt = rawTime > 0 && rawTime < 1000000000000
+      ? rawTime * 1000
+      : rawTime;
+  final replies = <CommentItem>[];
+  final replayContent = c['replay_content'];
+  if (replayContent is String && replayContent.trim().isNotEmpty) {
+    replies.add(CommentItem(
+      id: '${c['id'] ?? ''}_reply',
+      nickName: (c['replay_nickname'] as String?) ?? '',
+      comment: replayContent,
+      like: 0,
+    ));
+  }
+  final images = c['images'];
+  String? avatar;
+  if (images is List && images.isNotEmpty) {
+    final first = images.first;
+    avatar = first is String && first.startsWith('http') ? first : null;
+  }
+  return CommentItem(
+    id: c['id']?.toString() ?? '',
+    nickName: (c['nickname'] as String?) ?? '',
+    avatar: avatar,
+    comment: (c['content'] as String?) ?? '',
+    like: _asInt(c['likes']),
+    createAt: createAt > 0 ? createAt : null,
+    replies: replies,
   );
 }
 

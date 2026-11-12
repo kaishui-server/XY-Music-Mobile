@@ -181,6 +181,14 @@ class _MusicLibraryPageState extends ConsumerState<MusicLibraryPage>
     if (!changed) return;
     _lastTabIndex = _tabController.index;
     _lastLocalTabIndex = _localTabController.index;
+    // 离开收藏分页时退出收藏搜索：焦点残留在搜索框（用户未手动退出搜索）
+    // 会让输入连接持续存在，后续任意触发页面重建的操作（点歌播放、系统
+    // 返回收起键盘后再交互）都会重新唤起键盘，体感即「任意操作都弹键盘」。
+    // 一加 ACE 竞速版（ColorOS）实测复现，切页时主动退出最稳妥。
+    if (_favSearchMode && _tabController.index != 0) {
+      _exitFavSearch();
+      return;
+    }
     // 切换分页（含本地音乐子分页）时重建 AppBar（右上角按钮跟随变化）。
     if (mounted) setState(() {});
   }
@@ -829,9 +837,17 @@ class _MusicLibraryPageState extends ConsumerState<MusicLibraryPage>
                                 query.isEmpty
                             ? _favOnReorder
                             : null,
-                        onPlay: (list, i) => ref
-                            .read(libraryProvider.notifier)
-                            .playList(list, i),
+                        onPlay: (list, i) {
+                          // 点击列表先收起搜索焦点：搜索框残留焦点时，
+                          // 播放触发的页面重建会把输入连接重新挂上，
+                          // 键盘随即弹出（见 _onTabChanged 内注释）。
+                          if (_favSearchFocus.hasFocus) {
+                            _favSearchFocus.unfocus();
+                          }
+                          return ref
+                              .read(libraryProvider.notifier)
+                              .playList(list, i);
+                        },
                       ),
               ),
             ),
@@ -1453,9 +1469,9 @@ class _MusicLibraryPageState extends ConsumerState<MusicLibraryPage>
 
   Widget _buildLocalTab(BuildContext context) {
     final songs = ref.watch(libraryProvider.select((s) => s.songs));
-    if (songs.isEmpty) {
-      return const _EmptyHint('本地音乐库为空\n点击右上角「扫描目录」添加本地音乐文件夹');
-    }
+    // 歌曲 / 歌手 / 专辑分类常驻：即使本地库为空也显示三个类目（空态
+    // 提示放在各子分页列表区内，不再整页替换掉分类栏）。用户反馈空库
+    // 时三个类目消失、扫描完目录分类栏才出现，观感突兀。
     return Column(
       children: [
         TabBar(
@@ -1538,37 +1554,33 @@ class _MusicLibraryPageState extends ConsumerState<MusicLibraryPage>
               : '${visibleSongs.length} / ${sortedSongs.length} 首歌曲',
           onAction: () =>
               ref.read(libraryProvider.notifier).playAll(visibleSongs),
-        ),
-        // 工具行（图三样式）：左侧排序下拉，右侧多选 / 刷新小图标。
-        Padding(
-          padding: const EdgeInsets.fromLTRB(16, 0, 8, 2),
-          child: Row(
-            children: [
-              SongSortMenuButton(
-                sort: _localSort,
-                onSortChanged: (sort) => setState(() => _localSort = sort),
-              ),
-              const Spacer(),
-              IconButton(
-                tooltip: '多选',
-                onPressed: visibleSongs.isEmpty ? null : _enterLocalSelection,
-                icon: const Icon(Icons.checklist_rounded),
-              ),
-              IconButton(
-                tooltip: _libraryScanning ? '扫描中...' : '刷新',
-                onPressed: _libraryScanning ? null : _refreshLibrary,
-                icon: _libraryScanning
-                    ? const SizedBox.square(
-                        dimension: 20,
-                        child: CircularProgressIndicator(strokeWidth: 2),
-                      )
-                    : const Icon(Icons.refresh_rounded),
-              ),
-            ],
-          ),
+          // 排序 / 多选 / 刷新上移并入本行（原独立工具行移除）。
+          leadingTools: [
+            SongSortMenuButton(
+              sort: _localSort,
+              onSortChanged: (sort) => setState(() => _localSort = sort),
+            ),
+            IconButton(
+              tooltip: '多选',
+              onPressed: visibleSongs.isEmpty ? null : _enterLocalSelection,
+              icon: const Icon(Icons.checklist_rounded),
+            ),
+            IconButton(
+              tooltip: _libraryScanning ? '扫描中...' : '刷新',
+              onPressed: _libraryScanning ? null : _refreshLibrary,
+              icon: _libraryScanning
+                  ? const SizedBox.square(
+                      dimension: 20,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    )
+                  : const Icon(Icons.refresh_rounded),
+            ),
+          ],
         ),
         Expanded(
-          child: SongsListView(
+          child: songs.isEmpty
+              ? const _EmptyHint('本地音乐库为空\n点击右上角「扫描目录」添加本地音乐文件夹')
+              : SongsListView(
             songs: visibleSongs,
             padding: EdgeInsets.fromLTRB(
               10,
@@ -1923,6 +1935,7 @@ class _TabHeaderBar extends StatelessWidget {
     this.onAction,
     this.actionIcon = Icons.play_arrow,
     this.actionLabel = '播放全部',
+    this.leadingTools = const <Widget>[],
   });
 
   final String countLabel;
@@ -1933,6 +1946,10 @@ class _TabHeaderBar extends StatelessWidget {
   /// 按钮图标与文案；播放列表分页改为「定位当前播放」。
   final IconData actionIcon;
   final String actionLabel;
+
+  /// 数量与操作按钮之间的紧凑工具（本地音乐页的排序 / 多选 / 刷新），
+  /// 原独立工具行上移并入本行（用户要求只上移、合理分布）。
+  final List<Widget> leadingTools;
 
   @override
   Widget build(BuildContext context) {
@@ -1949,6 +1966,8 @@ class _TabHeaderBar extends StatelessWidget {
               style: TextStyle(color: scheme.onSurfaceVariant),
             ),
           ),
+          ...leadingTools,
+          if (leadingTools.isNotEmpty) const SizedBox(width: 6),
           FilledButton.tonalIcon(
             onPressed: onAction,
             icon: Icon(actionIcon, size: 20),

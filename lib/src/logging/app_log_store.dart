@@ -105,7 +105,9 @@ class AppLogStore {
   Timer? _persistTimer;
   bool _installed = false;
   bool _initialized = false;
-  int maxEntries = 500;
+  /// 卡顿修复：真机上「播放中反复重缓冲」的现场往往在小时级才出现，
+  /// 500 条（约十几分钟）一滚动就被覆盖，抓不到复现窗口。默认提到 2000。
+  int maxEntries = 2000;
 
   /// 探针日志独立配额，与 [maxEntries] 互不挤占。
   ///
@@ -164,8 +166,8 @@ class AppLogStore {
   Future<void> _load() async {
     try {
       final preferences = await SharedPreferences.getInstance();
-      maxEntries = (preferences.getInt(_maxEntriesKey) ?? 500)
-          .clamp(50, 5000)
+      maxEntries = (preferences.getInt(_maxEntriesKey) ?? 2000)
+          .clamp(200, 20000)
           .toInt();
       // 探针配额旧默认是 300（久播 25 分钟即被告警刷屏写满，真卡顿现场
       // 会被挤掉）。读到 <= 300 视为「仍是旧默认/从未调整」，一次性提升
@@ -174,7 +176,7 @@ class AppLogStore {
       maxProbeEntries = (rawProbeMax == null || rawProbeMax <= 300
               ? 3000
               : rawProbeMax)
-          .clamp(50, 5000)
+          .clamp(200, 20000)
           .toInt();
       warningOnly = preferences.getBool(_warningOnlyKey) ?? false;
       final raw = preferences.getString(_entriesKey);
@@ -444,7 +446,7 @@ class AppLogStore {
   /// 按通道各自配额裁剪（从最早的一条开始）。两个通道共用同一条时间序，
   /// 但配额独立——久播时数百条探针不会再把业务日志挤出缓冲区。
   void _trimChannel(AppLogChannel channel, int max) {
-    final keep = max.clamp(50, 5000).toInt();
+    final keep = max.clamp(200, 20000).toInt();
     // 快速路径：总条数不足单通道配额时肯定不超限，避免高频 add 时的全表遍历。
     if (_entries.length <= keep) return;
     var count = 0;
@@ -461,7 +463,7 @@ class AppLogStore {
   }
 
   Future<void> setMaxEntries(int value) async {
-    maxEntries = value.clamp(50, 5000);
+    maxEntries = value.clamp(200, 20000);
     _trim();
     final preferences = await SharedPreferences.getInstance();
     await preferences.setInt(_maxEntriesKey, maxEntries);
@@ -469,7 +471,7 @@ class AppLogStore {
   }
 
   Future<void> setMaxProbeEntries(int value) async {
-    maxProbeEntries = value.clamp(50, 5000);
+    maxProbeEntries = value.clamp(200, 20000);
     _trim();
     final preferences = await SharedPreferences.getInstance();
     await preferences.setInt(_probeMaxEntriesKey, maxProbeEntries);

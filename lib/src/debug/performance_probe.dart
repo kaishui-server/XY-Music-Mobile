@@ -4,6 +4,7 @@ import 'dart:ui' as ui;
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/scheduler.dart';
+import 'package:flutter/widgets.dart';
 import 'package:path_provider/path_provider.dart';
 
 import '../logging/app_log_store.dart';
@@ -285,12 +286,47 @@ class PerformanceProbe {
   int audioStarveEvents = 0;
   int dspTakeoverEvents = 0;
 
+  // ---- FrameTiming 帧耗时（引擎侧 vsync 精确口径） ----
+  ///
+  /// ANIM_JANK 基于帧时间戳间隔（分不出是构建慢还是光栅化慢）；FrameTiming
+  /// 直接给出每帧的 buildDuration（UI 线程构建）与 rasterDuration（GPU
+  /// 光栅化），是验收「GPU/raster 侧转场开销」类修复的唯一硬指标：修复后
+  /// 应看到 rasterJank 显著下降而 uiJank 不涨。计数口径：单帧超过当前
+  /// 刷新率预算（frameBudgetUs）记 1 帧 jank，分开累计。
+  int ftUiJankFrames = 0;
+  int ftRasterJankFrames = 0;
+  int ftWorstBuildUs = 0;
+  int ftWorstRasterUs = 0;
+  bool _ftHookInstalled = false;
+
+  /// 播放详情页形变转场进行中标记（由 animated_page_route 的转场同步
+  /// 逻辑写入）。用于把 raster jank 帧归因到转场窗口：5633 实测 UI 侧
+  /// 已降 5~6 倍而 raster 不降，需要知道剩余 raster 卡顿是发生在转场中
+  /// （面板合成开销）还是转场外（其它场景）。摘要里 ft(m=+N) 即本字段
+  /// 的增量。
+  bool morphTransitionActive = false;
+
+  /// 其中落在形变转场窗口内的 raster jank 帧数（摘要 ft(m=+N)）。
+  int ftRasterJankMorphFrames = 0;
+
+  /// 播放栏跟手拖拽进行中标记（由 animated_page_route 的 dragValue
+  /// setter 写入）。跟手期间的 sheet 帧间隔/ticker 空窗是手指节奏而非
+  /// 掉帧（见 onAnimFrame 内注释），统计时剔除。
+  bool gestureDrivingAnim = false;
+
+  /// 跟手剔除的 sheet 帧数（摘要 animSrc(sheet) 后 gest=+N）。
+  int animGestureSheetFrames = 0;
+  int _baseAnimGestureSheetFrames = 0;
+
   // 30s 摘要的增量基线（上一周期结束时的累计值）。
   int _basePaintSlow = 0;
   int _baseTickerCalls = 0;
   int _basePositionCalls = 0;
   int _baseAnimDropped = 0;
   int _baseAudioStarve = 0;
+  int _baseFtUiJank = 0;
+  int _baseFtRasterJank = 0;
+  int _baseFtRasterJankMorph = 0;
   int _summaryCount = 0;
 
   /// 环形缓冲当前水位（0~capacity）。
@@ -308,6 +344,34 @@ class PerformanceProbe {
       (_) => _recordSnapshot(),
     );
     _ensureFrameWatchdog();
+    _ensureFrameTimingHook();
+  }
+
+  /// FrameTiming 埋点（只注册一次）：拿每帧的 buildDuration/rasterDuration，
+  /// 按「单帧超刷新率预算」分开累计 UI 构建与 GPU 光栅化 jank 帧数。
+  /// 上一帧时刻口径（ANIM_JANK）分不清构建慢还是光栅化慢，这份引擎侧
+  /// 数据是转场开销修复的验收依据。
+  void _ensureFrameTimingHook() {
+    if (_ftHookInstalled) return;
+    _ftHookInstalled = true;
+    SchedulerBinding.instance.addTimingsCallback(_onFrameTimings);
+  }
+
+  void _onFrameTimings(List<FrameTiming> timings) {
+    // 帧调度被 lifecycle 关闭时不产生新帧，回调不会来；防御性跳过即可。
+    if (!SchedulerBinding.instance.framesEnabled) return;
+    final budget = frameBudgetUs;
+    for (var i = 0; i < timings.length; i++) {
+      final build = timings[i].buildDuration.inMicroseconds;
+      final raster = timings[i].rasterDuration.inMicroseconds;
+      if (build > ftWorstBuildUs) ftWorstBuildUs = build;
+      if (raster > ftWorstRasterUs) ftWorstRasterUs = raster;
+      if (build > budget) ftUiJankFrames++;
+      if (raster > budget) {
+        ftRasterJankFrames++;
+        if (morphTransitionActive) ftRasterJankMorphFrames++;
+      }
+    }
   }
 
   /// 帧管线看门狗（单例 Timer，只创建一次）。
@@ -492,6 +556,16 @@ class PerformanceProbe {
       // 分源明细：底栏 branch / 音乐库 tab 与播放页 sheet 混在一条序列里
       // 统计会把彼此的间隔串成假掉帧，这里各给一份独立读数。
       ..write(' animSrc(${_animSourceSummary()})')
+      // 引擎侧帧耗时：UI 构建与 GPU 光栅化分开的超预算帧数与单帧最差值。
+      // 配合 animSrc 用——「帧间隔超标 + raster 超预算」即 GPU 侧卡顿，
+      // 「帧间隔超标 + build 超预算」即 Dart 构建侧卡顿。
+      ..write(
+        ' ft(ui=+${ftUiJankFrames - _baseFtUiJank}'
+        ' raster=+${ftRasterJankFrames - _baseFtRasterJank}'
+        ' m=+${ftRasterJankMorphFrames - _baseFtRasterJankMorph}'
+        ' worstB=${_fmtMs(ftWorstBuildUs)}'
+        ' worstR=${_fmtMs(ftWorstRasterUs)})',
+      )
       // 设备帧预算：所有 anim 阈值与掉帧折算都以它为基准，写进摘要才能
       // 判断「10ms 间隔」在 120Hz 机上到底是正常还是掉帧。
       ..write(
@@ -513,7 +587,17 @@ class PerformanceProbe {
     // 三者本周期全部零增长——说明没有任何东西向引擎请求帧（frame
     // starvation），画面处于冻结态。这是「久播后越用越卡」的直接病灶，
     // 单条 warning 不会被 5s 节流吞掉，可精确定位停摆起点。
+    //
+    // 前提修正（一加 ACE 竞速版 144 分钟日志实证 183 条全为误报）：app
+    // 退后台/息屏后引擎把帧调度关掉（framesEnabled=false），本周期帧侧
+    // 必然零增长，而 position 由音频时钟驱动继续推进——两者相减天然
+    // 「满足」停摆条件。因此必须叠加「帧调度开启 + 生命周期 resumed」
+    // 前提，只有前台真冻结才允许上报。
+    final framesOn = SchedulerBinding.instance.framesEnabled;
+    final life = WidgetsBinding.instance.lifecycleState;
     if (uiVisible &&
+        framesOn &&
+        life == AppLifecycleState.resumed &&
         _summaryCount > 1 &&
         dPaintCalls == 0 &&
         dTicker == 0 &&
@@ -544,6 +628,10 @@ class PerformanceProbe {
     _baseAnimDropped = animDroppedFrames;
     _baseAnimFrames = animFrames;
     _baseAudioStarve = audioStarveEvents;
+    _baseFtUiJank = ftUiJankFrames;
+    _baseFtRasterJank = ftRasterJankFrames;
+    _baseFtRasterJankMorph = ftRasterJankMorphFrames;
+    _baseAnimGestureSheetFrames = animGestureSheetFrames;
   }
 
   /// 播放页是否正在显示进度条 / 逐字歌词。
@@ -568,6 +656,11 @@ class PerformanceProbe {
         ..write(_animDropped[i])
         ..write('d');
     }
+    // sheet 跟手剔除的帧数：这些帧的间隔不参与间隔/掉帧统计（手指节奏
+    // 伪影），单独标注以便核对剔除比例是否合理（占比过高说明用户在慢拖，
+    // 数字不可比）。
+    final gestDelta = animGestureSheetFrames - _baseAnimGestureSheetFrames;
+    if (gestDelta > 0) sb.write(' gest=+$gestDelta');
     return sb.toString();
   }
 
@@ -688,7 +781,9 @@ class PerformanceProbe {
       }
       if (gap > tickerMaxGapUs) tickerMaxGapUs = gap;
       _record(_ProbeEventType.ticker, gap);
-      if (gap > tickerGapWarnUs) {
+      // 跟手拖拽期间帧只跟随手指产生，ticker 空窗是预期行为，不算卡顿
+      // （与 onAnimFrame 的跟手剔除同口径）。
+      if (gap > tickerGapWarnUs && !gestureDrivingAnim) {
         tickerGapEvents++;
         if (!_throttled(now, _logTickerAtUs)) {
           _logTickerAtUs = now;
@@ -714,6 +809,16 @@ class PerformanceProbe {
     final i = source.index;
     final last = _lastAnimUs[i];
     if (last != 0) {
+      // 手势跟手帧：拖拽驱动的转场里帧只跟随手指节奏产生，帧间隔反映
+      // 手指速度而非渲染能力——把「手指停顿」算成掉帧是伪影（5634 日志
+      // 里 sheet 最大间隔 818ms 与 TICKER_GAP 985ms 大半来自慢拖）。
+      // 跟手期间只计帧数（gest=+N，供摘要标注占比），不计间隔/掉帧。
+      if (source == AnimSource.sheet && gestureDrivingAnim) {
+        _animFrames[i]++;
+        animGestureSheetFrames++;
+        _lastAnimUs[i] = now;
+        return;
+      }
       _animFrames[i]++;
       final gap = now - last;
       // 超长间隔 = 动画被后台/息屏冻结后恢复，不是掉帧：直接丢弃，

@@ -18,7 +18,7 @@ import '../widgets/queue_sheet.dart';
 ///
 /// 展开时详情页面板从播放栏矩形连续「生长」到全屏：面板顶边全程跟随
 /// 手指、顶部圆角随生长收平、封面从迷你圆角图连续变形到详情页封面、
-/// 栏内容早段淡出、页面内容后段（约 t=0.55 起）淡入。
+/// 栏内容早段淡出、页面内容后段（约 t=0.5 起）淡入。
 class XyPlayerSheetOrigin {
   const XyPlayerSheetOrigin({
     required this.barRect,
@@ -57,6 +57,18 @@ final ValueNotifier<bool> xySheetRouteActive = ValueNotifier<bool>(false);
 /// 又反向迟滞——这是此前展开/收起「不丝滑」的主因。
 bool xyPlayerSheetGestureDriving = false;
 
+/// 形变转场是否尚未落定（t < 1）：详情页背景层据此降级为「轻量背景」
+/// （不透明兜底色 + 氛围 blob，跳过全屏封面重度模糊）。
+///
+/// 根源：面板 Rect/圆角每帧都在变（`Positioned.fromRect` + 随半径变化的
+/// `ClipRRect`），整棵面板子树每帧重新栅格化，而背景层打底是一次全屏
+/// `ImageFilter.blur(sigma 32)`（单份约 7~14ms）。转场期垫层
+/// （pageBackdrop）与页面本体各有一份，合计两份全屏模糊每帧重算，低端
+/// 机上尾段单帧可达 50~100ms —— 这正是「进歌曲页卡、退出去也卡」的主因。
+/// 转场期间改用同色系轻量背景，落定（t=1）后自动恢复完整背景，静止画面
+/// 与原先完全一致。
+final ValueNotifier<bool> xyPlayerSheetMorphing = ValueNotifier<bool>(false);
+
 /// 详情页封面最终矩形的通用估算：形变封面的终点（buildPlayerSheetOrigin）
 /// 与详情页下滑/上滑收起手势的分区判定共用同一来源，保证两者一致。
 Rect estimatePageCoverRect(Size screen, double statusBarTop, PlayerCoverStyle style) {
@@ -90,7 +102,7 @@ XyPlayerSheetOrigin buildPlayerSheetOrigin({
 /// 全屏的毛玻璃面板中，并叠加封面连续变形层与栏内容复刻层。
 ///
 /// 转场值 t（0→1）：面板矩形 Rect.lerp(barRect, 全屏, t)、圆角 32(1-t)、
-/// 页面 Opacity((t-.55)/.45)（经 OverflowBox 底对齐保持全屏布局不重排）、
+/// 页面 Opacity((t-.5)/.4)（经 OverflowBox 底对齐保持全屏布局不重排）、
 /// 栏复刻 Opacity(1-t/.25)、封面形变 Rect.lerp(cover→pageCover) 且在
 /// t>0.75 淡出让位于真实封面。收起为完全倒序（与展开同一条动画）。
 class XyPlayerSheetMorph extends ConsumerWidget {
@@ -102,6 +114,10 @@ class XyPlayerSheetMorph extends ConsumerWidget {
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     // 面板复刻层与封面层需要的播放状态：与迷你播放栏同一套订阅。
+    // 刻意不订阅 position/duration：播放中进度是细档流（约 16ms 一次，
+    // 120Hz 下等于每帧），若并入这里，转场期间 morph 每帧都要因进度变化
+    // 重建整棵树（面板 + 整个详情页 + 封面形变层），而真正需要进度的
+    // 只有栏复刻里的那条迷你进度条——已下沉到 _ReplicaProgress 单独订阅。
     final player = ref.watch(
       playerProvider.select(
         (state) => (
@@ -109,8 +125,6 @@ class XyPlayerSheetMorph extends ConsumerWidget {
           isPlaying: state.isPlaying,
           isLoading: state.isLoading,
           errorMessage: state.errorMessage,
-          position: state.position,
-          duration: state.duration,
         ),
       ),
     );
@@ -128,8 +142,6 @@ class XyPlayerSheetMorph extends ConsumerWidget {
       bool isPlaying,
       bool isLoading,
       String? errorMessage,
-      double position,
-      double duration,
     })
     player,
   ) {
@@ -150,7 +162,12 @@ class XyPlayerSheetMorph extends ConsumerWidget {
     final full = Rect.fromLTWH(0, 0, screen.width, screen.height);
     final panel = Rect.lerp(origin.barRect, full, t)!;
     final radius = 32 * (1 - t);
-    final pageT = ((t - .55) / .45).clamp(0.0, 1.0);
+    // 圆角提前收平：t>0.9 时理论半径只剩 3.2px 以下（肉眼不可见），但
+    // ClipRRect 的圆角每帧变化会让整棵面板子树（含详情页全屏内容）每帧
+    // 重新栅格化。低于该阈值直接归零并去掉裁剪，转场尾段——也就是页面
+    // 内容最多、最重的一段——不再付裁剪与重栅格化成本，视觉无差别。
+    final panelRadius = radius > 3.2 ? radius : 0.0;
+    final pageT = ((t - .5) / .4).clamp(0.0, 1.0);
     final barT = (1 - t / .25).clamp(0.0, 1.0);
     final coverT = Curves.easeOut.transform(t);
     final coverRect = Rect.lerp(origin.coverRect, origin.pageCoverRect, coverT)!;
@@ -160,19 +177,23 @@ class XyPlayerSheetMorph extends ConsumerWidget {
     final current = player.current;
     // 背景连续性（两种主题都要）：面板底色是 scheme.surface（浅色主题下
     // 即纯白）@.86/.92，而详情页真实背景恒为「封面模糊 + 深色压暗」的
-    // 暗色调，页面正文又要到 t≈0.55 才淡入——中间整段是一块近白/近黑面板，
+    // 暗色调，页面正文又要到 t≈0.5 才淡入——中间整段是一块近白/近黑面板，
     // 展开与收起都会在面板底色↔页面暗背景之间来回扫，这正是用户看到的
     // 「闪白」（浅色主题是纯白面板扫暗底，深色主题是面板底色与封面氛围色
     // 不一致，在部分机型上同样明显）。
     // 这里在面板内垫一层与详情页完全同源的背景（同一组件、同样底部对齐、
     // 同样按全屏尺寸溢出裁切），在转场前段由透明交叉淡入：起始帧仍是播放
     // 栏的毛玻璃观感，随后直接过渡到页面真实背景（不再出现比两端都亮的
-    // 白色中间态）；页面正文 t≥0.55 淡入时，其背景与本层逐像素一致，
+    // 白色中间态）；页面正文 t≥0.5 淡入时，其背景与本层逐像素一致，
     // 交叠期间背景完全不变。
     final backdropT = ((t - .02) / .5).clamp(0.0, 1.0);
     // 页面完全不透明后不再构建垫层：详情页自身背景是重度的封面模糊
     // （ImageFiltered sigma 32），Stack 不会对被子节点完全遮挡的层做剔除，
-    // 转场结束后仍保留垫层等于整场播放期间都多画一遍全屏模糊。t=1 时
+    // 转场结束后仍保留垫层等于整场播放期间都多画一遍全屏模糊。页面正文
+    // 淡入窗口取 (t-.5)/.4（t=0.9 即完全盖住，早于 5634 之前的 (t-.55)/.45）：
+    // easeOutCubic 曲线下 t=0.9 出现在动画 53% 处——垫层提前移除让转场
+    // 最后 200ms（视觉近静止、最昂贵的一段）从「壳层快照+垫层+页面」
+    // 3 层全屏混合降到 2 层，视觉无差别（两背景逐像素一致）。t=1 时
     // 页面正文（Opacity 1，直接透传）与其背景已逐像素覆盖垫层，此时
     // 移除垫层既不改变任何一帧的画面，也把转场结束后的额外开销降为 0；
     // 收起动画 t<1 时垫层按原值重新出现，全程背景仍连续。
@@ -195,6 +216,11 @@ class XyPlayerSheetMorph extends ConsumerWidget {
     // 与详情页同源的背景垫层，从透明交叉淡入到完全不透明。
     // 底下的 ColoredBox 与详情页 Scaffold 兜底色取同一个值，保证封面模糊层
     // 淡入/未就绪时两处透出的都是同一个不透明底色，而不是面板的纯白。
+    // lite: true —— 转场期间用轻量背景（不透明兜底色 + 氛围 blob），
+    // 跳过全屏封面重度模糊（sigma 32，单份 7~14ms）：面板 Rect/圆角每帧
+    // 变化会让本层每帧重新栅格化，与页面本体那份模糊叠加后尾段单帧可达
+    // 50~100ms。落定后垫层移除（showPageBackdrop 转 false），页面切回完整
+    // 背景，视觉无损失。
     final pageBackdrop = showPageBackdrop
         ? Positioned.fill(
             child: Opacity(
@@ -210,27 +236,42 @@ class XyPlayerSheetMorph extends ConsumerWidget {
                   child: SizedBox(
                     width: screen.width,
                     height: screen.height,
-                    child: PlayerDetailBackground(current: current),
+                    child: PlayerDetailBackground(current: current, lite: true),
                   ),
                 ),
               ),
             ),
           )
         : null;
+    // 面板投影：blur 24 的阴影每帧随面板 Rect 重算，后段面板已接近全屏
+    // （阴影大半落在屏幕外）时纯属浪费。转场后段直接去掉，前段保留浮起感。
+    final panelShadows = t < .35
+        ? [
+            BoxShadow(
+              color: Colors.black.withValues(alpha: dark ? .3 : .09),
+              blurRadius: 24,
+              offset: const Offset(0, 8),
+            ),
+          ]
+        : const <BoxShadow>[];
+    // 面板底色让位：垫层完全不透明后（backdropT>=1）或页面正文已完全
+    // 淡入（pageT>=1）时，86/92% 半透明的 surface 底色被逐像素盖住、
+    // 毫无可见贡献，却让合成器每帧多混合一层全屏半透明（5632 探针实测
+    // raster 是转场卡顿主因，全屏 blend 是大头）。此时置透明，合成器
+    // 可直接剔除该层。仅在有垫层/页面兜底（current != null）时让位，
+    // 无曲目时页面体没有不透明背景，底色仍需承担面板外观。
+    final panelBaseCovered =
+        current != null && (backdropT >= 1 || pageT >= 1);
     final panelContent = DecoratedBox(
       decoration: BoxDecoration(
-        color: scheme.surface.withValues(alpha: dark ? .86 : .92),
-        borderRadius: BorderRadius.circular(radius),
+        color: panelBaseCovered
+            ? scheme.surface.withValues(alpha: 0)
+            : scheme.surface.withValues(alpha: dark ? .86 : .92),
+        borderRadius: BorderRadius.circular(panelRadius),
         border: Border.all(
           color: dark ? XyColors.darkBorder : XyColors.lightBorder,
         ),
-        boxShadow: [
-          BoxShadow(
-            color: Colors.black.withValues(alpha: dark ? .3 : .09),
-            blurRadius: 24,
-            offset: const Offset(0, 8),
-          ),
-        ],
+        boxShadow: panelShadows,
       ),
       child: Stack(
         children: [
@@ -274,8 +315,8 @@ class XyPlayerSheetMorph extends ConsumerWidget {
         Positioned.fromRect(
           rect: panel,
           child: ClipRRect(
-            borderRadius: BorderRadius.circular(radius),
-            clipBehavior: radius > .5 ? Clip.antiAlias : Clip.none,
+            borderRadius: BorderRadius.circular(panelRadius),
+            clipBehavior: panelRadius > .5 ? Clip.antiAlias : Clip.none,
             // 注意：这里刻意不再挂 BackdropFilter。
             // 1) 面板色本来就 86%~92% 不透明，模糊只剩 8%~14% 的可见收益，
             //    却要付一次全屏 saveLayer + 大半径采样；
@@ -356,8 +397,6 @@ class XyPlayerSheetMorph extends ConsumerWidget {
       bool isPlaying,
       bool isLoading,
       String? errorMessage,
-      double position,
-      double duration,
     })
     player,
     QueueItem current,
@@ -399,14 +438,36 @@ class XyPlayerSheetMorph extends ConsumerWidget {
           Align(
             alignment: Alignment.bottomLeft,
             child: RepaintBoundary(
-              child: MiniPlayerProgress(
-                position: player.position,
-                duration: player.duration,
-              ),
+              // 进度单独订阅：只让这条进度条随进度流重建，不牵动整棵
+              // 形变树（见 build 里的订阅说明）。
+              child: _ReplicaProgress(),
             ),
           ),
         ],
       ),
+    );
+  }
+}
+
+/// 形变面板内的迷你进度条：进度流的唯一订阅点。
+///
+/// 播放中 position/duration 是细档更新（约 16ms 一次，120Hz 屏上等于每帧），
+/// 放在 [XyPlayerSheetMorph] 主体里订阅会让整棵形变树（面板装饰 + 整个
+/// 详情页 + 封面形变层）每帧重建一次，转场期间叠加成明显卡顿。这里单独
+/// 订阅，重建范围只有这条进度条本身。
+class _ReplicaProgress extends ConsumerWidget {
+  const _ReplicaProgress();
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final progress = ref.watch(
+      playerProvider.select(
+        (state) => (position: state.position, duration: state.duration),
+      ),
+    );
+    return MiniPlayerProgress(
+      position: progress.position,
+      duration: progress.duration,
     );
   }
 }

@@ -37,6 +37,29 @@ class _ProxyTask {
   }
 
   DateTime lastUsed = DateTime.now();
+
+  /// 已解析的真实 CDN 直链（跟随 302 后的最终 URL）及解析时刻。
+  ///
+  /// 播放器息屏/后台后 AudioSink 失活重建会重新请求代理（无 Range 全量），
+  /// 接力续传也会频繁开新连接——若每次都从原始 dlink 重新跟随 302，百度
+  /// PCS 的重定向应答 + CDN 边缘建连在非会员限速时段要额外等 1~3s，叠加
+  /// 首字节排队就是「无声几秒」。缓存最终 URL（TTL 5 分钟，保守低于
+  /// dlink 签名有效期；任何 4xx/5xx/超时立即失效）后，重建/接力直接连
+  /// CDN 边缘，显著缩短无声期。
+  String? resolvedUrl;
+  DateTime? resolvedAt;
+
+  bool get resolvedFresh {
+    final at = resolvedAt;
+    return resolvedUrl != null &&
+        at != null &&
+        DateTime.now().difference(at) < const Duration(minutes: 5);
+  }
+
+  void invalidateResolved() {
+    resolvedUrl = null;
+    resolvedAt = null;
+  }
 }
 
 class CloudPlaybackProxy {
@@ -120,7 +143,11 @@ class CloudPlaybackProxy {
     final segments = Uri.tryParse(url)?.pathSegments ?? const <String>[];
     final filename =
         segments.isNotEmpty ? segments.last : 'audio';
-    return 'http://127.0.0.1:$server/ct/$token/$filename';
+    // 文件名必须单段编码：音乐文件名常含空格、#、?、%、& 等字符，
+    // 直接拼进 URL 会截断 path（# 起 fragment），播放器请求落到未知
+    // token 被代理 404，表现即 ExoPlayer「(0) Source error」。
+    return 'http://127.0.0.1:$server/ct/$token/'
+        '${Uri.encodeComponent(filename)}';
   }
 
   Future<int> _ensureServer() async {
@@ -182,7 +209,12 @@ class CloudPlaybackProxy {
       // 器场景恒带 Range）。无 Range 一律补 bytes=0-（HTTP 语义等价全量
       // 文件，206 响应播放器照收）。
       final range = req.headers.value(HttpHeaders.rangeHeader) ?? 'bytes=0-';
-      final (resp, errBody) = await _openUpstream(task, req.method, range);
+      final (resp, errBody) = await _openUpstream(
+        task,
+        req.method,
+        range,
+        firstByteTimeout: const Duration(seconds: 20),
+      );
 
       req.response.statusCode = resp.statusCode;
       // QQ 音乐等 CDN 会对明文流返回撒谎的 Content-Type：L1 直链是
@@ -245,16 +277,42 @@ class CloudPlaybackProxy {
       final cr = resp.headers.value(HttpHeaders.contentRangeHeader);
       final m = RegExp(r'bytes\s+(\d+)-').firstMatch(cr ?? '');
       if (m != null) start = int.parse(m.group(1)!);
-      await _relayResponse(req, task, resp, start);
+      final complete = await _relayResponse(req, task, resp, start);
+      if (!complete) {
+        // 已声明的段长没能写完就收尾，播放器会把这条响应当成「正常结束的
+        // 短文件」——ExoPlayer 侧表现为读越界/源解析失败，随后整曲重载、
+        // 进度条回到开头。这里主动断开连接，让播放器按「网络中断」重试
+        // 当前 Range，位置得以保住（这是「卡顿几秒 + 进度复位」循环的
+        // 第二个成因，第一个在播放器侧的断流恢复）。
+        try {
+          final socket = await req.response.detachSocket(writeHeaders: false);
+          socket.destroy();
+          playbackChainLog(
+            '[播放链路] 代理接力未完成，主动断开连接交由播放器按 Range 重试',
+          );
+          return;
+        } catch (_) {
+          // detach 失败（响应已提交/已分离）：退回正常关闭。
+        }
+      }
       await req.response.close();
     } catch (e) {
       // 转发层异常（TLS 握手/连接重置/上游中断）在此处对 Dart 完全可见
       // ——这是定位网盘播放失败根因的关键日志通道。断网瞬间多条并发
       // 连接抛相同异常，经去重节流后落盘。
       _logProxyError('[播放链路] 代理转发异常: $e');
+      // 与接力失败同源的处理：只要响应头已按上游声明的 Content-Length
+      // 交给播放器，就不能用 close() 草草收尾——播放器会把「长度不足的
+      // 正常结束」当成完整响应，随后源解析失败重载（进度条复位）。中断
+      // 连接可让播放器以网络错误重试当前 Range。
       try {
-        await req.response.close();
-      } catch (_) {}
+        final socket = await req.response.detachSocket(writeHeaders: false);
+        socket.destroy();
+      } catch (_) {
+        try {
+          await req.response.close();
+        } catch (_) {}
+      }
     }
   }
 
@@ -265,7 +323,10 @@ class CloudPlaybackProxy {
   /// CDN 掐的是连接而非 URL），直到本段声明的长度转发完整或重试耗尽。
   /// QMC 流逐块解密（绝对偏移定位密钥流）。逐块 flush 提供背压，防止
   /// 播放器消费慢时响应缓冲无限堆积。
-  Future<void> _relayResponse(
+  ///
+  /// 返回值：本段是否已完整转发（true 表示可以正常收尾；false 表示还有
+  /// 已声明的字节没发出，调用方必须中断连接而不是静默结束）。
+  Future<bool> _relayResponse(
     HttpRequest req,
     _ProxyTask task,
     HttpClientResponse first,
@@ -309,16 +370,16 @@ class CloudPlaybackProxy {
       } catch (e) {
         broken = true;
       }
-      if (writeBroken) return;
+      if (writeBroken) return true;
       // 完成判断：累计绝对偏移（offset 跨接力段推进，consumed 每段重置）
       // 达到首个响应声明的段尾即完整——断流发生在段尾属正常收尾。
       final totalDone = offset + consumed;
       if (declared >= 0 && totalDone >= startOffset + declared) {
-        return;
+        return true;
       }
       if (!broken && declared < 0) {
         // chunked（无长度声明）正常 EOF：直接结束。
-        return;
+        return true;
       }
       // 段未转发完（上游提前 EOF 或断流）：接力续传。
       attempts++;
@@ -328,7 +389,7 @@ class CloudPlaybackProxy {
           'offset=$totalDone/'
           '${declared < 0 ? '?' : startOffset + declared}',
         );
-        return;
+        return false;
       }
       final resumeAt = totalDone;
       playbackChainLog(
@@ -341,13 +402,46 @@ class CloudPlaybackProxy {
         task,
         req.method,
         'bytes=$resumeAt-',
+        // 续传等待预算不能沿用「接力 5s」的老值：百度 PCS 在非会员时段
+        // 首字节迟到 5s 以上属常态，5s 超时会让一次普通的慢响应直接
+        // 变成断流，播放器随即重载（卡顿 + 进度复位）。
+        firstByteTimeout: const Duration(seconds: 12),
       );
       if (errBody != null) {
         playbackChainLog(
           '[播放链路] 代理接力终止：上游续传失败 HTTP '
           '${next.statusCode} offset=$resumeAt',
         );
-        return;
+        return false;
+      }
+      // 续传响应必须真的从 resumeAt 开始。CDN 忽略 Range 返回 200 全量
+      // 时若继续按 offset=resumeAt 写，播放器收到的是从头开始的字节，
+      // 整段错位后解码出垃圾并报错重载——这正是「周期性卡顿 + 进度条
+      // 复位」最难查的一种形态，宁可直接放弃这一次接力。
+      if (next.statusCode != HttpStatus.partialContent) {
+        playbackChainLog(
+          '[播放链路] 代理接力终止：续传响应非 206（HTTP ${next.statusCode}）'
+          'offset=$resumeAt，放弃本次接力交播放器重试',
+        );
+        try {
+          await next.drain<void>();
+        } catch (_) {}
+        return false;
+      }
+      final nextRange = next.headers.value(HttpHeaders.contentRangeHeader);
+      final nextMatch =
+          RegExp(r'bytes\s+(\d+)-').firstMatch(nextRange ?? '');
+      final nextStart = nextMatch != null ? int.parse(nextMatch.group(1)!) : -1;
+      if (nextStart != resumeAt) {
+        playbackChainLog(
+          '[播放链路] 代理接力终止：续传起点不符（期望 $resumeAt，'
+          '实际 ${nextStart < 0 ? '无 Content-Range' : nextStart}），'
+          '放弃本次接力交播放器重试',
+        );
+        try {
+          await next.drain<void>();
+        } catch (_) {}
+        return false;
       }
       resp = next;
       consumed = 0;
@@ -365,29 +459,54 @@ class CloudPlaybackProxy {
   Future<(HttpClientResponse, String?)> _openUpstream(
     _ProxyTask task,
     String method,
-    String range,
-  ) async {
-    var current = Uri.parse(task.url);
+    String range, {
+    // 首包等待预算（等响应头，不含 TCP 建连）：首跳 20s、接力续传 5s。
+    // 百度 PCS 在非会员时段由限速边缘（chunlei/ant）应答，首字节迟到
+    // 5s 以上属常态；旧值统一 5s 会把「慢」误判成「失败」，代理当场
+    // 抛超时，ExoPlayer 侧只能表现为 (0) Source error / 起播超时。
+    Duration firstByteTimeout = const Duration(seconds: 5),
+  }) async {
+    // 复用已解析的 CDN 直链：省掉 302 跳转与重复建连（详见 _ProxyTask
+    // resolvedUrl 注释）。首次请求/缓存过期/上次失败时从原始 dlink 起跳。
+    var current =
+        (task.resolvedFresh ? Uri.parse(task.resolvedUrl!) : Uri.parse(task.url));
+    if (task.resolvedFresh) {
+      playbackChainLog(
+        '[播放链路] 代理复用已解析CDN直链 host=${current.host} '
+        '（免302重定向）Range=$range',
+      );
+    }
     var degraded = false;
     HttpClientResponse resp;
     for (var hop = 0;; hop++) {
       final rq = await _http.openUrl(method, current);
-      rq.headers.set(HttpHeaders.rangeHeader, range);
+      // 先注入上游业务头（UA/Referer/Cookie），再设置 Range：顺序反了的话
+      // task.headers 里若带 Range（部分音源下发的头会透传原始 Range），
+      // 会覆盖掉本次接力/seek 需要的区间，续传从错误偏移取数，播放器收到
+      // 错位字节后解码失败重载，表现为周期性卡顿 + 进度条复位。
       task.headers.forEach(rq.headers.set);
+      rq.headers.set(HttpHeaders.rangeHeader, range);
       try {
-        resp = await rq.close().timeout(const Duration(seconds: 5));
+        resp = await rq.close().timeout(firstByteTimeout);
       } on TimeoutException {
-        if (current.scheme == 'https' && !degraded) {
+        // 百度 CDN 只认真实 https 通道：降级 http 只会换回 403，
+        // 把「慢」变成「死」，因此不对 pan.baidu.com / baidupcs 系域名降级。
+        final isBaidu = current.host.contains('baidu');
+        // 超时说明缓存的直链可能已被边缘节点下线：失效缓存，下次重走 302。
+        task.invalidateResolved();
+        if (current.scheme == 'https' && !degraded && !isBaidu) {
           degraded = true;
           playbackChainLog(
-            '[播放链路] 代理转发 ${task.label} 上游 5s 无响应，降级 http 重试 '
+            '[播放链路] 代理转发 ${task.label} 上游 '
+            '${firstByteTimeout.inSeconds}s 无响应，降级 http 重试 '
             'host=${current.host}',
           );
           current = current.replace(scheme: 'http');
           continue;
         }
         playbackChainLog(
-          '[播放链路] 代理转发 ${task.label} 上游连接超时(5s) host=${current.host} '
+          '[播放链路] 代理转发 ${task.label} 上游连接超时'
+          '(${firstByteTimeout.inSeconds}s) host=${current.host} '
           'scheme=${current.scheme}',
         );
         rethrow;
@@ -399,6 +518,8 @@ class CloudPlaybackProxy {
       if (resp.statusCode < 300 || resp.statusCode >= 400) {
         // 上游异常状态：读 body 留痕并透传（403 防盗链 / 404 过期 / 5xx）。
         if (resp.statusCode >= 400) {
+          // 直链可能已过期/被风控：失效缓存，下次重走 302 换新签名链。
+          task.invalidateResolved();
           var body = '';
           try {
             body = await utf8.decodeStream(resp.cast<List<int>>());
@@ -411,6 +532,9 @@ class CloudPlaybackProxy {
           );
           return (resp, snippet.isEmpty ? '' : snippet);
         }
+        // 成功（200/206）：记下最终 CDN URL 供后续请求免 302 复用。
+        task.resolvedUrl = current.toString();
+        task.resolvedAt = DateTime.now();
         return (resp, null);
       }
       final loc = resp.headers.value(HttpHeaders.locationHeader);

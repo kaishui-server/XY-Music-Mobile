@@ -7,6 +7,7 @@ import '../core/settings.dart';
 import '../favorites/favorites_provider.dart';
 import '../library/library_provider.dart';
 import '../library/online_cover_overrides.dart';
+import '../logging/error_context.dart';
 import '../navigation/shell.dart';
 import '../player/player_provider.dart';
 import '../../pages/library/online_cover_edit_page.dart';
@@ -708,6 +709,9 @@ class _SongsListViewState extends ConsumerState<SongsListView> {
     );
     if (picked == null || !context.mounted) return;
     final (plugin, replacement) = picked;
+    // 崩溃现场埋点：记录「正在换源」与目标插件（5623 的 ref-after-dispose
+    // 崩溃就发生在这条异步链路里），崩溃文件的上下文行据此收窄候选范围。
+    ErrorContext.noteAction('换源:${plugin.id}');
     // 必须在 await 之前取 notifier：同步换源会改动收藏集合，收藏页的
     // FutureBuilder（旧版按收藏集合做 key）会因此整树重建，本列表 State
     // 会在等待期间被销毁；await 之后再走 ref 就会抛

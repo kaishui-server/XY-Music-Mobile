@@ -27,6 +27,7 @@ import '../cloud/direct_link_cache.dart';
 import '../debug/performance_probe.dart';
 import '../effects/effects_provider.dart';
 import '../favorites/favorites_provider.dart';
+import '../home/listen_stats_uploader.dart';
 import '../logging/app_log_store.dart';
 import '../playlists/playlists_provider.dart';
 import '../plugins/plugin_runtime.dart';
@@ -133,6 +134,25 @@ final playbackRelinkProposalProvider = StateProvider<PlaybackRelinkProposal?>(
 final playbackNoticeEventProvider = StateProvider<PlaybackNoticeEvent?>(
   (ref) => null,
 );
+
+/// 队列里存在「所属插件已停用」的残留歌曲时的一次性提示载荷。
+///
+/// 只描述事实（哪些插件的多少首），清理动作由 UI 侧调用
+/// [PlayerNotifier.removeResidualPluginSongs] 执行。
+class ResidualPluginQueueNotice {
+  const ResidualPluginQueueNotice({
+    required this.pluginIds,
+    required this.pluginNames,
+    required this.songCount,
+  });
+
+  final Set<String> pluginIds;
+  final String pluginNames;
+  final int songCount;
+}
+
+final residualPluginQueueNoticeProvider =
+    StateProvider<ResidualPluginQueueNotice?>((ref) => null);
 
 /// 插件替代音源必须同时满足同名、同作者和近似同长度。不同平台通常会有
 /// 1～2 秒的取整差异，因此把“同时长”限定为最多相差 2 秒。
@@ -647,6 +667,13 @@ class _MediaSessionBridge extends audio_service.CompositeAudioHandler {
   /// 队列下标点播，替代内部 handler 在单曲源上越界 seek 的默认行为）。
   Future<void> Function(int index)? onSkipToQueueItem;
 
+  /// 通知栏/锁屏/耳机/车机的播放键：必须先回到宿主，再由宿主走与软件内
+  /// 播放键同一条恢复链（见 [play] 覆写）。
+  Future<void> Function()? onPlayPressed;
+
+  /// 通知栏/锁屏/耳机/车机的暂停键。
+  Future<void> Function()? onPausePressed;
+
   /// 通知栏「收藏」按钮：切换当前曲目的收藏状态。
   Future<void> Function()? onToggleFavorite;
 
@@ -776,6 +803,17 @@ class _MediaSessionBridge extends audio_service.CompositeAudioHandler {
   audio_service.PlaybackState? _lastInnerState;
   bool _attached = false;
 
+  /// 是否把「引擎 idle」归一化为「暂停态 ready」再对外发布。
+  ///
+  /// 播放器实例被内存治理释放（[_releasePlayerForMemory]）后，裸 handler 的
+  /// stop() 会广播 processingState=idle（原生 STATE_NONE）。OriginOS 据此
+  /// 判定“应用已停止播放”，把系统播控卡片按钮置灰、单击转成拉起应用，
+  /// 点击根本到不了 Dart（华为/鸿蒙则仍回调 onPlay）。释放实例只是重建链路
+  /// 的一步，应用仍有当前曲目可续播，故释放期间置 true：媒体会话保持可点、
+  /// 按钮为「播放」；真正起播（收到非 idle 状态）或清空队列时复位 false。
+  // 开关状态由模块级 [_idleNormalizationGate] 承载：宿主
+  // ([_PlayerNotifier]) 置位、桥接 ([_publish]) 消费与复位，两边必须是同一份。
+
   /// 订阅被包装 handler 的播放状态并开始发布补丁后的状态。
   /// 必须在替换 SwitchAudioHandler.inner 之前调用一次。
   void attach() {
@@ -876,7 +914,30 @@ class _MediaSessionBridge extends audio_service.CompositeAudioHandler {
   ValueStream<audio_service.MediaItem?> get mediaItem => _currentMediaItem;
 
   void _publish(audio_service.PlaybackState state) {
-    _lastInnerState = state;
+    // 【vivo/OriginOS 兼容，必读】播放器实例被内存治理释放
+    // （[_releasePlayerForMemory]）时，裸 handler 的 stop() 会广播
+    // processingState=idle，原生侧即 STATE_NONE。华为/鸿蒙的系统播控对
+    // STATE_NONE 仍会把单击回调给 onPlay；OriginOS 则据此判定“应用已停止
+    // 播放”，把卡片按钮置灰、单击转成"拉起应用"，点击根本到不了 Dart——
+    // 这正是“华为好使、vivo 单击无反应”的差异来源。
+    // 释放实例只是重建链路的一步，应用仍有当前曲目可从原进度续播，因此
+    // 把这类 idle 归一化为 ready（暂停态）：媒体会话保持可点、按钮为
+    // “播放”，单击才会照常回调 onPlay 进入宿主恢复链。
+    // 真正的停止（清空队列/退出）此时 queueIndex 解析为 null，不会被归一化，
+    // 通知照常移除。
+    var effective = state;
+    if (state.processingState == audio_service.AudioProcessingState.idle) {
+      if (_idleNormalizationGate.armed && queueIndexResolver?.call() != null) {
+        effective = state.copyWith(
+          processingState: audio_service.AudioProcessingState.ready,
+        );
+      }
+    } else {
+      // 引擎已恢复真实进度状态（loading/ready/completed）：释放期结束，
+      // 后续 idle 一律按真实含义上报。
+      _idleNormalizationGate.armed = false;
+    }
+    _lastInnerState = effective;
     _syncQueueIfNeeded();
     // Android 13+（含澎湃 HyperOS）系统媒体卡片按 PlaybackState 分配
     // 按钮槽位：播放/暂停居中、上一首/下一首按 action bits，两个
@@ -887,17 +948,26 @@ class _MediaSessionBridge extends audio_service.CompositeAudioHandler {
     final controls = <audio_service.MediaControl>[
       _favoriteControl(),
       audio_service.MediaControl.skipToPrevious,
-      state.playing
+      effective.playing
           ? audio_service.MediaControl.pause
           : audio_service.MediaControl.play,
       audio_service.MediaControl.skipToNext,
       _playModeControl(),
     ];
     _patchedPlaybackState.add(
-      state.copyWith(
+      effective.copyWith(
         controls: controls,
         systemActions: {
-          ...state.systemActions,
+          ...effective.systemActions,
+          // 【vivo/OriginOS 必读】必须显式声明 play/pause 两个 action：
+          // OriginOS 的通知栏「播放」键在 state=PAUSED 时，会先按
+          // PlaybackState.actions 里的 ACTION_PLAY 判定该键是否可点；
+          // 缺这个 bit 时系统把点击解释为「展开/拉起应用」，回调根本
+          // 到不了 Dart（与暂停键走了两条不同判定路径，因此出现
+          // 「能暂停、不能恢复」）。controls 里虽然带了 MediaControl，
+          // 但 systemActions 才是原生 action bits 的来源。
+          audio_service.MediaAction.play,
+          audio_service.MediaAction.pause,
           audio_service.MediaAction.skipToPrevious,
           audio_service.MediaAction.skipToNext,
         },
@@ -912,6 +982,57 @@ class _MediaSessionBridge extends audio_service.CompositeAudioHandler {
   @override
   ValueStream<audio_service.PlaybackState> get playbackState =>
       _patchedPlaybackState;
+
+  /// 通知栏/锁屏/耳机/车机的播放键。
+  ///
+  /// 不能交给被包装的裸 handler 直接对平台播放器发 play：后台久置
+  /// （onTrimMemory ≥ TRIM_MEMORY_BACKGROUND）后宿主会
+  /// [_releasePlayerForMemory] 释放播放器实例并置空「音源已就绪」标记，
+  /// 此时平台层 play 打在已释放实例上既不报错也不出声——用户侧就是
+  /// 「通知栏能暂停、却再也播不起来」。这里统一路由回宿主的
+  /// [onPlayPressed]，由它走与软件内播放键完全一致的恢复链
+  /// （音源未就绪重走 _playAt、重建窗口挂起补执行、时钟音量校正、
+  /// 播放统计结算），恢复能力与软件内点播放严格对齐。
+  ///
+  /// 防重入（关键）：just_audio 引擎自身的 play()/pause() 在本地补丁包里
+  /// 已改为直连裸 handler（见 _JustAudioPlayer.play/pause 的分层隔离
+  /// 注释），不会经过本类，因此宿主恢复链里调 _player.play() 不会再回到
+  /// 这里成环——这是「修好通知栏、软件内播放反而卡死」那条错误路线的
+  /// 结构性规避，不依赖任何布尔守卫。
+  @override
+  Future<void> play() async {
+    // 【诊断锚点】这条日志是「事件到底有没有到达 Dart」的唯一分界线：
+    // 通知栏点击后日志里连这一行都没有 → 事件死在原生/媒体会话层，问题
+    // 不在宿主恢复链；有这一行而后续无输出 → 死在宿主链的某个静默出口。
+    // 没有 adb 时仅靠这条即可二分，必须保留。
+    AppLogStore.instance.add(
+      '[通知栏按键] 桥收到 play（回调${onPlayPressed == null ? "未注入" : "已注入"}）',
+      level: AppLogLevel.info,
+    );
+    final callback = onPlayPressed;
+    if (callback != null) {
+      await callback();
+      return;
+    }
+    await super.play();
+  }
+
+  @override
+  Future<void> pause() async {
+    // 与 [play] 对称的入口锚点：只有这一行能证明「暂停键事件到了 Dart」。
+    // 日志里 play/pause 只有其一出现时，即可判定丢失发生在原生媒体会话层，
+    // 不必再翻宿主恢复链。
+    AppLogStore.instance.add(
+      '[通知栏按键] 桥收到 pause（回调${onPausePressed == null ? "未注入" : "已注入"}）',
+      level: AppLogLevel.info,
+    );
+    final callback = onPausePressed;
+    if (callback != null) {
+      await callback();
+      return;
+    }
+    await super.pause();
+  }
 
   /// 车机方向盘/蓝牙耳机的上一首/下一首按键走系统 KeyEvent → onClick
   /// 路径（区别于通知栏按钮直接调 skipToNext）。默认实现最终在下游的
@@ -1244,7 +1365,16 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
       // 将其藏在私有变量中，宿主无法干预媒体会话）。
       final handler = xySwitchAudioHandler;
       final current = handler.inner;
-      if (identical(current, _mediaSessionBridge)) {
+      // 播放器实例重建（内存治理释放后新建 AudioPlayer）时，补丁包有意
+      // 保留宿主已装的桥接不覆盖；此时桥接包裹的仍是**已 dispose 的旧
+      // handler**，它不再广播 PlaybackState，通知栏图标与进度会冻结在释放
+      // 前那一帧——用户点播放键得不到任何视觉反馈，与"按键失效"同义。
+      // 因此只要活跃裸 handler 换了，就必须按新 handler 重新包裹。
+      final activeRaw = xyCurrentPlayerHandler;
+      final installed = _mediaSessionBridge;
+      if (installed != null &&
+          identical(current, installed) &&
+          (activeRaw == null || identical(installed._innerRef, activeRaw))) {
         return;
       }
       // 只有 just_audio_background 的内部 handler 就位后才安装，避免把
@@ -1252,10 +1382,13 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
       // 的类型判断（is）而非 runtimeType 字符串比较：--obfuscate 构建下
       // 类名被混淆，字符串比较恒 false，桥接永远装不上（通知栏五键变
       // 三键的根因）。
-      if (!handler.xyInnerPlayerReady) return;
+      final target = activeRaw ?? (handler.xyInnerPlayerReady ? current : null);
+      if (target == null) return;
       _mediaSessionBridge?.detach();
-      final bridge = _MediaSessionBridge(current)
+      final bridge = _MediaSessionBridge(target)
         ..mediaItemResolver = _systemMediaItem
+        ..onPlayPressed = _handleExternalPlayPressed
+        ..onPausePressed = _handleExternalPausePressed
         ..onSkipToNext = next
         ..onSkipToPrevious = previous
         ..queueSource = () {
@@ -1318,6 +1451,299 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
     _mediaSessionBridge?.notifyCustomControlsChanged();
   }
 
+  /// 外部（通知栏/锁屏/耳机/车机）播放键的宿主侧处理。
+  ///
+  /// 1. 引擎实际已在出声时直接返回：避免重复起播打断 DSP 静音时钟接管、
+  ///    重置进度，或把接管时置 0 的时钟音量拉回满值；
+  /// 2. `state.isPlaying` 与引擎真实状态可能背离（久置后被
+  ///    [_releasePlayerForMemory] 释放实例，或重建后事件流残留），此处置信
+  ///    引擎侧 `_player.playing`；状态说在播而引擎没在播时先纠正标志，否则
+  ///    [toggle] 会命中「暂停」分支，点播放键反而变成暂停；
+  /// 3. 其余全部交给 [toggle]：音源未就绪自动重走 [_playAt]（带当前进度）、
+  ///    重建窗口内由 [_pendingPlayRequestId] 补执行、起播前校正时钟音量。
+  Future<void> _handleExternalPlayPressed() async {
+    // 入口即清静音暂停标记：外部播放键的语义就是「要出声」，此前的任何
+    // 手动暂停都不该继续压制恢复（旧实现在这里不清，探活与重建的
+    // `_manualPause` 守卫会把整条恢复链静默吃掉，用户点多少次都没反应）。
+    _manualPause = false;
+    AppLogStore.instance.add(
+      '[通知栏按键] 播放键：进入宿主恢复链（'
+      'current=${state.current?.path ?? "null"}，'
+      'enginePlaying=${_player.playing}，'
+      'state.isPlaying=${state.isPlaying}，'
+      'processing=${_player.processingState}，'
+      'isLoading=${state.isLoading}，'
+      'rebuilding=$_rebuildingPlayer，'
+      'dsp=$_dspPipelineActive/$_dspPipelinePlaying，'
+      'prepared=$_preparedSourceRequestId/$_playRequestId）',
+      level: AppLogLevel.info,
+    );
+    if (state.current == null) {
+      // 回前台前队列被重建/清空过时 current 可能暂时为空；只要队列还有项
+      // 就按原下标重走 _playAt，而不是静默 return（OriginOS 的单击只会来
+      // 一次，丢弃即表现为“点了没反应”）。
+      final fallbackIndex = state.queueIndex;
+      if (fallbackIndex >= 0 && fallbackIndex < state.queue.length) {
+        AppLogStore.instance.add(
+          '[通知栏按键] 播放键：无当前曲目，按队列下标重载 $fallbackIndex',
+          level: AppLogLevel.info,
+        );
+        await _playAt(fallbackIndex, startPositionSecs: state.position);
+      } else {
+        AppLogStore.instance.add(
+          '[通知栏按键] 播放键：无当前曲目且队列为空，无法恢复',
+          level: AppLogLevel.info,
+        );
+      }
+      return;
+    }
+    if (_player.playing) {
+      // 引擎自报在播不等于在出声：AudioSink 静默失活时 playing 仍为 true、
+      // 推算时钟照走。用户此刻点播放键，说明他听到的是静音/暂停，这就是
+      // 「无声假播」的确证——不再只是挂探活（旧实现的探活判据靠 position
+      // 推进量，而假播时推算时钟照常 +1000ms/秒，判据恒不成立，于是整条
+      // 链路静默走完、日志一条没有、声音一声不响）。改为直接重建
+      // AudioSink，探活只作二次兜底。
+      AppLogStore.instance.add(
+        '[通知栏按键] 播放键：引擎自报在播但用户点了播放，判定无声假播，直接重建 AudioSink',
+        level: AppLogLevel.info,
+      );
+      await _reattachAudioSink(0, cause: '外部播放键命中引擎自报在播，');
+      _scheduleExternalResumeProbe();
+      return;
+    }
+    AppLogStore.instance.add(
+      '[通知栏按键] 播放键：引擎未在出声，转入宿主恢复链 '
+      '（state.isPlaying=${state.isPlaying}，'
+      'processing=${_player.processingState}，'
+      'prepared=$_preparedSourceRequestId/$_playRequestId，'
+      'loading=${state.isLoading}）',
+      level: AppLogLevel.info,
+    );
+    if (state.isPlaying) {
+      state = state.copyWith(isPlaying: false);
+    }
+    _manualPause = false;
+    // 分岔：引擎仍持有本曲音源（ready + 音源就绪标记匹配）时走直连 resume，
+    // 不走 [toggle] 的完整切歌链——后者会重新 setAudioSource（后台重新解析
+    // 在线流）、重新校验通知权限，任一环节在后台失败都是静默 return，用户
+    // 侧就是「点了没反应」。音源未就绪 / 正在重建 / DSP 接管中才回落完整链。
+    final itemPath = state.current?.path;
+    final dspBusy = _dspPipelineActive && _dspPipelinePlaying;
+    if (itemPath != null &&
+        !dspBusy &&
+        !_rebuildingPlayer &&
+        !state.isLoading &&
+        _preparedSourceRequestId == _playRequestId &&
+        _player.processingState == ProcessingState.ready) {
+      AppLogStore.instance.add(
+        '[通知栏按键] 播放键：引擎处于暂停态且音源就绪，直连 resume',
+        level: AppLogLevel.info,
+      );
+      await _resumeEngineDirectly(itemPath);
+    } else {
+      await toggle();
+    }
+    _scheduleExternalResumeProbe();
+  }
+
+  /// 外部播放键的「暂停态直连恢复」：引擎仍在暂停态且音源就绪时，直接把
+  /// 引擎推起来，跳过 [_startPlayback]／[_playAt] 的重新赋源环节。
+  ///
+  /// 后者的每一环都可能在后台上静默失败（重新解析在线流、申请通知权限、
+  /// requestId 校验），而暂停→播放本来不需要它们：缓冲还在、位置还在，
+  /// 只需要 play()。音量与 DSP 接管按 [_startPlayback] 同样的口径处理。
+  Future<void> _resumeEngineDirectly(String itemPath) async {
+    final requestId = _playRequestId;
+    // 起播前无条件校正时钟音量：DSP 接管期间时钟被置 0，恢复时必须先按
+    // 真实音量出声（接管路径随后再静音）。
+    try {
+      await _player.setVolume(_ref.read(volumeProvider));
+    } catch (_) {}
+    if (_dspWanted(itemPath)) {
+      if (_dspPipelineActive &&
+          _dspPipelinePath == itemPath &&
+          await isUsbExclusiveActive()) {
+        await _ensureDspPipeline(requestId, itemPath);
+      } else {
+        _pendingDspTakeover = (requestId: requestId, itemPath: itemPath);
+      }
+    }
+    if (requestId != _playRequestId || state.current?.path != itemPath) return;
+    _manualPause = false;
+    state = state.copyWith(isPlaying: true, isLoading: false, errorMessage: null);
+    final playback = _player.play();
+    unawaited(_watchPlayback(playback, requestId, itemPath));
+  }
+
+  /// 外部播放键恢复后的无声探活（覆盖「非久置」场景的 AudioSink 静默失活）。
+  ///
+  /// 判据只看引擎是否真的推进，不做任何机型假设：
+  /// 1. 恢复后先给 1.6s 启动窗口（解冻 / 重新填充缓冲需要时间）；
+  /// 2. 窗口结束仍在播放但 1.2s 内 position 推进不足 300ms，判定为「无声
+  ///    假播」（AudioTrack 已 DEAD_OBJECT，ExoPlayer 推算时钟却照走），
+  ///    执行 [_reattachAudioSink] 的 pause→seek→play 重建输出单元；
+  /// 3. 窗口结束时引擎根本没在播，说明 play 指令丢失，补推一次 play()。
+  ///
+  /// 关键点：全程不等回前台。旧实现只有生命周期回调里才做这件事，所以在
+  /// 后台点通知栏播放只能出声失败，用户被迫进软件。
+  void _scheduleExternalResumeProbe() {
+    _externalResumeProbeTimer?.cancel();
+    final token = ++_externalResumeProbeToken;
+    playbackChainLog('[通知栏按键] 探活：已排期 1.6s 后检查（token=$token）');
+    _externalResumeProbeTimer = Timer(const Duration(milliseconds: 1600), () {
+      if (token != _externalResumeProbeToken) {
+        playbackChainLog('[通知栏按键] 探活：token 失效（已被新的点击/暂停取代），放弃');
+        return;
+      }
+      if (_manualPause || _videoMediaBridgeActive || _rebuildingPlayer) {
+        playbackChainLog(
+          '[通知栏按键] 探活：进入时命中守卫放弃'
+          '（manualPause=$_manualPause，videoBridge=$_videoMediaBridgeActive，'
+          'rebuilding=$_rebuildingPlayer）',
+        );
+        return;
+      }
+      // 仍在加载（重新赋源/缓冲）时放弃探活：起播链自带 12s 看门狗，
+      // 这里插手只会对正在缓冲的实例做 pause/seek，制造一次真实断音。
+      if (state.isLoading) {
+        playbackChainLog('[通知栏按键] 探活：仍在 loading，交给起播链看门狗，放弃');
+        return;
+      }
+      if (!_player.playing) {
+        playbackChainLog('[通知栏按键] 探活：1.6s 后引擎仍未在播，补推一次 play()');
+        unawaited(_player.play().catchError((Object error) {
+          playbackChainLog('[通知栏按键] 探活补推 play() 失败：$error');
+        }));
+        _externalResumeProbeTimer = Timer(
+          const Duration(milliseconds: 1200),
+          () {
+            if (token != _externalResumeProbeToken) return;
+            if (_manualPause || !_player.playing) return;
+            _probeExternalResumeProgress(token);
+          },
+        );
+        return;
+      }
+      _probeExternalResumeProgress(token);
+    });
+  }
+
+  /// 探活第二阶段：以引擎实时 position 为基准，看窗口内是否真的推进。
+  ///
+  /// 【判据修正】position 推进量**不能**用来判定是否出声：AudioSink 写失败
+  /// （DEAD_OBJECT）属 non-fatal，ExoPlayer 的推算时钟照常 +1000ms/秒，
+  /// 所以 1.2s 窗口内 advanced 恒 ≈1200ms，旧阈值「< 300ms 才算假播」
+  /// 永远不成立——探活于是每次都静默放过，这正是「点了没反应且日志一条
+  /// 没有」的根因。阈值改为 900ms：推进明显慢于实时（时钟被冻结/追帧）
+  /// 同样视为异常，而不推进则直接判假播。
+  void _probeExternalResumeProgress(int token) {
+    final baseMs = _player.position.inMilliseconds;
+    _externalResumeProbeTimer = Timer(const Duration(milliseconds: 1200), () {
+      if (token != _externalResumeProbeToken) {
+        playbackChainLog('[通知栏按键] 探活二段：token 失效，放弃');
+        return;
+      }
+      if (_manualPause || _videoMediaBridgeActive || _rebuildingPlayer) {
+        playbackChainLog(
+          '[通知栏按键] 探活二段：命中守卫放弃'
+          '（manualPause=$_manualPause，videoBridge=$_videoMediaBridgeActive，'
+          'rebuilding=$_rebuildingPlayer）',
+        );
+        return;
+      }
+      if (state.isLoading) {
+        playbackChainLog('[通知栏按键] 探活二段：仍在 loading，放弃');
+        return;
+      }
+      if (!_player.playing) {
+        playbackChainLog('[通知栏按键] 探活二段：引擎已不在播，放弃');
+        return;
+      }
+      final advanced = _player.position.inMilliseconds - baseMs;
+      if (advanced >= 900) {
+        playbackChainLog(
+          '[通知栏按键] 探活二段：1.2s 推进 ${advanced}ms，时钟正常，放行',
+        );
+        return;
+      }
+      playbackChainLog(
+        '[通知栏按键] 探活：在播但 1.2s 内仅推进 ${advanced}ms，'
+        '判定无声假播，重建 AudioSink',
+      );
+      unawaited(_reattachAudioSink(0, cause: '外部播放键探活未推进，'));
+    });
+  }
+
+  /// 外部暂停键：引擎在出声时走 [toggle] 的暂停分支（含播放统计结算）；
+  /// 引擎已停而状态残留「播放中」时只纠正标志，不做无意义调用。
+  ///
+  /// 【幂等反转】已完全暂停时又收到 pause，判定为 ROM 播控状态残留——
+  /// 2026-11-12 vivo 实测：暂停后用户点「播放」，OriginOS 把 action 报成
+  /// pause（按钮语义停留在暂停帧，与 [_scheduleMediaSessionRefreshAfterPause]
+  /// 记录的「首次状态更新被丢弃」同源但方向相反），整份日志无一条 play
+  /// 锚点。暂停态下 pause 无任何语义，唯一合理意图是播放：距上次真实暂停
+  /// 超过 2s 即反转走恢复链；2s 内视为同一次暂停的重复回声，忽略。
+  Future<void> _handleExternalPausePressed() async {
+    // 暂停必须作废在飞的恢复探活：否则探活到点后会把刚暂停的播放重新推起来
+    // （或被误判成「无声假播」而触发 AudioSink 重建，用户听到一次爆音）。
+    _externalResumeProbeTimer?.cancel();
+    _externalResumeProbeTimer = null;
+    _externalResumeProbeToken++;
+    if (_player.playing) {
+      await toggle();
+      _lastExternalStalePauseAt = DateTime.now();
+      _scheduleMediaSessionRefreshAfterPause();
+      return;
+    }
+    if (!state.isPlaying &&
+        !state.isLoading &&
+        state.current != null) {
+      final now = DateTime.now();
+      final last = _lastExternalStalePauseAt;
+      final isEcho =
+          last != null && now.difference(last) < const Duration(seconds: 2);
+      if (!isEcho) {
+        playbackChainLog(
+          '[通知栏按键] 已暂停时收到 pause，判定 ROM 播控残留（实按播放），幂等反转恢复',
+        );
+        await _handleExternalPlayPressed();
+        return;
+      }
+      playbackChainLog('[通知栏按键] 已暂停时收到 pause，距真实暂停 <2s，视为重复回声忽略');
+    }
+    if (state.isPlaying || state.isLoading) {
+      state = state.copyWith(isPlaying: false, isLoading: false);
+    }
+    _scheduleMediaSessionRefreshAfterPause();
+  }
+
+  /// 暂停后主动重推播放状态（vivo/OriginOS 专用加固）。
+  ///
+  /// 暂停瞬间原生侧会收到一次 PlaybackState(PAUSED)，但 OriginOS 的播控
+  /// 卡片存在「首次状态更新被丢弃、按钮语义停留在上一帧」的现象：卡片图标
+  /// 已经变成播放键，系统内部仍按 PAUSED 前的 actions 处理点击，于是点
+  /// 播放被解释为「展开应用」，回调不进入 Dart（日志里连
+  /// `[通知栏按键] 桥收到 play` 都没有）。暂停后延迟补推两次幂等状态，
+  /// 逼迫系统按最新 controls/systemActions 重建按钮与点击分支。
+  void _scheduleMediaSessionRefreshAfterPause() {
+    _mediaSessionRefreshTimer?.cancel();
+    final token = ++_mediaSessionRefreshToken;
+    void push() {
+      if (token != _mediaSessionRefreshToken) return;
+      _mediaSessionBridge?.notifyCustomControlsChanged();
+      _syncAndroidPlaybackInfo();
+    }
+
+    _mediaSessionRefreshTimer = Timer(const Duration(milliseconds: 300), () {
+      push();
+      _mediaSessionRefreshTimer = Timer(
+        const Duration(milliseconds: 1500),
+        push,
+      );
+    });
+  }
+
   /// 上一次车机/方向盘按键的触发时间（节流用）。
   DateTime? _lastCarMediaButtonAt;
 
@@ -1342,6 +1768,14 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
         return;
       }
       _lastCarMediaButtonAt = now;
+      // 【锚点日志】vivo/OriginOS 会把通知栏媒体键以 keyEvent 注入前台
+      // Activity（走本通道而非 MediaSession 桥接），2026-11-12 vivo 日志里
+      // 暂停成功、播放没反应且全程零日志——没有这行就无法区分「事件没到」
+      // 和「到了没处理」。必须保留。
+      AppLogStore.instance.add(
+        '[媒体键通道] onMediaButton action=$action',
+        level: AppLogLevel.info,
+      );
       switch (action) {
         case 'next':
           await next();
@@ -1350,14 +1784,23 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
           await previous();
           break;
         case 'playPause':
-          await toggle();
-          break;
         case 'play':
-          if (!state.isPlaying) await toggle();
-          break;
         case 'pause':
         case 'stop':
-          if (state.isPlaying) await toggle();
+          // 统一路由到外部按键处理链（带日志锚点、假播重建、暂停态直连
+          // 恢复）。旧实现 `case 'play': if (!state.isPlaying) await
+          // toggle()` 有一个静默黑洞：AudioSink 失活假播时 state.isPlaying
+          // 仍为 true（推算时钟照走、playing 事件未清），此时 isPlaying
+          // 恒为 true、连日志都没有；而同通道的暂停走 toggle 暂停分支
+          // （无日志但能响）——正是 vivo「暂停可以、播放没反应、日志零
+          // 痕迹」的组合。按按键语义与引擎真实状态分派，不再信 UI 状态。
+          final wantsPause = action == 'pause' || action == 'stop';
+          final enginePlaying = _player.playing;
+          if (wantsPause || enginePlaying) {
+            await _handleExternalPausePressed();
+          } else {
+            await _handleExternalPlayPressed();
+          }
           break;
         case 'fastForward':
           await seek(state.position + 10);
@@ -1796,6 +2239,14 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
           '[DSP] 共享管线启动失败(${cooldown}s冷却, '
           '原因=${_dspFailKind(message)})，回退原生输出: $message',
         );
+        // 【vivo 加固】启动失败可能停在半初始化状态：OpenSL 分支对已建
+        // 引擎/输出对象有销毁兜底，但流下载线程与共享槽不在其销毁路径上；
+        // vivo(OriginOS) 的音频 HAL 会话配额紧张（CreateOutputMix res=12
+        // 即会话数上限），残留会挤占引擎后续的输出会话——暂停→播放打不响、
+        // 乃至输出残留缓冲（听感串音）都与之相关。幂等清理一次，失败不追责。
+        try {
+          await stopUsbExclusivePlayback();
+        } catch (_) {}
       }
       return false;
     }
@@ -2250,6 +2701,10 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
       _audioInterruptionSub = null;
       _becomingNoisySub?.cancel();
       _becomingNoisySub = null;
+      // dispose 内部会 stop() → 广播 idle（原生 STATE_NONE）。置位后该 idle
+      // 被归一化为 ready 对外发布，OriginOS 的播控卡片才不会因 STATE_NONE
+      // 把播放键置灰/把单击转成拉起应用（华为不受影响）。见字段注释。
+      _idleNormalizationGate.armed = true;
       try {
         await _player.dispose().timeout(const Duration(seconds: 3));
       } catch (_) {
@@ -2271,7 +2726,25 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
       _preparedSourceRequestId = null;
     } finally {
       _rebuildingPlayer = false;
+      // 释放/重建期间到达的外部播放键请求（见 [_pendingPlayAtIndex]）。
+      _flushPendingPlayAt();
     }
+  }
+
+  /// 补执行重建期间挂起的「按队列下标重播」请求（见 [_pendingPlayAtIndex]）。
+  ///
+  /// 必须延后一拍：调用点都在 `finally` 里，[_rebuildingPlayer] 刚复位，
+  /// 但同步返回前 [_playAt] 仍会读到旧值把自己再次拦住。
+  void _flushPendingPlayAt() {
+    final index = _pendingPlayAtIndex;
+    if (index == null) return;
+    _pendingPlayAtIndex = null;
+    final secs = _pendingPlayAtSecs;
+    _pendingPlayAtSecs = 0;
+    playbackChainLog('[自愈] 重建结束，补执行挂起的重播请求（index=$index）');
+    Future<void>.microtask(() async {
+      await _playAt(index, startPositionSecs: secs);
+    });
   }
 
   /// 告知原生「本轮不探测」并附原因（对应 FreezeProbe.noteDartProbeIdle）。
@@ -2453,6 +2926,9 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
         playbackChainLog('[自愈] 重建结束，补执行重建期间挂起的播放请求');
         unawaited(_startPlayback(pending, pendingPath));
       }
+      // 外部播放键走 [_playAt] 时挂起的重播请求（与上面按 requestId 挂起
+      // 的 [_pendingPlayRequestId] 是两条独立路径，互斥命中）。
+      _flushPendingPlayAt();
     }
   }
 
@@ -2665,6 +3141,30 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
   /// （无声、进度不动、状态却显示播放中）。改动由 [_startPlayback] 入口
   /// 记录、[_rebuildPlayer] 结束时按就绪情况补执行。
   int? _pendingPlayRequestId;
+  /// 重建窗口内到达的「按队列下标重播」请求（外部播放键走 [_playAt] 时）：
+  /// [_playAt] 入口发现 [_rebuildingPlayer] 为真就记下标与进度，重建结束由
+  /// [_flushPendingPlayAt] 补执行。此前 [_playAt] 没有这层守卫，重建（内存
+  /// 治理释放 / 主线程楔死自愈）与通知栏播放键撞车时会在旧实例刚 dispose 的
+  /// 同时刻 setAudioSource，表现为「点了没反应，进软件再点才行」。
+  int? _pendingPlayAtIndex;
+  double _pendingPlayAtSecs = 0;
+  /// 外部（通知栏/锁屏/耳机）播放键恢复后的无声探活计时器与令牌。
+  ///
+  /// 非久置场景（只是暂停了一会儿）在部分 ROM 上 ExoPlayer 的 AudioSink 已经
+  /// 静默失活：play() 不报错、推算时钟照走，但完全没有声音；原实现只有
+  /// 「回前台」的生命周期回调才会触发 [_reattachAudioSink] 修它——用户侧
+  /// 现象正是「通知栏能暂停，必须进软件才能继续播放」。这里把探活挂到外部
+  /// 按键路径上，不等回前台。
+  Timer? _externalResumeProbeTimer;
+  int _externalResumeProbeToken = 0;
+  /// 最近一次真实暂停的时刻（外部 pause 键生效时记录）。暂停态下再次收到
+  /// pause 且距此时刻 ≥2s 时，判定为 ROM 播控残留并幂等反转为播放
+  /// （见 [_handleExternalPausePressed]）。
+  DateTime? _lastExternalStalePauseAt;
+  /// 暂停后补推播放状态的计时器与令牌（见
+  /// [_scheduleMediaSessionRefreshAfterPause]）。
+  Timer? _mediaSessionRefreshTimer;
+  int _mediaSessionRefreshToken = 0;
   /// 主线程心跳探测定时器（见 [_startPlayerHeartbeat]）。
   Timer? _playerHeartbeatTimer;
 
@@ -2823,6 +3323,10 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
   /// 播放中流被上游掐断（音源 URL 时效过期/CDN 断流）后的自动重解析
   /// 恢复：连续恢复计数（正常起播 ready 后清零）与重缓冲卡死看门狗。
   int _streamRecoverCount = 0;
+  /// 上一次流断恢复时的播放进度（ms）：用于判断「是否在同一位置反复断流」
+  /// ——若是，说明该区段是坏点（被限速打死/数据损坏），原地续播只会无限
+  /// 重试，需要跳过一段。
+  int? _lastStreamRecoverPosMs;
   Timer? _bufferingWatchdog;
   StreamSubscription<PlayerException>? _errorSub;
 
@@ -2848,6 +3352,9 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
     _attachPlayerStreams();
     _startPlayerHeartbeat();
     await _restoreSession();
+    // 会话恢复后再检查队列残留：此时 queue 才是用户上次的真实队列，
+    // 若其中有歌曲所属插件已被停用/删除，给出一次性清理提示。
+    unawaited(_maybeNotifyResidualPluginSongs());
   }
 
   /// position 采样周期随界面可见性自适应（内存卡顿修复放宽后）：
@@ -3186,6 +3693,22 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
       // 耗电优化：Wi-Fi 高性能锁跟随播放态（内部已去重，高频回调无额外开销）。
       unawaited(PlaybackWifiLock.sync(playing));
       final completed = ps.processingState == ProcessingState.completed;
+      // 音质探测闸门上报（卡顿修复方案①）：插件运行时据此判断能否启动
+      // 或继续逐档 musicUrl 探测——只有 playing-ready 且缓冲提前量 ≥3s
+      // 才允许，重缓冲立即挂起。探测与起播/续缓冲抢同一条出口带宽，
+      // 起播阶段探测是「起播慢 + 播放中反复重缓冲」的直接成因。
+      final probeGate = QualityProbeGate.instance;
+      probeGate.report(
+        ready: ps.processingState == ProcessingState.ready,
+        bufferedAheadMs:
+            _player.bufferedPosition.inMilliseconds -
+            _player.position.inMilliseconds,
+      );
+      if (ps.processingState == ProcessingState.ready) {
+        // 缓冲已达标：补跑起播阶段被挂起的音质预取探测（内部自行判断
+        // 是否真的达标，空队列时立即返回）。
+        _ref.read(pluginRuntimeProvider).flushDeferredQualityProbes();
+      }
       // 播放中重缓冲（卡顿）事件：从 ready 跌回 buffering 是媒体层
       // 供流不足的直接证据。起播/换歌加载阶段的 buffering 不算
       // （前一状态不是 ready，天然被挡掉）。
@@ -3197,6 +3720,9 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
           !state.isLoading) {
         _rebufferCount++;
         _rebufferEnteredAt = DateTime.now();
+        // 重缓冲立即挂起音质探测：逐档 musicUrl 会进一步抢带宽 +
+        // 抢占 QuickJS 引擎，让本来就供流不足的播放雪上加霜。
+        probeGate.reportRebuffer();
         // 卡死看门狗：重缓冲持续 30s 无任何状态跃迁即视为流已断
         // （上游掐流后 ExoPlayer 可能不上报 error，只无限 buffering），
         // 强制重新解析当前曲。
@@ -3250,6 +3776,8 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
         // 启动 Rust 管线（见 [_scheduleDeferredDspTakeover]）。
         if (playing && ps.processingState == ProcessingState.ready) {
           _streamRecoverCount = 0;
+          // 真正恢复播放后清掉「坏点」记忆，下一次断流重新按原位续播。
+          _lastStreamRecoverPosMs = null;
           _scheduleDeferredDspTakeover();
         }
         unawaited(_syncDspPipelinePlaying(playing));
@@ -3371,14 +3899,32 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
     int backgroundMs, {
     String cause = '回前台',
   }) async {
-    if (_rebuildingPlayer) return;
-    if (_manualPause || _videoMediaBridgeActive) return;
+    if (_rebuildingPlayer) {
+      playbackChainLog('[音频] $cause跳过 AudioSink 重建：播放器正在重建');
+      return;
+    }
+    if (_manualPause || _videoMediaBridgeActive) {
+      playbackChainLog(
+        '[音频] $cause跳过 AudioSink 重建'
+        '（manualPause=$_manualPause，videoBridge=$_videoMediaBridgeActive）',
+      );
+      return;
+    }
     // DSP 接管时真声由 Rust 管线输出（just_audio 只是静音时钟），管线另有
     // 2s 存活看门狗与饥饿干预；此处 pause/play 时钟会被
     // [_syncDspPipelinePlaying] 转发给管线，反而制造一次真实断音。
-    if (_dspPipelineActive && _dspPipelinePlaying) return;
+    if (_dspPipelineActive && _dspPipelinePlaying) {
+      playbackChainLog('[音频] $cause跳过 AudioSink 重建：DSP 管线正在出声');
+      return;
+    }
     final current = state.current;
-    if (current == null || !state.isPlaying) return;
+    if (current == null || !state.isPlaying) {
+      playbackChainLog(
+        '[音频] $cause跳过 AudioSink 重建'
+        '（current=${current?.path ?? "null"}，state.isPlaying=${state.isPlaying}）',
+      );
+      return;
+    }
     // 【P0-2】seek 基准必须取引擎实时位置。state.position 是 UI 快照，
     // 后台冻结期间根本不更新：实测日志里同一时刻 UI 快照 18932ms、
     // 引擎实际 316100ms，偏差 297168ms。用快照 seek 会把播放瞬间拉回
@@ -3515,6 +4061,11 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
       _audioSinkLazyProbeTimer = null;
       _audioSinkProbeToken++;
       _flushCurrentPlaybackStats();
+      // 切后台时先等本地写链落库，再强制上报一次：熄屏/后台听歌期间
+      // 云端排行榜也能拿到最新时长，而不是等下次回前台才补。
+      unawaited(
+        _statsWriteChain.then((_) => uploadListenStats(_ref, force: true)),
+      );
       // 后台期间不做曲尾滞留自愈（冻结中触发的切歌会与解冻后的引擎事件
       // 竞争），挂起中的计时器直接取消。
       _trackEndSwallowHealTimer?.cancel();
@@ -4375,7 +4926,7 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
         final savedLyricsRaw = meta['lyricsRaw']?.toString();
         return QueueItem(
           path: p,
-          title: meta['title']?.toString() ?? _titleFromPath(p),
+          title: _restoredTitle(meta, p),
           artist: meta['artist']?.toString() ?? '',
           album: meta['album']?.toString() ?? '',
           durationMs: (meta['durationMs'] as num?)?.toInt() ?? 0,
@@ -4522,9 +5073,39 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
   }
 
   String _titleFromPath(String p) {
+    // 云盘歌 path = cloud://<provider>/<account>/<urlEncodedFileJson>：
+    // 直接按「/」取末段得到的是 URL 编码 JSON（%7B%22id%22…），即用户
+    // 反馈的「切后台/息屏恢复后标题变乱码」——会话存储缺失 title 时
+    // 走到这里把 path 当了标题并写回持久化。反解出文件名去扩展名显示。
+    if (p.startsWith('cloud://')) {
+      final segs = p.split('/');
+      if (segs.length > 3) {
+        try {
+          final fileJson =
+              jsonDecode(Uri.decodeComponent(segs.sublist(3).join('/')))
+                  as Map<String, dynamic>;
+          final name = (fileJson['name'] ?? '').toString().trim();
+          if (name.isNotEmpty) {
+            final dot = name.lastIndexOf('.');
+            return dot > 0 ? name.substring(0, dot) : name;
+          }
+        } catch (_) {}
+      }
+      return '云盘音频';
+    }
     final name = p.split(RegExp(r'[\\/]')).last;
     final dot = name.lastIndexOf('.');
     return dot > 0 ? name.substring(0, dot) : name;
+  }
+
+  /// 会话/存储恢复标题：缺失、空串、或已被旧版污染成 URL 编码 JSON
+  /// （%7B 开头）时按 path 反解兜底。
+  String _restoredTitle(Map<String, dynamic> meta, String p) {
+    final t = meta['title']?.toString() ?? '';
+    if (t.trim().isEmpty || t.startsWith('%7B') || t.startsWith('%7b')) {
+      return _titleFromPath(p);
+    }
+    return t;
   }
 
   /// 防抖持久化进度（每 5 秒一次），供重启恢复。
@@ -4643,6 +5224,9 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
     _flushPlaybackStats(state);
     // stop() 会发出 playing=false，先抑制自动下一首。
     _manualPause = true;
+    // 这里是真正的停止（用户清空队列）：idle 必须按真实含义上报，
+    // 通知/媒体会话才会正常移除，不能归一化成「暂停态」残留卡片。
+    _idleNormalizationGate.armed = false;
     ++_playRequestId;
     _preparedSourceRequestId = null;
     try {
@@ -4722,6 +5306,111 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
     if (wasCurrent) await _playAt(currentIndex);
   }
 
+  /// 一次性残留提示的落盘标记（每个安装只提示一次，用户处理后不再打扰）。
+  static const _residualPluginNoticeKey = 'queueResidualPluginNoticeShown';
+
+  /// 移除队列中来自「已停用/已删除插件」的残留歌曲，返回实际移除数量。
+  ///
+  /// 正在播放的那一首不会被移除（避免清理动作把正在听的歌直接掐断），
+  /// 用户可自行处理。清理后同步 [queueOriginal] 快照，保证切回列表顺序时
+  /// 不会把这些残留再次带回队列。
+  Future<int> removeResidualPluginSongs(Set<String> disabledPluginIds) async {
+    if (disabledPluginIds.isEmpty) return 0;
+    final queue = [...state.queue];
+    if (queue.isEmpty) return 0;
+    final current = state.queueIndex >= 0 && state.queueIndex < queue.length
+        ? queue[state.queueIndex]
+        : null;
+    bool isResidual(QueueItem item) {
+      final id = item.pluginId?.trim() ?? '';
+      if (id.isEmpty || !disabledPluginIds.contains(id)) return false;
+      return !identical(item, current);
+    }
+
+    final removed = queue.where(isResidual).length;
+    if (removed == 0) return 0;
+    queue.removeWhere(isResidual);
+    // queueOriginal 存的是 path 快照：只保留仍在队列中出现的路径，
+    // 否则切回列表顺序时会把这些残留重新带回队列。
+    final remainingPaths = queue.map((item) => item.path).toSet();
+    final original = state.queueOriginal
+        .where(remainingPaths.contains)
+        .toList();
+    final currentIndex = current == null ? -1 : queue.indexOf(current);
+    state = state.copyWith(
+      queue: queue,
+      queueIndex: currentIndex,
+      current: current,
+      queueOriginal: original,
+    );
+    await _persistSession();
+    playbackChainLog(
+      '[播放链路] 已清理队列中来自已停用插件的残留歌曲 $removed 首 '
+      '(plugins=${disabledPluginIds.join(",")} 剩余=${queue.length})',
+    );
+    return removed;
+  }
+
+  /// 启动时检查队列里是否有「插件已停用」导致的残留歌曲，并给出一次性
+  /// 清理提示（图一方案④）。
+  ///
+  /// 只提示一次：命中后在偏好设置里落标记，避免每次冷启动都弹同一条提示。
+  /// 用户点击「清理」即从队列移除这些歌（不影响正在播放的那一首）。
+  Future<void> _maybeNotifyResidualPluginSongs() async {
+    try {
+      final preferences = await SharedPreferences.getInstance();
+      if (preferences.getBool(_residualPluginNoticeKey) ?? false) return;
+      final queue = state.queue;
+      if (queue.isEmpty) return;
+      final plugins = await _ref.read(enabledMusicPluginsProvider.future);
+      final enabledIds = plugins.map((plugin) => plugin.id).toSet();
+      final residualIds = <String>{};
+      for (final item in queue) {
+        final id = item.pluginId?.trim() ?? '';
+        if (id.isEmpty || enabledIds.contains(id)) continue;
+        // 只有插件歌曲（带 pluginData）才算残留；本地/网络直链不受影响。
+        if (item.pluginData == null) continue;
+        residualIds.add(id);
+      }
+      if (residualIds.isEmpty) return;
+      final residualCount = queue
+          .where(
+            (item) =>
+                residualIds.contains(item.pluginId?.trim() ?? '') &&
+                item.pluginData != null,
+          )
+          .length;
+      if (residualCount == 0) return;
+      await preferences.setBool(_residualPluginNoticeKey, true);
+      final names = residualIds.map(_residualPluginDisplayName).join('、');
+      playbackChainLog(
+        '[播放链路] 检测到队列残留歌曲 $residualCount 首，'
+        '所属插件已停用: ${residualIds.join(",")}',
+      );
+      _ref.read(residualPluginQueueNoticeProvider.notifier).state =
+          ResidualPluginQueueNotice(
+            pluginIds: residualIds,
+            pluginNames: names,
+            songCount: residualCount,
+          );
+    } catch (error) {
+      // 提示属于附带能力，任何异常都不应影响起播/恢复流程。
+      playbackChainLog('[播放链路] 残留歌曲检查失败: $error');
+    }
+  }
+
+  /// 残留歌曲提示文案里的插件名：优先用已安装记录的显示名。
+  String _residualPluginDisplayName(String pluginId) {
+    const fallback = {
+      'kw': '酷我音乐',
+      'kg': '酷狗音乐',
+      'tx': 'QQ音乐',
+      'wy': '网易云音乐',
+      'mg': '咪咕音乐',
+    };
+    return fallback[pluginId] ?? pluginId;
+  }
+
   /// [startPositionSecs] 非空时从指定进度继续播放（恢复会话后重试起播用）；
   /// 为空表示从头播放，普通切歌/点播行为不变。
   Future<void> _playAt(
@@ -4730,7 +5419,26 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
     String? qualityOverride,
   }) async {
     if (index < 0 || index >= state.queue.length) return;
+    // 重建窗口内不得直接 setAudioSource：[_rebuildingPlayer] 为真时旧实例
+    // 正在 dispose、新实例尚未就绪，此刻赋源会在两个实例间交错，既不报错
+    // 也不出声。通知栏播放键在久置场景必然撞上这个窗口（释放即发生在点按
+    // 之前），所以先记账，重建结束后补执行。
+    if (_rebuildingPlayer) {
+      _pendingPlayAtIndex = index;
+      _pendingPlayAtSecs = startPositionSecs ?? state.position;
+      _manualPause = false;
+      playbackChainLog(
+        '[自愈] 重建进行中，重播请求挂起（index=$index，'
+        'position=${_pendingPlayAtSecs.toStringAsFixed(1)}s）',
+      );
+      return;
+    }
     _installMediaSessionBridge();
+    // 下面用 _player.stop() 释放旧曲缓冲，会广播 idle（原生 STATE_NONE）。
+    // OriginOS 会据此把播控卡片置灰、单击转成拉起应用，用户连点第二次
+    // 播放键的机会都没有；起播前把它当作「暂停态」上报，收到真实 ready
+    // 后自动复位（见 _publish）。清空队列/停止仍按真实 idle 上报。
+    _idleNormalizationGate.armed = true;
     // 重新点播歌曲（包括正在以视频形式播放的 B 站歌曲）时，先结束
     // 临时视频会话并退出媒体桥接。否则视频画面自带的伴音会与新启动
     // 的音频流同时播放，出现两路重复的声音。
@@ -4740,6 +5448,9 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
     }
     final requestId = ++_playRequestId;
     _preparedSourceRequestId = null;
+    // 新曲起播：复位音质探测闸门（旧曲的缓冲提前量对新曲无参考价值），
+    // 逐档探测必须等新曲真正 ready 且缓冲 ≥3s 后才允许启动。
+    QualityProbeGate.instance.reset();
     var item = state.queue[index];
     final associated = await _loadAssociatedReplacement(item.path);
     if (requestId != _playRequestId) return;
@@ -5027,6 +5738,9 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
           // B3：该曲后续会被 Rust DSP 接管时，也把播放器改走同一本地
           // 代理，双轨共用一条上游通道，避免接管窗口内两路直连抢带宽。
           shareProxyWithDsp: _dspWanted(item.path),
+          // 卡顿修复方案②：以解析出的真实直链作为同源判据。
+          dedupKey: resolved.url,
+          origin: 'playAt:plugin',
         );
         try {
           await submitUrl(source);
@@ -5147,6 +5861,8 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
               headers: null, // 鉴权头已由代理注入
               tag: mediaItem,
               requestId: requestId,
+              dedupKey: resolved.url,
+              origin: 'playAt:lx-owned',
             );
           }
           try {
@@ -5228,6 +5944,8 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
           headers: null, // 鉴权头已由代理注入
           tag: mediaItem,
           requestId: requestId,
+          dedupKey: source.url,
+          origin: 'playAt:lx-recognized',
         );
         if (!(state.current?.lyricsAttempted ?? false)) {
           unawaited(
@@ -5266,6 +5984,8 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
           requestId: requestId,
           // B3：网络直链同样按接管意图决定是否改走本地代理（双轨同源）。
           shareProxyWithDsp: _dspWanted(item.path),
+          dedupKey: item.path,
+          origin: 'playAt:networkUrl',
         );
         return null;
       case PlaybackSourceType.localFile:
@@ -5323,9 +6043,20 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
     int? requestId,
     String? ekey,
     bool shareProxyWithDsp = false,
+    String? dedupKey,
+    String origin = 'unknown',
   }) async {
     await _enqueueSourceOperation(() async {
       if (requestId != null && requestId != _playRequestId) return;
+      // 卡顿修复方案②：播放中重复 setUrl 去重。
+      //
+      // 同一首歌在「引擎仍在推进」时被重复提交同一音源，会把已经建好
+      // 的缓冲整体丢弃、从头重新拉流，是真机上「播放中突发重缓冲」的
+      // 直接触发点。此处同源 + 在播时直接跳过；进度由引擎自然保留，
+      // 若上层预期位置与引擎位置有明显偏差则用 seek 补齐。
+      if (dedupKey != null && _shouldSkipDuplicateSetUrl(dedupKey, tag)) {
+        return;
+      }
       // DSP 源记录：在线直链交给 Rust 流缓存直读（与 ExoPlayer 各自
       // 连接 CDN）。与 setUrl 同在串行队列内，切歌时不会记录到旧曲 URL。
       if (url.startsWith('http')) {
@@ -5398,21 +6129,87 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
         playbackChainLog(
           '[播放链路] setUrl 开始 ${viaProxy ? '本地代理通道' : host} '
           '(${headers == null ? (viaProxy ? '头由代理注入' : '无头直连') : '直连 ${headers?.length ?? 0} 头'})'
-          '${ekey != null ? ' QMC加密' : ''}',
+          '${ekey != null ? ' QMC加密' : ''} 触发者=$origin'
+          '${dedupKey != null ? ' 源键=${_shortDedupKey(dedupKey)}' : ''}',
         );
       }
       // setUrl 加超时保护：部分机型上 ExoPlayer 加载特定 URL 可能卡死
       // （既不抛错也不完成），导致 isLoading 永久为 true。超过 15 秒
       // 主动放弃并抛出超时，交由上层错误处理链路统一兜底。
+      final setUrlWatch = Stopwatch()..start();
       try {
         await _player
             .setUrl(url, headers: headers, tag: tag)
             .timeout(const Duration(seconds: 15));
+        // 记录本次真正生效的音源键与触发者：同源重复提交据此去重，
+        // 日志里也能一眼看出「谁在反复重放」。
+        if (dedupKey != null && tag is MediaItem) {
+          _lastAppliedSourceKey = '$dedupKey|${tag.id}';
+          _lastAppliedSourceAtMs = DateTime.now().millisecondsSinceEpoch;
+        }
+        playbackChainLog(
+          '[播放链路] setUrl 完成 ${setUrlWatch.elapsedMilliseconds}ms '
+          '触发者=$origin'
+          '${dedupKey != null ? ' 源键=${_shortDedupKey(dedupKey)}' : ''}',
+        );
       } on TimeoutException {
-        playbackChainLog('[播放链路] setUrl 超时 15s，主动中断并上报错误');
+        playbackChainLog(
+          '[播放链路] setUrl 超时 15s，主动中断并上报错误 触发者=$origin',
+        );
         rethrow;
       }
     });
+  }
+
+  /// 上一次真正提交给引擎的音源键（`源键|mediaItemId`），用于方案②去重。
+  String? _lastAppliedSourceKey;
+  int _lastAppliedSourceAtMs = 0;
+
+  /// 日志里只打源键尾部：完整直链可能带鉴权参数，不宜落盘。
+  static String _shortDedupKey(String key) =>
+      key.length <= 48 ? key : '…${key.substring(key.length - 48)}';
+
+  /// 判断本次 setUrl 是否属于「播放中重复提交同一音源」（卡顿修复方案②）。
+  ///
+  /// 命中即跳过：引擎仍在推进时重建数据源会把已建好的缓冲整体丢弃，
+  /// 表现为播放中毫无征兆地重新缓冲。同源且引擎未推进（idle/completed、
+  /// 位置为 0）时不跳过，保证真正的重新起播仍然生效。
+  bool _shouldSkipDuplicateSetUrl(String dedupKey, Object? tag) {
+    if (tag is! MediaItem) return false;
+    final key = '$dedupKey|${tag.id}';
+    if (_lastAppliedSourceKey != key) return false;
+    final processingState = _player.processingState;
+    if (processingState == ProcessingState.idle ||
+        processingState == ProcessingState.completed) {
+      return false;
+    }
+    final enginePosMs = _player.position.inMilliseconds;
+    if (!_player.playing && enginePosMs < 1000) return false;
+    // 进度兜底：跳过 setUrl 时进度本应自然连续，但上层（重试路径）
+    // 可能期望从某个已知位置续播；偏差明显时用 seek 补齐，避免
+    // 「跳过重放」被误读成「从头重播」。
+    // state.position 为秒（double），换算成毫秒再与引擎位置比较。
+    final expectedMs = (state.position * 1000).round();
+    final driftMs = expectedMs - enginePosMs;
+    if (driftMs.abs() > 1500) {
+      unawaited(() async {
+        try {
+          await _player.seek(Duration(milliseconds: expectedMs));
+          playbackChainLog(
+            '[播放链路] 跳过重复 setUrl 后 seek 对齐进度 '
+            '${enginePosMs}ms→${expectedMs}ms',
+          );
+        } catch (_) {
+          // 对齐失败不影响播放：引擎位置本来就是连续的。
+        }
+      }());
+    }
+    playbackChainLog(
+      '[播放链路] 跳过重复 setUrl（同源在播）源键=${_shortDedupKey(dedupKey)} '
+      'tag=${tag.id} pos=${enginePosMs}ms state=$processingState '
+      '距上次提交=${DateTime.now().millisecondsSinceEpoch - _lastAppliedSourceAtMs}ms',
+    );
+    return true;
   }
 
   String? _pluginNameFromSnapshot(QueueItem item) {
@@ -5847,7 +6644,7 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
         : json['cover_thumb_path']?.toString().trim() ?? '';
     return QueueItem(
       path: path,
-      title: json['title']?.toString() ?? _titleFromPath(path),
+      title: _restoredTitle(json, path),
       artist: json['artist']?.toString() ?? '',
       album: json['album']?.toString() ?? '',
       durationMs: ((json['duration'] as num?)?.toInt() ?? 0) * 1000,
@@ -6343,7 +7140,7 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
     if (path.isEmpty) return null;
     return QueueItem(
       path: path,
-      title: json['title']?.toString() ?? _titleFromPath(path),
+      title: _restoredTitle(json, path),
       artist: json['artist']?.toString() ?? '',
       album: json['album']?.toString() ?? '',
       durationMs: (json['durationMs'] as num?)?.toInt() ?? 0,
@@ -6416,6 +7213,7 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
         headers: null,
         tag: mediaItem,
         requestId: requestId,
+        origin: 'cloud:direct-link',
       );
     }
 
@@ -7695,6 +8493,10 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
       try {
         final dbPath = await _ref.read(dbPathProvider.future);
         await statsRecordPlay(dbPath: dbPath, payloadJson: payload);
+        // 落库成功后把最新时长同步到云端排行榜（内部有 60s 节流）。
+        // 此前上报只挂在首页日榜 provider 的构建里，用户长时间停留在
+        // 播放页不动首页时，云端时长会一直停在旧值。
+        unawaited(uploadListenStats(_ref));
       } catch (_) {
         // 统计失败不影响播放；下一次刷写继续尝试记录新增时长。
       }
@@ -8132,6 +8934,10 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
         _manualPause = true;
         _flushCurrentPlaybackStats();
         await _player.pause();
+        // 暂停即结算：等最后一段时长落库后立即同步云端排行榜。
+        unawaited(
+          _statsWriteChain.then((_) => uploadListenStats(_ref, force: true)),
+        );
       } else {
         // 音源未就绪（恢复会话失败、上首播放失败等）时不能直接
         // _startPlayback：_preparedSourceRequestId 校验不通过会静默返回，
@@ -8391,16 +9197,44 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
       return;
     }
     _streamRecoverCount++;
+    // 断点续播：记下此刻进度，重解析拿到新直链后 seek 回来。
+    //
+    // 旧实现重解析后只 seek 到「跳过头部」（多数用户为 0），于是每次断流
+    // 自愈都把播放位置打回开头——用户视角就是「卡几秒 → 进度条复位 →
+    // 接着播」，只要上游周期性掐流就是一个无限循环。流断属于网络层问题，
+    // 与播放位置无关，没有任何理由丢掉已经播过的进度。
+    final liveMs = _player.position.inMilliseconds;
+    final fallbackMs = (state.position * 1000).round();
+    final resumeMs = liveMs > 0 ? liveMs : fallbackMs;
+    final lastMs = _lastStreamRecoverPosMs;
+    // 同一位置（±15s）连续第二次断流：当作坏点，跳过 30s 越过它，
+    // 否则原地重试会一直撞在同一段坏数据上。
+    final sameSpot = lastMs != null && (resumeMs - lastMs).abs() < 15000;
+    _lastStreamRecoverPosMs = resumeMs;
+    var targetMs = resumeMs;
+    if (sameSpot) targetMs = resumeMs + 30000;
+    // 不超过曲尾：超出时交给正常的播完逻辑（避免 seek 到 duration 之后
+    // 触发 completed 抖动）。
+    final durationMs = (state.duration * 1000).round();
+    if (durationMs > 0 && targetMs > durationMs - 1000) {
+      targetMs = durationMs > 2000 ? durationMs - 1000 : durationMs;
+    }
     AppLogStore.instance.add(
       '[卡顿] 流断自动恢复 #$_streamRecoverCount：$reason，'
-      '重新解析当前曲「${state.current?.title ?? state.current?.path}」',
+      '重新解析当前曲「${state.current?.title ?? state.current?.path}」'
+      '断点=${resumeMs}ms → 续播=${targetMs}ms${sameSpot ? '（同点位反复断流，跳过坏点）' : ''}',
       level: AppLogLevel.warning,
     );
     unawaited(() async {
       await _playAt(index);
       final restartSecs = _restartSeekSeconds();
-      if (restartSecs > 0) {
-        await seek(restartSecs);
+      final targetSecs = targetMs > 0 ? targetMs / 1000.0 : restartSecs;
+      if (targetSecs > 0) {
+        try {
+          await seek(targetSecs);
+        } catch (_) {
+          // 起播失败时位置无从谈起：交上层按播放失败处理。
+        }
       }
     }());
   }
@@ -8572,10 +9406,26 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
     _dspDeferredTakeoverTimer?.cancel();
     unawaited(_stopDspPipeline());
     _playerHeartbeatTimer?.cancel();
+    _externalResumeProbeTimer?.cancel();
+    _externalResumeProbeTimer = null;
+    _externalResumeProbeToken++;
     _player.dispose();
     super.dispose();
   }
 }
+
+/// 「释放/重载窗口把 idle 归一化为 ready」的共享开关（见 [_MediaSessionBridge._publish]）。
+///
+/// 置位方在宿主 [_PlayerNotifier]（释放实例前、[playAt] 停旧源前），消费与
+/// 复位方在媒体会话桥接的状态发布逻辑里——两者是不同类，必须共享同一份
+/// 状态，故用模块级可变对象承载，而不是各自持有字段。
+class _IdleNormalizationGate {
+  /// 为 true 时，桥接把 idle 上报为 ready（暂停态），避免 OriginOS 把系统
+  /// 播控卡片判定为「应用已停止播放」而置灰按钮、吞掉单击。
+  bool armed = false;
+}
+
+final _IdleNormalizationGate _idleNormalizationGate = _IdleNormalizationGate();
 
 class _LocalPlaybackException implements Exception {
   const _LocalPlaybackException(this.message);

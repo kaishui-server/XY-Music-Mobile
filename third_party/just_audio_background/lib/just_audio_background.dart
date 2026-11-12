@@ -19,6 +19,18 @@ late JustAudioPlatform _platform;
 /// 未初始化（JustAudioBackground.init 尚未调用）时抛出 LateInitializationError。
 SwitchAudioHandler get xySwitchAudioHandler => _audioHandler;
 
+/// XY Music 本地补丁：当前活跃的平台播放 handler（最近一次被创建的
+/// `_PlayerAudioHandler`）。
+///
+/// 宿主若在 inner 上包了一层媒体会话桥接，播放器实例重建（内存治理
+/// dispose 后新建 AudioPlayer）时 [_JustAudioPlayer] 不会再把 inner 换回
+/// 新 handler（见其构造函数里的保留逻辑），桥接于是继续监听**已释放的旧
+/// handler**：PlaybackState 冻结在释放前那一帧，通知栏的播放/暂停图标、
+/// 进度条都不再变化（用户看到的就是"点了播放没反应"）。宿主凭本访问器
+/// 拿到新的裸 handler 重新包裹即可恢复转发。
+AudioHandler? _xyCurrentPlayerHandler;
+AudioHandler? get xyCurrentPlayerHandler => _xyCurrentPlayerHandler;
+
 /// XY Music 本地补丁：平台播放 handler 就位探测（混淆安全）。
 ///
 /// 混淆构建（--obfuscate）会把 Dart 类名替换成无意义符号，
@@ -485,6 +497,9 @@ class _JustAudioPlayer extends AudioPlayerPlatform {
 
   _JustAudioPlayer({required this.initRequest}) : super(initRequest.id) {
     eventController.onCancel = _playerAudioHandler.cancelStreamSubscriptions;
+    // 记录当前活跃的平台 handler，供宿主桥接在重建后重新包裹（见
+    // [xyCurrentPlayerHandler]）。
+    _xyCurrentPlayerHandler = _playerAudioHandler;
     _playerAudioHandler._initPlayer(initRequest);
     // XY Music 本地补丁：重建播放器实例时保留宿主已安装的媒体会话
     // 桥接（_MediaSessionBridge 套在 _playerAudioHandler 外层）。若此时
@@ -526,15 +541,22 @@ class _JustAudioPlayer extends AudioPlayerPlatform {
   Future<LoadResponse> load(LoadRequest request) =>
       _playerAudioHandler.customLoad(request);
 
+  // XY Music 本地补丁（分层隔离）：引擎内部的 play/pause 必须直连裸
+  // handler [_playerAudioHandler]，绝不能穿过媒体会话桥接
+  // （宿主安装的 _MediaSessionBridge）。桥接的 play()/pause() 会回调宿主
+  // 的恢复链路，而宿主恢复链路最终又会调 AudioPlayer.play() 回到这里，
+  // 形成「引擎调用 → 桥接 → 宿主 → 引擎调用」的无限重入，软件内点播放
+  // 会直接卡死/无声。直连后结构上不可能成环：引擎调用走引擎，只有外部
+  // 按键（通知栏/锁屏/耳机/车机）才经过桥接。
   @override
   Future<PlayResponse> play(PlayRequest request) async {
-    await _audioHandler.play();
+    await _playerAudioHandler.play();
     return PlayResponse();
   }
 
   @override
   Future<PauseResponse> pause(PauseRequest request) async {
-    await _audioHandler.pause();
+    await _playerAudioHandler.pause();
     return PauseResponse();
   }
 
@@ -1060,7 +1082,20 @@ class _PlayerAudioHandler extends BaseAudioHandler
       _updatePosition();
       customEvent.add(_PlayingEvent(_playing = true));
       _broadcastState();
-      await (await _player).play(PlayRequest());
+      // XY Music 本地补丁（不可静默挂起）：平台播放器已释放时
+      // `_playerCompleter` 会被 stop()/dispose 重置为未完成，`await
+      // (await _player)` 将永不落定——Future 无声挂起，既不报错也不出声，
+      // 而上面已经把 `_playing=true` 广播出去，通知栏/UI 反而显示"正在
+      // 播放"。这类调用一定发生在实例重建/释放之后，没有任何可以等待的
+      // 对象，就地回滚为暂停态把决定权交回调用方（宿主会重走完整音源
+      // 加载链），绝不把播放指令挂在空 completer 上。
+      final platform = _playerCompleter.value;
+      if (platform == null) {
+        customEvent.add(_PlayingEvent(_playing = false));
+        _broadcastState();
+        return;
+      }
+      await platform.play(PlayRequest());
     }
   }
 
@@ -1069,7 +1104,10 @@ class _PlayerAudioHandler extends BaseAudioHandler
     _updatePosition();
     customEvent.add(_PlayingEvent(_playing = false));
     _broadcastState();
-    await (await _player).pause(PauseRequest());
+    // 同上：平台播放器不存在时暂停已是既成事实，不做空等待。
+    final platform = _playerCompleter.value;
+    if (platform == null) return;
+    await platform.pause(PauseRequest());
   }
 
   void _updatePosition() {

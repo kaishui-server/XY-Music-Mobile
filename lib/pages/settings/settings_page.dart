@@ -265,12 +265,6 @@ const settingsSearchEntries = <SettingsSearchEntry>[
     keywords: '搜索线程 并发 同时请求 平台 串行 全部并行',
   ),
   SettingsSearchEntry(
-    title: '显示音质标识',
-    path: ['播放', '显示音质标识'],
-    route: '/settings/playback',
-    icon: Icons.verified_outlined,
-  ),
-  SettingsSearchEntry(
     title: '保持屏幕常亮',
     path: ['播放', '保持屏幕常亮'],
     route: '/settings/playback',
@@ -1185,13 +1179,6 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
           value: settings?.playOtherAudioWithoutInterruption ?? false,
           onChanged: (value) =>
               notifier.setPlayOtherAudioWithoutInterruption(value),
-        ),
-        _switchTile(
-          context,
-          icon: Icons.verified,
-          title: '显示音质标识',
-          value: settings?.showQualityBadges ?? true,
-          onChanged: (v) => notifier.setShowQualityBadges(v),
         ),
         _switchTile(
           context,
@@ -2788,6 +2775,79 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
             }
           }
 
+          /// 选择动态壁纸（视频）。落盘后与图片壁纸共用同一个设置项，
+          /// 渲染层按扩展名判断该走图片还是视频。
+          Future<void> pickVideo() async {
+            // 视频固定 withData:false：几十上百 MB 读进内存再写盘，
+            // 低端机会被 LMK 直接杀掉。
+            final picked = await FilePicker.platform.pickFiles(
+              type: FileType.custom,
+              allowedExtensions: const [
+                'mp4',
+                'm4v',
+                'mov',
+                'webm',
+                'mkv',
+                '3gp',
+              ],
+              withData: false,
+            );
+            if (picked == null || picked.files.isEmpty) return;
+            final file = picked.files.single;
+            final sourcePath = file.path;
+            if (sourcePath == null) {
+              if (context.mounted) {
+                ScaffoldMessenger.of(
+                  context,
+                ).showSnackBar(const SnackBar(content: Text('无法读取视频，请重新选择')));
+              }
+              return;
+            }
+            // 壁纸是常驻循环播放，300 MB 封顶：再大的文件光是复制落盘
+            // 就要十几秒，硬解缓冲也会把常驻内存顶穿。
+            if (file.size > 300 * 1024 * 1024) {
+              if (context.mounted) {
+                ScaffoldMessenger.of(
+                  context,
+                ).showSnackBar(const SnackBar(content: Text('视频不能超过 300 MB')));
+              }
+              return;
+            }
+            try {
+              final dataDir = await ref.read(appDataDirProvider.future);
+              final directory = Directory(p.join(dataDir, 'appearance'));
+              await directory.create(recursive: true);
+              final extension = p.extension(sourcePath).toLowerCase();
+              final safeExtension = const [
+                '.mp4',
+                '.m4v',
+                '.mov',
+                '.webm',
+                '.mkv',
+                '.3gp',
+              ].contains(extension)
+                  ? extension
+                  : '.mp4';
+              // 文件名每次都变化，理由同图片：复用旧路径会被当缓存命中。
+              final target = File(
+                p.join(
+                  directory.path,
+                  'custom_background_${DateTime.now().microsecondsSinceEpoch}$safeExtension',
+                ),
+              );
+              await File(sourcePath).copy(target.path);
+              if (context.mounted) {
+                setSheetState(() => imagePath = target.path);
+              }
+            } catch (error) {
+              if (context.mounted) {
+                ScaffoldMessenger.of(
+                  context,
+                ).showSnackBar(SnackBar(content: Text('保存背景视频失败：$error')));
+              }
+            }
+          }
+
           return SafeArea(
             child: Padding(
               padding: const EdgeInsets.fromLTRB(16, 0, 16, 20),
@@ -2801,7 +2861,7 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
                   ),
                   const SizedBox(height: 6),
                   Text(
-                    '图片仅保存在本机，不会上传到服务器。',
+                    '支持图片与动态视频（mp4 / mov / webm 等），仅保存在本机，不会上传到服务器。',
                     style: TextStyle(
                       color: Theme.of(context).colorScheme.onSurfaceVariant,
                       fontSize: 12,
@@ -2874,8 +2934,14 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
                     children: [
                       OutlinedButton.icon(
                         onPressed: pickImage,
-                        icon: const Icon(Icons.upload_file_outlined),
-                        label: const Text('选择图片'),
+                        icon: const Icon(Icons.image_outlined),
+                        label: const Text('图片'),
+                      ),
+                      const SizedBox(width: 8),
+                      OutlinedButton.icon(
+                        onPressed: pickVideo,
+                        icon: const Icon(Icons.movie_outlined),
+                        label: const Text('视频'),
                       ),
                       const Spacer(),
                       if (imagePath.isNotEmpty)
@@ -2883,15 +2949,18 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
                           onPressed: () => setSheetState(() => imagePath = ''),
                           child: const Text('恢复默认'),
                         ),
-                      const SizedBox(width: 6),
-                      FilledButton(
-                        onPressed: () => Navigator.pop(
-                          sheetContext,
-                          _CustomBackgroundResult(imagePath, blur, fade),
-                        ),
-                        child: const Text('应用'),
-                      ),
                     ],
+                  ),
+                  const SizedBox(height: 8),
+                  SizedBox(
+                    width: double.infinity,
+                    child: FilledButton(
+                      onPressed: () => Navigator.pop(
+                        sheetContext,
+                        _CustomBackgroundResult(imagePath, blur, fade),
+                      ),
+                      child: const Text('应用'),
+                    ),
                   ),
                 ],
               ),

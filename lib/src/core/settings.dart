@@ -244,7 +244,6 @@ class AppSettings {
     this.landscapeImmersiveLyrics = false,
     this.portraitImmersiveLyrics = true,
     this.homeModules = kDefaultHomeModules,
-    this.showQualityBadges = true,
     // 列表中的网络歌曲（导入歌单/搜索结果）是否加载网络封面。
     this.showPlaylistSongCovers = true,
     this.onlineDefaultQuality = '320k',
@@ -378,7 +377,6 @@ class AppSettings {
 
   /// 首页已启用的模块 id（猜你想听固定展示，不在列表中即关闭）。
   final List<String> homeModules;
-  final bool showQualityBadges;
 
   /// 列表中的网络歌曲（导入歌单/搜索结果）是否加载网络封面。关闭后
   /// 这类歌曲在列表中显示渐变占位图，跳过逐首下载网络封面，加快
@@ -514,7 +512,6 @@ class AppSettings {
     bool? landscapeImmersiveLyrics,
     bool? portraitImmersiveLyrics,
     List<String>? homeModules,
-    bool? showQualityBadges,
     bool? showPlaylistSongCovers,
     String? onlineDefaultQuality,
     String? qqSourceApiKey,
@@ -609,7 +606,6 @@ class AppSettings {
       portraitImmersiveLyrics:
           portraitImmersiveLyrics ?? this.portraitImmersiveLyrics,
       homeModules: homeModules ?? this.homeModules,
-      showQualityBadges: showQualityBadges ?? this.showQualityBadges,
       showPlaylistSongCovers:
           showPlaylistSongCovers ?? this.showPlaylistSongCovers,
       onlineDefaultQuality: onlineDefaultQuality ?? this.onlineDefaultQuality,
@@ -760,7 +756,6 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
       homeModules: prefs.getStringList('homeModules') == null
           ? kDefaultHomeModules
           : normalizeHomeModules(prefs.getStringList('homeModules')!),
-      showQualityBadges: prefs.getBool('showQualityBadges') ?? true,
       showPlaylistSongCovers:
           prefs.getBool('showPlaylistSongCovers') ?? true,
       onlineDefaultQuality: prefs.getString('onlineDefaultQuality') ?? '320k',
@@ -1022,7 +1017,6 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
         next.portraitImmersiveLyrics,
       ),
       prefs.setStringList('homeModules', next.homeModules),
-      prefs.setBool('showQualityBadges', next.showQualityBadges),
       prefs.setBool('showPlaylistSongCovers', next.showPlaylistSongCovers),
       prefs.setString('onlineDefaultQuality', next.onlineDefaultQuality),
       prefs.setString('qqSourceApiKey', next.qqSourceApiKey),
@@ -1300,9 +1294,6 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
         .toList(growable: false);
     return _save(current.copyWith(homeModules: ordered));
   }
-  Future<void> setShowQualityBadges(bool v) => _save(
-    (state.valueOrNull ?? const AppSettings()).copyWith(showQualityBadges: v),
-  );
   Future<void> setShowPlaylistSongCovers(bool v) => _save(
     (state.valueOrNull ?? const AppSettings()).copyWith(
       showPlaylistSongCovers: v,

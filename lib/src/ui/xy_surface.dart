@@ -4,6 +4,7 @@ import 'dart:ui' as ui;
 import 'package:flutter/material.dart';
 
 import 'xy_theme.dart';
+import 'xy_video_wallpaper.dart';
 
 class XyPageBackground extends StatelessWidget {
   const XyPageBackground({super.key, required this.child});
@@ -141,6 +142,11 @@ class _XyAppBackgroundState extends State<XyAppBackground> {
   }) {
     final dark = brightness == Brightness.dark;
     final hasImage = path.isNotEmpty;
+    // 动态壁纸：自定义壁纸既可以是图片也可以是视频（mp4/mov/webm…）。
+    // 视频层与原图片层同构——一份清晰打底 + 一份高斯模糊叠层，两层
+    // 共享同一个 VideoPlayerController（见 XyVideoWallpaper 的租约池），
+    // 渲染成本只是一次纹理采样，不会额外解码一份视频。
+    final isVideo = xyIsVideoWallpaperPath(path);
 
     Widget image() {
       if (decodedImage != null) {
@@ -160,6 +166,11 @@ class _XyAppBackgroundState extends State<XyAppBackground> {
       );
     }
 
+    Widget media() {
+      if (isVideo) return XyVideoWallpaper(path: path);
+      return image();
+    }
+
     // 整个背景是独立的重绘边界，并且这个 Widget 实例只会在背景设置真的
     // 变化时重建。路由入场、退场和页面滚动只重绘前景，不再让手机 GPU
     // 重新合成模糊图片，避免先出现默认底色再闪出背景图。
@@ -170,14 +181,17 @@ class _XyAppBackgroundState extends State<XyAppBackground> {
             ? Stack(
                 fit: StackFit.expand,
                 children: [
-                  image(),
-                  ImageFiltered(
-                    imageFilter: ui.ImageFilter.blur(
-                      sigmaX: blur,
-                      sigmaY: blur,
+                  media(),
+                  if (isVideo && blur <= 0)
+                    const SizedBox.shrink()
+                  else
+                    ImageFiltered(
+                      imageFilter: ui.ImageFilter.blur(
+                        sigmaX: blur,
+                        sigmaY: blur,
+                      ),
+                      child: media(),
                     ),
-                    child: image(),
-                  ),
                   ColoredBox(
                     color: (dark ? Colors.black : Colors.white).withValues(
                       alpha: ((dark ? .38 : .28) + fade).clamp(0.0, 1.0),

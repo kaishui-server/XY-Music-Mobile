@@ -84,13 +84,23 @@ class _SearchSourceTab {
 }
 
 /// LX 平台显示名，使用各平台的直接名称。
+///
+/// 未登记的代号不再被过滤掉（订阅源可以自行扩展平台，如 ikun 的 git、
+/// lx-cit 的 qs/jo）：走 [_lxSourceDisplayName] 兜底显示代号本身，保证
+/// 「订阅源声明多少平台，搜索页就展示多少平台」。
 const _lxSourceNames = <String, String>{
   'kw': '酷我音乐',
   'kg': '酷狗音乐',
   'tx': 'QQ音乐',
   'wy': '网易云音乐',
   'mg': '咪咕音乐',
+  'git': 'Gitcode',
+  'qs': '汽水音乐',
+  'jo': 'JOOX',
 };
+
+String _lxSourceDisplayName(String source) =>
+    _lxSourceNames[source] ?? source.toUpperCase();
 
 /// 把已启用插件列表转换成搜索 Tab 列表：一插件一 Tab。
 List<_SearchSourceTab> _buildSearchSourceTabs(
@@ -103,10 +113,8 @@ List<_SearchSourceTab> _buildSearchSourceTabs(
         name: plugin.name,
         lxSources: plugin.isLx
             ? (plugin.lxSources.isEmpty
-                  ? const ['kw', 'kg', 'tx', 'wy', 'mg']
-                  : plugin.lxSources
-                        .where(_lxSourceNames.containsKey)
-                        .toList(growable: false))
+                  ? kHostLxSearchSources
+                  : plugin.lxSources)
             : const [],
       ),
   ];
@@ -475,10 +483,14 @@ class _SearchPageState extends ConsumerState<SearchPage>
           coverUrl: item.coverUrl,
           categoryLabel: _categoryLabelForPlugin(category, plugin),
           // 歌手封面缺失时按名补查（LX 走公开搜索，其余走插件歌手搜索）；
-          // 专辑/歌单不补查。
+          // 专辑/歌单不补查。LX 的歌手条目 coverUrl 是聚合来的歌曲封面
+          // 而非真头像，标记为兜底图让详情页用补查结果覆盖（用户反馈
+          // 详情页与列表头像不统一的根因）。
           resolveCoverUrl: category == _SearchCategory.artists
               ? (name) => _artistAvatarResolver.resolve(plugin.id, name)
               : null,
+          coverIsFallback:
+              category == _SearchCategory.artists && plugin.isLx,
           loadSongs: () async {
             final lxSource = _lxSourceFor(tab);
             final results = switch (category) {
@@ -664,7 +676,7 @@ class _SearchPageState extends ConsumerState<SearchPage>
               for (final source in tab.lxSources)
                 _sourceMenuEntry(
                   source,
-                  _lxSourceNames[source]!,
+                  _lxSourceDisplayName(source),
                   current == source,
                 ),
             ],
@@ -866,6 +878,14 @@ class _SearchPageState extends ConsumerState<SearchPage>
         categoryLabel: _categoryLabelForPlugin(category, plugin),
         showMiniPlayer: showMiniPlayer,
         onTap: (item) => _openCatalogResult(tab, category, item),
+        // LX 音源的歌手条目由歌曲聚合而来，coverUrl 是歌曲封面而非歌手
+        // 头像，与详情页补查出的头像不一致（用户反馈）。这里对 LX 歌手
+        // tab 接入同一套头像补查（resolver 带内存缓存，同名歌手只查一次）；
+        // 非 LX 插件的歌手搜索本身就返回真实歌手头像，无需补查。
+        resolveAvatar:
+            category == _SearchCategory.artists && tab.plugin.isLx
+            ? (name) => _artistAvatarResolver.resolve(tab.plugin.id, name)
+            : null,
       );
     }
     return SongsListView(
@@ -1121,6 +1141,7 @@ class _CatalogListView extends StatefulWidget {
     required this.categoryLabel,
     required this.showMiniPlayer,
     required this.onTap,
+    this.resolveAvatar,
   });
 
   final List<PluginCatalogResult> items;
@@ -1128,6 +1149,9 @@ class _CatalogListView extends StatefulWidget {
   final String categoryLabel;
   final bool showMiniPlayer;
   final ValueChanged<PluginCatalogResult> onTap;
+
+  /// 歌手头像补查回调（仅 LX 音源歌手 tab 非空，见构造处的注释）。
+  final Future<String> Function(String artistName)? resolveAvatar;
 
   @override
   State<_CatalogListView> createState() => _CatalogListViewState();
@@ -1160,6 +1184,10 @@ class _CatalogListViewState extends State<_CatalogListView> {
           itemBuilder: (context, index) {
             final item = widget.items[index];
             final cover = item.coverUrl.trim();
+            // LX 歌手条目走头像补查：补查完成前显示占位图标，不先闪一张
+            // 错误的歌曲封面（resolver 有缓存，重复搜索同一歌手秒回）。
+            final resolveArtistAvatar =
+                isArtist && widget.resolveAvatar != null;
             final placeholder = Icon(
               isArtist
                   ? Icons.person_outline_rounded
@@ -1179,7 +1207,14 @@ class _CatalogListViewState extends State<_CatalogListView> {
                 child: SizedBox(
                   width: 52,
                   height: 52,
-                  child: cover.isEmpty
+                  child: resolveArtistAvatar
+                      ? _ArtistAvatar(
+                          artistName: item.title,
+                          resolve: widget.resolveAvatar!,
+                          scheme: scheme,
+                          placeholder: placeholder,
+                        )
+                      : cover.isEmpty
                       ? ColoredBox(
                           color: scheme.surfaceContainerHighest,
                           child: Center(child: placeholder),
@@ -1220,6 +1255,62 @@ class _CatalogListViewState extends State<_CatalogListView> {
           hasMiniPlayer: widget.showMiniPlayer,
         ),
       ],
+    );
+  }
+}
+
+/// LX 歌手条目的补查头像：初始占位，resolve 返回真头像后替换显示。
+/// resolver 自带内存缓存，同一（插件, 歌手名）只发起一次查询。
+class _ArtistAvatar extends StatefulWidget {
+  const _ArtistAvatar({
+    required this.artistName,
+    required this.resolve,
+    required this.scheme,
+    required this.placeholder,
+  });
+
+  final String artistName;
+  final Future<String> Function(String artistName) resolve;
+  final ColorScheme scheme;
+  final Widget placeholder;
+
+  @override
+  State<_ArtistAvatar> createState() => _ArtistAvatarState();
+}
+
+class _ArtistAvatarState extends State<_ArtistAvatar> {
+  String? _url;
+
+  @override
+  void initState() {
+    super.initState();
+    _resolve();
+  }
+
+  Future<void> _resolve() async {
+    final url = await widget.resolve(widget.artistName);
+    if (!mounted || url.isEmpty || url == _url) return;
+    setState(() => _url = url);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final url = _url;
+    if (url == null || url.isEmpty) {
+      return ColoredBox(
+        color: widget.scheme.surfaceContainerHighest,
+        child: Center(child: widget.placeholder),
+      );
+    }
+    return Image.network(
+      url,
+      // 与列表其它网络封面同口径：CDN 校验 UA，必须带浏览器请求头。
+      headers: coverImageNetworkHeaders(url),
+      fit: BoxFit.cover,
+      errorBuilder: (_, _, _) => ColoredBox(
+        color: widget.scheme.surfaceContainerHighest,
+        child: Center(child: widget.placeholder),
+      ),
     );
   }
 }

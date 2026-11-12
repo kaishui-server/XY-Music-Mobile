@@ -134,13 +134,36 @@ object FreezeProbe {
     @Volatile
     private var foregroundActivities = 0
 
+    /**
+     * 最近一次「进入前台」的时刻（uptimeMillis）。
+     *
+     * 防误报关键：后台被冻结期间 Dart 心跳必然停更，转前台后的首个采样
+     * 读到的 dartLag 里混着整段后台挂起期（荣耀 AAP-AN00 实测 8173942ms
+     * 那条「停摆」即此误报——判定发生在转前台后的第一个采样点）。恢复
+     * 前台后必须先观测到一次 Dart 心跳（noteDartProbe/noteDartProbeIdle
+     * 都算），才能确认「当前停摆时长只含前台时间」，才有资格判真停摆。
+     */
+    @Volatile
+    private var lastResumedAtMs = 0L
+
     private val lifecycleTracker = object : Application.ActivityLifecycleCallbacks {
         override fun onActivityResumed(activity: Activity) {
+            val enteringForeground = foregroundActivities == 0
             foregroundActivities++
+            // 前后台切换时间线：判读停摆记录时需要知道「这条停摆是在进前台
+            // 后第几个采样点测得的」。只记切换沿（0→1 / 1→0），不记每次
+            // 页面级 resume/pause，避免刷屏。
+            if (enteringForeground) {
+                lastResumedAtMs = SystemClock.uptimeMillis()
+                record("[${timeFormat.format(Date())}] 生命周期 进入前台（onActivityResumed ${activity.localClassName}）")
+            }
         }
 
         override fun onActivityPaused(activity: Activity) {
             if (foregroundActivities > 0) foregroundActivities--
+            if (foregroundActivities == 0) {
+                record("[${timeFormat.format(Date())}] 生命周期 退到后台（onActivityPaused ${activity.localClassName}）")
+            }
         }
 
         override fun onActivityCreated(activity: Activity, savedInstanceState: Bundle?) {}
@@ -202,6 +225,20 @@ object FreezeProbe {
                 "进程启动 pid=${Process.myPid()} uptime=${SystemClock.uptimeMillis()}ms " +
                     "设备=${Build.MANUFACTURER} ${Build.MODEL} API=${Build.VERSION.SDK_INT}",
             )
+            // 版本号随现场落盘：此前 freeze 文件头部不含版本，只能靠
+            // 「dex 里有没有新格式字符串」反推是哪个构建，事后无法直接归档。
+            val pkgInfo = try {
+                app.packageManager.getPackageInfo(app.packageName, 0)
+            } catch (_: Throwable) {
+                null
+            }
+            @Suppress("DEPRECATION")
+            val versionCode = when {
+                pkgInfo == null -> -1L
+                Build.VERSION.SDK_INT >= Build.VERSION_CODES.P -> pkgInfo.longVersionCode
+                else -> pkgInfo.versionCode.toLong()
+            }
+            add("版本 versionName=${pkgInfo?.versionName ?: "?"} versionCode=$versionCode")
             // 判定口径随现场一起落盘：日后翻日志时不必再回头倒推阈值与
             // 「为什么这条算异常」。Dart 侧每条采样行带 dartLag/probeGap/
             // dartIdle 三项自证数据，据此可直接区分「isolate 真停摆」与
@@ -209,7 +246,7 @@ object FreezeProbe {
             add(
                 "判定口径 采样间隔=${INTERVAL_MS}ms Dart心跳=20s " +
                     "停摆阈值=${DART_LAG_EVENT_MS}ms " +
-                    "（需同时满足：前台 + 本探针采样间隔正常）",
+                    "（需同时满足：前台 + 本探针采样间隔正常 + 转前台后已观测到 Dart 心跳）",
             )
             addAll(previousExitInfo(app))
         }
@@ -272,22 +309,32 @@ object FreezeProbe {
         val dartIdle = lastDartIdleReason.ifEmpty { "active" }
         val line = memoryLine(context, dartLag, probeGap, dartIdle)
         val dartStalled = dartLag >= DART_LAG_EVENT_MS
-        // 停摆判定三档，必须先排除「不该归咎于 Dart」的两种情况：
+        // 停摆判定三档，必须先排除「不该归咎于 Dart」的三种情况：
         // ① 进程在后台：MagicOS/ColorOS 等冻结 Dart isolate 是省电行为
         //    （native 音频线程不受影响，歌照常出声）；
-        // ② 探针自身也被冻结（probeGap ≥ 2 个采样周期）：整机冻结，与 Dart 无关。
-        // 只有「前台 + 探针自身仍在按周期采样 + Dart 心跳仍不动」才算真故障
-        // （ANR 级），才落盘现场——否则正常后台播放/暂停都会留下一份「崩溃
-        // 记录」，把真卡死淹没（荣耀 AAP-AN00 实测 37 分钟假停摆即此误报）。
-        val dartStallAbnormal = dartStalled && inForeground && !proberFrozen
+        // ② 探针自身也被冻结（probeGap ≥ 2 个采样周期）：整机冻结，与 Dart 无关；
+        // ③ 转前台后尚未观测到 Dart 心跳：当前 dartLag 里混着整段后台挂起期
+        //    （后台心跳必然停更），不能算前台停摆——等下一个心跳（≤20s）刷新
+        //    后重新评估。荣耀 AAP-AN00 实测 8173942ms 那条「停摆」即此误报：
+        //    判定发生在转前台后的第一个采样点，后台挂起期被一并计入。
+        // 只有「前台 + 探针自身仍在按周期采样 + 转前台后已见 Dart 心跳 +
+        // Dart 心跳仍不动」才算真故障（ANR 级），才落盘现场——否则正常后台
+        // 播放/暂停都会留下一份「崩溃记录」，把真卡死淹没（同机型实测 37
+        // 分钟假停摆即后台冻结误报）。
+        val probeAfterResume = lastResumedAtMs == 0L || lastDartProbeAt >= lastResumedAtMs
+        val dartStallAbnormal = dartStalled && inForeground && !proberFrozen && probeAfterResume
         if (dartStalled && !dartStallAbnormal && !bgStallNoted) {
             bgStallNoted = true
-            val cause = if (proberFrozen) {
-                "探针自身也被冻结 ${probeGap}ms，整机冻结，非故障"
-            } else {
-                "进程在后台，系统冻结 Dart isolate，非故障"
+            val cause = when {
+                proberFrozen -> "探针自身也被冻结 ${probeGap}ms，整机冻结，非故障"
+                !probeAfterResume ->
+                    "转前台后尚未观测到 Dart 心跳，停摆时长含后台挂起期，疑似后台冻结残留，非故障" +
+                        "（进前台=${(postedAt - lastResumedAtMs)}ms 前）"
+                else -> "进程在后台，系统冻结 Dart isolate，非故障"
             }
-            record("[${timeFormat.format(Date())}] Dart isolate 停摆 ${dartLag}ms（$cause）")
+            record(
+                "[${timeFormat.format(Date())}] Dart isolate 心跳停 ${dartLag}ms（$cause）${readCgroupInfo()}",
+            )
         }
         if (!dartStalled) bgStallNoted = false
         if (dartStallAbnormal) {
@@ -296,10 +343,13 @@ object FreezeProbe {
                     "（probeGap=${probeGap}ms dartIdle=$dartIdle）",
                 force = true,
             )
-            // 首次判停摆时抓一次全线程状态：直接区分「被锁/IO 阻塞」
-            // 与「CPU 空转」。整段一次性写入，避免逐线程开关文件。
+            // 首次判停摆时抓一次全线程状态 + cgroup 冻结状态：前者直接区分
+            // 「被锁/IO 阻塞」与「CPU 空转」，后者证明进程此刻没被 freezer
+            // 冻住（若 frozen=1 则这条停摆本身就是冻结误报）。整段一次性
+            // 写入，避免逐线程开关文件。
             if (!threadDumpDone) {
                 threadDumpDone = true
+                record(readCgroupInfo(), force = true)
                 record(
                     readThreadStates().joinToString(separator = "\n"),
                     force = true,
@@ -468,6 +518,36 @@ object FreezeProbe {
             }
         } catch (_: Throwable) {
             -1
+        }
+    }
+
+    /**
+     * 进程所属 cgroup 与 freezer 冻结状态（cgroup v2）。
+     *
+     * Android 12+ 把后台应用进程放进带 freezer 的 cgroup：frozen=1 期间进程
+     * 所有线程（含 Dart isolate 与本探针）被内核冻结，这就是「后台 Dart
+     * 心跳停更」的底层机制。停摆判读时需要这条证据：
+     *   - 非故障说明行里带 frozen=1 → 直接证实「停摆=系统冻结」；
+     *   - 真停摆现场带 frozen=0 → 证明进程没被冻住，isolate 是自己停的。
+     * 读取的是进程自己的 cgroup 目录（/proc/self/cgroup 给出路径），SELinux
+     * 只允许读自身，其他进程的 cgroup 读不到；部分机型/内核未挂 freezer
+     * 控制器时 cgroup.freeze 不存在，同样如实标注。
+     */
+    private fun readCgroupInfo(): String {
+        return try {
+            val self = File("/proc/self/cgroup").readText().trim()
+                .lines().firstOrNull { it.startsWith("0::") } ?: ""
+            if (self.isEmpty()) return " [cgroup] 非 cgroup v2 或无记录"
+            val path = self.substringAfter("0::")
+            val freeze = try {
+                val f = File("/sys/fs/cgroup$path/cgroup.freeze")
+                if (f.exists()) " frozen=${f.readText().trim()}" else " frozen=无freeze控制器"
+            } catch (_: Throwable) {
+                " frozen=读取受限"
+            }
+            " [cgroup]$path$freeze"
+        } catch (_: Throwable) {
+            " [cgroup] 读取失败"
         }
     }
 
@@ -822,13 +902,26 @@ object FreezeProbe {
                     file.parentFile?.mkdirs()
                     file.appendText(headerLines.joinToString(separator = "\n", postfix = "\n"))
                     // 环形缓冲里混着自我说明性质的「非故障」行（后台停摆、
-                    // 整机冻结等）。它们只该留在内存里解释上下文，不该进崩溃
-                    // 文件——否则导出的「崩溃记录」里出现「非故障」字样与真
-                    // 现场并列，既误导判断，也让这份文件的意义失效。
-                    file.appendText(
-                        ring.filterNot { it.contains("非故障") }
-                            .joinToString(separator = "\n", postfix = "\n"),
-                    )
+                    // 整机冻结、后台冻结残留等）。全部丢掉会让导出文件失去
+                    // 「为什么之前没落盘」的解释，全部保留又会让非故障行与
+                    // 真现场并列刷屏——折中：只保留最后一条（附省略计数），
+                    // 判读者既能看到最近一次未落盘的异常性质，也不会被淹没。
+                    val nonFaultCount = ring.count { it.contains("非故障") }
+                    var nonFaultSeen = 0
+                    val kept = ring.mapNotNull { buffered ->
+                        if (!buffered.contains("非故障")) return@mapNotNull buffered
+                        nonFaultSeen++
+                        when (nonFaultSeen) {
+                            nonFaultCount ->
+                                if (nonFaultCount > 1) {
+                                    buffered + "（此前还有 ${nonFaultCount - 1} 条同类说明行已省略）"
+                                } else {
+                                    buffered
+                                }
+                            else -> null
+                        }
+                    }
+                    file.appendText(kept.joinToString(separator = "\n", postfix = "\n"))
                     flushed = true
                 } else {
                     file.appendText(line + "\n")

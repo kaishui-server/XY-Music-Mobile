@@ -10,8 +10,10 @@ import 'player_sheet_morph.dart';
 const xyPageTransitionDuration = Duration(milliseconds: 300);
 const xyPageReverseTransitionDuration = Duration(milliseconds: 260);
 
-/// 播放详情页转场时长（XianYu 同款 450ms，正反向一致）。
-const xyPlayerSheetTransitionDuration = Duration(milliseconds: 450);
+/// 播放详情页转场时长（XianYu 同款 450ms 起步；5635 实测低端机 GPU
+/// 光栅化一帧 morph 约 10~16ms、120Hz 下跑不满原速，缩短到 340ms：
+/// 高开销帧数量减少约 1/4，快进快出也更贴合 XianYu 的利落手感）。
+const xyPlayerSheetTransitionDuration = Duration(milliseconds: 340);
 
 /// 播放详情页转场进行中标记：详情页从屏幕底部滑入/收回期间，底下壳层
 /// 页面的二级转场（跟随覆盖页动画）必须冻结——「页面从静态背景上滑过」
@@ -254,6 +256,11 @@ Widget xyPlayerSheetTransition(
       xySecondaryTransitionFrozen =
           animation.status == AnimationStatus.forward ||
           animation.status == AnimationStatus.reverse;
+      // 背景降级标记同步（t 未落定即转场中）。必须在帧后置位：build 阶段
+      // 直接写会同步通知监听者（详情页背景层）markNeedsBuild 而抛异常。
+      // 展开时页面本体在 t≈0.55 才挂载，首帧读到的已是降级值；t=1 落定
+      // 后一帧内恢复完整背景。
+      _syncPlayerSheetMorphing(animation.value < 1);
       // 落定（含被上层页覆盖）裸返回：t=1 时形变各层退化为页面本身。
       if (animation.value >= 1) return child!;
       if (xyPlayerSheetOrigin == null) {
@@ -263,6 +270,29 @@ Widget xyPlayerSheetTransition(
     },
   );
 }
+
+/// 把「转场未落定」写入 [xyPlayerSheetMorphing]：值未变时零开销，值变化
+/// 时推迟到帧末提交，避免 build 阶段同步通知监听者引发 markNeedsBuild
+/// 异常（详情页背景层是 ValueListenableBuilder，收到通知会重建）。
+void _syncPlayerSheetMorphing(bool morphing) {
+  if (xyPlayerSheetMorphing.value == morphing) return;
+  if (_pendingPlayerSheetMorphing == morphing) return;
+  _pendingPlayerSheetMorphing = morphing;
+  WidgetsBinding.instance.addPostFrameCallback((_) {
+    if (_pendingPlayerSheetMorphing != morphing) return;
+    _pendingPlayerSheetMorphing = null;
+    if (xyPlayerSheetMorphing.value != morphing) {
+      xyPlayerSheetMorphing.value = morphing;
+      // 探针 raster 归因窗口随 morphing 状态同步（帧回调在 build 之外
+      // 读取该标记，这里也是帧后提交，同步写安全）。
+      if (kPerformanceProbeEnabled) {
+        PerformanceProbe.instance.morphTransitionActive = morphing;
+      }
+    }
+  });
+}
+
+bool? _pendingPlayerSheetMorphing;
 
 /// 兜底转场：全屏覆盖页从底部向上滑入/收回（5574 行为）。
 Widget _playerSheetFallbackTransition(Animation<double> animation, Widget? child) {
@@ -306,6 +336,17 @@ class XyPlayerSheetRoute<T> extends PageRouteBuilder<T> {
     // 转场期间隐藏所有 MiniPlayerBar 实例本体（morph 层复刻提供
     // 面板视觉），收起动画结束（dispose）后恢复。
     xySheetRouteActive.value = true;
+    // install 当帧同步置位「转场中」：morphing 常规同步走 postFrame
+    // （见 _syncPlayerSheetMorphing），首帧空档会让壳层停画判定
+    // （shell.dart 的 P0-4）误判一帧「已落定」，把展开首帧的壳层
+    // Offstage 掉（morph 层 backdrop 下无内容，可能闪一帧深色）。
+    // 构造器是事件回调而非 build 阶段，直接写无 markNeedsBuild 风险。
+    xyPlayerSheetMorphing.value = true;
+    // 探针 raster 归因：转场窗口开始（帧回调在 build 之外读取该标记，
+    // 同步写安全）。
+    if (kPerformanceProbeEnabled) {
+      PerformanceProbe.instance.morphTransitionActive = true;
+    }
   }
 
   /// 手势写入的目标转场值：控制器未就绪（尚未 install）时暂存，
@@ -334,6 +375,10 @@ class XyPlayerSheetRoute<T> extends PageRouteBuilder<T> {
     if (_dismissing || !isActive) return;
     _dragTarget = value.clamp(0.0, 1.0);
     xyPlayerSheetGestureDriving = true;
+    // 探针：跟手期间剔除手势节奏伪影（见 probe onAnimFrame 注释）。
+    if (kPerformanceProbeEnabled) {
+      PerformanceProbe.instance.gestureDrivingAnim = true;
+    }
     final controller = this.controller;
     if (controller == null) return;
     if (controller.isAnimating) controller.stop();
@@ -359,6 +404,9 @@ class XyPlayerSheetRoute<T> extends PageRouteBuilder<T> {
     // 残留手势把面板重新拉回全屏。
     if (_dismissing || !isActive) return;
     xyPlayerSheetGestureDriving = false;
+    if (kPerformanceProbeEnabled) {
+      PerformanceProbe.instance.gestureDrivingAnim = false;
+    }
     _dragStallTimer?.cancel();
     final controller = this.controller;
     if (controller == null) return;
@@ -396,6 +444,9 @@ class XyPlayerSheetRoute<T> extends PageRouteBuilder<T> {
     _dismissing = true;
     _dragStallTimer?.cancel();
     xyPlayerSheetGestureDriving = false;
+    if (kPerformanceProbeEnabled) {
+      PerformanceProbe.instance.gestureDrivingAnim = false;
+    }
     final controller = this.controller;
     if (controller == null) {
       _popSelf();
@@ -478,11 +529,23 @@ class XyPlayerSheetRoute<T> extends PageRouteBuilder<T> {
       xyPlayerSheetRouteRef = null;
     }
     xySheetRouteActive.value = false;
+    // 兜底复位背景降级标记：正常路径由 t=1 落定复位，这里覆盖收起动画
+    // 播完（dismissed）/路由被外部直接移除等路径，避免详情页背景永久
+    // 停在轻量版本。
+    _syncPlayerSheetMorphing(false);
+    // 探针 raster 归因窗口同步关闭（与 install 置位配对；postFrame 路径
+    // 正常也会写 false，这里是路由被外部直接移除时的兜底）。
+    if (kPerformanceProbeEnabled) {
+      PerformanceProbe.instance.morphTransitionActive = false;
+    }
     // 兜底复位冻结标记：正常路径由转场落定复位，这里覆盖转场被异常
     // 中断（路由被外部直接移除等）的情况，避免壳层二级转场被永久冻结。
     xySecondaryTransitionFrozen = false;
     // 同步复位跟手标记，防止下一轮正常补间动画被误判为手势驱动。
     xyPlayerSheetGestureDriving = false;
+    if (kPerformanceProbeEnabled) {
+      PerformanceProbe.instance.gestureDrivingAnim = false;
+    }
     super.dispose();
   }
 }

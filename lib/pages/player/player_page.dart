@@ -25,6 +25,7 @@ import '../../src/effects/effects_provider.dart';
 import '../../src/favorites/favorites_provider.dart';
 import '../../src/library/library_provider.dart';
 import '../../src/library/online_cover_overrides.dart';
+import '../../src/logging/error_context.dart';
 import '../../src/lyrics/lyrics_models.dart';
 import '../../src/navigation/animated_page_route.dart';
 import '../../src/navigation/player_sheet_morph.dart';
@@ -45,6 +46,7 @@ import '../../src/plugins/plugin_runtime.dart';
 import '../../src/rust/api.dart';
 import '../../src/rust/music/types.dart';
 import '../../src/ui/xy_theme.dart';
+import '../../src/ui/xy_video_wallpaper.dart';
 import '../../src/share/share_sheet.dart';
 import 'vinyl_tonearm.dart';
 import '../../src/widgets/batch_download.dart';
@@ -1904,6 +1906,9 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
     );
     if (picked == null || !mounted) return;
     final (plugin, replacement) = picked;
+    // 崩溃现场埋点：记录「正在换源」与目标插件，崩溃文件的上下文行据此
+    // 能把候选范围收窄到这段异步链路。
+    ErrorContext.noteAction('换源:${plugin.id}');
     // 提前取 notifier：等待期间页面可能被销毁，届时 ref 已失效，
     // await 之后再 ref.read 会抛「Cannot use "ref" after the widget was
     // disposed.」。notifier 不随 widget 生命周期销毁，提前取出仍可完成换源。
@@ -2222,7 +2227,11 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
       } catch (_) {}
     }
     final wallpaper = settings?.customBackgroundPath.trim() ?? '';
-    if (wallpaper.isNotEmpty && await File(wallpaper).exists()) {
+    // 壁纸可能是动态视频：这里要的是「一张图」的字节，视频一旦
+    // readAsBytes 会整段落进内存，直接跳过走默认色。
+    if (wallpaper.isNotEmpty &&
+        !xyIsVideoWallpaperPath(wallpaper) &&
+        await File(wallpaper).exists()) {
       return await File(wallpaper).readAsBytes();
     }
     return null;
@@ -2488,21 +2497,11 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
                 mainAxisSize: MainAxisSize.min,
                 children: [
                   for (final value in qualities)
-                    ListTile(
-                      title: Text(_qualityLabel(value)),
-                      trailing: Row(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          if (value == current)
-                            Icon(
-                              Icons.check_rounded,
-                              size: 20,
-                              color: Theme.of(sheetContext).colorScheme.primary,
-                            ),
-                          if (value == current) const SizedBox(width: 6),
-                          sizeTrailing(sheetContext, value),
-                        ],
-                      ),
+                    _qualityOptionTile(
+                      sheetContext,
+                      value: value,
+                      selected: value == current,
+                      trailing: sizeTrailing(sheetContext, value),
                       onTap: () => Navigator.pop(sheetContext, value),
                     ),
                 ],
@@ -2521,6 +2520,60 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
       context,
       message: error ?? '已切换为 ${_qualityLabel(quality)}',
       type: error == null ? XyNoticeType.success : XyNoticeType.error,
+    );
+  }
+
+  /// 音质菜单单选行（图三样式）：选中项为圆角主题色填充块 + 主题色文字，
+  /// 未选中项无填充、文字仍用常规前景色。
+  Widget _qualityOptionTile(
+    BuildContext context, {
+    required String value,
+    required bool selected,
+    required Widget trailing,
+    required VoidCallback onTap,
+  }) {
+    final scheme = Theme.of(context).colorScheme;
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 2),
+      child: Material(
+        color: Colors.transparent,
+        child: InkWell(
+          borderRadius: BorderRadius.circular(12),
+          onTap: onTap,
+          child: Ink(
+            decoration: BoxDecoration(
+              color: selected ? scheme.primary.withValues(alpha: .16) : null,
+              borderRadius: BorderRadius.circular(12),
+            ),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(
+                horizontal: 16,
+                vertical: 14,
+              ),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: Text(
+                      _qualityLabel(value),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        fontSize: 15,
+                        fontWeight: selected
+                            ? FontWeight.w700
+                            : FontWeight.w500,
+                        color: selected ? scheme.primary : scheme.onSurface,
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 12),
+                  trailing,
+                ],
+              ),
+            ),
+          ),
+        ),
+      ),
     );
   }
 
@@ -3898,7 +3951,11 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
           fit: StackFit.expand,
           children: [
             // 电脑版详情页同款：封面铺满、重度模糊并叠加暗色氛围层。
-            PlayerDetailBackground(current: current),
+            // 形变转场未落定期间改走轻量背景（跳过全屏重度模糊）：
+            // 面板每帧变形会让背景子树每帧重栅格化，是全屏模糊的主要
+            // 浪费点；落定后再延迟一拍切回完整背景，避免落定那一帧同时
+            // 承担网络封面解码 + 模糊首帧栅格化（表现为动画结束又卡一下）。
+            _MorphAwareBackdrop(current: current),
             // 沉浸式竖屏：封面顶到屏幕顶端，标题行浮在封面上（否则
             // header 区域露出背景，显得封面“没有覆盖上部”）。
             // 仅封面页显示；歌词页不叠沉浸式封面，露出模糊背景。
@@ -6633,6 +6690,57 @@ class _PluginLyricsTabs extends StatelessWidget {
   }
 }
 
+/// 形变转场感知的详情页背景。
+///
+/// 转场未落定（`xyPlayerSheetMorphing` 为 true）时用轻量背景；落定后**延迟**
+/// 一小段再切回完整背景，而不是落定当帧立刻切换：完整背景要新建封面
+/// （在线封面还要走 Rust 代理 + base64 全量解码）并做一次全屏 sigma 32
+/// 模糊的首帧栅格化，放在落定帧会和「转场结束」叠成一次新的卡顿。
+class _MorphAwareBackdrop extends StatefulWidget {
+  const _MorphAwareBackdrop({required this.current});
+
+  final QueueItem? current;
+
+  @override
+  State<_MorphAwareBackdrop> createState() => _MorphAwareBackdropState();
+}
+
+class _MorphAwareBackdropState extends State<_MorphAwareBackdrop> {
+  static const _restoreDelay = Duration(milliseconds: 160);
+
+  bool _lite = xyPlayerSheetMorphing.value;
+  Timer? _restoreTimer;
+
+  @override
+  void initState() {
+    super.initState();
+    xyPlayerSheetMorphing.addListener(_onMorphingChanged);
+  }
+
+  @override
+  void dispose() {
+    _restoreTimer?.cancel();
+    xyPlayerSheetMorphing.removeListener(_onMorphingChanged);
+    super.dispose();
+  }
+
+  void _onMorphingChanged() {
+    final morphing = xyPlayerSheetMorphing.value;
+    _restoreTimer?.cancel();
+    if (morphing) {
+      if (!_lite) setState(() => _lite = true);
+      return;
+    }
+    _restoreTimer = Timer(_restoreDelay, () {
+      if (mounted && _lite) setState(() => _lite = false);
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) =>
+      PlayerDetailBackground(current: widget.current, lite: _lite);
+}
+
 /// 播放详情页背景：封面模糊 + 深色压暗/渐变，所有主题下都是暗色调。
 ///
 /// 公开是因为播放详情页的形变转场（`XyPlayerSheetMorph`）需要在面板内
@@ -6641,9 +6749,22 @@ class _PluginLyricsTabs extends StatelessWidget {
 /// 用同一组件、同样的底部对齐与尺寸溢出，可以保证面板背景与页面背景
 /// 逐像素连续。
 class PlayerDetailBackground extends ConsumerWidget {
-  const PlayerDetailBackground({super.key, required this.current});
+  const PlayerDetailBackground({
+    super.key,
+    required this.current,
+    this.lite = false,
+  });
 
   final QueueItem? current;
+
+  /// 轻量模式：跳过「全屏封面重度模糊（sigma 32）」这一层重打底，改用
+  /// 不透明兜底色 + 氛围 blob 提供同色调暗底。
+  ///
+  /// 用于播放详情页的形变转场期间（`xyPlayerSheetMorphing`）：面板矩形
+  /// 与圆角每帧变化，整棵面板子树每帧重新栅格化，而全屏模糊单份要
+  /// 7~14ms，转场期垫层与页面本体各有一份 → 尾段单帧 50~100ms。落定后
+  /// 恢复完整背景，静止画面与原先一致。
+  final bool lite;
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
@@ -6661,7 +6782,13 @@ class PlayerDetailBackground extends ConsumerWidget {
       PlayerDetailBackgroundMode.wallpaperBlur =>
         wallpaperPath.isEmpty
             ? _ambientBackdrop(current)
-            : _wallpaperBackdrop(wallpaperPath, wallpaperBlur, blurred: true),
+            // 轻量模式下去掉壁纸模糊（转场期每帧重栅格化太贵），
+            // 图片本体保留，落定后再叠回模糊。
+            : _wallpaperBackdrop(
+                wallpaperPath,
+                wallpaperBlur,
+                blurred: !lite,
+              ),
       PlayerDetailBackgroundMode.flowingLight => _ambientBackdrop(current),
       PlayerDetailBackgroundMode.customImage =>
         detailImagePath.isEmpty
@@ -6733,28 +6860,38 @@ class PlayerDetailBackground extends ConsumerWidget {
   }
 
   Widget _wallpaperBackdrop(String path, double blur, {required bool blurred}) {
-    Widget image = Image.file(
-      File(path),
-      fit: BoxFit.cover,
-      cacheWidth: 1440,
-      gaplessPlayback: true,
-      filterQuality: FilterQuality.low,
-      errorBuilder: (_, _, _) => const SizedBox.expand(),
-    );
+    // 自定义壁纸/详情页图片可以是动态视频。视频层在转场期（lite）暂停，
+    // 避免每帧换纹理把整棵面板子树拖进逐帧重栅格化。
+    final isVideo = xyIsVideoWallpaperPath(path);
+    Widget image = isVideo
+        ? XyVideoWallpaper(path: path, paused: lite)
+        : Image.file(
+            File(path),
+            fit: BoxFit.cover,
+            cacheWidth: 1440,
+            gaplessPlayback: true,
+            filterQuality: FilterQuality.low,
+            errorBuilder: (_, _, _) => const SizedBox.expand(),
+          );
     if (blurred) {
-      image = ImageFiltered(
-        imageFilter: ui.ImageFilter.blur(
-          sigmaX: blur.clamp(0, 40),
-          sigmaY: blur.clamp(0, 40),
+      // 静态图片壁纸的模糊结果恒定：独立 RepaintBoundary 让它只栅格化
+      // 一次（兄弟层逐帧重绘不再拖累）；视频壁纸内容逐帧变化，边界无法
+      // 缓存，但也不会比无边界更差。
+      image = RepaintBoundary(
+        child: ImageFiltered(
+          imageFilter: ui.ImageFilter.blur(
+            sigmaX: blur.clamp(0, 40),
+            sigmaY: blur.clamp(0, 40),
+          ),
+          child: image,
         ),
-        child: image,
       );
     }
     return image;
   }
 
   Widget _ambientBackdrop(QueueItem? item) =>
-      _AmbientBackground(item: item);
+      _AmbientBackground(item: item, lite: lite);
 }
 
 /// 氛围背景取色未就绪或无封面时的回退色板。
@@ -6778,9 +6915,10 @@ Color? _parseHslColor(dynamic value) {
 }
 
 class _AmbientBackground extends ConsumerStatefulWidget {
-  const _AmbientBackground({required this.item});
+  const _AmbientBackground({required this.item, this.lite = false});
 
   final QueueItem? item;
+  final bool lite;
 
   @override
   ConsumerState<_AmbientBackground> createState() =>
@@ -6902,23 +7040,40 @@ class _AmbientBackgroundState extends ConsumerState<_AmbientBackground> {
     // 该子树与动画无关，放在 AnimatedBuilder 外只构建一次，
     // 避免每帧重建比对整棵模糊子树（低端机上可感知的无效开销）。
     Widget blurCover;
-    if (item == null) {
+    if (widget.lite) {
+      // 轻量模式（形变转场期间 / 转场垫层）：封面重度模糊是全屏 sigma 32
+      // 的一次大采样，单份 7~14ms，而转场期面板每帧变形会让本层每帧重新
+      // 栅格化（转场垫层 + 页面本体两份叠加 → 尾段单帧 50~100ms）。
+      // 这里改用与详情页 Scaffold 兜底同一色的不透明底，色相由上面的
+      // 氛围 blob 提供，落定（lite=false）后自动切回完整模糊打底。
+      blurCover = ColoredBox(
+        color: playerBackdropBaseColor(Theme.of(context).colorScheme),
+      );
+    } else if (item == null) {
       // 无曲目兜底同样不能用纯白：详情页正文是白字暗底，白底会让整页
       // 反色——深色主题下也成立，转场中即表现为一帧整屏闪白。
       blurCover = const ColoredBox(color: XyColors.playerBackdropBase);
     } else {
-      blurCover = Transform.scale(
-        scale: 1.24,
-        child: ImageFiltered(
-          imageFilter: ui.ImageFilter.blur(sigmaX: 32, sigmaY: 32),
-          child: CoverImage(
-            songPath: item.path,
-            imageUrl: resolveOnlineCoverUrl(item.coverUrl, item.path),
-            width: double.infinity,
-            height: double.infinity,
-            radius: 0,
-            cacheWidth: 256,
-            icon: Icons.music_note_rounded,
+      blurCover = RepaintBoundary(
+        // 【性能关键】全屏 sigma-32 模糊单次栅格化 7~14ms，且内容恒定
+        // （只在切歌时变）。没有独立边界时，黑胶旋转/逐字歌词等兄弟层
+        // 的每帧重绘会冒泡到页面级边界，把这份静态全屏模糊拖着重跑
+        // ——播放页任何动画期间 raster 都多背 7~14ms/帧，中低端 GPU
+        // 直接持续掉帧（多机型复现的黑胶+逐字卡顿共同根因）。独立
+        // 边界后切歌才重缓存一次。
+        child: Transform.scale(
+          scale: 1.24,
+          child: ImageFiltered(
+            imageFilter: ui.ImageFilter.blur(sigmaX: 32, sigmaY: 32),
+            child: CoverImage(
+              songPath: item.path,
+              imageUrl: resolveOnlineCoverUrl(item.coverUrl, item.path),
+              width: double.infinity,
+              height: double.infinity,
+              radius: 0,
+              cacheWidth: 256,
+              icon: Icons.music_note_rounded,
+            ),
           ),
         ),
       );
@@ -7940,7 +8095,13 @@ class _SpinningCoverState extends State<_SpinningCover>
         angle: _controller.value * 2 * math.pi,
         child: child,
       ),
-      child: widget.child,
+      // 【性能关键】盘面+标签包内层 RepaintBoundary：子树内容恒定（旋转
+      // 只改 transform），Impeller 把它缓存成纹理后每帧只做一次纹理变换
+      // 合成；没有这层边界时，旋转每帧重录重绘整棵子树——盘面径向渐变、
+      // ~36 圈音轨细环、封面 ColorFiltered 的 saveLayer 全部逐帧重跑，
+      // 中低端 GPU（华为/vivo 实测）直接持续掉帧。切歌时 CoverImage 变化
+      // 会自动触发该边界重缓存，无需手动失效。
+      child: RepaintBoundary(child: widget.child),
     );
   }
 }
@@ -8142,27 +8303,33 @@ class VinylCover extends StatelessWidget {
             // 下方，不随盘面旋转。此前阴影包在旋转子树内，模糊黑影随
             // 盘 24 秒一圈游走（Skia 模糊层的 saveLayer 边界是方形），
             // 表现为唱片外围一块边界可见的方形浅黑模糊。
-            DecoratedBox(
-              decoration: const BoxDecoration(
-                shape: BoxShape.circle,
-                boxShadow: [
-                  BoxShadow(
-                    color: Color(0xB2000000),
-                    blurRadius: 44,
-                    spreadRadius: -10,
-                    offset: Offset(0, 22),
-                  ),
-                ],
-              ),
-              // 唱片本体：播放时 24 秒匀速转一圈，暂停时停住。
-              child: _SpinningCover(
-                playing: playing,
-                period: const Duration(seconds: 24),
-                child: CustomPaint(
-                  size: Size.square(side),
-                  painter: _VinylDiscPainter(),
-                  child: Center(
-                    child: _VinylLabel(item: item, size: side),
+            // 【独立边界】44px 高斯模糊是整棵封面子树最贵的单次栅格化，
+            // 必须有专属 RepaintBoundary：否则旋转层每帧重绘会冒泡到
+            // 外层边界（7818），把这份静态投影也拖着重栅格化（华为/vivo
+            // 实测黑胶播放期间持续掉帧的主因，多机型复现）。
+            RepaintBoundary(
+              child: DecoratedBox(
+                decoration: const BoxDecoration(
+                  shape: BoxShape.circle,
+                  boxShadow: [
+                    BoxShadow(
+                      color: Color(0xB2000000),
+                      blurRadius: 44,
+                      spreadRadius: -10,
+                      offset: Offset(0, 22),
+                    ),
+                  ],
+                ),
+                // 唱片本体：播放时 24 秒匀速转一圈，暂停时停住。
+                child: _SpinningCover(
+                  playing: playing,
+                  period: const Duration(seconds: 24),
+                  child: CustomPaint(
+                    size: Size.square(side),
+                    painter: _VinylDiscPainter(),
+                    child: Center(
+                      child: _VinylLabel(item: item, size: side),
+                    ),
                   ),
                 ),
               ),
@@ -8170,14 +8337,19 @@ class VinylCover extends StatelessWidget {
             // 扇形高光固定在屏幕空间（光源不随唱片旋转），叠加在盘面之上。
             Positioned.fill(
               child: IgnorePointer(
-                child: CustomPaint(painter: _VinylSheenPainter()),
+                // 静态绘制层同样给独立边界，旋转重绘不再拖累它。
+                child: RepaintBoundary(
+                  child: CustomPaint(painter: _VinylSheenPainter()),
+                ),
               ),
             ),
             // 唱针（复刻 BakaMusic 经典款）：播放 -12 度搭在盘缘内侧，
             // 暂停 -20 度悬在盘缘外，720ms 回弹过渡；不拦截点击。
             if (showTonearm)
               Positioned.fill(
-                child: IgnorePointer(child: VinylTonearm(playing: playing)),
+                child: IgnorePointer(
+                  child: RepaintBoundary(child: VinylTonearm(playing: playing)),
+                ),
               ),
             // 手势层盖在最上，避免旋转层干扰点击。
             Positioned.fill(
@@ -8229,25 +8401,35 @@ class _VinylLabel extends StatelessWidget {
                     ),
                   )
                 : ClipOval(
-                    child: ColorFiltered(
-                      colorFilter: const ColorFilter.matrix([
-                        0.9, 0, 0, 0, 0, //
-                        0, 0.9, 0, 0, 0, //
-                        0, 0, 0.9, 0, 0, //
-                        0, 0, 0, 1.08, 0, //
-                      ]),
-                      child: CoverImage(
-                        songPath: current.path,
-                        imageUrl: resolveOnlineCoverUrl(
-                          current.coverUrl,
-                          current.path,
+                    // 压暗层：与原 ColorFilter.matrix(RGB×0.9) 视觉等效
+                    // （该矩阵只做线性压暗，无跨通道混合，不提饱和），但
+                    // 纯色透明叠加不产生 saveLayer——ColorFiltered 在
+                    // Impeller 下每次重栅格化都要开离屏层，是黑胶缓存
+                    // 重建（切歌/内存压力逐出纹理）时的单帧大头。
+                    child: Stack(
+                      fit: StackFit.expand,
+                      children: [
+                        CoverImage(
+                          songPath: current.path,
+                          imageUrl: resolveOnlineCoverUrl(
+                            current.coverUrl,
+                            current.path,
+                          ),
+                          width: label * .92,
+                          height: label * .92,
+                          radius: label * .46,
+                          highQuality: true,
+                          icon: Icons.music_note_rounded,
                         ),
-                        width: label * .92,
-                        height: label * .92,
-                        radius: label * .46,
-                        highQuality: true,
-                        icon: Icons.music_note_rounded,
-                      ),
+                        const IgnorePointer(
+                          child: DecoratedBox(
+                            decoration: BoxDecoration(
+                              shape: BoxShape.circle,
+                              color: Color(0x1A000000),
+                            ),
+                          ),
+                        ),
+                      ],
                     ),
                   ),
           ),
@@ -10033,6 +10215,8 @@ class _GlassControlCard extends ConsumerWidget {
     );
     if (picked == null || !context.mounted) return;
     final (plugin, song) = picked;
+    // 崩溃现场埋点：同上，记录「正在换源」与目标插件。
+    ErrorContext.noteAction('换源:${plugin.id}');
     // 提前取 notifier：等待期间页面可能被销毁，await 后再 ref.read 会抛
     // 「Cannot use "ref" after the widget was disposed.」。
     final playerNotifier = ref.read(playerProvider.notifier);

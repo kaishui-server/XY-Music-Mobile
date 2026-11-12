@@ -1239,6 +1239,11 @@ class BackupService {
     try {
       final file = File(path);
       if (!await file.exists()) return null;
+      // 先按文件大小筛一遍再读：动态视频壁纸动辄上百 MB，直接
+      // readAsBytes 会把整段视频搬进内存（移动端直接 OOM），而它
+      // 本来就会因为超过 maxBytes 被丢弃。
+      final length = await file.length();
+      if (length == 0 || length > maxBytes) return null;
       final bytes = await file.readAsBytes();
       if (bytes.isEmpty || bytes.length > maxBytes) return null;
       return BackupAppearanceFile(

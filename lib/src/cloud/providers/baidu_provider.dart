@@ -3,6 +3,11 @@
 // 注意：分享列表/转存接口必须带登录态（BDUSS），故 parseShareLink 内
 // 直接读本地绑定凭据；转存的 sekey 是 verify 换来的 randsk（BDCLND），
 // 不是提取码本身。
+//
+// 直链（cookie 轨）现行通道是 /api/download：sign1/sign3 由
+// gettemplatevariable 下发，sign = base64(rc4(key=sign3, data=sign1))。
+// filemetas 铸出的 dlink 已被 PCS 下载风控弃用（任何 UA/头/TLS 栈都
+// 403 31362 sign error），只作为兜底保留。
 
 import 'dart:convert';
 
@@ -17,14 +22,31 @@ class BaiduProvider extends CloudProvider {
   const BaiduProvider();
 
   static const _appId = '250528';
+
+  /// 统一移动 UA：WebView 签发的 Cookie 与创建会话时的 UA 绑定，用桌面
+  /// UA 请求会被判定会话无效（api/* 直接 errno=-6）。
   static const _ua =
-      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
-      '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+      'Mozilla/5.0 (Linux; Android 13; M2102K1C) AppleWebKit/537.36 '
+      '(KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36';
+
+  /// dlink 下载校验 UA 前缀（PCS/开放平台规则：下载请求须为 netdisk 系）。
+  static const _netdiskUa = 'netdisk;P2SP;2.2.91.136;android-android;';
+
+  /// /api/download 签名三元组缓存（按账号摘要，30 分钟）。三元组由账号
+  /// 会话派生、长期稳定，缓存后每首歌省一次 gettemplatevariable 往返。
+  static final Map<String, _BaiduSign> _signCache = {};
 
   Map<String, String> _h(Map<String, String> cred) => {
         'User-Agent': _ua,
         'Referer': 'https://pan.baidu.com/disk/main',
         'Cookie': cookieHeader(cred),
+      };
+
+  /// 分享接口请求头（Referer 为根路径）。
+  Map<String, String> _shareHeaders(String cookie) => {
+        'User-Agent': _ua,
+        'Referer': 'https://pan.baidu.com/',
+        'Cookie': cookie,
       };
 
   @override
@@ -157,11 +179,7 @@ class BaiduProvider extends CloudProvider {
     final listResp = await cloudGet(
       'https://pan.baidu.com/share/list?clienttype=0&app_id=$_appId&web=1'
       '&shorturl=${Uri.encodeQueryComponent(surl)}&root=1',
-      headers: {
-        'User-Agent': _ua,
-        'Referer': 'https://pan.baidu.com/',
-        'Cookie': cookie,
-      },
+      headers: _shareHeaders(cookie),
     );
     if (!listResp.isOk) throw const CloudException('分享文件列表获取失败');
     final errno = (listResp.json['errno'] as num?)?.toInt();
@@ -214,11 +232,7 @@ class BaiduProvider extends CloudProvider {
         'path': '/apps/弦予音乐',
         'filelist': jsonEncode(share.files.map((f) => f.id).toList()),
       },
-      headers: {
-        'User-Agent': _ua,
-        'Referer': 'https://pan.baidu.com/',
-        'Cookie': cookieHeader(cred),
-      },
+      headers: _shareHeaders(cookieHeader(cred)),
     );
     if (!transferResp.isOk) throw const CloudException('转存失败');
     final errno = (transferResp.json['errno'] as num?)?.toInt();
@@ -289,13 +303,18 @@ class BaiduProvider extends CloudProvider {
   @override
   Future<CloudDirectLink> getDirectLink(
       Map<String, String> cred, CloudFile file) async {
-    // 多路由降级（对齐惜梦解析与 OpenList 社区实现）：
-    // ① web /api/filemetas：cookie 态按 target 路径取 dlink（OpenList
-    //    crack 同款参数 web=5&origin=dlna；UA 必须为 netdisk）；
-    // ② xpan multimedia filemetas：cookie + bdstoken 按 fsid 取 dlink，
-    //    部分账号会被风控拒绝（errno=9019「会话不被认可」）。
-    final bdstoken = await _fetchBdstoken(cred);
+    // 主通道①：/api/download（网页端现行直链通道，sign 签名）。
+    // 兜底②：web /api/filemetas（cookie 态按 target 路径取 dlink，
+    //        OpenList crack 同款参数 web=5&origin=dlna）。
+    // 兜底③：xpan multimedia filemetas（按 fsid 取 dlink，部分账号被
+    //        风控拒绝 errno=9019）。
     final errors = <String>[];
+    try {
+      return await _directLinkViaDownloadApi(cred, file);
+    } on CloudException catch (e) {
+      errors.add('api/download：${e.message}');
+    }
+    final bdstoken = await _fetchBdstoken(cred);
     if ((file.path ?? '').isNotEmpty) {
       try {
         return await _directLinkWebFilemetas(cred, file, bdstoken);
@@ -309,6 +328,124 @@ class BaiduProvider extends CloudProvider {
       errors.add('xpan filemetas：${e.message}');
     }
     throw CloudException('直链获取失败（${errors.join('；')}）');
+  }
+
+  /// 主通道：`/api/download?type=dlink`。
+  ///
+  /// 签名链路：gettemplatevariable 下发 sign1/sign2/sign3/timestamp，sign2
+  /// 是服务端下发的固定 RC4 实现，故 sign = base64(rc4(key=sign3, data=sign1))。
+  /// dlink 的 302 放行条件是 netdisk 系 UA + 全量 cookie（缺 cookie 报
+  /// 31045 user not exists）。
+  Future<CloudDirectLink> _directLinkViaDownloadApi(
+    Map<String, String> cred,
+    CloudFile file,
+  ) async {
+    final triple = await _signTriple(cred);
+    final sign = base64Encode(
+      _rc4(utf8.encode(triple.sign3), utf8.encode(triple.sign1)),
+    );
+    final resp = await cloudGet(
+      'https://pan.baidu.com/api/download?channel=chunlei&clienttype=0'
+      '&web=1&app_id=$_appId'
+      '&fidlist=${Uri.encodeQueryComponent('[${file.id}]')}'
+      '&type=dlink&vip=0'
+      '&sign=${Uri.encodeQueryComponent(sign)}'
+      '&timestamp=${triple.timestamp}',
+      headers: _h(cred),
+    );
+    if (!resp.isOk) {
+      throw CloudException('HTTP ${resp.status} ${respErrorDetail(resp)}');
+    }
+    final errno = (resp.json['errno'] as num?)?.toInt() ?? -1;
+    if (errno != 0) {
+      // errno=113 签名过期：清缓存，重试链路自动拉新三元组。
+      _dropSign(cred);
+      throw CloudException(
+        errno == 113
+            ? 'errno=113 签名已过期，请重试'
+            : 'errno=$errno ${respErrorDetail(resp)}',
+      );
+    }
+    final dlink = _dlinkFromDownloadResp(resp.json);
+    if (dlink.isEmpty) {
+      throw CloudException('响应未含 dlink ${respErrorDetail(resp)}');
+    }
+    return _finishBaiduLink(dlink, file, cred);
+  }
+
+  /// 取（并缓存）签名三元组。timestamp 用服务端下发值，避免本地时钟偏差。
+  Future<_BaiduSign> _signTriple(Map<String, String> cred) async {
+    final key = md5Hex(cookieHeader(cred));
+    final cached = _signCache[key];
+    if (cached != null && !cached.expired) return cached;
+    final resp = await cloudGet(
+      'https://pan.baidu.com/api/gettemplatevariable?clienttype=0'
+      '&app_id=$_appId&web=1'
+      '&fields=${Uri.encodeQueryComponent('["sign1","sign2","sign3","timestamp"]')}',
+      headers: _h(cred),
+    );
+    if (!resp.isOk) {
+      throw CloudException('签名获取失败 HTTP ${resp.status}');
+    }
+    final errno = (resp.json['errno'] as num?)?.toInt() ?? -1;
+    if (errno != 0) {
+      throw CloudException('签名获取失败 errno=$errno');
+    }
+    final result = resp.json['result'];
+    final sign1 = result is Map ? (result['sign1'] ?? '').toString() : '';
+    final sign3 = result is Map ? (result['sign3'] ?? '').toString() : '';
+    final ts = result is Map
+        ? (result['timestamp'] as num?)?.toInt() ??
+            DateTime.now().millisecondsSinceEpoch ~/ 1000
+        : DateTime.now().millisecondsSinceEpoch ~/ 1000;
+    if (sign1.isEmpty || sign3.isEmpty) {
+      throw const CloudException('签名获取失败（响应缺 sign1/sign3）');
+    }
+    final triple = _BaiduSign(sign1: sign1, sign3: sign3, timestamp: ts);
+    _signCache[key] = triple;
+    return triple;
+  }
+
+  void _dropSign(Map<String, String> cred) =>
+      _signCache.remove(md5Hex(cookieHeader(cred)));
+
+  /// RC4（网页 sign2 下发的固定实现：key=sign3、data=sign1）。
+  static List<int> _rc4(List<int> key, List<int> data) {
+    final s = List<int>.generate(256, (i) => i);
+    var j = 0;
+    for (var i = 0; i < 256; i++) {
+      j = (j + s[i] + key[i % key.length]) & 0xff;
+      final t = s[i];
+      s[i] = s[j];
+      s[j] = t;
+    }
+    final out = List<int>.filled(data.length, 0);
+    var i = 0;
+    j = 0;
+    for (var k = 0; k < data.length; k++) {
+      i = (i + 1) & 0xff;
+      j = (j + s[i]) & 0xff;
+      final t = s[i];
+      s[i] = s[j];
+      s[j] = t;
+      out[k] = data[k] ^ s[(s[i] + s[j]) & 0xff];
+    }
+    return out;
+  }
+
+  /// /api/download 响应形态（实测三种）：顶层 dlink 字符串；顶层 dlink
+  /// 数组（元素 {dlink: "..."}）；或 filemetas 式 list[0].dlink。
+  static String _dlinkFromDownloadResp(Map<String, dynamic> json) {
+    final raw = json['dlink'];
+    if (raw is String && raw.isNotEmpty) return raw;
+    if (raw is List && raw.isNotEmpty) {
+      final first = raw.first;
+      if (first is Map) {
+        final v = (first['dlink'] ?? '').toString();
+        if (v.isNotEmpty) return v;
+      }
+    }
+    return _dlinkFromMetasResp(json);
   }
 
   /// 路由①：web 文件元信息接口，响应字段是 info[].dlink（与 xpan 的
@@ -330,11 +467,13 @@ class BaiduProvider extends CloudProvider {
     if (errno != 0) {
       throw CloudException('errno=$errno ${respErrorDetail(resp)}');
     }
-    final dlink = _dlinkFromMetasResp(resp.json);
+    // 与 XianYu 对齐：filemetas 的 dlink 也可能下发在顶层（字符串或
+    // [{dlink}] 数组），只认 info/list 会把成功响应当成「响应未含 dlink」。
+    final dlink = _dlinkFromDownloadResp(resp.json);
     if (dlink.isEmpty) {
       throw CloudException('响应未含 dlink ${respErrorDetail(resp)}');
     }
-    return _finishBaiduLink(dlink, file, 'netdisk', cred);
+    return _finishBaiduLink(dlink, file, cred);
   }
 
   /// 路由②：xpan multimedia filemetas（fsids 检索）。dlink 下发与下载均
@@ -364,11 +503,11 @@ class BaiduProvider extends CloudProvider {
       }
       throw CloudException('errno=$errno ${respErrorDetail(metaResp)}');
     }
-    final dlink = _dlinkFromMetasResp(metaResp.json);
+    final dlink = _dlinkFromDownloadResp(metaResp.json);
     if (dlink.isEmpty) {
       throw CloudException('响应未含 dlink ${respErrorDetail(metaResp)}');
     }
-    return _finishBaiduLink(dlink, file, 'pan.baidu.com', cred);
+    return _finishBaiduLink(dlink, file, cred);
   }
 
   /// filemetas 响应兼容两种字段形态：web 接口 info[].dlink /
@@ -386,18 +525,16 @@ class BaiduProvider extends CloudProvider {
 
   /// dlink 归一：跟随 302 确认真实 CDN 域名，命中限速域名黑名单即拒。
   ///
-  /// 5508 日志定位：dlink 请求带 Cookie 仍 403 且无重定向——`netdisk`
-  /// UA 是 OpenList access_token 流程的下载头，cookie 态下不被 d.pcs
-  /// 接受。改为完全模拟网页端下载请求头：浏览器 UA + pan.baidu.com
-  /// Referer + 登录 Cookie（探测与播放统一，避免特征不一致）。
+  /// 跳转腿与播放头统一为 netdisk 系 UA + 全量 cookie：PCS 下载网关按该
+  /// 组合放行，缺 cookie 报 31045 user not exists；终态 baidupcs 边缘自带
+  /// 签名授权，对多余 cookie 不敏感。
   Future<CloudDirectLink> _finishBaiduLink(
     String dlink,
     CloudFile file,
-    String ua,
     Map<String, String> cred,
   ) async {
     final headers = {
-      'User-Agent': _ua,
+      'User-Agent': _netdiskUa,
       'Referer': 'https://pan.baidu.com/disk/main',
       'Cookie': cookieHeader(cred),
     };
@@ -421,4 +558,22 @@ class BaiduProvider extends CloudProvider {
     if (cred == null) throw const CloudException('请先绑定百度网盘');
     return cred;
   }
+}
+
+/// /api/download 签名三元组（sign2 不下发，固定 RC4 由服务端约定）。
+class _BaiduSign {
+  _BaiduSign({
+    required this.sign1,
+    required this.sign3,
+    required this.timestamp,
+  }) : _at = DateTime.now();
+
+  final String sign1;
+  final String sign3;
+  final int timestamp;
+  final DateTime _at;
+
+  /// 30 分钟复用窗口（官方 sign 有效期远大于此，留足安全边际）。
+  bool get expired =>
+      DateTime.now().difference(_at) > const Duration(minutes: 30);
 }

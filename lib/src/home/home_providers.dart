@@ -2,7 +2,6 @@ import 'dart:async';
 import 'dart:convert';
 
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-import 'package:shared_preferences/shared_preferences.dart';
 
 import '../auth/auth_provider.dart';
 import '../core/app_refresh.dart';
@@ -11,6 +10,11 @@ import '../library/library_provider.dart';
 import '../recent/recent_provider.dart';
 import '../recent/recent_store.dart';
 import '../rust/api.dart';
+import 'listen_stats_uploader.dart';
+
+// 排行榜上报的请求体构造已移到 listen_stats_uploader，这里继续对外暴露，
+// 保持既有调用方（含测试）的导入路径不变。
+export 'listen_stats_uploader.dart' show buildListenStatsReportPayload;
 
 const _hotCommentApi = 'https://api.fuchenboke.cn/api/wangyi.php';
 
@@ -330,51 +334,12 @@ final homeLeaderboardProvider =
       // 预加载会同时启动日/周/总榜三个 provider。统计上报只需要执行一次，
       // 否则三份 provider 会并发读取本地统计库并重复请求服务端，启动时会
       // 与首页首帧争抢 SQLite/网络资源，造成明显卡顿。
+      //
+      // 上报本身在 listen_stats_uploader 中做节流/单飞，并直接读本地统计库
+      // 的实时值（不再复用 homeStatisticsProvider 的 5 分钟缓存快照）。
+      // 播放器在写库后、切后台时也会主动触发上报，这里只是兜底入口。
       if (xymusicId.isNotEmpty && period == LeaderboardPeriod.daily) {
-        // 听歌统计上报完全作为旁路任务执行，不能阻塞榜单请求；网络较慢
-        // 或本地统计库繁忙时，用户仍可立即切换并查看日/周/总榜。
-        unawaited(() async {
-          try {
-            final stats = await ref
-                .read(homeStatisticsProvider.future)
-                .timeout(const Duration(seconds: 3));
-            final report = await notifier.requestBackendAction(
-              'report_listen_stats',
-              buildListenStatsReportPayload(
-                xymusicId: xymusicId,
-                totalDuration: stats.listenDuration,
-                dailyDuration: stats.dailyListenDuration,
-                weeklyDuration: stats.weeklyListenDuration,
-              ),
-              fetchTimeoutMs: 3000,
-            );
-            final resetAt = report['reset_at']?.toString().trim() ?? '';
-            if (resetAt.isNotEmpty) {
-              const resetKey = 'listen_stats_last_reset_at';
-              final prefs = await SharedPreferences.getInstance();
-              final lastResetAt = prefs.getString(resetKey) ?? '';
-              if (lastResetAt.isEmpty || resetAt.compareTo(lastResetAt) > 0) {
-                await statsResetLocalStatistics(
-                  dbPath: await ref.read(dbPathProvider.future),
-                );
-                await prefs.setString(resetKey, resetAt);
-                ref.invalidate(homeStatisticsProvider);
-                await notifier.requestBackendAction(
-                  'report_listen_stats',
-                  buildListenStatsReportPayload(
-                    xymusicId: xymusicId,
-                    totalDuration: 0,
-                    dailyDuration: 0,
-                    weeklyDuration: 0,
-                  ),
-                  fetchTimeoutMs: 3000,
-                );
-              }
-            }
-          } catch (_) {
-            // 上报失败不影响公共排行榜读取。
-          }
-        }());
+        unawaited(uploadListenStats(ref));
       }
 
       try {
@@ -393,17 +358,3 @@ final homeLeaderboardProvider =
             const LeaderboardData(leaderboard: [], totalUsers: 0);
       }
     });
-
-Map<String, dynamic> buildListenStatsReportPayload({
-  required String xymusicId,
-  required int totalDuration,
-  required int dailyDuration,
-  required int weeklyDuration,
-}) => {
-  'xymusic_id': xymusicId,
-  'duration': totalDuration.clamp(0, 0x7FFFFFFFFFFFFFFF),
-  'daily_duration': dailyDuration.clamp(0, 0x7FFFFFFFFFFFFFFF),
-  // 服务端周榜由每日记录汇总；保留该字段便于服务端日志和后续兼容。
-  'weekly_duration': weeklyDuration.clamp(0, 0x7FFFFFFFFFFFFFFF),
-  'unique_songs_count': 0,
-};
