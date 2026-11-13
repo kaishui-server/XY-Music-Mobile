@@ -16,7 +16,7 @@ void main() {
   });
 
   test('设置搜索支持标题、路径和关键词', () {
-    expect(searchSettings('Alist').first.title, '云端音乐');
+    expect(searchSettings('PikPak').first.title, '网盘账号绑定');
     expect(
       searchSettings('不熄屏').any((entry) => entry.title == '保持屏幕常亮'),
       isTrue,

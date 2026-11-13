@@ -16,6 +16,7 @@ import '../../src/core/custom_font.dart';
 import '../../src/auth/auth_provider.dart';
 import '../../src/backup/backup_service.dart';
 import '../../src/favorites/favorites_provider.dart';
+import '../../src/navigation/settings_expand_transition.dart';
 import '../../src/navigation/sidebar_controller.dart';
 import '../../src/player/desktop_lyrics.dart';
 import '../../src/player/bluetooth_lyrics.dart';
@@ -34,10 +35,14 @@ enum SettingsSection {
   root,
   account,
   appearance,
+  /// 歌单封面：从「个性化 › 外观」进入的下一级页面。
+  playlistCovers,
   layout,
   sidebarLayout,
   bottomBar,
   playback,
+  /// 音量调节设置：从「音乐 › 播放」进入的三级页面。
+  volume,
   playbackDetail,
   lyrics,
   desktopLyrics,
@@ -77,95 +82,18 @@ const settingsSearchEntries = <SettingsSearchEntry>[
     keywords: '登录 注册 账号安全 退出',
   ),
   SettingsSearchEntry(
+    title: '网盘账号绑定',
+    path: ['账号', '网盘账号绑定'],
+    route: '/cloud-bind',
+    icon: Icons.cloud_outlined,
+    keywords: '百度网盘 阿里云盘 夸克 UC 天翼 移动 迅雷 123 PikPak 绑定 登录',
+  ),
+  SettingsSearchEntry(
     title: '外观',
     path: ['外观'],
     route: '/settings/appearance',
     icon: Icons.palette_outlined,
-    keywords: '主题 模式 颜色 深色 浅色 背景 图片 模糊 字体',
-  ),
-  SettingsSearchEntry(
-    title: '播放',
-    path: ['播放'],
-    route: '/settings/playback',
-    icon: Icons.play_circle_outline_rounded,
-    keywords: '音量 音质 屏幕常亮 封面 歌单',
-  ),
-  SettingsSearchEntry(
-    title: '布局',
-    path: ['布局'],
-    route: '/settings/layout',
-    icon: Icons.view_quilt_outlined,
-    keywords: '顶栏 侧边栏 位置 左上 右上',
-  ),
-  SettingsSearchEntry(
-    title: '歌词',
-    path: ['歌词'],
-    route: '/settings/playback-detail',
-    icon: Icons.queue_music_outlined,
-    keywords: '歌词 播放详情 封面 歌词显示',
-  ),
-  SettingsSearchEntry(
-    title: '插件管理',
-    path: ['插件管理'],
-    route: '/settings/plugins',
-    icon: Icons.extension_outlined,
-    keywords: '插件 安装 启用 卸载 更新',
-  ),
-  SettingsSearchEntry(
-    title: '音乐库',
-    path: ['音乐库'],
-    route: '/settings/library',
-    icon: Icons.library_music_outlined,
-    keywords: '本地 扫描 文件夹',
-  ),
-  SettingsSearchEntry(
-    title: '下载',
-    path: ['下载'],
-    route: '/settings/download',
-    icon: Icons.download_outlined,
-    keywords: '保存 路径 音质 歌词',
-  ),
-  SettingsSearchEntry(
-    title: '每次下载是否询问细节',
-    path: ['下载', '每次下载是否询问细节'],
-    route: '/settings/download',
-    icon: Icons.tune_rounded,
-    keywords: '询问 不询问 下载弹窗',
-  ),
-  SettingsSearchEntry(
-    title: '备份与恢复',
-    path: ['备份与恢复'],
-    route: '/settings/backup',
-    icon: Icons.backup_outlined,
-    keywords: '备份 恢复 导出 导入 迁移 换机 歌单 收藏',
-  ),
-  SettingsSearchEntry(
-    title: '其他',
-    path: ['其他'],
-    route: '/settings/other',
-    icon: Icons.tune_rounded,
-    keywords: '统计 关于 版本',
-  ),
-  SettingsSearchEntry(
-    title: '存储与缓存',
-    path: ['存储与缓存'],
-    route: '/settings/storage',
-    icon: Icons.cleaning_services_outlined,
-    keywords: '缓存 清理 空间 占用 封面 临时文件',
-  ),
-  SettingsSearchEntry(
-    title: '账号与安全',
-    path: ['账号', '账号与安全'],
-    route: '/account?from=settings',
-    icon: Icons.account_circle_outlined,
-    keywords: '登录 注册 验证码 退出',
-  ),
-  SettingsSearchEntry(
-    title: '播放详情页歌词',
-    path: ['歌词', '播放详情页歌词'],
-    route: '/settings/lyrics',
-    icon: Icons.lyrics_outlined,
-    keywords: '翻译 逐字 动效',
+    keywords: '主题 模式 颜色 深色 浅色 背景 图片 模糊 字体 封面',
   ),
   SettingsSearchEntry(
     title: '主题模式',
@@ -217,6 +145,20 @@ const settingsSearchEntries = <SettingsSearchEntry>[
     keywords: '唱针 唱臂 黑胶唱片 开关',
   ),
   SettingsSearchEntry(
+    title: '歌单歌曲加载封面',
+    path: ['外观', '歌单歌曲加载封面'],
+    route: '/settings/playlist-covers',
+    icon: Icons.image_outlined,
+    keywords: '歌单 列表 封面 加载 省流量',
+  ),
+  SettingsSearchEntry(
+    title: '布局',
+    path: ['布局'],
+    route: '/settings/layout',
+    icon: Icons.view_quilt_outlined,
+    keywords: '顶栏 侧边栏 底栏 首页模块',
+  ),
+  SettingsSearchEntry(
     title: '侧边栏位置',
     path: ['布局', '顶栏布局', '侧边栏位置'],
     route: '/settings/layout',
@@ -226,7 +168,7 @@ const settingsSearchEntries = <SettingsSearchEntry>[
   SettingsSearchEntry(
     title: '侧边栏布局',
     path: ['布局', '侧边栏布局'],
-    route: '/settings/sidebar-layout',
+    route: '/settings/layout',
     icon: Icons.view_sidebar_outlined,
     keywords: '菜单 显示 隐藏 开关 拖拽 排序',
   ),
@@ -238,17 +180,130 @@ const settingsSearchEntries = <SettingsSearchEntry>[
     keywords: '底栏 导航栏 目的地 显示 隐藏 拖拽 排序',
   ),
   SettingsSearchEntry(
-    title: '音量',
-    path: ['播放', '音量'],
-    route: '/settings/playback',
-    icon: Icons.volume_up_outlined,
+    title: '首页模块显示',
+    path: ['布局', '首页模块'],
+    route: '/settings/layout',
+    icon: Icons.dashboard_customize_outlined,
+    keywords: '首页 模块 显示 隐藏',
   ),
   SettingsSearchEntry(
-    title: '在线默认音质',
-    path: ['播放', '在线默认音质'],
+    title: '歌词',
+    path: ['歌词'],
+    route: '/settings/lyrics',
+    icon: Icons.lyrics_outlined,
+    keywords: '歌词 翻译 罗马音 逐字 动效 对齐 字号 颜色 桌面歌词 蓝牙歌词',
+  ),
+  SettingsSearchEntry(
+    title: '显示翻译',
+    path: ['歌词', '显示翻译'],
+    route: '/settings/lyrics',
+    icon: Icons.translate_outlined,
+    keywords: '翻译',
+  ),
+  SettingsSearchEntry(
+    title: '显示罗马音',
+    path: ['歌词', '显示罗马音'],
+    route: '/settings/lyrics',
+    icon: Icons.abc_rounded,
+    keywords: '罗马音',
+  ),
+  SettingsSearchEntry(
+    title: '逐字动效',
+    path: ['歌词', '逐字动效'],
+    route: '/settings/lyrics',
+    icon: Icons.spellcheck_outlined,
+    keywords: '逐字歌词 动画',
+  ),
+  SettingsSearchEntry(
+    title: '显示位置',
+    path: ['歌词', '显示位置'],
+    route: '/settings/lyrics',
+    icon: Icons.format_align_left_outlined,
+    keywords: '对齐 左 中 右',
+  ),
+  SettingsSearchEntry(
+    title: '歌词设置',
+    path: ['歌词', '歌词设置'],
+    route: '/settings/lyrics',
+    icon: Icons.format_size_outlined,
+    keywords: '字体 大小 歌词大小 颜色 已播 未播',
+  ),
+  SettingsSearchEntry(
+    title: '单击歌词调整进度',
+    path: ['歌词', '单击歌词调整进度'],
+    route: '/settings/lyrics',
+    icon: Icons.touch_app_outlined,
+    keywords: '点击歌词 跳转 进度 seek',
+  ),
+  SettingsSearchEntry(
+    title: '桌面歌词',
+    path: ['歌词', '桌面歌词'],
+    route: '/settings/desktop-lyrics',
+    icon: Icons.subtitles_outlined,
+    keywords: '悬浮歌词 桌面歌词 浮窗 逐字效果',
+  ),
+  SettingsSearchEntry(
+    title: '蓝牙歌词',
+    path: ['歌词', '蓝牙歌词'],
+    route: '/settings/bluetooth-lyrics',
+    icon: Icons.bluetooth_audio_outlined,
+    keywords: '车载 蓝牙 歌词 推送',
+  ),
+  SettingsSearchEntry(
+    title: '插件管理',
+    path: ['插件管理'],
+    route: '/settings/plugins',
+    icon: Icons.extension_outlined,
+    keywords: '插件 安装 启用 卸载 更新',
+  ),
+  SettingsSearchEntry(
+    title: '在线安装',
+    path: ['插件管理', '在线安装'],
+    route: '/settings/plugins',
+    icon: Icons.public_outlined,
+    keywords: '插件地址 网络安装',
+  ),
+  SettingsSearchEntry(
+    title: '本地导入插件',
+    path: ['插件管理', '本地导入插件'],
+    route: '/settings/plugins',
+    icon: Icons.upload_file_outlined,
+    keywords: 'js 文件 插件',
+  ),
+  SettingsSearchEntry(
+    title: '播放',
+    path: ['播放'],
+    route: '/settings/playback',
+    icon: Icons.play_circle_outline_rounded,
+    keywords: '音质 音量 并发 失败策略 常亮 浮窗',
+  ),
+  SettingsSearchEntry(
+    title: '默认音质',
+    path: ['播放', '默认音质'],
     route: '/settings/playback',
     icon: Icons.high_quality_outlined,
     keywords: '128k 192k 320k flac 无损',
+  ),
+  SettingsSearchEntry(
+    title: '音量调节设置',
+    path: ['播放', '音量调节设置'],
+    route: '/settings/volume',
+    icon: Icons.volume_up_outlined,
+    keywords: '音量 音量键 滑块',
+  ),
+  SettingsSearchEntry(
+    title: '应用内音量',
+    path: ['播放', '音量调节设置', '应用内音量'],
+    route: '/settings/volume',
+    icon: Icons.volume_up,
+    keywords: '音量 滑块',
+  ),
+  SettingsSearchEntry(
+    title: '音量键调节应用内音量',
+    path: ['播放', '音量调节设置', '音量键调节应用内音量'],
+    route: '/settings/volume',
+    icon: Icons.volume_up_rounded,
+    keywords: '音量键 系统音量',
   ),
   SettingsSearchEntry(
     title: '播放歌曲时',
@@ -265,6 +320,20 @@ const settingsSearchEntries = <SettingsSearchEntry>[
     keywords: '搜索线程 并发 同时请求 平台 串行 全部并行',
   ),
   SettingsSearchEntry(
+    title: '播放失败策略',
+    path: ['播放', '播放失败策略'],
+    route: '/settings/playback',
+    icon: Icons.replay_rounded,
+    keywords: '重试 换源 失败 跳过',
+  ),
+  SettingsSearchEntry(
+    title: '与其他应用同时播放',
+    path: ['播放', '与其他应用同时播放'],
+    route: '/settings/playback',
+    icon: Icons.multitrack_audio_rounded,
+    keywords: '不中断 同时播放 音频焦点',
+  ),
+  SettingsSearchEntry(
     title: '保持屏幕常亮',
     path: ['播放', '保持屏幕常亮'],
     route: '/settings/playback',
@@ -272,59 +341,18 @@ const settingsSearchEntries = <SettingsSearchEntry>[
     keywords: '不熄屏',
   ),
   SettingsSearchEntry(
-    title: '显示翻译',
-    path: ['歌词', '播放详情页歌词', '显示翻译'],
-    route: '/settings/lyrics',
-    icon: Icons.translate_outlined,
+    title: '迷你播放悬浮窗',
+    path: ['播放', '迷你播放悬浮窗'],
+    route: '/settings/playback',
+    icon: Icons.picture_in_picture_alt_outlined,
+    keywords: '浮窗 通知栏 迷你播放器',
   ),
   SettingsSearchEntry(
-    title: '单击歌词调整进度',
-    path: ['歌词', '单击歌词调整进度'],
-    route: '/settings/playback-detail',
-    icon: Icons.touch_app_outlined,
-    keywords: '点击歌词 跳转 进度 seek',
-  ),
-  SettingsSearchEntry(
-    title: '逐字动效',
-    path: ['歌词', '播放详情页歌词', '逐字动效'],
-    route: '/settings/lyrics',
-    icon: Icons.spellcheck_outlined,
-    keywords: '逐字歌词 动画',
-  ),
-  SettingsSearchEntry(
-    title: '歌词设置',
-    path: ['歌词', '播放详情页歌词', '歌词设置'],
-    route: '/settings/lyrics',
-    icon: Icons.format_size_outlined,
-    keywords: '字体 大小 歌词大小 颜色 已播 未播 翻译 罗马音 逐字 动效 对齐',
-  ),
-  SettingsSearchEntry(
-    title: '桌面歌词',
-    path: ['歌词', '桌面歌词'],
-    route: '/settings/desktop-lyrics',
-    icon: Icons.subtitles_outlined,
-    keywords: '悬浮歌词 桌面歌词 浮窗 逐字效果',
-  ),
-  SettingsSearchEntry(
-    title: '扫描文件夹',
-    path: ['音乐库', '扫描文件夹'],
-    route: '/settings/scan-folders',
-    icon: Icons.folder_special_outlined,
-    keywords: '添加目录 本地音乐',
-  ),
-  SettingsSearchEntry(
-    title: '扫描格式',
-    path: ['音乐库', '扫描格式'],
-    route: '/settings/library',
-    icon: Icons.audiotrack_outlined,
-    keywords: 'flac mp3 wav aac m4a ogg aiff',
-  ),
-  SettingsSearchEntry(
-    title: '排除短音频',
-    path: ['音乐库', '排除短音频'],
-    route: '/settings/library',
-    icon: Icons.timer_outlined,
-    keywords: '最短时长 秒',
+    title: '下载',
+    path: ['下载'],
+    route: '/settings/download',
+    icon: Icons.download_outlined,
+    keywords: '保存 路径 音质 歌词',
   ),
   SettingsSearchEntry(
     title: '下载路径',
@@ -345,24 +373,32 @@ const settingsSearchEntries = <SettingsSearchEntry>[
     path: ['下载', '同时下载歌词'],
     route: '/settings/download',
     icon: Icons.lyrics_outlined,
+    keywords: '歌词 下载',
   ),
   SettingsSearchEntry(
-    title: '听歌统计',
-    path: ['其他', '听歌统计'],
-    route: '/settings/statistics',
-    icon: Icons.query_stats_outlined,
-    keywords: '播放次数 时长 历史',
+    title: '每次下载是否询问细节',
+    path: ['下载', '每次下载是否询问细节'],
+    route: '/settings/download',
+    icon: Icons.tune_rounded,
+    keywords: '询问 不询问 下载弹窗',
   ),
   SettingsSearchEntry(
-    title: '日志与调试',
-    path: ['其他', '日志与调试'],
-    route: '/settings/logs-debug',
-    icon: Icons.bug_report_outlined,
-    keywords: '日志 调试 导出 错误 警告',
+    title: '储存',
+    path: ['储存'],
+    route: '/settings/storage',
+    icon: Icons.cleaning_services_outlined,
+    keywords: '缓存 清理 空间 占用 封面 临时文件',
+  ),
+  SettingsSearchEntry(
+    title: '备份',
+    path: ['备份'],
+    route: '/settings/backup',
+    icon: Icons.backup_outlined,
+    keywords: '备份 恢复 导出 导入 迁移 换机 歌单 收藏',
   ),
   SettingsSearchEntry(
     title: '日志',
-    path: ['其他', '日志与调试', '日志'],
+    path: ['日志'],
     route: '/settings/logs',
     icon: Icons.description_outlined,
     keywords: '保存条数 错误日志 时间范围 导出',
@@ -375,32 +411,67 @@ const settingsSearchEntries = <SettingsSearchEntry>[
     keywords: '功能建议 提交问题 我的反馈 上传图片 日志',
   ),
   SettingsSearchEntry(
+    title: '支持开发者',
+    path: ['支持开发者'],
+    route: '/settings/sponsor',
+    icon: Icons.favorite_outline_rounded,
+    keywords: '赞助 打赏 收款码 微信 支付宝',
+  ),
+  SettingsSearchEntry(
     title: '关于 XY Music',
-    path: ['其他', '关于 XY Music'],
+    path: ['关于'],
     route: '/settings/about',
     icon: Icons.info_outline,
-    keywords: '版本 开源 许可',
+    keywords: '版本 开源 许可 仓库 创作者',
   ),
   SettingsSearchEntry(
-    title: '在线安装',
-    path: ['插件管理', '在线安装'],
-    route: '/settings/plugins',
-    icon: Icons.public_outlined,
-    keywords: '插件地址 网络安装',
+    title: '其他',
+    path: ['其他'],
+    route: '/settings/other',
+    icon: Icons.tune_rounded,
+    keywords: '统计 电池 保活 音乐库',
   ),
   SettingsSearchEntry(
-    title: '本地导入插件',
-    path: ['插件管理', '本地导入插件'],
-    route: '/settings/plugins',
-    icon: Icons.upload_file_outlined,
-    keywords: 'js 文件 插件',
+    title: '听歌统计',
+    path: ['其他', '听歌统计'],
+    route: '/settings/statistics',
+    icon: Icons.query_stats_outlined,
+    keywords: '播放次数 时长 历史',
   ),
   SettingsSearchEntry(
-    title: '网盘账号绑定',
-    path: ['账号', '网盘账号绑定'],
-    route: '/cloud-bind',
-    icon: Icons.cloud_outlined,
-    keywords: '百度网盘 阿里云盘 夸克 UC 天翼 移动 迅雷 123 PikPak 绑定 登录',
+    title: '音乐库',
+    path: ['其他', '音乐库'],
+    route: '/settings/library',
+    icon: Icons.library_music_outlined,
+    keywords: '本地 扫描 文件夹 格式',
+  ),
+  SettingsSearchEntry(
+    title: '扫描文件夹',
+    path: ['其他', '音乐库', '扫描文件夹'],
+    route: '/settings/scan-folders',
+    icon: Icons.folder_special_outlined,
+    keywords: '添加目录 本地音乐',
+  ),
+  SettingsSearchEntry(
+    title: '扫描格式',
+    path: ['其他', '音乐库', '扫描格式'],
+    route: '/settings/library',
+    icon: Icons.audiotrack_outlined,
+    keywords: 'flac mp3 wav aac m4a ogg aiff',
+  ),
+  SettingsSearchEntry(
+    title: '排除短音频',
+    path: ['其他', '音乐库', '排除短音频'],
+    route: '/settings/library',
+    icon: Icons.timer_outlined,
+    keywords: '最短时长 秒',
+  ),
+  SettingsSearchEntry(
+    title: '日志与调试',
+    path: ['其他', '日志与调试'],
+    route: '/settings/logs-debug',
+    icon: Icons.bug_report_outlined,
+    keywords: '日志 调试 导出 错误 警告',
   ),
 ];
 
@@ -438,6 +509,19 @@ List<SettingsSearchEntry> searchSettings(String rawQuery) {
   return results;
 }
 
+/// 根页设置类目：按「个性化 / 音乐 / 应用」三块组织（对齐参考实现
+/// CurrentMusicX 的 SettingsScreen 分组），每块是一张可折叠卡片。
+enum _SettingsCategory {
+  personalization('个性化', Icons.auto_awesome_outlined),
+  music('音乐', Icons.library_music_outlined),
+  app('应用', Icons.widgets_outlined);
+
+  const _SettingsCategory(this.label, this.icon);
+
+  final String label;
+  final IconData icon;
+}
+
 class SettingsPage extends ConsumerStatefulWidget {
   const SettingsPage({super.key, this.section = SettingsSection.root});
 
@@ -452,6 +536,37 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
   String _query = '';
   bool _exportingBackup = false;
   bool _importingBackup = false;
+
+  /// 根页类目展开状态：初值全收起，首帧后按序展开（入场 stagger），
+  /// 之后由用户点组头折叠/展开。
+  final Map<_SettingsCategory, bool> _categoryExpanded = {
+    for (final category in _SettingsCategory.values) category: false,
+  };
+
+  /// 类目入场展开的计时器，页面销毁时统一取消。
+  final List<Timer> _categoryRevealTimers = [];
+
+  @override
+  void initState() {
+    super.initState();
+    _scheduleCategoryReveal();
+  }
+
+  /// 入场展开：三块类目依次错开 90ms 展开，形成自上而下的生长感
+  /// （参考实现的分组入场节奏）。子页面没有类目分组，直接跳过。
+  void _scheduleCategoryReveal() {
+    if (widget.section != SettingsSection.root) return;
+    var delay = 60;
+    for (final category in _SettingsCategory.values) {
+      _categoryRevealTimers.add(
+        Timer(Duration(milliseconds: delay), () {
+          if (!mounted) return;
+          setState(() => _categoryExpanded[category] = true);
+        }),
+      );
+      delay += 90;
+    }
+  }
 
   /// 悬浮头部（搜索框）的测量 Key 与实测高度：搜索框悬浮于设置列表
   /// 上方，列表内容滚动时从毛玻璃下方穿过被模糊（与列表浮动按钮组
@@ -478,6 +593,10 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
 
   @override
   void dispose() {
+    for (final timer in _categoryRevealTimers) {
+      timer.cancel();
+    }
+    _categoryRevealTimers.clear();
     _searchController.dispose();
     super.dispose();
   }
@@ -1005,6 +1124,38 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
               ref.read(settingsProvider.notifier).setVinylTonearm(value),
             ),
           ),
+        // 歌单封面开关移入「外观 › 歌单歌曲加载封面」下一级页面。
+        _entryRow(
+          context,
+          title: '歌单歌曲加载封面',
+          subtitle: settings?.showPlaylistSongCovers ?? true
+              ? '已开启：歌单列表会为歌曲拉取封面'
+              : '已关闭：不再拉取封面，省流量与内存',
+          route: '/settings/playlist-covers',
+        ),
+      ],
+      SettingsSection.playlistCovers => [
+        _switchTile(
+          context,
+          icon: Icons.image_outlined,
+          title: '歌单歌曲加载封面',
+          subtitle: '关闭后歌单列表不再为歌曲拉取封面，省流量与内存',
+          value: settings?.showPlaylistSongCovers ?? true,
+          onChanged: (v) => notifier.setShowPlaylistSongCovers(v),
+        ),
+        Padding(
+          padding: const EdgeInsets.fromLTRB(16, 10, 16, 18),
+          child: Text(
+            '歌单里的歌曲条目默认使用插件返回的封面地址即时加载。'
+            '关闭后列表只显示占位图，可显著减少同时进行的网络请求与图片内存占用；'
+            '播放页与播放条不受影响。',
+            style: TextStyle(
+              fontSize: 12,
+              height: 1.5,
+              color: Theme.of(context).colorScheme.onSurfaceVariant,
+            ),
+          ),
+        ),
       ],
       SettingsSection.layout => [
         Padding(
@@ -1026,6 +1177,28 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
             settings?.sidebarPosition == SidebarPosition.right ? '右上' : '左上',
           ),
           onTap: () => _pickSidebarPosition(context, ref, settings),
+        ),
+        // 侧边栏布局编辑器并入本页（原「侧边栏布局」独立页面）。
+        Padding(
+          padding: const EdgeInsets.fromLTRB(16, 20, 16, 4),
+          child: Text(
+            '侧边栏布局',
+            style: TextStyle(
+              fontSize: 13,
+              fontWeight: FontWeight.w700,
+              color: Theme.of(context).colorScheme.primary,
+            ),
+          ),
+        ),
+        _SidebarLayoutEditor(
+          settings: settings ?? const AppSettings(),
+          notifier: notifier,
+        ),
+        _categoryTile(
+          context,
+          title: '自定义底栏',
+          subtitle: '挑选底栏目的地并拖动排序',
+          route: '/settings/bottom-bar',
         ),
         Padding(
           padding: const EdgeInsets.fromLTRB(16, 20, 16, 4),
@@ -1059,7 +1232,6 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
           ),
         ),
       ],
-      // 侧边栏布局与自定义底栏体量大，改为独立页面，根页只留入口卡片。
       SettingsSection.sidebarLayout => [
         _SidebarLayoutEditor(
           settings: settings ?? const AppSettings(),
@@ -1075,26 +1247,18 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
       SettingsSection.playback => [
         _tile(
           context,
-          icon: Icons.volume_up,
-          title: '音量',
-          trailing: _volumeSlider(settings, notifier),
-        ),
-        _switchTile(
-          context,
-          icon: Icons.volume_up_rounded,
-          title: '音量键调节应用内音量',
-          subtitle: '应用前台时音量键只调本应用音量，不影响系统媒体音量',
-          value: settings?.volumeKeyControlsAppVolume ?? true,
-          onChanged: (v) => notifier.setVolumeKeyControlsAppVolume(v),
-        ),
-        _tile(
-          context,
           icon: Icons.high_quality,
-          title: '在线默认音质',
+          title: '默认音质',
           trailing: Text(
             qualityDisplayLabel(settings?.onlineDefaultQuality ?? '320k'),
           ),
           onTap: () => _pickQuality(context, ref, settings, isOnline: true),
+        ),
+        _categoryTile(
+          context,
+          title: '音量调节设置',
+          subtitle: '应用内音量滑块、音量键是否只调本应用音量',
+          route: '/settings/volume',
         ),
         _tile(
           context,
@@ -1175,17 +1339,11 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
         _switchTile(
           context,
           icon: Icons.multitrack_audio_rounded,
-          title: '播放其他音频不中断此应用播放',
+          title: '与其他应用同时播放',
+          subtitle: '开启后播放其它应用的音频不会中断本应用播放',
           value: settings?.playOtherAudioWithoutInterruption ?? false,
           onChanged: (value) =>
               notifier.setPlayOtherAudioWithoutInterruption(value),
-        ),
-        _switchTile(
-          context,
-          icon: Icons.image_not_supported_outlined,
-          title: '歌单歌曲加载封面',
-          value: settings?.showPlaylistSongCovers ?? true,
-          onChanged: (v) => notifier.setShowPlaylistSongCovers(v),
         ),
         _switchTile(
           context,
@@ -1198,36 +1356,33 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
         _switchTile(
           context,
           icon: Icons.picture_in_picture_alt_outlined,
-          title: '迷你播放器浮窗',
+          title: '迷你播放悬浮窗',
           subtitle: '通知栏单击媒体卡片弹出浮窗，封面/进度条/切歌按钮可直接操作',
           value: settings?.miniPlayerOverlayEnabled ?? false,
           onChanged: (v) => _setMiniPlayerOverlay(context, ref, v),
         ),
       ],
-      SettingsSection.playbackDetail => [
+      // 「音量调节设置」三级页：从「音乐 › 播放」进入。
+      SettingsSection.volume => [
+        _tile(
+          context,
+          icon: Icons.volume_up,
+          title: '应用内音量',
+          trailing: _volumeSlider(settings, notifier),
+        ),
         _switchTile(
           context,
-          icon: Icons.touch_app_outlined,
-          title: '单击歌词调整进度',
-          value: settings?.lyricTapSeek ?? true,
-          onChanged: (v) => notifier.setLyricTapSeek(v),
-        ),
-        _tile(
-          context,
-          icon: Icons.lyrics_outlined,
-          title: '播放详情页歌词',
-          trailing: const Text(''),
-          onTap: () => context.push('/settings/lyrics'),
-        ),
-        _tile(
-          context,
-          icon: Icons.subtitles_outlined,
-          title: '桌面歌词',
-          trailing: const Text(''),
-          onTap: () => context.push('/settings/desktop-lyrics'),
+          icon: Icons.volume_up_rounded,
+          title: '音量键调节应用内音量',
+          subtitle: '应用前台时音量键只调本应用音量，不影响系统媒体音量',
+          value: settings?.volumeKeyControlsAppVolume ?? true,
+          onChanged: (v) => notifier.setVolumeKeyControlsAppVolume(v),
         ),
       ],
+      // 内容已全部并入「个性化 › 歌词」页；保留空分支以兼容旧路由。
+      SettingsSection.playbackDetail => const [],
       SettingsSection.lyrics => [
+        // 歌词显示
         _switchTile(
           context,
           icon: Icons.translate,
@@ -1321,6 +1476,26 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
           ),
           // 与播放详情页更多菜单共用同一歌词设置底部面板。
           onTap: () => unawaited(showLyricSettingsSheet(context)),
+        ),
+        // 播放详情页歌词行为（原「播放」下一级页面）。
+        _switchTile(
+          context,
+          icon: Icons.touch_app_outlined,
+          title: '单击歌词调整进度',
+          value: settings?.lyricTapSeek ?? true,
+          onChanged: (v) => notifier.setLyricTapSeek(v),
+        ),
+        _categoryTile(
+          context,
+          title: '桌面歌词',
+          subtitle: '桌面歌词开关、样式、字号与位置',
+          route: '/settings/desktop-lyrics',
+        ),
+        _categoryTile(
+          context,
+          title: '蓝牙歌词',
+          subtitle: '车载/蓝牙设备歌词显示与推送',
+          route: '/settings/bluetooth-lyrics',
         ),
       ],
       SettingsSection.desktopLyrics => [
@@ -1546,17 +1721,11 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
           onTap: () => context.push('/settings/statistics'),
         ),
         _batteryOptimizationTile(context),
-        _tile(
+        _categoryTile(
           context,
-          icon: Icons.info_outline,
-          title: '关于 XY Music',
-          titleStyle: const TextStyle(fontWeight: FontWeight.w700),
-          // 原生通道读取实际版本（构建时来自 pubspec.yaml），避免
-          // 硬编码版本号随版本升级过期。
-          trailing: Text(
-            ref.watch(appVersionProvider).valueOrNull ?? '',
-          ),
-          onTap: () => context.push('/settings/about'),
+          title: '音乐库',
+          subtitle: '扫描文件夹、扫描格式与短音频过滤',
+          route: '/settings/library',
         ),
         _categoryTile(
           context,
@@ -1589,8 +1758,11 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
     );
   }
 
-  /// 根页卡片流：入口型分类做独立卡片，普通分类标题写在大框上方、
-  /// 内容直接内嵌展示（与子页面共用 _sectionTiles 的内容列表）。
+  /// 根页卡片流：按「个性化 / 音乐 / 应用」三类目组织（对齐参考实现
+  /// CurrentMusicX SettingsScreen 的分组方式），每个类目是一张可折叠
+  /// 卡片：组头是图标 + 标题 + 折叠箭头，组内容用高度 + 透明度动画
+  /// 展开。设置项本体（_sectionTiles 提供的内容）完全沿用，只重排分类
+  /// 与外层容器，不改任何设置项。
   List<Widget> _rootCards(
     BuildContext context, {
     required AppSettings? settings,
@@ -1598,199 +1770,313 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
     required AuthState auth,
     required AsyncValue<bool> dynamicColorSupported,
   }) {
-    List<Widget> tiles(SettingsSection section) => _sectionTiles(
-      context,
-      section: section,
-      settings: settings,
-      notifier: notifier,
-      auth: auth,
-      dynamicColorSupported: dynamicColorSupported,
-    );
-    return [
-      _entryCard(
+    // 账号置顶：不归入三类目，单独一张无组头卡片。
+    final account = <Widget>[
+      _entryRow(
         context,
         title: '账号',
         subtitle: auth.isLoggedIn ? auth.user!.nickname : '登录、注册与账号安全',
         route: '/account?from=settings',
       ),
-      _entryCard(
-        context,
-        title: '插件管理',
-        subtitle: '安装、启用与管理音乐插件',
-        route: '/settings/plugins',
-      ),
-      _groupHeader(context, '个性化'),
-      _entryCard(
+    ];
+
+    // 个性化：外观、布局、歌词（入口型，进独立页面）。
+    final personalization = <Widget>[
+      _entryRow(
         context,
         title: '外观',
         subtitle: '主题、颜色、字体、壁纸与封面样式',
         route: '/settings/appearance',
       ),
-      _entryCard(
+      _entryRow(
         context,
         title: '布局',
-        subtitle: '顶栏位置与首页模块',
+        subtitle: '顶栏与侧边栏布局、自定义底栏、首页模块',
         route: '/settings/layout',
       ),
-      _entryCard(
-        context,
-        title: '侧边栏布局',
-        subtitle: '菜单显示、隐藏与拖拽排序',
-        route: '/settings/sidebar-layout',
-      ),
-      _entryCard(
-        context,
-        title: '自定义底栏',
-        subtitle: '挑选底栏目的地并拖动排序',
-        route: '/settings/bottom-bar',
-      ),
-      _sectionCard(
-        context,
-        title: '播放',
-        children: tiles(SettingsSection.playback),
-      ),
-      _sectionCard(
+      _entryRow(
         context,
         title: '歌词',
-        children: tiles(SettingsSection.playbackDetail),
+        subtitle: '翻译、罗马音、逐字动效、桌面歌词与蓝牙歌词',
+        route: '/settings/lyrics',
       ),
-      _sectionCard(
+    ];
+
+    // 音乐：插件管理、播放、下载（入口型，进独立页面）。
+    final music = <Widget>[
+      _entryRow(
         context,
-        title: '蓝牙歌词',
-        children: tiles(SettingsSection.bluetoothLyrics),
+        title: '插件管理',
+        subtitle: '安装、启用与管理音乐插件',
+        route: '/settings/plugins',
       ),
-      _sectionCard(
+      _entryRow(
+        context,
+        title: '播放',
+        subtitle: '音质、音量调节、并发数、失败策略与浮窗',
+        route: '/settings/playback',
+      ),
+      _entryRow(
         context,
         title: '下载',
-        children: tiles(SettingsSection.download),
+        subtitle: '下载路径、下载音质与歌词、元数据写入',
+        route: '/settings/download',
       ),
-      _entryCard(
+    ];
+
+    // 应用：储存、备份、日志、问题反馈、支持开发者、关于、其他。
+    final app = <Widget>[
+      _entryRow(
         context,
-        title: '备份与恢复',
-        subtitle: '导出或导入歌单、收藏、本地曲库、插件与设置',
-        route: '/settings/backup',
-      ),
-      _entryCard(
-        context,
-        title: '存储与缓存',
+        title: '储存',
         subtitle: '查看并清理封面、播放缓存与临时文件',
         route: '/settings/storage',
       ),
-      _sectionCard(
+      _entryRow(
         context,
-        title: '其他',
-        children: tiles(SettingsSection.other),
+        title: '备份',
+        subtitle: '导出或导入歌单、收藏、本地曲库、插件与设置',
+        route: '/settings/backup',
       ),
-      _entryCard(
+      _entryRow(
+        context,
+        title: '日志',
+        subtitle: '日志保存、筛选与导出',
+        route: '/settings/logs',
+      ),
+      _entryRow(
         context,
         title: '问题反馈',
         subtitle: '提交问题、建议并查看处理进度',
         route: '/settings/feedback',
       ),
+      _entryRow(
+        context,
+        title: '支持开发者',
+        subtitle: '查看赞助说明与收款码',
+        route: '/settings/sponsor',
+      ),
+      _entryRow(
+        context,
+        title: '关于',
+        subtitle: '版本、项目仓库、创作者与开源许可',
+        route: '/settings/about',
+      ),
+      _entryRow(
+        context,
+        title: '其他',
+        subtitle: '听歌统计、后台播放保活与音乐库',
+        route: '/settings/other',
+      ),
+    ];
+
+    return [
+      _flatCard(context, children: account),
+      _categoryCard(
+        context,
+        category: _SettingsCategory.personalization,
+        children: personalization,
+      ),
+      _categoryCard(
+        context,
+        category: _SettingsCategory.music,
+        children: music,
+      ),
+      _categoryCard(context, category: _SettingsCategory.app, children: app),
     ];
   }
 
-  /// 分组标题：把若干入口卡片归入同一大块（如「个性化」下的外观、布局）。
-  Widget _groupHeader(BuildContext context, String title) {
+  /// 无组头的独立卡片（账号置顶行用）：底色与圆角与类目卡片一致。
+  Widget _flatCard(BuildContext context, {required List<Widget> children}) {
+    final scheme = Theme.of(context).colorScheme;
     return Padding(
-      padding: const EdgeInsets.fromLTRB(20, 0, 20, 7),
-      child: Text(
-        title,
-        style: TextStyle(
-          fontSize: 14,
-          fontWeight: FontWeight.w700,
-          color: Theme.of(context).colorScheme.primary,
+      padding: const EdgeInsets.fromLTRB(16, 0, 16, 14),
+      child: Material(
+        color: scheme.surfaceContainerLow,
+        borderRadius: BorderRadius.circular(18),
+        clipBehavior: Clip.antiAlias,
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: _withDivider(context, children),
         ),
       ),
     );
   }
 
-  /// 入口卡片：需要独立页面的分类（无图标），点击进入。
-  Widget _entryCard(
+  /// 类目卡片：组头可点击折叠/展开，箭头随状态旋转，组内容用
+  /// AnimatedSize 做高度动画、AnimatedOpacity 做淡入淡出。
+  Widget _categoryCard(
+    BuildContext context, {
+    required _SettingsCategory category,
+    required List<Widget> children,
+  }) {
+    final scheme = Theme.of(context).colorScheme;
+    final expanded = _categoryExpanded[category] ?? true;
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 0, 16, 14),
+      child: Material(
+        color: scheme.surfaceContainerLow,
+        borderRadius: BorderRadius.circular(18),
+        clipBehavior: Clip.antiAlias,
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            InkWell(
+              onTap: () => setState(
+                () => _categoryExpanded[category] = !expanded,
+              ),
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(14, 12, 10, 12),
+                child: Row(
+                  children: [
+                    Container(
+                      width: 30,
+                      height: 30,
+                      decoration: BoxDecoration(
+                        color: scheme.primary.withValues(alpha: .12),
+                        borderRadius: BorderRadius.circular(9),
+                      ),
+                      child: Icon(
+                        category.icon,
+                        size: 17,
+                        color: scheme.primary,
+                      ),
+                    ),
+                    const SizedBox(width: 10),
+                    Expanded(
+                      child: Text(
+                        category.label,
+                        style: const TextStyle(
+                          fontSize: 15,
+                          fontWeight: FontWeight.w700,
+                        ),
+                      ),
+                    ),
+                    AnimatedRotation(
+                      turns: expanded ? .25 : 0,
+                      duration: const Duration(milliseconds: 220),
+                      curve: Curves.easeOutCubic,
+                      child: Icon(
+                        Icons.chevron_right_rounded,
+                        size: 22,
+                        color: scheme.outline,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+            // 展开动画：高度由 AnimatedSize 生长/回收，内容随透明度淡入，
+            // 折叠时直接卸载子树（不在收起状态下保留全部设置项）。
+            AnimatedSize(
+              duration: const Duration(milliseconds: 260),
+              curve: Curves.easeOutCubic,
+              alignment: Alignment.topCenter,
+              child: AnimatedOpacity(
+                opacity: expanded ? 1 : 0,
+                duration: const Duration(milliseconds: 180),
+                curve: Curves.easeOut,
+                child: expanded
+                    ? Column(
+                        crossAxisAlignment: CrossAxisAlignment.stretch,
+                        children: [
+                          Divider(
+                            height: 1,
+                            thickness: .6,
+                            color: scheme.outlineVariant,
+                          ),
+                          ..._withDivider(context, children),
+                          const SizedBox(height: 4),
+                        ],
+                      )
+                    : const SizedBox.shrink(),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// 组内相邻项之间插细分隔线（左右内缩 16）。
+  List<Widget> _withDivider(BuildContext context, List<Widget> children) {
+    final color = Theme.of(context).colorScheme.outlineVariant;
+    final out = <Widget>[];
+    for (var i = 0; i < children.length; i++) {
+      if (i > 0) {
+        out.add(
+          Divider(
+            height: 1,
+            thickness: .6,
+            color: color,
+            indent: 16,
+            endIndent: 16,
+          ),
+        );
+      }
+      out.add(children[i]);
+    }
+    return out;
+  }
+
+  /// 组内入口行：整行可点、右侧箭头，不再另起一张卡片（底色与圆角由
+  /// 类目卡片统一提供）。
+  Widget _entryRow(
     BuildContext context, {
     required String title,
     required String subtitle,
     required String route,
   }) {
     final scheme = Theme.of(context).colorScheme;
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
-      child: Material(
-        color: scheme.surfaceContainerLow,
-        borderRadius: BorderRadius.circular(16),
-        clipBehavior: Clip.antiAlias,
-        child: InkWell(
-          onTap: () => context.push(route),
-          child: Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-            child: Row(
-              children: [
-                Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(
-                        title,
-                        style: const TextStyle(
-                          fontSize: 15,
-                          fontWeight: FontWeight.w700,
-                        ),
+    return Builder(
+      builder: (rowContext) => InkWell(
+        onTap: () => _openSettingsRoute(rowContext, route),
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(16, 11, 14, 11),
+          child: Row(
+            children: [
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      title,
+                      style: const TextStyle(
+                        fontSize: 15,
+                        fontWeight: FontWeight.w600,
                       ),
-                      const SizedBox(height: 2),
-                      Text(
-                        subtitle,
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: TextStyle(
-                          fontSize: 12,
-                          color: scheme.onSurfaceVariant,
-                        ),
+                    ),
+                    const SizedBox(height: 2),
+                    Text(
+                      subtitle,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        fontSize: 12,
+                        color: scheme.onSurfaceVariant,
                       ),
-                    ],
-                  ),
+                    ),
+                  ],
                 ),
-                const SizedBox(width: 8),
-                Icon(Icons.chevron_right_rounded, color: scheme.outline),
-              ],
-            ),
+              ),
+              const SizedBox(width: 8),
+              Icon(Icons.chevron_right_rounded, size: 20, color: scheme.outline),
+            ],
           ),
         ),
       ),
     );
   }
 
-  /// 内容卡片：分类名称写在大框上方，设置项直接展示在框内。
-  Widget _sectionCard(
-    BuildContext context, {
-    required String title,
-    required List<Widget> children,
-  }) {
-    final scheme = Theme.of(context).colorScheme;
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Padding(
-            padding: const EdgeInsets.only(left: 4, bottom: 7),
-            child: Text(
-              title,
-              style: TextStyle(
-                fontSize: 14,
-                fontWeight: FontWeight.w700,
-                color: scheme.primary,
-              ),
-            ),
-          ),
-          Material(
-            color: scheme.surfaceContainerLow,
-            borderRadius: BorderRadius.circular(16),
-            clipBehavior: Clip.antiAlias,
-            child: Column(children: children),
-          ),
-        ],
-      ),
+  /// 设置项跳转：先把被点击行的屏幕矩形登记为「页面展开」转场起点，
+  /// 再 push。展开动画本体在路由层（routes.dart 的 _settingsExpandPage），
+  /// 没有起点时会自动回退到全局页面切换模式。
+  void _openSettingsRoute(BuildContext rowContext, String route) {
+    SettingsExpandOriginRegistry.capture(
+      rowContext,
+      color: Theme.of(rowContext).colorScheme.surfaceContainerLow,
     );
+    context.push(route);
   }
 
   List<Widget> _searchResultTiles(BuildContext context) {
@@ -1817,45 +2103,47 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
 
   Widget _settingsSearchTile(BuildContext context, SettingsSearchEntry entry) {
     final scheme = Theme.of(context).colorScheme;
-    return ListTile(
-      minTileHeight: 64,
-      leading: Container(
-        width: 38,
-        height: 38,
-        decoration: BoxDecoration(
-          color: scheme.secondaryContainer.withValues(alpha: .66),
-          borderRadius: BorderRadius.circular(11),
-        ),
-        child: Icon(entry.icon, size: 21, color: scheme.onSecondaryContainer),
-      ),
-      title: Text(
-        entry.title,
-        style: const TextStyle(fontWeight: FontWeight.w600),
-      ),
-      subtitle: Text(
-        entry.level == 1 ? '一级分类' : entry.path.join(' › '),
-        maxLines: 1,
-        overflow: TextOverflow.ellipsis,
-      ),
-      trailing: Row(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Container(
-            padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 3),
-            decoration: BoxDecoration(
-              color: scheme.surfaceContainerHighest,
-              borderRadius: BorderRadius.circular(999),
-            ),
-            child: Text(
-              _levelLabel(entry.level),
-              style: TextStyle(fontSize: 10, color: scheme.onSurfaceVariant),
-            ),
+    return Builder(
+      builder: (tileContext) => ListTile(
+        minTileHeight: 64,
+        leading: Container(
+          width: 38,
+          height: 38,
+          decoration: BoxDecoration(
+            color: scheme.secondaryContainer.withValues(alpha: .66),
+            borderRadius: BorderRadius.circular(11),
           ),
-          const SizedBox(width: 5),
-          Icon(Icons.chevron_right_rounded, size: 19, color: scheme.outline),
-        ],
+          child: Icon(entry.icon, size: 21, color: scheme.onSecondaryContainer),
+        ),
+        title: Text(
+          entry.title,
+          style: const TextStyle(fontWeight: FontWeight.w600),
+        ),
+        subtitle: Text(
+          entry.level == 1 ? '一级分类' : entry.path.join(' › '),
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+        ),
+        trailing: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 3),
+              decoration: BoxDecoration(
+                color: scheme.surfaceContainerHighest,
+                borderRadius: BorderRadius.circular(999),
+              ),
+              child: Text(
+                _levelLabel(entry.level),
+                style: TextStyle(fontSize: 10, color: scheme.onSurfaceVariant),
+              ),
+            ),
+            const SizedBox(width: 5),
+            Icon(Icons.chevron_right_rounded, size: 19, color: scheme.outline),
+          ],
+        ),
+        onTap: () => _openSettingsRoute(tileContext, entry.route),
       ),
-      onTap: () => context.push(entry.route),
     );
   }
 
@@ -1870,12 +2158,14 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
     SettingsSection.root => '设置',
     SettingsSection.account => '账号',
     SettingsSection.appearance => '外观',
+    SettingsSection.playlistCovers => '歌单歌曲加载封面',
     SettingsSection.layout => '布局',
     SettingsSection.sidebarLayout => '侧边栏布局',
     SettingsSection.bottomBar => '自定义底栏',
     SettingsSection.playback => '播放',
-    SettingsSection.playbackDetail => '歌词',
-    SettingsSection.lyrics => '播放详情页歌词',
+    SettingsSection.volume => '音量调节设置',
+    SettingsSection.playbackDetail => '播放详情页歌词',
+    SettingsSection.lyrics => '歌词',
     SettingsSection.desktopLyrics => '桌面歌词',
     SettingsSection.bluetoothLyrics => '蓝牙歌词',
     SettingsSection.library => '音乐库',
@@ -1893,12 +2183,14 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
     required String route,
   }) {
     final scheme = Theme.of(context).colorScheme;
-    return ListTile(
-      minTileHeight: 64,
-      title: Text(title, style: const TextStyle(fontWeight: FontWeight.w600)),
-      subtitle: Text(subtitle, maxLines: 1, overflow: TextOverflow.ellipsis),
-      trailing: Icon(Icons.chevron_right, color: scheme.outline),
-      onTap: () => context.push(route),
+    return Builder(
+      builder: (tileContext) => ListTile(
+        minTileHeight: 64,
+        title: Text(title, style: const TextStyle(fontWeight: FontWeight.w600)),
+        subtitle: Text(subtitle, maxLines: 1, overflow: TextOverflow.ellipsis),
+        trailing: Icon(Icons.chevron_right, color: scheme.outline),
+        onTap: () => _openSettingsRoute(tileContext, route),
+      ),
     );
   }
 
@@ -2045,23 +2337,36 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
     VoidCallback? onTap,
     TextStyle? titleStyle,
   }) {
-    return ListTile(
-      title: Text(title, style: titleStyle),
-      trailing: onTap == null
-          ? trailing
-          : Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                trailing,
-                const SizedBox(width: 4),
-                Icon(
-                  Icons.chevron_right,
-                  size: 18,
-                  color: Theme.of(context).colorScheme.outline,
-                ),
-              ],
-            ),
-      onTap: onTap,
+    return Builder(
+      builder: (tileContext) => ListTile(
+        title: Text(title, style: titleStyle),
+        trailing: onTap == null
+            ? trailing
+            : Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  trailing,
+                  const SizedBox(width: 4),
+                  Icon(
+                    Icons.chevron_right,
+                    size: 18,
+                    color: Theme.of(context).colorScheme.outline,
+                  ),
+                ],
+              ),
+        // 行的可点行为有两类：进下一级页面（登记展开起点）或弹层；
+        // 弹层场景登记的起点不会被消费（登记表自带过期兜底），
+        // 不会干扰其它导航。
+        onTap: onTap == null
+            ? null
+            : () {
+                SettingsExpandOriginRegistry.capture(
+                  tileContext,
+                  color: Theme.of(context).colorScheme.surfaceContainerLow,
+                );
+                onTap();
+              },
+      ),
     );
   }
 
@@ -3509,7 +3814,7 @@ class _DesktopLyricsStyleSheetState
                 padding:
                     const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
                 decoration: BoxDecoration(
-                  color: Color(backgroundColor).withOpacity(opacity),
+                  color: Color(backgroundColor).withValues(alpha: opacity),
                   borderRadius: BorderRadius.circular(14),
                   border: Border.all(color: Colors.white12),
                 ),

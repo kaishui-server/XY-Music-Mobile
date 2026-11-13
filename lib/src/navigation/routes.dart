@@ -38,12 +38,14 @@ import '../../pages/settings/plugins_page.dart';
 import '../../pages/settings/scan_folders_page.dart';
 import '../../pages/settings/logs_page.dart';
 import '../../pages/settings/feedback_page.dart';
+import '../../pages/settings/sponsor_page.dart';
 import '../../pages/playlists/playlists_page.dart';
 import '../../pages/playlists/playlist_detail_page.dart';
 import '../../pages/recognize/recognize_page.dart';
 import '../../src/music_platform/platform_session.dart';
 import 'animated_branch_container.dart';
 import 'animated_page_route.dart';
+import 'settings_expand_transition.dart';
 import 'shell.dart';
 
 Page<void> _instantPage(GoRouterState state, Widget child) =>
@@ -75,6 +77,27 @@ class XyPlayerSheetPage<T> extends Page<T> {
 /// CustomTransitionPage（拿不到路由控制器），改用自定义 [XyPlayerSheetPage]。
 Page<void> _playerSheetPage(GoRouterState state, Widget child) =>
     XyPlayerSheetPage<void>(key: state.pageKey, child: child);
+
+/// 设置项 → 子页面：卡片展开转场。起点取自在设置页被点击的那一行
+/// （见 [SettingsExpandOriginRegistry]）；没有起点（深链 / 搜索直达 /
+/// 从其它入口进入）时自动回退到全局页面切换模式。
+Page<void> _settingsExpandPage(GoRouterState state, Widget child) {
+  final origin = SettingsExpandOriginRegistry.take();
+  return CustomTransitionPage<void>(
+    key: state.pageKey,
+    transitionDuration: xySettingsExpandDuration,
+    reverseTransitionDuration: xySettingsExpandReverseDuration,
+    transitionsBuilder: (context, animation, secondaryAnimation, child) =>
+        xySettingsExpandTransition(
+          context,
+          animation,
+          secondaryAnimation,
+          child,
+          origin,
+        ),
+    child: child,
+  );
+}
 
 /// 主路由：使用 StatefulShellRoute 保持各一级页面状态。
 final appRouter = GoRouter(
@@ -247,7 +270,7 @@ final appRouter = GoRouter(
               routes: [
                 GoRoute(
                   path: 'tasks',
-                  pageBuilder: (context, state) => _instantPage(
+                  pageBuilder: (context, state) => _settingsExpandPage(
                     state,
                     const TaskManagerPage(),
                   ),
@@ -255,7 +278,7 @@ final appRouter = GoRouter(
                     // 批量任务详情：展示本次批量操作的歌曲列表。
                     GoRoute(
                       path: 'batch/:id',
-                      pageBuilder: (context, state) => _instantPage(
+                      pageBuilder: (context, state) => _settingsExpandPage(
                         state,
                         BatchTaskDetailPage(
                           taskId: Uri.decodeComponent(
@@ -268,98 +291,123 @@ final appRouter = GoRouter(
                 ),
                 GoRoute(
                   path: 'account-services',
-                  pageBuilder: (context, state) => _instantPage(
+                  pageBuilder: (context, state) => _settingsExpandPage(
                     state,
                     const SettingsPage(section: SettingsSection.account),
                   ),
                 ),
                 GoRoute(
                   path: 'appearance',
-                  pageBuilder: (context, state) => _instantPage(
+                  pageBuilder: (context, state) => _settingsExpandPage(
                     state,
                     const SettingsPage(section: SettingsSection.appearance),
                   ),
                 ),
                 GoRoute(
+                  path: 'playlist-covers',
+                  pageBuilder: (context, state) => _settingsExpandPage(
+                    state,
+                    const SettingsPage(
+                      section: SettingsSection.playlistCovers,
+                    ),
+                  ),
+                ),
+                GoRoute(
                   path: 'layout',
-                  pageBuilder: (context, state) => _instantPage(
+                  pageBuilder: (context, state) => _settingsExpandPage(
                     state,
                     const SettingsPage(section: SettingsSection.layout),
                   ),
                 ),
                 GoRoute(
                   path: 'sidebar-layout',
-                  pageBuilder: (context, state) => _instantPage(
+                  pageBuilder: (context, state) => _settingsExpandPage(
                     state,
                     const SettingsPage(section: SettingsSection.sidebarLayout),
                   ),
                 ),
                 GoRoute(
                   path: 'bottom-bar',
-                  pageBuilder: (context, state) => _instantPage(
+                  pageBuilder: (context, state) => _settingsExpandPage(
                     state,
                     const SettingsPage(section: SettingsSection.bottomBar),
                   ),
                 ),
                 GoRoute(
                   path: 'playback',
-                  pageBuilder: (context, state) => _instantPage(
+                  pageBuilder: (context, state) => _settingsExpandPage(
                     state,
                     const SettingsPage(section: SettingsSection.playback),
                   ),
                 ),
                 GoRoute(
+                  path: 'volume',
+                  pageBuilder: (context, state) => _settingsExpandPage(
+                    state,
+                    const SettingsPage(section: SettingsSection.volume),
+                  ),
+                ),
+                GoRoute(
                   path: 'playback-detail',
-                  pageBuilder: (context, state) => _instantPage(
+                  pageBuilder: (context, state) => _settingsExpandPage(
                     state,
                     const SettingsPage(section: SettingsSection.playbackDetail),
                   ),
                 ),
                 GoRoute(
                   path: 'lyrics',
-                  pageBuilder: (context, state) => _instantPage(
+                  pageBuilder: (context, state) => _settingsExpandPage(
                     state,
                     const SettingsPage(section: SettingsSection.lyrics),
                   ),
                 ),
                 GoRoute(
                   path: 'desktop-lyrics',
-                  pageBuilder: (context, state) => _instantPage(
+                  pageBuilder: (context, state) => _settingsExpandPage(
                     state,
                     const SettingsPage(section: SettingsSection.desktopLyrics),
                   ),
                 ),
                 GoRoute(
+                  path: 'bluetooth-lyrics',
+                  pageBuilder: (context, state) => _settingsExpandPage(
+                    state,
+                    const SettingsPage(
+                      section: SettingsSection.bluetoothLyrics,
+                    ),
+                  ),
+                ),
+                GoRoute(
                   path: 'library',
-                  pageBuilder: (context, state) => _instantPage(
+                  pageBuilder: (context, state) => _settingsExpandPage(
                     state,
                     const SettingsPage(section: SettingsSection.library),
                   ),
                 ),
                 GoRoute(
                   path: 'download',
-                  pageBuilder: (context, state) => _instantPage(
+                  pageBuilder: (context, state) => _settingsExpandPage(
                     state,
                     const SettingsPage(section: SettingsSection.download),
                   ),
                 ),
                 GoRoute(
                   path: 'other',
-                  pageBuilder: (context, state) => _instantPage(
+                  pageBuilder: (context, state) => _settingsExpandPage(
                     state,
                     const SettingsPage(section: SettingsSection.other),
                   ),
                 ),
                 GoRoute(
                   path: 'backup',
-                  pageBuilder: (context, state) => _instantPage(
+                  pageBuilder: (context, state) => _settingsExpandPage(
                     state,
                     const SettingsPage(section: SettingsSection.backup),
                   ),
                 ),
                 GoRoute(
                   path: 'logs-debug',
-                  pageBuilder: (context, state) => _instantPage(
+                  pageBuilder: (context, state) => _settingsExpandPage(
                     state,
                     const SettingsPage(section: SettingsSection.logsDebug),
                   ),
@@ -367,12 +415,12 @@ final appRouter = GoRouter(
                 GoRoute(
                   path: 'logs',
                   pageBuilder: (context, state) =>
-                      _instantPage(state, const LogsPage()),
+                      _settingsExpandPage(state, const LogsPage()),
                 ),
                 GoRoute(
                   path: 'feedback',
                   pageBuilder: (context, state) =>
-                      _instantPage(state, const FeedbackPage()),
+                      _settingsExpandPage(state, const FeedbackPage()),
                 ),
                 GoRoute(
                   path: 'account',
@@ -381,26 +429,31 @@ final appRouter = GoRouter(
                 GoRoute(
                   path: 'statistics',
                   pageBuilder: (context, state) =>
-                      _instantPage(state, const StatisticsPage()),
+                      _settingsExpandPage(state, const StatisticsPage()),
                 ),
                 GoRoute(
                   path: 'storage',
                   pageBuilder: (context, state) =>
-                      _instantPage(state, const StoragePage()),
+                      _settingsExpandPage(state, const StoragePage()),
                 ),
                 GoRoute(
                   path: 'about',
                   pageBuilder: (context, state) =>
-                      _instantPage(state, const AboutPage()),
+                      _settingsExpandPage(state, const AboutPage()),
+                ),
+                GoRoute(
+                  path: 'sponsor',
+                  pageBuilder: (context, state) =>
+                      _settingsExpandPage(state, const SponsorPage()),
                 ),
                 GoRoute(
                   path: 'scan-folders',
                   pageBuilder: (context, state) =>
-                      _instantPage(state, const ScanFoldersPage()),
+                      _settingsExpandPage(state, const ScanFoldersPage()),
                 ),
                 GoRoute(
                   path: 'plugins',
-                  pageBuilder: (context, state) => _instantPage(
+                  pageBuilder: (context, state) => _settingsExpandPage(
                     state,
                     PluginsPage(
                       showSidebarButton:
@@ -414,7 +467,7 @@ final appRouter = GoRouter(
             // 重建账号内容，不会让设置页成为退出登录后的可见父页面。
             GoRoute(
               path: '/account',
-              pageBuilder: (context, state) => _instantPage(
+              pageBuilder: (context, state) => _settingsExpandPage(
                 state,
                 AccountPage(
                   showSidebarButton:
