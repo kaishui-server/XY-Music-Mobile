@@ -17,6 +17,8 @@ import '../../src/ui/xy_theme.dart';
 import '../../src/widgets/cover_image.dart';
 import '../../src/widgets/song_list_view.dart';
 import '../../src/widgets/top_notice.dart';
+import '../../src/navigation/paged_transition.dart';
+import '../../src/navigation/animated_page_route.dart';
 
 /// 探索页入口。搜索结果仍由独立的搜索页承载，探索页提供个性化推荐
 /// 和各插件的热门榜单。
@@ -289,7 +291,7 @@ class _ExploreHotChartsTabs extends StatelessWidget {
           const SizedBox(height: 8),
           SizedBox(
             height: contentHeight,
-            child: TabBarView(
+            child: XyTabBarView(
               children: [
                 for (final entry in entries)
                   // 榜单内容完整展开，不再嵌套纵向滚动容器；上下滑动统一由
@@ -389,7 +391,7 @@ class _ExploreRecommendationsPageState extends State<ExploreRecommendationsPage>
             child: SafeArea(
               top: false,
               bottom: false,
-              child: TabBarView(
+              child: XyTabBarView(
                 controller: _controller,
                 children: [
                   _RecommendationFullSongs(
@@ -913,16 +915,28 @@ class _RecommendedPlaylistsContent extends ConsumerWidget {
   }
 }
 
-/// 「每日30首」Tab 内容：拉取 Baka QQ 音乐插件的每日歌单。
+/// 「每日30首」Tab 内容：聚合所有支持每日推荐的 Baka 插件（QQ 音乐 /
+/// 酷狗 / 酷我）的每日歌单。
 ///
-/// 按插件返回的 state 分流：ready 展示歌单卡片（点击进入详情/播放）；
-/// unconfigured / login_required 引导去插件设置填写用户 ID；其余状态
-/// 给出可重试或可刷新的提示。
-class _Daily30RecommendationContent extends ConsumerWidget {
+/// 多音源时顶部展示音源切换条（默认选中第一个已就绪的音源），单音源时
+/// 维持原布局。每个音源按插件返回的 state 分流：ready 展示歌单卡片
+/// （点击进入详情/播放）；unconfigured / login_required 引导去插件设置
+/// 填写用户 ID；其余状态给出可重试或可刷新的提示。
+class _Daily30RecommendationContent extends ConsumerStatefulWidget {
   const _Daily30RecommendationContent();
 
   @override
-  Widget build(BuildContext context, WidgetRef ref) {
+  ConsumerState<_Daily30RecommendationContent> createState() =>
+      _Daily30RecommendationContentState();
+}
+
+class _Daily30RecommendationContentState
+    extends ConsumerState<_Daily30RecommendationContent> {
+  /// 用户手动选择的音源下标；null 表示跟随「第一个已就绪音源」。
+  int? _selectedSource;
+
+  @override
+  Widget build(BuildContext context) {
     return ref.watch(dailyRecommendationsProvider).when(
           loading: () => const Padding(
             padding: EdgeInsets.symmetric(vertical: 44),
@@ -933,70 +947,124 @@ class _Daily30RecommendationContent extends ConsumerWidget {
             detail: '$error',
             onRetry: () => ref.invalidate(dailyRecommendationsProvider),
           ),
-          data: (state) {
-            if (state == null) {
+          data: (states) {
+            if (states.isEmpty) {
               // 正常路径下无 Baka 插件时不显示该 Tab，这里是防御性兜底。
               return const _RecommendationMessage(
                 message: '暂无每日 30 首推荐',
-                detail: '当前没有支持每日推荐的 Baka QQ 音乐插件，安装后即可使用',
+                detail: '当前没有支持每日推荐的 Baka 音乐插件，安装后即可使用',
               );
             }
-            final result = state.result;
-            switch (result.state) {
-              case 'ready':
-                final playlist = state.playlist;
-                if (playlist == null) {
-                  return _RecommendationMessage(
-                    message: '今日歌单加载失败',
-                    detail: '返回的歌单数据不完整，请稍后重试',
-                    onRetry: () =>
-                        ref.invalidate(dailyRecommendationsProvider),
-                  );
-                }
-                return Padding(
-                  padding: const EdgeInsets.only(top: 4),
-                  child: _RecommendationPlaylistTile(playlist: playlist),
-                );
-              case 'unconfigured':
-                return _RecommendationMessage(
-                  message: '尚未配置 QQ 音乐用户 ID',
-                  detail: '进入插件设置，填写 Baka QQ 音乐插件中的"用户 ID"，即可开启你的每日 30 首',
-                  onRetry: () => context.push<void>('/settings/plugins'),
-                  actionLabel: '去设置',
-                );
-              case 'login_required':
-                return _RecommendationMessage(
-                  message: 'QQ 音乐用户 ID 已失效',
-                  detail: '请重新获取用户 ID 后到插件设置中更新',
-                  onRetry: () => context.push<void>('/settings/plugins'),
-                  actionLabel: '去设置',
-                );
-              case 'blocked':
-                return const _RecommendationMessage(
-                  message: '每日推荐暂不可用',
-                  detail: '该账号的每日推荐请求暂时受限，请稍后再试',
-                );
-              case 'updating':
-                return _RecommendationMessage(
-                  message: '今日歌单正在生成',
-                  detail: '每日 30 首需要一点时间生成，稍后刷新查看',
-                  onRetry: () => ref.invalidate(dailyRecommendationsProvider),
-                  actionLabel: '刷新',
-                );
-              case 'unsupported':
-                return const _RecommendationMessage(
-                  message: '暂无每日 30 首推荐',
-                  detail: '当前插件不支持每日推荐，安装支持该功能的 Baka QQ 音乐插件后即可使用',
-                );
-              default:
-                return _RecommendationMessage(
-                  message: '每日推荐加载失败',
-                  detail: '请检查网络后重试',
-                  onRetry: () => ref.invalidate(dailyRecommendationsProvider),
-                );
+            // 未配置用户 ID 的音源不展示（空列表无意义）；全部未配置时给
+            // 一条汇总引导，指明需要填写的插件。
+            final usable = states
+                .where((state) => state.result.state != 'unconfigured')
+                .toList();
+            if (usable.isEmpty) {
+              final names = states.map((s) => s.plugin.name).join('、');
+              return _RecommendationMessage(
+                message: '尚未配置用户 ID',
+                detail: '到插件设置为$names填写用户 ID（酷狗/酷我为 kg_xxx / kw_xxx 格式），即可开启你的每日 30 首',
+                onRetry: () => context.push<void>('/settings/plugins'),
+                actionLabel: '去设置',
+              );
             }
+            if (usable.length == 1) {
+              return _buildSourceContent(context, usable.first);
+            }
+            final readyIndex = usable.indexWhere(
+              (state) => state.result.isReady,
+            );
+            final selected =
+                (_selectedSource == null || _selectedSource! >= usable.length)
+                ? (readyIndex >= 0 ? readyIndex : 0)
+                : _selectedSource!;
+            return Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                SizedBox(
+                  height: 36,
+                  child: ListView.separated(
+                    scrollDirection: Axis.horizontal,
+                    padding: const EdgeInsets.symmetric(horizontal: 16),
+                    itemCount: usable.length,
+                    separatorBuilder: (_, _) => const SizedBox(width: 8),
+                    itemBuilder: (context, index) {
+                      final state = usable[index];
+                      return ChoiceChip(
+                        // 音源切换条展示完整插件名（如「Baka QQ 音乐」「酷狗[T]」），
+                        // 与插件设置里的名称一致，避免多个 Baka 音源同名混淆。
+                        label: Text(state.plugin.name),
+                        selected: index == selected,
+                        onSelected: (_) =>
+                            setState(() => _selectedSource = index),
+                      );
+                    },
+                  ),
+                ),
+                const SizedBox(height: 8),
+                _buildSourceContent(context, usable[selected]),
+              ],
+            );
           },
         );
+  }
+
+  Widget _buildSourceContent(BuildContext context, DailyRecommendationState state) {
+    final source = state.sourceLabel;
+    final result = state.result;
+    switch (result.state) {
+      case 'ready':
+        final playlist = state.playlist;
+        if (playlist == null) {
+          return _RecommendationMessage(
+            message: '今日歌单加载失败',
+            detail: '返回的歌单数据不完整，请稍后重试',
+            onRetry: () => ref.invalidate(dailyRecommendationsProvider),
+          );
+        }
+        return Padding(
+          padding: const EdgeInsets.only(top: 4),
+          child: _RecommendationPlaylistTile(playlist: playlist),
+        );
+      case 'unconfigured':
+        return _RecommendationMessage(
+          message: '尚未配置$source用户 ID',
+          detail: '进入插件设置，填写$source插件的"用户 ID"（酷狗/酷我为 kg_xxx / kw_xxx 格式），即可开启你的每日 30 首',
+          onRetry: () => context.push<void>('/settings/plugins'),
+          actionLabel: '去设置',
+        );
+      case 'login_required':
+        return _RecommendationMessage(
+          message: '$source用户 ID 已失效',
+          detail: '请重新获取用户 ID 后到插件设置中更新',
+          onRetry: () => context.push<void>('/settings/plugins'),
+          actionLabel: '去设置',
+        );
+      case 'blocked':
+        return const _RecommendationMessage(
+          message: '每日推荐暂不可用',
+          detail: '该账号的每日推荐请求暂时受限，请稍后再试',
+        );
+      case 'updating':
+        return _RecommendationMessage(
+          message: '今日歌单正在生成',
+          detail: '每日 30 首需要一点时间生成，稍后刷新查看',
+          onRetry: () => ref.invalidate(dailyRecommendationsProvider),
+          actionLabel: '刷新',
+        );
+      case 'unsupported':
+        return const _RecommendationMessage(
+          message: '暂无每日 30 首推荐',
+          detail: '当前插件不支持每日推荐，安装支持该功能的 Baka 音乐插件后即可使用',
+        );
+      default:
+        return _RecommendationMessage(
+          message: '每日推荐加载失败',
+          detail: '请检查网络后重试',
+          onRetry: () => ref.invalidate(dailyRecommendationsProvider),
+        );
+    }
   }
 }
 
@@ -1036,31 +1104,9 @@ class _RecommendationPlaylistTile extends StatelessWidget {
         borderRadius: BorderRadius.circular(14),
         child: InkWell(
           onTap: () => Navigator.of(context).push<void>(
-            PageRouteBuilder<void>(
-              opaque: true,
-              transitionDuration: const Duration(milliseconds: 240),
-              reverseTransitionDuration: const Duration(milliseconds: 190),
-              pageBuilder: (_, _, _) =>
-                  _RecommendedPlaylistPage(playlist: playlist),
-              transitionsBuilder: (_, animation, secondaryAnimation, child) {
-                final eased = CurvedAnimation(
-                  parent: animation,
-                  curve: Curves.easeOutCubic,
-                  reverseCurve: Curves.easeInCubic,
-                );
-                return FadeTransition(
-                  opacity: eased,
-                  child: SlideTransition(
-                    position: Tween<Offset>(
-                      begin: const Offset(0, .035),
-                      end: Offset.zero,
-                    ).animate(eased),
-                    // 过渡期间页内容只光栅化一次，动画每帧只更新外层淡入
-                    // 与位移，避免整页（含封面列表）逐帧重绘导致切换掉帧。
-                    child: RepaintBoundary(child: child),
-                  ),
-                );
-              },
+            // 转场跟随全局「页面切换动画」设置，不再写死淡入+位移。
+            XyAnimatedPageRoute<void>(
+              builder: (_) => _RecommendedPlaylistPage(playlist: playlist),
             ),
           ),
           borderRadius: BorderRadius.circular(14),

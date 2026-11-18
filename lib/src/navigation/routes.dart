@@ -48,12 +48,41 @@ import 'animated_page_route.dart';
 import 'settings_expand_transition.dart';
 import 'shell.dart';
 
+/// 常规页面工厂：转场统一由全局「页面切换动画」设置决定
+/// （[xyPageTransition] 按平移 / 层叠 / 淡入淡出分发）。除「设置根页 → 设置
+/// 详情页」这一层用展开转场外，其余层级（含设置详情页的下一级）都走这里。
 Page<void> _instantPage(GoRouterState state, Widget child) =>
     CustomTransitionPage<void>(
       key: state.pageKey,
       transitionDuration: xyPageTransitionDuration,
       reverseTransitionDuration: xyPageReverseTransitionDuration,
       transitionsBuilder: xyPageTransition,
+      child: child,
+    );
+
+/// 设置根页（/settings）专用页面工厂：入场上层仍跟随全局「页面切换动画」，
+/// 但本页被设置详情页覆盖时**不再播放二级全局转场**，而是按同一矩形做
+/// 挖洞互补裁剪（见 [xySettingsRootCoverTransition]）——矩形之外绘制本页，
+/// 矩形之内留给详情页，矩形缩到哪本页就露出到哪，两层不会文字叠加。
+Page<void> _settingsRootPage(GoRouterState state, Widget child) =>
+    CustomTransitionPage<void>(
+      key: state.pageKey,
+      transitionDuration: xyPageTransitionDuration,
+      reverseTransitionDuration: xyPageReverseTransitionDuration,
+      transitionsBuilder: (context, animation, secondaryAnimation, child) {
+        final inbound = xyPageTransition(
+          context,
+          animation,
+          kAlwaysDismissedAnimation,
+          child,
+        );
+        return xySettingsRootCoverTransition(
+          context,
+          animation,
+          secondaryAnimation,
+          inbound,
+        );
+      },
       child: child,
     );
 
@@ -65,10 +94,8 @@ class XyPlayerSheetPage<T> extends Page<T> {
   final Widget child;
 
   @override
-  Route<T> createRoute(BuildContext context) => XyPlayerSheetRoute<T>(
-    settings: this,
-    builder: (context) => child,
-  );
+  Route<T> createRoute(BuildContext context) =>
+      XyPlayerSheetRoute<T>(settings: this, builder: (context) => child);
 }
 
 /// 播放详情页专属页面工厂：XianYu 式底部滑入/收回转场（见
@@ -79,10 +106,24 @@ Page<void> _playerSheetPage(GoRouterState state, Widget child) =>
     XyPlayerSheetPage<void>(key: state.pageKey, child: child);
 
 /// 设置项 → 子页面：卡片展开转场。起点取自在设置页被点击的那一行
-/// （见 [SettingsExpandOriginRegistry]）；没有起点（深链 / 搜索直达 /
-/// 从其它入口进入）时自动回退到全局页面切换模式。
+/// （见 [SettingsExpandOriginRegistry]）。
+///
+/// 判定口径是「父路由是谁 + 这次导航是否来自设置页的一次行点击」：
+/// 只有从设置根页点某一行进入下一级设置详情页时才登记起点、才走纯展开
+/// 动画；没有起点说明这不是「设置根页 → 详情页」这一层（深链直达、
+/// 搜索直达、侧边栏 / 底栏入口、探索页引导等），直接回退到
+/// [_instantPage]，跟随全局「页面切换动画」设置，不做展开。
+///
+/// 该工厂只用于设置根页的直接下一级（含从设置进入的账号页）。设置详情页
+/// 再往下的路由（如任务详情、关于页里的第三方许可）一律 [_instantPage]。
 Page<void> _settingsExpandPage(GoRouterState state, Widget child) {
   final origin = SettingsExpandOriginRegistry.take();
+  // 没有设置行起点：不属于「设置根页 → 详情页」这一层，按全局转场处理。
+  if (origin == null) return _instantPage(state, child);
+  // 详情页本体保持透明（与根页共底壳层壁纸），页面直接参与矩形生长 /
+  // 收缩（见 [xySettingsExpandTransition]），落定后整页透出壳层壁纸，
+  // 观感与进入前一致。壳层浮层（自定义底栏、迷你播放条）绘制在导航器
+  // 之上，不受本转场影响，始终正常显示。
   return CustomTransitionPage<void>(
     key: state.pageKey,
     transitionDuration: xySettingsExpandDuration,
@@ -122,6 +163,9 @@ final appRouter = GoRouter(
         return AnimatedBranchContainer(
           currentIndex: navigationShell.currentIndex,
           direction: branchSwitchDirection.value,
+          // 横滑跟手滑到位后提交分支切换；initialLocation 为 false，
+          // 目标分支的页面栈与滚动位置全部保留。
+          onBranchSelected: (index) => navigationShell.goBranch(index),
           children: children,
         );
       },
@@ -265,20 +309,20 @@ final appRouter = GoRouter(
             GoRoute(
               path: '/settings',
               pageBuilder: (context, state) =>
-                  _instantPage(state, const SettingsPage()),
+                  _settingsRootPage(state, const SettingsPage()),
               // 设置及其子页面统一隐藏迷你播放条。
               routes: [
                 GoRoute(
                   path: 'tasks',
-                  pageBuilder: (context, state) => _settingsExpandPage(
-                    state,
-                    const TaskManagerPage(),
-                  ),
+                  pageBuilder: (context, state) =>
+                      _settingsExpandPage(state, const TaskManagerPage()),
                   routes: [
                     // 批量任务详情：展示本次批量操作的歌曲列表。
+                    // 属「设置详情页的下一级」，转场跟随全局切换模式，
+                    // 不再用卡片展开动画。
                     GoRoute(
                       path: 'batch/:id',
-                      pageBuilder: (context, state) => _settingsExpandPage(
+                      pageBuilder: (context, state) => _instantPage(
                         state,
                         BatchTaskDetailPage(
                           taskId: Uri.decodeComponent(
@@ -301,15 +345,6 @@ final appRouter = GoRouter(
                   pageBuilder: (context, state) => _settingsExpandPage(
                     state,
                     const SettingsPage(section: SettingsSection.appearance),
-                  ),
-                ),
-                GoRoute(
-                  path: 'playlist-covers',
-                  pageBuilder: (context, state) => _settingsExpandPage(
-                    state,
-                    const SettingsPage(
-                      section: SettingsSection.playlistCovers,
-                    ),
                   ),
                 ),
                 GoRoute(
@@ -369,22 +404,6 @@ final appRouter = GoRouter(
                   ),
                 ),
                 GoRoute(
-                  path: 'bluetooth-lyrics',
-                  pageBuilder: (context, state) => _settingsExpandPage(
-                    state,
-                    const SettingsPage(
-                      section: SettingsSection.bluetoothLyrics,
-                    ),
-                  ),
-                ),
-                GoRoute(
-                  path: 'library',
-                  pageBuilder: (context, state) => _settingsExpandPage(
-                    state,
-                    const SettingsPage(section: SettingsSection.library),
-                  ),
-                ),
-                GoRoute(
                   path: 'download',
                   pageBuilder: (context, state) => _settingsExpandPage(
                     state,
@@ -403,13 +422,6 @@ final appRouter = GoRouter(
                   pageBuilder: (context, state) => _settingsExpandPage(
                     state,
                     const SettingsPage(section: SettingsSection.backup),
-                  ),
-                ),
-                GoRoute(
-                  path: 'logs-debug',
-                  pageBuilder: (context, state) => _settingsExpandPage(
-                    state,
-                    const SettingsPage(section: SettingsSection.logsDebug),
                   ),
                 ),
                 GoRoute(
@@ -467,13 +479,17 @@ final appRouter = GoRouter(
             // 重建账号内容，不会让设置页成为退出登录后的可见父页面。
             GoRoute(
               path: '/account',
-              pageBuilder: (context, state) => _settingsExpandPage(
-                state,
-                AccountPage(
-                  showSidebarButton:
-                      state.uri.queryParameters['from'] != 'settings',
-                ),
-              ),
+              // 从设置页点进来（from=settings）才算「设置根页 → 详情页」，
+              // 用卡片展开动画；从侧边栏等其它入口进来时父路由不是设置根页，
+              // 跟随全局「页面切换动画」设置。
+              pageBuilder: (context, state) {
+                final fromSettings =
+                    state.uri.queryParameters['from'] == 'settings';
+                final page = AccountPage(showSidebarButton: !fromSettings);
+                return fromSettings
+                    ? _settingsExpandPage(state, page)
+                    : _instantPage(state, page);
+              },
               routes: [
                 // 编辑账号信息：修改头像/昵称/密码，刷新账号资料。
                 GoRoute(
@@ -503,8 +519,9 @@ final appRouter = GoRouter(
                               pageBuilder: (context, state) => _instantPage(
                                 state,
                                 CloudDataPlaylistDetailPage(
-                                  playlistId:
-                                      Uri.decodeComponent(state.pathParameters['id'] ?? ''),
+                                  playlistId: Uri.decodeComponent(
+                                    state.pathParameters['id'] ?? '',
+                                  ),
                                 ),
                               ),
                             ),
@@ -519,17 +536,13 @@ final appRouter = GoRouter(
                         ),
                         GoRoute(
                           path: 'plugins',
-                          pageBuilder: (context, state) => _instantPage(
-                            state,
-                            const CloudDataPluginsPage(),
-                          ),
+                          pageBuilder: (context, state) =>
+                              _instantPage(state, const CloudDataPluginsPage()),
                         ),
                         GoRoute(
                           path: 'user',
-                          pageBuilder: (context, state) => _instantPage(
-                            state,
-                            const CloudDataUserPage(),
-                          ),
+                          pageBuilder: (context, state) =>
+                              _instantPage(state, const CloudDataUserPage()),
                         ),
                       ],
                     ),
@@ -538,17 +551,16 @@ final appRouter = GoRouter(
                 // 第三方音乐平台（QQ/网易/酷狗）：登录后可导入在线歌单。
                 GoRoute(
                   path: 'music-platform',
-                  pageBuilder: (context, state) => _instantPage(
-                    state,
-                    const PlatformAccountPage(),
-                  ),
+                  pageBuilder: (context, state) =>
+                      _instantPage(state, const PlatformAccountPage()),
                   routes: [
                     GoRoute(
                       path: 'playlists/:platform',
                       pageBuilder: (context, state) => _instantPage(
                         state,
                         PlatformPlaylistsPage(
-                          platform: MusicPlatformX.fromName(
+                          platform:
+                              MusicPlatformX.fromName(
                                 state.pathParameters['platform'],
                               ) ??
                               MusicPlatform.netease,

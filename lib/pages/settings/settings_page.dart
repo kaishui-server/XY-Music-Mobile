@@ -18,8 +18,8 @@ import '../../src/backup/backup_service.dart';
 import '../../src/favorites/favorites_provider.dart';
 import '../../src/navigation/settings_expand_transition.dart';
 import '../../src/navigation/sidebar_controller.dart';
+import '../../src/player/bluetooth_lyrics_switch.dart';
 import '../../src/player/desktop_lyrics.dart';
-import '../../src/player/bluetooth_lyrics.dart';
 import '../../src/player/mini_player_overlay.dart';
 import '../../src/playlists/playlists_provider.dart';
 import '../../src/plugins/plugin_runtime.dart';
@@ -35,8 +35,6 @@ enum SettingsSection {
   root,
   account,
   appearance,
-  /// 歌单封面：从「个性化 › 外观」进入的下一级页面。
-  playlistCovers,
   layout,
   sidebarLayout,
   bottomBar,
@@ -46,12 +44,9 @@ enum SettingsSection {
   playbackDetail,
   lyrics,
   desktopLyrics,
-  bluetoothLyrics,
-  library,
   download,
   backup,
   other,
-  logsDebug,
   feedback,
 }
 
@@ -62,6 +57,7 @@ class SettingsSearchEntry {
     required this.route,
     required this.icon,
     this.keywords = '',
+    this.note,
   });
 
   final String title;
@@ -70,16 +66,20 @@ class SettingsSearchEntry {
   final IconData icon;
   final String keywords;
 
+  /// 可选入口标注：条目所在功能不在设置页层级内时（如音乐库页、侧边栏），
+  /// 在搜索结果的路径后缀上补充说明，避免用户按路径找不到入口。
+  final String? note;
+
   int get level => path.length;
 }
 
 const settingsSearchEntries = <SettingsSearchEntry>[
   SettingsSearchEntry(
     title: '账号',
-    path: ['账号'],
+    path: ['账号', '账号与安全'],
     route: '/account?from=settings',
     icon: Icons.manage_accounts_outlined,
-    keywords: '登录 注册 账号安全 退出',
+    keywords: '登录 注册 账号与安全 账号安全 退出',
   ),
   SettingsSearchEntry(
     title: '网盘账号绑定',
@@ -117,6 +117,13 @@ const settingsSearchEntries = <SettingsSearchEntry>[
     keywords: 'Material You 安卓12 系统颜色 壁纸取色',
   ),
   SettingsSearchEntry(
+    title: '页面切换动画',
+    path: ['外观', '页面切换动画'],
+    route: '/settings/appearance',
+    icon: Icons.animation,
+    keywords: '转场 过渡 切换效果 平移 层叠 淡入淡出 slide stack fade 动画',
+  ),
+  SettingsSearchEntry(
     title: '自定义字体',
     path: ['外观', '自定义字体'],
     route: '/settings/appearance',
@@ -124,11 +131,32 @@ const settingsSearchEntries = <SettingsSearchEntry>[
     keywords: '字体 ttf otf 全局 文字 更换',
   ),
   SettingsSearchEntry(
+    title: '自定义壁纸',
+    path: ['外观', '自定义壁纸'],
+    route: '/settings/appearance',
+    icon: Icons.wallpaper_outlined,
+    keywords: '壁纸 背景图 背景图片 更换 相册',
+  ),
+  SettingsSearchEntry(
     title: '播放详情页背景',
     path: ['外观', '播放详情页背景'],
     route: '/settings/appearance',
     icon: Icons.wallpaper_outlined,
     keywords: '封面模糊 壁纸模糊 氛围 自定义图片',
+  ),
+  SettingsSearchEntry(
+    title: '详情页自定义图片',
+    path: ['外观', '播放详情页背景', '详情页自定义图片'],
+    route: '/settings/appearance',
+    icon: Icons.image_outlined,
+    keywords: '播放详情页 自定义图片 背景图 相册',
+  ),
+  SettingsSearchEntry(
+    title: '自定义背景压暗遮罩',
+    path: ['外观', '自定义背景压暗遮罩'],
+    route: '/settings/appearance',
+    icon: Icons.contrast_outlined,
+    keywords: '遮罩 压暗 变暗 蒙版 暗色 自定义图片 壁纸',
   ),
   SettingsSearchEntry(
     title: '播放页封面样式',
@@ -147,7 +175,7 @@ const settingsSearchEntries = <SettingsSearchEntry>[
   SettingsSearchEntry(
     title: '歌单歌曲加载封面',
     path: ['外观', '歌单歌曲加载封面'],
-    route: '/settings/playlist-covers',
+    route: '/settings/appearance',
     icon: Icons.image_outlined,
     keywords: '歌单 列表 封面 加载 省流量',
   ),
@@ -191,7 +219,7 @@ const settingsSearchEntries = <SettingsSearchEntry>[
     path: ['歌词'],
     route: '/settings/lyrics',
     icon: Icons.lyrics_outlined,
-    keywords: '歌词 翻译 罗马音 逐字 动效 对齐 字号 颜色 桌面歌词 蓝牙歌词',
+    keywords: '歌词 翻译 罗马音 逐字 动效 对齐 字号 颜色 桌面歌词 蓝牙歌词 车载 推送',
   ),
   SettingsSearchEntry(
     title: '显示翻译',
@@ -236,6 +264,13 @@ const settingsSearchEntries = <SettingsSearchEntry>[
     keywords: '点击歌词 跳转 进度 seek',
   ),
   SettingsSearchEntry(
+    title: '蓝牙歌词',
+    path: ['歌词', '蓝牙歌词'],
+    route: '/settings/lyrics',
+    icon: Icons.bluetooth_audio_outlined,
+    keywords: '蓝牙 车载 车机 推送 蓝牙歌词',
+  ),
+  SettingsSearchEntry(
     title: '桌面歌词',
     path: ['歌词', '桌面歌词'],
     route: '/settings/desktop-lyrics',
@@ -243,11 +278,74 @@ const settingsSearchEntries = <SettingsSearchEntry>[
     keywords: '悬浮歌词 桌面歌词 浮窗 逐字效果',
   ),
   SettingsSearchEntry(
-    title: '蓝牙歌词',
-    path: ['歌词', '蓝牙歌词'],
-    route: '/settings/bluetooth-lyrics',
-    icon: Icons.bluetooth_audio_outlined,
-    keywords: '车载 蓝牙 歌词 推送',
+    title: '开启桌面歌词',
+    path: ['歌词', '桌面歌词', '开启桌面歌词'],
+    route: '/settings/desktop-lyrics',
+    icon: Icons.subtitles_outlined,
+    keywords: '桌面歌词 开关 悬浮窗 权限',
+  ),
+  SettingsSearchEntry(
+    title: '软件内不显示桌面歌词',
+    path: ['歌词', '桌面歌词', '软件内不显示桌面歌词'],
+    route: '/settings/desktop-lyrics',
+    icon: Icons.visibility_off_outlined,
+    keywords: '应用内隐藏 界面内不显示 悬浮歌词',
+  ),
+  SettingsSearchEntry(
+    title: '暂停时隐藏歌词',
+    path: ['歌词', '桌面歌词', '暂停时隐藏歌词'],
+    route: '/settings/desktop-lyrics',
+    icon: Icons.pause_circle_outline,
+    keywords: '暂停 隐藏 桌面歌词',
+  ),
+  SettingsSearchEntry(
+    title: '显示逐字歌词效果',
+    path: ['歌词', '桌面歌词', '显示逐字歌词效果'],
+    route: '/settings/desktop-lyrics',
+    icon: Icons.auto_awesome,
+    keywords: '逐字 卡拉OK 桌面歌词 动画',
+  ),
+  SettingsSearchEntry(
+    title: '不显示背景色',
+    path: ['歌词', '桌面歌词', '不显示背景色'],
+    route: '/settings/desktop-lyrics',
+    icon: Icons.layers_clear_outlined,
+    keywords: '透明 无背景 桌面歌词 底色',
+  ),
+  SettingsSearchEntry(
+    title: '锁定桌面歌词',
+    path: ['歌词', '桌面歌词', '锁定桌面歌词'],
+    route: '/settings/desktop-lyrics',
+    icon: Icons.lock_outline,
+    keywords: '锁定 移动 拖动 桌面歌词',
+  ),
+  SettingsSearchEntry(
+    title: '上下位置',
+    path: ['歌词', '桌面歌词', '上下位置'],
+    route: '/settings/desktop-lyrics',
+    icon: Icons.vertical_align_center_rounded,
+    keywords: '位置 高度 上下 桌面歌词',
+  ),
+  SettingsSearchEntry(
+    title: '歌词样式',
+    path: ['歌词', '桌面歌词', '歌词样式'],
+    route: '/settings/desktop-lyrics',
+    icon: Icons.palette_outlined,
+    keywords: '颜色 背景 透明度 桌面歌词',
+  ),
+  SettingsSearchEntry(
+    title: '歌词字号',
+    path: ['歌词', '桌面歌词', '歌词字号'],
+    route: '/settings/desktop-lyrics',
+    icon: Icons.format_size_rounded,
+    keywords: '字号 大小 桌面歌词',
+  ),
+  SettingsSearchEntry(
+    title: '翻译字号',
+    path: ['歌词', '桌面歌词', '翻译字号'],
+    route: '/settings/desktop-lyrics',
+    icon: Icons.text_fields_rounded,
+    keywords: '翻译 字号 大小 桌面歌词',
   ),
   SettingsSearchEntry(
     title: '插件管理',
@@ -269,6 +367,13 @@ const settingsSearchEntries = <SettingsSearchEntry>[
     route: '/settings/plugins',
     icon: Icons.upload_file_outlined,
     keywords: 'js 文件 插件',
+  ),
+  SettingsSearchEntry(
+    title: '插件用户变量',
+    path: ['插件管理', '插件用户变量'],
+    route: '/settings/plugins',
+    icon: Icons.data_object_rounded,
+    keywords: '变量 配置 参数 脚本',
   ),
   SettingsSearchEntry(
     title: '播放',
@@ -324,7 +429,7 @@ const settingsSearchEntries = <SettingsSearchEntry>[
     path: ['播放', '播放失败策略'],
     route: '/settings/playback',
     icon: Icons.replay_rounded,
-    keywords: '重试 换源 失败 跳过',
+    keywords: '重试 换源 失败 跳过 优先重试次数 最大换源尝试次数',
   ),
   SettingsSearchEntry(
     title: '与其他应用同时播放',
@@ -376,11 +481,27 @@ const settingsSearchEntries = <SettingsSearchEntry>[
     keywords: '歌词 下载',
   ),
   SettingsSearchEntry(
+    title: '下载时写入元数据',
+    path: ['下载', '下载时写入元数据'],
+    route: '/settings/download',
+    icon: Icons.edit_note_rounded,
+    keywords: '元数据 标签 tag 封面 歌词 标题 写入音频',
+  ),
+  SettingsSearchEntry(
     title: '每次下载是否询问细节',
     path: ['下载', '每次下载是否询问细节'],
     route: '/settings/download',
     icon: Icons.tune_rounded,
     keywords: '询问 不询问 下载弹窗',
+  ),
+  // 任务管理入口在侧边栏，不在设置页层级内，用 note 标注来源。
+  SettingsSearchEntry(
+    title: '任务管理',
+    path: ['任务管理'],
+    route: '/settings/tasks',
+    icon: Icons.task_alt_outlined,
+    keywords: '批量任务 下载任务 任务列表 进度',
+    note: '侧边栏入口',
   ),
   SettingsSearchEntry(
     title: '储存',
@@ -390,6 +511,41 @@ const settingsSearchEntries = <SettingsSearchEntry>[
     keywords: '缓存 清理 空间 占用 封面 临时文件',
   ),
   SettingsSearchEntry(
+    title: '封面缓存',
+    path: ['储存', '封面缓存'],
+    route: '/settings/storage',
+    icon: Icons.image_outlined,
+    keywords: '封面 图片缓存',
+  ),
+  SettingsSearchEntry(
+    title: '播放流缓存',
+    path: ['储存', '播放流缓存'],
+    route: '/settings/storage',
+    icon: Icons.play_circle_outline_rounded,
+    keywords: '音频流 缓存 试听',
+  ),
+  SettingsSearchEntry(
+    title: '下载中转文件',
+    path: ['储存', '下载中转文件'],
+    route: '/settings/storage',
+    icon: Icons.download_outlined,
+    keywords: '下载 临时 中转',
+  ),
+  SettingsSearchEntry(
+    title: '临时文件',
+    path: ['储存', '临时文件'],
+    route: '/settings/storage',
+    icon: Icons.folder_delete_outlined,
+    keywords: '临时 temp',
+  ),
+  SettingsSearchEntry(
+    title: '内存缓存',
+    path: ['储存', '内存缓存'],
+    route: '/settings/storage',
+    icon: Icons.memory_rounded,
+    keywords: '内存 图片内存',
+  ),
+  SettingsSearchEntry(
     title: '备份',
     path: ['备份'],
     route: '/settings/backup',
@@ -397,11 +553,81 @@ const settingsSearchEntries = <SettingsSearchEntry>[
     keywords: '备份 恢复 导出 导入 迁移 换机 歌单 收藏',
   ),
   SettingsSearchEntry(
+    title: '导出备份',
+    path: ['备份', '导出备份'],
+    route: '/settings/backup',
+    icon: Icons.file_upload_outlined,
+    keywords: '导出 备份文件 迁移 换机',
+  ),
+  SettingsSearchEntry(
+    title: '导入备份',
+    path: ['备份', '导入备份'],
+    route: '/settings/backup',
+    icon: Icons.file_download_outlined,
+    keywords: '导入 恢复 备份文件 迁移 换机',
+  ),
+  SettingsSearchEntry(
     title: '日志',
     path: ['日志'],
     route: '/settings/logs',
     icon: Icons.description_outlined,
-    keywords: '保存条数 错误日志 时间范围 导出',
+    keywords: '保存条数 日志时间范围 警告 报错 导出 崩溃记录 探针日志 清空 筛选',
+  ),
+  SettingsSearchEntry(
+    title: '保存日志条数',
+    path: ['日志', '保存日志条数'],
+    route: '/settings/logs',
+    icon: Icons.numbers_rounded,
+    keywords: '条数 上限 保留',
+  ),
+  SettingsSearchEntry(
+    title: '保存探针日志条数',
+    path: ['日志', '保存探针日志条数'],
+    route: '/settings/logs',
+    icon: Icons.speed_rounded,
+    keywords: '探针 配额',
+  ),
+  SettingsSearchEntry(
+    title: '只记录警告和报错日志',
+    path: ['日志', '只记录警告和报错日志'],
+    route: '/settings/logs',
+    icon: Icons.filter_alt_outlined,
+    keywords: '警告 报错 error warn 筛选',
+  ),
+  SettingsSearchEntry(
+    title: '崩溃记录',
+    path: ['日志', '崩溃记录'],
+    route: '/settings/logs',
+    icon: Icons.bug_report_outlined,
+    keywords: '闪退 崩溃 crash 20 份',
+  ),
+  SettingsSearchEntry(
+    title: '日志时间范围',
+    path: ['日志', '日志时间范围'],
+    route: '/settings/logs',
+    icon: Icons.date_range_outlined,
+    keywords: '时间 范围 筛选',
+  ),
+  SettingsSearchEntry(
+    title: '导出全部日志',
+    path: ['日志', '导出全部日志'],
+    route: '/settings/logs',
+    icon: Icons.file_upload_outlined,
+    keywords: '导出 全部 日志',
+  ),
+  SettingsSearchEntry(
+    title: '导出错误日志',
+    path: ['日志', '导出错误日志'],
+    route: '/settings/logs',
+    icon: Icons.error_outline_rounded,
+    keywords: '导出 错误 error',
+  ),
+  SettingsSearchEntry(
+    title: '一键清空日志',
+    path: ['日志', '一键清空日志'],
+    route: '/settings/logs',
+    icon: Icons.delete_sweep_outlined,
+    keywords: '清空 删除 日志',
   ),
   SettingsSearchEntry(
     title: '问题反馈',
@@ -418,18 +644,46 @@ const settingsSearchEntries = <SettingsSearchEntry>[
     keywords: '赞助 打赏 收款码 微信 支付宝',
   ),
   SettingsSearchEntry(
-    title: '关于 XY Music',
+    title: '关于',
     path: ['关于'],
     route: '/settings/about',
     icon: Icons.info_outline,
-    keywords: '版本 开源 许可 仓库 创作者',
+    keywords: '关于 版本 开源 许可 仓库 项目仓库 官网 检查更新 第三方许可 创作者',
+  ),
+  SettingsSearchEntry(
+    title: '检查更新',
+    path: ['关于', '检查更新'],
+    route: '/settings/about',
+    icon: Icons.system_update_alt_rounded,
+    keywords: '更新 版本 升级',
+  ),
+  SettingsSearchEntry(
+    title: '项目仓库',
+    path: ['关于', '项目仓库'],
+    route: '/settings/about',
+    icon: Icons.source_outlined,
+    keywords: 'github 源码 仓库',
+  ),
+  SettingsSearchEntry(
+    title: '软件官网',
+    path: ['关于', '软件官网'],
+    route: '/settings/about',
+    icon: Icons.language_rounded,
+    keywords: '官网 网站 xymusic.cc',
+  ),
+  SettingsSearchEntry(
+    title: '第三方许可',
+    path: ['关于', '第三方许可'],
+    route: '/settings/about',
+    icon: Icons.article_outlined,
+    keywords: '开源 许可 license 致谢',
   ),
   SettingsSearchEntry(
     title: '其他',
     path: ['其他'],
     route: '/settings/other',
     icon: Icons.tune_rounded,
-    keywords: '统计 电池 保活 音乐库',
+    keywords: '统计 电池 保活',
   ),
   SettingsSearchEntry(
     title: '听歌统计',
@@ -439,39 +693,37 @@ const settingsSearchEntries = <SettingsSearchEntry>[
     keywords: '播放次数 时长 历史',
   ),
   SettingsSearchEntry(
-    title: '音乐库',
-    path: ['其他', '音乐库'],
-    route: '/settings/library',
-    icon: Icons.library_music_outlined,
-    keywords: '本地 扫描 文件夹 格式',
+    title: '后台播放保活',
+    path: ['其他', '后台播放保活'],
+    route: '/settings/other',
+    icon: Icons.battery_saver_outlined,
+    keywords: '电池优化 省电 白名单 华为 荣耀 后台被杀 中断播放',
   ),
+  // 扫描文件夹/扫描格式/排除短音频已并入「音乐库 → 本地音乐」右上角的
+  // 扫描目录设置页，搜索直达该页。
   SettingsSearchEntry(
     title: '扫描文件夹',
-    path: ['其他', '音乐库', '扫描文件夹'],
+    path: ['音乐库', '本地音乐', '扫描文件夹'],
     route: '/settings/scan-folders',
     icon: Icons.folder_special_outlined,
     keywords: '添加目录 本地音乐',
+    note: '音乐库页入口',
   ),
   SettingsSearchEntry(
     title: '扫描格式',
-    path: ['其他', '音乐库', '扫描格式'],
-    route: '/settings/library',
+    path: ['音乐库', '本地音乐', '扫描文件夹', '扫描格式'],
+    route: '/settings/scan-folders',
     icon: Icons.audiotrack_outlined,
     keywords: 'flac mp3 wav aac m4a ogg aiff',
+    note: '音乐库页入口',
   ),
   SettingsSearchEntry(
     title: '排除短音频',
-    path: ['其他', '音乐库', '排除短音频'],
-    route: '/settings/library',
+    path: ['音乐库', '本地音乐', '扫描文件夹', '排除短音频'],
+    route: '/settings/scan-folders',
     icon: Icons.timer_outlined,
     keywords: '最短时长 秒',
-  ),
-  SettingsSearchEntry(
-    title: '日志与调试',
-    path: ['其他', '日志与调试'],
-    route: '/settings/logs-debug',
-    icon: Icons.bug_report_outlined,
-    keywords: '日志 调试 导出 错误 警告',
+    note: '音乐库页入口',
   ),
 ];
 
@@ -510,7 +762,7 @@ List<SettingsSearchEntry> searchSettings(String rawQuery) {
 }
 
 /// 根页设置类目：按「个性化 / 音乐 / 应用」三块组织（对齐参考实现
-/// CurrentMusicX 的 SettingsScreen 分组），每块是一张可折叠卡片。
+/// CurrentMusicX 的 SettingsScreen 分组），每块是一张常显卡片。
 enum _SettingsCategory {
   personalization('个性化', Icons.auto_awesome_outlined),
   music('音乐', Icons.library_music_outlined),
@@ -537,37 +789,6 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
   bool _exportingBackup = false;
   bool _importingBackup = false;
 
-  /// 根页类目展开状态：初值全收起，首帧后按序展开（入场 stagger），
-  /// 之后由用户点组头折叠/展开。
-  final Map<_SettingsCategory, bool> _categoryExpanded = {
-    for (final category in _SettingsCategory.values) category: false,
-  };
-
-  /// 类目入场展开的计时器，页面销毁时统一取消。
-  final List<Timer> _categoryRevealTimers = [];
-
-  @override
-  void initState() {
-    super.initState();
-    _scheduleCategoryReveal();
-  }
-
-  /// 入场展开：三块类目依次错开 90ms 展开，形成自上而下的生长感
-  /// （参考实现的分组入场节奏）。子页面没有类目分组，直接跳过。
-  void _scheduleCategoryReveal() {
-    if (widget.section != SettingsSection.root) return;
-    var delay = 60;
-    for (final category in _SettingsCategory.values) {
-      _categoryRevealTimers.add(
-        Timer(Duration(milliseconds: delay), () {
-          if (!mounted) return;
-          setState(() => _categoryExpanded[category] = true);
-        }),
-      );
-      delay += 90;
-    }
-  }
-
   /// 悬浮头部（搜索框）的测量 Key 与实测高度：搜索框悬浮于设置列表
   /// 上方，列表内容滚动时从毛玻璃下方穿过被模糊（与列表浮动按钮组
   /// 同款观感），列表顶部让出头部高度。
@@ -593,10 +814,6 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
 
   @override
   void dispose() {
-    for (final timer in _categoryRevealTimers) {
-      timer.cancel();
-    }
-    _categoryRevealTimers.clear();
     _searchController.dispose();
     super.dispose();
   }
@@ -855,6 +1072,8 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
     );
 
     return Scaffold(
+      // 页面底保持透明（露出应用背景层）：半透明只做在类目卡片上
+      //（见 [_categoryCard] / [_flatCard]），不做整页半透明。
       appBar: AppBar(
         automaticallyImplyLeading:
             section != SettingsSection.root ||
@@ -1124,17 +1343,7 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
               ref.read(settingsProvider.notifier).setVinylTonearm(value),
             ),
           ),
-        // 歌单封面开关移入「外观 › 歌单歌曲加载封面」下一级页面。
-        _entryRow(
-          context,
-          title: '歌单歌曲加载封面',
-          subtitle: settings?.showPlaylistSongCovers ?? true
-              ? '已开启：歌单列表会为歌曲拉取封面'
-              : '已关闭：不再拉取封面，省流量与内存',
-          route: '/settings/playlist-covers',
-        ),
-      ],
-      SettingsSection.playlistCovers => [
+        // 歌单封面开关直接放在本页，不再进下一级页面。
         _switchTile(
           context,
           icon: Icons.image_outlined,
@@ -1142,19 +1351,6 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
           subtitle: '关闭后歌单列表不再为歌曲拉取封面，省流量与内存',
           value: settings?.showPlaylistSongCovers ?? true,
           onChanged: (v) => notifier.setShowPlaylistSongCovers(v),
-        ),
-        Padding(
-          padding: const EdgeInsets.fromLTRB(16, 10, 16, 18),
-          child: Text(
-            '歌单里的歌曲条目默认使用插件返回的封面地址即时加载。'
-            '关闭后列表只显示占位图，可显著减少同时进行的网络请求与图片内存占用；'
-            '播放页与播放条不受影响。',
-            style: TextStyle(
-              fontSize: 12,
-              height: 1.5,
-              color: Theme.of(context).colorScheme.onSurfaceVariant,
-            ),
-          ),
         ),
       ],
       SettingsSection.layout => [
@@ -1485,17 +1681,21 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
           value: settings?.lyricTapSeek ?? true,
           onChanged: (v) => notifier.setLyricTapSeek(v),
         ),
+        // 蓝牙歌词：开关入口已从播放详情页更多菜单移入本页，复用共用桥接
+        // 逻辑（开启会拉起原生蓝牙权限，未授权不写设置）。
+        _switchTile(
+          context,
+          icon: Icons.bluetooth_audio_outlined,
+          title: '蓝牙歌词',
+          subtitle: '通过蓝牙把歌词推送到车机屏幕，开启需授予蓝牙权限',
+          value: settings?.bluetoothLyricsEnabled ?? false,
+          onChanged: (next) => applyBluetoothLyricsEnabled(context, ref, next),
+        ),
         _categoryTile(
           context,
           title: '桌面歌词',
           subtitle: '桌面歌词开关、样式、字号与位置',
           route: '/settings/desktop-lyrics',
-        ),
-        _categoryTile(
-          context,
-          title: '蓝牙歌词',
-          subtitle: '车载/蓝牙设备歌词显示与推送',
-          route: '/settings/bluetooth-lyrics',
         ),
       ],
       SettingsSection.desktopLyrics => [
@@ -1595,38 +1795,6 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
         ),
         _desktopLyricsPreview(context, settings),
       ],
-      SettingsSection.bluetoothLyrics => [
-        _switchTile(
-          context,
-          icon: Icons.bluetooth_audio,
-          title: '蓝牙歌词',
-          value: settings?.bluetoothLyricsEnabled ?? false,
-          onChanged: (value) => _setBluetoothLyrics(context, ref, value),
-        ),
-      ],
-      SettingsSection.library => [
-        _tile(
-          context,
-          icon: Icons.folder_special,
-          title: '扫描文件夹',
-          trailing: const Text(''),
-          onTap: () => context.push('/settings/scan-folders'),
-        ),
-        _tile(
-          context,
-          icon: Icons.audiotrack,
-          title: '扫描格式',
-          trailing: Text('${settings?.scanFormats.length ?? 0} 种'),
-          onTap: () => _pickScanFormats(context, ref, settings),
-        ),
-        _tile(
-          context,
-          icon: Icons.timer,
-          title: '排除短音频（秒）',
-          trailing: Text('${settings?.libraryMinDurationSeconds ?? 0}'),
-          onTap: () => _pickMinDuration(context, ref, settings),
-        ),
-      ],
       SettingsSection.download => [
         _tile(
           context,
@@ -1721,27 +1889,6 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
           onTap: () => context.push('/settings/statistics'),
         ),
         _batteryOptimizationTile(context),
-        _categoryTile(
-          context,
-          title: '音乐库',
-          subtitle: '扫描文件夹、扫描格式与短音频过滤',
-          route: '/settings/library',
-        ),
-        _categoryTile(
-          context,
-          title: '日志与调试',
-          subtitle: '日志保存、筛选与导出',
-          route: '/settings/logs-debug',
-        ),
-      ],
-      SettingsSection.logsDebug => [
-        _tile(
-          context,
-          icon: Icons.description_outlined,
-          title: '日志',
-          trailing: const Text('保存与导出'),
-          onTap: () => context.push('/settings/logs'),
-        ),
       ],
       SettingsSection.feedback => const [],
     };
@@ -1759,10 +1906,10 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
   }
 
   /// 根页卡片流：按「个性化 / 音乐 / 应用」三类目组织（对齐参考实现
-  /// CurrentMusicX SettingsScreen 的分组方式），每个类目是一张可折叠
-  /// 卡片：组头是图标 + 标题 + 折叠箭头，组内容用高度 + 透明度动画
-  /// 展开。设置项本体（_sectionTiles 提供的内容）完全沿用，只重排分类
-  /// 与外层容器，不改任何设置项。
+  /// CurrentMusicX SettingsScreen 的分组方式），每个类目是一张常显卡片：
+  /// 组头只作分组标题（不可折叠、无箭头），设置项直接渲染。设置项本体
+  /// （_sectionTiles 提供的内容）完全沿用，只重排分类与外层容器，不改任
+  /// 何设置项。
   List<Widget> _rootCards(
     BuildContext context, {
     required AppSettings? settings,
@@ -1797,7 +1944,7 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
       _entryRow(
         context,
         title: '歌词',
-        subtitle: '翻译、罗马音、逐字动效、桌面歌词与蓝牙歌词',
+        subtitle: '翻译、罗马音、逐字动效、蓝牙歌词与桌面歌词',
         route: '/settings/lyrics',
       ),
     ];
@@ -1850,6 +1997,13 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
         subtitle: '提交问题、建议并查看处理进度',
         route: '/settings/feedback',
       ),
+      // 「其他」紧跟在问题反馈下面（低频杂项收到靠后位置）。
+      _entryRow(
+        context,
+        title: '其他',
+        subtitle: '听歌统计与后台播放保活',
+        route: '/settings/other',
+      ),
       _entryRow(
         context,
         title: '支持开发者',
@@ -1861,12 +2015,6 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
         title: '关于',
         subtitle: '版本、项目仓库、创作者与开源许可',
         route: '/settings/about',
-      ),
-      _entryRow(
-        context,
-        title: '其他',
-        subtitle: '听歌统计、后台播放保活与音乐库',
-        route: '/settings/other',
       ),
     ];
 
@@ -1892,7 +2040,7 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
     return Padding(
       padding: const EdgeInsets.fromLTRB(16, 0, 16, 14),
       child: Material(
-        color: scheme.surfaceContainerLow,
+        color: xyTranslucentCardColor(context) ?? scheme.surfaceContainerLow,
         borderRadius: BorderRadius.circular(18),
         clipBehavior: Clip.antiAlias,
         child: Column(
@@ -1903,95 +2051,59 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
     );
   }
 
-  /// 类目卡片：组头可点击折叠/展开，箭头随状态旋转，组内容用
-  /// AnimatedSize 做高度动画、AnimatedOpacity 做淡入淡出。
+  /// 类目卡片：组头只作分组标题，设置项常显（不折叠、不可点击）。
   Widget _categoryCard(
     BuildContext context, {
     required _SettingsCategory category,
     required List<Widget> children,
   }) {
     final scheme = Theme.of(context).colorScheme;
-    final expanded = _categoryExpanded[category] ?? true;
     return Padding(
       padding: const EdgeInsets.fromLTRB(16, 0, 16, 14),
       child: Material(
-        color: scheme.surfaceContainerLow,
+        color: xyTranslucentCardColor(context) ?? scheme.surfaceContainerLow,
         borderRadius: BorderRadius.circular(18),
         clipBehavior: Clip.antiAlias,
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
-            InkWell(
-              onTap: () => setState(
-                () => _categoryExpanded[category] = !expanded,
-              ),
-              child: Padding(
-                padding: const EdgeInsets.fromLTRB(14, 12, 10, 12),
-                child: Row(
-                  children: [
-                    Container(
-                      width: 30,
-                      height: 30,
-                      decoration: BoxDecoration(
-                        color: scheme.primary.withValues(alpha: .12),
-                        borderRadius: BorderRadius.circular(9),
-                      ),
-                      child: Icon(
-                        category.icon,
-                        size: 17,
-                        color: scheme.primary,
+            Padding(
+              padding: const EdgeInsets.fromLTRB(14, 12, 14, 12),
+              child: Row(
+                children: [
+                  Container(
+                    width: 30,
+                    height: 30,
+                    decoration: BoxDecoration(
+                      color: scheme.primary.withValues(alpha: .12),
+                      borderRadius: BorderRadius.circular(9),
+                    ),
+                    child: Icon(
+                      category.icon,
+                      size: 17,
+                      color: scheme.primary,
+                    ),
+                  ),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: Text(
+                      category.label,
+                      style: const TextStyle(
+                        fontSize: 15,
+                        fontWeight: FontWeight.w700,
                       ),
                     ),
-                    const SizedBox(width: 10),
-                    Expanded(
-                      child: Text(
-                        category.label,
-                        style: const TextStyle(
-                          fontSize: 15,
-                          fontWeight: FontWeight.w700,
-                        ),
-                      ),
-                    ),
-                    AnimatedRotation(
-                      turns: expanded ? .25 : 0,
-                      duration: const Duration(milliseconds: 220),
-                      curve: Curves.easeOutCubic,
-                      child: Icon(
-                        Icons.chevron_right_rounded,
-                        size: 22,
-                        color: scheme.outline,
-                      ),
-                    ),
-                  ],
-                ),
+                  ),
+                ],
               ),
             ),
-            // 展开动画：高度由 AnimatedSize 生长/回收，内容随透明度淡入，
-            // 折叠时直接卸载子树（不在收起状态下保留全部设置项）。
-            AnimatedSize(
-              duration: const Duration(milliseconds: 260),
-              curve: Curves.easeOutCubic,
-              alignment: Alignment.topCenter,
-              child: AnimatedOpacity(
-                opacity: expanded ? 1 : 0,
-                duration: const Duration(milliseconds: 180),
-                curve: Curves.easeOut,
-                child: expanded
-                    ? Column(
-                        crossAxisAlignment: CrossAxisAlignment.stretch,
-                        children: [
-                          Divider(
-                            height: 1,
-                            thickness: .6,
-                            color: scheme.outlineVariant,
-                          ),
-                          ..._withDivider(context, children),
-                          const SizedBox(height: 4),
-                        ],
-                      )
-                    : const SizedBox.shrink(),
-              ),
+            Divider(
+              height: 1,
+              thickness: .6,
+              color: scheme.outlineVariant,
             ),
+            ..._withDivider(context, children),
+            const SizedBox(height: 4),
           ],
         ),
       ),
@@ -2070,12 +2182,10 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
 
   /// 设置项跳转：先把被点击行的屏幕矩形登记为「页面展开」转场起点，
   /// 再 push。展开动画本体在路由层（routes.dart 的 _settingsExpandPage），
-  /// 没有起点时会自动回退到全局页面切换模式。
+  /// 设置子页面只用这一种转场，不受全局「页面切换动画」设置影响。
+  /// 展开主体是下一页内容本身，这里只需登记矩形与圆角，不再登记卡片底色。
   void _openSettingsRoute(BuildContext rowContext, String route) {
-    SettingsExpandOriginRegistry.capture(
-      rowContext,
-      color: Theme.of(rowContext).colorScheme.surfaceContainerLow,
-    );
+    SettingsExpandOriginRegistry.capture(rowContext);
     context.push(route);
   }
 
@@ -2120,7 +2230,11 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
           style: const TextStyle(fontWeight: FontWeight.w600),
         ),
         subtitle: Text(
-          entry.level == 1 ? '一级分类' : entry.path.join(' › '),
+          entry.level == 1
+              ? (entry.note == null ? '一级分类' : '一级分类 · ${entry.note}')
+              : (entry.note == null
+                    ? entry.path.join(' › ')
+                    : '${entry.path.join(' › ')} · ${entry.note}'),
           maxLines: 1,
           overflow: TextOverflow.ellipsis,
         ),
@@ -2158,7 +2272,6 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
     SettingsSection.root => '设置',
     SettingsSection.account => '账号',
     SettingsSection.appearance => '外观',
-    SettingsSection.playlistCovers => '歌单歌曲加载封面',
     SettingsSection.layout => '布局',
     SettingsSection.sidebarLayout => '侧边栏布局',
     SettingsSection.bottomBar => '自定义底栏',
@@ -2167,12 +2280,9 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
     SettingsSection.playbackDetail => '播放详情页歌词',
     SettingsSection.lyrics => '歌词',
     SettingsSection.desktopLyrics => '桌面歌词',
-    SettingsSection.bluetoothLyrics => '蓝牙歌词',
-    SettingsSection.library => '音乐库',
     SettingsSection.download => '下载',
     SettingsSection.backup => '备份与恢复',
     SettingsSection.other => '其他',
-    SettingsSection.logsDebug => '日志与调试',
     SettingsSection.feedback => '问题反馈',
   };
 
@@ -2360,10 +2470,7 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
         onTap: onTap == null
             ? null
             : () {
-                SettingsExpandOriginRegistry.capture(
-                  tileContext,
-                  color: Theme.of(context).colorScheme.surfaceContainerLow,
-                );
+                SettingsExpandOriginRegistry.capture(tileContext);
                 onTap();
               },
       ),
@@ -2619,28 +2726,6 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
       await DesktopLyricsBridge.setEnabled(false);
     }
     await notifier.setDesktopLyricsEnabled(enabled);
-  }
-
-  Future<void> _setBluetoothLyrics(
-    BuildContext context,
-    WidgetRef ref,
-    bool enabled,
-  ) async {
-    final notifier = ref.read(settingsProvider.notifier);
-    if (enabled) {
-      final started = await BluetoothLyricsBridge.setEnabled(true);
-      if (!started) {
-        if (context.mounted) {
-          ScaffoldMessenger.of(
-            context,
-          ).showSnackBar(const SnackBar(content: Text('请授予蓝牙权限后再开启蓝牙歌词')));
-        }
-        return;
-      }
-    } else {
-      await BluetoothLyricsBridge.setEnabled(false);
-    }
-    await notifier.setBluetoothLyricsEnabled(enabled);
   }
 
   /// 迷你播放器浮窗开关：开启前先查悬浮窗权限——未授权则拉起授权页并
@@ -3487,125 +3572,6 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
       } else {
         await n.setDownloadQuality(choice.value as String);
       }
-    }
-  }
-
-  Future<void> _pickMinDuration(
-    BuildContext context,
-    WidgetRef ref,
-    AppSettings? s,
-  ) async {
-    final cur = s?.libraryMinDurationSeconds ?? 0;
-    final choices = const [
-      _Choice('不排除', 0),
-      _Choice('10 秒', 10),
-      _Choice('30 秒', 30),
-      _Choice('60 秒', 60),
-    ];
-    final choice = await showModalBottomSheet<_Choice>(
-      context: context,
-      useRootNavigator: true,
-      builder: (sheetContext) => _choiceSheet(
-        sheetContext,
-        choices,
-        cur,
-        labelOf: (v) => switch (v) {
-          0 => '不排除',
-          10 => '10 秒',
-          30 => '30 秒',
-          60 => '60 秒',
-          _ => '$v 秒',
-        },
-      ),
-    );
-    if (choice != null) {
-      await ref
-          .read(settingsProvider.notifier)
-          .setLibraryMinDurationSeconds(choice.value as int);
-    }
-  }
-
-  /// 扫描格式多选：勾选要扫描入库的音频格式（至少保留一种）。
-  Future<void> _pickScanFormats(
-    BuildContext context,
-    WidgetRef ref,
-    AppSettings? s,
-  ) async {
-    final selected = {...(s?.scanFormats ?? kSupportedScanFormats)};
-    const labels = {
-      'flac': 'FLAC（无损）',
-      'mp3': 'MP3',
-      'wav': 'WAV（无损）',
-      'aac': 'AAC',
-      'm4a': 'M4A / ALAC',
-      'ogg': 'OGG / Vorbis',
-      'aiff': 'AIFF',
-    };
-    final result = await showModalBottomSheet<Set<String>>(
-      context: context,
-      useRootNavigator: true,
-      builder: (sheetContext) => StatefulBuilder(
-        builder: (context, setModalState) {
-          return SafeArea(
-            child: SingleChildScrollView(
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  const Padding(
-                    padding: EdgeInsets.fromLTRB(16, 16, 16, 8),
-                    child: Text(
-                      '扫描格式',
-                      style: TextStyle(
-                        fontWeight: FontWeight.w600,
-                        fontSize: 16,
-                      ),
-                    ),
-                  ),
-                  for (final fmt in kSupportedScanFormats)
-                    CheckboxListTile(
-                      title: Text(labels[fmt] ?? fmt.toUpperCase()),
-                      value: selected.contains(fmt),
-                      onChanged: (v) {
-                        setModalState(() {
-                          if (v == true) {
-                            selected.add(fmt);
-                          } else {
-                            selected.remove(fmt);
-                          }
-                        });
-                      },
-                    ),
-                  Padding(
-                    padding: const EdgeInsets.all(16),
-                    child: Row(
-                      mainAxisAlignment: MainAxisAlignment.end,
-                      children: [
-                        TextButton(
-                          onPressed: () => Navigator.pop(context),
-                          child: const Text('取消'),
-                        ),
-                        const SizedBox(width: 8),
-                        FilledButton(
-                          onPressed: selected.isEmpty
-                              ? null
-                              : () => Navigator.pop(context, selected),
-                          child: const Text('确定'),
-                        ),
-                      ],
-                    ),
-                  ),
-                ],
-              ),
-            ),
-          );
-        },
-      ),
-    );
-    if (result != null && result.isNotEmpty) {
-      final ordered = kSupportedScanFormats
-          .where((f) => result.contains(f))
-          .toList();
-      await ref.read(settingsProvider.notifier).setScanFormats(ordered);
     }
   }
 

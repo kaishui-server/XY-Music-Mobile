@@ -5,7 +5,6 @@ import 'package:go_router/go_router.dart';
 import 'package:lpinyin/lpinyin.dart';
 
 import '../../src/core/settings.dart';
-import '../../src/debug/performance_probe.dart';
 import '../../src/favorites/favorites_provider.dart';
 import '../../src/library/library_provider.dart';
 import '../../src/navigation/sidebar_controller.dart';
@@ -27,6 +26,8 @@ import '../../src/widgets/queue_sheet.dart';
 import '../../src/widgets/song_list_view.dart';
 import '../../src/widgets/top_notice.dart';
 import '../settings/scan_folders_page.dart';
+import '../../src/navigation/paged_transition.dart';
+import '../../src/navigation/animated_page_route.dart';
 
 /// 收藏分页右上角「更多」菜单项。
 enum _FavoritesMenuAction {
@@ -145,21 +146,6 @@ class _MusicLibraryPageState extends ConsumerState<MusicLibraryPage>
     super.initState();
     _tabController.addListener(_onTabChanged);
     _localTabController.addListener(_onTabChanged);
-    // 探针：音乐库两层 TabBarView 的切页动画帧。
-    //
-    // 必须挂 `TabController.animation` 而不是 controller 本身：controller
-    // 的 listener 只在 index / indexIsChanging 变化时触发（每段切换至多
-    // 两三次），动画帧全在 animation 这条 AnimationController 上。挂错
-    // 对象会得到「帧数恒为个位数」的假数据。之前这两个分页完全没有
-    // 采样点，日志里查不到任何音乐库切页记录。
-    if (kPerformanceProbeEnabled) {
-      _tabController.animation?.addListener(_onProbeTabFrame);
-      _localTabController.animation?.addListener(_onProbeTabFrame);
-    }
-  }
-
-  void _onProbeTabFrame() {
-    PerformanceProbe.instance.onAnimFrame(AnimSource.tab);
   }
 
   /// 上一次的分页索引：TabController 的监听在切换动画期间每帧都会触发，
@@ -169,13 +155,6 @@ class _MusicLibraryPageState extends ConsumerState<MusicLibraryPage>
   int _lastLocalTabIndex = 0;
 
   void _onTabChanged() {
-    // 探针：indexIsChanging 为真的那一刻就是一次分页动画的起点，清空
-    // 上一轮帧基准，避免两次切换之间的空闲期被折成首帧超长间隔。
-    if (kPerformanceProbeEnabled &&
-        (_tabController.indexIsChanging ||
-            _localTabController.indexIsChanging)) {
-      PerformanceProbe.instance.onAnimStart(AnimSource.tab);
-    }
     final changed = _tabController.index != _lastTabIndex ||
         _localTabController.index != _lastLocalTabIndex;
     if (!changed) return;
@@ -197,11 +176,6 @@ class _MusicLibraryPageState extends ConsumerState<MusicLibraryPage>
   void dispose() {
     _tabController.removeListener(_onTabChanged);
     _localTabController.removeListener(_onTabChanged);
-    // 探针：与 initState 的 animation listener 严格配对。
-    if (kPerformanceProbeEnabled) {
-      _tabController.animation?.removeListener(_onProbeTabFrame);
-      _localTabController.animation?.removeListener(_onProbeTabFrame);
-    }
     _tabController.dispose();
     _localTabController.dispose();
     _favSearchController.dispose();
@@ -374,7 +348,7 @@ class _MusicLibraryPageState extends ConsumerState<MusicLibraryPage>
             onPressed: _libraryScanning
                 ? null
                 : () => Navigator.of(context).push(
-                      MaterialPageRoute<void>(
+                      XyAnimatedPageRoute<void>(
                         builder: (_) => const ScanFoldersPage(),
                       ),
                     ),
@@ -446,7 +420,7 @@ class _MusicLibraryPageState extends ConsumerState<MusicLibraryPage>
         ),
       ),
       body: XyPageBackground(
-        child: TabBarView(
+        child: XyTabBarView(
           controller: _tabController,
           // 用 _DeferredTab 懒构建：TabBarView 会一次性索要全部子项的 Widget
           // 实例，若在此直接调用六个分页的构建方法，每次切页都要把未显示
@@ -1489,7 +1463,7 @@ class _MusicLibraryPageState extends ConsumerState<MusicLibraryPage>
           ],
         ),
         Expanded(
-          child: TabBarView(
+          child: XyTabBarView(
             controller: _localTabController,
             // 同样懒构建：默认只构建「歌曲」子分页，歌手 / 专辑分组视图
             // （含整库分组与拼音排序）仅在切到该子分页时才计算。

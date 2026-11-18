@@ -4,13 +4,16 @@ import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../../src/core/settings.dart';
 import '../../src/library/library_provider.dart';
 import '../../src/library/native_storage_permission.dart';
 import '../../src/library/scan_settings_provider.dart';
 import '../../src/widgets/top_notice.dart';
 import '../library/folder_browser_page.dart';
+import '../../src/navigation/animated_page_route.dart';
 
-/// 扫描目录管理页：添加/删除本地音乐扫描目录。
+/// 扫描目录管理页：添加/删除本地音乐扫描目录；扫描格式、短音频过滤
+/// 两项扫描参数收在右上角更多菜单（⋮）里，列表区域只留目录本身。
 class ScanFoldersPage extends ConsumerStatefulWidget {
   const ScanFoldersPage({super.key});
 
@@ -63,7 +66,7 @@ class _ScanFoldersPageState extends ConsumerState<ScanFoldersPage> {
         // 文件路径且与扫描走同一套权限。
         if (!mounted) return;
         dir = await Navigator.of(context).push<String>(
-          MaterialPageRoute(builder: (_) => const FolderBrowserPage()),
+          XyAnimatedPageRoute(builder: (_) => const FolderBrowserPage()),
         );
       } else {
         dir = await FilePicker.platform.getDirectoryPath();
@@ -127,10 +130,128 @@ class _ScanFoldersPageState extends ConsumerState<ScanFoldersPage> {
     }
   }
 
+  /// 排除短音频：选择扫描入库时过滤的最短时长（0=不排除）。
+  Future<void> _pickMinDuration(int cur) async {
+    const choices = <({String label, int value})>[
+      (label: '不排除', value: 0),
+      (label: '10 秒', value: 10),
+      (label: '30 秒', value: 30),
+      (label: '60 秒', value: 60),
+    ];
+    final choice = await showModalBottomSheet<int>(
+      context: context,
+      useRootNavigator: true,
+      builder: (sheetContext) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            for (final c in choices)
+              ListTile(
+                title: Text(c.label),
+                trailing: c.value == cur
+                    ? Icon(
+                        Icons.check,
+                        color: Theme.of(sheetContext).colorScheme.primary,
+                      )
+                    : null,
+                selected: c.value == cur,
+                onTap: () => Navigator.pop(sheetContext, c.value),
+              ),
+          ],
+        ),
+      ),
+    );
+    if (choice == null) return;
+    await ref
+        .read(settingsProvider.notifier)
+        .setLibraryMinDurationSeconds(choice);
+    if (mounted) _toast('已设置排除时长');
+  }
+
+  /// 扫描格式多选：勾选要扫描入库的音频格式（至少保留一种）。
+  Future<void> _pickScanFormats(AppSettings? settings) async {
+    final selected = {...(settings?.scanFormats ?? kSupportedScanFormats)};
+    const labels = {
+      'flac': 'FLAC（无损）',
+      'mp3': 'MP3',
+      'wav': 'WAV（无损）',
+      'aac': 'AAC',
+      'm4a': 'M4A / ALAC',
+      'ogg': 'OGG / Vorbis',
+      'aiff': 'AIFF',
+    };
+    final result = await showModalBottomSheet<Set<String>>(
+      context: context,
+      useRootNavigator: true,
+      builder: (sheetContext) => StatefulBuilder(
+        builder: (context, setModalState) {
+          return SafeArea(
+            child: SingleChildScrollView(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  const Padding(
+                    padding: EdgeInsets.fromLTRB(16, 16, 16, 8),
+                    child: Text(
+                      '扫描格式',
+                      style: TextStyle(
+                        fontWeight: FontWeight.w600,
+                        fontSize: 16,
+                      ),
+                    ),
+                  ),
+                  for (final fmt in kSupportedScanFormats)
+                    CheckboxListTile(
+                      title: Text(labels[fmt] ?? fmt.toUpperCase()),
+                      value: selected.contains(fmt),
+                      onChanged: (v) {
+                        setModalState(() {
+                          if (v == true) {
+                            selected.add(fmt);
+                          } else {
+                            selected.remove(fmt);
+                          }
+                        });
+                      },
+                    ),
+                  Padding(
+                    padding: const EdgeInsets.all(16),
+                    child: Row(
+                      mainAxisAlignment: MainAxisAlignment.end,
+                      children: [
+                        TextButton(
+                          onPressed: () => Navigator.pop(context),
+                          child: const Text('取消'),
+                        ),
+                        const SizedBox(width: 8),
+                        FilledButton(
+                          onPressed: selected.isEmpty
+                              ? null
+                              : () => Navigator.pop(context, selected),
+                          child: const Text('确定'),
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          );
+        },
+      ),
+    );
+    if (result == null || result.isEmpty) return;
+    final ordered =
+        kSupportedScanFormats.where((f) => result.contains(f)).toList();
+    await ref.read(settingsProvider.notifier).setScanFormats(ordered);
+    if (mounted) _toast('已更新扫描格式');
+  }
+
   @override
   Widget build(BuildContext context) {
     final foldersAsync = ref.watch(scanFoldersProvider);
     final scheme = Theme.of(context).colorScheme;
+    final settings = ref.watch(settingsProvider).valueOrNull;
     // 悬浮底栏 + 迷你播放栏固定占据底部条带（Shell 已把高度注入
     // MediaQuery.padding.bottom），页面底部两角/底部的按钮都会被遮挡，
     // 「添加目录」改为悬浮在页面正中央。
@@ -151,6 +272,64 @@ class _ScanFoldersPageState extends ConsumerState<ScanFoldersPage> {
                   )
                 : const Icon(Icons.refresh),
           ),
+          // 扫描参数收进右上角更多菜单，列表区域留给目录本身。
+          PopupMenuButton<String>(
+            tooltip: '更多',
+            onSelected: (value) {
+              switch (value) {
+                case 'formats':
+                  _pickScanFormats(settings);
+                case 'min_duration':
+                  _pickMinDuration(settings?.libraryMinDurationSeconds ?? 0);
+              }
+            },
+            itemBuilder: (context) => [
+              PopupMenuItem(
+                value: 'formats',
+                child: Row(
+                  children: [
+                    Icon(Icons.audiotrack_rounded,
+                        size: 20, color: scheme.primary),
+                    const SizedBox(width: 12),
+                    const Text('扫描格式'),
+                    const Spacer(),
+                    Text(
+                      '${settings?.scanFormats.length ?? 0} 种',
+                      style: TextStyle(
+                        fontSize: 13,
+                        color: scheme.onSurfaceVariant,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              PopupMenuItem(
+                value: 'min_duration',
+                child: Row(
+                  children: [
+                    Icon(Icons.timer_outlined,
+                        size: 20, color: scheme.primary),
+                    const SizedBox(width: 12),
+                    const Text('排除短音频'),
+                    const Spacer(),
+                    Text(
+                      switch (settings?.libraryMinDurationSeconds ?? 0) {
+                        0 => '不排除',
+                        10 => '10 秒',
+                        30 => '30 秒',
+                        60 => '60 秒',
+                        final v => '$v 秒',
+                      },
+                      style: TextStyle(
+                        fontSize: 13,
+                        color: scheme.onSurfaceVariant,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
         ],
       ),
       floatingActionButton: folders.isEmpty
@@ -167,79 +346,94 @@ class _ScanFoldersPageState extends ConsumerState<ScanFoldersPage> {
               label: const Text('添加目录'),
             ),
       floatingActionButtonLocation: const _CenterFabLocation(),
-      body: foldersAsync.when(
-        loading: () => const Center(child: CircularProgressIndicator()),
-        error: (e, _) => Center(child: Text('加载失败：$e')),
-        data: (folders) {
-          if (folders.isEmpty) {
-            return Center(
-              child: Padding(
-                padding: const EdgeInsets.all(32),
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    Icon(
-                      Icons.folder_off,
-                      size: 48,
-                      color: scheme.onSurfaceVariant,
-                    ),
-                    const SizedBox(height: 12),
-                    const Text(
-                      '还没有扫描目录',
-                      style: TextStyle(fontWeight: FontWeight.w600),
-                    ),
-                    const SizedBox(height: 4),
-                    Text(
-                      '点击「添加目录」选择本地音乐文件夹，\n然后到「音乐库 → 本地音乐」下拉刷新开始扫描',
-                      textAlign: TextAlign.center,
-                      style: TextStyle(
-                        fontSize: 13,
-                        color: scheme.onSurfaceVariant,
+      body: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Expanded(
+            child: foldersAsync.when(
+              loading: () =>
+                  const Center(child: CircularProgressIndicator()),
+              error: (e, _) => Center(child: Text('加载失败：$e')),
+              data: (folders) {
+                if (folders.isEmpty) {
+                  return Center(
+                    child: Padding(
+                      padding: const EdgeInsets.all(32),
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Icon(
+                            Icons.folder_off,
+                            size: 48,
+                            color: scheme.onSurfaceVariant,
+                          ),
+                          const SizedBox(height: 12),
+                          const Text(
+                            '还没有扫描目录',
+                            style:
+                                TextStyle(fontWeight: FontWeight.w600),
+                          ),
+                          const SizedBox(height: 4),
+                          Text(
+                            '点击「添加目录」选择本地音乐文件夹，\n然后到「音乐库 → 本地音乐」下拉刷新开始扫描',
+                            textAlign: TextAlign.center,
+                            style: TextStyle(
+                              fontSize: 13,
+                              color: scheme.onSurfaceVariant,
+                            ),
+                          ),
+                          const SizedBox(height: 20),
+                          FilledButton.icon(
+                            onPressed: _adding ? null : _addFolder,
+                            icon: _adding
+                                ? const SizedBox(
+                                    width: 18,
+                                    height: 18,
+                                    child: CircularProgressIndicator(
+                                      strokeWidth: 2,
+                                    ),
+                                  )
+                                : const Icon(Icons.create_new_folder),
+                            label: const Text('添加目录'),
+                          ),
+                        ],
                       ),
                     ),
-                    const SizedBox(height: 20),
-                    FilledButton.icon(
-                      onPressed: _adding ? null : _addFolder,
-                      icon: _adding
-                          ? const SizedBox(
-                              width: 18,
-                              height: 18,
-                              child: CircularProgressIndicator(strokeWidth: 2),
-                            )
-                          : const Icon(Icons.create_new_folder),
-                      label: const Text('添加目录'),
-                    ),
-                  ],
-                ),
-              ),
-            );
-          }
-          return ListView.separated(
-            // 底部留白计入悬浮底栏 + 播放栏（Shell 注入值已含系统安全区），
-            // 防止列表尾部条目/删除按钮被遮挡。
-            padding: EdgeInsets.only(
-              bottom: MediaQuery.paddingOf(context).bottom + 24,
+                  );
+                }
+                return ListView.separated(
+                  // 底部留白计入悬浮底栏 + 播放栏（Shell 注入值已含系统安全区），
+                  // 防止列表尾部条目/删除按钮被遮挡。
+                  padding: EdgeInsets.only(
+                    bottom: MediaQuery.paddingOf(context).bottom + 24,
+                  ),
+                  itemCount: folders.length,
+                  separatorBuilder: (_, _) => const Divider(height: 1),
+                  itemBuilder: (context, i) {
+                    final f = folders[i];
+                    return ListTile(
+                      leading:
+                          Icon(Icons.folder, color: scheme.primary),
+                      title: Text(
+                        f.path,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                      subtitle: Text('${f.songCount} 首'),
+                      trailing: IconButton(
+                        icon: Icon(
+                          Icons.delete_outline,
+                          color: scheme.error,
+                        ),
+                        onPressed: () => _removeFolder(f.path),
+                      ),
+                    );
+                  },
+                );
+              },
             ),
-            itemCount: folders.length,
-            separatorBuilder: (_, _) => const Divider(height: 1),
-            itemBuilder: (context, i) {
-              final f = folders[i];
-              return ListTile(
-                leading: Icon(Icons.folder, color: scheme.primary),
-                title: Text(
-                  f.path,
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                ),
-                subtitle: Text('${f.songCount} 首'),
-                trailing: IconButton(
-                  icon: Icon(Icons.delete_outline, color: scheme.error),
-                  onPressed: () => _removeFolder(f.path),
-                ),
-              );
-            },
-          );
-        },
+          ),
+        ],
       ),
     );
   }

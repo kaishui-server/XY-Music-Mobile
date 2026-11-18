@@ -3,6 +3,7 @@ import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../src/auth/auth_provider.dart';
+import '../../src/navigation/animated_page_route.dart';
 import '../../src/ui/external_link.dart';
 import '../../src/update/app_update.dart';
 import '../../src/widgets/top_notice.dart' show XyNotice, XyNoticeType;
@@ -165,7 +166,7 @@ class AboutPage extends ConsumerWidget {
                 title: '第三方许可',
                 subtitle: '开源组件与参考项目致谢',
                 onTap: () => Navigator.of(context).push(
-                  MaterialPageRoute<void>(
+                  XyAnimatedPageRoute<void>(
                     builder: (_) => const ThirdPartyLicensesPage(),
                   ),
                 ),
@@ -181,7 +182,7 @@ class AboutPage extends ConsumerWidget {
                 title: '赞助',
                 subtitle: '支持开发者，查看收款码',
                 onTap: () => Navigator.of(context).push(
-                  MaterialPageRoute<void>(
+                  XyAnimatedPageRoute<void>(
                     builder: (_) => const SponsorPage(),
                   ),
                 ),

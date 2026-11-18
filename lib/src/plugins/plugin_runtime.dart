@@ -1403,6 +1403,28 @@ class PluginRuntimeService {
   // 并在后续任意一次成功解析时立即解除熔断。
   static const Duration _lxCircuitCooldown = Duration(seconds: 45);
 
+  /// 鉴权类失败熔断（卡密过期/授权过期/鉴权失败）：这类错误是插件配置层
+  /// 问题（key/卡密失效），与具体歌曲无关，但此前只被当作业务失败逐档重试，
+  /// 每首歌都要白撞整条音质链（2026-11-12 vivo X100s 日志实测：lx-cit 4 档
+  /// ~0.5s + HYWmusic 3 档 ~2-4s，全靠后面的可用源兜底，起播被拖到 5s+）。
+  /// 冷却期内整插件跳过，时长长于连接熔断（配置修复频率低）；插件重载
+  /// （更新 key/订阅）走 dispose 清账立即恢复。
+  final Map<String, DateTime> _lxAuthCooldownUntil = {};
+  static const Duration _lxAuthCooldown = Duration(minutes: 10);
+
+  /// 判断 LX 解析错误是否为鉴权类（key/卡密/授权配置问题，与歌曲无关）。
+  bool _isLxAuthError(String message) {
+    final m = message.toLowerCase();
+    return m.contains('鉴权失败') ||
+        m.contains('鉴权过期') ||
+        m.contains('卡密') ||
+        m.contains('授权已过期') ||
+        m.contains('授权过期') ||
+        m.contains('登录已过期') ||
+        m.contains('登录失效') ||
+        m.contains('unauthorized');
+  }
+
   /// 判断 LX 解析错误是否为连接级（服务器不可达/超时），用于熔断计数。
   bool _isLxConnectivityError(String message) {
     final m = message.toLowerCase();
@@ -1420,7 +1442,9 @@ class PluginRuntimeService {
 
   bool _lxCircuitOpen(EnabledMusicPlugin plugin) {
     final until = _lxCircuitCooldownUntil[plugin.id];
-    return until != null && DateTime.now().isBefore(until);
+    if (until != null && DateTime.now().isBefore(until)) return true;
+    final authUntil = _lxAuthCooldownUntil[plugin.id];
+    return authUntil != null && DateTime.now().isBefore(authUntil);
   }
 
   // ==================== 【P0-1】解析失败账本 ====================
@@ -1463,6 +1487,8 @@ class PluginRuntimeService {
 
   /// 记账一次失败；脚本级异常直接升级为本会话永久失败。
   void _noteSourceFailure(String key, Object error) {
+    // 上游服务态错误由源级短冷却接管，不写入歌曲级判死账。
+    if (_isUpstreamServiceError(error.toString())) return;
     final now = DateTime.now();
     final firstAt = _sourceFailureFirstAt[key];
     if (firstAt == null || now.difference(firstAt) > _sourceFailureWindow) {
@@ -1487,6 +1513,49 @@ class PluginRuntimeService {
         m.contains('is not defined') ||
         m.contains('undefined is not an object') ||
         m.contains('null is not an object');
+  }
+
+  /// 上游服务态错误：插件背后的取流网关整段不可用（lx-cit 的
+  /// 「取流服务准备中」、上游 5xx、限速）。换音质、换歌曲、重试都不会
+  /// 恢复，只能等服务端补货；这类错误不能计入歌曲级判死账。
+  static bool _isUpstreamServiceError(String message) {
+    final m = message.toLowerCase();
+    return m.contains('取流服务准备中') ||
+        m.contains('服务准备中') ||
+        m.contains('请求过速') ||
+        m.contains('rate limit') ||
+        m.contains('too many requests') ||
+        m.contains('bad gateway') ||
+        m.contains('service unavailable') ||
+        m.contains('upstream service') ||
+        m.contains('网关错误');
+  }
+
+  /// 源级上游冷却键：同一插件下同一平台的取流通道是同一条上游链路。
+  String _upstreamServiceKey(EnabledMusicPlugin plugin, String source) =>
+      'upstream|${plugin.id}|$source';
+
+  bool _upstreamServiceBlocked(String key) {
+    final until = _upstreamServiceCooldownUntil[key];
+    if (until == null) return false;
+    if (DateTime.now().isBefore(until)) return true;
+    _upstreamServiceCooldownUntil.remove(key);
+    return false;
+  }
+
+  void _noteUpstreamServiceFailure(String key, Object error) {
+    final now = DateTime.now();
+    _upstreamServiceCooldownUntil[key] = now.add(_upstreamServiceCooldown);
+    _upstreamServiceCooldownUntil.removeWhere((_, until) => until.isBefore(now));
+    if (_upstreamServiceCooldownUntil.length > _upstreamServiceScopeLimit) {
+      _upstreamServiceCooldownUntil.clear();
+    }
+    AppLogStore.instance.add(
+      '[播放链路] 上游取流服务暂不可用（$key），该源 '
+      '${_upstreamServiceCooldown.inSeconds}s 内跳过：'
+      '${_friendlyError(error.toString())}',
+      level: AppLogLevel.info,
+    );
   }
 
   /// 账本自清理：过期条目 + 超量丢最旧，防止账本自身变成内存增长点。
@@ -1648,6 +1717,16 @@ class PluginRuntimeService {
   // 直接跳过该 (插件|歌曲|音质)，不再占用解析预算。
   final Set<String> _sourcePermanentFailures = {};
 
+  // 【P0-3】上游服务态错误短冷却：插件背后的取流网关整段不可用
+  //（lx-cit 返回「取流服务准备中」、上游 5xx、请求过速）与歌曲、音质、
+  // 解析路径都无关，换档重试不会恢复。旧实现把它当普通失败记账，
+  // 两次就把整首歌判死进 90s 窗口，弹「解析该歌曲已连续失败」，
+  // 既误导用户换源，也让这首歌在窗口内彻底不可用。
+  // 这里改为源级短冷却：15s 内跳过该 (插件|平台) 源，过期自动重试。
+  static const Duration _upstreamServiceCooldown = Duration(seconds: 15);
+  static const int _upstreamServiceScopeLimit = 32;
+  final Map<String, DateTime> _upstreamServiceCooldownUntil = {};
+
   // 【P0-2】单曲解析总预算：一次起播最多 12 次上游调用 / 20 秒。
   // 超出即放弃本次解析交上层换源，避免单曲把整条档位链跑穿（实测未缓存
   // 歌可跑 16+ 次上游请求，单曲耗时 20s+）。
@@ -1801,7 +1880,7 @@ class PluginRuntimeService {
     // 抛错让上层立即换源，不再白撞死服务器。
     if (_lxCircuitOpen(plugin)) {
       throw Exception(
-        '音源「${plugin.name}」近期连接失败，已临时跳过（约 45 秒后自动重试）',
+        '音源「${plugin.name}」近期解析失败（连接/鉴权类），已临时跳过（稍后自动重试）',
       );
     }
     _activeRuntimeOperations++;
@@ -2950,11 +3029,12 @@ class PluginRuntimeService {
     }
   }
 
-  /// 获取 Baka QQ 音乐插件的每日 30 首推荐（getDailyRecommendations）。
+  /// 获取 Baka 音源插件的每日 30 首推荐（getDailyRecommendations）。
   ///
-  /// 依赖插件用户变量中的 qq_user_id（用户 ID）换取每日歌单；未填时
-  /// 插件返回 unconfigured，由 UI 提示引导配置。LX / animemusic 协议
-  /// 不提供该接口，直接返回 unsupported，调用方据此隐藏入口。
+  /// Baka 音乐插件（QQ/酷狗/酷我）共用同一接口，依赖插件用户变量中的
+  /// qq_user_id（用户 ID）换取每日歌单；未填时插件返回 unconfigured，
+  /// 由 UI 提示引导配置。LX / animemusic 协议不提供该接口，直接返回
+  /// unsupported，调用方据此隐藏入口。
   Future<DailyRecommendationResult> getDailyRecommendations(
     EnabledMusicPlugin plugin,
   ) async {
@@ -5849,7 +5929,17 @@ class PluginRuntimeService {
     final songInfo = Map<String, dynamic>.from(value);
     if (_lxCircuitOpen(plugin)) {
       throw Exception(
-        '音源「${plugin.name}」近期连接失败，已临时跳过（约 45 秒后自动重试）',
+        '音源「${plugin.name}」近期解析失败（连接/鉴权类），已临时跳过（稍后自动重试）',
+      );
+    }
+    // 【P1-1】上游服务态冷却：该 (插件|平台) 的取流通道刚返回过
+    //「取流服务准备中」/5xx/限速，逐档重跑只会白等整条音质梯子。
+    final lxSourceId = songInfo['source']?.toString().trim() ?? '';
+    final upstreamServiceKey = _upstreamServiceKey(plugin, lxSourceId);
+    if (_upstreamServiceBlocked(upstreamServiceKey)) {
+      throw Exception(
+        '音源「${plugin.name}」上游取流服务暂不可用（临时故障），'
+        '已跳过该源，稍后自动重试',
       );
     }
     // 【P0-1】整曲判死：此插件解析这首歌短时间内已连续失败，而播放器失败
@@ -5948,6 +6038,7 @@ class PluginRuntimeService {
           // 解析成功即视为网络恢复：立即解除熔断，避免换网络/服务恢复
           // 后仍被旧熔断冷却拦截（华为 Mate30Pro 换 WiFi 后插件不可用）。
           _lxCircuitCooldownUntil.remove(plugin.id);
+          _lxAuthCooldownUntil.remove(plugin.id);
           AppLogStore.instance.add(
             '[播放链路] Source API解析成功 音质$quality '
             '${sourceApiResult.filename}',
@@ -5992,6 +6083,7 @@ class PluginRuntimeService {
           // 解析成功即视为网络恢复：立即解除熔断，避免换网络/服务恢复
           // 后仍被旧熔断冷却拦截（华为 Mate30Pro 换 WiFi 后插件不可用）。
           _lxCircuitCooldownUntil.remove(plugin.id);
+          _lxAuthCooldownUntil.remove(plugin.id);
           if (attemptStopwatch.elapsedMilliseconds > 3000) {
             AppLogStore.instance.add(
               '[播放链路] LX解析成功 ${plugin.name} 音质$quality '
@@ -6017,6 +6109,12 @@ class PluginRuntimeService {
         } else {
           sameErrorStreak = 1;
           lastErrorMessage = friendly;
+        }
+        // 【P1-2】上游服务态错误：换音质不会恢复服务端，立即跳出档位
+        // 梯子并挂源级短冷却，避免同一源上每首歌都重撞一遍。
+        if (_isUpstreamServiceError(error.toString())) {
+          _noteUpstreamServiceFailure(upstreamServiceKey, error);
+          break;
         }
         // 【P0-1】记账：档位级失败（含脚本级永久失败）写入账本，
         // 后续重试不再重复撞同一格。
@@ -6096,6 +6194,7 @@ class PluginRuntimeService {
           // 解析成功即视为网络恢复：立即解除熔断，避免换网络/服务恢复
           // 后仍被旧熔断冷却拦截（华为 Mate30Pro 换 WiFi 后插件不可用）。
           _lxCircuitCooldownUntil.remove(plugin.id);
+          _lxAuthCooldownUntil.remove(plugin.id);
           if (attemptStopwatch.elapsedMilliseconds > 3000) {
             AppLogStore.instance.add(
               '[播放链路] LX公共解析成功 ${plugin.name} 音质$quality '
@@ -6109,6 +6208,12 @@ class PluginRuntimeService {
         final friendly = _friendlyError(error.toString());
         final isConnError = _isLxConnectivityError(error.toString());
         if (isConnError) publicConnErrors++;
+        // 【P1-2】公共通路同样按上游服务态错误提前放弃（公共解析与插件
+        // 脚本共用同一条上游网关，换路一样不通）。
+        if (_isUpstreamServiceError(error.toString())) {
+          _noteUpstreamServiceFailure(upstreamServiceKey, error);
+          break;
+        }
         // 【P0-1】公共通路同样记账，重试时不再重复撞同一格。
         _noteSourceFailure(publicFailureKey, error);
         AppLogStore.instance.add(
@@ -6135,9 +6240,24 @@ class PluginRuntimeService {
         );
       }
     }
+    // 鉴权类失败（key/卡密/授权过期）同样与歌曲无关：整条音质链都会失败，
+    // 直接熔断 10 分钟，避免每首歌都从死源开始爬梯子（X100s 起播 5s 的
+    // 主要构成）。更新 key/订阅重载插件后自动清账恢复。
+    if (lastError != null && _isLxAuthError(lastError.toString())) {
+      _lxAuthCooldownUntil[plugin.id] = DateTime.now().add(_lxAuthCooldown);
+      AppLogStore.instance.add(
+        '[播放链路] 音源「${plugin.name}」鉴权类失败（卡密/授权过期），'
+        '已跳过 ${_lxAuthCooldown.inMinutes} 分钟，更新配置重载后立即恢复',
+        level: AppLogLevel.warning,
+      );
+    }
     // 【P0-1】整曲记账：两路都失败才算这首歌在该插件解析失败，用于
     // 上层失败策略链反复调用本方法时快速判死。
-    _noteSourceFailure(songFailureKey, lastError ?? 'LX 没有返回可播放地址');
+    // 上游服务态失败已挂源级短冷却，不写整曲判死账（否则会弹
+    //「解析该歌曲已连续失败」并让窗口期内本曲重试全被拦）。
+    if (lastError == null || !_isUpstreamServiceError(lastError.toString())) {
+      _noteSourceFailure(songFailureKey, lastError ?? 'LX 没有返回可播放地址');
+    }
     // 【P1-2】连续整体失败计数：达到阈值说明 JS 脚本内部状态或 QuickJS
     // 堆已劣化（异常对象、脚本内部缓存只增不减），重建运行时一次性回收。
     _lxResolveFailureStreak += 1;
@@ -6216,15 +6336,12 @@ class PluginRuntimeService {
   }
 
   /// MusicFree 插件评论：getMusicComments(musicItem, page)。
-  /// 插件未声明该方法时抛出含方法名的异常，由调用方回退平台直连评论。
+  /// 插件未声明该方法时抛出含方法名的异常，由调用方回退平台评论接口。
   Future<dynamic> getMusicComments(
     EnabledMusicPlugin plugin,
     Map<String, dynamic> musicItem,
     int page,
   ) {
-    if (plugin.isAnimemusic) {
-      return _getAnimemusicComments(plugin, musicItem, page);
-    }
     if (_runsPluginsInBackground) {
       return _runPluginOperation(plugin, 'getMusicComments', {
         'musicItem': musicItem,
@@ -6236,15 +6353,6 @@ class PluginRuntimeService {
       page,
     ]);
   }
-
-  /// 惜梦聚合插件（v2 洛雪版 / v3 MusicFree 版）评论兜底：插件本体不
-  /// 含评论方法，由宿主直连 animemusic 后端 music/comment；歌曲引用
-  /// （平台码 + id）由 _animemusicSongRef 统一解析。
-  Future<Map<String, dynamic>> getAnimemusicComments(
-    EnabledMusicPlugin plugin,
-    Map<String, dynamic> musicItem,
-    int page,
-  ) => _getAnimemusicComments(plugin, musicItem, page);
 
   // ==================== animemusic/1 REST 直连 ====================
   // 插件本体是 CommonJS Node 模块，QuickJS 没有其依赖的 http/https/zlib
@@ -6840,94 +6948,6 @@ class PluginRuntimeService {
     }
     final line = await _callAnimemusicApi(plugin, 'music/lyric', params);
     return joinLyrics(line);
-  }
-
-  /// animemusic 评论（music/comment）：hot/list 位于响应顶层，hot 仅第
-  /// 一页返回（热门），list 为最新评论分页；kg/kw/mg/tx 暂无公开签名
-  /// 接口，后端返回空列表不报错。转换为 MusicFree 插件评论格式
-  /// （{data: [...], isEnd}）交给 plugin_comments 统一解析。
-  Future<Map<String, dynamic>> _getAnimemusicComments(
-    EnabledMusicPlugin plugin,
-    Map<String, dynamic> musicItem,
-    int page,
-  ) async {
-    final (platform, id) = _animemusicSongRef(plugin, musicItem);
-    if (id.isEmpty) return const {'data': <dynamic>[], 'isEnd': true};
-    const limit = 20;
-    final body = await _callAnimemusicApi(plugin, 'music/comment', {
-      'platform': platform,
-      'musicId': id,
-      'page': '$page',
-      'limit': '$limit',
-    });
-    final list = _animemusicCommentItems(body['list'], 'list-$page');
-    final hot = page <= 1
-        ? _animemusicCommentItems(body['hot'], 'hot')
-        : const <dynamic>[];
-    return {
-      'data': [...hot, ...list],
-      // 请求 20 条实际不足 20 条时视为最后一页。
-      'isEnd': list.length < limit,
-    };
-  }
-
-  /// animemusic 评论条目（user/avatar/content/time/location/likes）映射为
-  /// CommentItem.normalize 识别的字段名；time 为「YYYY-MM-DD」日期字符串，
-  /// 转换成毫秒时间戳。bilibili 的楼中楼（floors）映射到 replies。
-  static List<Map<String, dynamic>> _animemusicCommentItems(
-    dynamic raw,
-    String idPrefix,
-  ) {
-    if (raw is! List) return const [];
-    final items = <Map<String, dynamic>>[];
-    for (final entry in raw) {
-      if (entry is! Map) continue;
-      final item = <String, dynamic>{
-        'id': '$idPrefix-${items.length}',
-        'nickName': entry['user']?.toString() ?? '',
-        'avatar': entry['avatar']?.toString(),
-        'comment': entry['content']?.toString() ?? '',
-        'like': entry['likes'] is num ? (entry['likes'] as num).toInt() : null,
-        'createAt': _parseAnimemusicCommentTime(entry['time']),
-        'location': entry['location']?.toString(),
-      };
-      final floors = entry['floors'];
-      if (floors is List && floors.isNotEmpty) {
-        item['replies'] = _animemusicCommentItems(floors, '$idPrefix-r');
-      }
-      items.add(item);
-    }
-    return items;
-  }
-
-  static int? _parseAnimemusicCommentTime(dynamic value) {
-    final text = value?.toString().trim() ?? '';
-    if (text.isEmpty) return null;
-    final parsed = DateTime.tryParse(text);
-    if (parsed != null) return parsed.millisecondsSinceEpoch;
-    // 抖音（qishui）等平台的评论时间是美式格式
-    // 「M/D/YYYY, h:mm:ss AM/PM」，DateTime.tryParse 无法识别。
-    final us = RegExp(
-      r'^(\d{1,2})/(\d{1,2})/(\d{4})'
-      r'(?:,\s*(\d{1,2}):(\d{2})(?::(\d{2}))?\s*([AaPp][Mm]))?$',
-    ).firstMatch(text);
-    if (us != null) {
-      var hour = int.parse(us.group(4) ?? '0');
-      final minute = int.parse(us.group(5) ?? '0');
-      final second = int.parse(us.group(6) ?? '0');
-      final meridiem = (us.group(7) ?? '').toLowerCase();
-      if (meridiem == 'pm' && hour < 12) hour += 12;
-      if (meridiem == 'am' && hour == 12) hour = 0;
-      return DateTime(
-        int.parse(us.group(3)!),
-        int.parse(us.group(1)!),
-        int.parse(us.group(2)!),
-        hour,
-        minute,
-        second,
-      ).millisecondsSinceEpoch;
-    }
-    return int.tryParse(text);
   }
 
   /// animemusic 各平台 MV 画质映射（与插件 MV_QUALITY 一致）：平台不支持
@@ -9043,6 +9063,7 @@ class PluginRuntimeService {
     _mediaSourceCache.clear();
     _lxConnectivityFailures.clear();
     _lxCircuitCooldownUntil.clear();
+    _lxAuthCooldownUntil.clear();
   }
 
   /// 【P1-2】解析连续失败后的运行时回收：销毁 QuickJS 运行时并清空

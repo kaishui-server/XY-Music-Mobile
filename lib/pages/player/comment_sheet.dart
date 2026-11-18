@@ -30,8 +30,18 @@ class _CommentSheetState extends ConsumerState<CommentSheet> {
   bool _loadMoreError = false;
   String? _error;
   bool _unsupported = false;
-  int _sortMode = 0; // 0 最多赞 1 最新
+  int _sortMode = 0; // 0 最多赞 1 最新 2 推荐（仅酷狗）
+
+  /// 当前歌曲是否支持「推荐」排序（酷狗推荐池专用档位）。
+  bool _showRecommended = false;
   final Set<String> _expandedReplies = {};
+
+  // 楼层（二级评论）按需分页：key = 主评论 id + 列表下标。
+  final Map<String, List<CommentItem>> _replyItems = {};
+  final Map<String, int> _replyPage = {};
+  final Map<String, bool> _replyEnd = {};
+  final Map<String, bool> _replyLoading = {};
+  final Map<String, String?> _replyError = {};
   final _scroll = ScrollController();
 
   @override
@@ -93,11 +103,24 @@ class _CommentSheetState extends ConsumerState<CommentSheet> {
         });
         return;
       }
+      // 酷狗评论有专用推荐池排序（sort=recommend），其它平台没有该档位。
+      final showRecommended =
+          commentPlatformOf(plugin: plugin, pluginData: pluginData) == 'kg';
+      if (_showRecommended != showRecommended) {
+        setState(() => _showRecommended = showRecommended);
+      }
       final result = await fetchSongComments(
         plugin: plugin,
         pluginData: pluginData,
         runtime: ref.read(pluginRuntimeProvider),
         page: page,
+        // 排序交给服务端（sort=hot/new/recommend），本地不再重排：
+        // 分页拉取时本地排序会让「最多赞」的前几条永远来自已加载的部分。
+        sort: switch (_sortMode) {
+          1 => CommentSort.latest,
+          2 => CommentSort.recommended,
+          _ => CommentSort.hot,
+        },
       );
       if (result == null) {
         if (!mounted) return;
@@ -114,6 +137,10 @@ class _CommentSheetState extends ConsumerState<CommentSheet> {
         if (page == 1) {
           _comments = result.items;
           _expandedReplies.clear();
+          _replyItems.clear();
+          _replyEnd.clear();
+          _replyLoading.clear();
+          _replyError.clear();
         } else {
           // 按内容去重，个别来源每页重复返回。
           final seen = _comments
@@ -148,14 +175,63 @@ class _CommentSheetState extends ConsumerState<CommentSheet> {
     }
   }
 
-  List<CommentItem> get _sorted {
-    final list = [..._comments];
-    if (_sortMode == 0) {
-      list.sort((a, b) => (b.like ?? 0).compareTo(a.like ?? 0));
-    } else {
-      list.sort((a, b) => (b.createAt ?? 0).compareTo(a.createAt ?? 0));
+  /// 排序由接口按 sort 参数下发，本地只保持返回顺序。
+  List<CommentItem> get _sorted => _comments;
+
+  /// 展开 / 收起楼层；首次展开时拉第一页楼层回复。
+  Future<void> _toggleReplies(CommentItem item, int index) async {
+    final key = '${item.id}_$index';
+    if (_expandedReplies.contains(key)) {
+      setState(() => _expandedReplies.remove(key));
+      return;
     }
-    return list;
+    setState(() => _expandedReplies.add(key));
+    if (_replyItems.containsKey(key) || _replyLoading[key] == true) return;
+    await _loadReplies(item, index, 1);
+  }
+
+  /// 拉取一页楼层回复（rid 接口）。接口不可用时回退主评论自带 replies。
+  Future<void> _loadReplies(CommentItem item, int index, int page) async {
+    final key = '${item.id}_$index';
+    if (_replyError[key] != null && page > 1) {
+      // 加载更多失败后重试：清掉错误标记后重来。
+      setState(() => _replyError.remove(key));
+    }
+    // 翻页游标取已加载楼层的最后一条（上游下发 rank_score 时才有）。
+    final loaded = _replyItems[key];
+    final cursor = page > 1 && loaded != null && loaded.isNotEmpty
+        ? loaded.last.rankScore
+        : null;
+    setState(() => _replyLoading[key] = true);
+    try {
+      final result = await fetchCommentReplies(item, page: page, cursor: cursor);
+      if (!mounted) return;
+      setState(() {
+        _replyLoading[key] = false;
+        final list = _replyItems.putIfAbsent(key, () => <CommentItem>[]);
+        if (result == null) {
+          if (list.isEmpty) list.addAll(item.replies);
+          _replyEnd[key] = true;
+          _replyPage[key] = 1;
+          return;
+        }
+        final seen = list
+            .map((r) => '${r.id}|${r.nickName}|${r.comment}')
+            .toSet();
+        for (final r in result.items) {
+          if (seen.add('${r.id}|${r.nickName}|${r.comment}')) list.add(r);
+        }
+        if (list.isEmpty && item.replies.isNotEmpty) list.addAll(item.replies);
+        _replyPage[key] = page;
+        _replyEnd[key] = result.isEnd;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _replyLoading[key] = false;
+        _replyError[key] = e.toString();
+      });
+    }
   }
 
   String _fmtTime(int? ts) {
@@ -238,7 +314,7 @@ class _CommentSheetState extends ConsumerState<CommentSheet> {
   }
 
   Widget _buildSortToggle(ColorScheme scheme) {
-    final labels = ['最多赞', '最新'];
+    final labels = ['最多赞', '最新', if (_showRecommended) '推荐'];
     return Container(
       height: 30,
       padding: const EdgeInsets.symmetric(horizontal: 2),
@@ -251,7 +327,12 @@ class _CommentSheetState extends ConsumerState<CommentSheet> {
         children: List.generate(labels.length, (i) {
           final selected = _sortMode == i;
           return GestureDetector(
-            onTap: () => setState(() => _sortMode = i),
+            onTap: () {
+              if (_sortMode == i) return;
+              setState(() => _sortMode = i);
+              // 排序由服务端决定，切换后从第一页重新拉取。
+              _fetch(1);
+            },
             child: Container(
               padding: const EdgeInsets.symmetric(horizontal: 10),
               alignment: Alignment.center,
@@ -375,13 +456,21 @@ class _CommentSheetState extends ConsumerState<CommentSheet> {
           }
           return const SizedBox.shrink();
         }
+        final item = sorted[i];
+        final key = '${item.id}_$i';
         return _CommentTile(
-          item: sorted[i],
-          expanded: _expandedReplies.contains('${sorted[i].id}_$i'),
-          onToggleReply: () => setState(() {
-            final key = '${sorted[i].id}_$i';
-            if (!_expandedReplies.remove(key)) _expandedReplies.add(key);
-          }),
+          item: item,
+          expanded: _expandedReplies.contains(key),
+          onToggleReply: () => _toggleReplies(item, i),
+          replies: _replyItems[key] ?? const [],
+          replyLoading: _replyLoading[key] ?? false,
+          replyEnd: _replyEnd[key] ?? false,
+          replyError: _replyError[key],
+          onLoadMoreReplies: () => _loadReplies(
+            item,
+            i,
+            (_replyPage[key] ?? 1) + 1,
+          ),
           fmtTime: _fmtTime,
           fmtLike: _fmtLike,
         );
@@ -412,6 +501,11 @@ class _CommentTile extends StatelessWidget {
     required this.item,
     required this.expanded,
     required this.onToggleReply,
+    required this.replies,
+    required this.replyLoading,
+    required this.replyEnd,
+    required this.replyError,
+    required this.onLoadMoreReplies,
     required this.fmtTime,
     required this.fmtLike,
   });
@@ -419,8 +513,19 @@ class _CommentTile extends StatelessWidget {
   final CommentItem item;
   final bool expanded;
   final VoidCallback onToggleReply;
+
+  /// 已加载的楼层回复（分页累积）。
+  final List<CommentItem> replies;
+  final bool replyLoading;
+  final bool replyEnd;
+  final String? replyError;
+  final VoidCallback onLoadMoreReplies;
   final String Function(int?) fmtTime;
   final String Function(int?) fmtLike;
+
+  /// 楼层总数：接口给的 reply_num 优先，未下发时退回自带 replies 数量。
+  int get _replyTotal =>
+      item.replyCount > replies.length ? item.replyCount : replies.length;
 
   @override
   Widget build(BuildContext context) {
@@ -490,7 +595,7 @@ class _CommentTile extends StatelessWidget {
                   item.comment,
                   style: const TextStyle(fontSize: 14, height: 1.45),
                 ),
-                if (item.replies.isNotEmpty) ...[
+                if (_replyTotal > 0) ...[
                   const SizedBox(height: 6),
                   GestureDetector(
                     onTap: onToggleReply,
@@ -498,13 +603,22 @@ class _CommentTile extends StatelessWidget {
                       mainAxisSize: MainAxisSize.min,
                       children: [
                         Text(
-                          '${item.replies.length} 条回复',
+                          '$_replyTotal 条回复',
                           style: TextStyle(
                             fontSize: 12,
                             color: scheme.primary,
                             fontWeight: FontWeight.w600,
                           ),
                         ),
+                        if (replyLoading && !expanded)
+                          const Padding(
+                            padding: EdgeInsets.only(left: 6),
+                            child: SizedBox(
+                              width: 12,
+                              height: 12,
+                              child: CircularProgressIndicator(strokeWidth: 2),
+                            ),
+                          ),
                         Icon(
                           expanded
                               ? Icons.keyboard_arrow_up
@@ -521,94 +635,131 @@ class _CommentTile extends StatelessWidget {
                     curve: Curves.easeOutCubic,
                     alignment: Alignment.topCenter,
                     child: expanded
-                        ? Container(
-                            margin: const EdgeInsets.only(top: 8),
-                            padding: const EdgeInsets.all(10),
-                            decoration: BoxDecoration(
-                              color: scheme.surfaceContainerHighest
-                                  .withValues(alpha: .5),
-                              borderRadius: BorderRadius.circular(10),
-                            ),
-                            child: Column(
-                              children: [
-                                for (final r in item.replies)
-                                  Padding(
-                                    padding:
-                                        const EdgeInsets.symmetric(vertical: 5),
-                                    child: Row(
-                                      crossAxisAlignment:
-                                          CrossAxisAlignment.start,
-                                      children: [
-                                        _Avatar(url: r.avatar, size: 24),
-                                        const SizedBox(width: 8),
-                                        Expanded(
-                                          child: Column(
-                                            crossAxisAlignment:
-                                                CrossAxisAlignment.start,
-                                            children: [
-                                              Row(
-                                                children: [
-                                                  Expanded(
-                                                    child: Text(
-                                                      r.nickName.isEmpty
-                                                          ? '匿名用户'
-                                                          : r.nickName,
-                                                      maxLines: 1,
-                                                      overflow: TextOverflow
-                                                          .ellipsis,
-                                                      style: TextStyle(
-                                                        fontSize: 12,
-                                                        fontWeight:
-                                                            FontWeight.w600,
-                                                        color: scheme
-                                                            .onSurfaceVariant,
-                                                      ),
-                                                    ),
-                                                  ),
-                                                  if (fmtLike(r.like)
-                                                      .isNotEmpty)
-                                                    Text(
-                                                      fmtLike(r.like),
-                                                      style: TextStyle(
-                                                        fontSize: 11,
-                                                        color: scheme
-                                                            .onSurfaceVariant,
-                                                      ),
-                                                    ),
-                                                ],
-                                              ),
-                                              if (fmtTime(r.createAt)
-                                                  .isNotEmpty)
-                                                Text(
-                                                  fmtTime(r.createAt),
-                                                  style: TextStyle(
-                                                    fontSize: 10,
-                                                    color: scheme
-                                                        .onSurfaceVariant
-                                                        .withValues(
-                                                            alpha: 0.7),
-                                                  ),
-                                                ),
-                                              const SizedBox(height: 2),
-                                              Text(
-                                                r.comment,
-                                                style: const TextStyle(
-                                                  fontSize: 13,
-                                                  height: 1.4,
-                                                ),
-                                              ),
-                                            ],
-                                          ),
-                                        ),
-                                      ],
-                                    ),
-                                  ),
-                              ],
-                            ),
-                          )
+                        ? _buildReplies(context, scheme)
                         : const SizedBox(width: double.infinity),
                   ),
                 ],
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// 楼层回复列表：分页累积，底部提供「加载更多 / 重试」。
+  Widget _buildReplies(BuildContext context, ColorScheme scheme) {
+    return Container(
+      margin: const EdgeInsets.only(top: 8),
+      padding: const EdgeInsets.all(10),
+      decoration: BoxDecoration(
+        color: scheme.surfaceContainerHighest.withValues(alpha: .5),
+        borderRadius: BorderRadius.circular(10),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          for (final r in replies) _replyRow(context, scheme, r),
+          if (replyLoading)
+            const Padding(
+              padding: EdgeInsets.symmetric(vertical: 8),
+              child: SizedBox(
+                width: 16,
+                height: 16,
+                child: CircularProgressIndicator(strokeWidth: 2),
+              ),
+            )
+          else if (replyError != null)
+            GestureDetector(
+              onTap: onLoadMoreReplies,
+              child: Padding(
+                padding: const EdgeInsets.symmetric(vertical: 4),
+                child: Text(
+                  '回复加载失败，点击重试',
+                  style: TextStyle(fontSize: 12, color: scheme.error),
+                ),
+              ),
+            )
+          else if (replies.isEmpty)
+            Padding(
+              padding: const EdgeInsets.symmetric(vertical: 4),
+              child: Text(
+                '暂无回复',
+                style: TextStyle(
+                  fontSize: 12,
+                  color: scheme.onSurfaceVariant,
+                ),
+              ),
+            )
+          else if (!replyEnd)
+            GestureDetector(
+              onTap: onLoadMoreReplies,
+              child: Padding(
+                padding: const EdgeInsets.symmetric(vertical: 4),
+                child: Text(
+                  '加载更多回复',
+                  style: TextStyle(
+                    fontSize: 12,
+                    color: scheme.primary,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+
+  Widget _replyRow(BuildContext context, ColorScheme scheme, CommentItem r) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 5),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          _Avatar(url: r.avatar, size: 24),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: [
+                    Expanded(
+                      child: Text(
+                        r.nickName.isEmpty ? '匿名用户' : r.nickName,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                          fontSize: 12,
+                          fontWeight: FontWeight.w600,
+                          color: scheme.onSurfaceVariant,
+                        ),
+                      ),
+                    ),
+                    if (fmtLike(r.like).isNotEmpty)
+                      Text(
+                        fmtLike(r.like),
+                        style: TextStyle(
+                          fontSize: 11,
+                          color: scheme.onSurfaceVariant,
+                        ),
+                      ),
+                  ],
+                ),
+                if (fmtTime(r.createAt).isNotEmpty)
+                  Text(
+                    fmtTime(r.createAt),
+                    style: TextStyle(
+                      fontSize: 10,
+                      color: scheme.onSurfaceVariant.withValues(alpha: 0.7),
+                    ),
+                  ),
+                const SizedBox(height: 2),
+                Text(
+                  r.comment,
+                  style: const TextStyle(fontSize: 13, height: 1.4),
+                ),
               ],
             ),
           ),

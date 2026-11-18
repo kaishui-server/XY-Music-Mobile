@@ -43,6 +43,11 @@ class _MiniPlayerBarState extends ConsumerState<MiniPlayerBar> {
   /// 避免叠出两个播放页路由。
   bool _opening = false;
 
+  /// 展开看门狗：`_opening` 置位后若迟迟没有存活的详情页路由（push 被
+  /// 导航器拒绝 / 竞态 / 异常），到点强制复位，否则播放栏会永久停在
+  /// 隐藏态，配合残留的全局标记让整页「卡住」。
+  Timer? _openGuardTimer;
+
   /// 上滑手势已 push 详情页（进入跟手驱动阶段）。
   bool _dragPushed = false;
 
@@ -88,12 +93,64 @@ class _MiniPlayerBarState extends ConsumerState<MiniPlayerBar> {
     if (ref.read(playerProvider).current == null) return;
     setState(() => _opening = true);
     _prepareOrigin();
+    // 看门狗：正常路径下路由 install 后 xyPlayerSheetRouteRef 立即可用，
+    // 400ms 足够判定；到点仍没有存活路由说明这次展开没成功，复位标记，
+    // 让播放栏回到可点击的常态（而不是永久隐藏 + 壳层冻结卡死）。
+    _openGuardTimer?.cancel();
+    _openGuardTimer = Timer(const Duration(milliseconds: 400), () {
+      final route = xyPlayerSheetRouteRef;
+      if (route != null && route.isActive) return;
+      healPlayerSheetGlobals();
+      if (!mounted) {
+        _opening = false;
+        return;
+      }
+      setState(() => _opening = false);
+    });
+    Future<Object?>? pushing;
+    try {
+      pushing = context.push('/player');
+    } catch (error, stack) {
+      _recoverOpenFailure(error, stack);
+      return;
+    }
     unawaited(
-      context.push('/player').whenComplete(() {
-        // 收起动画结束（路由 pop 完成）后才恢复显示播放栏本体。
-        if (mounted) setState(() => _opening = false);
-      }),
+      pushing
+          .then<void>((_) {}, onError: (Object error, StackTrace stack) {
+            _recoverOpenFailure(error, stack);
+          })
+          .whenComplete(() {
+            _openGuardTimer?.cancel();
+            // 收起动画结束（路由 pop 完成）后才恢复显示播放栏本体。
+            if (!mounted) {
+              _opening = false;
+              return;
+            }
+            setState(() => _opening = false);
+            // 路由已离场：若全局转场标记仍有残留（异常收起路径），拉回
+            // 静止态，避免下一次展开带着脏标记表现异常。
+            healPlayerSheetGlobals();
+          }),
     );
+  }
+
+  /// 展开失败后的自愈：复位打开标记与所有形变转场全局标记。
+  ///
+  /// 卡住现象的根因就是这里没做兜底——`_opening` 卡在 true 时播放栏
+  /// 永久隐藏且拒绝一切点击；同时 `xySheetRouteActive` / `xyPlayerSheetMorphing`
+  /// 残留为 true 会让壳层被快照冻结，画面整页停更。
+  void _recoverOpenFailure(Object error, StackTrace stack) {
+    _openGuardTimer?.cancel();
+    _opening = false;
+    healPlayerSheetGlobals();
+    if (!mounted) return;
+    setState(() {});
+  }
+
+  @override
+  void dispose() {
+    _openGuardTimer?.cancel();
+    super.dispose();
   }
 
   void _onDragStart(DragStartDetails details) {
@@ -230,7 +287,11 @@ class _MiniPlayerBarState extends ConsumerState<MiniPlayerBar> {
     return ValueListenableBuilder<bool>(
       valueListenable: xySheetRouteActive,
       builder: (context, routeActive, _) {
-        final hidden = _opening || routeActive;
+        // 存活守卫：全局激活标记只在形变路由确实在栈里时才生效，
+        // 残留脏标记不会把播放栏永久藏起来（用户看到「播放栏消失、
+        // 点了没反应」的那种卡住）。
+        final sheetAlive = xyPlayerSheetRouteRef?.isActive ?? false;
+        final hidden = _opening || (routeActive && sheetAlive);
         return IgnorePointer(
           ignoring: hidden,
           child: Opacity(

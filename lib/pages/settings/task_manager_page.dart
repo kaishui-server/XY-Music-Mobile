@@ -17,6 +17,7 @@ import '../../src/rust/api.dart';
 import '../../src/widgets/batch_download.dart';
 import '../../src/widgets/frosted_search_field.dart';
 import '../../src/widgets/top_notice.dart';
+import '../../src/navigation/paged_transition.dart';
 
 /// 任务管理页：分「批量任务」与「单项任务」两个 Tab。
 ///
@@ -571,7 +572,7 @@ class _TaskManagerPageState extends ConsumerState<TaskManagerPage>
           ],
         ),
       ),
-      body: TabBarView(
+      body: XyTabBarView(
         controller: _tab,
         children: [
           _buildBatchTasksTab(theme, batchTasks),

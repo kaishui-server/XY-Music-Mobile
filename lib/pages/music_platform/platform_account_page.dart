@@ -10,12 +10,15 @@ import '../../src/music_platform/platform_api.dart';
 import '../../src/music_platform/platform_session.dart';
 import '../../src/widgets/top_notice.dart';
 import 'web_login_page.dart';
+import '../../src/navigation/animated_page_route.dart';
 
 /// 各平台通用的“网页登录”入口：推入 WebView 登录页，
 /// 登录成功后由页面自行保存会话并返回。
 Future<void> _showWebLogin(BuildContext context, MusicPlatform platform) {
   return Navigator.of(context, rootNavigator: true).push(
-    MaterialPageRoute<void>(builder: (_) => WebLoginPage(platform: platform)),
+    XyAnimatedPageRoute<void>(
+      builder: (_) => WebLoginPage(platform: platform),
+    ),
   );
 }
 

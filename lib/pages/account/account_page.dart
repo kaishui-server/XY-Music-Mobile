@@ -11,8 +11,10 @@ import '../../src/music_platform/platform_session.dart';
 import '../../src/navigation/sidebar_controller.dart';
 import '../../src/playlists/playlists_provider.dart';
 import '../../src/sync/account_cloud_sync.dart';
+import '../../src/ui/xy_surface.dart';
 import '../../src/widgets/top_notice.dart';
 import '../../src/widgets/user_avatar_image.dart';
+import '../../src/navigation/paged_transition.dart';
 
 /// 账号认证页：未登录时展示登录/注册，已登录时展示个人资料。
 class AccountPage extends ConsumerStatefulWidget {
@@ -382,6 +384,7 @@ class _AccountPageState extends ConsumerState<AccountPage>
       ),
     );
     return Scaffold(
+      // 页面底保持透明：半透明只做在类目卡片上（见 [_InfoCard]）。
       appBar: AppBar(
         automaticallyImplyLeading: !widget.showSidebarButton || !sidebarOnRight,
         leading: widget.showSidebarButton && !sidebarOnRight
@@ -489,7 +492,7 @@ class _AccountPageState extends ConsumerState<AccountPage>
             padding: EdgeInsets.only(
               bottom: MediaQuery.paddingOf(context).bottom,
             ),
-            child: TabBarView(
+            child: XyTabBarView(
               controller: _tab,
               children: [
                 _loginForm(context, auth),
@@ -977,7 +980,10 @@ class _InfoCard extends StatelessWidget {
     }
     return Container(
       decoration: BoxDecoration(
-        color: scheme.surfaceContainerHigh,
+        // 类目卡片半透明（深色主题），透出下层应用背景；页面底保持透明，
+        // 不做整页半透明。
+        color:
+            xyTranslucentCardColor(context) ?? scheme.surfaceContainerHigh,
         borderRadius: BorderRadius.circular(14),
       ),
       child: Column(children: items),

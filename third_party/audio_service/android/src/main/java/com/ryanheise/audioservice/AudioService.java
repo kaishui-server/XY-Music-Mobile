@@ -363,6 +363,16 @@ public class AudioService extends MediaBrowserServiceCompat {
 
     @Override
     public int onStartCommand(final Intent intent, int flags, int startId) {
+        // XY Music 本地补丁：原生层媒体键锚点。通知栏按键必须先落到这里，
+        // 才会经 handleIntent → MediaSession 回调 → Dart 桥接；用 adb logcat
+        // 过滤 XYMediaBtn 即可二分「事件没送达」和「送达没处理」（排查
+        // vivo/OriginOS 通知栏按键丢失用，Dart 侧日志看不到这一层）。
+        if (intent != null) {
+            final KeyEvent event = intent.getParcelableExtra(Intent.EXTRA_KEY_EVENT);
+            android.util.Log.i("XYMediaBtn",
+                "onStartCommand action=" + intent.getAction()
+                + " keyCode=" + (event == null ? -1 : event.getKeyCode()));
+        }
         MediaButtonReceiver.handleIntent(mediaSession, intent);
         return START_NOT_STICKY;
     }
@@ -569,14 +579,24 @@ public class AudioService extends MediaBrowserServiceCompat {
         int keyCode = toKeyCode(action);
         if (keyCode == KeyEvent.KEYCODE_UNKNOWN)
             return null;
-        Intent intent = new Intent(this, MediaButtonReceiver.class);
+        Intent intent = new Intent(this, AudioService.class);
         intent.setAction(Intent.ACTION_MEDIA_BUTTON);
         intent.putExtra(Intent.EXTRA_KEY_EVENT, new KeyEvent(KeyEvent.ACTION_DOWN, keyCode));
         int flags = 0;
         if (Build.VERSION.SDK_INT >= 23) {
             flags |= PendingIntent.FLAG_IMMUTABLE;
         }
-        return PendingIntent.getBroadcast(this, keyCode, intent, flags);
+        // XY Music 本地补丁：媒体键 PendingIntent 从「广播 MediaButtonReceiver
+        // → startForegroundService 转发」改为直发 AudioService。OriginOS
+        // （vivo X100s 2026-11-12 实测）会拦截后台应用的广播→FGS 启动链路：
+        // 暂停后点播放键被静默丢弃并退化为「展开应用」（Dart 全日志无任何
+        // 按键锚点、应用被 resumed）。直发 service 走
+        // PendingIntent.getForegroundService，通知交互豁免后台启动限制；
+        // 键事件经 onStartCommand → handleIntent → MediaSession 回调进 Dart，
+        // 少一跳广播且不受 ROM 广播冻结影响。
+        return Build.VERSION.SDK_INT >= 26
+            ? PendingIntent.getForegroundService(this, keyCode, intent, flags)
+            : PendingIntent.getService(this, keyCode, intent, flags);
     }
 
     PendingIntent buildDeletePendingIntent() {

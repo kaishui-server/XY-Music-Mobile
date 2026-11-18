@@ -6,7 +6,7 @@ import 'dart:ui' as ui;
 
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/foundation.dart'
-    show ValueListenable, ValueNotifier, listEquals;
+    show ValueListenable, ValueNotifier, listEquals, mapEquals;
 import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart';
 import 'package:flutter/scheduler.dart';
@@ -25,11 +25,13 @@ import '../../src/effects/effects_provider.dart';
 import '../../src/favorites/favorites_provider.dart';
 import '../../src/library/library_provider.dart';
 import '../../src/library/online_cover_overrides.dart';
+import '../../src/library/song_cover_edit_actions.dart';
 import '../../src/logging/error_context.dart';
 import '../../src/lyrics/lyrics_models.dart';
 import '../../src/navigation/animated_page_route.dart';
 import '../../src/navigation/player_sheet_morph.dart';
 import '../../src/player/player_provider.dart';
+import '../../src/player/artist_avatar_preload.dart';
 import '../../src/player/player_ui_activity.dart';
 import '../../src/player/desktop_lyrics.dart';
 import '../../src/player/mini_player_overlay.dart';
@@ -50,15 +52,16 @@ import '../../src/ui/xy_video_wallpaper.dart';
 import '../../src/share/share_sheet.dart';
 import 'vinyl_tonearm.dart';
 import '../../src/widgets/batch_download.dart';
+import '../../src/widgets/cover_edit_sheet.dart';
+import '../../src/widgets/cover_disk_cache.dart';
 import '../../src/widgets/cover_image.dart';
 import '../../src/widgets/lyric_settings_sheet.dart';
 import '../../src/widgets/queue_sheet.dart';
 import '../../src/widgets/source_switch.dart';
 import '../../src/widgets/top_notice.dart';
 import 'comment_sheet.dart';
-import '../../src/debug/performance_probe.dart';
-import '../../src/debug/probe_report_dialog.dart';
 import '../search/online_catalog_detail_page.dart';
+import '../../src/navigation/paged_transition.dart';
 
 const _pluginLyricsSearchMemoryKey = 'pluginLyricsSearchQueriesV1';
 
@@ -289,6 +292,7 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
     'com.xymusic.mobile/screen_awake',
   );
   static const _galleryChannel = MethodChannel('com.xymusic.mobile/gallery');
+
   /// 状态栏原生兜底通道（与可视化页同款）：Android 15 强制 edge-to-edge
   /// 后 SystemChrome 的 immersiveSticky 在部分机型失效，API 30+ 用原生
   /// WindowInsetsController 硬隐藏状态栏；否则沉浸式下状态栏残留为
@@ -297,11 +301,11 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
 
   late final PageController _detailPageController = PageController();
 
-  /// 歌曲信息面板的歌手头像补查（万象等插件的歌手搜索接口返回头像），
-  /// 结果带缓存与并发去重，失败静默回退占位。
-  late final ArtistAvatarResolver _artistAvatarResolver = ArtistAvatarResolver(
-    fetchAvatar: _fetchArtistAvatar,
-  );
+  /// 正在播放歌曲的作者头像预取已上移到全局 provider
+  /// （currentArtistAvatarsProvider）：跟播放切换走，播放页未挂载也会
+  /// 解析头像 URL 并落封面磁盘缓存。播放页只负责最后一环——结果就绪时
+  /// 按面板显示宽度预解码进 ImageCache（见 build 里的 ref.listen）。
+
   ProviderSubscription<bool>? _playingSubscription;
   ProviderSubscription<bool?>? _keepScreenOnSubscription;
   bool _screenAwake = false;
@@ -469,6 +473,9 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
     });
     // 播放页可见期才需要细粒度进度采样（进度条 + 逐字歌词）；离开本页后
     // player_provider 会降到 600ms 粗档，减少无人观看的 UI 刷新。
+    // 封面覆盖表变更（更多菜单里「搜索并关联封面」）后重建本页，
+    // 让大封面/迷你封面立即换图，而不是等下次切歌才刷新。
+    onlineCoverRevision.addListener(_onOnlineCoverChanged);
     PlayerUiActivity.acquire();
     // 常亮需同时满足：设置开关打开 + 正在播放 + 本页可见 + App 非 hidden。
     // 设置项与播放态任一变化都重算一次，避免「歌在播就在任何页面钉亮屏幕」。
@@ -508,7 +515,8 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
         ref.read(settingsProvider).valueOrNull?.keepScreenOn ?? false;
     final lifecycleHidden =
         WidgetsBinding.instance.lifecycleState == AppLifecycleState.hidden;
-    final shouldWake = keepScreenOn &&
+    final shouldWake =
+        keepScreenOn &&
         PlayerUiActivity.isVisible &&
         !lifecycleHidden &&
         ref.read(playerProvider).isPlaying;
@@ -762,36 +770,36 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
     // 面板无人驱动停在中间（收不回也弹不回）。
     final collapseVelocity = _collapseVelocity();
     _clearDetailSwipe();
-      // 收起模式：松手按速度/进度决定收起或回弹；被系统取消（如通知栏
-      // 手势抢走指针）时回弹。阈值与展开侧灵敏度对齐：快速下滑，或拖过
-      // 96px（约 1/8 屏）即收起——短距轻拖也能收回，仅极短误触弹回；
-      // 收起提交走 pop，转场从当前值反向播放——与单击收起同一条动画。
-      if (mode == _DetailGestureMode.collapse) {
-        if (event is PointerCancelEvent) {
-          _sheetRoute?.springBack();
-          return;
-        }
-        final barTop =
-            xyPlayerSheetOrigin?.barRect.top ??
-            MediaQuery.sizeOf(context).height * .85;
-        final collapse = collapseVelocity > 180 ||
-            _collapseProgress <= 1 - 96 / barTop;
-        if (collapse) {
-          // 收起提交走路由自身的安全路径（与播放栏收起同一实现）：
-          // 先播完收起动画（转场值到 0、status=dismissed）再移除路由。
-          // 直接 Navigator.pop 会让 reverse 动画在久播帧预算被挤占或
-          // 残留手势抢断时停在中途，路由永不 dispose → 半透明面板残影。
-          final route = _sheetRoute;
-          if (route != null) {
-            route.collapseAndPop();
-          } else {
-            Navigator.of(context).pop();
-          }
-        } else {
-          _sheetRoute?.springBack();
-        }
+    // 收起模式：松手按速度/进度决定收起或回弹；被系统取消（如通知栏
+    // 手势抢走指针）时回弹。阈值与展开侧灵敏度对齐：快速下滑，或拖过
+    // 96px（约 1/8 屏）即收起——短距轻拖也能收回，仅极短误触弹回；
+    // 收起提交走 pop，转场从当前值反向播放——与单击收起同一条动画。
+    if (mode == _DetailGestureMode.collapse) {
+      if (event is PointerCancelEvent) {
+        _sheetRoute?.springBack();
         return;
       }
+      final barTop =
+          xyPlayerSheetOrigin?.barRect.top ??
+          MediaQuery.sizeOf(context).height * .85;
+      final collapse =
+          collapseVelocity > 180 || _collapseProgress <= 1 - 96 / barTop;
+      if (collapse) {
+        // 收起提交走路由自身的安全路径（与播放栏收起同一实现）：
+        // 先播完收起动画（转场值到 0、status=dismissed）再移除路由。
+        // 直接 Navigator.pop 会让 reverse 动画在久播帧预算被挤占或
+        // 残留手势抢断时停在中途，路由永不 dispose → 半透明面板残影。
+        final route = _sheetRoute;
+        if (route != null) {
+          route.collapseAndPop();
+        } else {
+          Navigator.of(context).pop();
+        }
+      } else {
+        _sheetRoute?.springBack();
+      }
+      return;
+    }
     if (start == null || end == null) return;
 
     final delta = end - start;
@@ -1741,6 +1749,7 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
           ?.name;
     }
     if (!mounted) return;
+    final preload = ref.read(currentArtistAvatarsProvider);
     await showModalBottomSheet<void>(
       context: context,
       useRootNavigator: true,
@@ -1756,40 +1765,75 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
                 unawaited(_openArtistWorks(item, artist));
               },
         // 歌曲条目只带歌手名时，按名走所属插件（万象等）的歌手搜索
-        // 接口补头像；失败由解析器静默回退占位。
+        // 接口补头像；失败由解析器静默回退占位。解析器为全局实例，
+        // 与 provider 层预取共享缓存，不会重复打接口。
         resolveAvatar: pluginId == null || pluginId.isEmpty
             ? null
             : (artistName) =>
-                _artistAvatarResolver.resolve(pluginId, artistName),
+                  ref
+                      .read(artistAvatarResolverProvider)
+                      .resolve(pluginId, artistName),
+        // 预取结果：面板挂载即用，不再等补查完成。
+        initialAvatars: item.path == preload.path
+            ? preload.avatars
+            : const {},
       ),
     );
   }
 
-  /// 按名获取歌手头像：LX 源走公开搜索兜底，其余源走插件的歌手搜索
-  /// 并只取同名结果；失败静默返回空，由界面回退占位。
-  Future<String> _fetchArtistAvatar(
-    String pluginId,
-    String artistName,
+  /// 信息面板头像预解码（预取链路的最后一环）：
+  /// provider 层已完成「URL 解析 + 封面磁盘缓存落盘 + 代理字节预热」，
+  /// 这里补 precacheImage——按面板 38dp 头像的显示宽度解码进 ImageCache。
+  /// 缺了这步，首帧仍要等一次解码（低端机上是几十毫秒的白位）。
+  Future<void> _precacheAvatars(
+    ({String path, Map<String, String> avatars}) preload,
   ) async {
-    if (!mounted) return '';
-    final plugins = await ref.read(enabledMusicPluginsProvider.future);
-    if (!mounted) return '';
-    final plugin = plugins.where((plugin) => plugin.id == pluginId).firstOrNull;
-    if (plugin == null) return '';
-    final runtime = ref.read(pluginRuntimeProvider);
-    return resolveArtistAvatar(
-      isLx: plugin.isLx,
-      artistName: artistName,
-      searchPluginArtists: () => runtime.searchArtists(plugin, artistName),
-      resolvePublicAvatar: () => runtime.resolveArtistAvatarByName(artistName),
-    );
+    final cacheRoot = await ref.read(appDataDirProvider.future);
+    if (!mounted) return;
+    final dpr = MediaQuery.maybeOf(context)?.devicePixelRatio ?? 3.0;
+    final decodeWidth = coverDecodeWidthFor(38, devicePixelRatio: dpr);
+    for (final raw in preload.avatars.values) {
+      final url = normalizeCoverImageUrl(raw);
+      if (url.isEmpty) continue;
+      ImageProvider? provider;
+      final cached = CoverDiskCache.peek(url);
+      if (cached != null && cached.isNotEmpty) {
+        provider = coverFileImageProvider(cached, decodeWidth);
+      } else {
+        final path = await CoverDiskCache.resolve(
+          url,
+          headers: coverImageNetworkHeaders(url),
+          cacheRoot: cacheRoot,
+        );
+        if (!mounted) return;
+        if (path != null && path.isNotEmpty) {
+          provider = coverFileImageProvider(path, decodeWidth);
+        } else if (needsCoverImageProxy(url)) {
+          // 网易云 CDN 直连 403：代理字节已在 provider 层预热进共享缓存，
+          // 这里取同一份 MemoryImage 并解码。
+          provider = await coverPrewarmProxiedImage(
+            url,
+            decodeWidth: decodeWidth,
+          );
+          if (!mounted) return;
+        }
+      }
+      if (provider == null) continue;
+      try {
+        await precacheImage(provider, context);
+      } catch (_) {
+        // 预解码失败无副作用：面板仍会自行加载并回退占位。
+      }
+      if (!mounted) return;
+    }
   }
 
   /// 查看作者发布的歌曲：以歌曲数据里的歌手条目为目录项，复用搜索页
   /// 的歌手详情页加载作品；插件未实现详情接口时由运行时回退按名搜索。
-  Future<void> _openArtistWorks(QueueItem item, _SongArtistInfo artist) async {
+  Future<void> _openArtistWorks(QueueItem item, SongArtistInfo artist) async {
     // 与 _showSongInfoSheet 一致：识曲歌曲按完整回退链兜底，保证
     // 「作品」入口打开后仍能定位到实际解析该歌的插件。
+    final preload = ref.read(currentArtistAvatarsProvider);
     final plugins = await ref.read(enabledMusicPluginsProvider.future);
     final pluginId = recognizedPluginIdForDisplay(item, plugins);
     if (pluginId == null || pluginId.isEmpty) return;
@@ -1827,12 +1871,19 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
         builder: (_) => OnlineCatalogDetailPage(
           title: artist.name,
           subtitle: plugin.name,
-          coverUrl: artist.avatar,
+          coverUrl: effectiveArtistAvatar(
+            artist.avatar,
+            item.path == preload.path
+                ? preload.avatars[artist.name]
+                : null,
+          ),
           categoryLabel: '歌手',
           // 与歌曲信息面板一致：平台头像优先；缺失时按名补查（LX 源走
           // 公开搜索兜底），解析器缓存保证重复进入页面不重复打接口。
           resolveCoverUrl: (name) =>
-              _artistAvatarResolver.resolve(plugin.id, name),
+              ref
+                  .read(artistAvatarResolverProvider)
+                  .resolve(plugin.id, name),
           loadSongs: () async {
             final results = await runtime.getArtistSongs(plugin, catalog);
             return [
@@ -2546,10 +2597,7 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
               borderRadius: BorderRadius.circular(12),
             ),
             child: Padding(
-              padding: const EdgeInsets.symmetric(
-                horizontal: 16,
-                vertical: 14,
-              ),
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
               child: Row(
                 children: [
                   Expanded(
@@ -3381,8 +3429,15 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
     }
   }
 
+  /// 封面覆盖表变更（关联/编辑封面）后重建播放页，让封面立即生效。
+  void _onOnlineCoverChanged() {
+    if (!mounted) return;
+    setState(() {});
+  }
+
   @override
   void dispose() {
+    onlineCoverRevision.removeListener(_onOnlineCoverChanged);
     // 视频控制器由会话对象持有，退出详情页只销毁页面 UI，不暂停或释放视频。
     // 这样从详情页返回后，视频仍可继续播放；重新进入详情页时会重新绑定。
     // 横屏锁定跟随详情页生命周期，离开页面即解除；同时恢复系统状态栏
@@ -3430,6 +3485,17 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
         ) ??
         PlayerCoverStyle.classic;
     _loadLyricsOffsetFor(current);
+    // 作者头像预取在 provider 层随播放切换自动执行（无需播放页挂载）；
+    // 这里监听结果并做最后一环预解码，信息面板首帧即真实头像。
+    ref.listen(currentArtistAvatarsProvider, (prev, next) {
+      if (next.path.isEmpty || next.avatars.isEmpty) return;
+      if (prev != null &&
+          prev.path == next.path &&
+          mapEquals(prev.avatars, next.avatars)) {
+        return;
+      }
+      unawaited(_precacheAvatars(next));
+    });
     // 换歌时检测 MV 可用性（同步前缀先重置旧结果，按钮判定见
     // _mvButtonVisible），检测完成后再通过 setState 刷新按钮显隐。
     unawaited(_refreshMvAvailability(current));
@@ -3590,7 +3656,9 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
         onPointerCancel: current == null
             ? null
             : (event) => _finishDetailSwipe(event, constraints.maxWidth),
-        child: PageView(
+        // 封面 ↔ 歌词分页：切换效果跟随全局「页面切换动画」设置，
+        // 不再固定为水平推移。
+        child: XyPageView(
           controller: _detailPageController,
           physics: const NeverScrollableScrollPhysics(),
           onPageChanged: (page) {
@@ -3607,40 +3675,40 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
               // 不按曲目换 key：否则整个封面子树重建，CoverImage 内部
               // 的「上一帧垫底 + 交叉淡入」失效，切歌会先闪占位图。
               _ImmersiveCoverPage(
-                  item: current,
-                  offsetTenths: _lyricsOffsetTenths,
-                  // 竖屏时封面本体由外层 Stack 的 _ImmersiveTopCover 绘制
-                  //（铺到屏幕顶端），这里恒为透明手势占位。此前 paintCover
-                  // 随 coverHidden 翻转：真实详情页把封面在内容区又画一遍，
-                  // 与顶部封面错位叠放——顶部出现两份错位裁切（重复裁切），
-                  // 且与 _ImmersiveTopCover 重复挂同一 coverAnchorKey。
-                  miniLyricRows: miniLyricRows,
-                  miniLyricReserveRows: miniLyricReserveRows,
-                  // 歌词页在前时封面（含迷你歌词）不可见：停迷你歌词逐字
-                  // Ticker，回封面页时由 _TimedLyricText.didUpdateWidget 恢复。
-                  miniLyricsActive: !_showLyrics,
-                  onTap: current == null ? null : _toggleLyrics,
-                  onLongPress: current == null
-                      ? null
-                      : () => unawaited(_showMoreMenu(current)),
+                item: current,
+                offsetTenths: _lyricsOffsetTenths,
+                // 竖屏时封面本体由外层 Stack 的 _ImmersiveTopCover 绘制
+                //（铺到屏幕顶端），这里恒为透明手势占位。此前 paintCover
+                // 随 coverHidden 翻转：真实详情页把封面在内容区又画一遍，
+                // 与顶部封面错位叠放——顶部出现两份错位裁切（重复裁切），
+                // 且与 _ImmersiveTopCover 重复挂同一 coverAnchorKey。
+                miniLyricRows: miniLyricRows,
+                miniLyricReserveRows: miniLyricReserveRows,
+                // 歌词页在前时封面（含迷你歌词）不可见：停迷你歌词逐字
+                // Ticker，回封面页时由 _TimedLyricText.didUpdateWidget 恢复。
+                miniLyricsActive: !_showLyrics,
+                onTap: current == null ? null : _toggleLyrics,
+                onLongPress: current == null
+                    ? null
+                    : () => unawaited(_showMoreMenu(current)),
               )
             else
               _BigCover(
-                  item: current,
-                  offsetTenths: _lyricsOffsetTenths,
-                  style: coverStyle,
-                  coverHidden: widget.coverHidden,
-                  coverAnchorKey: widget.coverAnchorKey,
-                  miniLyricRows: miniLyricRows,
-                  miniLyricReserveRows: miniLyricReserveRows,
-                  // 歌词页在前时封面（含迷你歌词）不可见：停迷你歌词逐字
-                  // Ticker，回封面页时由 _TimedLyricText.didUpdateWidget 恢复。
-                  miniLyricsActive: !_showLyrics,
-                  onTap: current == null ? null : _toggleLyrics,
-                  // 长按封面直接弹出“更多”菜单，与右上角更多按钮一致。
-                  onLongPress: current == null
-                      ? null
-                      : () => unawaited(_showMoreMenu(current)),
+                item: current,
+                offsetTenths: _lyricsOffsetTenths,
+                style: coverStyle,
+                coverHidden: widget.coverHidden,
+                coverAnchorKey: widget.coverAnchorKey,
+                miniLyricRows: miniLyricRows,
+                miniLyricReserveRows: miniLyricReserveRows,
+                // 歌词页在前时封面（含迷你歌词）不可见：停迷你歌词逐字
+                // Ticker，回封面页时由 _TimedLyricText.didUpdateWidget 恢复。
+                miniLyricsActive: !_showLyrics,
+                onTap: current == null ? null : _toggleLyrics,
+                // 长按封面直接弹出“更多”菜单，与右上角更多按钮一致。
+                onLongPress: current == null
+                    ? null
+                    : () => unawaited(_showMoreMenu(current)),
               ),
             if (current == null)
               const Center(
@@ -4510,10 +4578,48 @@ class _PlayerMoreSheetState extends ConsumerState<_PlayerMoreSheet> {
   /// 解除关联后行内即时移除入口（弹层不收起）。
   late bool _hasLyricsAssociation = widget.hasLyricsAssociation;
 
+  /// 封面编辑四动作共用的执行器（大图 / 相册 / 跨插件搜索 / 相册选择）。
+  late final SongCoverEditor _coverEditor = SongCoverEditor(
+    songPath: widget.item.path,
+    title: widget.item.title,
+    artist: widget.item.artist,
+    originalCoverUrl: widget.item.coverUrl,
+    pluginId: widget.item.pluginId,
+    durationMs: widget.item.durationMs,
+  );
+
+  /// 当前是否已存在自定义封面（行内当前值展示用）。
+  late final bool _hasCustomCover = _coverEditor.hasOverride;
+
   /// 收起弹层后执行宿主动作（子面板由宿主页面拉起）。
   void _popThen(VoidCallback action) {
     Navigator.pop(context);
     action();
+  }
+
+  /// 「编辑封面」行：整行点击收起更多菜单后拉起底部面板（查看大图 /
+  /// 保存到相册 / 搜索封面 / 从相册选择），面板与「歌词设置」同构。
+  Widget _coverEditRow(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return _settingRow(
+      context,
+      icon: Icons.image_outlined,
+      title: '编辑封面',
+      value: _hasCustomCover ? '已自定义' : '跨插件检索',
+      trailing: Icon(
+        Icons.chevron_right_rounded,
+        size: 20,
+        color: scheme.outline,
+      ),
+      onTap: () {
+        // 面板由根 Navigator 拉起：先留存其 context，本弹层 pop 后自身
+        // context 就失效了，仍需一个可用 context 去打开底部面板。
+        final hostContext = Navigator.of(context, rootNavigator: true).context;
+        _popThen(() {
+          unawaited(showCoverEditSheet(hostContext, _coverEditor));
+        });
+      },
+    );
   }
 
   /// 圆形快捷按钮：圆形底 + 图标 + 下方文字标签（可选附加小按钮）。
@@ -4897,6 +5003,7 @@ class _PlayerMoreSheetState extends ConsumerState<_PlayerMoreSheet> {
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.stretch,
                     children: [
+                      _coverEditRow(context),
                       _switchRow(
                         context,
                         icon: Icons.subtitles_outlined,
@@ -5043,29 +5150,6 @@ class _PlayerMoreSheetState extends ConsumerState<_PlayerMoreSheet> {
                         value: '跳过头部/尾部',
                         onOpen: widget.onShowSkipRange,
                       ),
-                      // 性能探针报告入口：仅 debug 构建 + 探针开关开启时显示。
-                      if (kPerformanceProbeEntryVisible)
-                        _settingRow(
-                          context,
-                          icon: Icons.speed_rounded,
-                          title: '性能探针报告',
-                          trailing: Icon(
-                            Icons.chevron_right_rounded,
-                            size: 20,
-                            color: scheme.outline,
-                          ),
-                          onTap: () {
-                            final navigator = Navigator.of(
-                              context,
-                              rootNavigator: true,
-                            );
-                            Navigator.pop(context);
-                            showDialog<void>(
-                              context: navigator.context,
-                              builder: (_) => const ProbeReportDialog(),
-                            );
-                          },
-                        ),
                     ],
                   ),
                 ),
@@ -5078,211 +5162,10 @@ class _PlayerMoreSheetState extends ConsumerState<_PlayerMoreSheet> {
   }
 }
 
-/// 歌曲信息面板的作者条目：平台原始歌手对象 + 提取后的展示字段。
-class _SongArtistInfo {
-  const _SongArtistInfo({
-    required this.name,
-    required this.artistId,
-    required this.artistMid,
-    required this.raw,
-    this.avatar = '',
-  });
-
-  final String name;
-  final String artistId;
-  final String artistMid;
-
-  /// 平台头像地址；部分平台（如 QQ/网易歌手条目）不提供，为空时回退占位图标。
-  final String avatar;
-
-  /// 平台原始歌手 map（含 name/id/mid 等），作为 getArtistWorks 的
-  /// rawData 直传插件。
-  final Map<String, dynamic> raw;
-}
-
-String _firstTextOf(Map<dynamic, dynamic> map, List<String> keys) {
-  for (final key in keys) {
-    final value = map[key];
-    if (value is String && value.trim().isNotEmpty) return value.trim();
-    if (value is num) return value.toString();
-  }
-  return '';
-}
-
-/// 从歌手对象提取头像地址。兼容字符串与 `{url: ...}` / `{urlTemplate: ...}`
-/// 形式的嵌套值；顶层找不到时再查 user_info/author_info/user 等嵌套对象
-/// （汽水等平台的歌手信息包裹在 user_info 里）。
-String _artistAvatarOf(Map<String, dynamic> map) {
-  const keys = [
-    'avatar',
-    'avatarUrl',
-    'avatar_url',
-    'avatarImgUrlStr',
-    'headImg',
-    'headPic',
-    'headUrl',
-    'head_url',
-    'singerPic',
-    'singerImg',
-    'artistPic',
-    'artistImg',
-    'pic',
-    'picUrl',
-    'pic_url',
-    'img',
-    'imgUrl',
-    'img_url',
-    'img1v1Url',
-    'img1v1',
-    'image',
-    'photo',
-    'upic',
-    'face',
-    'userFace',
-    'user_face',
-    'cover',
-    'coverUrl',
-    'cover_url',
-  ];
-  String readFrom(Map<dynamic, dynamic> source) {
-    for (final key in keys) {
-      final value = source[key];
-      if (value is String && value.trim().isNotEmpty) return value.trim();
-      if (value is Map) {
-        final nested = value['url'] ?? value['urlTemplate'] ?? value['src'];
-        if (nested is String && nested.trim().isNotEmpty) {
-          return nested.trim();
-        }
-      }
-    }
-    return '';
-  }
-
-  final direct = readFrom(map);
-  if (direct.isNotEmpty) return direct;
-  for (final nestedKey in const [
-    'user_info',
-    'author_info',
-    'user',
-    'artist',
-  ]) {
-    final nested = map[nestedKey];
-    if (nested is Map) {
-      final found = readFrom(nested);
-      if (found.isNotEmpty) return found;
-    }
-  }
-  return '';
-}
-
-/// 是否为 QQ 音乐曲目：封面/artwork 指向 y.gtimg.cn（其他平台不会命中）。
-bool _isQqSong(QueueItem item) {
-  final data = item.pluginData;
-  final urls = <String?>[
-    item.coverUrl,
-    data?['artwork']?.toString(),
-    data?['cover']?.toString(),
-    data?['coverUrl']?.toString(),
-  ];
-  return urls.any((url) => (url ?? '').contains('gtimg.cn'));
-}
-
-/// QQ 音乐歌手头像约定地址（与桌面端 LxMusicSdk、Rust lx_search 一致）：
-/// 歌手条目只带 mid，无头像字段，需按 T001 规则拼接。
-String _qqSingerAvatarUrl(String mid) => mid.isEmpty
-    ? ''
-    : 'https://y.gtimg.cn/music/photo_new/T001R500x500M000$mid.jpg';
-
-/// 从歌曲插件数据提取作者列表：优先归一化后的 singerList（QQ/汽水/
-/// 网易等），兼容 artists/singers/singer/ar 等原始字段；都没有时按
-/// item.artist 文本按常见分隔符拆分（无 ID，仅展示）。
-List<_SongArtistInfo> _songArtistsOf(QueueItem item) {
-  final data = item.pluginData;
-  List<dynamic> entries = const [];
-  if (data != null) {
-    final list =
-        data['singerList'] ??
-        data['singers'] ??
-        data['artists'] ??
-        data['artistList'];
-    if (list is List) {
-      entries = list;
-    } else {
-      final single = data['singer'] ?? data['ar'] ?? data['author_info'];
-      if (single is List) {
-        entries = single;
-      } else if (single is Map) {
-        entries = [single];
-      }
-    }
-  }
-  final artists = <_SongArtistInfo>[];
-  // QQ 歌手条目无头像字段，按 mid 拼 T001 头像地址兜底。
-  final qqSong = _isQqSong(item);
-  for (final entry in entries) {
-    if (entry is Map) {
-      final map = Map<String, dynamic>.from(entry);
-      final name = _firstTextOf(map, const [
-        'name',
-        'title',
-        'artist',
-        'singer',
-        'author',
-      ]);
-      final id = _firstTextOf(map, const [
-        'id',
-        'artistId',
-        'artist_id',
-        'singerId',
-      ]);
-      final mid = _firstTextOf(map, const [
-        'mid',
-        'artistMid',
-        'artist_mid',
-        'singerMid',
-      ]);
-      if (name.isNotEmpty || id.isNotEmpty) {
-        final avatar = _artistAvatarOf(map);
-        artists.add(
-          _SongArtistInfo(
-            name: name,
-            artistId: id,
-            artistMid: mid,
-            avatar: avatar.isNotEmpty
-                ? avatar
-                : (qqSong ? _qqSingerAvatarUrl(mid) : ''),
-            raw: map,
-          ),
-        );
-      }
-    } else if (entry is String && entry.trim().isNotEmpty) {
-      artists.add(
-        _SongArtistInfo(
-          name: entry.trim(),
-          artistId: '',
-          artistMid: '',
-          raw: {'name': entry.trim()},
-        ),
-      );
-    }
-  }
-  if (artists.isEmpty && item.artist.trim().isNotEmpty) {
-    for (final name in item.artist.split(RegExp(r'[/、,，&]'))) {
-      final trimmed = name.trim();
-      if (trimmed.isNotEmpty) {
-        artists.add(
-          _SongArtistInfo(
-            name: trimmed,
-            artistId: '',
-            artistMid: '',
-            raw: {'name': trimmed},
-          ),
-        );
-      }
-    }
-  }
-  return artists;
-}
+/// 歌曲信息面板的作者条目：平台原始歌手对象 + 提取后的展示字段
+/// （SongArtistInfo 及提取逻辑在 src/player/artist_avatar_preload.dart，
+/// 与全局预取共用同一份实现）。
+typedef _SongArtistInfo = SongArtistInfo;
 
 /// 歌曲信息面板：平台 + 歌曲（名称/ID/MID）+ 作者列表（点击作者查看
 /// 其发布的歌曲）。ID 类文本用 SelectableText 方便直接长按复制。
@@ -5292,6 +5175,7 @@ class _SongInfoSheet extends StatefulWidget {
     required this.platform,
     this.onOpenArtist,
     this.resolveAvatar,
+    this.initialAvatars = const {},
   });
 
   final QueueItem item;
@@ -5305,17 +5189,23 @@ class _SongInfoSheet extends StatefulWidget {
   /// 按歌手名补查头像；null 时不查询，直接使用平台数据或占位。
   final Future<String> Function(String artistName)? resolveAvatar;
 
+  /// 播放页预加载好的头像（歌手名 → URL）：面板首帧直接可用，无需等
+  /// 补查接口返回，也不会先显示人形占位再淡入。
+  final Map<String, String> initialAvatars;
+
   @override
   State<_SongInfoSheet> createState() => _SongInfoSheetState();
 }
 
 class _SongInfoSheetState extends State<_SongInfoSheet> {
   /// 补查到的头像（歌手名 → URL）；空串表示查询无结果，仍回退占位。
+  /// 初始值来自播放页预加载结果，其余缺项仍走面板内补查兜底。
   final Map<String, String> _resolvedAvatars = {};
 
   @override
   void initState() {
     super.initState();
+    _resolvedAvatars.addAll(widget.initialAvatars);
     unawaited(_loadMissingAvatars());
   }
 
@@ -5325,13 +5215,10 @@ class _SongInfoSheetState extends State<_SongInfoSheet> {
   Future<void> _loadMissingAvatars() async {
     final resolve = widget.resolveAvatar;
     if (resolve == null) return;
-    final avatars = await resolveMissingArtistAvatars(
-      [
-        for (final artist in _songArtistsOf(widget.item))
-          (name: artist.name, avatar: artist.avatar),
-      ],
-      resolve,
-    );
+    final avatars = await resolveMissingArtistAvatars([
+      for (final artist in songArtistsOf(widget.item))
+        (name: artist.name, avatar: artist.avatar),
+    ], resolve);
     if (!mounted || avatars.isEmpty) return;
     setState(() => _resolvedAvatars.addAll(avatars));
   }
@@ -5396,10 +5283,7 @@ class _SongInfoSheetState extends State<_SongInfoSheet> {
       radius: 19,
       icon: Icons.person_rounded,
       placeholder: placeholder,
-      gradient: [
-        scheme.primary.withValues(alpha: .7),
-        scheme.primary,
-      ],
+      gradient: [scheme.primary.withValues(alpha: .7), scheme.primary],
     );
   }
 
@@ -5407,26 +5291,26 @@ class _SongInfoSheetState extends State<_SongInfoSheet> {
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
     final data = widget.item.pluginData;
-    final artists = _songArtistsOf(widget.item);
-    final rawTitle = _firstTextOf(data ?? const {}, const [
+    final artists = songArtistsOf(widget.item);
+    final rawTitle = firstTextOf(data ?? const {}, const [
       'title',
       'name',
       'songname',
       'songName',
     ]);
     final songName = rawTitle.isNotEmpty ? rawTitle : widget.item.title;
-    final songId = _firstTextOf(data ?? const {}, const [
+    final songId = firstTextOf(data ?? const {}, const [
       'id',
       'songId',
       'songid',
       'musicId',
     ]);
-    final songMid = _firstTextOf(data ?? const {}, const [
+    final songMid = firstTextOf(data ?? const {}, const [
       'mid',
       'songmid',
       'songMid',
     ]);
-    final rawAlbum = _firstTextOf(data ?? const {}, const [
+    final rawAlbum = firstTextOf(data ?? const {}, const [
       'album',
       'albumname',
       'albumName',
@@ -6600,7 +6484,7 @@ class _PluginLyricsTabs extends StatelessWidget {
             ),
           ),
           Expanded(
-            child: TabBarView(
+            child: XyTabBarView(
               children: [
                 for (final id in pluginIds)
                   _pluginLyricsList(context, grouped[id]!),
@@ -6784,11 +6668,7 @@ class PlayerDetailBackground extends ConsumerWidget {
             ? _ambientBackdrop(current)
             // 轻量模式下去掉壁纸模糊（转场期每帧重栅格化太贵），
             // 图片本体保留，落定后再叠回模糊。
-            : _wallpaperBackdrop(
-                wallpaperPath,
-                wallpaperBlur,
-                blurred: !lite,
-              ),
+            : _wallpaperBackdrop(wallpaperPath, wallpaperBlur, blurred: !lite),
       PlayerDetailBackgroundMode.flowingLight => _ambientBackdrop(current),
       PlayerDetailBackgroundMode.customImage =>
         detailImagePath.isEmpty
@@ -6921,8 +6801,7 @@ class _AmbientBackground extends ConsumerStatefulWidget {
   final bool lite;
 
   @override
-  ConsumerState<_AmbientBackground> createState() =>
-      _AmbientBackgroundState();
+  ConsumerState<_AmbientBackground> createState() => _AmbientBackgroundState();
 }
 
 class _AmbientBackgroundState extends ConsumerState<_AmbientBackground> {
@@ -7087,10 +6966,7 @@ class _AmbientBackgroundState extends ConsumerState<_AmbientBackground> {
         Positioned.fill(
           child: RepaintBoundary(
             child: CustomPaint(
-              painter: _AmbientBackgroundPainter(
-                _kAmbientPhase,
-                _to,
-              ),
+              painter: _AmbientBackgroundPainter(_kAmbientPhase, _to),
               child: const SizedBox.expand(),
             ),
           ),
@@ -7802,6 +7678,8 @@ class _BigCover extends ConsumerWidget {
                   clipBehavior: Clip.none,
                   children: [
                     // 方形封面下缘的“桌面反光”，仅经典样式使用。
+                    // 属于封面样式的装饰，随 [_CoverStyleReveal] 只在转场
+                    // 落定前才显现，动画过程中不提前出现。
                     if (showCoverExtras && style == PlayerCoverStyle.classic)
                       Positioned(
                         top: side - 2,
@@ -7809,13 +7687,18 @@ class _BigCover extends ConsumerWidget {
                         right: 7,
                         height: 58,
                         child: IgnorePointer(
-                          child: DecoratedBox(
-                            decoration: BoxDecoration(
-                              borderRadius: BorderRadius.circular(22),
-                              gradient: const LinearGradient(
-                                begin: Alignment.topCenter,
-                                end: Alignment.bottomCenter,
-                                colors: [Color(0x24FFFFFF), Colors.transparent],
+                          child: _CoverStyleReveal(
+                            child: DecoratedBox(
+                              decoration: BoxDecoration(
+                                borderRadius: BorderRadius.circular(22),
+                                gradient: const LinearGradient(
+                                  begin: Alignment.topCenter,
+                                  end: Alignment.bottomCenter,
+                                  colors: [
+                                    Color(0x24FFFFFF),
+                                    Colors.transparent,
+                                  ],
+                                ),
                               ),
                             ),
                           ),
@@ -7829,33 +7712,42 @@ class _BigCover extends ConsumerWidget {
                       // 背景层。RepaintBoundary 不裁剪，唱臂/阴影/高光
                       // 伸出封面边界的绘制不受影响。
                       child: RepaintBoundary(
-                        child: coverHidden
-                          // 预览层：封面区域留空，仅保留同尺寸透明占位
-                          //（放大层持续提供封面视觉，占位用于锚定目标矩形）。
-                          ? SizedBox(
-                              key: coverAnchorKey,
-                              width: side,
-                              height: side,
-                            )
-                          : switch (style) {
-                              // 圆形旋转封面（参考 MusicFree）：25 秒一圈，
-                              // 播放时匀速旋转、暂停时停住，切歌（key 变化）归零。
-                              PlayerCoverStyle.circle => _buildCircle(
-                                playing,
-                                side,
-                              ),
-                              // 黑胶唱片（参考 BakaMusic）：盘面 24 秒一圈。
-                              PlayerCoverStyle.vinyl => VinylCover(
-                                item: item,
-                                playing: playing,
-                                size: side,
-                                showTonearm: showTonearm,
-                                onTap: onTap,
-                                onLongPress: onLongPress,
-                              ),
-                              _ => _buildClassic(side),
-                            },
-                          ),
+                        // 封面样式层：转场期间隐藏，随飞行封面淡出、封面落到
+                        // 详情页既定位置后才渐显（见 [_CoverStyleReveal]）。
+                        // 封面本体作为 child 缓存传入，交接窗口每帧只变不透明
+                        // 度，不重建带旋转 Ticker 的封面。
+                        child: _CoverStyleReveal(
+                          child: coverHidden
+                              // 预览层：封面区域留空，仅保留同尺寸透明占位
+                              //（放大层持续提供封面视觉，占位用于锚定目标矩形）。
+                              ? SizedBox(
+                                  key: coverAnchorKey,
+                                  width: side,
+                                  height: side,
+                                )
+                              : switch (style) {
+                                  // 圆形旋转封面（参考 MusicFree）：25 秒一圈，
+                                  // 播放时匀速旋转、暂停时停住，切歌（key 变化）归零。
+                                  PlayerCoverStyle.circle => _buildCircle(
+                                    playing,
+                                    side,
+                                  ),
+                                  // 黑胶唱片（参考 BakaMusic）：盘面 24 秒一圈。
+                                  // phaseSink：把盘面实时相位回写给形变转场层，
+                                  // 收起时飞行层按同一角度接续（不跳角度）。
+                                  PlayerCoverStyle.vinyl => VinylCover(
+                                    item: item,
+                                    playing: playing,
+                                    size: side,
+                                    showTonearm: showTonearm,
+                                    onTap: onTap,
+                                    onLongPress: onLongPress,
+                                    phaseSink: xyCoverSpinPhase,
+                                  ),
+                                  _ => _buildClassic(side),
+                                },
+                        ),
+                      ),
                     ),
                     if (item != null && showCoverExtras)
                       Positioned(
@@ -7965,9 +7857,11 @@ class _BigCover extends ConsumerWidget {
             ),
           ],
         ),
-        child: _SpinningCover(
+        child: SpinningCover(
           playing: playing,
           period: const Duration(seconds: 25),
+          // 相位回写给形变转场层：收起时飞行层的圆图按同一角度接着转。
+          phaseSink: xyCoverSpinPhase,
           child: Material(
             color: Colors.transparent,
             shape: const CircleBorder(),
@@ -8041,36 +7935,53 @@ class _LandscapeCoverFavorite extends ConsumerWidget {
 
 /// 匀速旋转容器：播放时转、暂停时停在当前角度；换歌时由父级的
 /// ValueKey 触发重建，角度自然归零。手势命中区域不受旋转影响。
-class _SpinningCover extends StatefulWidget {
-  const _SpinningCover({
+///
+/// 转场复用：形变转场层的封面飞行层也用它绘制旋转（圆形样式）。飞行层
+/// 是新的 State，若一律从 0 度起转，收起转场时详情页封面已经转了任意
+/// 角度，封面会在动画开始的一帧「跳角度」。为此提供 [initialPhase]
+/// （挂载时接续相位）与 [phaseSink]（详情页封面把实时相位回写
+/// `xyCoverSpinPhase`，飞行层据此接续）。
+class SpinningCover extends StatefulWidget {
+  const SpinningCover({
+    super.key,
     required this.child,
     required this.playing,
     this.period = const Duration(seconds: 25),
+    this.initialPhase = 0,
+    this.phaseSink,
   });
 
   final Widget child;
   final bool playing;
   final Duration period;
 
+  /// 起转相位（0~1 为一圈）。
+  final double initialPhase;
+
+  /// 相位回写目标，详见类文档。
+  final ValueNotifier<double>? phaseSink;
+
   @override
-  State<_SpinningCover> createState() => _SpinningCoverState();
+  State<SpinningCover> createState() => SpinningCoverState();
 }
 
-class _SpinningCoverState extends State<_SpinningCover>
+class SpinningCoverState extends State<SpinningCover>
     with SingleTickerProviderStateMixin {
   late final AnimationController _controller = AnimationController(
     vsync: this,
     duration: widget.period,
+    value: widget.initialPhase % 1.0,
   );
 
   @override
   void initState() {
     super.initState();
+    _controller.addListener(_writePhase);
     if (widget.playing) _controller.repeat();
   }
 
   @override
-  void didUpdateWidget(_SpinningCover oldWidget) {
+  void didUpdateWidget(SpinningCover oldWidget) {
     super.didUpdateWidget(oldWidget);
     if (widget.playing == oldWidget.playing) return;
     if (widget.playing) {
@@ -8081,8 +7992,19 @@ class _SpinningCoverState extends State<_SpinningCover>
     }
   }
 
+  /// 把相位写回 [SpinningCover.phaseSink]（值未变不通知）。Ticker 阶段
+  /// 写入，不会在 build 中触发 markNeedsBuild。
+  void _writePhase() {
+    final sink = widget.phaseSink;
+    if (sink == null) return;
+    final phase = _controller.value % 1.0;
+    if (sink.value == phase) return;
+    sink.value = phase;
+  }
+
   @override
   void dispose() {
+    _controller.removeListener(_writePhase);
     _controller.dispose();
     super.dispose();
   }
@@ -8187,6 +8109,30 @@ class _ImmersiveCoverPage extends StatelessWidget {
   }
 }
 
+/// 详情页封面样式层的显现开关。
+///
+/// 播放栏 → 详情页的形变转场期间，封面视觉由转场层的封面飞行层提供
+/// （圆角方图，形态与详情页更多菜单的封面卡一致）；本页的封面样式
+/// （黑胶盘、圆图、直角沉浸式、24 圆角方图，以及唱臂/反光等样式装饰）
+/// 只在封面飞到详情页既定位置、动画落定前的一段才渐显，落定即完全显现。
+/// 显现度来源是 [xyPlayerPageCoverReveal]：无转场时恒为 1，直接透传子节点
+/// （不额外付一层 Opacity 合成开销）。
+class _CoverStyleReveal extends StatelessWidget {
+  const _CoverStyleReveal({required this.child});
+
+  final Widget child;
+
+  @override
+  Widget build(BuildContext context) {
+    return ValueListenableBuilder<double>(
+      valueListenable: xyPlayerPageCoverReveal,
+      child: child,
+      builder: (context, reveal, child) =>
+          reveal >= 1 ? child! : Opacity(opacity: reveal, child: child),
+    );
+  }
+}
+
 /// 沉浸式封面的全幅顶层：铺满屏宽、顶到屏幕顶端（覆盖状态栏下方
 /// 的标题行背后），同样应用 62% 清晰 + 底部渐隐，顶部叠加轻微暗色
 /// 渐变保证白色标题文字可读。
@@ -8215,38 +8161,42 @@ class _ImmersiveTopCover extends StatelessWidget {
       height: side,
       child: coverHidden
           ? const SizedBox.shrink()
-          : ShaderMask(
-              blendMode: BlendMode.dstIn,
-              shaderCallback: (bounds) => const LinearGradient(
-                begin: Alignment.topCenter,
-                end: Alignment.bottomCenter,
-                colors: [Colors.white, Colors.white, Colors.transparent],
-                stops: [0, .62, 1],
-              ).createShader(bounds),
-              child: Stack(
-                fit: StackFit.expand,
-                children: [
-                  CoverImage(
-                    songPath: item.path,
-                    imageUrl: resolveOnlineCoverUrl(item.coverUrl, item.path),
-                    width: side,
-                    height: side,
-                    radius: 0,
-                    highQuality: true,
-                    icon: Icons.music_note_rounded,
-                  ),
-                  // 顶部可读性渐变（标题文字浮在封面上）。
-                  const DecoratedBox(
-                    decoration: BoxDecoration(
-                      gradient: LinearGradient(
-                        begin: Alignment.topCenter,
-                        end: Alignment.bottomCenter,
-                        colors: [Color(0x59000000), Colors.transparent],
-                        stops: [0, .28],
+          // 沉浸式封面同样是“封面样式”，转场期间由飞行层持有封面视觉，
+          // 落定前才渐显，避免动画过程中详情页顶部已经铺上封面图。
+          : _CoverStyleReveal(
+              child: ShaderMask(
+                blendMode: BlendMode.dstIn,
+                shaderCallback: (bounds) => const LinearGradient(
+                  begin: Alignment.topCenter,
+                  end: Alignment.bottomCenter,
+                  colors: [Colors.white, Colors.white, Colors.transparent],
+                  stops: [0, .62, 1],
+                ).createShader(bounds),
+                child: Stack(
+                  fit: StackFit.expand,
+                  children: [
+                    CoverImage(
+                      songPath: item.path,
+                      imageUrl: resolveOnlineCoverUrl(item.coverUrl, item.path),
+                      width: side,
+                      height: side,
+                      radius: 0,
+                      highQuality: true,
+                      icon: Icons.music_note_rounded,
+                    ),
+                    // 顶部可读性渐变（标题文字浮在封面上）。
+                    const DecoratedBox(
+                      decoration: BoxDecoration(
+                        gradient: LinearGradient(
+                          begin: Alignment.topCenter,
+                          end: Alignment.bottomCenter,
+                          colors: [Color(0x59000000), Colors.transparent],
+                          stops: [0, .28],
+                        ),
                       ),
                     ),
-                  ),
-                ],
+                  ],
+                ),
               ),
             ),
     );
@@ -8265,6 +8215,8 @@ class VinylCover extends StatelessWidget {
     this.showTonearm = true,
     this.onTap,
     this.onLongPress,
+    this.initialPhase = 0,
+    this.phaseSink,
   });
 
   final QueueItem? item;
@@ -8273,6 +8225,13 @@ class VinylCover extends StatelessWidget {
   final bool showTonearm;
   final VoidCallback? onTap;
   final VoidCallback? onLongPress;
+
+  /// 盘面起转相位（0~1 为一圈）：形变转场层复用本组件时接续详情页
+  /// 封面当前角度，收起瞬间盘面不跳角度。语义见 [SpinningCover]。
+  final double initialPhase;
+
+  /// 盘面相位回写目标，语义见 [SpinningCover]。
+  final ValueNotifier<double>? phaseSink;
 
   @override
   Widget build(BuildContext context) {
@@ -8298,63 +8257,67 @@ class VinylCover extends StatelessWidget {
             height: side,
             child: Stack(
               clipBehavior: Clip.none,
-          children: [
-            // 投影固定在屏幕空间：真实黑胶的投影由固定光源决定，始终朝
-            // 下方，不随盘面旋转。此前阴影包在旋转子树内，模糊黑影随
-            // 盘 24 秒一圈游走（Skia 模糊层的 saveLayer 边界是方形），
-            // 表现为唱片外围一块边界可见的方形浅黑模糊。
-            // 【独立边界】44px 高斯模糊是整棵封面子树最贵的单次栅格化，
-            // 必须有专属 RepaintBoundary：否则旋转层每帧重绘会冒泡到
-            // 外层边界（7818），把这份静态投影也拖着重栅格化（华为/vivo
-            // 实测黑胶播放期间持续掉帧的主因，多机型复现）。
-            RepaintBoundary(
-              child: DecoratedBox(
-                decoration: const BoxDecoration(
-                  shape: BoxShape.circle,
-                  boxShadow: [
-                    BoxShadow(
-                      color: Color(0xB2000000),
-                      blurRadius: 44,
-                      spreadRadius: -10,
-                      offset: Offset(0, 22),
+              children: [
+                // 投影固定在屏幕空间：真实黑胶的投影由固定光源决定，始终朝
+                // 下方，不随盘面旋转。此前阴影包在旋转子树内，模糊黑影随
+                // 盘 24 秒一圈游走（Skia 模糊层的 saveLayer 边界是方形），
+                // 表现为唱片外围一块边界可见的方形浅黑模糊。
+                // 【独立边界】44px 高斯模糊是整棵封面子树最贵的单次栅格化，
+                // 必须有专属 RepaintBoundary：否则旋转层每帧重绘会冒泡到
+                // 外层边界（7818），把这份静态投影也拖着重栅格化（华为/vivo
+                // 实测黑胶播放期间持续掉帧的主因，多机型复现）。
+                RepaintBoundary(
+                  child: DecoratedBox(
+                    decoration: const BoxDecoration(
+                      shape: BoxShape.circle,
+                      boxShadow: [
+                        BoxShadow(
+                          color: Color(0xB2000000),
+                          blurRadius: 44,
+                          spreadRadius: -10,
+                          offset: Offset(0, 22),
+                        ),
+                      ],
                     ),
-                  ],
-                ),
-                // 唱片本体：播放时 24 秒匀速转一圈，暂停时停住。
-                child: _SpinningCover(
-                  playing: playing,
-                  period: const Duration(seconds: 24),
-                  child: CustomPaint(
-                    size: Size.square(side),
-                    painter: _VinylDiscPainter(),
-                    child: Center(
-                      child: _VinylLabel(item: item, size: side),
+                    // 唱片本体：播放时 24 秒匀速转一圈，暂停时停住。
+                    child: SpinningCover(
+                      playing: playing,
+                      period: const Duration(seconds: 24),
+                      initialPhase: initialPhase,
+                      phaseSink: phaseSink,
+                      child: CustomPaint(
+                        size: Size.square(side),
+                        painter: _VinylDiscPainter(),
+                        child: Center(
+                          child: _VinylLabel(item: item, size: side),
+                        ),
+                      ),
                     ),
                   ),
                 ),
-              ),
-            ),
-            // 扇形高光固定在屏幕空间（光源不随唱片旋转），叠加在盘面之上。
-            Positioned.fill(
-              child: IgnorePointer(
-                // 静态绘制层同样给独立边界，旋转重绘不再拖累它。
-                child: RepaintBoundary(
-                  child: CustomPaint(painter: _VinylSheenPainter()),
+                // 扇形高光固定在屏幕空间（光源不随唱片旋转），叠加在盘面之上。
+                Positioned.fill(
+                  child: IgnorePointer(
+                    // 静态绘制层同样给独立边界，旋转重绘不再拖累它。
+                    child: RepaintBoundary(
+                      child: CustomPaint(painter: _VinylSheenPainter()),
+                    ),
+                  ),
                 ),
-              ),
-            ),
-            // 唱针（复刻 BakaMusic 经典款）：播放 -12 度搭在盘缘内侧，
-            // 暂停 -20 度悬在盘缘外，720ms 回弹过渡；不拦截点击。
-            if (showTonearm)
-              Positioned.fill(
-                child: IgnorePointer(
-                  child: RepaintBoundary(child: VinylTonearm(playing: playing)),
+                // 唱针（复刻 BakaMusic 经典款）：播放 -12 度搭在盘缘内侧，
+                // 暂停 -20 度悬在盘缘外，720ms 回弹过渡；不拦截点击。
+                if (showTonearm)
+                  Positioned.fill(
+                    child: IgnorePointer(
+                      child: RepaintBoundary(
+                        child: VinylTonearm(playing: playing),
+                      ),
+                    ),
+                  ),
+                // 手势层盖在最上，避免旋转层干扰点击。
+                Positioned.fill(
+                  child: InkWell(onTap: onTap, onLongPress: onLongPress),
                 ),
-              ),
-            // 手势层盖在最上，避免旋转层干扰点击。
-            Positioned.fill(
-              child: InkWell(onTap: onTap, onLongPress: onLongPress),
-            ),
               ],
             ),
           );
@@ -9397,7 +9360,7 @@ class _TimedLyricText extends ConsumerStatefulWidget {
 }
 
 class _TimedLyricTextState extends ConsumerState<_TimedLyricText>
-    with SingleTickerProviderStateMixin {
+    with TickerProviderStateMixin {
   /// 活动行共享的播放进度（已应用歌词偏移）。逐字淡入模式下 position
   /// 每个 tick 只写入这个 ValueNotifier，由各词的 [_ProgressiveLyricWordState]
   /// 做局部更新（阶段切换/淡入中 setState），本行 TextSpan 树与
@@ -9409,6 +9372,18 @@ class _TimedLyricTextState extends ConsumerState<_TimedLyricText>
   /// 60fps 在两个采样点间本地推算进度（基于播放中时钟匀速前进，每次
   /// position 广播校准基准），淡入过渡平滑且只在活动行生效。
   late final Ticker _ticker = createTicker(_onTick);
+
+  /// 行尾收束渐变（0 = 已播色，1 = 未播色）。
+  ///
+  /// 行切走时旧逻辑是「扫到行尾的整行亮字一帧内硬切成未播色」——亮字在
+  /// 一帧里整体掉到 55% 透明度，观感就是逐字渲染到末尾抽搐一下（视频里
+  /// 亮像素 33ms 内从 5856 直接归零）。这里把这一帧的突变改成 300ms 的
+  /// 颜色渐变，结尾和扫光一样平滑收掉；停在同一颜色上不做任何额外重绘。
+  late final AnimationController _dimFade = AnimationController(
+    vsync: this,
+    duration: const Duration(milliseconds: 300),
+    value: 1,
+  );
   double _basePositionMs = 0;
   Duration _baseClock = Duration.zero;
   Duration _lastElapsed = Duration.zero;
@@ -9423,6 +9398,7 @@ class _TimedLyricTextState extends ConsumerState<_TimedLyricText>
     // words 仅 4、listeners 仅 4，全是「销毁时仍 started」的残留）。同时
     // 先 stop 再 dispose 也避免 Ticker 在 active 状态下被释放。
     _stopTicker();
+    _dimFade.dispose();
     _positionNotifier.dispose();
     _ticker.dispose();
     super.dispose();
@@ -9431,6 +9407,16 @@ class _TimedLyricTextState extends ConsumerState<_TimedLyricText>
   @override
   void didUpdateWidget(_TimedLyricText oldWidget) {
     super.didUpdateWidget(oldWidget);
+    // 行尾收束：活动行切走时不再一帧硬切到未播色，改为颜色渐变收尾。
+    // 元素被复用给另一行（换行/切歌/seek 跨行）时不渐变——那行的颜色
+    // 与上一行的已播色无关，直接按新行状态渲染。
+    if (oldWidget.line != widget.line) {
+      _dimFade.value = 1;
+    } else if (oldWidget.selected && !widget.selected) {
+      _dimFade.forward(from: 0);
+    } else if (!oldWidget.selected && widget.selected) {
+      _dimFade.value = 1;
+    }
     // 页面可见性恢复（封面页↔歌词页切换回来）：隐藏期间 Ticker 已停、
     // 帧时钟不再推进，恢复时基准归零让推算从隐藏前进度继续（与暂停
     // 恢复同语义），position 采样照常平滑校准，无闪跳。
@@ -9487,7 +9473,6 @@ class _TimedLyricTextState extends ConsumerState<_TimedLyricText>
     if (!_ticker.isActive) _ticker.start();
     if (!_tickerStarted) {
       _tickerStarted = true;
-      if (kPerformanceProbeEnabled) PerformanceProbe.instance.onTickerStart();
     }
   }
 
@@ -9497,7 +9482,6 @@ class _TimedLyricTextState extends ConsumerState<_TimedLyricText>
     if (_ticker.isActive) _ticker.stop();
     if (!_tickerStarted) return;
     _tickerStarted = false;
-    if (kPerformanceProbeEnabled) PerformanceProbe.instance.onTickerStop();
   }
 
   /// 整行扫光结束时刻（最后一个词扫光右缘，秒，与 position 同坐标系）。
@@ -9523,7 +9507,6 @@ class _TimedLyricTextState extends ConsumerState<_TimedLyricText>
   /// 混写导致播放时词进度计算全错——暂停时 Ticker 停写只剩校准值，
   /// 反而正常，即「播放看不出逐字、暂停能看到」的根因）。
   void _onTick(Duration elapsed) {
-    if (kPerformanceProbeEnabled) PerformanceProbe.instance.onTickerTick();
     _lastElapsed = elapsed;
     if (!widget.selected ||
         (widget.effectMode != LyricWordEffectMode.progressive &&
@@ -9609,6 +9592,28 @@ class _TimedLyricTextState extends ConsumerState<_TimedLyricText>
       // 恢复活动行时 didUpdateWidget 重置基准 + build 活动分支
       // _ensureTicker() 重启，推算连续无跳变。仅本 hunk，可独立回退。
       _stopTicker();
+      // 行尾收束渐变：只有「刚从活动行切走」的这一小段才做颜色过渡，其余
+      // 非活动行（滚入视口、页面不可见）直接走静态文本。渐变期间每帧只
+      // 重建这一个 Text（18 帧左右），不改布局、不涉及词级 Painter。
+      if (_dimFade.isAnimating) {
+        return AnimatedBuilder(
+          animation: _dimFade,
+          builder: (context, _) {
+            final color = Color.lerp(
+              widget.playedColor,
+              widget.unplayedColor,
+              Curves.easeOutCubic.transform(_dimFade.value),
+            );
+            return Text(
+              line.text,
+              textAlign: textAlign,
+              style: color == null
+                  ? lineStyle
+                  : lineStyle.copyWith(color: color),
+            );
+          },
+        );
+      }
       return Text(line.text, textAlign: textAlign, style: lineStyle);
     }
 
@@ -9660,7 +9665,10 @@ class _TimedLyricTextState extends ConsumerState<_TimedLyricText>
       // 持续占帧预算（久播/低端机尤其明显）。恢复播放时 Ticker 重启、
       // 基准时钟归零（elapsed 重新从 0 起算），推算从暂停点继续，由
       // position 采样照常平滑校准。
-      ref.listen(playerProvider.select((state) => state.isPlaying), (_, playing) {
+      ref.listen(playerProvider.select((state) => state.isPlaying), (
+        _,
+        playing,
+      ) {
         if (playing) {
           _baseClock = Duration.zero;
           _ensureTicker();
@@ -9906,10 +9914,6 @@ class _ProgressiveLyricWordState extends State<_ProgressiveLyricWord> {
     super.initState();
     _stage = _stageFor(widget.position.value);
     widget.position.addListener(_onPositionChanged);
-    if (kPerformanceProbeEnabled) {
-      PerformanceProbe.instance.onPositionListenerAdded();
-      PerformanceProbe.instance.onWordStateCreated();
-    }
   }
 
   @override
@@ -9970,7 +9974,6 @@ class _ProgressiveLyricWordState extends State<_ProgressiveLyricWord> {
   }
 
   void _onPositionChanged() {
-    if (kPerformanceProbeEnabled) PerformanceProbe.instance.onPositionChanged();
     if (!mounted) return;
     // 只做阶段切换（低频）；填充中的词进度推进由扫光 Painter 的
     // repaint: position 直接驱动 markNeedsPaint，不再每帧 setState
@@ -9981,10 +9984,6 @@ class _ProgressiveLyricWordState extends State<_ProgressiveLyricWord> {
   @override
   void dispose() {
     widget.position.removeListener(_onPositionChanged);
-    if (kPerformanceProbeEnabled) {
-      PerformanceProbe.instance.onPositionListenerRemoved();
-      PerformanceProbe.instance.onWordStateDisposed();
-    }
     _invalidateSweepPainters();
     super.dispose();
   }
@@ -10001,10 +10000,7 @@ class _ProgressiveLyricWordState extends State<_ProgressiveLyricWord> {
       // 已唱：上浮已随扫光进度推进到最大并稳定，直接绘制期位移。
       return Transform.translate(
         offset: Offset(0, -_liftOffset),
-        child: Text(
-          widget.text,
-          style: _playedStyle(resolved),
-        ),
+        child: Text(widget.text, style: _playedStyle(resolved)),
       );
     }
     // 扫光填充（两种效果模式共用，参数不同）：暗底、亮区与过渡带全部
@@ -10041,7 +10037,6 @@ class _SweepWordPainter extends CustomPainter {
 
   @override
   void paint(Canvas canvas, Size size) {
-    if (kPerformanceProbeEnabled) PerformanceProbe.instance.onPaintStart();
     state._ensureSweepPainters();
     final w = state.widget;
     final pos = w.position.value;
@@ -10100,7 +10095,6 @@ class _SweepWordPainter extends CustomPainter {
       canvas.restore();
     }
     canvas.restore();
-    if (kPerformanceProbeEnabled) PerformanceProbe.instance.onPaintEnd();
   }
 
   @override
@@ -10589,16 +10583,10 @@ class _ProgressBarState extends ConsumerState<_ProgressBar>
     if (!active) {
       if (!_progressTickerCounted) return;
       _progressTickerCounted = false;
-      if (kPerformanceProbeEnabled) {
-        PerformanceProbe.instance.onProgressTickerStop();
-      }
       return;
     }
     if (_progressTickerCounted) return;
     _progressTickerCounted = true;
-    if (kPerformanceProbeEnabled) {
-      PerformanceProbe.instance.onProgressTickerStart();
-    }
   }
 
   void _onTick(Duration _) {

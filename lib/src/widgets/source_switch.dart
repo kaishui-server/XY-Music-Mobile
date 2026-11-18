@@ -10,6 +10,7 @@ import '../plugins/lx_playlist_import.dart' show lxSourceLabel;
 import '../plugins/plugin_runtime.dart';
 import '../favorites/favorites_provider.dart';
 import '../playlists/playlists_provider.dart';
+import '../navigation/paged_transition.dart';
 
 /// 换源：把歌曲切换到其他已启用插件的同名音源。
 ///
@@ -672,7 +673,7 @@ class _SourceSwitchSheetState extends ConsumerState<_SourceSwitchSheet> {
                   ),
                 ),
                 Expanded(
-                  child: TabBarView(
+                  child: XyTabBarView(
                     children: [
                       for (final plugin in _plugins) _pluginList(context, plugin),
                     ],

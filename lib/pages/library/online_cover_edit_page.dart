@@ -9,6 +9,7 @@ import '../../src/core/db_path.dart';
 import '../../src/library/online_cover_overrides.dart';
 import '../../src/widgets/cover_search_sheet.dart';
 import '../../src/widgets/top_notice.dart';
+import '../../src/navigation/animated_page_route.dart';
 
 /// 保存封面到系统相册的原生桥（与播放页分享图共用同一通道）。
 const _galleryChannel = MethodChannel('com.xymusic.mobile/gallery');
@@ -38,7 +39,7 @@ class OnlineCoverEditPage extends StatefulWidget {
     required String? coverUrl,
   }) {
     return Navigator.of(context, rootNavigator: true).push(
-      MaterialPageRoute<void>(
+      XyAnimatedPageRoute<void>(
         builder: (_) => OnlineCoverEditPage(
           songPath: songPath,
           title: title,

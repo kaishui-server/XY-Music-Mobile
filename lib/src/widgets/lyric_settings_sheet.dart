@@ -133,8 +133,77 @@ class _LyricSettingsSheetState extends ConsumerState<LyricSettingsSheet> {
                 ),
               ),
               const SizedBox(height: 14),
+              _sliderRow(
+                context,
+                icon: Icons.format_size_rounded,
+                title: '歌词字号',
+                value: fontSize,
+                min: 12,
+                max: 32,
+                divisions: 20,
+                onChanged: (value) => notifier.setLyricFontSize(value),
+              ),
+              _sliderRow(
+                context,
+                icon: Icons.subtitles_outlined,
+                title: '迷你歌词字号',
+                value: settings.miniLyricFontSize,
+                min: 10,
+                max: 24,
+                divisions: 14,
+                onChanged: (value) => notifier.setMiniLyricFontSize(value),
+              ),
+              const SizedBox(height: 8),
+              _alignmentRow(context, settings.lyricDisplayAlignment),
+              const SizedBox(height: 6),
+              SwitchListTile(
+                contentPadding: EdgeInsets.zero,
+                secondary: Icon(Icons.translate_rounded, color: scheme.primary),
+                title: const Text('显示翻译'),
+                value: settings.showLyricsTranslation,
+                onChanged: (value) => notifier.setShowLyricsTranslation(value),
+              ),
+              SwitchListTile(
+                contentPadding: EdgeInsets.zero,
+                secondary: Icon(
+                  Icons.abc_rounded,
+                  color: scheme.primary,
+                ),
+                title: const Text('显示罗马音'),
+                value: settings.showLyricsRomaji,
+                onChanged: (value) => notifier.setShowLyricsRomaji(value),
+              ),
+              const SizedBox(height: 6),
+              _segmentRow(
+                title: '逐字动效',
+                labels: const {0: '逐词', 1: '渐进', 2: '关闭'},
+                selected: settings.lyricWordEffectMode.index,
+                onSelectionChanged: (selection) => notifier
+                    .setLyricWordEffectMode(
+                      LyricWordEffectMode.values[selection.first],
+                    ),
+              ),
+              const SizedBox(height: 10),
+              SwitchListTile(
+                contentPadding: EdgeInsets.zero,
+                secondary: Icon(
+                  Icons.auto_awesome_rounded,
+                  color: scheme.primary,
+                ),
+                title: const Text('歌词光效'),
+                subtitle: const Text('逐字歌词按逐字进度发光；无逐字时间戳时激活行整行发光'),
+                value: settings.lyricGlowEnabled,
+                onChanged: (value) => notifier.setLyricGlowEnabled(value),
+              ),
+              const SizedBox(height: 8),
               Row(
                 children: [
+                  Icon(
+                    Icons.palette_outlined,
+                    color: scheme.primary,
+                    size: 20,
+                  ),
+                  const SizedBox(width: 12),
                   const Text(
                     '歌词颜色',
                     style: TextStyle(fontSize: 15, fontWeight: FontWeight.w600),
@@ -172,76 +241,6 @@ class _LyricSettingsSheetState extends ConsumerState<LyricSettingsSheet> {
                     ? notifier.setPlayerLyricUnplayedColor(value)
                     : notifier.setPlayerLyricPlayedColor(value),
               ),
-              const SizedBox(height: 18),
-              _sliderRow(
-                context,
-                icon: Icons.format_size_rounded,
-                title: '歌词字号',
-                value: fontSize,
-                min: 12,
-                max: 32,
-                divisions: 20,
-                onChanged: (value) => notifier.setLyricFontSize(value),
-              ),
-              _sliderRow(
-                context,
-                icon: Icons.subtitles_outlined,
-                title: '迷你歌词字号',
-                value: settings.miniLyricFontSize,
-                min: 10,
-                max: 24,
-                divisions: 14,
-                onChanged: (value) => notifier.setMiniLyricFontSize(value),
-              ),
-              const SizedBox(height: 6),
-              SwitchListTile(
-                contentPadding: EdgeInsets.zero,
-                secondary: Icon(Icons.translate_rounded, color: scheme.primary),
-                title: const Text('显示翻译'),
-                value: settings.showLyricsTranslation,
-                onChanged: (value) => notifier.setShowLyricsTranslation(value),
-              ),
-              SwitchListTile(
-                contentPadding: EdgeInsets.zero,
-                secondary: Icon(
-                  Icons.abc_rounded,
-                  color: scheme.primary,
-                ),
-                title: const Text('显示罗马音'),
-                value: settings.showLyricsRomaji,
-                onChanged: (value) => notifier.setShowLyricsRomaji(value),
-              ),
-              const SizedBox(height: 6),
-              _segmentRow(
-                title: '逐字动效',
-                labels: const {0: '逐词', 1: '渐进', 2: '关闭'},
-                selected: settings.lyricWordEffectMode.index,
-                onSelectionChanged: (selection) => notifier
-                    .setLyricWordEffectMode(
-                      LyricWordEffectMode.values[selection.first],
-                    ),
-              ),
-              const SizedBox(height: 10),
-              SwitchListTile(
-                contentPadding: EdgeInsets.zero,
-                secondary: Icon(
-                  Icons.auto_awesome_rounded,
-                  color: scheme.primary,
-                ),
-                title: const Text('发光效果'),
-                subtitle: const Text('逐字歌词按逐字进度发光；无逐字时间戳时激活行整行发光'),
-                value: settings.lyricGlowEnabled,
-                onChanged: (value) => notifier.setLyricGlowEnabled(value),
-              ),
-              _segmentRow(
-                title: '对齐方式',
-                labels: const {0: '靠左', 1: '居中', 2: '靠右'},
-                selected: settings.lyricDisplayAlignment.index,
-                onSelectionChanged: (selection) => notifier
-                    .setLyricDisplayAlignment(
-                      LyricDisplayAlignment.values[selection.first],
-                    ),
-              ),
               const SizedBox(height: 4),
               Text(
                 '颜色、字号与显示开关实时生效并自动保存',
@@ -252,6 +251,113 @@ class _LyricSettingsSheetState extends ConsumerState<LyricSettingsSheet> {
                 ),
               ),
             ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// 对齐方式：占据整行的三段图标选择条（参考设计稿）。
+  ///
+  /// 与标题行分开布局——标题在上，整行宽度均分给「靠左/居中/靠右」三段；
+  /// 段内只显示图标、不显示文字，选中段填充主题色浅底并把图标提亮，未选段
+  /// 透明底、图标次级；段与段之间用 1px 细线分隔，整条不加圆角外框，与设计
+  /// 稿保持一致。
+  Widget _alignmentRow(
+    BuildContext context,
+    LyricDisplayAlignment selected,
+  ) {
+    final scheme = Theme.of(context).colorScheme;
+    const items = <(LyricDisplayAlignment, IconData, String)>[
+      (LyricDisplayAlignment.left, Icons.format_align_left_rounded, '靠左'),
+      (LyricDisplayAlignment.center, Icons.format_align_center_rounded, '居中'),
+      (LyricDisplayAlignment.right, Icons.format_align_right_rounded, '靠右'),
+    ];
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Row(
+          children: [
+            Icon(
+              Icons.format_align_left_rounded,
+              color: scheme.primary,
+              size: 20,
+            ),
+            const SizedBox(width: 12),
+            const Text('对齐方式', style: TextStyle(fontSize: 15)),
+          ],
+        ),
+        const SizedBox(height: 8),
+        DecoratedBox(
+          decoration: BoxDecoration(
+            border: Border.all(
+              color: scheme.outlineVariant.withValues(alpha: .6),
+            ),
+          ),
+          child: SizedBox(
+            height: 48,
+            child: Row(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                for (var i = 0; i < items.length; i++) ...[
+                  if (i > 0)
+                    VerticalDivider(
+                      width: 1,
+                      thickness: 1,
+                      color: scheme.outlineVariant.withValues(alpha: .6),
+                    ),
+                  Expanded(
+                    child: _alignmentSegment(
+                      context,
+                      icon: items[i].$2,
+                      label: items[i].$3,
+                      selected: selected == items[i].$1,
+                      onTap: () => ref
+                          .read(settingsProvider.notifier)
+                          .setLyricDisplayAlignment(items[i].$1),
+                    ),
+                  ),
+                ],
+              ],
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  /// 对齐方式单段：选中浅色主题底 + 主题前景，未选透明底 + 次级前景。
+  ///
+  /// 段内只保留图标、不显示文字，图标语义（靠左/居中/靠右）通过
+  /// [Semantics] 与 [Tooltip] 提供，保证无障碍朗读与长按提示。
+  Widget _alignmentSegment(
+    BuildContext context, {
+    required IconData icon,
+    required String label,
+    required bool selected,
+    required VoidCallback onTap,
+  }) {
+    final scheme = Theme.of(context).colorScheme;
+    final foreground = selected
+        ? scheme.onSurface
+        : scheme.onSurface.withValues(alpha: .55);
+    return Semantics(
+      button: true,
+      selected: selected,
+      label: label,
+      child: Tooltip(
+        message: label,
+        excludeFromSemantics: true,
+        child: InkWell(
+          onTap: onTap,
+          child: AnimatedContainer(
+            duration: const Duration(milliseconds: 160),
+            curve: Curves.easeOut,
+            color: selected
+                ? scheme.primary.withValues(alpha: .16)
+                : Colors.transparent,
+            alignment: Alignment.center,
+            child: Icon(icon, size: 20, color: foreground),
           ),
         ),
       ),

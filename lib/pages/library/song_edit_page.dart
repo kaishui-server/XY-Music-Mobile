@@ -12,6 +12,7 @@ import '../../src/library/library_provider.dart';
 import '../../src/rust/api.dart';
 import '../../src/widgets/cover_search_sheet.dart';
 import '../../src/widgets/top_notice.dart';
+import '../../src/navigation/animated_page_route.dart';
 
 /// 保存封面到系统相册的原生桥（与播放页分享图共用同一通道）。
 const _galleryChannel = MethodChannel('com.xymusic.mobile/gallery');
@@ -28,7 +29,7 @@ class SongEditPage extends ConsumerStatefulWidget {
 
   static Future<void> open(BuildContext context, String songPath) {
     return Navigator.of(context, rootNavigator: true).push(
-      MaterialPageRoute<void>(
+      XyAnimatedPageRoute<void>(
         builder: (_) => SongEditPage(songPath: songPath),
       ),
     );

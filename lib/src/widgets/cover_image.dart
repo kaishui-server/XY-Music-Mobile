@@ -118,7 +118,18 @@ class _CoverImageState extends ConsumerState<CoverImage> {
   /// 会请求不同宽度，向上取整到固定槽位可以让相邻尺寸复用同一份解码纹理，
   /// 减少 ImageCache 碎片。
   static const List<int> _decodeSlots = <int>[
-    32, 48, 64, 96, 128, 160, 192, 256, 384, 512, 768, 1024,
+    32,
+    48,
+    64,
+    96,
+    128,
+    160,
+    192,
+    256,
+    384,
+    512,
+    768,
+    1024,
   ];
 
   String? _path;
@@ -264,7 +275,8 @@ class _CoverImageState extends ConsumerState<CoverImage> {
     }
 
     try {
-      final resolvedRoot = _cacheRoot ?? await ref.read(appDataDirProvider.future);
+      final resolvedRoot =
+          _cacheRoot ?? await ref.read(appDataDirProvider.future);
       if (resolvedRoot == null || resolvedRoot.isEmpty) return;
       final cacheRoot = resolvedRoot;
       _cacheRoot = cacheRoot;
@@ -523,6 +535,81 @@ Map<String, String>? coverImageNetworkHeaders(String imageUrl) {
   return null;
 }
 
+/// 复现 [CoverImage] 的解码宽度决策（槽位规则），供预加载侧构造与组件
+/// 完全一致的 ImageProvider key。
+///
+/// ImageCache 的 key 是 provider 的相等性，`ResizeImage(cacheWidth: 96)`
+/// 与 `ResizeImage(cacheWidth: 128)` 是两份缓存。预加载若用自己估的尺寸
+/// 解码，组件首次 build 时 key 对不上，等于把同一张图解码两遍，预热完全
+/// 白做——所以这里必须与 `CoverImage._decodeWidth` 保持同一套算法。
+int? coverDecodeWidthFor(
+  double logicalWidth, {
+  int? cacheWidth,
+  bool highQuality = false,
+  required double devicePixelRatio,
+}) {
+  final forced = cacheWidth;
+  if (forced != null) return forced.clamp(1, 2048);
+  if (!logicalWidth.isFinite || logicalWidth <= 0) return null;
+  final raw = (logicalWidth * devicePixelRatio).round();
+  if (raw <= 0) return null;
+  if (highQuality) return raw.clamp(1, 2048);
+  for (final slot in _CoverImageState._decodeSlots) {
+    if (raw <= slot) return slot;
+  }
+  return _CoverImageState._decodeSlots.last;
+}
+
+/// 与 [CoverImage] 内部完全一致的本地文件 provider（预加载与组件共用同
+/// 一个 ImageCache key，预热过的图在组件首帧同步命中，无占位帧）。
+ImageProvider coverFileImageProvider(String path, int? decodeWidth) =>
+    _CoverImageState._fileProvider(File(path), decodeWidth);
+
+/// 预热必须走 Rust 图片代理的封面/头像（网易云 CDN 直连 403）。
+///
+/// 与 [CoverImage] 的 `_loadProxiedImage` 共用同一份跨实例代理字节缓存与
+/// 并发请求表：预热写进去之后，组件首次 build 能在同步路径上直接取到
+/// 字节与同一个 [MemoryImage]（相等性按字节对象身份），既不重复请求也不
+/// 重复解码。返回 null 表示代理没拿到图。
+Future<ImageProvider?> coverPrewarmProxiedImage(
+  String imageUrl, {
+  int? decodeWidth,
+}) async {
+  final url = normalizeCoverImageUrl(imageUrl);
+  if (url.isEmpty) return null;
+  final cached = _CoverImageState._proxyCache[url];
+  if (cached != null) {
+    // 命中即刷新 LRU 位置：_putProxyCache 内部会扣掉旧条目字节再重登记，
+    // 这里不能先手动 remove（会让字节计数重复累加）。
+    _CoverImageState._putProxyCache(url, cached);
+    return ResizeImage.resizeIfNeeded(decodeWidth, null, MemoryImage(cached));
+  }
+  try {
+    final bytes = await _CoverImageState._proxyTasks.putIfAbsent(url, () async {
+      try {
+        final dataUrl = await proxyImage(
+          url: url,
+          referer: 'https://music.163.com/',
+        );
+        final comma = dataUrl.indexOf(',');
+        if (comma <= 0 || !dataUrl.substring(0, comma).contains(';base64')) {
+          return null;
+        }
+        final decoded = base64Decode(dataUrl.substring(comma + 1));
+        if (decoded.isEmpty) return null;
+        _CoverImageState._putProxyCache(url, decoded);
+        return decoded;
+      } finally {
+        _CoverImageState._proxyTasks.remove(url);
+      }
+    });
+    if (bytes == null) return null;
+    return ResizeImage.resizeIfNeeded(decodeWidth, null, MemoryImage(bytes));
+  } catch (_) {
+    return null;
+  }
+}
+
 /// 网易云 CDN 在部分 Android ROM/运营商网络下直连会 403，
 /// 与电脑端一致通过 Rust 图片代理加载。
 bool needsCoverImageProxy(String imageUrl) {
@@ -545,8 +632,7 @@ String normalizeCoverImageUrl(String? imageUrl) {
   final isLocalHost =
       host == 'localhost' || host == '127.0.0.1' || host == '[::1]';
   const keepPlainHttpHosts = ['kwcdn.kuwo.cn'];
-  final keepPlain =
-      keepPlainHttpHosts.any((suffix) => host.endsWith(suffix));
+  final keepPlain = keepPlainHttpHosts.any((suffix) => host.endsWith(suffix));
   if (normalized.startsWith('http://') && !isLocalHost && !keepPlain) {
     normalized = 'https://${normalized.substring(7)}';
   }

@@ -6,6 +6,40 @@ import 'package:flutter/material.dart';
 import 'xy_theme.dart';
 import 'xy_video_wallpaper.dart';
 
+/// 深色主题下整屏列表类页面（设置、账号）的半透明底色。
+///
+/// 主题里 `scaffoldBackgroundColor` 是透明的，页面直接露出应用背景层的
+/// 纯黑底（[XyColors.darkBackground]），整屏看是乌黑一块；设置项卡片以
+/// 「从该行展开成整页」的方式进入下一级时，过程中就是一片黑色，观感很硬。
+/// 铺一层半透明 surface 后，背景层的渐变/自定义壁纸能透出来，展开动画
+/// 过渡到下一级也不会变成纯黑。
+///
+/// 浅色主题返回 null（保持原本的完全透明），不影响壁纸透出。
+Color? xyTranslucentPageColor(BuildContext context) {
+  if (Theme.of(context).brightness != Brightness.dark) return null;
+  return Theme.of(context).colorScheme.surface.withValues(alpha: 0.55);
+}
+
+/// 设置 / 账号页「类目卡片」的底色：仅自定义背景（图片/视频壁纸）时返回
+/// 半透明色让壁纸透上来；默认主题返回 null，调用方回退到不透明 surface。
+///
+/// 用户诉求（2026-11-15）：默认主题下纯色背景与半透明卡底色差极小，卡片
+/// 改回不透明；自定义背景下保留半透明——浅色主题 alpha 压得太低会和页面
+/// 底糊成一片、文字对比度也掉，因此取比深色略高的不透明度（0.72），既能
+/// 透出壁纸又保住卡片的边界与可读性。
+///
+/// 自定义背景判定走 [XyBackgroundScope]（应用根 [XyAppBackground] 注入，
+/// imagePath 非空即存在自定义壁纸）。
+Color? xyTranslucentCardColor(BuildContext context) {
+  final hasCustomBackground =
+      XyBackgroundScope.maybeOf(context)?.path.trim().isNotEmpty ?? false;
+  if (!hasCustomBackground) return null;
+  final dark = Theme.of(context).brightness == Brightness.dark;
+  return Theme.of(
+    context,
+  ).colorScheme.surfaceContainerLow.withValues(alpha: dark ? 0.55 : 0.72);
+}
+
 class XyPageBackground extends StatelessWidget {
   const XyPageBackground({super.key, required this.child});
 

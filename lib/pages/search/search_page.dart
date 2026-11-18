@@ -20,6 +20,7 @@ import '../../src/widgets/mini_player_bar.dart';
 import '../../src/widgets/song_list_view.dart';
 import '../../src/widgets/top_notice.dart';
 import 'online_catalog_detail_page.dart';
+import '../../src/navigation/paged_transition.dart';
 
 bool isCurrentSearchSong(QueueItem? current, Song song) =>
     current?.path == song.path;
@@ -1084,7 +1085,7 @@ class _SearchPageState extends ConsumerState<SearchPage>
                 if (showingHistory) {
                   return _historyBody(showMiniPlayer: showMiniPlayer);
                 }
-                return TabBarView(
+                return XyTabBarView(
                   children: [
                     for (final tab in tabs)
                       _tabBody(

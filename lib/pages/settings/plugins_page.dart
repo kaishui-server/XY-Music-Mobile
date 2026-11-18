@@ -1373,14 +1373,20 @@ class _PluginsPageState extends ConsumerState<PluginsPage> {
   }
 
   Future<void> _showUserVariables(_PluginInfo plugin) async {
-    // 「用户 ID」（qq_user_id）是 Baka QQ 音乐插件专属变量：非 Baka
-    // 协议插件即使脚本声明了该变量也隐藏输入行，避免误导。保存时
-    // 该键随过滤后的 variables 一起被清理，不会残留在其它插件上。
+    // 「用户 ID」（qq_user_id）是 Baka 音源插件（QQ/酷狗/酷我）的每日
+    // 30 首必要变量，三家插件共用同一个变量键：非 Baka 协议插件即使
+    // 脚本声明了该变量也隐藏输入行，避免误导。保存时该键随过滤后的
+    // variables 一起被清理，不会残留在其它插件上。
+    // 「X-API-KEY」是 Baka 音源插件的历史鉴权变量：订阅源（mc.vsaa.cn）
+    // 的插件已改为订阅链接自带密钥，脚本里残留的声明不再需要填写
+    // （2026-11 插件侧确认），Baka 插件上隐藏该输入行避免误导。
     final variables = plugin.userVariables
         .where(
           (variable) =>
               !(variable.key == 'qq_user_id' &&
-                  plugin.kind != _PluginKind.baka),
+                  plugin.kind != _PluginKind.baka) &&
+              !(variable.key == 'X-API-KEY' &&
+                  plugin.kind == _PluginKind.baka),
         )
         .toList();
     if (variables.isEmpty) return;

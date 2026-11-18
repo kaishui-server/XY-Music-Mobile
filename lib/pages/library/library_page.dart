@@ -18,6 +18,7 @@ import '../../src/widgets/song_list_view.dart';
 import '../../src/widgets/top_notice.dart';
 import 'folder_browser_page.dart';
 import 'song_list_page.dart';
+import '../../src/navigation/paged_transition.dart';
 
 /// 本地音乐“歌曲”Tab 的多选模式开关。AppBar 右上角的多选按钮与 Tab
 /// 内的选择工具栏分属不同组件，通过 Provider 同步开关状态。
@@ -110,7 +111,7 @@ class _LibraryPageState extends ConsumerState<LibraryPage>
         // 无法扫描、选择器能浏览扫描却 EACCES 的割裂问题。
         if (!mounted) return;
         directory = await Navigator.of(context).push<String>(
-          MaterialPageRoute(builder: (_) => const FolderBrowserPage()),
+          XyAnimatedPageRoute(builder: (_) => const FolderBrowserPage()),
         );
       } else {
         directory = await FilePicker.platform.getDirectoryPath();
@@ -248,7 +249,7 @@ class _LibraryPageState extends ConsumerState<LibraryPage>
                 message: lib.error!,
                 onRetry: () => ref.read(libraryProvider.notifier).load(),
               )
-            : TabBarView(
+            : XyTabBarView(
                 controller: _tab,
                 children: [
                   _AllSongsTab(),

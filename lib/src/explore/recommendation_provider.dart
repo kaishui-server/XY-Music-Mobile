@@ -30,11 +30,12 @@ void preloadExploreData(WidgetRef ref) {
         .read(exploreHotChartsProvider.future)
         .catchError((_) => const <RecommendedPlaylist>[]),
   );
-  // Baka QQ 每日 30 首：与其它推荐一起后台预热，进入 Tab 时直接展示。
+  // Baka 每日 30 首（QQ/酷狗/酷我多音源）：与其它推荐一起后台预热，
+  // 进入 Tab 时直接展示。
   unawaited(
     ref
         .read(dailyRecommendationsProvider.future)
-        .catchError((_) => null),
+        .catchError((_) => const <DailyRecommendationState>[]),
   );
 }
 
@@ -431,7 +432,7 @@ class RecommendedPlaylist {
   final bool isChart;
 }
 
-/// Baka QQ 音乐插件的每日 30 首推荐状态。
+/// Baka 插件的每日 30 首推荐状态（多音源：QQ 音乐 / 酷狗 / 酷我）。
 ///
 /// [result] 为插件 getDailyRecommendations 的原始结果；ready 且歌单数据
 /// 完整时额外构造 [playlist]，探索页直接复用它进入歌单详情/播放。
@@ -439,65 +440,106 @@ class DailyRecommendationState {
   const DailyRecommendationState({
     required this.plugin,
     required this.result,
+    required this.sourceLabel,
     this.playlist,
   });
 
   final EnabledMusicPlugin plugin;
   final DailyRecommendationResult result;
+
+  /// 音源展示名（由插件名/ID 推导，见 [dailyRecommendationSourceLabel]），
+  /// 探索页音源切换与状态提示文案共用。
+  final String sourceLabel;
   final RecommendedPlaylist? playlist;
 }
 
-/// 从已启用的 Baka 插件中挑出支持每日推荐的 QQ 音源，拉取其今日
-/// 30 首歌单。仅 Baka 协议插件会命中；无插件或插件不支持时返回 null，
-/// 探索页据此隐藏「每日30首」Tab 或显示引导提示。
-final dailyRecommendationsProvider =
-    FutureProvider<DailyRecommendationState?>((ref) async {
-  final plugins = await ref.read(enabledMusicPluginsProvider.future);
-  EnabledMusicPlugin? target;
-  for (final plugin in plugins) {
-    // 只认 BakaMusic 契约插件；musicfree/洛雪/animemusic 一律跳过。
-    if (!plugin.isBaka) continue;
-    if (!plugin.mayHaveMethod('getDailyRecommendations')) continue;
-    target = plugin;
-    break;
+/// 由插件名/ID 推导每日推荐音源的展示名。Baka 音源插件命名遵循
+/// 「Baka QQ 音乐 / 酷狗[T] / 酷我[T]」风格，按关键词优先匹配。
+String dailyRecommendationSourceLabel(EnabledMusicPlugin plugin) {
+  final value = '${plugin.name} ${plugin.id}'.toLowerCase();
+  if (value.contains('酷狗') ||
+      value.contains('kugou') ||
+      RegExp(r'\bkg\b').hasMatch(value)) {
+    return '酷狗';
   }
-  if (target == null) return null;
+  if (value.contains('酷我') ||
+      value.contains('kuwo') ||
+      RegExp(r'\bkw\b').hasMatch(value)) {
+    return '酷我';
+  }
+  if (value.contains('qq') || value.contains('腾讯')) return 'QQ音乐';
+  return plugin.name.trim().isEmpty ? '音乐' : plugin.name.trim();
+}
+
+/// 拉取**所有**支持每日推荐的 Baka 插件（QQ 音乐 / 酷狗 / 酷我）的今日
+/// 30 首歌单，按音源优先级（QQ → 酷狗 → 酷我 → 其它）稳定排序返回。
+/// 仅 Baka 协议插件会命中；无插件或插件不支持时返回空列表，探索页据此
+/// 隐藏「每日30首」Tab 或显示引导提示。
+///
+/// 各音源的用户 ID 仍由各插件自行从自己的设置读取（酷狗/酷我的用户 ID
+/// 形如 kg_xxx / kw_xxx，密钥由订阅下发），宿主只负责聚合与展示。
+final dailyRecommendationsProvider =
+    FutureProvider<List<DailyRecommendationState>>((ref) async {
+  final plugins = await ref.read(enabledMusicPluginsProvider.future);
+  final targets = <EnabledMusicPlugin>[
+    for (final plugin in plugins)
+      // 只认 BakaMusic 契约插件；musicfree/洛雪/animemusic 一律跳过。
+      if (plugin.isBaka && plugin.mayHaveMethod('getDailyRecommendations'))
+        plugin,
+  ];
+  if (targets.isEmpty) return const [];
 
   final runtime = ref.read(pluginRuntimeProvider);
-  final result = await runtime.getDailyRecommendations(target);
-  RecommendedPlaylist? playlist;
-  if (result.isReady && result.sheetItem != null) {
-    final sheet = result.sheetItem!;
-    final rawData = Map<String, dynamic>.from(sheet);
-    final id = sheet['id']?.toString() ?? '';
-    if (id.isNotEmpty) {
-      final title = result.title.isNotEmpty
-          ? result.title
-          : (sheet['title']?.toString().trim().isNotEmpty == true
-              ? sheet['title']!.toString()
-              : '每日三十首');
-      final account = result.accountName.isNotEmpty
-          ? result.accountName
-          : 'QQ 音乐';
-      playlist = RecommendedPlaylist(
-        plugin: target,
-        result: PluginCatalogResult(
-          pluginId: target.id,
-          id: id,
-          title: title,
-          subtitle: '$account · 每日推荐',
-          coverUrl:
-              (sheet['cover'] ?? sheet['artwork'])?.toString() ?? '',
-          rawData: rawData,
-        ),
-      );
+  final tasks = targets.map((plugin) => () async {
+    final result = await runtime.getDailyRecommendations(plugin);
+    RecommendedPlaylist? playlist;
+    if (result.isReady && result.sheetItem != null) {
+      final sheet = result.sheetItem!;
+      final rawData = Map<String, dynamic>.from(sheet);
+      final id = sheet['id']?.toString() ?? '';
+      if (id.isNotEmpty) {
+        final sourceLabel = dailyRecommendationSourceLabel(plugin);
+        final title = result.title.isNotEmpty
+            ? result.title
+            : (sheet['title']?.toString().trim().isNotEmpty == true
+                  ? sheet['title']!.toString()
+                  : '每日三十首');
+        final account = result.accountName.isNotEmpty
+            ? result.accountName
+            : sourceLabel;
+        playlist = RecommendedPlaylist(
+          plugin: plugin,
+          result: PluginCatalogResult(
+            pluginId: plugin.id,
+            id: id,
+            title: title,
+            subtitle: '$account · 每日推荐',
+            coverUrl: (sheet['cover'] ?? sheet['artwork'])?.toString() ?? '',
+            rawData: rawData,
+          ),
+        );
+      }
     }
-  }
-  return DailyRecommendationState(
-    plugin: target,
-    result: result,
-    playlist: playlist,
+    return DailyRecommendationState(
+      plugin: plugin,
+      result: result,
+      sourceLabel: dailyRecommendationSourceLabel(plugin),
+      playlist: playlist,
+    );
+  }());
+  final states = (await Future.wait(tasks)).toList();
+  int sourcePriority(String label) => switch (label) {
+    'QQ音乐' => 0,
+    '酷狗' => 1,
+    '酷我' => 2,
+    _ => 3,
+  };
+  states.sort(
+    (a, b) => sourcePriority(
+      a.sourceLabel,
+    ).compareTo(sourcePriority(b.sourceLabel)),
   );
+  return states;
 });
 
 /// 从已启用插件的热门榜单拉取大众热门歌曲，与个人偏好无关，

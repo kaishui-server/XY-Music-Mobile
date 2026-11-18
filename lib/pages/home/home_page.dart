@@ -884,35 +884,48 @@ class _StatisticsPanel extends StatelessWidget {
               ),
             ],
           ),
-          const SizedBox(height: 18),
+          const SizedBox(height: 14),
           Divider(height: 1, color: theme.dividerColor),
           const SizedBox(height: 12),
-          GridView.count(
-            crossAxisCount: 2,
-            shrinkWrap: true,
-            physics: const NeverScrollableScrollPhysics(),
-            crossAxisSpacing: 10,
-            mainAxisSpacing: 10,
-            childAspectRatio: 2.25,
+          // 二行二列指标：每格高度由内容决定（不再按固定比例/固定高度），
+          // 面板底部不会残留没有内容的空白，字号与行距保持正常呼吸感。
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              _StatMetricTile(
-                label: '曲库总时长',
-                value: _formatLongDuration(data.libraryDuration),
+              Expanded(
+                child: _StatMetricTile(
+                  label: '曲库总时长',
+                  value: _formatLongDuration(data.libraryDuration),
+                ),
               ),
-              _StatMetricTile(
-                label: '音乐库大小',
-                value: _formatFileSize(data.totalFileSize),
+              const SizedBox(width: 14),
+              Expanded(
+                child: _StatMetricTile(
+                  label: '音乐库大小',
+                  value: _formatFileSize(data.totalFileSize),
+                ),
               ),
-              _StatMetricTile(
-                label: '无损占比',
-                value: '${data.losslessRatio.toStringAsFixed(1)}%',
+            ],
+          ),
+          const SizedBox(height: 12),
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Expanded(
+                child: _StatMetricTile(
+                  label: '无损占比',
+                  value: '${data.losslessRatio.toStringAsFixed(1)}%',
+                ),
               ),
-              _StatMetricTile(
-                label: '最常听',
-                value: data.mostPlayed?.title ?? '暂无记录',
-                detail: data.mostPlayed == null
-                    ? null
-                    : '${data.mostPlayedCount} 次',
+              const SizedBox(width: 14),
+              Expanded(
+                child: _StatMetricTile(
+                  label: '最常听',
+                  value: data.mostPlayed?.title ?? '暂无记录',
+                  detail: data.mostPlayed == null
+                      ? null
+                      : '${data.mostPlayedCount} 次',
+                ),
               ),
             ],
           ),
@@ -937,11 +950,11 @@ class _CompactMetric extends StatelessWidget {
         Text(
           label,
           style: TextStyle(
-            fontSize: 10,
+            fontSize: 11,
             color: theme.colorScheme.onSurfaceVariant,
           ),
         ),
-        const SizedBox(height: 3),
+        const SizedBox(height: 4),
         Align(
           alignment: Alignment.centerRight,
           child: FittedBox(
@@ -972,36 +985,35 @@ class _StatMetricTile extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 6),
-      child: Column(
-        mainAxisAlignment: MainAxisAlignment.center,
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(
+          label,
+          style: TextStyle(
+            fontSize: 12,
+            color: theme.colorScheme.onSurfaceVariant,
+          ),
+        ),
+        const SizedBox(height: 6),
+        Text(
+          value,
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+          style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w800),
+        ),
+        if (detail != null) ...[
+          const SizedBox(height: 2),
           Text(
-            label,
+            detail!,
             style: TextStyle(
-              fontSize: 10,
+              fontSize: 11,
               color: theme.colorScheme.onSurfaceVariant,
             ),
           ),
-          const SizedBox(height: 5),
-          Text(
-            value,
-            maxLines: 1,
-            overflow: TextOverflow.ellipsis,
-            style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w800),
-          ),
-          if (detail != null)
-            Text(
-              detail!,
-              style: TextStyle(
-                fontSize: 9,
-                color: theme.colorScheme.onSurfaceVariant,
-              ),
-            ),
         ],
-      ),
+      ],
     );
   }
 }

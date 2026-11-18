@@ -24,7 +24,6 @@ import '../cloud/cloud_credentials_store.dart';
 import '../cloud/cloud_registry.dart';
 import '../cloud/cloud_types.dart';
 import '../cloud/direct_link_cache.dart';
-import '../debug/performance_probe.dart';
 import '../effects/effects_provider.dart';
 import '../favorites/favorites_provider.dart';
 import '../home/listen_stats_uploader.dart';
@@ -1682,35 +1681,41 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
   /// 2026-11-12 vivo 实测：暂停后用户点「播放」，OriginOS 把 action 报成
   /// pause（按钮语义停留在暂停帧，与 [_scheduleMediaSessionRefreshAfterPause]
   /// 记录的「首次状态更新被丢弃」同源但方向相反），整份日志无一条 play
-  /// 锚点。暂停态下 pause 无任何语义，唯一合理意图是播放：距上次真实暂停
-  /// 超过 2s 即反转走恢复链；2s 内视为同一次暂停的重复回声，忽略。
+  /// 锚点。暂停态下 pause 无任何语义，唯一合理意图是播放：反转走恢复链。
+  ///
+  /// 【统一防抖】2026-11-12 X100s 二次实测：暂停/播放**所有**按键都以
+  /// pause 形态到达（含反转恢复成功的播放键），于是「每次按键 = 取反当前
+  /// 状态」，双击任何按钮都会切两次——用户实测：双击暂停变成暂停→播放，
+  /// 双击播放变成播放→暂停。修复：外部按键统一为取反 + 3s 防抖，3s 内的
+  /// 连按视为同一次操作的重按/回声直接忽略；单击（距上次外部按键 ≥3s）
+  /// 语义不变（在播→暂停，已停→反转播放）。
   Future<void> _handleExternalPausePressed() async {
     // 暂停必须作废在飞的恢复探活：否则探活到点后会把刚暂停的播放重新推起来
     // （或被误判成「无声假播」而触发 AudioSink 重建，用户听到一次爆音）。
     _externalResumeProbeTimer?.cancel();
     _externalResumeProbeTimer = null;
     _externalResumeProbeToken++;
+    final now = DateTime.now();
+    final last = _lastExternalStalePauseAt;
+    if (last != null && now.difference(last) < const Duration(seconds: 3)) {
+      playbackChainLog('[通知栏按键] 距上次外部按键 <3s，视为重按/回声忽略');
+      _scheduleMediaSessionRefreshAfterPause();
+      return;
+    }
+    _lastExternalStalePauseAt = now;
     if (_player.playing) {
       await toggle();
-      _lastExternalStalePauseAt = DateTime.now();
       _scheduleMediaSessionRefreshAfterPause();
       return;
     }
     if (!state.isPlaying &&
         !state.isLoading &&
         state.current != null) {
-      final now = DateTime.now();
-      final last = _lastExternalStalePauseAt;
-      final isEcho =
-          last != null && now.difference(last) < const Duration(seconds: 2);
-      if (!isEcho) {
-        playbackChainLog(
-          '[通知栏按键] 已暂停时收到 pause，判定 ROM 播控残留（实按播放），幂等反转恢复',
-        );
-        await _handleExternalPlayPressed();
-        return;
-      }
-      playbackChainLog('[通知栏按键] 已暂停时收到 pause，距真实暂停 <2s，视为重复回声忽略');
+      playbackChainLog(
+        '[通知栏按键] 已暂停时收到 pause，判定 ROM 播控残留（实按播放），幂等反转恢复',
+      );
+      await _handleExternalPlayPressed();
+      return;
     }
     if (state.isPlaying || state.isLoading) {
       state = state.copyWith(isPlaying: false, isLoading: false);
@@ -2203,9 +2208,6 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
         'anime参数=${_ref.read(effectsProvider).valueOrNull?.animeEffectId ?? '无'}'
         '${cacheRaceRetried ? '（缓存竞态重试后成功）' : ''}',
       );
-      if (kPerformanceProbeEnabled) {
-        PerformanceProbe.instance.onDspTakeover();
-      }
       return true;
     } catch (error) {
       // A3：按失败原因给冷却时长（资源类瞬时占用 10s / 网络 20s /
@@ -2460,9 +2462,6 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
       final starvedMs = _starvationStarvedMs;
       if (_starvationStreak >= _starvationThreshold) {
         playbackChainLog('[DSP] 缓冲饥饿恢复（本次持续约 ${starvedMs}ms）');
-        if (kPerformanceProbeEnabled) {
-          PerformanceProbe.instance.onAudioStarveEnd(starvedMs);
-        }
       }
       _starvationStreak = 0;
       _starvationStartedAt = null;
@@ -2472,9 +2471,6 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
     if (_starvationStreak == 1) {
       _starvationStartedAt = DateTime.now();
       playbackChainLog('[DSP] 检测到缓冲饥饿（开始计数）');
-      if (kPerformanceProbeEnabled) {
-        PerformanceProbe.instance.onAudioStarveStart();
-      }
       // 耗电优化：本会话真出过饥饿才把轮询切到 250ms 细档（60s 后自动回落）。
       _escalateStarvationPoll();
     }
@@ -3157,9 +3153,9 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
   /// 按键路径上，不等回前台。
   Timer? _externalResumeProbeTimer;
   int _externalResumeProbeToken = 0;
-  /// 最近一次真实暂停的时刻（外部 pause 键生效时记录）。暂停态下再次收到
-  /// pause 且距此时刻 ≥2s 时，判定为 ROM 播控残留并幂等反转为播放
-  /// （见 [_handleExternalPausePressed]）。
+  /// 最近一次外部媒体按键（含播放/暂停，X100s 上两者都以 pause 形态到达）
+  /// 被受理的时刻。距此时刻 <3s 的后续按键视为重按/回声忽略，≥3s 才按
+  /// 取反语义处理（见 [_handleExternalPausePressed] 的统一防抖）。
   DateTime? _lastExternalStalePauseAt;
   /// 暂停后补推播放状态的计时器与令牌（见
   /// [_scheduleMediaSessionRefreshAfterPause]）。

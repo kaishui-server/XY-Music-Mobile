@@ -1805,6 +1805,21 @@ const JO_LANG: &str = "en";
 const JO_PAGE_SIZE: u32 = 30;
 const JO_MAX_PAGES: u32 = 4;
 
+/// JOOX openapi 搜索（网页/桌面走同一条链路）：单页 30 条，条目里只有
+/// base64 trackId，没有 songmid；songmid 必须再请求详情接口换取。
+const JO_OPENAPI_SEARCH_URL: &str = "https://cache.api.joox.com/openjoox/v2/search_type";
+const JO_OPENAPI_TRACK_URL: &str = "https://cache.api.joox.com/openjoox2/v1/track";
+const JO_OPENAPI_COUNTRY: &str = "hk";
+const JO_OPENAPI_LANG: &str = "zh_cn";
+/// 详情接口签名盐值（网页端硬编码）：secret = md5(盐值 + 去掉 secret 的 query)
+const JO_TRACK_SECRET_SALT: &str = "Jo0x@t3Nc3nT";
+/// 详情接口 type 过滤：0 = 单曲
+const JO_OPENAPI_TRACK_TYPE: u32 = 0;
+/// 详情补 songmid 的并发窗口与总次数上限：每条结果都要一次详情请求，
+/// 串行 30 条会把搜索拖到十几秒，全并发又会被上游限速。
+const JO_DETAIL_CONCURRENCY: usize = 6;
+const JO_MAX_DETAIL_LOOKUPS: usize = 24;
+
 /// JOOX 的文本字段（歌名/歌手/专辑）是 base64 编码的 UTF-8；少数返回已是
 /// 明文。解码结果必须是合法 UTF-8 且不含控制字符才采纳，避免把恰好符合
 /// base64 字母表的明文（如 "abcd"）解成乱码。
@@ -1874,17 +1889,13 @@ fn jo_item_from_song(raw: &serde_json::Value) -> Option<LxSearchItem> {
         .unwrap_or("")
         .trim()
         .to_string();
-    let is_mid = mid.len() == 14
-        && mid.starts_with('Z')
-        && mid[1..].chars().all(|c| c.is_ascii_hexdigit());
-    // 没有 mid 时退回数字 ID：能搜到、能评论，取流由插件报错而不是静默失败
-    let songmid = if is_mid {
-        mid.clone()
-    } else if !numeric_id.is_empty() {
-        numeric_id.clone()
-    } else {
+    let is_mid = jo_is_valid_mid(&mid);
+    // 没有合法 mid 就不再退回数字 songid：数字 ID 不是取流标识，退回只会
+    // 产生「能搜到、点了必然取不到流」的假结果。
+    if !is_mid {
         return None;
-    };
+    }
+    let songmid = mid.clone();
 
     let img = ["album_url", "albummid", "singer_url", "singermid"]
         .iter()
@@ -1984,6 +1995,223 @@ fn jo_decode_singers(singers: &serde_json::Value) -> String {
     names.join("、")
 }
 
+/// JOOX 取流标识：1 位 Z 前缀 + 13 位十六进制，共 14 位。
+fn jo_is_valid_mid(mid: &str) -> bool {
+    mid.len() == 14 && mid.starts_with('Z') && mid[1..].chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// 详情接口签名：secret = md5(盐值 + 去掉 secret 的完整 query)
+fn jo_track_secret(query: &str) -> String {
+    format!(
+        "{:x}",
+        md5::compute(format!("{}{}", JO_TRACK_SECRET_SALT, query))
+    )
+}
+
+/// 搜索响应的 tracks 可能是对象数组，也可能每个命中再包一层数组（上游按
+/// 「同曲多版本」分组），拍平一层并保持原顺序。
+fn jo_flatten_search_tracks(value: &serde_json::Value) -> Vec<serde_json::Value> {
+    let Some(list) = value.as_array() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for item in list {
+        match item {
+            serde_json::Value::Array(inner) => out.extend(inner.iter().cloned()),
+            other => out.push(other.clone()),
+        }
+    }
+    out
+}
+
+async fn jo_fetch_openapi_search(keyword: &str) -> Result<Vec<serde_json::Value>, String> {
+    let url = format!(
+        "{}?country={}&lang={}&key={}&type={}",
+        JO_OPENAPI_SEARCH_URL,
+        JO_OPENAPI_COUNTRY,
+        JO_OPENAPI_LANG,
+        urlencoding::encode(keyword),
+        JO_OPENAPI_TRACK_TYPE,
+    );
+    let result = http_get_json(&url, &[("User-Agent", JO_UA)]).await?;
+    if let Some(code) = result.get("error_code").and_then(|v| v.as_i64()) {
+        if code != 0 {
+            let msg = result.get("error").and_then(|v| v.as_str()).unwrap_or("");
+            return Err(format!("JO openapi search: error_code={} {}", code, msg));
+        }
+    }
+    let tracks = result
+        .get("tracks")
+        .map(jo_flatten_search_tracks)
+        .unwrap_or_default();
+    if tracks.is_empty() {
+        return Err("JO openapi search: no results".to_string());
+    }
+    Ok(tracks)
+}
+
+/// 详情：songmid 是唯一能取流的标识，只能从这里拿。
+///
+/// 路径段里的 trackId 必须保持原始形态（base64 的 '=' 不转义），只有 query
+/// 里的 id 需要百分号编码；两者弄反上游直接回 401 Invalid secret key。
+/// 正常响应即使 error_code 非 0（如 9009002 cannot play）也可能带 songmid，
+/// 所以只按 HTTP 状态判失败，不看 error_code。
+async fn jo_fetch_track_detail(track_id: &str) -> Option<serde_json::Value> {
+    if track_id.is_empty() {
+        return None;
+    }
+    let query = format!(
+        "country={}&lang={}&lyric=0&fs=0&im=1&id={}",
+        JO_OPENAPI_COUNTRY,
+        JO_OPENAPI_LANG,
+        urlencoding::encode(track_id),
+    );
+    let url = format!(
+        "{}/{}?{}&secret={}",
+        JO_OPENAPI_TRACK_URL,
+        track_id,
+        query,
+        jo_track_secret(&query)
+    );
+    http_get_json(&url, &[("User-Agent", JO_UA)]).await.ok()
+}
+
+/// 并发拉详情，返回与入参同序的结果（None 表示该条不可用）。
+async fn jo_fetch_details(ids: &[String]) -> Vec<Option<serde_json::Value>> {
+    let mut out: Vec<Option<serde_json::Value>> = vec![None; ids.len()];
+    let mut set = tokio::task::JoinSet::new();
+    let mut next = 0usize;
+    while next < ids.len() && set.len() < JO_DETAIL_CONCURRENCY {
+        let idx = next;
+        let id = ids[idx].clone();
+        set.spawn(async move { (idx, jo_fetch_track_detail(&id).await) });
+        next += 1;
+    }
+    while let Some(joined) = set.join_next().await {
+        if let Ok((idx, value)) = joined {
+            out[idx] = value;
+        }
+        if next < ids.len() {
+            let idx = next;
+            let id = ids[idx].clone();
+            set.spawn(async move { (idx, jo_fetch_track_detail(&id).await) });
+            next += 1;
+        }
+    }
+    out
+}
+
+/// openapi 搜索条目 + 详情 → LxSearchItem。
+///
+/// 详情里的 play_duration 是试听片段长度（与搜索条目不一致），时长以搜索
+/// 条目为准；档位只认详情明示的 has_hq/has_hifi，不虚报高档位，避免
+///「列表显示 flac、播放时取不到流」的假音质。
+fn jo_item_from_openapi(
+    track: &serde_json::Value,
+    detail: Option<&serde_json::Value>,
+) -> Option<LxSearchItem> {
+    let track_id = track
+        .get("id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let mid = detail
+        .and_then(|d| d.get("songmid"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    // 没有合法 mid 就无法取流：宁可这条不进列表，也不给一条点了必然
+    // 失败的假结果。
+    if !jo_is_valid_mid(&mid) {
+        return None;
+    }
+
+    let img = track
+        .get("images")
+        .and_then(|v| v.as_array())
+        .and_then(|list| {
+            let pick = list
+                .iter()
+                .find(|i| i.get("width").and_then(|w| w.as_u64()) == Some(300))
+                .or_else(|| {
+                    list.iter()
+                        .max_by_key(|i| i.get("width").and_then(|w| w.as_u64()).unwrap_or(0))
+                });
+            pick.and_then(|i| i.get("url"))
+                .and_then(|u| u.as_str())
+                .map(|s| s.to_string())
+        })
+        .filter(|s| s.starts_with("http"));
+
+    let has_hq = detail
+        .and_then(|d| d.get("has_hq"))
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0)
+        == 1;
+    let has_hifi = detail
+        .and_then(|d| d.get("has_hifi"))
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0)
+        == 1;
+    let mut qualities: Vec<&'static str> = vec!["128k"];
+    if has_hq {
+        qualities.push("320k");
+    }
+    if has_hifi {
+        qualities.push("flac");
+    }
+    let mut types = Vec::new();
+    let mut lx_types = HashMap::new();
+    for quality in qualities {
+        types.push(LxTypeTuple {
+            quality_type: quality.into(),
+            size: None,
+            hash: None,
+        });
+        lx_types.insert(quality.into(), LxTypeEntry { size: None, hash: None });
+    }
+
+    let playtime = track
+        .get("play_duration")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+    Some(LxSearchItem {
+        name: jo_decode_text(track.get("name").and_then(|v| v.as_str()).unwrap_or("")),
+        singer: format_singer_name(
+            track.get("artist_list").unwrap_or(&serde_json::Value::Null),
+            "name",
+        ),
+        album_name: track
+            .get("album_name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        album_id: track
+            .get("album_id")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        songmid: mid.clone(),
+        source: "jo".into(),
+        interval: format_play_time(playtime),
+        img,
+        hash: None,
+        str_media_mid: Some(mid),
+        // 评论接口认「数字 songid 或 base64 歌曲 ID」：openapi 没有数字
+        // songid，这里存 base64 trackId 供评论链路使用。
+        song_id: if track_id.is_empty() {
+            None
+        } else {
+            Some(serde_json::Value::String(track_id))
+        },
+        album_mid: None,
+        copyright_id: None,
+        types,
+        lx_types: Some(lx_types),
+    })
+}
+
 fn jo_build_search_body(keyword: &str, sin: u32, ein: u32) -> String {
     serde_json::json!({
         "header": {
@@ -2075,9 +2303,9 @@ async fn jo_fetch_songs(keyword: &str, page: u32) -> Result<Vec<LxSearchItem>, S
     Ok(out)
 }
 
-/// JOOX 搜索：单页 30 条，不足 limit 时继续翻页（上游 sum 通常封顶 1000）。
-async fn search_jo(keyword: &str, limit: u32) -> Result<Vec<LxSearchItem>, String> {
-    let want = limit.max(1);
+/// 旧通道（commonCgi/search/get）：一次 30 条且自带 songmid、数字 songid 与
+/// kbps_map，无需详情请求；上游对它有限流，只作 openapi 的兜底。
+async fn jo_search_legacy(keyword: &str, want: usize) -> Result<Vec<LxSearchItem>, String> {
     let mut collected: Vec<LxSearchItem> = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for page in 1..=JO_MAX_PAGES {
@@ -2091,15 +2319,54 @@ async fn search_jo(keyword: &str, limit: u32) -> Result<Vec<LxSearchItem>, Strin
                 collected.push(it);
             }
         }
-        if collected.len() as u32 >= want || (page_len as u32) < JO_PAGE_SIZE {
+        if collected.len() >= want || (page_len as u32) < JO_PAGE_SIZE {
             break;
         }
     }
     if collected.is_empty() {
         return Err("JO search: no results".to_string());
     }
-    collected.truncate(want as usize);
+    collected.truncate(want);
     Ok(collected)
+}
+
+/// JOOX 搜索：主路走 openapi（条目只有 base64 trackId，靠详情补 songmid，
+/// 补不到的直接丢弃），详情整体失败或一条都换不出 songmid 时回退旧通道，
+/// 避免整个音源在详情接口限流时静默变空。
+async fn search_jo(keyword: &str, limit: u32) -> Result<Vec<LxSearchItem>, String> {
+    let want = limit.max(1) as usize;
+    if let Ok(tracks) = jo_fetch_openapi_search(keyword).await {
+        let head: Vec<serde_json::Value> = tracks
+            .into_iter()
+            .take(want.min(JO_MAX_DETAIL_LOOKUPS))
+            .collect();
+        if !head.is_empty() {
+            let ids: Vec<String> = head
+                .iter()
+                .map(|t| {
+                    t.get("id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string()
+                })
+                .collect();
+            let details = jo_fetch_details(&ids).await;
+            let mut collected: Vec<LxSearchItem> = Vec::new();
+            let mut seen = std::collections::HashSet::new();
+            for (track, detail) in head.iter().zip(details.iter()) {
+                if let Some(item) = jo_item_from_openapi(track, detail.as_ref()) {
+                    if seen.insert(item.songmid.clone()) {
+                        collected.push(item);
+                    }
+                }
+            }
+            if !collected.is_empty() {
+                collected.truncate(want);
+                return Ok(collected);
+            }
+        }
+    }
+    jo_search_legacy(keyword, want).await
 }
 
 /// 搜索 LX 音源
@@ -2200,8 +2467,9 @@ mod tests {
         assert_eq!(cached, "WY search: code=-460");
     }
 
-    /// 真联网验证 jo 搜索：JOOX 文本字段是 base64，必须解出中文；mid 与数字
-    /// songid 都要保留（分别供取流与评论），缺一会导致某一环静默失效。
+    /// 真联网验证 jo 搜索：走 openapi 主路，songmid 由详情接口补出（Z 开头
+    /// 14 位），song_id 存 base64 trackId 供评论接口用，两者缺一会导致某一环
+    /// 静默失效。
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "依赖网络与 JOOX 接口可用性"]
     async fn test_search_jo_real_network() {
@@ -2209,10 +2477,14 @@ mod tests {
         assert!(!items.is_empty(), "jo 搜索结果不应为空");
         let first = &items[0];
         assert_eq!(first.source, "jo");
-        assert!(!first.songmid.is_empty(), "songmid(mid) 不应为空");
+        assert!(
+            first.songmid.len() == 14 && first.songmid.starts_with('Z'),
+            "songmid 必须是详情里换出的 14 位 mid，实际 {}",
+            first.songmid
+        );
         assert!(
             first.song_id.is_some(),
-            "数字 songid 必须保留给评论接口用"
+            "base64 trackId 必须保留给评论接口用"
         );
         assert_eq!(first.name, "七里香");
         assert!(first.singer.contains("周杰倫") || first.singer.contains("周杰伦"));
@@ -2254,6 +2526,114 @@ mod tests {
             .collect();
         // hires=0 视为不可用，不进列表
         assert_eq!(qualities, vec!["128k", "320k", "flac"]);
+    }
+
+    /// 详情接口签名：真实样本（七里香 base64 trackId）算出的 secret 必须与
+    /// 网页端一致，否则上游回 401 Invalid secret key。
+    #[test]
+    fn test_jo_track_secret_matches_web_sample() {
+        let query = "country=hk&lang=zh_cn&lyric=0&fs=0&im=1&id=vT8gcKzRFXzZypW6PJuLCA%3D%3D";
+        assert_eq!(
+            jo_track_secret(query),
+            "99391b114080d39ebe8c3bd4393d1cdd".to_string()
+        );
+    }
+
+    #[test]
+    fn test_jo_flatten_search_tracks_flattens_nested() {
+        // 上游把「同曲多版本」再包一层数组：展开后顺序不能乱
+        let raw = serde_json::json!([
+            [{"id": "a"}, {"id": "b"}],
+            {"id": "c"}
+        ]);
+        let flat = jo_flatten_search_tracks(&raw);
+        let ids: Vec<&str> = flat
+            .iter()
+            .map(|v| v.get("id").and_then(|x| x.as_str()).unwrap_or(""))
+            .collect();
+        assert_eq!(ids, vec!["a", "b", "c"]);
+        assert!(jo_flatten_search_tracks(&serde_json::Value::Null).is_empty());
+    }
+
+    /// openapi 条目 + 详情 → 结果项：mid 来自详情、时长取搜索条目（详情是
+    /// 试听片段长度）、封面取 300px 一档、档位按 has_hq/has_hifi 明示值。
+    #[test]
+    fn test_jo_item_from_openapi_builds_item() {
+        let track = serde_json::json!({
+            "id": "vT8gcKzRFXzZypW6PJuLCA==",
+            "name": "七里香",
+            "album_name": "七里香",
+            "album_id": "5p8uhVEFroHlKDxtcRo3zg==",
+            "artist_list": [{"id": "x", "name": "周杰倫"}],
+            "play_duration": 299,
+            "images": [
+                {"width": 1000, "height": 1000, "url": "https://image.joox.com/a/1000"},
+                {"width": 300, "height": 300, "url": "https://image.joox.com/a/300"}
+            ]
+        });
+        let detail = serde_json::json!({
+            "songmid": "ZDE8F7D6B963B4",
+            "has_hq": 1,
+            "has_hifi": 1,
+            "play_duration": 53,
+            "error_code": 9009002
+        });
+        let item = jo_item_from_openapi(&track, Some(&detail)).expect("应解析成功");
+        assert_eq!(item.name, "七里香");
+        assert_eq!(item.singer, "周杰倫");
+        assert_eq!(item.songmid, "ZDE8F7D6B963B4");
+        assert_eq!(item.str_media_mid.as_deref(), Some("ZDE8F7D6B963B4"));
+        assert_eq!(
+            item.song_id.as_ref().and_then(|v| v.as_str()),
+            Some("vT8gcKzRFXzZypW6PJuLCA==")
+        );
+        // 时长用搜索条目的 299s，不是详情里的试听 53s
+        assert_eq!(item.interval, "04:59");
+        assert_eq!(item.img.as_deref(), Some("https://image.joox.com/a/300"));
+        let qualities: Vec<&str> = item
+            .types
+            .iter()
+            .map(|t| t.quality_type.as_str())
+            .collect();
+        assert_eq!(qualities, vec!["128k", "320k", "flac"]);
+    }
+
+    /// 详情拿不到合法 mid 时整条丢弃：不能给用户一条点了必然取不到流的
+    /// 假结果。
+    #[test]
+    fn test_jo_item_from_openapi_requires_valid_mid() {
+        let track = serde_json::json!({
+            "id": "vT8gcKzRFXzZypW6PJuLCA==",
+            "name": "七里香",
+            "play_duration": 299
+        });
+        assert!(jo_item_from_openapi(&track, None).is_none());
+        // 数字 songid 形态的 songmid 不是合法取流标识
+        let bad = serde_json::json!({"songmid": "102065756"});
+        assert!(jo_item_from_openapi(&track, Some(&bad)).is_none());
+        // 只有 has_hq 时不该虚报 flac
+        let hq_only = serde_json::json!({"songmid": "ZDE8F7D6B963B4", "has_hq": 1, "has_hifi": 0});
+        let item = jo_item_from_openapi(&track, Some(&hq_only)).expect("应解析成功");
+        let qualities: Vec<&str> = item
+            .types
+            .iter()
+            .map(|t| t.quality_type.as_str())
+            .collect();
+        assert_eq!(qualities, vec!["128k", "320k"]);
+    }
+
+    /// 旧通道条目只有数字 songid、没有合法 mid 时直接丢弃（历史 bug：数字
+    /// ID 被当 mid 存下，播放时必然取流失败）。
+    #[test]
+    fn test_jo_item_from_song_rejects_numeric_only_id() {
+        let raw = serde_json::json!({
+            "songid": 102065756,
+            "songmid": "",
+            "songname": "5LiD6YeM6aaZ",
+            "singername": "5ZGo5p2w5YCr",
+            "playtime": 299
+        });
+        assert!(jo_item_from_song(&raw).is_none());
     }
 
     #[test]

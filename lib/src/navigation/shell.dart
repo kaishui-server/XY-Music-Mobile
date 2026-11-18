@@ -13,6 +13,8 @@ import '../ui/xy_theme.dart';
 import '../ui/xy_surface.dart';
 import '../widgets/mini_player_bar.dart';
 import '../widgets/top_notice.dart';
+import 'animated_branch_container.dart';
+import 'animated_page_route.dart';
 import 'player_sheet_morph.dart';
 import 'sidebar_controller.dart';
 
@@ -176,37 +178,35 @@ class AppShell extends ConsumerWidget {
       ref.read(playbackNoticeEventProvider.notifier).state = null;
     });
     // 队列中存在「所属插件已停用」的残留歌曲：一次性提示，允许直接清理。
-    ref.listen<ResidualPluginQueueNotice?>(
-      residualPluginQueueNoticeProvider,
-      (previous, next) {
-        if (next == null) return;
-        ref.read(residualPluginQueueNoticeProvider.notifier).state = null;
-        final messengerContext = appScaffoldKey.currentContext ?? context;
-        XyNotice.show(
-          messengerContext,
-          message:
-              '播放队列中有 ${next.songCount} 首来自已停用插件'
-              '「${next.pluginNames}」的歌曲，可一键清理',
-          type: XyNoticeType.warning,
-          duration: const Duration(seconds: 8),
-          actionLabel: '清理',
-          onAction: () async {
-            final removed = await ref
-                .read(playerProvider.notifier)
-                .removeResidualPluginSongs(next.pluginIds);
-            final noticeContext = appScaffoldKey.currentContext;
-            if (noticeContext == null) return;
-            XyNotice.show(
-              noticeContext,
-              message: removed > 0
-                  ? '已清理 $removed 首残留歌曲'
-                  : '没有可清理的残留歌曲',
-              type: removed > 0 ? XyNoticeType.success : XyNoticeType.info,
-            );
-          },
-        );
-      },
-    );
+    ref.listen<ResidualPluginQueueNotice?>(residualPluginQueueNoticeProvider, (
+      previous,
+      next,
+    ) {
+      if (next == null) return;
+      ref.read(residualPluginQueueNoticeProvider.notifier).state = null;
+      final messengerContext = appScaffoldKey.currentContext ?? context;
+      XyNotice.show(
+        messengerContext,
+        message:
+            '播放队列中有 ${next.songCount} 首来自已停用插件'
+            '「${next.pluginNames}」的歌曲，可一键清理',
+        type: XyNoticeType.warning,
+        duration: const Duration(seconds: 8),
+        actionLabel: '清理',
+        onAction: () async {
+          final removed = await ref
+              .read(playerProvider.notifier)
+              .removeResidualPluginSongs(next.pluginIds);
+          final noticeContext = appScaffoldKey.currentContext;
+          if (noticeContext == null) return;
+          XyNotice.show(
+            noticeContext,
+            message: removed > 0 ? '已清理 $removed 首残留歌曲' : '没有可清理的残留歌曲',
+            type: removed > 0 ? XyNoticeType.success : XyNoticeType.info,
+          );
+        },
+      );
+    });
     final safeBottom = MediaQuery.paddingOf(context).bottom;
     final showMiniPlayer = shouldShowMiniPlayerForPath(currentPath);
     // 迷你播放栏仅在「有歌在播」时真正渲染，注入的遮挡高度需同步，
@@ -254,6 +254,31 @@ class AppShell extends ConsumerWidget {
       currentPath,
       navigationShell.currentIndex,
       visiblePaths,
+    );
+
+    // 横滑切页：把可见目的地顺序映射成分支下标序列，供分支容器判断拖动
+    // 方向的相邻页。仅在一级页面根部启用——进入二级页（歌单详情、设置
+    // 子页等）后让位给页面自身手势与系统返回。
+    final branchPaths = <String?>[
+      for (final branch in navigationShell.route.branches)
+        branch.routes.isNotEmpty && branch.routes.first is GoRoute
+            ? (branch.routes.first as GoRoute).path
+            : null,
+    ];
+    final swipeOrder = branchSwipeOrderFromPaths(
+      visiblePaths: visiblePaths,
+      branchPaths: branchPaths,
+      currentIndex: navigationShell.currentIndex,
+    );
+    // 仅在一级页面启用：当前路由等于某个分支根，或等于某个可见目的地
+    // （侧栏一级入口，如插件管理 /settings/plugins）。进入二级页（歌单
+    // 详情、设置子页等）后让位给页面自身手势与系统返回。
+    final swipeTopLevel =
+        branchPaths.contains(currentPath) ||
+        visiblePaths.any((path) => path.split('?').first == currentPath);
+    updateBranchSwipe(
+      enabled: bottomBarVisible && swipeTopLevel && swipeOrder.length >= 2,
+      order: swipeOrder,
     );
 
     void navigate(String path) =>
@@ -390,13 +415,19 @@ class AppShell extends ConsumerWidget {
           xySheetRouteActive,
           xyPlayerSheetMorphing,
         ]),
-        builder: (context, _) => _ShellFreezeGate(
-          morphing:
-              xySheetRouteActive.value && xyPlayerSheetMorphing.value,
-          covered:
-              xySheetRouteActive.value && !xyPlayerSheetMorphing.value,
-          child: scaffold,
-        ),
+        builder: (context, _) {
+          // 存活守卫：冻结/隐藏只在形变路由真实存在于导航栈时生效。
+          // 万一这次展开没成功（push 被拒、竞态、导航器未就绪）而全局
+          // 标记又残留下来，这里直接按「未转场」渲染——否则壳层会被
+          // 永久快照/Offstage，表现成整页卡死、点不动。
+          final sheetAlive = xyPlayerSheetRouteRef?.isActive ?? false;
+          final active = sheetAlive && xySheetRouteActive.value;
+          return _ShellFreezeGate(
+            morphing: active && xyPlayerSheetMorphing.value,
+            covered: active && !xyPlayerSheetMorphing.value,
+            child: scaffold,
+          );
+        },
       ),
     );
   }
@@ -485,42 +516,53 @@ class XyBottomBar extends ConsumerWidget {
         .map((id) => _sidebarDestinations[id])
         .whereType<_SidebarDestination>()
         .toList();
+    // 底栏容器本体：颜色/描边/投影/内容，与是否挂毛玻璃无关，单独提出，
+    // 供下面的条件包装复用同一棵子树（切换毛玻璃开关时不重建内容）。
+    final bar = Container(
+      height: kBottomBarHeight,
+      decoration: BoxDecoration(
+        color: theme.colorScheme.surface.withValues(alpha: dark ? .34 : .48),
+        borderRadius: BorderRadius.circular(XyRadii.large),
+        border: Border.all(
+          color: dark ? XyColors.darkBorder : XyColors.lightBorder,
+        ),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black.withValues(alpha: dark ? 0.3 : 0.09),
+            blurRadius: 24,
+            offset: const Offset(0, 8),
+          ),
+        ],
+      ),
+      child: Row(
+        children: [
+          for (final item in items)
+            Expanded(
+              child: _BottomBarDestination(
+                destination: item,
+                selected: _destinationSelected(currentPath, item.path),
+                showLabel: showLabels,
+                onTap: () => context.go(item.path),
+              ),
+            ),
+        ],
+      ),
+    );
     return ClipRRect(
       borderRadius: BorderRadius.circular(XyRadii.large),
-      child: BackdropFilter.grouped(
-        filter: ui.ImageFilter.blur(sigmaX: 12, sigmaY: 12),
-        child: Container(
-          height: kBottomBarHeight,
-          decoration: BoxDecoration(
-            color: theme.colorScheme.surface.withValues(
-              alpha: dark ? .34 : .48,
-            ),
-            borderRadius: BorderRadius.circular(XyRadii.large),
-            border: Border.all(
-              color: dark ? XyColors.darkBorder : XyColors.lightBorder,
-            ),
-            boxShadow: [
-              BoxShadow(
-                color: Colors.black.withValues(alpha: dark ? 0.3 : 0.09),
-                blurRadius: 24,
-                offset: const Offset(0, 8),
+      // 【性能】底栏一级分页切换期间临时摘掉毛玻璃：切换时前后两页在全屏
+      // 尺寸上交叉淡化，模糊层每帧还要对变化中的整条栏宽背景重新采样，
+      // 两项开销叠在同一批帧上正把 raster 线程压爆。切换落定即恢复；
+      // 200ms 内只是少一层背景模糊，底色/描边/投影完全不变，观感差别极小。
+      child: ValueListenableBuilder<bool>(
+        valueListenable: xyBranchSwitchActive,
+        builder: (context, switching, child) => switching
+            ? child!
+            : BackdropFilter.grouped(
+                filter: ui.ImageFilter.blur(sigmaX: 12, sigmaY: 12),
+                child: child!,
               ),
-            ],
-          ),
-          child: Row(
-            children: [
-              for (final item in items)
-                Expanded(
-                  child: _BottomBarDestination(
-                    destination: item,
-                    selected: _destinationSelected(currentPath, item.path),
-                    showLabel: showLabels,
-                    onTap: () => context.go(item.path),
-                  ),
-                ),
-            ],
-          ),
-        ),
+        child: bar,
       ),
     );
   }
