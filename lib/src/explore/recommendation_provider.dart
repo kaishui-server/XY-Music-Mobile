@@ -45,8 +45,11 @@ void preloadExploreData(WidgetRef ref) {
 /// 已启用插件；不会把完整播放记录上传到服务端。
 final exploreRecommendationsProvider = FutureProvider<List<Song>>((ref) async {
   // 后台不刷新：到点若 App 在 hidden 则顺延，回前台后再重算推荐。
-  ref.onDispose(
-    scheduleRefreshWhenVisible(const Duration(minutes: 30), ref.invalidateSelf),
+  // 句柄在同步段构造即注册 onDispose 并立即计时（回收后不再触碰 ref）。
+  registerVisibleRefresh(
+    ref,
+    const Duration(minutes: 30),
+    ref.invalidateSelf,
   );
 
   final library = ref.read(libraryProvider).songs;
@@ -442,6 +445,7 @@ class DailyRecommendationState {
     required this.result,
     required this.sourceLabel,
     this.playlist,
+    this.sourceVisible = true,
   });
 
   final EnabledMusicPlugin plugin;
@@ -451,10 +455,57 @@ class DailyRecommendationState {
   /// 探索页音源切换与状态提示文案共用。
   final String sourceLabel;
   final RecommendedPlaylist? playlist;
+
+  /// 是否允许在探索页展示该来源插件名与歌单。Baka 插件未填写
+  /// 「用户 ID / 连接码」用户变量时为 false：即使插件返回了歌曲，
+  /// 也不输出来源与歌单（不占位、不灰态），由页面直接跳过该来源。
+  final bool sourceVisible;
 }
 
-/// 由插件名/ID 推导每日推荐音源的展示名。Baka 音源插件命名遵循
-/// 「Baka QQ 音乐 / 酷狗[T] / 酷我[T]」风格，按关键词优先匹配。
+/// Baka 音源插件中承载「用户 ID / 连接码」语义的用户变量键，逐字对齐
+/// 各音源脚本 `userVariables` 的声明：
+/// - `qq_user_id`：QQ 音乐，标签「用户 ID」（/connect 扫码后复制）
+/// - `kg_user_id`：酷狗，标签「用户 ID」，hint 为「酷狗连接码」
+/// - `kw_user_id`：酷我，标签「酷我连接码」
+/// - `wy_user_id`：网易云，标签「网易云连接码」
+///
+/// 其余变量（`SOURCE_API_KEY` / `SOURCE_API_URL` / `USE_SPONSORED_MV_API`
+/// 等）只影响取链或播放能力，不代表用户身份，不参与门禁判定。
+const dailyRecommendationSourceKeys = <String>{
+  'qq_user_id',
+  'kg_user_id',
+  'kw_user_id',
+  'wy_user_id',
+};
+
+/// 判断用户变量键是否属于「用户 ID / 连接码」语义。
+bool _isUserSourceVariableKey(String rawKey) {
+  final key = rawKey.trim().toLowerCase();
+  if (key.isEmpty) return false;
+  if (dailyRecommendationSourceKeys.contains(key)) return true;
+  // 后续接入的新 Baka 音源沿用 `<平台>_user_id` 命名，连接码另有
+  // `*_connect_code` 写法，一并纳入，避免每加一个音源就改一次门禁。
+  return key == 'user_id' ||
+      key.endsWith('_user_id') ||
+      key == 'connect_code' ||
+      key.endsWith('_connect_code');
+}
+
+/// 每日30首的来源展示门禁：只有 Baka 插件且用户已填写「用户 ID / 连接码」
+/// 类用户变量时，才允许展示该插件的来源名与歌单；未填写（变量缺失或值为
+/// 空/纯空白）时即使插件返回了歌曲也不展示。非 Baka 音源（MusicFree /
+/// 洛雪 / animemusic）的每日30首行为保持原样，不受此门禁影响。
+bool dailyRecommendationSourceVisible(EnabledMusicPlugin plugin) {
+  if (!plugin.isBaka) return true;
+  for (final entry in plugin.userVariables.entries) {
+    if (entry.value.trim().isEmpty) continue;
+    if (_isUserSourceVariableKey(entry.key)) return true;
+  }
+  return false;
+}
+
+/// 由插件名/ID 推导每日推荐音源的展示名。音源插件命名遵循
+/// 「Baka QQ 音乐 / 酷狗[T] / 酷我[T] / 网易云[T]」风格，按关键词优先匹配。
 String dailyRecommendationSourceLabel(EnabledMusicPlugin plugin) {
   final value = '${plugin.name} ${plugin.id}'.toLowerCase();
   if (value.contains('酷狗') ||
@@ -467,33 +518,49 @@ String dailyRecommendationSourceLabel(EnabledMusicPlugin plugin) {
       RegExp(r'\bkw\b').hasMatch(value)) {
     return '酷我';
   }
+  if (value.contains('网易云') ||
+      value.contains('netease') ||
+      RegExp(r'\bwy\b').hasMatch(value)) {
+    return '网易云';
+  }
   if (value.contains('qq') || value.contains('腾讯')) return 'QQ音乐';
   return plugin.name.trim().isEmpty ? '音乐' : plugin.name.trim();
 }
 
-/// 拉取**所有**支持每日推荐的 Baka 插件（QQ 音乐 / 酷狗 / 酷我）的今日
-/// 30 首歌单，按音源优先级（QQ → 酷狗 → 酷我 → 其它）稳定排序返回。
-/// 仅 Baka 协议插件会命中；无插件或插件不支持时返回空列表，探索页据此
-/// 隐藏「每日30首」Tab 或显示引导提示。
+/// 拉取**所有**支持每日推荐的音源插件（QQ 音乐 / 酷狗 / 酷我 / 网易云[T]）
+/// 的今日 30 首歌单，按音源优先级（QQ → 酷狗 → 酷我 → 其它）稳定排序返回。
+/// Baka 协议插件与声明了 getDailyRecommendations 的 MusicFree 订阅插件
+/// 均会命中；无插件或插件不支持时返回空列表，探索页据此隐藏「每日30首」
+/// Tab 或显示引导提示。
 ///
-/// 各音源的用户 ID 仍由各插件自行从自己的设置读取（酷狗/酷我的用户 ID
-/// 形如 kg_xxx / kw_xxx，密钥由订阅下发），宿主只负责聚合与展示。
+/// 各音源的用户 ID 仍由各插件自行从自己的设置读取（酷狗/酷我/网易云的
+/// 用户 ID 形如 kg_xxx / kw_xxx / wy_xxx，密钥由订阅下发），宿主只负责
+/// 聚合与展示。
 final dailyRecommendationsProvider =
     FutureProvider<List<DailyRecommendationState>>((ref) async {
   final plugins = await ref.read(enabledMusicPluginsProvider.future);
+  // 门禁收紧：每日30首只有 Baka 协议插件（QQ[L1]/酷狗[T]/酷我[T]/网易云[T]
+  // 等 baka 订阅源插件）与**静态扫描确认**实现了 getDailyRecommendations 的
+  // MusicFree 插件支持。LX 音源与 availableMethods 未识别（压缩/混淆）
+  // 的插件一律不进——mayHaveMethod 对未识别集合恒返回 true，放进来只会
+  // 让无此能力的插件也出现在「每日30首」里，点进去全是报错。
   final targets = <EnabledMusicPlugin>[
     for (final plugin in plugins)
-      // 只认 BakaMusic 契约插件；musicfree/洛雪/animemusic 一律跳过。
-      if (plugin.isBaka && plugin.mayHaveMethod('getDailyRecommendations'))
+      if (plugin.isBaka ||
+          (!plugin.isLx &&
+              plugin.availableMethods.contains('getDailyRecommendations')))
         plugin,
   ];
   if (targets.isEmpty) return const [];
 
   final runtime = ref.read(pluginRuntimeProvider);
   final tasks = targets.map((plugin) => () async {
+    // 来源门禁：Baka 插件未填写「用户 ID / 连接码」时不构造歌单，也不展示
+    // 来源插件名（结果本身照常拉取，供页面区分 unconfigured 等状态）。
+    final sourceVisible = dailyRecommendationSourceVisible(plugin);
     final result = await runtime.getDailyRecommendations(plugin);
     RecommendedPlaylist? playlist;
-    if (result.isReady && result.sheetItem != null) {
+    if (sourceVisible && result.isReady && result.sheetItem != null) {
       final sheet = result.sheetItem!;
       final rawData = Map<String, dynamic>.from(sheet);
       final id = sheet['id']?.toString() ?? '';
@@ -525,6 +592,7 @@ final dailyRecommendationsProvider =
       result: result,
       sourceLabel: dailyRecommendationSourceLabel(plugin),
       playlist: playlist,
+      sourceVisible: sourceVisible,
     );
   }());
   final states = (await Future.wait(tasks)).toList();
@@ -626,11 +694,11 @@ Future<List<Song>> _loadHotChartSongs(
 final explorePlaylistRecommendationsProvider =
     FutureProvider<List<RecommendedPlaylist>>((ref) async {
       // 后台不刷新：到点若 App 在 hidden 则顺延，回前台后再重拉歌单推荐。
-      ref.onDispose(
-        scheduleRefreshWhenVisible(
-          const Duration(minutes: 30),
-          ref.invalidateSelf,
-        ),
+      // 句柄在同步段构造即注册 onDispose 并立即计时（回收后不再触碰 ref）。
+      registerVisibleRefresh(
+        ref,
+        const Duration(minutes: 30),
+        ref.invalidateSelf,
       );
       final profile = await _loadTasteProfile(ref);
       if (profile == null) return const [];
@@ -788,8 +856,11 @@ final exploreHotChartsProvider = FutureProvider<List<RecommendedPlaylist>>((
   ref,
 ) async {
   // 后台不刷新：到点若 App 在 hidden 则顺延，回前台后再重拉榜单。
-  ref.onDispose(
-    scheduleRefreshWhenVisible(const Duration(minutes: 30), ref.invalidateSelf),
+  // 句柄在同步段构造即注册 onDispose 并立即计时（回收后不再触碰 ref）。
+  registerVisibleRefresh(
+    ref,
+    const Duration(minutes: 30),
+    ref.invalidateSelf,
   );
 
   // 依赖（watch）插件列表而非一次性 read：订阅更新/卸载/去重合并会

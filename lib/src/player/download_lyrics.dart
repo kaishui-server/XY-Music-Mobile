@@ -1,5 +1,7 @@
 import 'dart:convert';
 
+import '../plugins/plugin_runtime.dart';
+import '../plugins/qrc_decrypt.dart';
 import '../rust/api.dart';
 
 /// 有些插件会把 QRC/KRC 等歌词的密文直接放进播放结果。播放页解析器
@@ -161,9 +163,144 @@ Future<String> convertLyricsToEnhancedLrc(String raw) async {
 Future<String> normalizeLyricsForDownload(String raw) async {
   final text = raw.trim();
   if (text.isEmpty || !needsLyricNormalization(text)) return text;
-  final decoded = await convertLyricsToEnhancedLrc(text);
+  var decoded = await convertLyricsToEnhancedLrc(text);
+  if (decoded.isEmpty && looksLikeEncodedLyrics(text)) {
+    // Rust 解析器没拿下时用 Dart 侧 QRC 解密兜底：插件返回的常是
+    // musicu.fcg 的 crypt/qrc 密文，这条解密实现与播放页同源，避免
+    // 因为解析器分支条件不满足就把整首歌的歌词丢掉。
+    final plain = decryptQrcCipher(text)?.trim() ?? '';
+    if (plain.isNotEmpty) {
+      decoded = needsLyricNormalization(plain)
+          ? await convertLyricsToEnhancedLrc(plain)
+          : plain;
+    }
+  }
   if (decoded.isNotEmpty) return decoded;
   // hex 密文、QRC 容器 XML 解析失败时宁可不保存歌词，也不落盘乱码；
   // QRC/KRC 等可读的词级格式解析失败时保持原文，至少不丢歌词。
   return isUnreadableLyrics(text) ? '' : text;
+}
+
+String _normalizeForMatch(String s) =>
+    s.toLowerCase().replaceAll(RegExp(r'\s+'), '');
+
+Future<String?> _tryPluginLyrics(
+  PluginRuntimeService runtime,
+  EnabledMusicPlugin plugin,
+  Map<String, dynamic> pluginData,
+) async {
+  try {
+    final raw =
+        (await runtime
+                .getLyrics(plugin, pluginData)
+                .timeout(const Duration(seconds: 15)))
+            .trim();
+    if (raw.isEmpty) return null;
+    final normalized = await normalizeLyricsForDownload(raw);
+    return normalized.isEmpty ? null : normalized;
+  } catch (_) {
+    return null;
+  }
+}
+
+/// 在单个插件里按「标题 歌手」搜索，返回标题/歌手匹配度最高的一条。
+///
+/// 标题命中记 2 分、歌手命中记 1 分，至少 2 分才算同一首歌，避免把同名
+/// 不同曲的歌词写进文件。搜索失败或没有达标候选时返回 null。
+Future<PluginSearchSong?> _searchBestMatch(
+  PluginRuntimeService runtime,
+  EnabledMusicPlugin plugin,
+  String title,
+  String artist,
+) async {
+  final query = [title, artist]
+      .map((s) => s.trim())
+      .where((s) => s.isNotEmpty)
+      .join(' ');
+  if (query.isEmpty) return null;
+  final targetTitle = _normalizeForMatch(title);
+  final targetArtist = _normalizeForMatch(artist);
+  try {
+    final results = await runtime
+        .search(plugin, query)
+        .timeout(const Duration(seconds: 20));
+    PluginSearchSong? match;
+    var bestScore = 0;
+    for (final result in results.take(10)) {
+      var score = 0;
+      final resultTitle = _normalizeForMatch(result.title);
+      final resultArtist = _normalizeForMatch(result.artist);
+      if (resultTitle == targetTitle ||
+          (targetTitle.isNotEmpty &&
+              (resultTitle.contains(targetTitle) ||
+                  targetTitle.contains(resultTitle)))) {
+        score += 2;
+      }
+      if (targetArtist.isNotEmpty &&
+          (resultArtist.contains(targetArtist) ||
+              targetArtist.contains(resultArtist))) {
+        score += 1;
+      }
+      if (score > bestScore) {
+        bestScore = score;
+        match = result;
+      }
+    }
+    return bestScore >= 2 ? match : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+/// 下载歌词统一获取入口：
+/// 1. 本插件 getLyrics（QQ 返回 QRC 容器 XML、wy 返回 rawLrc 对象等均由
+///    [normalizeLyricsForDownload] 解码成标准增强 LRC）；
+/// 2. 本插件按「标题 歌手」重新搜索同一首再取词——订阅源歌曲的 pluginData
+///    可能缺 songmid/id（跨源分享、旧缓存、Baka 订阅源列表），插件按 id
+///    取词会直接失败，此时用搜索结果里的完整数据重试；
+/// 3. 本插件仍取不到（接口风控/无歌词能力/网络失败）时跨插件兜底：用
+///    「标题 歌手」在其他已启用插件搜索同名同歌手歌曲并取其歌词——各平台
+///    曲库歌词基本互通，单平台接口失效不再导致下载无歌词。
+/// 返回值已规范化为标准 LRC；全程取不到返回空串。
+Future<String> fetchLyricsForDownload({
+  required PluginRuntimeService runtime,
+  required List<EnabledMusicPlugin> plugins,
+  String? pluginId,
+  Map<String, dynamic>? pluginData,
+  required String title,
+  required String artist,
+}) async {
+  final ownId = pluginId?.trim() ?? '';
+
+  // 1) 本插件 getLyrics。
+  if (ownId.isNotEmpty && pluginData != null && pluginData.isNotEmpty) {
+    final own = plugins.where((candidate) => candidate.id == ownId).firstOrNull;
+    if (own != null) {
+      final text = await _tryPluginLyrics(runtime, own, pluginData);
+      if (text != null) return text;
+    }
+  }
+
+  // 2) 同插件搜索兜底：pluginData 不完整时按标题歌手找到同一首再取词。
+  if (ownId.isNotEmpty) {
+    final own = plugins.where((candidate) => candidate.id == ownId).firstOrNull;
+    if (own != null) {
+      final match = await _searchBestMatch(runtime, own, title, artist);
+      if (match != null) {
+        final text = await _tryPluginLyrics(runtime, own, match.rawData);
+        if (text != null) return text;
+      }
+    }
+  }
+
+  // 3) 跨插件兜底：逐个搜索「标题 歌手」，标题或歌手至少一项匹配才取词。
+  if ([title, artist].every((s) => s.trim().isEmpty)) return '';
+  for (final plugin in plugins) {
+    if (plugin.id == ownId) continue;
+    final match = await _searchBestMatch(runtime, plugin, title, artist);
+    if (match == null) continue;
+    final text = await _tryPluginLyrics(runtime, plugin, match.rawData);
+    if (text != null) return text;
+  }
+  return '';
 }

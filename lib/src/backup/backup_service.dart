@@ -125,6 +125,19 @@ class BackupExportOptions {
   bool get isEmpty => !favorites && !playlists && !plugins && !settings;
 }
 
+/// 组装好但尚未落盘的备份内容：文件名 + JSON 文本。
+///
+/// 本地导出（用户选保存位置）与 WebDAV 上传（直接上传到远端）共用
+/// 同一份组装结果，保证两条链路产出的备份格式完全一致。
+class BackupBlob {
+  const BackupBlob({required this.fileName, required this.json});
+
+  final String fileName;
+  final String json;
+
+  int get byteLength => utf8.encode(json).length;
+}
+
 /// 导入完成后的统计。
 class BackupImportResult {
   const BackupImportResult({
@@ -247,6 +260,22 @@ class BackupService {
   Future<String?> exportBackup({
     BackupExportOptions options = const BackupExportOptions(),
   }) async {
+    final blob = await buildBackupBlob(options: options);
+    final path = await FilePicker.platform.saveFile(
+      dialogTitle: '导出备份',
+      fileName: blob.fileName,
+      type: FileType.custom,
+      allowedExtensions: const ['json'],
+      bytes: utf8.encode(blob.json),
+    );
+    return (path == null || path.isEmpty) ? null : path;
+  }
+
+  /// 组装 v5 备份内容（不弹文件选择框）：供 WebDAV 上传等无界面链路
+  /// 复用与本地导出完全相同的组装逻辑与文件名。
+  Future<BackupBlob> buildBackupBlob({
+    BackupExportOptions options = const BackupExportOptions(),
+  }) async {
     final prefs = await SharedPreferences.getInstance();
     // 曲库元数据缓存表仅服务收藏/歌单恢复；音乐列表里本地歌的
     // 标题/歌手等元数据也从 songs 表补全。
@@ -305,19 +334,15 @@ class BackupService {
       'data': data,
     };
     final text = const JsonEncoder.withIndent('  ').convert(payload);
-    final now = DateTime.now();
+    return BackupBlob(fileName: buildBackupFileName(), json: text);
+  }
+
+  /// 备份文件名（与本地导出一致）：xy_music_backup_yyyyMMdd_HHmmss.json。
+  String buildBackupFileName([DateTime? now]) {
+    final dt = now ?? DateTime.now();
     String two(int v) => v.toString().padLeft(2, '0');
-    final fileName =
-        'xy_music_backup_${now.year}${two(now.month)}${two(now.day)}_'
-        '${two(now.hour)}${two(now.minute)}${two(now.second)}.json';
-    final path = await FilePicker.platform.saveFile(
-      dialogTitle: '导出备份',
-      fileName: fileName,
-      type: FileType.custom,
-      allowedExtensions: const ['json'],
-      bytes: utf8.encode(text),
-    );
-    return (path == null || path.isEmpty) ? null : path;
+    return 'xy_music_backup_${dt.year}${two(dt.month)}${two(dt.day)}_'
+        '${two(dt.hour)}${two(dt.minute)}${two(dt.second)}.json';
   }
 
   /// 把曲库 songs 表（columns + rows）转成 {path: 行 Map} 索引，
@@ -610,13 +635,28 @@ class BackupService {
     if (!await file.exists()) {
       throw const BackupException('备份文件不存在');
     }
-    final Object decoded;
+    final String raw;
     try {
-      decoded = jsonDecode(await file.readAsString());
-    } on FormatException {
-      throw const BackupException('文件损坏或不是有效的备份文件');
+      raw = await file.readAsString();
     } on FileSystemException {
       throw const BackupException('备份文件读取失败');
+    }
+    return decodeBackupText(raw, enabledPlugins: enabledPlugins);
+  }
+
+  /// 从备份 JSON 文本解析出待恢复数据（不读写本地文件）。
+  ///
+  /// WebDAV 恢复链路把远端下载到的 JSON 直接交给这里，与本地导入走
+  /// 完全相同的校验与解析逻辑；格式或版本不识别时抛 [BackupException]。
+  BackupData decodeBackupText(
+    String text, {
+    List<EnabledMusicPlugin> enabledPlugins = const [],
+  }) {
+    final Object decoded;
+    try {
+      decoded = jsonDecode(text);
+    } on FormatException {
+      throw const BackupException('文件损坏或不是有效的备份文件');
     }
     if (decoded is! Map<String, dynamic>) {
       throw const BackupException('文件损坏或不是有效的备份文件');

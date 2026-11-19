@@ -155,6 +155,23 @@ class _XyMusicAppState extends ConsumerState<XyMusicApp>
     Future.microtask(() => XyDeepLink.init(ref, appRouter));
     // 迷你播放器悬浮窗桥：接收原生按钮/进度条操作与通知栏单击回调。
     MiniPlayerOverlayBridge.init(ref);
+    // 原生闪退补录提示：上次闪退的日志（crash-exit-*.txt）由原生侧在
+    // 本次启动最初毫秒级写入并镜像到公共下载目录；「打开就闪退」的用户
+    // 拿不到应用私有目录，这里在进入界面后告知保存位置（只提示一次）。
+    Future.delayed(const Duration(seconds: 2), () async {
+      try {
+        final fresh = await AppLogStore.instance.unseenExitCrashReports();
+        if (fresh.isEmpty || !mounted) return;
+        XyNotice.show(
+          context,
+          type: XyNoticeType.warning,
+          duration: const Duration(seconds: 6),
+          message: '检测到上次闪退的崩溃日志（${fresh.length} 份），'
+              '已自动保存到「下载/XY Music/」目录；'
+              '也可在 设置→日志→崩溃记录 查看',
+        );
+      } catch (_) {}
+    });
   }
 
   @override
@@ -385,6 +402,9 @@ class _XyMusicAppState extends ConsumerState<XyMusicApp>
     final backgroundBlur =
         settings?.customBackgroundBlur ?? startup?.blur ?? 18.0;
     final backgroundFade = settings?.customBackgroundFade ?? 0.0;
+    // 壁纸显示方式：图片与视频动态背景共用同一份设置。
+    final backgroundFit =
+        settings?.backgroundFitMode ?? BackgroundFitMode.cover;
     _precacheBackground(backgroundPath);
     final accent = settings?.accentColor ?? 0xFFEC4141;
     final fontFamily = settings?.fontFamily ?? '';
@@ -433,6 +453,7 @@ class _XyMusicAppState extends ConsumerState<XyMusicApp>
                 imagePath: backgroundPath,
                 blur: backgroundBlur,
                 fade: backgroundFade,
+                fit: backgroundFit,
                 decodedImage: _decodedBackgroundPath == backgroundPath
                     ? _decodedBackgroundImage
                     : null,

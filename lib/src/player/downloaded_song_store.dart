@@ -150,3 +150,55 @@ Future<String> resolveDownloadStagingDirectory() async {
   await directory.create(recursive: true);
   return directory.path;
 }
+
+/// 默认下载文件命名模板（与旧硬编码 `artist-title` 行为一致）。
+const String kDefaultDownloadFilenameTemplate = '{artist} - {title}';
+
+/// 设置页「文件命名模板」内置预设（模板 → 显示名）。
+const Map<String, String> kDownloadFilenamePresets = {
+  '{artist} - {title}': '歌手 - 标题',
+  '{title} - {artist}': '标题 - 歌手',
+  '{title}': '仅标题',
+  '{artist} - {album} - {title}': '歌手 - 专辑 - 标题',
+  '{title} - {artist} - {quality}': '标题 - 歌手 - 音质',
+};
+
+/// 渲染下载文件命名模板。可用变量：{title} {artist} {album} {quality}
+/// {platform} {id}。缺失的变量替换为空串，随后折叠残留的 " - " 分隔符
+/// 与首尾空白；全部为空时回退标题（Rust 侧最终还会兜底「未知歌曲」）。
+/// {id} 从插件数据里尽力提取（id/songId/musicId），无则留空。
+String renderDownloadFilename(
+  String template, {
+  required String title,
+  required String artist,
+  String album = '',
+  String quality = '',
+  String platform = '',
+  Map<String, dynamic>? pluginData,
+}) {
+  String? pluginId() {
+    for (final key in const ['id', 'songId', 'musicId']) {
+      final value = pluginData?[key];
+      if (value != null && value.toString().trim().isNotEmpty) {
+        return value.toString().trim();
+      }
+    }
+    return null;
+  }
+
+  final values = <String, String?>{
+    'title': title.trim(),
+    'artist': artist.trim(),
+    'album': album.trim(),
+    'quality': quality.trim(),
+    'platform': platform.trim(),
+    'id': pluginId(),
+  };
+  final rendered = template
+      .trim()
+      .replaceAllMapped(RegExp(r'\{(\w+)\}'), (m) => values[m.group(1)] ?? '');
+  final collapsed = rendered
+      .replaceAll(RegExp(r'(\s*-\s*)+'), ' - ')
+      .replaceAll(RegExp(r'^[\s\-]+|[\s\-]+$'), '');
+  return collapsed.isEmpty ? title.trim() : collapsed;
+}

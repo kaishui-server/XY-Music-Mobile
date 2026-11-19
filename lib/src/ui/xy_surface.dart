@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 
 import 'xy_theme.dart';
 import 'xy_video_wallpaper.dart';
+import '../core/settings.dart' show BackgroundFitMode;
 
 /// 深色主题下整屏列表类页面（设置、账号）的半透明底色。
 ///
@@ -100,12 +101,16 @@ class XyAppBackground extends StatefulWidget {
     this.imagePath = '',
     this.blur = 18,
     this.fade = 0,
+    this.fit = BackgroundFitMode.cover,
     this.decodedImage,
   });
 
   final Widget child;
   final String imagePath;
   final double blur;
+
+  /// 壁纸铺放方式：图片与视频动态背景共用（居中裁剪 / 完全铺满）。
+  final BackgroundFitMode fit;
 
   /// 背景淡化强度（0~1）：叠加在基础蒙层之上，深色模式加深黑色蒙层、
   /// 浅色模式加深白色蒙层，数值越高壁纸越暗/越白。
@@ -121,6 +126,7 @@ class _XyAppBackgroundState extends State<XyAppBackground> {
   String? _layerPath;
   double? _layerBlur;
   double? _layerFade;
+  BackgroundFitMode? _layerFit;
   ui.Image? _layerImage;
   Brightness? _layerBrightness;
 
@@ -149,6 +155,7 @@ class _XyAppBackgroundState extends State<XyAppBackground> {
         _layerPath == path &&
         _layerBlur == blur &&
         _layerFade == fade &&
+        _layerFit == widget.fit &&
         identical(_layerImage, decodedImage) &&
         _layerBrightness == brightness) {
       return;
@@ -156,12 +163,14 @@ class _XyAppBackgroundState extends State<XyAppBackground> {
     _layerPath = path;
     _layerBlur = blur;
     _layerFade = fade;
+    _layerFit = widget.fit;
     _layerImage = decodedImage;
     _layerBrightness = brightness;
     _backgroundLayer = _buildBackgroundLayer(
       path: path,
       blur: blur,
       fade: fade,
+      fit: widget.fit,
       decodedImage: decodedImage,
       brightness: brightness,
     );
@@ -171,6 +180,7 @@ class _XyAppBackgroundState extends State<XyAppBackground> {
     required String path,
     required double blur,
     required double fade,
+    required BackgroundFitMode fit,
     required ui.Image? decodedImage,
     required Brightness brightness,
   }) {
@@ -181,18 +191,22 @@ class _XyAppBackgroundState extends State<XyAppBackground> {
     // 共享同一个 VideoPlayerController（见 XyVideoWallpaper 的租约池），
     // 渲染成本只是一次纹理采样，不会额外解码一份视频。
     final isVideo = xyIsVideoWallpaperPath(path);
+    // 显示方式：居中裁剪（等比铺满后裁切）/ 完全铺满（拉伸铺满）。
+    final boxFit = fit == BackgroundFitMode.fill
+        ? BoxFit.fill
+        : BoxFit.cover;
 
     Widget image() {
       if (decodedImage != null) {
         return RawImage(
           image: decodedImage,
-          fit: BoxFit.cover,
+          fit: boxFit,
           filterQuality: FilterQuality.low,
         );
       }
       return Image.file(
         File(path),
-        fit: BoxFit.cover,
+        fit: boxFit,
         cacheWidth: 1440,
         gaplessPlayback: true,
         filterQuality: FilterQuality.low,
@@ -201,7 +215,7 @@ class _XyAppBackgroundState extends State<XyAppBackground> {
     }
 
     Widget media() {
-      if (isVideo) return XyVideoWallpaper(path: path);
+      if (isVideo) return XyVideoWallpaper(path: path, fit: boxFit);
       return image();
     }
 

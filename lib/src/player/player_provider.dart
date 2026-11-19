@@ -18,6 +18,7 @@ import 'package:rxdart/rxdart.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../core/db_path.dart';
+import '../core/safe_state_notifier.dart';
 import '../core/settings.dart';
 import '../navigation/routes.dart';
 import '../cloud/cloud_credentials_store.dart';
@@ -333,6 +334,7 @@ class _RecognizedAudioSource {
     required this.url,
     this.headers = const {},
     this.lyrics = '',
+    this.ekey,
     this.plugin,
     this.pluginData,
   });
@@ -340,6 +342,10 @@ class _RecognizedAudioSource {
   final String url;
   final Map<String, String> headers;
   final String lyrics;
+
+  /// QQ 音乐 QMC ekey：mflac/mgg 加密流下载后解密用（播放走回环代理
+  /// 边拉边解，下载走 Rust 落盘后整文件解密，两边都不能丢）。
+  final String? ekey;
   final EnabledMusicPlugin? plugin;
   final Map<String, dynamic>? pluginData;
 }
@@ -349,6 +355,7 @@ class PlaybackDownloadSource {
     required this.url,
     this.headers = const {},
     this.lyrics = '',
+    this.ekey,
   });
 
   final String url;
@@ -357,6 +364,10 @@ class PlaybackDownloadSource {
   /// 解析音源时一并取得的歌词。批量下载的歌曲列表项通常尚未加载
   /// 歌词（lyricsRaw 为空），下载落盘 .lrc 时以此兜底。
   final String lyrics;
+
+  /// QMC ekey：下载加密流（mflac 等）后由 Rust 下载器整文件解密。
+  /// 缺失时加密流会原样落盘，产物无法播放、无标签无封面。
+  final String? ekey;
 }
 
 class PluginLyricsOption {
@@ -1115,7 +1126,7 @@ class _MediaSessionBridge extends audio_service.CompositeAudioHandler {
   }
 }
 
-class PlayerNotifier extends StateNotifier<PlaybackState>
+class PlayerNotifier extends SafeStateNotifier<PlaybackState>
     with WidgetsBindingObserver {
   PlayerNotifier(this._ref) : super(const PlaybackState()) {
     // 内存治理 ⑦：播放器实例以收紧缓冲的 load 配置创建（见
@@ -2656,7 +2667,12 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
     try {
       final cache = PaintingBinding.instance.imageCache;
       if (level >= 40) {
-        cache.clearLiveImages();
+        // 只 clear() 不 clearLiveImages()：clear() 不会销毁正在显示的
+        // 图（live 图由 widget 单独持有），被清掉的只是可重建的解码缓存；
+        // clearLiveImages() 会把正在显示的封面（迷你播放栏/列表可见项）
+        // 直接 dispose——切后台时 Android 必发 BACKGROUND(40)+ 级回调，
+        // 暂停状态下回前台无重建、Image provider 未变化不重新解码，
+        // 表现为播放栏封面一直空白（本地歌曲尤为明显）。
         cache.clear();
       } else {
         cache.maximumSize = 256;
@@ -2796,9 +2812,25 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
           .invokeMethod<Object?>('audioProbe')
           .timeout(const Duration(seconds: 2));
       // 主线程正常响应，无需处理。
+      _wedgeProbeTimeoutStreak = 0;
       return;
     } on TimeoutException {
-      playbackChainLog('[自愈] $reason（主线程 2s 未响应），重建播放器');
+      // 前台重负载（大列表滚动、批量封面解码）同样可能让主线程一次
+      // 往返超过 2s，单次超时不足以判定楔死；连续两个心跳周期（约 40s）
+      // 都无响应才重建，避免「做常规操作就被误伤重建打断」。
+      _wedgeProbeTimeoutStreak++;
+      if (_wedgeProbeTimeoutStreak < _wedgeProbeConfirmCycles) {
+        playbackChainLog(
+          '[自愈] 主线程探测超时（第 $_wedgeProbeTimeoutStreak 次），'
+          '等待下一周期二次确认',
+        );
+        return;
+      }
+      _wedgeProbeTimeoutStreak = 0;
+      playbackChainLog(
+        '[自愈] $reason（主线程连续 $_wedgeProbeConfirmCycles 次未响应），'
+        '重建播放器',
+      );
     } on PlatformException {
       // 通道不可用环境（非 Android 调试机等）不做楔死探测。
       return;
@@ -2939,6 +2971,21 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
   /// 播放器恢复（DSP 管线另有 2s 存活/停滞看门狗更快自愈）。
   double _heartbeatLastPos = -1;
 
+  /// 主线程楔死探测连续超时计数（心跳周期为粒度）：连续
+  /// [_wedgeProbeConfirmCycles] 次无响应才判定楔死并重建。
+  int _wedgeProbeTimeoutStreak = 0;
+
+  /// 楔死判定所需的心跳周期数：2 次（约 40s）。前台重负载的单次超时
+  /// 不再直接触发重建（重建即可听打断，误伤代价高）。
+  static const int _wedgeProbeConfirmCycles = 2;
+
+  /// 心跳停滞检测连续命中计数：连续 2 个周期（约 40s）都「20s 只前进
+  /// 不足 2s」才重建，前台重负载导致 UI 快照滞后的单周期误判不再打断。
+  int _heartbeatStallStreak = 0;
+
+  /// 停滞判定所需的连续周期数。
+  static const int _heartbeatStallConfirmCycles = 2;
+
   void _startPlayerHeartbeat() {
     _playerHeartbeatTimer?.cancel();
     _playerHeartbeatTimer = Timer.periodic(const Duration(seconds: 20), (_) {
@@ -2959,6 +3006,8 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
         // 暂停期间不检测停滞：恢复播放心跳重新从下一周期起算，
         // 避免用暂停前的旧 position 误判。
         _heartbeatLastPos = -1;
+        _heartbeatStallStreak = 0;
+        _wedgeProbeTimeoutStreak = 0;
         return;
       }
       // 进度停滞检测（通用，双周期确认）。
@@ -2974,13 +3023,27 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
         // 瞬间重建播放器，与切歌流程竞争造成突然停播无声。倒退只重置
         // 基准，真实停滞（advanced≈0）交给下一周期判定。
         if (advanced >= 0 && advanced < 2.0 && !nearEnd) {
+          _heartbeatStallStreak++;
           _heartbeatLastPos = -1;
+          if (_heartbeatStallStreak < _heartbeatStallConfirmCycles) {
+            // 单周期停滞不重建：前台重负载（大列表/图片解码）可能让
+            // UI 快照滞后一个周期，二次确认避免误伤。
+            playbackChainLog(
+              '[心跳] 疑似停滞（20s 仅前进 ${advanced.toStringAsFixed(1)}s），'
+              '等待下一周期二次确认',
+            );
+            return;
+          }
+          _heartbeatStallStreak = 0;
           unawaited(
             _rebuildPlayer(
-              '播放进度停滞（20s 仅前进 ${advanced.toStringAsFixed(1)}s）',
+              '播放进度停滞（连续 $_heartbeatStallConfirmCycles 个周期 '
+              '仅前进 ${advanced.toStringAsFixed(1)}s）',
             ),
           );
           return;
+        } else if (advanced >= 2.0 || nearEnd) {
+          _heartbeatStallStreak = 0;
         }
       }
       unawaited(_probeAndRebuild('播放心跳探测超时（主线程疑似楔死）'));
@@ -3826,27 +3889,27 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
     });
   }
 
-  /// 【核心修复③】后台停留时长阈值（毫秒）：超过即认为 ExoPlayer 的
-  /// AudioSink 可能已静默失活，回前台需强制重建输出单元。
+  /// 【核心修复③】「长后台窗口」阈值（毫秒）：回前台统一走惰性探测，
+  /// 该阈值只用于放宽长后台的探测窗口（解冻后引擎恢复推进更慢，短窗口
+  /// 的 1.8s 探测容易把「解冻慢」误判成「失活」）。
   ///
-  /// 【P0-1】5s → 60s 的调整依据（荣誉机实测 89 分钟日志）：
-  /// - 5s 阈值下单机触发了 19 次重建，绝大多数后台窗口只有 8~27s
-  ///   （10058 / 11170 / 14865 / 19373 / 21823 / 27648ms），这些短窗口里
-  ///   AudioSink 实际并未被回收，pause→seek→play 纯属误伤；
-  /// - 每次误伤都制造一次可听断音，seek 落入未缓存区间时还会阻塞
-  ///   6~28s，用户感知为「播放被反复暂停又继续」；
-  /// - 真正会被系统回收 AudioSink 的场景（省电冻结、音频焦点被长期
-  ///   抢占）在实测日志里是 191s / 188s 量级，60s 仍留足覆盖余量；
-  /// - 60s 以内不再无脑重建，改由 [_scheduleLazySinkProbe] 的惰性检测
-  ///   兜底（回前台等 1.5~2s 看引擎是否真的在走），见 P0-0。
-  /// 可按机型/ROM 实测调整：调大更保守（少打断），调小更激进（多兜底）。
-  static const int _audioSinkReattachMinBackgroundMs = 60000;
+  /// 【P0-1】历史教训（荣誉机实测 89 分钟日志）：5s 阈值下单机触发 19 次
+  /// 重建，绝大多数后台窗口只有 8~27s，AudioSink 实际并未被回收，
+  /// pause→seek→play 纯属误伤；每次误伤都制造一次可听断音，seek 落入
+  /// 未缓存区间时还会阻塞 6~28s。曾按 60s 分级「超阈值立即重建」，但
+  /// 实际上 AudioSink 未失活的 ≥60s 窗口同样被误伤——回前台必断一下。
+  /// 最终改为任何时长都先惰性探测（引擎推进 → 零动作），见 P0-0。
+  static const int _audioSinkLongBackgroundMs = 60000;
 
   /// 【P0-0】回前台惰性检测的延迟（毫秒）：回前台后不立即判定，先记
   /// 一次引擎 position 快照，等这么久再看是否推进。取 1800ms 的原因：
   /// 太小会撞上 ExoPlayer 解冻后重新填充缓冲的启动期（position 尚未恢复
   /// 推进，容易误判为「未推进」）；太大则真失活场景的静默时间过长。
   static const int _audioSinkLazyProbeDelayMs = 1800;
+
+  /// 长后台（≥[_audioSinkLongBackgroundMs]）回前台的探测延迟（毫秒）：
+  /// 省电冻结解冻后 ExoPlayer 重新填充缓冲更慢，放宽到 3s 再判定。
+  static const int _audioSinkLazyProbeDelayLongMs = 3000;
 
   /// 【P0-0】判定「引擎未推进」的容忍量（毫秒）：延迟窗口内引擎 position
   /// 推进量小于该值即视为停摆，才执行 AudioSink 重建。1800ms 窗口内正常
@@ -3864,7 +3927,7 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
   static const int _audioSinkReattachMinBufferedAheadMs = 2000;
 
   /// 进入非前台状态的最早时刻（一次后台窗口只记一次），用于计算后台
-  /// 停留时长；按 [_audioSinkReattachMinBackgroundMs] 判定后复位。
+  /// 停留时长；回前台惰性探测完成后复位。
   DateTime? _backgroundedAt;
 
   /// 【P0-0】惰性检测计时器：回前台后延迟 [_audioSinkLazyProbeDelayMs]
@@ -4007,8 +4070,12 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
     _audioSinkLazyProbeTimer = null;
     final baselineMs = _player.position.inMilliseconds;
     final probeToken = ++_audioSinkProbeToken;
+    // 长后台解冻更慢，探测窗口放宽，避免「解冻慢」被误判成「失活」。
+    final delayMs = backgroundMs >= _audioSinkLongBackgroundMs
+        ? _audioSinkLazyProbeDelayLongMs
+        : _audioSinkLazyProbeDelayMs;
     _audioSinkLazyProbeTimer = Timer(
-      const Duration(milliseconds: _audioSinkLazyProbeDelayMs),
+      Duration(milliseconds: delayMs),
       () {
         _audioSinkLazyProbeTimer = null;
         // 探测排到队后，期间若切了后台、切了歌或停止了播放，一律作废：
@@ -4087,16 +4154,10 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
         final backgroundMs =
             DateTime.now().difference(backgroundedAt).inMilliseconds;
         if (this.state.isPlaying) {
-          if (backgroundMs >= _audioSinkReattachMinBackgroundMs) {
-            // 超过 60s：属于能真正回收 AudioSink 的窗口（实测 191s / 188s
-            // 量级），引擎必坏，直接重建，不再多等一个探测窗口的静默。
-            unawaited(_reattachAudioSink(backgroundMs));
-          } else {
-            // 【P0-0】60s 以内：不立即判定重建，改为惰性检测——回前台后
-            // 延迟 1.5~2s 看引擎 position 有没有真的推进，推进了则完全
-            // 不动（零 pause/seek、零断音），未推进才走重建。
-            _scheduleLazySinkProbe(backgroundMs);
-          }
+          // 统一走惰性探测：先看引擎是否真的在推进，未推进才重建。
+          // 不再按 60s 阈值立即 pause→seek→play——AudioSink 未失活时
+          // 这是一次纯误伤的可听打断（「回前台就断一下」的主要来源）。
+          _scheduleLazySinkProbe(backgroundMs);
         }
       }
       // 回前台：统计周期刷写后台暂停期间累积的时长一次补齐（见
@@ -6980,7 +7041,8 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
       final lyrics =
           preferences.getString('$_rememberedLyricsPrefix$key')?.trim() ?? '';
       if (lyrics.isEmpty) return null;
-      final index = _ensureRememberedLyricsIndexLoaded(preferences);
+      // 仅为触发索引加载的副作用，返回值不使用。
+      _ensureRememberedLyricsIndexLoaded(preferences);
       _touchRememberedLyricsIndex(key);
       return lyrics;
     } catch (_) {
@@ -6996,7 +7058,8 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
     try {
       final preferences = await SharedPreferences.getInstance();
       await preferences.setString('$_rememberedLyricsPrefix$key', value);
-      final index = _ensureRememberedLyricsIndexLoaded(preferences);
+      // 仅为触发索引加载的副作用，返回值不使用。
+      _ensureRememberedLyricsIndexLoaded(preferences);
       _touchRememberedLyricsIndex(key);
     } catch (_) {}
   }
@@ -7339,6 +7402,7 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
           url: media.url,
           headers: media.headers,
           lyrics: media.lyrics,
+          ekey: media.ekey,
           plugin: lxPlugin,
         );
       }
@@ -7385,6 +7449,7 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
         url: media.url,
         headers: media.headers,
         lyrics: media.lyrics,
+        ekey: media.ekey,
         plugin: plugin,
         pluginData: data,
       );
@@ -7450,6 +7515,7 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
           url: media.url,
           headers: media.headers,
           lyrics: media.lyrics,
+          ekey: media.ekey,
           plugin: candidate.plugin,
           pluginData: candidate.song.rawData,
         );
@@ -7487,6 +7553,7 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
             url: media.url,
             headers: media.headers,
             lyrics: media.lyrics,
+            ekey: media.ekey,
             plugin: plugin,
             pluginData: {'lx': songInfo},
           );
@@ -8724,6 +8791,7 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
           url: source.url,
           headers: source.headers,
           lyrics: lyrics,
+          ekey: source.ekey,
         );
       case PlaybackSourceType.lx:
         final rawLx = item.pluginData?['lx'];
@@ -8741,6 +8809,7 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
             url: owned.url,
             headers: owned.headers,
             lyrics: owned.lyrics,
+            ekey: owned.ekey,
           );
         }
         final cached = await _resolveCachedRecognizedPlugin(
@@ -8767,6 +8836,7 @@ class PlayerNotifier extends StateNotifier<PlaybackState>
           url: source.url,
           headers: source.headers,
           lyrics: source.lyrics,
+          ekey: source.ekey,
         );
       case PlaybackSourceType.networkUrl:
         return PlaybackDownloadSource(url: item.path);

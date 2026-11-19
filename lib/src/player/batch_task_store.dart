@@ -4,6 +4,8 @@ import 'dart:convert';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import '../core/safe_state_notifier.dart';
+
 import 'download_history_store.dart' show DownloadProgressSink;
 
 /// 批量任务类型：批量下载 / 批量换源。
@@ -190,7 +192,7 @@ const kBatchTaskLimit = 200;
 const _batchTaskKey = 'batchTasksV1';
 Future<void> _writeQueue = Future<void>.value();
 
-class BatchTaskNotifier extends StateNotifier<List<BatchTask>> {
+class BatchTaskNotifier extends SafeStateNotifier<List<BatchTask>> {
   BatchTaskNotifier() : super(const []) {
     _load();
   }

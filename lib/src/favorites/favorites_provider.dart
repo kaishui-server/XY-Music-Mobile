@@ -4,6 +4,7 @@ import 'dart:convert';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import '../core/safe_state_notifier.dart';
 import '../library/library_provider.dart';
 import '../player/player_provider.dart';
 import '../plugins/plugin_runtime.dart';
@@ -148,7 +149,7 @@ class FavoriteSongSnapshot {
 ///
 /// 本地歌曲仍按路径交给 Rust 查询；网络歌曲额外在 SharedPreferences 中保存快照，
 /// 避免把 `plugin://` 虚拟路径误当成本地曲库路径后丢失。
-class FavoritesNotifier extends StateNotifier<Set<String>> {
+class FavoritesNotifier extends SafeStateNotifier<Set<String>> {
   FavoritesNotifier() : super(const {}) {
     _loaded = _load();
   }

@@ -791,17 +791,20 @@ class _RecommendationTabsState extends ConsumerState<_RecommendationTabs>
   @override
   void didChangeDependencies() {
     super.didChangeDependencies();
-    // 插件列表异步加载完成前 valueOrNull 为 null，按无 Baka 处理；
+    // 插件列表异步加载完成前 valueOrNull 为 null，按无每日推荐处理；
     // 数据到达后本回调会再次触发，届时再补齐第三个 Tab。
-    // 与 dailyRecommendationsProvider 的选型条件保持一致：必须是
-    // Baka 协议且可能声明 getDailyRecommendations 的插件才显示入口。
+    // 与 dailyRecommendationsProvider 的选型条件保持一致：Baka 协议
+    // 插件，或静态扫描确认实现了 getDailyRecommendations 的 MusicFree
+    // 订阅插件才显示入口；LX/未识别插件不显示（无此能力）。
     final hasDaily30 = ref
             .watch(enabledMusicPluginsProvider)
             .valueOrNull
             ?.any(
               (plugin) =>
-                  plugin.isBaka &&
-                  plugin.mayHaveMethod('getDailyRecommendations'),
+                  plugin.isBaka ||
+                  (!plugin.isLx &&
+                      plugin.availableMethods
+                          .contains('getDailyRecommendations')),
             ) ??
         false;
     if (hasDaily30 == _hasDaily30Plugin) return;
@@ -955,16 +958,30 @@ class _Daily30RecommendationContentState
                 detail: '当前没有支持每日推荐的 Baka 音乐插件，安装后即可使用',
               );
             }
+            // 来源门禁：Baka 插件未填写「用户 ID / 连接码」时不展示其来源名
+            // 与歌单（即使插件返回了歌曲），既不留空位也不做灰态占位。
+            final visible = states
+                .where((state) => state.sourceVisible)
+                .toList();
+            if (visible.isEmpty) {
+              return _RecommendationMessage(
+                message: '每日 30 首需要先连接账号',
+                detail:
+                    '到「设置 - 音乐插件」为 Baka 音源填写用户 ID / 连接码（酷狗/酷我/网易云为 kg_xxx / kw_xxx / wy_xxx 格式），即可查看每日 30 首',
+                onRetry: () => context.push<void>('/settings/plugins'),
+                actionLabel: '去设置',
+              );
+            }
             // 未配置用户 ID 的音源不展示（空列表无意义）；全部未配置时给
-            // 一条汇总引导，指明需要填写的插件。
-            final usable = states
+            // 一条汇总引导（不再列出插件名，来源名称仅在已连接后展示）。
+            final usable = visible
                 .where((state) => state.result.state != 'unconfigured')
                 .toList();
             if (usable.isEmpty) {
-              final names = states.map((s) => s.plugin.name).join('、');
               return _RecommendationMessage(
                 message: '尚未配置用户 ID',
-                detail: '到插件设置为$names填写用户 ID（酷狗/酷我为 kg_xxx / kw_xxx 格式），即可开启你的每日 30 首',
+                detail:
+                    '到「设置 - 音乐插件」填写用户 ID / 连接码（酷狗/酷我/网易云为 kg_xxx / kw_xxx / wy_xxx 格式），即可开启你的每日 30 首',
                 onRetry: () => context.push<void>('/settings/plugins'),
                 actionLabel: '去设置',
               );
@@ -1030,7 +1047,7 @@ class _Daily30RecommendationContentState
       case 'unconfigured':
         return _RecommendationMessage(
           message: '尚未配置$source用户 ID',
-          detail: '进入插件设置，填写$source插件的"用户 ID"（酷狗/酷我为 kg_xxx / kw_xxx 格式），即可开启你的每日 30 首',
+          detail: '进入插件设置，填写$source插件的"用户 ID"（酷狗/酷我/网易云为 kg_xxx / kw_xxx / wy_xxx 格式），即可开启你的每日 30 首',
           onRetry: () => context.push<void>('/settings/plugins'),
           actionLabel: '去设置',
         );

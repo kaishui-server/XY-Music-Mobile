@@ -925,6 +925,10 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
     VideoPlaybackSession.error = null;
     VideoPlaybackSession.changed();
     try {
+      // 让位时序：上面的 setState 只是把 MV 覆盖层排进下一帧构建，动态
+      // 壁纸的挂起与解码器释放在那一帧才真正发生。先等这一帧结束再取流
+      // 起播，避免 MV 解码器与尚未释放的背景解码器在起播瞬间并存争抢。
+      await WidgetsBinding.instance.endOfFrame;
       // MV 请求「最高档」哨兵值 2160P：baka 系插件按可用档位自动回落
       // 并在返回值里给出实际画质；B 站视频歌曲请求 1080P（匿名最高档）。
       final initialQuality = isMv ? '2160P' : '1080P';
@@ -1515,11 +1519,18 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
           ? await resolveDownloadStagingDirectory()
           : downloadDirectory;
       await Directory(workDirectory).create(recursive: true);
-      final basename = await buildDownloadBasename(
+      final videoTemplate =
+          ref.read(settingsProvider).valueOrNull?.downloadFilenameTemplate ??
+          kDefaultDownloadFilenameTemplate;
+      // 视频基名同样走命名模板；画质后缀保持原有行为（模板里 {quality}
+      // 留空，避免与后缀重复）。
+      final basename = renderDownloadFilename(
+        videoTemplate,
         title: item.title,
         artist: item.artist,
         album: item.album,
-        fileNameStyle: 'artist-title',
+        platform: item.pluginId ?? '',
+        pluginData: item.pluginData,
       );
       final fileName = '$basename [$_displayVideoQuality].mp4';
       final destination = await resolveDownloadPath(
@@ -2989,43 +3000,32 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
 
   Future<String> _lyricsForDownload(QueueItem item) async {
     final raw = item.lyricsRaw?.trim() ?? '';
-    if (raw.isEmpty || !needsLyricNormalization(raw)) return raw;
-
-    // 先用 Rust 歌词解析器解码 QRC/KRC 密文、QRC 容器 XML 与非标准词级
-    // 时间轴，再把展示行写成标准增强 LRC（`[行]<词起>词…<词束>`），
-    // 保证第三方播放器也能显示逐字。
-    final decoded = await convertLyricsToEnhancedLrc(raw);
-    if (decoded.isNotEmpty) return decoded;
-
-    // 部分插件的搜索结果携带的是损坏的 lyric 字段，但 getLyrics 接口
-    // 会返回正常正文；重新请求一次并同样规范化，避免把密文或非标准
-    // 时间轴写入文件。
-    final pluginId = item.pluginId?.trim() ?? '';
-    final pluginData = item.pluginData;
-    if (pluginId.isNotEmpty && pluginData != null) {
-      try {
-        final plugins = await ref.read(enabledMusicPluginsProvider.future);
-        final plugin = plugins
-            .where((candidate) => candidate.id == pluginId)
-            .firstOrNull;
-        if (plugin != null) {
-          final retry =
-              (await ref
-                      .read(pluginRuntimeProvider)
-                      .getLyrics(plugin, pluginData))
-                  .trim();
-          if (retry.isNotEmpty) {
-            final retryDecoded = await convertLyricsToEnhancedLrc(retry);
-            if (retryDecoded.isNotEmpty) return retryDecoded;
-            if (!isUnreadableLyrics(retry)) return retry;
-          }
-        }
-      } catch (_) {
-        // 歌词属于下载附加项，重新获取失败不应影响音频下载。
-      }
+    if (raw.isNotEmpty && !needsLyricNormalization(raw)) return raw;
+    if (raw.isNotEmpty) {
+      // 先用 Rust 歌词解析器解码 QRC/KRC 密文、QRC 容器 XML 与非标准词级
+      // 时间轴，再把展示行写成标准增强 LRC（`[行]<词起>词…<词束>`），
+      // 保证第三方播放器也能显示逐字。
+      final decoded = await convertLyricsToEnhancedLrc(raw);
+      if (decoded.isNotEmpty) return decoded;
+      if (!isUnreadableLyrics(raw)) return raw;
     }
-    // 无法可靠解码时宁可不保存歌词，也不要生成用户无法阅读的乱码文件。
-    return isUnreadableLyrics(raw) ? '' : raw;
+    // 歌词为空（列表/批量下载场景 lyricsRaw 常为空，且 QQ/wy 等插件的
+    // getMediaSource 不带歌词）或密文不可解码时走统一获取入口：
+    // 本插件 getLyrics → 跨插件兜底（同名词取词），再规范化落盘。
+    try {
+      final plugins = await ref.read(enabledMusicPluginsProvider.future);
+      return await fetchLyricsForDownload(
+        runtime: ref.read(pluginRuntimeProvider),
+        plugins: plugins,
+        pluginId: item.pluginId?.trim(),
+        pluginData: item.pluginData,
+        title: item.title,
+        artist: item.artist,
+      );
+    } catch (_) {
+      // 歌词属于下载附加项，获取失败不应影响音频下载。
+      return isUnreadableLyrics(raw) ? '' : raw;
+    }
   }
 
   Future<void> _downloadCurrent(QueueItem item) async {
@@ -3181,11 +3181,22 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
       if (ref.read(playerProvider).current?.path != item.path) {
         throw Exception('歌曲已切换，请重新选择下载');
       }
-      final destination = await resolveDownloadFullPath(
-        directory: workDirectory,
+      // 文件名按设置页命名模板渲染（默认「歌手 - 标题」，与旧行为一致）。
+      final settings = ref.read(settingsProvider).valueOrNull;
+      final filenameBase = renderDownloadFilename(
+        settings?.downloadFilenameTemplate ?? kDefaultDownloadFilenameTemplate,
         title: item.title,
         artist: item.artist,
         album: item.album,
+        quality: quality,
+        platform: item.pluginId ?? '',
+        pluginData: item.pluginData,
+      );
+      final destination = await resolveDownloadFullPath(
+        directory: workDirectory,
+        title: filenameBase,
+        artist: '',
+        album: '',
         url: source.url,
         quality: quality,
         keepSourceFilename: false,
@@ -3201,6 +3212,7 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
         download: () => downloadOnlineSong(
           url: source.url,
           destPath: destination,
+          ekey: source.ekey,
           headersJson: jsonEncode(source.headers),
         ),
       );
@@ -3218,11 +3230,13 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
         lyrics = await normalizeLyricsForDownload(source.lyrics);
       }
       final coverUrl = item.coverUrl?.trim() ?? '';
+      // 「下载歌词」管 .lrc 旁车文件，「写入元数据」把歌词写进音频标签；
+      // 只开后者时也需要带上歌词文本，否则下载出来的文件没有内嵌歌词。
+      final wantLyricsFile = settings?.downloadLyrics ?? true;
       await finalizeDownloadExtras(
         requestJson: jsonEncode({
-          if ((settings?.downloadLyrics ?? true) && lyrics.isNotEmpty)
-            'lyricsText': lyrics,
-          if ((settings?.downloadLyrics ?? true) && lyrics.isNotEmpty)
+          if (wantLyricsFile && lyrics.isNotEmpty) 'lyricsText': lyrics,
+          if (wantLyricsFile && lyrics.isNotEmpty)
             'lyricsPath': p.setExtension(verified.path, '.lrc'),
           if (coverUrl.startsWith('http://') || coverUrl.startsWith('https://'))
             'coverUrl': coverUrl,
@@ -3521,30 +3535,36 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
         if (current?.artist.isNotEmpty == true) current!.artist,
         _displayVideoQuality,
       ].join(' · ');
-      return Scaffold(
-        backgroundColor: Colors.black,
-        body: _BilibiliVideoView(
-          controller: _videoController,
-          loading: _videoLoading,
-          error: _videoError,
-          landscape: _videoLandscape,
-          onToggleOrientation: () => unawaited(_toggleVideoOrientation()),
-          onClose: () => unawaited(_closeBilibiliVideo()),
-          title: current?.title ?? '',
-          subtitle: videoSubtitle,
-          onPickSpeed: () => unawaited(_pickVideoSpeed()),
-          onPickQuality: () => unawaited(_pickVideoQuality()),
-          onToggleMute: () => unawaited(_toggleVideoMute()),
-          onDownload: () => unawaited(_downloadCurrentVideo()),
-          onReload: () => unawaited(_reloadVideoPlayback()),
-          onSelectQuality: (quality) {
-            if (_videoLoading) return;
-            unawaited(_switchVideoQuality(quality));
-          },
-          qualityChoices: _videoAvailableQualities.isNotEmpty
-              ? _videoAvailableQualities
-              : const ['1080P', '720P', '480P'],
-          currentQuality: _videoQuality,
+      // MV 独占解码器：本页全屏黑底 + 一路视频，背景动态壁纸既不可见，
+      // 又会与 MV 争抢硬件解码器、参与纹理合成（MV 默认 2160P），表现就是
+      // MV 画面闪烁掉帧。用让位作用域把视频壁纸整体挂起并释放，退出 MV
+      // 回到详情页时自动恢复，两者彻底隔开、不再同窗口并存。
+      return XyVideoWallpaperSuspendScope(
+        child: Scaffold(
+          backgroundColor: Colors.black,
+          body: _BilibiliVideoView(
+            controller: _videoController,
+            loading: _videoLoading,
+            error: _videoError,
+            landscape: _videoLandscape,
+            onToggleOrientation: () => unawaited(_toggleVideoOrientation()),
+            onClose: () => unawaited(_closeBilibiliVideo()),
+            title: current?.title ?? '',
+            subtitle: videoSubtitle,
+            onPickSpeed: () => unawaited(_pickVideoSpeed()),
+            onPickQuality: () => unawaited(_pickVideoQuality()),
+            onToggleMute: () => unawaited(_toggleVideoMute()),
+            onDownload: () => unawaited(_downloadCurrentVideo()),
+            onReload: () => unawaited(_reloadVideoPlayback()),
+            onSelectQuality: (quality) {
+              if (_videoLoading) return;
+              unawaited(_switchVideoQuality(quality));
+            },
+            qualityChoices: _videoAvailableQualities.isNotEmpty
+                ? _videoAvailableQualities
+                : const ['1080P', '720P', '480P'],
+            currentQuality: _videoQuality,
+          ),
         ),
       );
     }
@@ -6659,6 +6679,11 @@ class PlayerDetailBackground extends ConsumerWidget {
     final wallpaperPath = settings?.customBackgroundPath.trim() ?? '';
     final detailImagePath = settings?.playerDetailCustomImagePath.trim() ?? '';
     final wallpaperBlur = settings?.customBackgroundBlur ?? 18.0;
+    // 壁纸显示方式只作用于自定义壁纸；详情页自定义图片保持原有等比裁剪。
+    final wallpaperFit = switch (settings?.backgroundFitMode) {
+      BackgroundFitMode.fill => BoxFit.fill,
+      _ => BoxFit.cover,
+    };
 
     final backdrop = switch (mode) {
       // 封面模糊背景已移除：统一回退为氛围背景。
@@ -6668,7 +6693,12 @@ class PlayerDetailBackground extends ConsumerWidget {
             ? _ambientBackdrop(current)
             // 轻量模式下去掉壁纸模糊（转场期每帧重栅格化太贵），
             // 图片本体保留，落定后再叠回模糊。
-            : _wallpaperBackdrop(wallpaperPath, wallpaperBlur, blurred: !lite),
+            : _wallpaperBackdrop(
+                wallpaperPath,
+                wallpaperBlur,
+                blurred: !lite,
+                fit: wallpaperFit,
+              ),
       PlayerDetailBackgroundMode.flowingLight => _ambientBackdrop(current),
       PlayerDetailBackgroundMode.customImage =>
         detailImagePath.isEmpty
@@ -6739,15 +6769,20 @@ class PlayerDetailBackground extends ConsumerWidget {
     );
   }
 
-  Widget _wallpaperBackdrop(String path, double blur, {required bool blurred}) {
+  Widget _wallpaperBackdrop(
+    String path,
+    double blur, {
+    required bool blurred,
+    BoxFit fit = BoxFit.cover,
+  }) {
     // 自定义壁纸/详情页图片可以是动态视频。视频层在转场期（lite）暂停，
     // 避免每帧换纹理把整棵面板子树拖进逐帧重栅格化。
     final isVideo = xyIsVideoWallpaperPath(path);
     Widget image = isVideo
-        ? XyVideoWallpaper(path: path, paused: lite)
+        ? XyVideoWallpaper(path: path, paused: lite, fit: fit)
         : Image.file(
             File(path),
-            fit: BoxFit.cover,
+            fit: fit,
             cacheWidth: 1440,
             gaplessPlayback: true,
             filterQuality: FilterQuality.low,

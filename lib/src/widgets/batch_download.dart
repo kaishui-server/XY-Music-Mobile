@@ -12,7 +12,8 @@ import '../player/android_storage.dart';
 import '../player/batch_task_store.dart';
 import '../player/download_history_store.dart';
 import '../player/download_lyrics.dart';
-import '../plugins/plugin_runtime.dart' show qualityDisplayLabel;
+import '../plugins/plugin_runtime.dart'
+    show enabledMusicPluginsProvider, pluginRuntimeProvider, qualityDisplayLabel;
 import '../player/download_quality.dart';
 import '../player/downloaded_song_store.dart';
 import '../player/player_provider.dart';
@@ -473,11 +474,21 @@ Future<void> runBatchDownload(
           song.toQueueItem(),
           options.quality,
         );
-        final destination = await resolveDownloadFullPath(
-          directory: workDirectory,
+        // 文件名按设置页命名模板渲染（默认「歌手 - 标题」，与旧行为一致）。
+        final filenameBase = renderDownloadFilename(
+          settings?.downloadFilenameTemplate ?? kDefaultDownloadFilenameTemplate,
           title: song.title,
           artist: song.artist,
           album: song.album,
+          quality: options.quality,
+          platform: song.pluginId ?? '',
+          pluginData: song.pluginData,
+        );
+        final destination = await resolveDownloadFullPath(
+          directory: workDirectory,
+          title: filenameBase,
+          artist: '',
+          album: '',
           url: source.url,
           quality: options.quality,
           keepSourceFilename: false,
@@ -494,6 +505,7 @@ Future<void> runBatchDownload(
           download: () => downloadOnlineSong(
             url: source.url,
             destPath: destination,
+            ekey: source.ekey,
             headersJson: jsonEncode(source.headers),
           ),
         );
@@ -506,19 +518,37 @@ Future<void> runBatchDownload(
         );
         if (verified.warning != null) downgraded.add(verified.warning!);
         // 列表歌曲的 lyricsRaw 多为空（歌词只在播放时加载），音源解析
-        // 返回的歌词兜底；QRC/KRC 密文解码为标准 LRC 再落盘。
-        final rawLyrics = song.lyricsRaw?.trim().isNotEmpty == true
-            ? song.lyricsRaw!.trim()
-            : source.lyrics.trim();
-        final lyrics = (settings?.downloadLyrics ?? true)
-            ? await normalizeLyricsForDownload(rawLyrics)
-            : '';
+        // 返回的歌词兜底；仍为空时走统一获取入口（本插件 getLyrics →
+        // 跨插件兜底同名词取词）。QRC/KRC 密文解码为标准 LRC 再落盘。
+        var lyrics = '';
+        // 两个开关管的是不同产物：「下载歌词」写 .lrc 旁车文件，「写入元
+        // 数据」把歌词塞进音频标签。任一开启都需要取歌词——原实现只认前
+        // 一个开关，用户只开「写入元数据」时下载出来的文件没有内嵌歌词。
+        final wantLyricsFile = settings?.downloadLyrics ?? true;
+        final wantEmbedLyrics = options.writeMetadata;
+        if (wantLyricsFile || wantEmbedLyrics) {
+          final rawLyrics = song.lyricsRaw?.trim().isNotEmpty == true
+              ? song.lyricsRaw!.trim()
+              : source.lyrics.trim();
+          if (rawLyrics.isNotEmpty) {
+            lyrics = await normalizeLyricsForDownload(rawLyrics);
+          }
+          if (lyrics.isEmpty) {
+            lyrics = await fetchLyricsForDownload(
+              runtime: ref.read(pluginRuntimeProvider),
+              plugins: await ref.read(enabledMusicPluginsProvider.future),
+              pluginId: song.pluginId?.trim(),
+              pluginData: song.pluginData,
+              title: song.title,
+              artist: song.artist,
+            );
+          }
+        }
         final coverUrl = song.coverUrl?.trim() ?? '';
         await finalizeDownloadExtras(
           requestJson: jsonEncode({
-            if ((settings?.downloadLyrics ?? true) && lyrics.isNotEmpty)
-              'lyricsText': lyrics,
-            if ((settings?.downloadLyrics ?? true) && lyrics.isNotEmpty)
+            if (wantLyricsFile && lyrics.isNotEmpty) 'lyricsText': lyrics,
+            if (wantLyricsFile && lyrics.isNotEmpty)
               'lyricsPath': p.setExtension(verified.path, '.lrc'),
             if (coverUrl.startsWith('http://') ||
                 coverUrl.startsWith('https://'))

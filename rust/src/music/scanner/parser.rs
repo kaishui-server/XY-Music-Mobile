@@ -12,6 +12,7 @@ use lofty::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 use symphonia::core::codecs::CODEC_TYPE_NULL;
@@ -155,6 +156,14 @@ pub(crate) fn parse_song_from_file(path: &Path, path_str: &str, format: &str) ->
 
         if duration == 0 {
             duration = identity.duration_seconds.unwrap_or(0);
+        }
+        if duration == 0 {
+            // fMP4（如 B 站 m4s 音频段改后缀伪装成 mp3）的 mdhd 样本数
+            // 为 0，上面两条链都拿不到时长；mvhd/mehd/sidx 里通常还
+            // 留着总时长，逐层兜底解析出来。
+            if let Some(seconds) = mp4_fallback_duration_seconds(path) {
+                duration = seconds;
+            }
         }
         if sample_rate == 0 {
             sample_rate = identity.sample_rate.unwrap_or(0);
@@ -376,6 +385,233 @@ fn detect_audio_identity(path: &Path, ext: &str) -> AudioIdentity {
     }
 }
 
+/// 分片 MP4（fMP4，如 B 站 m4s 音频段改后缀伪装成 mp3）的时长兜底。
+///
+/// 这类文件的 `mdhd` 样本数为 0，lofty（时长只认 mdhd）与 symphonia
+/// 回退（依赖 n_frames）都解析不出；但 `mvhd`（整片时长）、`mehd`
+/// （分片总时长，使用 mvhd 时标）或 `sidx`（分片索引）里通常完整
+/// 保留了总时长（实测 B 站音频段三者齐全）。按 mvhd → mehd → sidx
+/// 逐层兜底，返回向下取整的秒数；都拿不到则返回 None。
+fn mp4_fallback_duration_seconds(path: &Path) -> Option<u32> {
+    let mut file = File::open(path).ok()?;
+    read_mp4_duration_seconds(&mut file)
+}
+
+/// MP4 box 头：四字符类型 + 载荷范围（body_start..body_end）。
+type Mp4BoxRange = ([u8; 4], u64, u64);
+
+/// 读取一个 MP4 box 头（兼容 size==1 的 64 位 largesize 与 size==0 的
+/// 「延伸到末尾」写法），返回类型与载荷范围。
+fn next_mp4_box<R: Read + Seek>(reader: &mut R, limit_end: u64) -> Option<Mp4BoxRange> {
+    let start = reader.stream_position().ok()?;
+    if limit_end.checked_sub(start)? < 8 {
+        return None;
+    }
+
+    let mut head = [0u8; 8];
+    reader.read_exact(&mut head).ok()?;
+
+    let mut body_start = start + 8;
+    let total = match u32::from_be_bytes([head[0], head[1], head[2], head[3]]) {
+        0 => limit_end - start,
+        1 => {
+            let mut extended = [0u8; 8];
+            reader.read_exact(&mut extended).ok()?;
+            body_start += 8;
+            u64::from_be_bytes(extended)
+        }
+        size => u64::from(size),
+    };
+
+    if total < body_start - start {
+        return None;
+    }
+    let end = start.checked_add(total)?;
+    (end <= limit_end).then_some(([head[4], head[5], head[6], head[7]], body_start, end))
+}
+
+fn read_u32_be<R: Read>(reader: &mut R) -> Option<u32> {
+    let mut buf = [0u8; 4];
+    reader.read_exact(&mut buf).ok()?;
+    Some(u32::from_be_bytes(buf))
+}
+
+fn read_u64_be<R: Read>(reader: &mut R) -> Option<u64> {
+    let mut buf = [0u8; 8];
+    reader.read_exact(&mut buf).ok()?;
+    Some(u64::from_be_bytes(buf))
+}
+
+/// 遍历一个容器 box 的子 box，回调返回 false 时提前停止。
+fn walk_mp4_children<R: Read + Seek>(
+    reader: &mut R,
+    body_start: u64,
+    body_end: u64,
+    mut on_box: impl FnMut(&mut R, Mp4BoxRange) -> bool,
+) {
+    let mut pos = body_start;
+    while pos + 8 <= body_end {
+        if reader.seek(SeekFrom::Start(pos)).is_err() {
+            return;
+        }
+        let Some((kind, box_body_start, box_body_end)) = next_mp4_box(reader, body_end) else {
+            return;
+        };
+        if !on_box(reader, (kind, box_body_start, box_body_end)) {
+            return;
+        }
+        pos = box_body_end;
+    }
+}
+
+/// 解析 mvhd / mehd 共有的「version + flags + 时间字段」布局，
+/// 返回（timescale, duration）。
+fn read_movie_header<R: Read + Seek>(reader: &mut R, body_start: u64) -> Option<(u32, u64)> {
+    reader.seek(SeekFrom::Start(body_start)).ok()?;
+    let version = {
+        let mut byte = [0u8; 1];
+        reader.read_exact(&mut byte).ok()?;
+        byte[0]
+    };
+    let _flags = {
+        let mut bytes = [0u8; 3];
+        reader.read_exact(&mut bytes).ok()?;
+        bytes
+    };
+    // version 0: creation(4) + modification(4)；version 1: 各 8 字节
+    let skipped = match version {
+        1 => read_u64_be(reader)? + read_u64_be(reader)?,
+        _ => u64::from(read_u32_be(reader)?) + u64::from(read_u32_be(reader)?),
+    };
+    let _ = skipped;
+    let timescale = read_u32_be(reader)?;
+    let duration = match version {
+        1 => read_u64_be(reader)?,
+        _ => u64::from(read_u32_be(reader)?),
+    };
+    Some((timescale, duration))
+}
+
+/// 解析 mehd（MovieFragmentHeaderBox，分片总时长，时标沿用 mvhd）。
+/// 注意 mehd 是 FullBox：version + flags 后直接跟 fragment_duration，
+/// 没有 mvhd 的 creation/modification/timescale 字段；version 0 为
+/// u32，version 1 为 u64。
+fn read_mehd_duration<R: Read + Seek>(reader: &mut R, body_start: u64) -> Option<u64> {
+    reader.seek(SeekFrom::Start(body_start)).ok()?;
+    let mut ver_flags = [0u8; 4];
+    reader.read_exact(&mut ver_flags).ok()?;
+    match ver_flags[0] {
+        1 => read_u64_be(reader),
+        _ => read_u32_be(reader).map(u64::from),
+    }
+}
+
+/// 解析 sidx 分片索引：总时长 = earliest_presentation_time +
+/// Σ subsegment_duration（sidx 自带时标）。
+fn read_sidx_duration<R: Read + Seek>(reader: &mut R, body_start: u64) -> Option<u64> {
+    reader.seek(SeekFrom::Start(body_start)).ok()?;
+    let version = {
+        let mut byte = [0u8; 1];
+        reader.read_exact(&mut byte).ok()?;
+        byte[0]
+    };
+    let _flags = {
+        let mut bytes = [0u8; 3];
+        reader.read_exact(&mut bytes).ok()?;
+        bytes
+    };
+    let _reference_id = read_u32_be(reader)?;
+    let timescale = read_u32_be(reader)?;
+    let earliest_presentation = match version {
+        1 => read_u64_be(reader)?,
+        _ => u64::from(read_u32_be(reader)?),
+    };
+    let _first_offset = match version {
+        1 => read_u64_be(reader)?,
+        _ => u64::from(read_u32_be(reader)?),
+    };
+    let reserved = read_u32_be(reader)?;
+    let reference_count = (reserved & 0xFFFF) as usize;
+
+    let mut total = earliest_presentation;
+    for _ in 0..reference_count {
+        let _reference = read_u32_be(reader)?;
+        total += u64::from(read_u32_be(reader)?); // subsegment_duration
+        let _sap = read_u32_be(reader)?;
+    }
+    (timescale > 0).then(|| total / u64::from(timescale))
+}
+
+fn read_mp4_duration_seconds<R: Read + Seek>(reader: &mut R) -> Option<u32> {
+    let file_len = reader.seek(SeekFrom::End(0)).ok()?;
+    reader.seek(SeekFrom::Start(0)).ok()?;
+
+    let mut moov_range: Option<(u64, u64)> = None;
+    let mut sidx_range: Option<(u64, u64)> = None;
+    let mut pos = 0u64;
+    while pos + 8 <= file_len {
+        reader.seek(SeekFrom::Start(pos)).ok()?;
+        let Some((kind, body_start, body_end)) = next_mp4_box(reader, file_len) else {
+            break;
+        };
+        if kind == *b"moov" {
+            moov_range = Some((body_start, body_end));
+        } else if kind == *b"sidx" && sidx_range.is_none() {
+            sidx_range = Some((body_start, body_end));
+        }
+        if body_end <= pos {
+            break;
+        }
+        pos = body_end;
+    }
+
+    let (body_start, body_end) = moov_range?;
+    let mut movie_timescale: u32 = 0;
+    let mut movie_duration: u64 = 0;
+    let mut fragment_duration: Option<u64> = None;
+    walk_mp4_children(reader, body_start, body_end, |reader, (kind, start, _)| {
+        match &kind {
+            b"mvhd" => {
+                if let Some((timescale, duration)) = read_movie_header(reader, start) {
+                    movie_timescale = timescale;
+                    movie_duration = duration;
+                }
+            }
+            b"mehd" => {
+                fragment_duration = read_mehd_duration(reader, start);
+            }
+            _ => {}
+        }
+        // mvhd 与 mehd 都拿齐后即可停
+        !(movie_duration > 0 && fragment_duration.is_some())
+    });
+
+    let seconds = if movie_timescale > 0 && movie_duration > 0 {
+        movie_duration / u64::from(movie_timescale)
+    } else if movie_timescale > 0 {
+        match fragment_duration.filter(|duration| *duration > 0) {
+            Some(duration) => duration / u64::from(movie_timescale),
+            None => {
+                let (sidx_start, _sidx_end) = sidx_range?;
+                let seconds = read_sidx_duration(reader, sidx_start)?;
+                if seconds == 0 {
+                    return None;
+                }
+                seconds
+            }
+        }
+    } else {
+        let (sidx_start, _sidx_end) = sidx_range?;
+        let seconds = read_sidx_duration(reader, sidx_start)?;
+        if seconds == 0 {
+            return None;
+        }
+        seconds
+    };
+
+    (seconds > 0).then(|| seconds.min(u32::MAX as u64) as u32)
+}
+
 fn resolve_album_artist_for_group(songs: &[Song]) -> (String, bool, bool) {
     let tagged_album_artists: Vec<String> = songs
         .iter()
@@ -589,5 +825,112 @@ pub(super) fn enrich_album_groups(songs: &mut [Song]) {
                 song.artist_names.clone()
             };
         }
+    }
+}
+
+#[cfg(test)]
+mod mp4_duration_tests {
+    use super::read_mp4_duration_seconds;
+    use std::io::Cursor;
+
+    fn box_with(kind: &[u8; 4], body: &[u8]) -> Vec<u8> {
+        let mut out = ((8 + body.len()) as u32).to_be_bytes().to_vec();
+        out.extend_from_slice(kind);
+        out.extend_from_slice(body);
+        out
+    }
+
+    fn container(kind: &[u8; 4], children: &[u8]) -> Vec<u8> {
+        box_with(kind, children)
+    }
+
+    fn movie_header_box(kind: &[u8; 4], timescale: u32, duration: u32) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.push(0u8); // version 0
+        body.extend_from_slice(&[0, 0, 0]); // flags
+        body.extend_from_slice(&0u32.to_be_bytes()); // creation
+        body.extend_from_slice(&0u32.to_be_bytes()); // modification
+        body.extend_from_slice(&timescale.to_be_bytes());
+        body.extend_from_slice(&duration.to_be_bytes());
+        box_with(kind, &body)
+    }
+
+    fn sidx_v0(timescale: u32, subsegment_durations: &[u32]) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.push(0u8); // version 0
+        body.extend_from_slice(&[0, 0, 0]); // flags
+        body.extend_from_slice(&1u32.to_be_bytes()); // reference_ID
+        body.extend_from_slice(&timescale.to_be_bytes());
+        body.extend_from_slice(&0u32.to_be_bytes()); // earliest_presentation_time
+        body.extend_from_slice(&0u32.to_be_bytes()); // first_offset
+        let mut reserved_and_count = 0u32;
+        reserved_and_count |= subsegment_durations.len() as u32;
+        body.extend_from_slice(&reserved_and_count.to_be_bytes());
+        for duration in subsegment_durations {
+            body.extend_from_slice(&0u32.to_be_bytes()); // reference_type + size
+            body.extend_from_slice(&duration.to_be_bytes());
+            body.extend_from_slice(&0u32.to_be_bytes()); // SAP info
+        }
+        box_with(b"sidx", &body)
+    }
+
+    fn minimal_fmp4(moov_box: &[u8], sidx: &[u8]) -> Cursor<Vec<u8>> {
+        let mut data = Vec::new();
+        data.extend_from_slice(&box_with(
+            b"ftyp",
+            b"isom\x00\x00\x02\x00isomiso2avc1mp41",
+        ));
+        data.extend_from_slice(moov_box);
+        if !sidx.is_empty() {
+            data.extend_from_slice(sidx);
+        }
+        data.extend_from_slice(&box_with(b"moof", &[0u8; 16]));
+        data.extend_from_slice(&box_with(b"mdat", &[0u8; 32]));
+        Cursor::new(data)
+    }
+
+    #[test]
+    fn mvhd_duration_wins() {
+        let moov = container(
+            b"moov",
+            &movie_header_box(b"mvhd", 1000, 214_000),
+        );
+        let mut reader = minimal_fmp4(&moov, &[]);
+        assert_eq!(read_mp4_duration_seconds(&mut reader), Some(214));
+    }
+
+    #[test]
+    fn mvhd_zero_falls_back_to_mehd() {
+        // 标准布局的 mehd：version + flags + fragment_duration
+        // （mehd 无 creation/modification/timescale 字段，时标沿用 mvhd 的 1000）
+        let mehd_body = {
+            let mut body = Vec::new();
+            body.push(0u8);
+            body.extend_from_slice(&[0, 0, 0]);
+            body.extend_from_slice(&213_996u32.to_be_bytes());
+            box_with(b"mehd", &body)
+        };
+        let moov = container(
+            b"moov",
+            &[
+                movie_header_box(b"mvhd", 1000, 0).as_slice(),
+                mehd_body.as_slice(),
+            ]
+            .concat(),
+        );
+        let mut reader = minimal_fmp4(&moov, &[]);
+        assert_eq!(read_mp4_duration_seconds(&mut reader), Some(213));
+    }
+
+    #[test]
+    fn sidx_fallback_when_movie_durations_zero() {
+        let moov = container(
+            b"moov",
+            &movie_header_box(b"mvhd", 1000, 0),
+        );
+        let durations: Vec<u32> = vec![44_100; 36]; // 36 段各 1 秒（44100 时标）
+        let sidx = sidx_v0(44_100, &durations);
+        let mut reader = minimal_fmp4(&moov, &sidx);
+        assert_eq!(read_mp4_duration_seconds(&mut reader), Some(36));
     }
 }

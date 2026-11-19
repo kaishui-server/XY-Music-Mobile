@@ -2,6 +2,7 @@ import 'package:flutter/widgets.dart';
 import 'package:go_router/go_router.dart';
 
 import '../logging/error_context.dart';
+import 'boot_location.dart';
 import '../../pages/home/home_page.dart';
 import '../../pages/explore/explore_page.dart';
 import '../../pages/library/library_page.dart';
@@ -141,8 +142,13 @@ Page<void> _settingsExpandPage(GoRouterState state, Widget child) {
 }
 
 /// 主路由：使用 StatefulShellRoute 保持各一级页面状态。
+///
+/// 启动落点跟着用户在「侧栏排序 / 自定义底栏」里配的顺序走（取第一个
+/// 可见入口），不再写死首页；`appRouter` 是顶层 `final`，首次读取才
+/// 初始化，只要 `main()` 在 `runApp` 之前预热了偏好快照，
+/// [resolveBootLocation] 同步拿到的就是用户的真实排序。
 final appRouter = GoRouter(
-  initialLocation: '/home',
+  initialLocation: resolveBootLocation(),
   // 崩溃上下文：记录最近一次导航与当前栈顶页面。release AOT 下异步异常的
   // 堆栈只有几帧挂起点，没有它就无法判断崩在哪一页。
   observers: [ErrorContextObserver()],

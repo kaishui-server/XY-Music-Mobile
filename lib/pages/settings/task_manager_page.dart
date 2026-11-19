@@ -10,9 +10,12 @@ import '../../src/core/settings.dart';
 import '../../src/player/android_storage.dart';
 import '../../src/player/batch_task_store.dart';
 import '../../src/player/download_history_store.dart';
+import '../../src/player/download_lyrics.dart';
 import '../../src/player/download_quality.dart';
 import '../../src/player/downloaded_song_store.dart';
 import '../../src/player/player_provider.dart';
+import '../../src/plugins/plugin_runtime.dart'
+    show enabledMusicPluginsProvider, pluginRuntimeProvider;
 import '../../src/rust/api.dart';
 import '../../src/widgets/batch_download.dart';
 import '../../src/widgets/frosted_search_field.dart';
@@ -275,11 +278,29 @@ class _TaskManagerPageState extends ConsumerState<TaskManagerPage>
           .read(playerProvider.notifier)
           .resolveDownloadSourceFor(item, entry.quality)
           .timeout(const Duration(seconds: 60));
-      final destination = await resolveDownloadFullPath(
-        directory: workDirectory,
+      // 文件名按设置页命名模板渲染（默认「歌手 - 标题」，与旧行为一致）。
+      // 下载历史里插件元数据存的是 JSON 字符串，先解码再用于 {id} 提取。
+      Map<String, dynamic>? entryPluginData;
+      if (entry.pluginDataJson != null) {
+        try {
+          final decoded = jsonDecode(entry.pluginDataJson!);
+          if (decoded is Map<String, dynamic>) entryPluginData = decoded;
+        } catch (_) {}
+      }
+      final filenameBase = renderDownloadFilename(
+        settings?.downloadFilenameTemplate ?? kDefaultDownloadFilenameTemplate,
         title: entry.title,
         artist: entry.artist,
         album: entry.album,
+        quality: entry.quality,
+        platform: entry.pluginId ?? '',
+        pluginData: entryPluginData,
+      );
+      final destination = await resolveDownloadFullPath(
+        directory: workDirectory,
+        title: filenameBase,
+        artist: '',
+        album: '',
         url: source.url,
         quality: entry.quality,
         keepSourceFilename: false,
@@ -295,6 +316,7 @@ class _TaskManagerPageState extends ConsumerState<TaskManagerPage>
         download: () => downloadOnlineSong(
           url: source.url,
           destPath: destination,
+          ekey: source.ekey,
           headersJson: jsonEncode(source.headers),
         ),
       );
@@ -304,18 +326,43 @@ class _TaskManagerPageState extends ConsumerState<TaskManagerPage>
         durationSec: (entry.durationMs / 1000).round(),
         songTitle: entry.title,
       );
+      // 歌词：与单曲/批量下载同一入口（本插件 getLyrics → 跨插件兜底），
+      // 重新下载同样补齐 .lrc 旁车与内嵌歌词标签。
+      // 「下载歌词」管 .lrc，「写入元数据」管标签内嵌，任一开启都要取歌词。
+      final wantLyricsFile = settings?.downloadLyrics ?? true;
+      final wantEmbedLyrics = settings?.downloadWriteMetadata ?? true;
+      var lyrics = '';
+      if (wantLyricsFile || wantEmbedLyrics) {
+        try {
+          lyrics = await fetchLyricsForDownload(
+            runtime: ref.read(pluginRuntimeProvider),
+            plugins: await ref.read(enabledMusicPluginsProvider.future),
+            pluginId: entry.pluginId?.trim(),
+            pluginData: entryPluginData,
+            title: entry.title,
+            artist: entry.artist,
+          );
+        } catch (_) {
+          // 歌词获取失败不影响音频重新下载。
+        }
+      }
       final coverUrl = entry.coverUrl?.trim() ?? '';
       await finalizeDownloadExtras(
         requestJson: jsonEncode({
+          if (wantLyricsFile && lyrics.isNotEmpty) 'lyricsText': lyrics,
+          if (wantLyricsFile && lyrics.isNotEmpty)
+            'lyricsPath': p.setExtension(verified.path, '.lrc'),
           if (coverUrl.startsWith('http://') || coverUrl.startsWith('https://'))
             'coverUrl': coverUrl,
-          'embedCover': true,
-          'metadata': {
-            'filePath': verified.path,
-            'title': entry.title,
-            'artist': entry.artist,
-            'album': entry.album,
-          },
+          'embedCover': wantEmbedLyrics,
+          if (wantEmbedLyrics)
+            'metadata': {
+              'filePath': verified.path,
+              'title': entry.title,
+              'artist': entry.artist,
+              'album': entry.album,
+              if (lyrics.isNotEmpty) 'lyrics': lyrics,
+            },
         }),
       );
       var finalPath = verified.path;
@@ -326,8 +373,20 @@ class _TaskManagerPageState extends ConsumerState<TaskManagerPage>
           fileName: p.basename(verified.path),
           mimeType: 'audio/*',
         );
+        final lrcPath = p.setExtension(verified.path, '.lrc');
+        if (await File(lrcPath).exists()) {
+          try {
+            await AndroidStorage.copyFileToDirectory(
+              directoryUri: directory,
+              sourcePath: lrcPath,
+              fileName: p.basename(lrcPath),
+              mimeType: 'text/plain',
+            );
+          } catch (_) {}
+        }
         try {
           await File(verified.path).delete();
+          if (await File(lrcPath).exists()) await File(lrcPath).delete();
         } catch (_) {}
       }
       await rememberDownloadedSongSnapshot(

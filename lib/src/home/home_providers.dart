@@ -76,6 +76,18 @@ void clearHotCommentCooldown() {
 }
 
 final hotCommentProvider = FutureProvider.autoDispose<HotComment>((ref) async {
+  // 刷新句柄在同步段（首个 await 之前）构造即注册 onDispose：autoDispose
+  // provider 若在请求期间被回收，await 之后再调 ref.onDispose 会在已 dispose
+  // 的 ProviderElementBase 上抛 Bad state（空闲闪退栈：onDispose → 本闭包）。
+  // autoArm: false —— 3 分钟轮换的计时起点必须是「请求成功之后」，取到句柄
+  // 后在下方 parseHotComment 成功处才 arm()；句柄内部自行记录回收状态并在
+  // dispose 时取消定时器。
+  final refresh = registerVisibleRefresh(
+    ref,
+    const Duration(minutes: 3),
+    ref.invalidateSelf,
+    autoArm: false,
+  );
   final cooldownUntil = _hotCommentCooldownUntil;
   if (cooldownUntil != null && DateTime.now().isBefore(cooldownUntil)) {
     final remainSeconds =
@@ -101,9 +113,9 @@ final hotCommentProvider = FutureProvider.autoDispose<HotComment>((ref) async {
     _hotCommentCooldownUntil = null;
     // 后台不刷新：到点若 App 在 hidden 则顺延，回前台后的下一个检查点
     // 才真正重拉热评，避免在后台按 3 分钟周期拉接口唤醒网络。
-    ref.onDispose(
-      scheduleRefreshWhenVisible(const Duration(minutes: 3), ref.invalidateSelf),
-    );
+    // 计时起点仍为「热评请求成功之后」，不在请求发起时启动；已回收时
+    // arm() 内部直接忽略，不会武装定时器。
+    refresh.arm();
     return result;
   } on FormatException catch (error) {
     // 上游偶发返回空内容 / 非 JSON：不退避，等下次轮换或用户重试即可恢复。
@@ -188,8 +200,11 @@ final homeStatisticsProvider = FutureProvider<HomeStatisticsData>((ref) async {
   // 后台不刷新：首页统计 5 分钟一刷（原 1 分钟，耗电优化），App 不可见时
   // 到点顺延，回前台再重算。每次重算都要串行跑 3 个 stats 接口（Rust 侧
   // 各开一次连接 + 20 条 DDL），1 分钟档在前台上也属于纯浪费。
-  ref.onDispose(
-    scheduleRefreshWhenVisible(const Duration(minutes: 5), ref.invalidateSelf),
+  // 句柄在同步段构造即注册 onDispose 并立即计时（计时起点就是本次计算开始）。
+  registerVisibleRefresh(
+    ref,
+    const Duration(minutes: 5),
+    ref.invalidateSelf,
   );
   final songs = ref.watch(libraryProvider.select((state) => state.songs));
   final dbPath = await ref.read(dbPathProvider.future);

@@ -260,6 +260,7 @@ class _WebLoginPageState extends ConsumerState<WebLoginPage> {
           path: value.valueOrNull?.customBackgroundPath ?? '',
           blur: value.valueOrNull?.customBackgroundBlur ?? 18.0,
           fade: value.valueOrNull?.customBackgroundFade ?? 0.0,
+          fit: value.valueOrNull?.backgroundFitMode ?? BackgroundFitMode.cover,
         ),
       ),
     );
@@ -269,6 +270,7 @@ class _WebLoginPageState extends ConsumerState<WebLoginPage> {
       imagePath: backgroundSettings.path,
       blur: backgroundSettings.blur,
       fade: backgroundSettings.fade,
+      fit: backgroundSettings.fit,
       child: Scaffold(
         appBar: AppBar(
           leading: const BackButton(),

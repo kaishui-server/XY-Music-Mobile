@@ -188,46 +188,34 @@ class _SongsListViewState extends ConsumerState<SongsListView> {
     final playingTarget = playingIndex < 0 ? null : playingIndex * _rowExtent;
     // 布局完成后测量首行真实高度，修正定位滚动的行高估算。
     WidgetsBinding.instance.addPostFrameCallback((_) => _measureFirstRow());
-    // 列表类型只取决于 onReorder：多选/普通模式共用同一棵滚动视图，
-    // 避免进入多选时因切换 ListView/ReorderableListView 丢失滚动位置。
-    final reorderable = widget.onReorder != null;
+    // 列表类型固定为 ReorderableListView（滚动视图不随编辑态切换）：
+    // 退出拖拽编辑时 onReorder 变 null，若在此切换 ListView 类型，
+    // Element 子树重建会把滚动位置归零——即「自定义排序点击完成后
+    // 列表自动滚回顶部」。非编辑态传 no-op 回调并关闭默认拖拽手柄，
+    // 交互与普通 ListView 完全一致（长按菜单不受影响）。
     return Stack(
       children: [
-        if (reorderable)
-          ReorderableListView.builder(
-            scrollController: _controller,
-            padding: widget.padding as EdgeInsets?,
-            itemCount: widget.songs.length + (widget.footer == null ? 0 : 1),
-            onReorderItem: widget.onReorder!,
-            itemBuilder: (context, i) => _buildRow(
-              context,
-              i,
-              favorites: favorites,
-              pluginNames: pluginNames,
-              lxPlugins: lxPlugins,
-              playingPath: playingPath,
-              dragIndex: i < widget.songs.length && !widget.selectionMode
-                  ? i
-                  : -1,
-              loadNetworkCover: loadNetworkCovers,
-            ),
-          )
-        else
-          ListView.builder(
-            controller: _controller,
-            padding: widget.padding,
-            itemCount: widget.songs.length + (widget.footer == null ? 0 : 1),
-            itemBuilder: (context, i) => _buildRow(
-              context,
-              i,
-              favorites: favorites,
-              pluginNames: pluginNames,
-              lxPlugins: lxPlugins,
-              playingPath: playingPath,
-              dragIndex: -1,
-              loadNetworkCover: loadNetworkCovers,
-            ),
+        ReorderableListView.builder(
+          buildDefaultDragHandles: false,
+          scrollController: _controller,
+          padding: widget.padding as EdgeInsets?,
+          itemCount: widget.songs.length + (widget.footer == null ? 0 : 1),
+          onReorderItem: widget.onReorder ?? (_, _) {},
+          itemBuilder: (context, i) => _buildRow(
+            context,
+            i,
+            favorites: favorites,
+            pluginNames: pluginNames,
+            lxPlugins: lxPlugins,
+            playingPath: playingPath,
+            dragIndex: i < widget.songs.length &&
+                    widget.onReorder != null &&
+                    !widget.selectionMode
+                ? i
+                : -1,
+            loadNetworkCover: loadNetworkCovers,
           ),
+        ),
         if (widget.showFloatingButtons)
           _FloatingListButtons(
             controller: _controller,

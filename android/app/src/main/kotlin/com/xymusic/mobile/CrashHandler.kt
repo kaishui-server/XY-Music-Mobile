@@ -61,22 +61,26 @@ object CrashHandler {
         } else {
             versionInfo?.versionCode?.toLong() ?: 0L
         }
-        file.writeText(
-            buildString {
-                appendLine("===== XY Music 原生崩溃 =====")
-                appendLine("时间: $time")
-                appendLine("线程: ${thread.name}")
-                appendLine("设备: ${Build.MANUFACTURER} ${Build.MODEL} (Android ${Build.VERSION.RELEASE}, API ${Build.VERSION.SDK_INT})")
-                appendLine("版本: $versionName (构建 $versionCode)")
-                appendLine("============================")
-                appendLine(stack)
-            },
-        )
+        val content = buildString {
+            appendLine("===== XY Music 原生崩溃 =====")
+            appendLine("时间: $time")
+            appendLine("线程: ${thread.name}")
+            appendLine("设备: ${Build.MANUFACTURER} ${Build.MODEL} (Android ${Build.VERSION.RELEASE}, API ${Build.VERSION.SDK_INT})")
+            appendLine("版本: $versionName (构建 $versionCode)")
+            appendLine("============================")
+            appendLine(stack)
+        }
+        file.writeText(content)
         trimOldFiles(dir)
+        // 镜像到公共下载目录：文件管理器可直接看到，不必进 App 导出。
+        DownloadsExporter.saveText(context, file.name, content)
     }
 
     private fun trimOldFiles(dir: File) {
         val files = dir.listFiles() ?: return
         files.sortedByDescending { it.name }.drop(MAX_FILES).forEach { it.delete() }
     }
+
+    /** 供 ExitInfoRecorder 等外部写入者复用的保留上限裁剪。 */
+    fun trimOldFilesCompat(dir: File) = trimOldFiles(dir)
 }

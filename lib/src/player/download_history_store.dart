@@ -5,6 +5,7 @@ import 'dart:io';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import '../core/safe_state_notifier.dart';
 import '../rust/api.dart' as rust;
 
 /// 下载记录状态。
@@ -167,7 +168,7 @@ const _downloadHistoryKey = 'downloadHistoryV1';
 Future<void> _writeQueue = Future<void>.value();
 
 class DownloadHistoryNotifier
-    extends StateNotifier<List<DownloadHistoryEntry>> {
+    extends SafeStateNotifier<List<DownloadHistoryEntry>> {
   DownloadHistoryNotifier() : super(const []) {
     _load();
   }

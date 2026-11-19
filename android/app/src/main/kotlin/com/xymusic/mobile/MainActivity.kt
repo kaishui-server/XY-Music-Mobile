@@ -138,6 +138,10 @@ class MainActivity : AudioServiceActivity() {
     private val releaseWifiLockRunnable = Runnable { releasePlaybackWifiLock() }
 
     override fun onCreate(savedInstanceState: android.os.Bundle?) {
+        // 原生闪退补录：必须在一切初始化之前——「打开就闪退」的场景下，
+        // Flutter 引擎与 Dart 日志都可能来不及跑，而这里先于引擎执行；
+        // 上次崩溃（SIGSEGV/SIGABRT/ANR）的原因会在本毫秒级落盘。
+        ExitInfoRecorder.recordLastExitIfCrash(this)
         // Rust std::env::temp_dir() 在 Android 上默认解析为 /data/local/tmp
         //（应用 UID 无权写入），流缓存建文件恒失败（os error 2）→ DSP 接管
         // 恒回退原生输出，音效广场在线流永远无效。进程级 TMPDIR 指向应用

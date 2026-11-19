@@ -9,6 +9,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:http/http.dart' as http;
 
 import '../../src/library/library_provider.dart';
+import '../../src/library/song_cover_edit_actions.dart';
 import '../../src/rust/api.dart';
 import '../../src/widgets/cover_search_sheet.dart';
 import '../../src/widgets/top_notice.dart';
@@ -130,6 +131,15 @@ class _SongEditPageState extends ConsumerState<SongEditPage> {
         _coverMime = _mimeFromName(result!.files.single.name);
         _coverChanged = true;
       });
+      // 与播放详情页「编辑封面」同款实时语义：选图后立即写覆盖表，
+      // 音乐库/播放页马上换上新封面，不必等保存 tag + 重扫曲库。
+      await SongCoverEditor(
+        songPath: widget.songPath,
+        title: '',
+        artist: '',
+        // 本地歌曲无网络封面原值；覆盖表仅按 songPath 生效。
+        originalCoverUrl: null,
+      ).applyBytes(bytes);
     } catch (e) {
       _toast('选择图片失败：$e', type: XyNoticeType.error);
     }
@@ -146,12 +156,21 @@ class _SongEditPageState extends ConsumerState<SongEditPage> {
         throw Exception('HTTP ${response.statusCode}');
       }
       final contentType = response.headers['content-type'] ?? '';
+      final bytes = response.bodyBytes;
       setState(() {
-        _coverBytes = response.bodyBytes;
+        _coverBytes = bytes;
         _coverMime = contentType.contains('png') ? 'image/png' : 'image/jpeg';
         _coverChanged = true;
       });
-      _toast('已关联封面，记得保存');
+      // 搜索替换与播放页编辑封面共用覆盖表链路：保存前即实时生效。
+      await SongCoverEditor(
+        songPath: widget.songPath,
+        title: '',
+        artist: '',
+        // 本地歌曲无网络封面原值；覆盖表仅按 songPath 生效。
+        originalCoverUrl: null,
+      ).applyBytes(bytes);
+      _toast('封面已实时更新，保存后写入歌曲文件');
     } catch (e) {
       _toast('封面下载失败：$e', type: XyNoticeType.error);
     }

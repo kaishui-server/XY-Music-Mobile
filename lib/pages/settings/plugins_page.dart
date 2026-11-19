@@ -81,6 +81,22 @@ class _PluginInfo {
   bool get isOnline => sourceUrl?.trim().isNotEmpty == true;
 }
 
+/// 「用户变量」弹窗中不展示的变量键（全部小写比较，忽略大小写与首尾空白）。
+///
+/// - `source_api_key`（显示名 X-API-KEY）：订阅源（mc.vsaa.cn）的 Baka
+///   音源插件历史鉴权项，插件在安装时已由订阅链接自动下发密钥，用户无需
+///   再手工填写（2026-11 插件侧确认）。兼容 `SOURCE_API_KEY` /
+///   `source_api_key` 等写法；JOOX 的 `sourceApiKey` 驼峰键归一化后为
+///   `sourceapikey`，与之下划线形式不同，保持原样展示。
+/// - `x-api-key`：早期把显示名当键的写法，一并兼容。
+///
+/// 仅作用于弹窗展示这一层：脚本里的 `userVariables` 声明与运行时
+/// `env.getUserVariables()` 读取完全不变，存量值也不会被保存逻辑清空。
+const _hiddenUserVariableKeys = {'source_api_key', 'x-api-key'};
+
+bool _isHiddenUserVariable(String rawKey) =>
+    _hiddenUserVariableKeys.contains(rawKey.trim().toLowerCase());
+
 class _InstallSummary {
   const _InstallSummary({
     required this.installed,
@@ -960,6 +976,15 @@ class _PluginsNotifier extends AsyncNotifier<List<_PluginInfo>> {
         if (declared.contains(entry.key) && entry.value.isNotEmpty)
           entry.key: entry.value,
     };
+    // 弹窗里不展示的变量（如 X-API-KEY）不会出现在 values 中，若直接按
+    // values 覆盖会把历史已保存的值清空，导致插件取链失效。这里沿用存量
+    // 值：只是界面不展示、不可编辑，运行时仍能照读。
+    final previous = stored[plugin.id] ?? const <String, String>{};
+    for (final entry in previous.entries) {
+      if (entry.value.trim().isEmpty) continue;
+      if (!_isHiddenUserVariable(entry.key)) continue;
+      filtered.putIfAbsent(entry.key, () => entry.value);
+    }
     if (filtered.isEmpty) {
       stored.remove(plugin.id);
     } else {
@@ -1377,16 +1402,16 @@ class _PluginsPageState extends ConsumerState<PluginsPage> {
     // 30 首必要变量，三家插件共用同一个变量键：非 Baka 协议插件即使
     // 脚本声明了该变量也隐藏输入行，避免误导。保存时该键随过滤后的
     // variables 一起被清理，不会残留在其它插件上。
-    // 「X-API-KEY」是 Baka 音源插件的历史鉴权变量：订阅源（mc.vsaa.cn）
-    // 的插件已改为订阅链接自带密钥，脚本里残留的声明不再需要填写
-    // （2026-11 插件侧确认），Baka 插件上隐藏该输入行避免误导。
+    // 「X-API-KEY」（脚本变量键为 SOURCE_API_KEY）是订阅源 Baka 音源插件
+    // 的历史鉴权变量：插件在安装时已由订阅链接自动下发密钥，脚本里残留
+    // 的声明不再需要填写（2026-11 插件侧确认），该行整行不展示，不留空行、
+    // 不显示灰态或占位；已保存的值由 saveUserVariables 原样保留，脚本照读。
     final variables = plugin.userVariables
         .where(
           (variable) =>
               !(variable.key == 'qq_user_id' &&
                   plugin.kind != _PluginKind.baka) &&
-              !(variable.key == 'X-API-KEY' &&
-                  plugin.kind == _PluginKind.baka),
+              !_isHiddenUserVariable(variable.key),
         )
         .toList();
     if (variables.isEmpty) return;

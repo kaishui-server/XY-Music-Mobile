@@ -2096,25 +2096,66 @@ class PluginRuntimeService {
     }
     dynamic response;
     Object? pluginError;
+    final bool isNetease = _isNeteaseMusicPlugin(plugin);
+    // 网易云[T]无 cookie 走 weapi 搜索易被风控返回无 result 的响应或直接
+    // 抛错；退避后重试一次通常即可命中（真机实测偶发，非稳定失败）。
+    Future<dynamic> invokeSearch() => _runsPluginsInBackground
+        ? _runPluginOperation(plugin, 'search', keyword)
+        : _callOnCurrentIsolate(plugin, 'search', [
+            keyword,
+            1,
+            'music',
+          ]);
+    Future<void> backoffRetry() async {
+      await Future<void>.delayed(const Duration(milliseconds: 800));
+      response = await invokeSearch();
+      pluginError = null;
+    }
+
     try {
-      response = _runsPluginsInBackground
-          ? await _runPluginOperation(plugin, 'search', keyword)
-          : await _callOnCurrentIsolate(plugin, 'search', [
-              keyword,
-              1,
-              'music',
-            ]);
+      response = await invokeSearch();
     } catch (error) {
       AppLogStore.instance.add(
         '[插件搜索] ${plugin.name} 搜索"$keyword"插件调用异常: '
         '${_friendlyError(error.toString())}',
         level: AppLogLevel.error,
       );
-      if (!_isQqMusicPlugin(plugin)) rethrow;
-      pluginError = error;
+      if (isNetease) {
+        try {
+          await backoffRetry();
+        } catch (retryError) {
+          AppLogStore.instance.add(
+            '[插件搜索] ${plugin.name} 搜索"$keyword"重试仍失败: '
+            '${_friendlyError(retryError.toString())}',
+            level: AppLogLevel.error,
+          );
+          rethrow;
+        }
+      } else if (!_isQqMusicPlugin(plugin)) {
+        rethrow;
+      } else {
+        pluginError = error;
+      }
     }
 
     var list = _extractResultList(response);
+    if (list.isEmpty && isNetease) {
+      AppLogStore.instance.add(
+        '[插件搜索] ${plugin.name} 搜索"$keyword"返回空，退避重试一次',
+        level: AppLogLevel.warning,
+      );
+      try {
+        await backoffRetry();
+        list = _extractResultList(response);
+      } catch (retryError) {
+        AppLogStore.instance.add(
+          '[插件搜索] ${plugin.name} 搜索"$keyword"重试仍失败: '
+          '${_friendlyError(retryError.toString())}',
+          level: AppLogLevel.error,
+        );
+        rethrow;
+      }
+    }
     if (list.isEmpty && _isQqMusicPlugin(plugin)) {
       try {
         list = await _searchQqWebFallback(keyword);
@@ -3029,18 +3070,19 @@ class PluginRuntimeService {
     }
   }
 
-  /// 获取 Baka 音源插件的每日 30 首推荐（getDailyRecommendations）。
+  /// 获取音源插件的每日 30 首推荐（getDailyRecommendations）。
   ///
-  /// Baka 音乐插件（QQ/酷狗/酷我）共用同一接口，依赖插件用户变量中的
-  /// qq_user_id（用户 ID）换取每日歌单；未填时插件返回 unconfigured，
-  /// 由 UI 提示引导配置。LX / animemusic 协议不提供该接口，直接返回
-  /// unsupported，调用方据此隐藏入口。
+  /// Baka 音乐插件（QQ/酷狗/酷我）与部分 MusicFree 订阅插件（网易云[T]等）
+  /// 共用同一接口与返回结构（state/title/sheetItem），依赖插件用户变量中
+  /// 的音源连接码（qq_user_id / wy_user_id 等）换取每日歌单；未填时插件
+  /// 返回 unconfigured，由 UI 提示引导配置。LX / animemusic 协议不提供该
+  /// 接口，直接返回 unsupported，调用方据此隐藏入口。
   Future<DailyRecommendationResult> getDailyRecommendations(
     EnabledMusicPlugin plugin,
   ) async {
-    // 仅 BakaMusic 契约插件提供每日推荐；静态未识别到方法时直接放弃，
-    // 避免对普通 MusicFree 插件发起无谓的跨 isolate 调用。
-    if (!plugin.isBaka || !plugin.mayHaveMethod('getDailyRecommendations')) {
+    // 静态未识别到 getDailyRecommendations 方法时直接放弃，避免无谓的
+    // 跨 isolate 调用；Baka 与声明该方法的 MusicFree 插件走同一条链路。
+    if (!plugin.mayHaveMethod('getDailyRecommendations')) {
       return const DailyRecommendationResult(state: 'unsupported');
     }
     try {

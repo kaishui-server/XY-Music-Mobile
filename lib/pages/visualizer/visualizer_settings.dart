@@ -9,6 +9,8 @@ import 'dart:convert';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import '../../src/core/safe_state_notifier.dart';
+
 /// 可视化形态。
 enum VisualizerForm { terrain, nebula }
 
@@ -356,7 +358,7 @@ const String _kPrefsKey = 'visualizer.settings.v2';
 /// 设置存档版本：提升后旧存档一次性重置为新默认值。
 const int kVisSettingsVersion = 2;
 
-class VisualizerSettingsNotifier extends StateNotifier<VisualizerSettings> {
+class VisualizerSettingsNotifier extends SafeStateNotifier<VisualizerSettings> {
   VisualizerSettingsNotifier() : super(const VisualizerSettings()) {
     _load();
   }

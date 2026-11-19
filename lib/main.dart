@@ -12,6 +12,7 @@ import 'app.dart';
 import 'src/core/custom_font.dart';
 import 'src/library/online_cover_overrides.dart';
 import 'src/logging/app_log_store.dart';
+import 'src/navigation/boot_location.dart';
 import 'src/services/cache_auto_clean.dart';
 
 /// 缓存自动清理的生命周期监听：切后台/隐藏时触发一次阈值检查。
@@ -27,6 +28,7 @@ AppLifecycleListener? cacheCleanLifecycleListener;
 const _logRestoreTimeout = Duration(seconds: 3);
 const _startupAssetTimeout = Duration(milliseconds: 2500);
 const _audioInitTimeout = Duration(seconds: 5);
+const _bootPrefsTimeout = Duration(seconds: 2);
 
 Future<void> main() async {
   // runZonedGuarded 兜住 zone 内逃逸的异步异常，交给日志系统落盘
@@ -75,6 +77,16 @@ Future<void> _bootstrapApp() async {
   );
   // 在线歌曲自定义封面覆盖表：启动即加载，列表/播放页按 revision 刷新。
   unawaited(initOnlineCoverOverrides());
+  // 启动落点预热：路由的 initialLocation 只能是同步值，必须在 runApp 之前
+  // 把偏好同步读出来，否则用户自定义的侧栏/底栏排序无法决定首屏页面
+  // （表现为「改了排序，启动还是首页」）。读取本身极快（AppLogStore 初始化
+  // 时已经拉过同一实例），这里仍加上限，读不到就退回首页，绝不阻断启动。
+  await warmUpBootPrefs().timeout(
+    _bootPrefsTimeout,
+    onTimeout: () {
+      debugPrint('启动落点偏好预热超时，回退默认首页');
+    },
+  );
   if (!kIsWeb && defaultTargetPlatform == TargetPlatform.android) {
     try {
       // Android 平板与手机统一使用边到边布局，状态栏由 Flutter 页面背景承载。

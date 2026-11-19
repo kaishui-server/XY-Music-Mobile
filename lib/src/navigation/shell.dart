@@ -718,6 +718,7 @@ class XyMobileSidebar extends ConsumerWidget {
         imagePath: settings?.customBackgroundPath ?? '',
         blur: settings?.customBackgroundBlur ?? 18,
         fade: settings?.customBackgroundFade ?? 0,
+        fit: settings?.backgroundFitMode ?? BackgroundFitMode.cover,
         child: SafeArea(
           right: false,
           child: Column(
@@ -1136,6 +1137,7 @@ class _XyLandscapeSidebarState extends ConsumerState<XyLandscapeSidebar> {
         imagePath: settings?.customBackgroundPath ?? '',
         blur: settings?.customBackgroundBlur ?? 18,
         fade: settings?.customBackgroundFade ?? 0,
+        fit: settings?.backgroundFitMode ?? BackgroundFitMode.cover,
         child: DecoratedBox(
           decoration: BoxDecoration(
             color: theme.colorScheme.surface.withValues(

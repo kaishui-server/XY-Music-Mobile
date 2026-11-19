@@ -15,11 +15,15 @@ import '../../src/core/db_path.dart';
 import '../../src/core/custom_font.dart';
 import '../../src/auth/auth_provider.dart';
 import '../../src/backup/backup_service.dart';
+import '../../src/backup/webdav_backup_controller.dart';
+import '../../src/backup/webdav_client.dart';
+import '../../src/core/secure_store.dart';
 import '../../src/favorites/favorites_provider.dart';
 import '../../src/navigation/settings_expand_transition.dart';
 import '../../src/navigation/sidebar_controller.dart';
 import '../../src/player/bluetooth_lyrics_switch.dart';
 import '../../src/player/desktop_lyrics.dart';
+import '../../src/player/downloaded_song_store.dart';
 import '../../src/player/mini_player_overlay.dart';
 import '../../src/playlists/playlists_provider.dart';
 import '../../src/plugins/plugin_runtime.dart';
@@ -135,7 +139,7 @@ const settingsSearchEntries = <SettingsSearchEntry>[
     path: ['外观', '自定义壁纸'],
     route: '/settings/appearance',
     icon: Icons.wallpaper_outlined,
-    keywords: '壁纸 背景图 背景图片 更换 相册',
+    keywords: '壁纸 背景图 背景图片 更换 相册 显示方式 居中裁剪 完全铺满 拉伸 铺满 视频壁纸',
   ),
   SettingsSearchEntry(
     title: '播放详情页背景',
@@ -488,6 +492,13 @@ const settingsSearchEntries = <SettingsSearchEntry>[
     keywords: '元数据 标签 tag 封面 歌词 标题 写入音频',
   ),
   SettingsSearchEntry(
+    title: '文件命名模板',
+    path: ['下载', '文件命名模板'],
+    route: '/settings/download',
+    icon: Icons.edit_outlined,
+    keywords: '文件名 命名 模板 变量 title artist album quality',
+  ),
+  SettingsSearchEntry(
     title: '每次下载是否询问细节',
     path: ['下载', '每次下载是否询问细节'],
     route: '/settings/download',
@@ -565,6 +576,13 @@ const settingsSearchEntries = <SettingsSearchEntry>[
     route: '/settings/backup',
     icon: Icons.file_download_outlined,
     keywords: '导入 恢复 备份文件 迁移 换机',
+  ),
+  SettingsSearchEntry(
+    title: 'WebDAV 备份',
+    path: ['备份', 'WebDAV 备份'],
+    route: '/settings/backup',
+    icon: Icons.cloud_outlined,
+    keywords: 'WebDAV 网盘 备份 恢复 坚果云 连接配置 服务器 账号 密码 保留最新备份',
   ),
   SettingsSearchEntry(
     title: '日志',
@@ -818,13 +836,19 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
     super.dispose();
   }
 
-  /// 导出前先弹勾选框：仅收藏 / 歌单 / 插件 / 设置四类可勾选，
-  /// 最近播放、听歌统计、下载记录等其余数据一律不进备份。
-  Future<BackupExportOptions?> _showBackupOptionsDialog() {
-    var favorites = true;
-    var playlists = true;
-    var plugins = true;
-    var settings = true;
+  /// 「备份内容」行点击后弹出的勾选弹窗：仅收藏 / 歌单 / 插件 / 设置四类
+  /// 可勾选，最近播放、听歌统计、下载记录等其余数据一律不进备份。
+  ///
+  /// 勾选结果由「备份内容」行独立编辑并持久化到 [AppSettings.backupSections]，
+  /// 本地导出与 WebDAV 备份共用这一份选择，导出/上传时不再弹此框。
+  Future<BackupExportOptions?> _showBackupOptionsDialog({
+    String actionLabel = '保存',
+    BackupExportOptions initial = const BackupExportOptions(),
+  }) {
+    var favorites = initial.favorites;
+    var playlists = initial.playlists;
+    var plugins = initial.plugins;
+    var settings = initial.settings;
     return showDialog<BackupExportOptions>(
       context: context,
       builder: (dialogContext) => StatefulBuilder(
@@ -892,7 +916,7 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
                       ),
                     )
                   : null,
-              child: const Text('导出'),
+              child: Text(actionLabel),
             ),
           ],
         ),
@@ -900,12 +924,32 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
     );
   }
 
-  /// 导出本地数据（按勾选项：收藏、歌单、插件、设置与主题）到
+  /// 点击「备份内容」行：弹勾选框并持久化选择结果（不触发任何导出）。
+  Future<void> _editBackupSections(
+    SettingsNotifier notifier,
+    AppSettings? settings,
+  ) async {
+    final picked = await _showBackupOptionsDialog(
+      actionLabel: '保存',
+      initial: backupOptionsFromSettings(settings),
+    );
+    if (!mounted || picked == null) return;
+    await notifier.setBackupSections(backupSectionsFromOptions(picked));
+    if (!mounted) return;
+    XyNotice.show(
+      context,
+      message: '备份内容已保存',
+      type: XyNoticeType.success,
+    );
+  }
+
+  /// 导出本地数据（按已保存的备份内容：收藏、歌单、插件、设置与主题）到
   /// 用户选择的 JSON 文件。
   Future<void> _exportBackup() async {
     if (_exportingBackup) return;
-    final options = await _showBackupOptionsDialog();
-    if (!mounted || options == null) return;
+    final options = backupOptionsFromSettings(
+      ref.read(settingsProvider).valueOrNull,
+    );
     setState(() => _exportingBackup = true);
     try {
       final path = await const BackupService().exportBackup(options: options);
@@ -948,76 +992,14 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
         enabledPlugins: plugins,
       );
       if (!mounted) return;
-      final exportedAt = data.exportedAt.isNotEmpty
-          ? data.exportedAt.replaceFirst('T', ' ').split('.').first
-          : '未知时间';
-      final libraryInfo = data.librarySongCount > 0
-          ? '与 ${data.librarySongCount} 首本地曲库'
-          : '';
-      final appearanceInfo = data.appearance.isEmpty
-          ? ''
-          : '、外观自定义文件（壁纸/字体）';
-      // v5 备份（仿 MusicFree 结构）直接展示歌单与歌曲数。
-      final sheetInfo = data.sheetCount > 0
-          ? '${data.sheetCount} 个歌单/收藏（共 ${data.songCount} 首）、'
-          : '${data.prefCount} 项数据、';
-      final confirmed = await showDialog<bool>(
-        context: context,
-        builder: (dialogContext) => AlertDialog(
-          title: const Text('导入备份？'),
-          content: Text(
-            '备份导出于 $exportedAt，包含 '
-            '$sheetInfo${data.pluginCount} 个插件'
-            '$libraryInfo$appearanceInfo。\n\n'
-            '导入将覆盖当前同名的歌单、收藏、插件、本地曲库与设置，'
-            '建议先停止播放后继续。最近播放与听歌统计不受备份影响。',
-          ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.pop(dialogContext, false),
-              child: const Text('取消'),
-            ),
-            FilledButton(
-              onPressed: () => Navigator.pop(dialogContext, true),
-              child: const Text('导入'),
-            ),
-          ],
-        ),
+      final confirmed = await _confirmRestoreData(
+        data,
+        title: '导入备份？',
+        actionLabel: '导入',
+        subject: '备份',
       );
-      if (!mounted || confirmed != true) return;
-      await service.applyBackup(data);
-      // 备份可能带回自定义字体文件（v3 起）：立即注册让字体无需重启
-      // 即可生效（文件缺失或损坏时 loadCustomFont 静默返回 false）。
-      if (data.appearance.font != null) {
-        await loadCustomFont(await customFontFilePath());
-      }
-      // 设置/主题在 provider 重建后立即生效；曲库表已整体写回 SQLite，
-      // invalidate 后曲库页即时刷新；歌单、收藏、最近播放与插件列表原先
-      // 由各 provider 在内存中持有快照且仅在启动时加载一次，导入后必须
-      // 一并 invalidate 重建，否则「我的收藏」等页面会继续显示旧的
-      // （空的）内存状态。
-      ref.invalidate(settingsProvider);
-      ref.invalidate(favoritesProvider);
-      ref.invalidate(playlistsProvider);
-      ref.invalidate(recentSongsProvider);
-      ref.invalidate(enabledMusicPluginsProvider);
-      if (data.librarySongCount > 0) ref.invalidate(libraryProvider);
-      if (!mounted) return;
-      await showDialog<void>(
-        context: context,
-        builder: (dialogContext) => AlertDialog(
-          title: const Text('导入完成'),
-          content: const Text(
-            '设置与主题已生效；本地曲库已恢复；歌单与收藏已恢复。',
-          ),
-          actions: [
-            FilledButton(
-              onPressed: () => Navigator.pop(dialogContext),
-              child: const Text('知道了'),
-            ),
-          ],
-        ),
-      );
+      if (!mounted || !confirmed) return;
+      await _applyRestoreData(data, doneTitle: '导入完成');
     } on BackupException catch (error) {
       if (mounted) {
         XyNotice.show(
@@ -1037,6 +1019,95 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
     } finally {
       if (mounted) setState(() => _importingBackup = false);
     }
+  }
+
+  /// 恢复前确认（本地导入与 WebDAV 恢复共用同一套弹窗与文案口径）：
+  /// [title] 为弹窗标题，[actionLabel] 为确认按钮文案，[subject] 为内容
+  /// 开头的来源说明（如「备份」「远端备份 xxx.json 」）。
+  Future<bool> _confirmRestoreData(
+    BackupData data, {
+    required String title,
+    required String actionLabel,
+    required String subject,
+  }) async {
+    final exportedAt = data.exportedAt.isNotEmpty
+        ? data.exportedAt.replaceFirst('T', ' ').split('.').first
+        : '未知时间';
+    final libraryInfo = data.librarySongCount > 0
+        ? '与 ${data.librarySongCount} 首本地曲库'
+        : '';
+    final appearanceInfo = data.appearance.isEmpty
+        ? ''
+        : '、外观自定义文件（壁纸/字体）';
+    // v5 备份（仿 MusicFree 结构）直接展示歌单与歌曲数。
+    final sheetInfo = data.sheetCount > 0
+        ? '${data.sheetCount} 个歌单/收藏（共 ${data.songCount} 首）、'
+        : '${data.prefCount} 项数据、';
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: Text(title),
+        content: Text(
+          '$subject导出于 $exportedAt，包含 '
+          '$sheetInfo${data.pluginCount} 个插件'
+          '$libraryInfo$appearanceInfo。\n\n'
+          '$actionLabel将覆盖当前同名的歌单、收藏、插件、本地曲库与设置，'
+          '建议先停止播放后继续。最近播放与听歌统计不受备份影响。',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext, false),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(dialogContext, true),
+            child: Text(actionLabel),
+          ),
+        ],
+      ),
+    );
+    return confirmed ?? false;
+  }
+
+  /// 把已确认的备份写入本机并刷新相关 provider（本地导入与 WebDAV
+  /// 恢复共用，保证两条链路恢复结果完全一致）。
+  Future<void> _applyRestoreData(
+    BackupData data, {
+    String doneTitle = '恢复完成',
+  }) async {
+    await const BackupService().applyBackup(data);
+    // 备份可能带回自定义字体文件（v3 起）：立即注册让字体无需重启
+    // 即可生效（文件缺失或损坏时 loadCustomFont 静默返回 false）。
+    if (data.appearance.font != null) {
+      await loadCustomFont(await customFontFilePath());
+    }
+    // 设置/主题在 provider 重建后立即生效；曲库表已整体写回 SQLite，
+    // invalidate 后曲库页即时刷新；歌单、收藏、最近播放与插件列表原先
+    // 由各 provider 在内存中持有快照且仅在启动时加载一次，导入后必须
+    // 一并 invalidate 重建，否则「我的收藏」等页面会继续显示旧的
+    // （空的）内存状态。
+    ref.invalidate(settingsProvider);
+    ref.invalidate(favoritesProvider);
+    ref.invalidate(playlistsProvider);
+    ref.invalidate(recentSongsProvider);
+    ref.invalidate(enabledMusicPluginsProvider);
+    if (data.librarySongCount > 0) ref.invalidate(libraryProvider);
+    if (!mounted) return;
+    await showDialog<void>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: Text(doneTitle),
+        content: const Text(
+          '设置与主题已生效；本地曲库已恢复；歌单与收藏已恢复。',
+        ),
+        actions: [
+          FilledButton(
+            onPressed: () => Navigator.pop(dialogContext),
+            child: const Text('知道了'),
+          ),
+        ],
+      ),
+    );
   }
 
   @override
@@ -1395,6 +1466,23 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
           title: '自定义底栏',
           subtitle: '挑选底栏目的地并拖动排序',
           route: '/settings/bottom-bar',
+        ),
+        Padding(
+          padding: const EdgeInsets.fromLTRB(16, 20, 16, 4),
+          child: Text(
+            '音乐库分页',
+            style: TextStyle(
+              fontSize: 13,
+              fontWeight: FontWeight.w700,
+              color: Theme.of(context).colorScheme.primary,
+            ),
+          ),
+        ),
+        // 音乐库分页编辑器：分页顺序 + 单页显隐 + 排序记忆，交互与
+        // 「侧边栏布局 / 自定义底栏」保持一致（拖动排序 + 开关显隐）。
+        _MusicLibraryTabsEditor(
+          settings: settings ?? const AppSettings(),
+          notifier: notifier,
         ),
         Padding(
           padding: const EdgeInsets.fromLTRB(16, 20, 16, 4),
@@ -1824,6 +1912,19 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
         ),
         _tile(
           context,
+          icon: Icons.edit_outlined,
+          title: '文件命名模板',
+          trailing: Text(
+            settings?.downloadFilenameTemplate.isNotEmpty == true
+                ? settings!.downloadFilenameTemplate
+                : kDefaultDownloadFilenameTemplate,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+          ),
+          onTap: () => _showDownloadFilenameTemplateSheet(context),
+        ),
+        _tile(
+          context,
           icon: Icons.tune_rounded,
           title: '每次下载是否询问细节',
           trailing: DropdownButtonHideUnderline(
@@ -1858,12 +1959,23 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
         ),
       ],
       SettingsSection.backup => [
-        ListTile(
-          title: const Text('备份内容'),
-          subtitle: const Text(
-            '歌单、收藏、本地曲库（扫描文件夹与歌曲信息）、'
-            '插件与用户变量、主题、全部设置与歌词关联',
+        _tile(
+          context,
+          icon: Icons.tune,
+          title: '备份内容',
+          // 右侧显示当前已选内容摘要，chevron 提示可点击进弹窗修改。
+          trailing: Text(
+            backupSectionsSummary(settings),
+            style: TextStyle(
+              fontSize: 13,
+              color: Theme.of(context).colorScheme.onSurfaceVariant,
+            ),
           ),
+          onTap: () => _editBackupSections(notifier, settings),
+        ),
+        _backupGroupHeader(
+          title: '本地备份',
+          subtitle: '按「备份内容」的选择导出为 JSON 文件保存在本机，或从 JSON 文件导入恢复',
         ),
         _tile(
           context,
@@ -1878,6 +1990,19 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
           title: _importingBackup ? '正在导入…' : '导入备份',
           trailing: const Text(''),
           onTap: _importingBackup ? null : _importBackup,
+        ),
+        _backupGroupHeader(
+          title: 'WebDAV 备份',
+          subtitle: '按同一份「备份内容」上传到网盘服务器，或从服务器恢复',
+        ),
+        _WebdavBackupSection(
+          onConfirmRestore: (data, fileName) => _confirmRestoreData(
+            data,
+            title: '从 WebDAV 恢复？',
+            actionLabel: '恢复',
+            subject: '远端备份 $fileName ',
+          ),
+          onApplyRestore: (data) => _applyRestoreData(data),
         ),
       ],
       SettingsSection.other => [
@@ -1902,6 +2027,17 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
       showDragHandle: true,
       isScrollControlled: true,
       builder: (_) => const _PlaybackFailurePolicySheet(),
+    );
+  }
+
+  /// 下载文件命名模板弹层入口：常用模板下拉 + 自定义输入，改动即保存。
+  Future<void> _showDownloadFilenameTemplateSheet(BuildContext context) {
+    return showModalBottomSheet<void>(
+      context: context,
+      useRootNavigator: true,
+      showDragHandle: true,
+      isScrollControlled: true,
+      builder: (_) => const _DownloadFilenameTemplateSheet(),
     );
   }
 
@@ -1982,7 +2118,7 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
       _entryRow(
         context,
         title: '备份',
-        subtitle: '导出或导入歌单、收藏、本地曲库、插件与设置',
+        subtitle: '本地 JSON 导出/导入，或 WebDAV 网盘备份与恢复',
         route: '/settings/backup',
       ),
       _entryRow(
@@ -2436,6 +2572,40 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
           ),
         ],
       ),
+    );
+  }
+
+  /// 备份页内的分组小标题（「本地备份」/「WebDAV 备份」），用来说明两组
+  /// 备份的入口边界，避免合并到同一页后混淆。
+  Widget _backupGroupHeader({required String title, required String subtitle}) {
+    return Builder(
+      builder: (headerContext) {
+        final scheme = Theme.of(headerContext).colorScheme;
+        return Padding(
+          padding: const EdgeInsets.fromLTRB(16, 18, 16, 6),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                title,
+                style: TextStyle(
+                  fontSize: 13,
+                  fontWeight: FontWeight.w700,
+                  color: scheme.primary,
+                ),
+              ),
+              const SizedBox(height: 2),
+              Text(
+                subtitle,
+                style: TextStyle(
+                  fontSize: 11.5,
+                  color: scheme.onSurfaceVariant,
+                ),
+              ),
+            ],
+          ),
+        );
+      },
     );
   }
 
@@ -3081,6 +3251,7 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
     var imagePath = settings?.customBackgroundPath ?? '';
     var blur = settings?.customBackgroundBlur ?? 18.0;
     var fade = settings?.customBackgroundFade ?? 0.0;
+    var fitMode = settings?.backgroundFitMode ?? BackgroundFitMode.cover;
     final result = await showModalBottomSheet<_CustomBackgroundResult>(
       context: context,
       useRootNavigator: true,
@@ -3267,6 +3438,7 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
                         imagePath: imagePath,
                         blur: blur,
                         fade: fade,
+                        fit: fitMode,
                         child: Center(
                           child: Text(
                             imagePath.isEmpty ? '尚未选择壁纸' : 'XY Music 壁纸预览',
@@ -3284,6 +3456,52 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
                     ),
                   ),
                   const SizedBox(height: 14),
+                  Row(
+                    children: [
+                      const Icon(Icons.aspect_ratio_outlined, size: 20),
+                      const SizedBox(width: 8),
+                      const Text('显示方式'),
+                      const Spacer(),
+                      Text(
+                        fitMode == BackgroundFitMode.fill ? '完全铺满' : '居中裁剪',
+                        style: TextStyle(
+                          color: Theme.of(context).colorScheme.onSurfaceVariant,
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 8),
+                  SizedBox(
+                    width: double.infinity,
+                    child: SegmentedButton<BackgroundFitMode>(
+                      segments: const [
+                        ButtonSegment(
+                          value: BackgroundFitMode.cover,
+                          label: Text('居中裁剪'),
+                        ),
+                        ButtonSegment(
+                          value: BackgroundFitMode.fill,
+                          label: Text('完全铺满'),
+                        ),
+                      ],
+                      selected: {fitMode},
+                      showSelectedIcon: false,
+                      onSelectionChanged: (selection) =>
+                          setSheetState(() => fitMode = selection.first),
+                    ),
+                  ),
+                  Padding(
+                    padding: const EdgeInsets.only(top: 6),
+                    child: Text(
+                      '居中裁剪：等比放大到铺满屏幕后裁掉溢出部分，画面不变形；'
+                      '完全铺满：拉伸到与屏幕等宽等高，不留边但可能变形。',
+                      style: TextStyle(
+                        color: Theme.of(context).colorScheme.onSurfaceVariant,
+                        fontSize: 12,
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 10),
                   Row(
                     children: [
                       const Icon(Icons.blur_on_outlined, size: 20),
@@ -3347,7 +3565,7 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
                     child: FilledButton(
                       onPressed: () => Navigator.pop(
                         sheetContext,
-                        _CustomBackgroundResult(imagePath, blur, fade),
+                        _CustomBackgroundResult(imagePath, blur, fade, fitMode),
                       ),
                       child: const Text('应用'),
                     ),
@@ -3364,6 +3582,7 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
     await notifier.setCustomBackgroundPath(result.path);
     await notifier.setCustomBackgroundBlur(result.blur);
     await notifier.setCustomBackgroundFade(result.fade);
+    await notifier.setBackgroundFitMode(result.fit);
   }
 
   /// 自定义字体面板：选择 .ttf/.otf 立即应用到全局，或恢复系统默认。
@@ -4105,6 +4324,139 @@ class _PlaybackFailurePolicyEditor extends StatelessWidget {
   }
 }
 
+/// 下载文件命名模板弹层：常用模板下拉 + 自定义输入框，改动即保存。
+class _DownloadFilenameTemplateSheet extends ConsumerStatefulWidget {
+  const _DownloadFilenameTemplateSheet();
+
+  @override
+  ConsumerState<_DownloadFilenameTemplateSheet> createState() =>
+      _DownloadFilenameTemplateSheetState();
+}
+
+class _DownloadFilenameTemplateSheetState
+    extends ConsumerState<_DownloadFilenameTemplateSheet> {
+  late final TextEditingController _controller;
+
+  /// 当前选中的常用模板；null = 自定义（输入框内容不在预设里）。
+  String? _selectedPreset;
+
+  @override
+  void initState() {
+    super.initState();
+    final current =
+        ref.read(settingsProvider).valueOrNull?.downloadFilenameTemplate ??
+        kDefaultDownloadFilenameTemplate;
+    _controller = TextEditingController(text: current);
+    _selectedPreset = kDownloadFilenamePresets.containsKey(current)
+        ? current
+        : null;
+    _controller.addListener(_onTextChanged);
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  void _onTextChanged() {
+    final text = _controller.text.trim();
+    if (text.isEmpty) return; // 清空时暂不保存，避免中途状态写入默认值
+    final preset = kDownloadFilenamePresets.containsKey(text) ? text : null;
+    if (preset != _selectedPreset) setState(() => _selectedPreset = preset);
+    ref
+        .read(settingsProvider.notifier)
+        .setDownloadFilenameTemplate(text);
+  }
+
+  void _applyPreset(String? template) {
+    setState(() => _selectedPreset = template);
+    if (template == null) return; // 自定义：保留输入框内容继续编辑
+    _controller.removeListener(_onTextChanged);
+    _controller.text = template;
+    _controller.addListener(_onTextChanged);
+    ref.read(settingsProvider.notifier).setDownloadFilenameTemplate(template);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final template = _controller.text.trim().isEmpty
+        ? kDefaultDownloadFilenameTemplate
+        : _controller.text;
+    const sample = (
+      title: '晴天',
+      artist: '周杰伦',
+      album: '叶惠美',
+      quality: 'flac',
+    );
+    return SafeArea(
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(20, 0, 20, 16),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            const Text(
+              '文件命名模板',
+              style: TextStyle(fontSize: 16, fontWeight: FontWeight.w700),
+            ),
+            const SizedBox(height: 12),
+            InputDecorator(
+              decoration: const InputDecoration(
+                labelText: '常用模板',
+                border: OutlineInputBorder(),
+                isDense: true,
+              ),
+              child: DropdownButtonHideUnderline(
+                child: DropdownButton<String?>(
+                  value: _selectedPreset,
+                  isExpanded: true,
+                  isDense: true,
+                  items: [
+                    for (final entry in kDownloadFilenamePresets.entries)
+                      DropdownMenuItem(
+                        value: entry.key,
+                        child: Text(entry.value),
+                      ),
+                    const DropdownMenuItem(value: null, child: Text('自定义')),
+                  ],
+                  onChanged: _applyPreset,
+                ),
+              ),
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: _controller,
+              decoration: InputDecoration(
+                labelText: '自定义模板',
+                helperText: '可用变量：{title} {artist} {album} {quality} {platform} {id}',
+                border: const OutlineInputBorder(),
+                isDense: true,
+              ),
+            ),
+            const SizedBox(height: 12),
+            Text(
+              '预览：${renderDownloadFilename(
+                template,
+                title: sample.title,
+                artist: sample.artist,
+                album: sample.album,
+                quality: sample.quality,
+                platform: 'wy',
+                pluginData: const {'id': '186016'},
+              )}.flac',
+              style: TextStyle(
+                fontSize: 12,
+                color: Theme.of(context).colorScheme.onSurfaceVariant,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
 /// 播放失败策略弹层：宿主设置页只保留一个入口块，编辑内容集中在此。
 class _PlaybackFailurePolicySheet extends ConsumerWidget {
   const _PlaybackFailurePolicySheet();
@@ -4172,6 +4524,114 @@ class _CountButton extends StatelessWidget {
     );
   }
 }
+
+/// 音乐库分页编辑器：拖动排序 + 开关显隐 + 排序记忆开关。
+/// 交互对齐 [_SidebarLayoutEditor] / [_BottomBarLayoutEditor]；
+/// 至少保留 1 个分页，关到只剩 1 个时该行开关置灰。
+class _MusicLibraryTabsEditor extends StatelessWidget {
+  const _MusicLibraryTabsEditor({
+    required this.settings,
+    required this.notifier,
+  });
+
+  final AppSettings settings;
+  final SettingsNotifier notifier;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final order = normalizeMusicLibraryTabOrder(settings.musicLibraryTabOrder);
+    final hidden = settings.musicLibraryHiddenTabs.toSet();
+    final visibleCount = order.where((id) => !hidden.contains(id)).length;
+    final onlyOneVisible = visibleCount <= 1;
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        ListTile(
+          leading: const Icon(Icons.tab_rounded),
+          title: const Text('分页显示'),
+          subtitle: Text(
+            onlyOneVisible
+                ? '至少保留 1 个分页（当前 $visibleCount 个）'
+                : '拖动排序，关闭隐藏（至少保留 1 个）',
+          ),
+          trailing: Text(
+            '$visibleCount/${order.length}',
+            style: TextStyle(fontSize: 13, color: scheme.onSurfaceVariant),
+          ),
+        ),
+        ReorderableListView.builder(
+          shrinkWrap: true,
+          physics: const NeverScrollableScrollPhysics(),
+          buildDefaultDragHandles: false,
+          itemCount: order.length,
+          onReorderItem: (oldIndex, newIndex) {
+            final next = [...order];
+            final item = next.removeAt(oldIndex);
+            next.insert(newIndex, item);
+            unawaited(notifier.setMusicLibraryTabOrder(next));
+          },
+          itemBuilder: (context, index) {
+            final id = order[index];
+            final visible = !hidden.contains(id);
+            return ListTile(
+              key: ValueKey('music-library-tab-$id'),
+              leading: Icon(_musicLibraryTabIcon(id)),
+              title: Text(_musicLibraryTabLabel(id)),
+              subtitle: visible ? null : const Text('已隐藏'),
+              trailing: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Switch(
+                    value: visible,
+                    // 只剩 1 个可见分页时禁止再关，避免音乐库空 Tab。
+                    onChanged: visible && onlyOneVisible
+                        ? null
+                        : (value) => unawaited(
+                            notifier.setMusicLibraryTabVisible(id, value),
+                          ),
+                  ),
+                  ReorderableDragStartListener(
+                    index: index,
+                    child: const Padding(
+                      padding: EdgeInsets.all(10),
+                      child: Icon(Icons.drag_handle_rounded),
+                    ),
+                  ),
+                ],
+              ),
+            );
+          },
+        ),
+        SwitchListTile(
+          title: const Text('记住各分页排序'),
+          subtitle: const Text('下次进入音乐库时沿用各分页上次的歌曲排序方式'),
+          value: settings.musicLibrarySortMemoryEnabled,
+          onChanged: (value) => unawaited(
+            notifier.setMusicLibrarySortMemoryEnabled(value),
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+IconData _musicLibraryTabIcon(String id) => switch (id) {
+  kMusicLibraryTabFavorites => Icons.favorite_border_rounded,
+  kMusicLibraryTabPlaylists => Icons.queue_music_rounded,
+  kMusicLibraryTabLocal => Icons.folder_open_rounded,
+  kMusicLibraryTabRecent => Icons.history_rounded,
+  _ => Icons.playlist_play_rounded,
+};
+
+String _musicLibraryTabLabel(String id) => switch (id) {
+  kMusicLibraryTabFavorites => '收藏',
+  kMusicLibraryTabPlaylists => '歌单',
+  kMusicLibraryTabLocal => '本地音乐',
+  kMusicLibraryTabRecent => '最近播放',
+  _ => '播放列表',
+};
 
 class _SidebarLayoutEditor extends StatelessWidget {
   const _SidebarLayoutEditor({required this.settings, required this.notifier});
@@ -4411,9 +4871,466 @@ class _Choice {
 }
 
 class _CustomBackgroundResult {
-  const _CustomBackgroundResult(this.path, this.blur, this.fade);
+  const _CustomBackgroundResult(this.path, this.blur, this.fade, this.fit);
 
   final String path;
   final double blur;
   final double fade;
+  final BackgroundFitMode fit;
+}
+
+/// 把持久化的备份内容选择（[AppSettings.backupSections]）转换成导出选项。
+///
+/// 本地导出与 WebDAV 备份都从这一处取值，保证两条链路内容一致；
+/// 未读过设置（null）时按四项全选处理，与老用户默认行为对齐。
+BackupExportOptions backupOptionsFromSettings(AppSettings? settings) {
+  final sections = settings?.backupSections ?? kAllBackupSections;
+  return BackupExportOptions(
+    favorites: sections.contains(kBackupSectionFavorites),
+    playlists: sections.contains(kBackupSectionPlaylists),
+    plugins: sections.contains(kBackupSectionPlugins),
+    settings: sections.contains(kBackupSectionSettings),
+  );
+}
+
+/// 勾选结果 → 持久化用的分段 key 列表（顺序固定为 收藏/歌单/插件/设置）。
+List<String> backupSectionsFromOptions(BackupExportOptions options) => [
+  if (options.favorites) kBackupSectionFavorites,
+  if (options.playlists) kBackupSectionPlaylists,
+  if (options.plugins) kBackupSectionPlugins,
+  if (options.settings) kBackupSectionSettings,
+];
+
+/// 「备份内容」行右侧摘要：四项全选显示「全部」，否则用「、」连接已选项。
+String backupSectionsSummary(AppSettings? settings) {
+  final sections = settings?.backupSections ?? kAllBackupSections;
+  final labels = [
+    if (sections.contains(kBackupSectionFavorites)) '收藏',
+    if (sections.contains(kBackupSectionPlaylists)) '歌单',
+    if (sections.contains(kBackupSectionPlugins)) '插件',
+    if (sections.contains(kBackupSectionSettings)) '设置',
+  ];
+  if (labels.isEmpty) return '未选择';
+  if (labels.length == kAllBackupSections.length) return '全部';
+  return labels.join('、');
+}
+
+/// 备份页内嵌的 WebDAV 区块：连接配置 + 备份 / 恢复 / 保存连接配置。
+///
+/// 与本地备份合并到同一页，但内容同源：
+/// - 「备份到 WebDAV」直接读取已保存的备份内容（与本地导出同一份选择），
+///   因此云端备份与本地导出的内容完全一致，且上传前不再弹选择框；
+/// - 「从 WebDAV 恢复」复用父页的恢复确认弹窗与写回流程。
+class _WebdavBackupSection extends ConsumerStatefulWidget {
+  const _WebdavBackupSection({
+    required this.onConfirmRestore,
+    required this.onApplyRestore,
+  });
+
+  /// 复用本地「导入备份」的恢复确认弹窗（参数为待恢复数据与远端文件名）。
+  final Future<bool> Function(BackupData data, String fileName)
+  onConfirmRestore;
+
+  /// 复用本地「导入备份」的写回与刷新流程。
+  final Future<void> Function(BackupData data) onApplyRestore;
+
+  @override
+  ConsumerState<_WebdavBackupSection> createState() =>
+      _WebdavBackupSectionState();
+}
+
+class _WebdavBackupSectionState extends ConsumerState<_WebdavBackupSection> {
+  /// 密码在安全存储中的键（与既有凭据键风格一致，不落普通配置）。
+  static const String _passwordKey = 'webdav.password.v1';
+
+  static const WebdavBackupController _controller = WebdavBackupController();
+
+  final TextEditingController _serverCtrl = TextEditingController();
+  final TextEditingController _accountCtrl = TextEditingController();
+  final TextEditingController _passwordCtrl = TextEditingController();
+
+  bool _obscure = true;
+  bool _keepLatestOnly = false;
+  bool _busy = false;
+  String _busyLabel = '';
+
+  @override
+  void initState() {
+    super.initState();
+    // 默认值先落位，避免异步读取设置期间输入框跳变。
+    _serverCtrl.text = kDefaultWebdavServerUrl;
+    WidgetsBinding.instance.addPostFrameCallback((_) => _loadSaved());
+  }
+
+  @override
+  void dispose() {
+    _serverCtrl.dispose();
+    _accountCtrl.dispose();
+    _passwordCtrl.dispose();
+    super.dispose();
+  }
+
+  /// 读取已保存的连接配置与密码，回填到输入框。
+  Future<void> _loadSaved() async {
+    final AppSettings settings;
+    try {
+      settings = await ref.read(settingsProvider.future);
+    } catch (_) {
+      return;
+    }
+    final password = await SecureStore.read(_passwordKey) ?? '';
+    if (!mounted) return;
+    setState(() {
+      _serverCtrl.text = settings.webdavServerUrl;
+      _accountCtrl.text = settings.webdavUsername;
+      _passwordCtrl.text = password;
+      _keepLatestOnly = settings.webdavKeepLatestOnly;
+    });
+  }
+
+  /// 把当前输入写入持久化（服务器地址、账号进 prefs，密码进安全存储）。
+  Future<void> _persistConfig() async {
+    final notifier = ref.read(settingsProvider.notifier);
+    final server = _serverCtrl.text.trim();
+    await notifier.setWebdavConnection(
+      // 留空时传 null，保留既有默认服务器地址，避免下次启动读到空串。
+      serverUrl: server.isEmpty ? null : server,
+      username: _accountCtrl.text.trim(),
+    );
+    await notifier.setWebdavKeepLatestOnly(_keepLatestOnly);
+    final password = _passwordCtrl.text;
+    if (password.isEmpty) {
+      await SecureStore.delete(_passwordKey);
+    } else {
+      await SecureStore.write(_passwordKey, password);
+    }
+  }
+
+  WebdavClient _buildClient() => _controller.buildClient(
+    serverUrl: _serverCtrl.text,
+    username: _accountCtrl.text,
+    password: _passwordCtrl.text,
+  );
+
+  void _toast(String message, [XyNoticeType type = XyNoticeType.info]) {
+    XyNotice.show(context, message: message, type: type);
+  }
+
+  /// 统一的任务执行外壳：置忙、错误映射为顶部提示、结束复位。
+  Future<void> _run({
+    required String action,
+    required Future<void> Function() task,
+  }) async {
+    if (_busy) return;
+    setState(() {
+      _busy = true;
+      _busyLabel = '正在$action…';
+    });
+    try {
+      await task();
+    } on WebdavException catch (error) {
+      if (mounted) _toast(error.message, XyNoticeType.error);
+    } on BackupException catch (error) {
+      if (mounted) _toast(error.message, XyNoticeType.error);
+    } catch (error) {
+      if (mounted) _toast('$action失败：$error', XyNoticeType.error);
+    } finally {
+      if (mounted) {
+        setState(() {
+          _busy = false;
+          _busyLabel = '';
+        });
+      }
+    }
+  }
+
+  /// 保存连接配置：先写入持久化，再做一次连通性校验。
+  Future<void> _saveConnection() => _run(
+    action: '校验连接',
+    task: () async {
+      final client = _buildClient();
+      await _persistConfig();
+      await _controller.verifyConnection(client);
+      if (!mounted) return;
+      _toast('连接成功，配置已保存', XyNoticeType.success);
+    },
+  );
+
+  /// 备份到 WebDAV：直接按已保存的备份内容（与本地导出同一份选择）上传，
+  /// 不再弹「选择备份内容」对话框；上传成功后可清理旧备份。
+  Future<void> _backupToWebdav() async {
+    if (_busy) return;
+    final options = backupOptionsFromSettings(
+      ref.read(settingsProvider).valueOrNull,
+    );
+    await _run(
+      action: '备份',
+      task: () async {
+        final client = _buildClient();
+        await _persistConfig();
+        final result = await _controller.backup(
+          client: client,
+          options: options,
+          keepLatestOnly: _keepLatestOnly,
+          onProgress: (label) {
+            if (mounted) setState(() => _busyLabel = label);
+          },
+        );
+        if (!mounted) return;
+        _toast(
+          result.removedCount > 0
+              ? '备份成功：${result.blob.fileName}'
+                    '（已清理 ${result.removedCount} 个旧备份）'
+              : '备份成功：${result.blob.fileName}',
+          XyNoticeType.success,
+        );
+      },
+    );
+  }
+
+  /// 从 WebDAV 恢复：列目录 → 选择 → 下载解析 → 复用本地确认与写回流程。
+  Future<void> _restoreFromWebdav() => _run(
+    action: '恢复',
+    task: () async {
+      final client = _buildClient();
+      await _persistConfig();
+      final entries = await _controller.listBackups(client);
+      if (!mounted) return;
+      if (entries.isEmpty) {
+        _toast('服务器上没有可恢复的备份', XyNoticeType.warning);
+        return;
+      }
+      // 选择期间放开忙碌态，避免进度条压住选择面板。
+      setState(() {
+        _busy = false;
+        _busyLabel = '';
+      });
+      final selected = await _pickRemoteBackup(entries);
+      if (!mounted || selected == null) return;
+      setState(() {
+        _busy = true;
+        _busyLabel = '正在下载备份…';
+      });
+      final plugins = await ref.read(enabledMusicPluginsProvider.future);
+      final data = await _controller.downloadBackup(
+        client: client,
+        fileName: selected.name,
+        enabledPlugins: plugins,
+      );
+      if (!mounted) return;
+      setState(() {
+        _busy = false;
+        _busyLabel = '';
+      });
+      final confirmed = await widget.onConfirmRestore(data, selected.name);
+      if (!mounted || !confirmed) return;
+      setState(() {
+        _busy = true;
+        _busyLabel = '正在恢复…';
+      });
+      await widget.onApplyRestore(data);
+      if (!mounted) return;
+      await _loadSaved();
+    },
+  );
+
+  /// 选择要恢复的远端备份（按修改时间倒序，最新的排最前）。
+  Future<WebdavEntry?> _pickRemoteBackup(List<WebdavEntry> entries) {
+    return showModalBottomSheet<WebdavEntry>(
+      context: context,
+      useRootNavigator: true,
+      showDragHandle: true,
+      isScrollControlled: true,
+      builder: (sheetContext) {
+        final scheme = Theme.of(sheetContext).colorScheme;
+        return SafeArea(
+          child: ConstrainedBox(
+            constraints: BoxConstraints(
+              maxHeight: MediaQuery.of(sheetContext).size.height * .6,
+            ),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(20, 4, 20, 4),
+                  child: Text(
+                    '选择要恢复的备份',
+                    style: TextStyle(
+                      fontSize: 16,
+                      fontWeight: FontWeight.w700,
+                      color: scheme.onSurface,
+                    ),
+                  ),
+                ),
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(20, 0, 20, 10),
+                  child: Text(
+                    '共 ${entries.length} 份，按备份时间从新到旧排列',
+                    style: TextStyle(
+                      fontSize: 12,
+                      color: scheme.onSurfaceVariant,
+                    ),
+                  ),
+                ),
+                Flexible(
+                  child: ListView.builder(
+                    shrinkWrap: true,
+                    itemCount: entries.length,
+                    itemBuilder: (context, index) {
+                      final entry = entries[index];
+                      return ListTile(
+                        leading: const Icon(Icons.description_outlined),
+                        title: Text(
+                          entry.name,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                        subtitle: Text(
+                          '${WebdavBackupController.formatTime(entry.modified)}'
+                          ' · ${WebdavBackupController.formatSize(entry.size)}',
+                        ),
+                        onTap: () => Navigator.pop(sheetContext, entry),
+                      );
+                    },
+                  ),
+                ),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Padding(
+          padding: const EdgeInsets.fromLTRB(16, 4, 16, 0),
+          child: Column(
+            children: [
+              TextField(
+                controller: _serverCtrl,
+                enabled: !_busy,
+                keyboardType: TextInputType.url,
+                autocorrect: false,
+                decoration: const InputDecoration(
+                  labelText: '服务器 URL',
+                  hintText: kDefaultWebdavServerUrl,
+                  prefixIcon: Icon(Icons.cloud_outlined),
+                ),
+              ),
+              const SizedBox(height: 12),
+              TextField(
+                controller: _accountCtrl,
+                enabled: !_busy,
+                autocorrect: false,
+                decoration: const InputDecoration(
+                  labelText: '账号',
+                  prefixIcon: Icon(Icons.person_outline_rounded),
+                ),
+              ),
+              const SizedBox(height: 12),
+              TextField(
+                controller: _passwordCtrl,
+                enabled: !_busy,
+                obscureText: _obscure,
+                decoration: InputDecoration(
+                  labelText: '密码',
+                  prefixIcon: const Icon(Icons.lock_outline_rounded),
+                  suffixIcon: IconButton(
+                    onPressed: () => setState(() => _obscure = !_obscure),
+                    icon: Icon(
+                      _obscure ? Icons.visibility_off : Icons.visibility,
+                    ),
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+        if (_busy) _busyHint(scheme),
+        SwitchListTile(
+          value: _keepLatestOnly,
+          onChanged: _busy
+              ? null
+              : (bool next) {
+                  setState(() => _keepLatestOnly = next);
+                  // 勾选状态独立保存，避免用户只勾选却忘了「保存连接配置」。
+                  ref
+                      .read(settingsProvider.notifier)
+                      .setWebdavKeepLatestOnly(next);
+                },
+          title: const Text('保留最新备份'),
+          subtitle: const Text('上传成功后删除服务器上的旧备份，只保留最新一份'),
+        ),
+        _actionTile(
+          icon: Icons.cloud_upload_outlined,
+          title: '备份到 WebDAV',
+          onTap: _busy ? null : _backupToWebdav,
+        ),
+        _actionTile(
+          icon: Icons.cloud_download_outlined,
+          title: '从 WebDAV 恢复',
+          onTap: _busy ? null : _restoreFromWebdav,
+        ),
+        _actionTile(
+          icon: Icons.save_outlined,
+          title: '保存连接配置',
+          onTap: _busy ? null : _saveConnection,
+        ),
+        Padding(
+          padding: const EdgeInsets.fromLTRB(16, 10, 16, 20),
+          child: Text(
+            '备份会上传到服务器下的 /${WebdavBackupController.directory} 目录'
+            '（不存在时自动创建），文件名与本地导出完全一致，'
+            '连接配置也可从本地备份恢复到本机。'
+            '密码仅保存在本机安全存储中，不写入备份文件与普通配置。',
+            style: TextStyle(fontSize: 12, color: scheme.onSurfaceVariant),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _busyHint(ColorScheme scheme) {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 10, 16, 0),
+      child: Row(
+        children: [
+          SizedBox(
+            width: 14,
+            height: 14,
+            child: CircularProgressIndicator(
+              strokeWidth: 2,
+              color: scheme.primary,
+            ),
+          ),
+          const SizedBox(width: 8),
+          Text(
+            _busyLabel,
+            style: TextStyle(fontSize: 12, color: scheme.onSurfaceVariant),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _actionTile({
+    required IconData icon,
+    required String title,
+    VoidCallback? onTap,
+  }) {
+    final scheme = Theme.of(context).colorScheme;
+    return ListTile(
+      leading: Icon(icon, color: scheme.onSurfaceVariant),
+      title: Text(title),
+      trailing: Icon(Icons.chevron_right, size: 18, color: scheme.outline),
+      onTap: onTap,
+    );
+  }
 }

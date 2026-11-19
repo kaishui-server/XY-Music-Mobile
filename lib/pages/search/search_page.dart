@@ -971,6 +971,7 @@ class _SearchPageState extends ConsumerState<SearchPage>
           path: value.valueOrNull?.customBackgroundPath ?? '',
           blur: value.valueOrNull?.customBackgroundBlur ?? 18.0,
           fade: value.valueOrNull?.customBackgroundFade ?? 0.0,
+          fit: value.valueOrNull?.backgroundFitMode ?? BackgroundFitMode.cover,
         ),
       ),
     );
@@ -1127,6 +1128,7 @@ class _SearchPageState extends ConsumerState<SearchPage>
                 imagePath: backgroundSettings.path,
                 blur: backgroundSettings.blur,
                 fade: backgroundSettings.fade,
+                fit: backgroundSettings.fit,
                 child: scaffold,
               )
             : scaffold,

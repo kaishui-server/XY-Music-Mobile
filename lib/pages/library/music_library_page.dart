@@ -50,10 +50,9 @@ class MusicLibraryPage extends ConsumerStatefulWidget {
 
 class _MusicLibraryPageState extends ConsumerState<MusicLibraryPage>
     with TickerProviderStateMixin {
-  late final TabController _tabController = TabController(
-    length: 5,
-    vsync: this,
-  );
+  /// 分页控制器：长度随「自定义音乐库分页」配置变化，因此不能声明为
+  /// final——顺序或显隐变化时整体重建（见 [_applyTabConfig]）。
+  late TabController _tabController;
 
   /// 本地音乐分页的子分页控制器：歌曲 / 歌手 / 专辑。
   late final TabController _localTabController = TabController(
@@ -61,7 +60,43 @@ class _MusicLibraryPageState extends ConsumerState<MusicLibraryPage>
     vsync: this,
   );
 
-  static const _tabs = ['收藏', '歌单', '本地音乐', '最近播放', '播放列表'];
+  /// 当前可见分页 id 列表（顺序即 TabBar 顺序）。
+  ///
+  /// 派生规则：先按设置里的 musicLibraryTabOrder 排序，再剔除
+  /// musicLibraryHiddenTabs 中的分页；至少保留 1 个分页。
+  List<String> _visibleTabIds = kDefaultMusicLibraryTabOrder;
+
+  List<String> _resolveVisibleTabIds(AppSettings settings) {
+    final hidden = settings.musicLibraryHiddenTabs.toSet();
+    final ids = normalizeMusicLibraryTabOrder(settings.musicLibraryTabOrder)
+        .where((id) => !hidden.contains(id))
+        .toList();
+    return ids.isEmpty ? kDefaultMusicLibraryTabOrder : ids;
+  }
+
+  /// 当前分页 id：所有「随分页切换」的标题与按钮改为按 id 判定，
+  /// 这样分页顺序/显隐可配置后不会错位。
+  String get _currentTabId {
+    if (_visibleTabIds.isEmpty) return kMusicLibraryTabFavorites;
+    final index = _tabController.index.clamp(0, _visibleTabIds.length - 1);
+    return _visibleTabIds[index];
+  }
+
+  static String _tabLabel(String id) => switch (id) {
+    kMusicLibraryTabFavorites => '收藏',
+    kMusicLibraryTabPlaylists => '歌单',
+    kMusicLibraryTabLocal => '本地音乐',
+    kMusicLibraryTabRecent => '最近播放',
+    _ => '播放列表',
+  };
+
+  Widget _buildTabPage(String id, BuildContext context) => switch (id) {
+    kMusicLibraryTabFavorites => _buildFavoritesTab(context),
+    kMusicLibraryTabPlaylists => _buildPlaylistsTab(context),
+    kMusicLibraryTabLocal => _buildLocalTab(context),
+    kMusicLibraryTabRecent => _buildRecentTab(context),
+    _ => _buildQueueTab(context),
+  };
 
   // ---- 收藏分页状态 ----
   String _favQuery = '';
@@ -144,8 +179,97 @@ class _MusicLibraryPageState extends ConsumerState<MusicLibraryPage>
   @override
   void initState() {
     super.initState();
+    final settings =
+        ref.read(settingsProvider).valueOrNull ?? const AppSettings();
+    _visibleTabIds = _resolveVisibleTabIds(settings);
+    _tabController = TabController(
+      length: _visibleTabIds.length,
+      vsync: this,
+    );
     _tabController.addListener(_onTabChanged);
     _localTabController.addListener(_onTabChanged);
+    _restoreSortMemory(settings);
+    // 设置页调整分页顺序/显隐后即时生效：配置变化就重建控制器，
+    // 无需退出音乐库再进。
+    ref.listenManual<AsyncValue<AppSettings>>(settingsProvider, (prev, next) {
+      final value = next.valueOrNull;
+      if (value == null) return;
+      final ids = _resolveVisibleTabIds(value);
+      if (!_sameTabIds(ids, _visibleTabIds)) _applyTabConfig(ids);
+      if (prev?.valueOrNull?.musicLibrarySortMemoryEnabled == true &&
+          !value.musicLibrarySortMemoryEnabled &&
+          mounted) {
+        // 关闭「记住排序」后立刻回到默认排序，不停留在旧排序上。
+        setState(() {
+          _favSort = const SongSort(SongSortKey.custom);
+          _favDragEditMode = false;
+          _localSort = const SongSort(SongSortKey.custom);
+        });
+      }
+    });
+  }
+
+  bool _sameTabIds(List<String> a, List<String> b) {
+    if (a.length != b.length) return false;
+    for (var i = 0; i < a.length; i++) {
+      if (a[i] != b[i]) return false;
+    }
+    return true;
+  }
+
+  /// 分页配置变化：重建 TabController（长度可能变了），尽量停留在原分页。
+  void _applyTabConfig(List<String> ids) {
+    if (ids.isEmpty) return;
+    final currentId = _currentTabId;
+    final nextIndex = ids.indexOf(currentId);
+    final oldController = _tabController;
+    final nextController = TabController(
+      length: ids.length,
+      vsync: this,
+      initialIndex: nextIndex < 0 ? 0 : nextIndex,
+    );
+    oldController.removeListener(_onTabChanged);
+    nextController.addListener(_onTabChanged);
+    setState(() {
+      _visibleTabIds = ids;
+      _tabController = nextController;
+      _lastTabIndex = nextController.index;
+    });
+    // 旧控制器可能仍被当前帧的 TabBar 引用，销毁延后一帧更稳。
+    WidgetsBinding.instance.addPostFrameCallback(
+      (_) => oldController.dispose(),
+    );
+  }
+
+  /// 恢复各分页记住的歌曲排序方式；「记住排序」关闭时保持默认排序。
+  void _restoreSortMemory(AppSettings settings) {
+    if (!settings.musicLibrarySortMemoryEnabled) return;
+    for (final entry in settings.musicLibraryTabSorts) {
+      final parts = entry.split('|');
+      if (parts.length < 3) continue;
+      final key = SongSortKey.values.firstWhere(
+        (value) => value.name == parts[1],
+        orElse: () => SongSortKey.custom,
+      );
+      final sort = SongSort(key, descending: parts[2] == '1');
+      if (parts[0] == kMusicLibraryTabFavorites) _favSort = sort;
+      if (parts[0] == kMusicLibraryTabLocal) _localSort = sort;
+    }
+  }
+
+  /// 排序变化时写入设置（「记住排序」关闭时不写，避免无效持久化）。
+  void _rememberSort(String tabId, SongSort sort) {
+    final settings = ref.read(settingsProvider).valueOrNull;
+    if (settings == null || !settings.musicLibrarySortMemoryEnabled) return;
+    unawaited(
+      ref
+          .read(settingsProvider.notifier)
+          .setMusicLibraryTabSort(
+            tabId,
+            sort.key.name,
+            descending: sort.descending,
+          ),
+    );
   }
 
   /// 上一次的分页索引：TabController 的监听在切换动画期间每帧都会触发，
@@ -164,7 +288,7 @@ class _MusicLibraryPageState extends ConsumerState<MusicLibraryPage>
     // 会让输入连接持续存在，后续任意触发页面重建的操作（点歌播放、系统
     // 返回收起键盘后再交互）都会重新唤起键盘，体感即「任意操作都弹键盘」。
     // 一加 ACE 竞速版（ColorOS）实测复现，切页时主动退出最稳妥。
-    if (_favSearchMode && _tabController.index != 0) {
+    if (_favSearchMode && _currentTabId != kMusicLibraryTabFavorites) {
       _exitFavSearch();
       return;
     }
@@ -188,11 +312,6 @@ class _MusicLibraryPageState extends ConsumerState<MusicLibraryPage>
     super.dispose();
   }
 
-  void _toast(String message) {
-    if (!mounted) return;
-    XyNotice.show(context, message: message, duration: const Duration(seconds: 2));
-  }
-
   String _pinyinKey(String text) =>
       PinyinHelper.getPinyinE(text.trim(), separator: ' ').toLowerCase();
 
@@ -207,22 +326,22 @@ class _MusicLibraryPageState extends ConsumerState<MusicLibraryPage>
   // ==========================================================================
 
   String get _appBarTitle {
-    switch (_tabController.index) {
-      case 0:
+    switch (_currentTabId) {
+      case kMusicLibraryTabFavorites:
         if (_favSwitchingSource) {
           return '换源中 $_favSwitchingDone/$_favSwitchingTotal';
         }
-      case 1:
+      case kMusicLibraryTabPlaylists:
         if (_playlistSelectionMode) return '已选 ${_playlistSelectedIds.length} 个歌单';
-      case 2:
+      case kMusicLibraryTabLocal:
         if (_localSelectionMode) return '已选 ${_localSelectedPaths.length} 首';
     }
     return '音乐库';
   }
 
   List<Widget> _buildAppBarActions() {
-    switch (_tabController.index) {
-      case 0:
+    switch (_currentTabId) {
+      case kMusicLibraryTabFavorites:
         // 收藏：排序 / 搜索 / 更多（批量下载 / 换源 / 保存到歌单 /
         // 取消收藏 / 刷新，与歌单详情页右上角「更多」同款）。
         if (_favSearchMode) {
@@ -241,6 +360,7 @@ class _MusicLibraryPageState extends ConsumerState<MusicLibraryPage>
             SongSortMenuButton(
               sort: _favSort,
               onSortChanged: (sort) {
+                var remember = false;
                 setState(() {
                   // 已处于自定义排序时再次点击「自定义」：
                   // 进入/退出拖拽编辑模式（手柄随之显隐）。
@@ -250,8 +370,11 @@ class _MusicLibraryPageState extends ConsumerState<MusicLibraryPage>
                   } else {
                     _favSort = sort;
                     _favDragEditMode = false;
+                    remember = true;
                   }
                 });
+                // 拖拽编辑模式切换不是排序变更，不写入记忆。
+                if (remember) _rememberSort(kMusicLibraryTabFavorites, sort);
               },
             ),
           IconButton(
@@ -287,7 +410,7 @@ class _MusicLibraryPageState extends ConsumerState<MusicLibraryPage>
             ],
           ),
         ];
-      case 1:
+      case kMusicLibraryTabPlaylists:
         // 歌单：多选（批量清空/删除）+ 导入。
         if (_playlistSelectionMode) {
           return [
@@ -325,7 +448,7 @@ class _MusicLibraryPageState extends ConsumerState<MusicLibraryPage>
             icon: const Icon(Icons.playlist_add_rounded),
           ),
         ];
-      case 2:
+      case kMusicLibraryTabLocal:
         // 本地音乐：搜索 / 多选模式显示取消；常规态右上角只留扫描目录与
         // 搜索，排序 / 多选 / 刷新下沉到歌曲列表顶部的工具行（图三样式）。
         if (_localSelectionMode) {
@@ -360,7 +483,7 @@ class _MusicLibraryPageState extends ConsumerState<MusicLibraryPage>
             icon: const Icon(Icons.search_rounded),
           ),
         ];
-      case 3:
+      case kMusicLibraryTabRecent:
         // 最近播放：搜索 + 清空。
         if (_recentSearchMode) {
           return [
@@ -405,7 +528,7 @@ class _MusicLibraryPageState extends ConsumerState<MusicLibraryPage>
         ],
         bottom: TabBar(
           controller: _tabController,
-          // 平均分布：五个分页等宽填充，不滚动。
+          // 平均分布：可见分页等宽填充，不滚动。
           labelStyle: const TextStyle(
             fontSize: 15,
             fontWeight: FontWeight.w700,
@@ -414,8 +537,9 @@ class _MusicLibraryPageState extends ConsumerState<MusicLibraryPage>
             fontSize: 14,
             fontWeight: FontWeight.w600,
           ),
+          // 分页数量与顺序由设置「音乐库分页」决定，被隐藏的分页不进 TabBar。
           tabs: [
-            for (final tab in _tabs) Tab(text: tab, height: 54),
+            for (final id in _visibleTabIds) Tab(text: _tabLabel(id), height: 54),
           ],
         ),
       ),
@@ -423,15 +547,16 @@ class _MusicLibraryPageState extends ConsumerState<MusicLibraryPage>
         child: XyTabBarView(
           controller: _tabController,
           // 用 _DeferredTab 懒构建：TabBarView 会一次性索要全部子项的 Widget
-          // 实例，若在此直接调用六个分页的构建方法，每次切页都要把未显示
+          // 实例，若在此直接调用各分页的构建方法，每次切页都要把未显示
           // 分页（尤其本地音乐分页的歌手/专辑分组与拼音排序）全部重算一遍，
           // 这是切页卡顿的主因。改为让 PageView 只构建实际挂载的分页。
           children: [
-            _DeferredTab(_buildFavoritesTab),
-            _DeferredTab(_buildPlaylistsTab),
-            _DeferredTab(_buildLocalTab),
-            _DeferredTab(_buildRecentTab),
-            _DeferredTab(_buildQueueTab),
+            for (final id in _visibleTabIds)
+              _DeferredTab(
+                (pageContext) => _buildTabPage(id, pageContext),
+                // 带 key：分页顺序/显隐变化后按 id 复用元素，不按位置错位。
+                key: ValueKey('music-library-page-$id'),
+              ),
           ],
         ),
       ),
@@ -1532,7 +1657,10 @@ class _MusicLibraryPageState extends ConsumerState<MusicLibraryPage>
           leadingTools: [
             SongSortMenuButton(
               sort: _localSort,
-              onSortChanged: (sort) => setState(() => _localSort = sort),
+              onSortChanged: (sort) {
+                setState(() => _localSort = sort);
+                _rememberSort(kMusicLibraryTabLocal, sort);
+              },
             ),
             IconButton(
               tooltip: '多选',
@@ -1894,7 +2022,7 @@ class _MusicLibraryPageState extends ConsumerState<MusicLibraryPage>
 /// 这正是分页切换卡顿的主因。本类把真正的构建推迟到该分页被挂载时，
 /// 观感与原有完全一致，只是不再做无用功。
 class _DeferredTab extends StatelessWidget {
-  const _DeferredTab(this.builder);
+  const _DeferredTab(this.builder, {super.key});
 
   final WidgetBuilder builder;
 

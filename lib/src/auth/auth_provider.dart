@@ -8,6 +8,7 @@ import 'package:flutter/services.dart';
 import 'package:image/image.dart' as img;
 import 'package:shared_preferences/shared_preferences.dart';
 
+import '../core/safe_state_notifier.dart';
 import '../core/db_path.dart';
 import '../rust/api.dart';
 
@@ -279,7 +280,7 @@ class _ClientMetadata {
   };
 }
 
-class AuthNotifier extends StateNotifier<AuthState> {
+class AuthNotifier extends SafeStateNotifier<AuthState> {
   AuthNotifier(this._ref) : super(const AuthState()) {
     init();
   }

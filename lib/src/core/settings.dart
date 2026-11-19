@@ -24,6 +24,15 @@ enum PlayerCoverStyle { classic, circle, immersive, vinyl }
 /// 淡入淡出（两页交叉淡化）。
 enum PageTransitionMode { slide, stack, fade }
 
+/// 自定义壁纸（图片或视频动态背景）的铺放方式。
+///
+/// - [cover] 居中裁剪：等比放大到铺满屏幕后居中裁掉溢出的部分（默认，
+///   不改变画面比例）；
+/// - [fill] 完全铺满：不保持宽高比，直接拉伸到铺满整个屏幕。
+///
+/// 图片与视频共用同一份设置，保证两种壁纸外观一致。
+enum BackgroundFitMode { cover, fill }
+
 /// 首页顶栏侧边栏按钮的位置。
 enum SidebarPosition { left, right }
 
@@ -110,6 +119,41 @@ List<String> normalizeBottomBarItemIds(Iterable<String> stored) {
   return normalized;
 }
 
+// ---- 音乐库分页（收藏 / 歌单 / 本地音乐 / 最近播放 / 播放列表）----
+
+const kMusicLibraryTabFavorites = 'favorites';
+const kMusicLibraryTabPlaylists = 'playlists';
+const kMusicLibraryTabLocal = 'local';
+const kMusicLibraryTabRecent = 'recent';
+const kMusicLibraryTabQueue = 'queue';
+
+/// 音乐库分页的默认顺序（也是合法 id 全集）。
+const kDefaultMusicLibraryTabOrder = <String>[
+  kMusicLibraryTabFavorites,
+  kMusicLibraryTabPlaylists,
+  kMusicLibraryTabLocal,
+  kMusicLibraryTabRecent,
+  kMusicLibraryTabQueue,
+];
+
+/// 归一化音乐库分页顺序：过滤合法 id、去重并补齐缺失项。
+///
+/// 与侧边栏一致——顺序列表始终是全集，隐藏与否由
+/// [AppSettings.musicLibraryHiddenTabs] 单独表达，避免新增分页后
+/// 老用户的顺序列表缺项而丢分页。
+List<String> normalizeMusicLibraryTabOrder(Iterable<String> stored) {
+  final normalized = <String>[];
+  for (final id in stored) {
+    if (kDefaultMusicLibraryTabOrder.contains(id) && !normalized.contains(id)) {
+      normalized.add(id);
+    }
+  }
+  for (final id in kDefaultMusicLibraryTabOrder) {
+    if (!normalized.contains(id)) normalized.add(id);
+  }
+  return normalized;
+}
+
 /// 播放过程中发生错误时的处理方式。
 enum PlaybackFailureAction { playNext, pause }
 
@@ -189,6 +233,38 @@ const kSupportedScanFormats = <String>[
   'ape',
 ];
 
+/// WebDAV 备份默认服务器地址（坚果云），新建配置时预填。
+const kDefaultWebdavServerUrl = 'https://dav.jianguoyun.com/dav/';
+
+/// WebDAV 备份的远端固定目录（挂载在服务器地址之下）。
+const kWebdavBackupDirName = 'XYMusic';
+
+/// 备份内容分段 key：与「备份内容」勾选项一一对应。
+const kBackupSectionFavorites = 'favorites';
+const kBackupSectionPlaylists = 'playlists';
+const kBackupSectionPlugins = 'plugins';
+const kBackupSectionSettings = 'settings';
+
+/// 全部备份内容分段（顺序即展示顺序：收藏 → 歌单 → 插件 → 设置）。
+const kAllBackupSections = <String>[
+  kBackupSectionFavorites,
+  kBackupSectionPlaylists,
+  kBackupSectionPlugins,
+  kBackupSectionSettings,
+];
+
+/// 归一化备份内容选择：过滤未知 key 并按展示顺序重排；老用户无该配置
+/// （null）或存了非法/空值时回退为四项全选，避免导出空备份。
+List<String> normalizeBackupSections(Iterable<String>? stored) {
+  if (stored == null) return kAllBackupSections;
+  final kept = {
+    for (final key in kAllBackupSections)
+      if (stored.contains(key)) key,
+  };
+  if (kept.isEmpty) return kAllBackupSections;
+  return kAllBackupSections.where(kept.contains).toList();
+}
+
 /// 移动端只使用 0=列表循环、1=单曲循环、2=随机播放。
 ///
 /// 旧版 Rust/桌面端会话曾允许用 3 表示单曲循环；升级或导入旧数据库时
@@ -229,9 +305,14 @@ class AppSettings {
     this.bottomBarEnabled = false,
     this.bottomBarItemIds = const <String>[],
     this.bottomBarShowLabels = true,
+    this.musicLibraryTabOrder = kDefaultMusicLibraryTabOrder,
+    this.musicLibraryHiddenTabs = const <String>[],
+    this.musicLibrarySortMemoryEnabled = true,
+    this.musicLibraryTabSorts = const <String>[],
     // 首次启动欢迎/初始化向导是否已完成（跳过或走完都算完成）。
     this.welcomeSetupCompleted = false,
     this.customBackgroundPath = '',
+    this.backgroundFitMode = BackgroundFitMode.cover,
     this.customBackgroundBlur = 18.0,
     this.customBackgroundFade = 0.0,
     this.playerDetailCustomImagePath = '',
@@ -289,10 +370,15 @@ class AppSettings {
     this.pluginInstallSkipVersionCheck = false,
     this.downloadLyrics = true,
     this.downloadWriteMetadata = true,
+    this.downloadFilenameTemplate = '{artist} - {title}',
     this.organizeRule = '{Artist}/{Album}/{Title}',
     this.scanFormats = kSupportedScanFormats,
     this.equalizerEnabled = false,
     this.equalizerGains = const [],
+    this.webdavServerUrl = kDefaultWebdavServerUrl,
+    this.webdavUsername = '',
+    this.webdavKeepLatestOnly = false,
+    this.backupSections = kAllBackupSections,
   });
 
   final double volume;
@@ -347,10 +433,25 @@ class AppSettings {
   /// 底栏是否显示条目文字；关闭后仅显示图标（紧凑样式）。
   final bool bottomBarShowLabels;
 
+  /// 音乐库分页顺序（顺序即 TabBar 显示顺序，始终含全部分页 id）。
+  final List<String> musicLibraryTabOrder;
+
+  /// 音乐库中被隐藏的分页 id（不在其中的分页正常显示，至少保留 1 个）。
+  final List<String> musicLibraryHiddenTabs;
+
+  /// 是否记住各分页的歌曲排序方式；关闭后每次进入分页回到默认排序。
+  final bool musicLibrarySortMemoryEnabled;
+
+  /// 各分页记住的歌曲排序方式，元素编码为 `tabId|sortKey|desc`（1/0）。
+  final List<String> musicLibraryTabSorts;
+
   /// 首次启动欢迎/初始化向导是否已完成（跳过或走完都算完成）。
   /// false 时应用根节点叠加全屏欢迎页（覆盖侧边栏与底栏）。
   final bool welcomeSetupCompleted;
   final String customBackgroundPath;
+
+  /// 自定义壁纸（图片/视频动态背景）的铺放方式，默认居中裁剪。
+  final BackgroundFitMode backgroundFitMode;
   final double customBackgroundBlur;
 
   /// 自定义壁纸的背景淡化强度（0~1），叠加在基础蒙层之上：深色模式加黑
@@ -466,6 +567,10 @@ class AppSettings {
 
   /// 下载后向音频文件写入元数据标签（标题/艺术家/专辑/歌词/封面）。
   final bool downloadWriteMetadata;
+
+  /// 在线下载文件命名模板。可用变量：{title} {artist} {album} {quality}
+  /// {platform} {id}。空变量会被剔除，分隔符（如 " - "）随变量一起清理。
+  final String downloadFilenameTemplate;
   final String organizeRule;
   final List<String> scanFormats;
 
@@ -475,6 +580,22 @@ class AppSettings {
   /// 均衡器各频段增益（dB）。频段数量随设备而异（常见 5 段），
   /// 应用时按下标对齐，超出设备频段数的部分忽略。
   final List<double> equalizerGains;
+
+  /// WebDAV 备份服务器地址（如坚果云 `https://dav.jianguoyun.com/dav/`）。
+  final String webdavServerUrl;
+
+  /// WebDAV 备份账号名（密码不落 shared_preferences，见 SecureStore）。
+  final String webdavUsername;
+
+  /// 勾选后每次上传成功只保留服务器上的最新一份备份。
+  final bool webdavKeepLatestOnly;
+
+  /// 备份内容选择（收藏 / 歌单 / 插件与用户变量 / 设置与主题）。
+  ///
+  /// 取值见 [kAllBackupSections]。本地导出与 WebDAV 备份共用这一份选择：
+  /// 由「备份内容」行单独编辑并持久化，导出/上传时直接读取，
+  /// 不再每次操作前弹框询问。
+  final List<String> backupSections;
 
   AppSettings copyWith({
     double? volume,
@@ -499,8 +620,13 @@ class AppSettings {
     bool? bottomBarEnabled,
     List<String>? bottomBarItemIds,
     bool? bottomBarShowLabels,
+    List<String>? musicLibraryTabOrder,
+    List<String>? musicLibraryHiddenTabs,
+    bool? musicLibrarySortMemoryEnabled,
+    List<String>? musicLibraryTabSorts,
     bool? welcomeSetupCompleted,
     String? customBackgroundPath,
+    BackgroundFitMode? backgroundFitMode,
     double? customBackgroundBlur,
     double? customBackgroundFade,
     String? playerDetailCustomImagePath,
@@ -551,10 +677,15 @@ class AppSettings {
     bool? pluginInstallSkipVersionCheck,
     bool? downloadLyrics,
     bool? downloadWriteMetadata,
+    String? downloadFilenameTemplate,
     String? organizeRule,
     List<String>? scanFormats,
     bool? equalizerEnabled,
     List<double>? equalizerGains,
+    String? webdavServerUrl,
+    String? webdavUsername,
+    bool? webdavKeepLatestOnly,
+    List<String>? backupSections,
   }) {
     return AppSettings(
       volume: volume ?? this.volume,
@@ -587,9 +718,18 @@ class AppSettings {
       bottomBarEnabled: bottomBarEnabled ?? this.bottomBarEnabled,
       bottomBarItemIds: bottomBarItemIds ?? this.bottomBarItemIds,
       bottomBarShowLabels: bottomBarShowLabels ?? this.bottomBarShowLabels,
+      musicLibraryTabOrder:
+          musicLibraryTabOrder ?? this.musicLibraryTabOrder,
+      musicLibraryHiddenTabs:
+          musicLibraryHiddenTabs ?? this.musicLibraryHiddenTabs,
+      musicLibrarySortMemoryEnabled:
+          musicLibrarySortMemoryEnabled ?? this.musicLibrarySortMemoryEnabled,
+      musicLibraryTabSorts:
+          musicLibraryTabSorts ?? this.musicLibraryTabSorts,
       welcomeSetupCompleted:
           welcomeSetupCompleted ?? this.welcomeSetupCompleted,
       customBackgroundPath: customBackgroundPath ?? this.customBackgroundPath,
+      backgroundFitMode: backgroundFitMode ?? this.backgroundFitMode,
       customBackgroundBlur: customBackgroundBlur ?? this.customBackgroundBlur,
       customBackgroundFade: customBackgroundFade ?? this.customBackgroundFade,
       playerDetailCustomImagePath:
@@ -667,10 +807,19 @@ class AppSettings {
       downloadLyrics: downloadLyrics ?? this.downloadLyrics,
       downloadWriteMetadata:
           downloadWriteMetadata ?? this.downloadWriteMetadata,
+      downloadFilenameTemplate:
+          downloadFilenameTemplate ?? this.downloadFilenameTemplate,
       organizeRule: organizeRule ?? this.organizeRule,
       scanFormats: scanFormats ?? this.scanFormats,
       equalizerEnabled: equalizerEnabled ?? this.equalizerEnabled,
       equalizerGains: equalizerGains ?? this.equalizerGains,
+      webdavServerUrl: webdavServerUrl ?? this.webdavServerUrl,
+      webdavUsername: webdavUsername ?? this.webdavUsername,
+      webdavKeepLatestOnly:
+          webdavKeepLatestOnly ?? this.webdavKeepLatestOnly,
+      backupSections: backupSections == null
+          ? this.backupSections
+          : normalizeBackupSections(backupSections),
     );
   }
 }
@@ -730,7 +879,27 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
         prefs.getStringList('bottomBarItemIds') ?? const [],
       ),
       bottomBarShowLabels: prefs.getBool('bottomBarShowLabels') ?? true,
+      musicLibraryTabOrder: normalizeMusicLibraryTabOrder(
+        prefs.getStringList('musicLibraryTabOrder') ??
+            kDefaultMusicLibraryTabOrder,
+      ),
+      musicLibraryHiddenTabs:
+          (prefs.getStringList('musicLibraryHiddenTabs') ?? const [])
+              .where(kDefaultMusicLibraryTabOrder.contains)
+              .toList(),
+      musicLibrarySortMemoryEnabled:
+          prefs.getBool('musicLibrarySortMemoryEnabled') ?? true,
+      musicLibraryTabSorts:
+          (prefs.getStringList('musicLibraryTabSorts') ?? const [])
+              .where((entry) {
+                final tabId = entry.split('|').first;
+                return kDefaultMusicLibraryTabOrder.contains(tabId);
+              })
+              .toList(),
       customBackgroundPath: prefs.getString('customBackgroundPath') ?? '',
+      backgroundFitMode: _backgroundFitModeFromInt(
+        prefs.getInt('backgroundFitMode') ?? BackgroundFitMode.cover.index,
+      ),
       customBackgroundBlur: prefs.getDouble('customBackgroundBlur') ?? 18.0,
       customBackgroundFade:
           (prefs.getDouble('customBackgroundFade') ?? 0.0)
@@ -827,6 +996,8 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
           prefs.getBool('pluginInstallSkipVersionCheck') ?? false,
       downloadLyrics: prefs.getBool('downloadLyrics') ?? true,
       downloadWriteMetadata: prefs.getBool('downloadWriteMetadata') ?? true,
+      downloadFilenameTemplate:
+          prefs.getString('downloadFilenameTemplate') ?? '{artist} - {title}',
       organizeRule:
           prefs.getString('organizeRule') ?? '{Artist}/{Album}/{Title}',
       scanFormats: prefs.getStringList('scanFormats') ?? kSupportedScanFormats,
@@ -835,6 +1006,13 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
           .map(double.tryParse)
           .whereType<double>()
           .toList(),
+      webdavServerUrl:
+          prefs.getString('webdavServerUrl') ?? kDefaultWebdavServerUrl,
+      webdavUsername: prefs.getString('webdavUsername') ?? '',
+      webdavKeepLatestOnly: prefs.getBool('webdavKeepLatestOnly') ?? false,
+      backupSections: normalizeBackupSections(
+        prefs.getStringList('backupSections'),
+      ),
     );
   }
 
@@ -866,6 +1044,13 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
       return PageTransitionMode.values[value];
     }
     return PageTransitionMode.fade;
+  }
+
+  BackgroundFitMode _backgroundFitModeFromInt(int value) {
+    if (value >= 0 && value < BackgroundFitMode.values.length) {
+      return BackgroundFitMode.values[value];
+    }
+    return BackgroundFitMode.cover;
   }
 
   PlayerDetailBackgroundMode _playerDetailBackgroundModeFromInt(int value) {
@@ -992,8 +1177,19 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
       prefs.setBool('bottomBarEnabled', next.bottomBarEnabled),
       prefs.setStringList('bottomBarItemIds', next.bottomBarItemIds),
       prefs.setBool('bottomBarShowLabels', next.bottomBarShowLabels),
+      prefs.setStringList('musicLibraryTabOrder', next.musicLibraryTabOrder),
+      prefs.setStringList(
+        'musicLibraryHiddenTabs',
+        next.musicLibraryHiddenTabs,
+      ),
+      prefs.setBool(
+        'musicLibrarySortMemoryEnabled',
+        next.musicLibrarySortMemoryEnabled,
+      ),
+      prefs.setStringList('musicLibraryTabSorts', next.musicLibraryTabSorts),
       prefs.setBool('welcomeSetupCompleted', next.welcomeSetupCompleted),
       prefs.setString('customBackgroundPath', next.customBackgroundPath),
+      prefs.setInt('backgroundFitMode', next.backgroundFitMode.index),
       prefs.setDouble('customBackgroundBlur', next.customBackgroundBlur),
       prefs.setDouble('customBackgroundFade', next.customBackgroundFade),
       prefs.setString(
@@ -1089,6 +1285,10 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
       ),
       prefs.setBool('downloadLyrics', next.downloadLyrics),
       prefs.setBool('downloadWriteMetadata', next.downloadWriteMetadata),
+      prefs.setString(
+        'downloadFilenameTemplate',
+        next.downloadFilenameTemplate,
+      ),
       prefs.setString('organizeRule', next.organizeRule),
       prefs.setStringList('scanFormats', next.scanFormats),
       prefs.setBool('equalizerEnabled', next.equalizerEnabled),
@@ -1096,6 +1296,10 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
         'equalizerGains',
         next.equalizerGains.map((value) => value.toString()).toList(),
       ),
+      prefs.setString('webdavServerUrl', next.webdavServerUrl),
+      prefs.setString('webdavUsername', next.webdavUsername),
+      prefs.setBool('webdavKeepLatestOnly', next.webdavKeepLatestOnly),
+      prefs.setStringList('backupSections', next.backupSections),
     ]);
   }
 
@@ -1212,6 +1416,64 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
     ),
   );
 
+  // ---- 音乐库分页（顺序 / 显隐 / 排序记忆）----
+
+  /// 更新音乐库分页顺序：顺序即 TabBar 显示顺序，列表始终含全部分页 id。
+  Future<void> setMusicLibraryTabOrder(List<String> order) => _save(
+    (state.valueOrNull ?? const AppSettings()).copyWith(
+      musicLibraryTabOrder: normalizeMusicLibraryTabOrder(order),
+    ),
+  );
+
+  /// 音乐库分页显隐。至少保留 1 个分页：关到只剩 1 个时忽略本次操作。
+  Future<void> setMusicLibraryTabVisible(String id, bool visible) {
+    final current = state.valueOrNull ?? const AppSettings();
+    if (!kDefaultMusicLibraryTabOrder.contains(id)) {
+      return Future.value();
+    }
+    final hidden = current.musicLibraryHiddenTabs.toSet();
+    if (visible) {
+      hidden.remove(id);
+    } else {
+      final visibleCount = kDefaultMusicLibraryTabOrder.length -
+          hidden.where(kDefaultMusicLibraryTabOrder.contains).length;
+      if (!hidden.contains(id) && visibleCount <= 1) return Future.value();
+      hidden.add(id);
+    }
+    return _save(
+      current.copyWith(
+        musicLibraryHiddenTabs:
+            hidden.where(kDefaultMusicLibraryTabOrder.contains).toList(),
+      ),
+    );
+  }
+
+  /// 记住各分页的歌曲排序方式开关（关闭后各分页回到默认排序）。
+  Future<void> setMusicLibrarySortMemoryEnabled(bool value) => _save(
+    (state.valueOrNull ?? const AppSettings()).copyWith(
+      musicLibrarySortMemoryEnabled: value,
+    ),
+  );
+
+  /// 记录某个分页的歌曲排序方式。
+  ///
+  /// 编码为 `tabId|sortKey|desc`（desc 用 1/0），随 [musicLibraryTabSorts]
+  /// 一起持久化；排序记忆关闭时直接清空该项，回到默认排序。
+  Future<void> setMusicLibraryTabSort(
+    String tabId,
+    String sortKey, {
+    bool descending = false,
+  }) {
+    final current = state.valueOrNull ?? const AppSettings();
+    final next = current.musicLibraryTabSorts
+        .where((entry) => !entry.startsWith('$tabId|'))
+        .toList();
+    if (current.musicLibrarySortMemoryEnabled) {
+      next.add('$tabId|$sortKey|${descending ? 1 : 0}');
+    }
+    return _save(current.copyWith(musicLibraryTabSorts: next));
+  }
+
   /// 完成首次启动欢迎/初始化向导（跳过或走完都调用一次，之后不再出现）。
   Future<void> completeWelcomeSetup() => _save(
     (state.valueOrNull ?? const AppSettings()).copyWith(
@@ -1228,6 +1490,11 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
     (state.valueOrNull ?? const AppSettings()).copyWith(
       customBackgroundBlur: value.clamp(0, 40).toDouble(),
     ),
+  );
+
+  /// 自定义壁纸（图片/视频）的铺放方式：居中裁剪 / 完全铺满。
+  Future<void> setBackgroundFitMode(BackgroundFitMode mode) => _save(
+    (state.valueOrNull ?? const AppSettings()).copyWith(backgroundFitMode: mode),
   );
 
   /// 自定义壁纸背景淡化强度（0~1），叠加在基础蒙层之上。
@@ -1521,8 +1788,40 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
   Future<void> setOrganizeRule(String r) => _save(
     (state.valueOrNull ?? const AppSettings()).copyWith(organizeRule: r),
   );
+  Future<void> setDownloadFilenameTemplate(String t) => _save(
+    (state.valueOrNull ?? const AppSettings()).copyWith(
+      downloadFilenameTemplate: t,
+    ),
+  );
   Future<void> setScanFormats(List<String> f) => _save(
     (state.valueOrNull ?? const AppSettings()).copyWith(scanFormats: f),
+  );
+
+  /// WebDAV 备份连接配置：服务器地址与账号写入 shared_preferences，
+  /// 密码由调用方写入 SecureStore（不落明文配置）。
+  Future<void> setWebdavConnection({
+    String? serverUrl,
+    String? username,
+  }) => _save(
+    (state.valueOrNull ?? const AppSettings()).copyWith(
+      webdavServerUrl: serverUrl?.trim(),
+      webdavUsername: username?.trim(),
+    ),
+  );
+
+  /// 备份成功后是否只保留服务器上的最新一份备份。
+  Future<void> setWebdavKeepLatestOnly(bool value) => _save(
+    (state.valueOrNull ?? const AppSettings()).copyWith(
+      webdavKeepLatestOnly: value,
+    ),
+  );
+
+  /// 备份内容选择（收藏 / 歌单 / 插件 / 设置）：本地导出与 WebDAV 备份
+  /// 共用同一份持久化选择，写入后即时生效。
+  Future<void> setBackupSections(List<String> sections) => _save(
+    (state.valueOrNull ?? const AppSettings()).copyWith(
+      backupSections: sections,
+    ),
   );
 }
 

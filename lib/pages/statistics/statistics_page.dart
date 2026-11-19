@@ -34,9 +34,11 @@ final _statisticsProvider = FutureProvider.autoDispose<_StatisticsData>((
   ref,
 ) async {
   // 后台不刷新：统计页不可见时到点顺延，回前台后再重算。
-  ref.onDispose(
-    scheduleRefreshWhenVisible(const Duration(minutes: 1), ref.invalidateSelf),
-  );
+  // 句柄在同步段构造即注册 onDispose 并立即计时（回收后不再触碰 ref）。
+  registerVisibleRefresh(ref, const Duration(minutes: 1), ref.invalidateSelf);
+  // 曲库 notifier 也必须在同步段取好：provider 若在后续 await 期间被回收，
+  // await 之后再 ref.read 会抛 Bad state。
+  final libraryNotifier = ref.read(libraryProvider.notifier);
   final dbPath = await ref.watch(dbPathProvider.future);
   // 这些接口首次打开数据库时会执行 schema 检查和旧版本迁移。串行读取可
   // 避免多个连接同时抢占 SQLite 写锁，尤其是首次进入统计页时。
@@ -59,7 +61,7 @@ final _statisticsProvider = FutureProvider.autoDispose<_StatisticsData>((
       .map((row) => row is Map ? row['song_path']?.toString() ?? '' : '')
       .where((path) => path.isNotEmpty)
       .toList();
-  final songs = await ref.read(libraryProvider.notifier).songsByPaths(paths);
+  final songs = await libraryNotifier.songsByPaths(paths);
   final byPath = {for (final song in songs) song.path: song};
   return _StatisticsData(
     listen: listen,

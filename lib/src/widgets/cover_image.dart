@@ -54,11 +54,21 @@ class CoverImage extends ConsumerStatefulWidget {
   ConsumerState<CoverImage> createState() => _CoverImageState();
 }
 
-class _CoverImageState extends ConsumerState<CoverImage> {
+class _CoverImageState extends ConsumerState<CoverImage>
+    with WidgetsBindingObserver {
   // 按歌曲路径缓存缩略图路径，避免重复触发 Rust 提取。走 LRU 上限，
   // 否则长时间播放/浏览大量歌曲后该静态表只增不减，常驻内存持续升高。
   static final LinkedHashMap<String, String> _cache = LinkedHashMap();
   static const _pathCacheLimit = 256;
+
+  /// 「上次确认无封面」的时间戳：空结果只短暂有效。
+  ///
+  /// Rust 侧提取缩略图要读音频文件本体，应用刚回前台（SD 卡/SAF 挂载还没
+  /// 恢复）、系统扫描占着文件锁等瞬时失败都会返回空串。这种空结果若被
+  /// 永久缓存，同一首歌的封面就会一直停在默认占位图上，只有重启进程
+  /// 才恢复——这正是「进后台再返回，播放栏封面变默认占位」的成因之一。
+  static final Map<String, DateTime> _emptyCachedAt = {};
+  static const _emptyCoverRetryAfter = Duration(seconds: 15);
   static final LinkedHashMap<String, Uint8List> _proxyCache = LinkedHashMap();
   static final Map<String, Future<Uint8List?>> _proxyTasks = {};
   static const _proxyCacheLimit = 64;
@@ -153,18 +163,44 @@ class _CoverImageState extends ConsumerState<CoverImage> {
   /// 否则切到无封面的歌会一直显示上一首的图。
   bool _noImage = false;
 
+  /// 本地封面提取的连续失败次数（异常计入，用来决定是否缓存空结果）。
+  int _loadFailures = 0;
+
+  /// 在线封面确认失败后是否已回落过本地封面，避免两条路径来回打转。
+  bool _localFallbackTried = false;
+
+  /// 上次「回前台自愈」的时间：限流，避免切屏抖动时反复向 Rust 提取。
+  DateTime? _lastResumeHealAt;
+
+  /// 本地封面解码失败后的自愈次数，防止坏文件导致的无限重试。
+  int _decodeHealCount = 0;
+
   String get _identityKey =>
       '${normalizeCoverImageUrl(widget.imageUrl)}|${widget.songPath}';
 
   @override
   void initState() {
     super.initState();
+    // 监听前台/后台切换：本地封面在后台可能因缓存清理或外置存储短暂
+    // 不可读而提取失败，回前台这一刻才有条件重取，否则会一直停在占位图。
+    WidgetsBinding.instance.addObserver(this);
     // 详情页/播放栏是彼此独立的实例：进页面前封面已在另一棵子树画过时，
     // 直接用那份 provider 垫底，缓存命中就无需等首帧。
     _retainedProvider = _recentGet(_identityKey);
     _primeSyncCaches();
     _load();
     _loadNetwork();
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) _healLocalCoverOnResume();
   }
 
   /// 不等待异步 IO，先用已有的同步缓存把本帧能确定的字段填好：
@@ -200,26 +236,34 @@ class _CoverImageState extends ConsumerState<CoverImage> {
       _proxyFailed = false;
       _netPath = null;
       _netResolvingUrl = null;
+      // 换歌即重置本轮的重试/回落状态：新曲目值得完整跑一遍两条路径。
+      _loadFailures = 0;
+      _localFallbackTried = false;
+      _lastResumeHealAt = null;
       _primeSyncCaches();
       _load();
       _loadNetwork();
     }
   }
 
-  Future<void> _load() async {
+  Future<void> _load({bool force = false, bool asFallback = false}) async {
     final imageUrl = normalizeCoverImageUrl(widget.imageUrl);
-    if (imageUrl.isNotEmpty) return;
+    // 有在线封面时优先走网络/磁盘缓存；`asFallback` 表示网络封面已确认
+    // 拿不到，此时必须回来再试一次本地内嵌封面，不能直接停在占位图。
+    if (!asFallback && imageUrl.isNotEmpty) return;
     final key = _cacheKey;
     final songPath = widget.songPath;
-    final cached = _cacheGet(key);
-    if (cached != null) {
-      if (mounted) {
-        setState(() {
-          _path = cached.isEmpty ? null : cached;
-          _noImage = cached.isEmpty;
-        });
+    if (!force) {
+      final cached = _cacheGet(key);
+      if (cached != null) {
+        if (mounted) {
+          setState(() {
+            _path = cached.isEmpty ? null : cached;
+            _noImage = cached.isEmpty;
+          });
+        }
+        return;
       }
-      return;
     }
     try {
       final dbPath = await ref.read(dbPathProvider.future);
@@ -236,20 +280,81 @@ class _CoverImageState extends ConsumerState<CoverImage> {
               cacheRoot: cacheRoot,
               path: widget.songPath,
             ));
-      _cachePut(key, p);
       if (!mounted || songPath != widget.songPath) return;
+      if (p.isEmpty) {
+        // Rust 返回空 = 这一次没提取到。空结果带冷却缓存，冷却期过后
+        // 允许重试（后台返回瞬间读文件失败属于典型的一次性失败）。
+        _cachePut(key, '');
+        setState(() {
+          _path = null;
+          _noImage = true;
+        });
+        return;
+      }
+      _cachePut(key, p);
       setState(() {
-        _path = p.isEmpty ? null : p;
-        _noImage = p.isEmpty;
+        _path = p;
+        _noImage = false;
       });
     } catch (_) {
-      _cachePut(key, '');
+      // 异常不写空缓存：异常多半是 db/目录瞬时未就绪，写进去会把封面
+      // 永久钉在占位图上。仅连续失败多次后才缓存空结果，避免反复重试。
+      _loadFailures++;
+      if (_loadFailures >= 2) _cachePut(key, '');
       if (!mounted || songPath != widget.songPath) return;
       setState(() {
         _path = null;
         _noImage = true;
       });
     }
+  }
+
+  /// 在线封面确认失败后回落本地内嵌封面。
+  Future<void> _loadLocalFallback() async {
+    if (_localFallbackTried) return;
+    _localFallbackTried = true;
+    await _load(asFallback: true);
+  }
+
+  /// 本地封面文件解码失败（缓存文件被系统清理、路径失效）时自愈。
+  ///
+  /// 关键点是「失效路径不能继续被信任」：静态路径缓存命中后不会再去问
+  /// Rust，一旦文件没了，封面就会一直停在占位图上直到进程重启。
+  void _healLocalCoverOnDecodeError(ImageProvider provider) {
+    _cacheDrop(_cacheKey);
+    unawaited(provider.evict());
+    if (_decodeHealCount >= 2) return;
+    _decodeHealCount++;
+    // errorBuilder 处在 build 阶段，这里必须延后一拍再 setState 重载。
+    Future<void>.microtask(() {
+      if (!mounted) return;
+      if (normalizeCoverImageUrl(widget.imageUrl).isNotEmpty) return;
+      _loadFailures = 0;
+      setState(() => _path = null);
+      unawaited(_load(force: true));
+    });
+  }
+
+  /// 回到前台时自愈：本地封面若只剩占位（之前提取失败）或缓存路径指向
+  /// 的文件已经不在，重新向 Rust 提取一次。
+  ///
+  /// 后台期间系统可能清理缓存目录、SD 卡/SAF 也可能短暂不可读，这些都
+  /// 只在「回到前台」这一刻才具备条件恢复。
+  void _healLocalCoverOnResume() {
+    if (!mounted) return;
+    if (normalizeCoverImageUrl(widget.imageUrl).isNotEmpty) return;
+    final path = _path;
+    final pathMissing = path != null && !File(path).existsSync();
+    if (!_noImage && !pathMissing) return;
+    if (pathMissing) _cacheDrop(_cacheKey);
+    final last = _lastResumeHealAt;
+    if (last != null &&
+        DateTime.now().difference(last) < const Duration(seconds: 10)) {
+      return;
+    }
+    _lastResumeHealAt = DateTime.now();
+    _loadFailures = 0;
+    unawaited(_load(force: true));
   }
 
   /// 网络封面优先走磁盘缓存：命中后是纯本地文件解码，冷启动也不用重新
@@ -293,8 +398,10 @@ class _CoverImageState extends ConsumerState<CoverImage> {
         if (needsCoverImageProxy(imageUrl)) {
           unawaited(_loadProxiedImage(imageUrl));
         } else {
-          // 明确拿不到封面：新曲目不再用上一曲的图垫底。
-          setState(() => _noImage = true);
+          // 在线封面确认拿不到：再试一次本地内嵌封面，两边都没有才
+          // 显示占位图（原先直接置占位，本地歌曲回前台网络封面失效后
+          // 就永久停在默认封面上了）。
+          await _loadLocalFallback();
         }
         return;
       }
@@ -303,9 +410,10 @@ class _CoverImageState extends ConsumerState<CoverImage> {
         _noImage = false;
       });
     } catch (_) {
-      if (mounted && imageUrl == normalizeCoverImageUrl(widget.imageUrl)) {
-        setState(() => _noImage = true);
+      if (!mounted || imageUrl != normalizeCoverImageUrl(widget.imageUrl)) {
+        return;
       }
+      await _loadLocalFallback();
     }
   }
 
@@ -314,16 +422,50 @@ class _CoverImageState extends ConsumerState<CoverImage> {
 
   static String? _cacheGet(String key) {
     final value = _cache.remove(key);
-    if (value != null) _cache[key] = value;
+    if (value == null) return null;
+    if (value.isEmpty) {
+      final at = _emptyCachedAt[key];
+      // 短期内的空结果照旧命中，避免同一帧里反复向 Rust 排队提取；
+      // 超过冷却时间就丢弃重试，让瞬时失败过的封面能自己长回来。
+      if (at != null &&
+          DateTime.now().difference(at) < _emptyCoverRetryAfter) {
+        _cache[key] = value;
+        return value;
+      }
+      _emptyCachedAt.remove(key);
+      return null;
+    }
+    // 缓存路径必须校验文件仍在：封面缓存文件被系统清理/淘汰后，旧路径
+    // 解码必然失败，如果继续信任它，封面就永久停在占位图上（只有重启
+    // 进程才会重新向 Rust 提取）。
+    if (!File(value).existsSync()) {
+      _emptyCachedAt.remove(key);
+      return null;
+    }
+    _cache[key] = value;
     return value;
   }
 
   static void _cachePut(String key, String value) {
     _cache.remove(key);
     _cache[key] = value;
-    while (_cache.length > _pathCacheLimit) {
-      _cache.remove(_cache.keys.first);
+    if (value.isEmpty) {
+      _emptyCachedAt[key] = DateTime.now();
+    } else {
+      _emptyCachedAt.remove(key);
     }
+    while (_cache.length > _pathCacheLimit) {
+      final evicted = _cache.keys.first;
+      _cache.remove(evicted);
+      _emptyCachedAt.remove(evicted);
+    }
+  }
+
+  /// 丢弃某首歌的本地封面缓存（文件失效/提取失败时用），下次读取会
+  /// 重新向 Rust 请求。
+  static void _cacheDrop(String key) {
+    _cache.remove(key);
+    _emptyCachedAt.remove(key);
   }
 
   Future<void> _loadProxiedImage(String imageUrl) async {
@@ -367,12 +509,15 @@ class _CoverImageState extends ConsumerState<CoverImage> {
         _proxyLoading = false;
         _proxyFailed = bytes == null;
       });
+      // 代理也没拿到图：最后再回落一次本地内嵌封面，别直接停在占位图。
+      if (bytes == null) unawaited(_loadLocalFallback());
     } catch (_) {
       if (mounted && imageUrl == normalizeCoverImageUrl(widget.imageUrl)) {
         setState(() {
           _proxyLoading = false;
           _proxyFailed = true;
         });
+        unawaited(_loadLocalFallback());
       }
     }
   }
@@ -468,13 +613,19 @@ class _CoverImageState extends ConsumerState<CoverImage> {
         errorBuilder: (_, _, _) => placeholder,
       );
     } else if (path != null) {
-      provider = _fileProvider(File(path), decodeWidth);
+      final localProvider = _fileProvider(File(path), decodeWidth);
+      provider = localProvider;
       content = Image(
-        image: provider,
+        image: localProvider,
         fit: BoxFit.cover,
         gaplessPlayback: true,
         frameBuilder: frameBuilder,
-        errorBuilder: (_, _, _) => placeholder,
+        errorBuilder: (_, _, _) {
+          // 缓存文件被清理/路径失效：丢掉失效路径并重新提取，而不是
+          // 永久停在占位图上。
+          _healLocalCoverOnDecodeError(localProvider);
+          return placeholder;
+        },
       );
     }
 

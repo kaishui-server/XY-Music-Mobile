@@ -348,6 +348,38 @@ class AppLogStore {
     }
   }
 
+  /// 启动后检测「原生闪退补录」文件（crash-exit-*.txt，由原生侧
+  /// ExitInfoRecorder 在上次启动/崩溃后写入），返回本次尚未提示过的
+  /// 文件名并把它们标记为已提示。提示文件通过崩溃目录内 marker 文件
+  /// 持久化（与崩溃记录同生命周期，清空记录即重置提示状态）。
+  Future<List<String>> unseenExitCrashReports() async {
+    try {
+      final dir = Directory(await _crashDir());
+      if (!dir.existsSync()) return const [];
+      // 只匹配 crash-exit-<时间戳>.txt，排除 marker（crash-exit-notified）
+      // 与路径提示（crash-exit-public-path）等辅助文件。
+      final exitCrashName = RegExp(r'^crash-exit-\d{8}-\d{6}\.txt$');
+      final names = dir
+          .listSync()
+          .whereType<File>()
+          .map((file) => p.basename(file.path))
+          .where(exitCrashName.hasMatch)
+          .toList()
+        ..sort();
+      if (names.isEmpty) return const [];
+      final markerFile = File(p.join(dir.path, 'crash-exit-notified.txt'));
+      final seen = markerFile.existsSync()
+          ? markerFile.readAsStringSync().split('\n').toSet()
+          : <String>{};
+      final fresh = names.where((name) => !seen.contains(name)).toList();
+      if (fresh.isEmpty) return const [];
+      await markerFile.writeAsString(names.join('\n'), flush: true);
+      return fresh;
+    } catch (_) {
+      return const [];
+    }
+  }
+
   Future<String> readCrashReport(CrashReport report) async {
     try {
       return await report.file.readAsString();
