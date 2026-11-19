@@ -373,6 +373,7 @@ class AppSettings {
     this.downloadFilenameTemplate = '{artist} - {title}',
     this.organizeRule = '{Artist}/{Album}/{Title}',
     this.scanFormats = kSupportedScanFormats,
+    this.scanSkipVideoFiles = false,
     this.equalizerEnabled = false,
     this.equalizerGains = const [],
     this.webdavServerUrl = kDefaultWebdavServerUrl,
@@ -574,6 +575,13 @@ class AppSettings {
   final String organizeRule;
   final List<String> scanFormats;
 
+  /// 扫描时是否排除视频文件（.mp4 / .m4v 等）。m4a 大类默认把 mp4
+  /// 扩展名一并纳入白名单（.mp4 容器里确实可能只装纯音频 AAC），但
+  /// 实际更常见的是整段 MV：入库后混进歌单，播放又没有可用音轨。
+  /// 开启后从扫描白名单剔除视频容器扩展名；Rust 侧扫描是增量 diff，
+  /// 磁盘候选集里不再出现的库记录会被 prune，故重扫即可清出旧视频。
+  final bool scanSkipVideoFiles;
+
   /// 均衡器（音效）总开关：关闭时直通原始音频。
   final bool equalizerEnabled;
 
@@ -680,6 +688,7 @@ class AppSettings {
     String? downloadFilenameTemplate,
     String? organizeRule,
     List<String>? scanFormats,
+    bool? scanSkipVideoFiles,
     bool? equalizerEnabled,
     List<double>? equalizerGains,
     String? webdavServerUrl,
@@ -811,6 +820,7 @@ class AppSettings {
           downloadFilenameTemplate ?? this.downloadFilenameTemplate,
       organizeRule: organizeRule ?? this.organizeRule,
       scanFormats: scanFormats ?? this.scanFormats,
+      scanSkipVideoFiles: scanSkipVideoFiles ?? this.scanSkipVideoFiles,
       equalizerEnabled: equalizerEnabled ?? this.equalizerEnabled,
       equalizerGains: equalizerGains ?? this.equalizerGains,
       webdavServerUrl: webdavServerUrl ?? this.webdavServerUrl,
@@ -1001,6 +1011,7 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
       organizeRule:
           prefs.getString('organizeRule') ?? '{Artist}/{Album}/{Title}',
       scanFormats: prefs.getStringList('scanFormats') ?? kSupportedScanFormats,
+      scanSkipVideoFiles: prefs.getBool('scanSkipVideoFiles') ?? false,
       equalizerEnabled: prefs.getBool('equalizerEnabled') ?? false,
       equalizerGains: (prefs.getStringList('equalizerGains') ?? const [])
           .map(double.tryParse)
@@ -1291,6 +1302,7 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
       ),
       prefs.setString('organizeRule', next.organizeRule),
       prefs.setStringList('scanFormats', next.scanFormats),
+      prefs.setBool('scanSkipVideoFiles', next.scanSkipVideoFiles),
       prefs.setBool('equalizerEnabled', next.equalizerEnabled),
       prefs.setStringList(
         'equalizerGains',
@@ -1795,6 +1807,12 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
   );
   Future<void> setScanFormats(List<String> f) => _save(
     (state.valueOrNull ?? const AppSettings()).copyWith(scanFormats: f),
+  );
+
+  /// 扫描时是否跳过视频文件（mp4 / m4v 等）。
+  Future<void> setScanSkipVideoFiles(bool v) => _save(
+    (state.valueOrNull ?? const AppSettings())
+        .copyWith(scanSkipVideoFiles: v),
   );
 
   /// WebDAV 备份连接配置：服务器地址与账号写入 shared_preferences，

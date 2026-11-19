@@ -2,7 +2,9 @@ import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../../src/core/settings.dart';
 import '../../src/widgets/top_notice.dart';
 
 /// 自建目录浏览器（设计参考 MusicFree 的 fileSelector 页面）。
@@ -16,17 +18,17 @@ import '../../src/widgets/top_notice.dart';
 /// - 规避 file_picker 在部分国产 ROM 上的兼容性问题。
 ///
 /// 仅用于 Android；其他平台请在入口处回退 file_picker。
-class FolderBrowserPage extends StatefulWidget {
+class FolderBrowserPage extends ConsumerStatefulWidget {
   const FolderBrowserPage({super.key, this.initialFolder});
 
   /// 初始目录（默认停在存储选择层）。
   final String? initialFolder;
 
   @override
-  State<FolderBrowserPage> createState() => _FolderBrowserPageState();
+  ConsumerState<FolderBrowserPage> createState() => _FolderBrowserPageState();
 }
 
-class _FolderBrowserPageState extends State<FolderBrowserPage> {
+class _FolderBrowserPageState extends ConsumerState<FolderBrowserPage> {
   /// Android 主存储（内部存储）根目录。
   static const _primaryRoot = '/storage/emulated/0';
 
@@ -38,6 +40,13 @@ class _FolderBrowserPageState extends State<FolderBrowserPage> {
   static const _audioExtensions = {
     'aac', 'aif', 'aiff', 'flac', 'm4a', 'm4b', 'mp3', 'mp4',
     'oga', 'ogg', 'opus', 'wav', 'wma', 'ape',
+  };
+
+  /// 视频容器扩展名（小写）。mp4/m4v 音频内容按 m4a 大类可播，但纯视频
+  /// 文件不该出现在歌曲列表里；开启「跳过视频文件」后按此集合剔除，
+  /// 与扫描入库的过滤口径保持一致。
+  static const _videoExtensions = {
+    'mp4', 'm4v', 'mov', '3gp', 'mkv', 'webm', 'avi', 'flv',
   };
 
   /// 可选存储根列表：主存储 + 挂载的 SD 卡卷（无 SD 卡时仅主存储）。
@@ -133,6 +142,10 @@ class _FolderBrowserPageState extends State<FolderBrowserPage> {
       _loading = true;
       _error = null;
     });
+    // 用户开启了「跳过视频文件」时，预览列表同样滤掉视频容器，
+    // 让浏览器里看到的就是扫描会入库的内容。
+    final skipVideoFiles =
+        ref.read(settingsProvider).valueOrNull?.scanSkipVideoFiles ?? false;
     try {
       final dirs = <Directory>[];
       final songs = <File>[];
@@ -153,7 +166,9 @@ class _FolderBrowserPageState extends State<FolderBrowserPage> {
           final ext = name.contains('.')
               ? name.substring(name.lastIndexOf('.') + 1).toLowerCase()
               : '';
-          if (_audioExtensions.contains(ext)) songs.add(entity);
+          if (!_audioExtensions.contains(ext)) continue;
+          if (skipVideoFiles && _videoExtensions.contains(ext)) continue;
+          songs.add(entity);
         }
       }
       dirs.sort(

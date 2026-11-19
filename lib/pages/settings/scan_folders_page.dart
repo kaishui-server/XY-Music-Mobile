@@ -168,6 +168,19 @@ class _ScanFoldersPageState extends ConsumerState<ScanFoldersPage> {
     if (mounted) _toast('已设置排除时长');
   }
 
+  /// 跳过视频文件：开启后扫描不再入库 .mp4 / .m4v 等视频容器。
+  /// 切换后立即重扫——Rust 侧增量 diff 只会 prune 掉磁盘候选中
+  /// 不存在的记录，不重扫的话已入库的视频文件仍留在歌单里。
+  Future<void> _toggleSkipVideo(bool cur) async {
+    final next = !cur;
+    await ref
+        .read(settingsProvider.notifier)
+        .setScanSkipVideoFiles(next);
+    if (!mounted) return;
+    _toast(next ? '已开启：跳过视频文件' : '已关闭：恢复扫描视频文件');
+    await _rescan();
+  }
+
   /// 扫描格式多选：勾选要扫描入库的音频格式（至少保留一种）。
   Future<void> _pickScanFormats(AppSettings? settings) async {
     final selected = {...(settings?.scanFormats ?? kSupportedScanFormats)};
@@ -281,6 +294,8 @@ class _ScanFoldersPageState extends ConsumerState<ScanFoldersPage> {
                   _pickScanFormats(settings);
                 case 'min_duration':
                   _pickMinDuration(settings?.libraryMinDurationSeconds ?? 0);
+                case 'skip_video':
+                  _toggleSkipVideo(settings?.scanSkipVideoFiles ?? false);
               }
             },
             itemBuilder: (context) => [
@@ -320,6 +335,27 @@ class _ScanFoldersPageState extends ConsumerState<ScanFoldersPage> {
                         60 => '60 秒',
                         final v => '$v 秒',
                       },
+                      style: TextStyle(
+                        fontSize: 13,
+                        color: scheme.onSurfaceVariant,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              PopupMenuItem(
+                value: 'skip_video',
+                child: Row(
+                  children: [
+                    Icon(Icons.videocam_off_outlined,
+                        size: 20, color: scheme.primary),
+                    const SizedBox(width: 12),
+                    const Text('跳过视频文件'),
+                    const Spacer(),
+                    Text(
+                      (settings?.scanSkipVideoFiles ?? false)
+                          ? '已排除'
+                          : '扫描',
                       style: TextStyle(
                         fontSize: 13,
                         color: scheme.onSurfaceVariant,

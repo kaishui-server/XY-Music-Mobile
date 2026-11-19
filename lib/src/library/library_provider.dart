@@ -529,6 +529,20 @@ class LibraryNotifier extends SafeStateNotifier<LibraryState> {
 
   /// 格式大类 → 实际扩展名白名单（与 Rust is_ext_allowed 对应）。
   /// wma/ape/opus 与 MusicFree 的本地音乐支持格式对齐。
+  /// 视频容器扩展名：开启「不扫描视频文件」时从白名单剔除。
+  /// 当前只有 m4a 大类把 mp4 带进了白名单，其余为防御性覆盖
+  /// （同目录混放 MV、后续扩展白名单变化时不至于漏拦）。
+  static const _videoScanExtensions = <String>{
+    'mp4',
+    'm4v',
+    'mov',
+    '3gp',
+    'mkv',
+    'webm',
+    'avi',
+    'flv',
+  };
+
   static const _formatExtensions = <String, List<String>>{
     'flac': ['flac'],
     'mp3': ['mp3'],
@@ -577,6 +591,14 @@ class LibraryNotifier extends SafeStateNotifier<LibraryState> {
     final allowed = <String>[
       for (final f in selectedFormats) ...(_formatExtensions[f] ?? [f]),
     ];
+    // 「不扫描视频文件」：m4a 大类白名单里带 mp4，而 .mp4 多数是
+    // 整段 MV（入库只是白占歌单，播放没有可用音轨），开启后剔除
+    // 视频容器扩展名。Rust 侧扫描是增量 diff：不在 allowedFormats
+    // 里的扩展名进不了磁盘候选集，对应库记录会在 diff 阶段被 prune，
+    // 因此开启后重扫一次即可把已入库的视频文件清出媒体库。
+    if (settings?.scanSkipVideoFiles ?? false) {
+      allowed.removeWhere(_videoScanExtensions.contains);
+    }
 
     final foldersJson = await getLibraryFolders(dbPath: dbPath);
     final folders = (jsonDecode(foldersJson) as List)
