@@ -1,57 +1,41 @@
 package com.xymusic.mobile
 
-import android.app.Notification
-import android.app.NotificationChannel
-import android.app.NotificationManager
-import android.app.PendingIntent
 import android.content.Context
-import android.content.Intent
-import android.graphics.Color
-import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
-import android.view.KeyEvent
-import android.widget.RemoteViews
-import androidx.core.app.NotificationCompat
-import com.ryanheise.audioservice.MediaButtonReceiver
 
 /**
  * 通知栏&锁屏实时歌词（任务A：蓝牙歌词补强）。
  *
  * 职责：
- * - 以「通知栏歌词通知」形式展示当前播放歌曲的实时歌词行，锁屏同样可见；
  * - 原生侧持有整首 LRC 行数组，用墙钟（elapsedRealtime）按播放进度推进
- *   当前行，仅在行变化时更新 RemoteViews（避免通知节流/抖动）；
+ *   当前行，仅在行变化时向系统媒体卡片同步一次第二行文本；
  * - Flutter 侧通过 MethodChannel（com.xymusic.mobile/notification_lyrics）
  *   推送：歌曲元数据 + 整首 LRC + 进度锚点 + 播放态；切歌时 LRC 变化即
  *   重置并立即显示新歌歌词；
  * - 保留蓝牙歌词开关语义：通知栏歌词跟随 bluetoothLyricsEnabled 开关。
  *
- * 华为（HarmonyOS）防「通知栏越权闪退」措施：
- * 1. 不申请任何额外权限。仅复用清单已声明的 POST_NOTIFICATIONS；
- *    Android 13+ 未授予通知权限时自动降级为「仅内部更新，不发通知」，
- *    绝不触发系统权限异常。
- * 2. 只用 NotificationCompat 标准字段 + 静态 RemoteViews 布局
- *    （res/layout/lyrics_notification.xml），更新仅 setTextViewText，
- *    不动态加载 URL/图片/外部 View，不使用 setFullScreenIntent。
- * 3. 所有通知发布/更新路径 try/catch 兜底，任何 ROM 特有问题都只丢
- *    该次更新，不影响播放进程。
+ * 载体说明（双卡片修复后）：
+ * 本模块**不再发布自定义歌词通知**。原自定义 RemoteViews 通知
+ * （NOTIFICATION_ID=0x6C01 + res/layout/lyrics_notification.xml）已整体移除：
+ * 华为/HarmonyOS 通知栏同一时刻只保留 AudioService 构建的系统 MediaStyle
+ * 卡片，独立再发一张会造成双卡片。逐行歌词改为通过反射
+ * AudioService.setMediaSecondLine 叠加到系统媒体卡片的歌手位。
+ *
+ * 华为（HarmonyOS）稳定性措施：
+ * 1. 不申请任何额外权限。
+ * 2. 不自行构建/发布任何通知，只操作系统媒体卡片的文本字段。
+ * 3. 所有同步路径（反射调用）try/catch 兜底，任何 ROM 特有问题都只丢
+ *    该次同步，不影响播放进程。
  */
 object NotificationLyricsManager {
-    const val CHANNEL = "com.xymusic.mobile/notification_lyrics"
-
-    private const val CHANNEL_ID = "xy_lyrics_notification"
-    private const val CHANNEL_NAME = "歌词通知"
-    private const val NOTIFICATION_ID = 0x6C01 // "歌词" 语义 ID，避开媒体通知段
-
     private const val TICK_MS = 200L
 
     /** 单行 LRC 条目。 */
     private data class LyricLine(val timeMs: Long, val text: String)
 
     private var context: Context? = null
-    private var manager: NotificationManager? = null
     private val mainHandler = Handler(Looper.getMainLooper())
 
     // ---- 当前歌词状态 ----
@@ -99,17 +83,12 @@ object NotificationLyricsManager {
     @Synchronized
     fun enable(ctx: Context) {
         context = ctx.applicationContext
-        manager = ctx.applicationContext.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
-            ?: return
-        ensureChannel()
     }
 
-    /** 停止并移除通知栏歌词（幂等）。 */
+    /** 停止通知栏歌词并恢复媒体卡片歌手行（幂等）。 */
     @Synchronized
     fun disable(ctx: Context) {
         stopTicker()
-        val mgr = ctx.applicationContext.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
-        runCatching { mgr?.cancel(NOTIFICATION_ID) }
         // 关闭蓝牙歌词：媒体通知（AudioService 媒体卡片）第二行恢复纯歌手。
         syncAudioServiceSecondLine(null)
         lines = emptyList()
@@ -118,7 +97,6 @@ object NotificationLyricsManager {
         artist = ""
         playing = false
         context = null
-        manager = null
     }
 
     /**
@@ -138,11 +116,7 @@ object NotificationLyricsManager {
         lyricsStatus: String,
     ) {
         val appCtx = ctx.applicationContext
-        val mgr = appCtx.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
-            ?: return
         context = appCtx
-        manager = mgr
-        ensureChannel()
 
         val titleChanged = newTitle != title || newArtist != artist
         if (titleChanged) {
@@ -290,28 +264,6 @@ object NotificationLyricsManager {
         mainHandler.removeCallbacks(ticker)
     }
 
-    private fun ensureChannel() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val ch = manager?.getNotificationChannel(CHANNEL_ID)
-            if (ch == null) {
-                runCatching {
-                    manager?.createNotificationChannel(
-                        NotificationChannel(
-                            CHANNEL_ID,
-                            CHANNEL_NAME,
-                            NotificationManager.IMPORTANCE_LOW,
-                        ).apply {
-                            description = "播放时显示实时滚动歌词"
-                            setShowBadge(false)
-                            enableVibration(false)
-                            enableLights(false)
-                        },
-                    )
-                }
-            }
-        }
-    }
-
     /** 当前歌词行文本；无歌词时返回占位。 */
     private fun currentLyricText(): String {
         if (lines.isEmpty()) {
@@ -354,7 +306,7 @@ object NotificationLyricsManager {
     /**
      * 同步媒体卡片第二行歌词（双卡片修复后的唯一出口）。
      *
-     * 不再独立发布自定义歌词通知（NOTIFICATION_ID=0x6C01 发布路径已停用）：
+     * 自定义歌词通知（原 NOTIFICATION_ID=0x6C01 发布路径）已完全移除：
      * 华为/HarmonyOS 通知栏同一时刻只保留 AudioService 构建的系统
      * MediaStyle 原生媒体卡片，逐行歌词通过 setMediaSecondLine 叠加到该
      * 卡片歌手位（蓝牙歌词开启时），避免同一时刻出现两张 XY Music 媒体

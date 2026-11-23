@@ -97,3 +97,23 @@ int lyricActiveIndex(List<LyricLine> lines, double position) {
   if (active < 0) active = 0;
   return active;
 }
+
+/// 用户歌词偏移（单位 0.1 秒）的合法范围，与播放页 `clampLyricsOffsetTenths`
+/// 保持一致。
+int clampLyricOffsetTenths(int value) => value.clamp(-100, 100);
+
+/// 居中歌词页与底栏迷你歌词**共用**的当前行定位。
+///
+/// 两处必须用同一份行轴、同一个播放位置、同一套用户歌词偏移，否则会出现
+/// 「底栏已经换行、居中歌词还停在上一行」（或整行提前/滞后）的不同步观感。
+/// [offsetTenths] 是用户设置的歌词偏移（0.1 秒），语义等同于播放页的
+/// `applyLyricsOffset`（正数让歌词提前）；缺省 0 表示不偏移。
+int lyricActiveIndexAt(
+  List<LyricLine> lines,
+  double position, {
+  int offsetTenths = 0,
+}) {
+  if (lines.isEmpty) return 0;
+  final shifted = position + clampLyricOffsetTenths(offsetTenths) / 10;
+  return lyricActiveIndex(lines, shifted);
+}

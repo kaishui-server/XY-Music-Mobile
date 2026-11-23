@@ -13,6 +13,7 @@ import android.os.Environment
 import android.os.Handler
 import android.os.Looper
 import android.os.PowerManager
+import android.os.SystemClock
 import android.provider.MediaStore
 import android.provider.DocumentsContract
 import android.provider.Settings
@@ -49,6 +50,9 @@ class MainActivity : AudioServiceActivity() {
         private const val STORAGE_CHANNEL = "com.xymusic.mobile/storage"
         private const val DEEPLINK_CHANNEL = "com.xymusic.mobile/deeplink"
         private const val MEDIA_BUTTON_CHANNEL = "com.xymusic.mobile/media_buttons"
+        /// 「系统媒体卡片/播控胶囊被点击」的来源标记，与
+        /// AudioService.EXTRA_MEDIA_CARD_CLICK 保持一致。
+        private const val EXTRA_MEDIA_CARD_CLICK = "xymusic_media_card_click"
         private const val VOLUME_KEY_CHANNEL = "com.xymusic.mobile/volume_keys"
         private const val MINI_PLAYER_CHANNEL = "com.xymusic.mobile/mini_player"
         private const val SYSTEM_UI_CHANNEL = "com.xymusic.mobile/system_ui"
@@ -107,6 +111,13 @@ class MainActivity : AudioServiceActivity() {
     )
 
     private var mediaButtonChannel: MethodChannel? = null
+
+    /// 最近一次「系统媒体卡片/播控胶囊被点击」的时刻（elapsedRealtime 毫秒）。
+    /// -1 表示无记录。不直接经通道投递而是记时刻，原因见 [handleMediaCardClick]：
+    /// 冷启动 onCreate 早于 Dart 侧 setMethodCallHandler，invoke 会静默丢失；
+    /// 且 resumed 与点击的先后顺序在各 ROM 上不一致。
+    @Volatile
+    private var lastMediaCardClickAt: Long = -1L
 
     /// 迷你播放器悬浮窗通道：Dart 侧据此启停浮窗、同步播放状态，并接收
     /// 浮窗内按钮/进度条的操作回调。
@@ -170,6 +181,8 @@ class MainActivity : AudioServiceActivity() {
         pendingDeepLink = extractDeepLink(intent)
         // 通知栏双击（自动开桌面歌词）/浮窗 ⚙ 设置键的冷启动转发。
         handleDesktopLyricsIntent(intent)
+        // 系统媒体卡片/播控胶囊点击的来源标记（冷启动）。见 handleMediaCardClick。
+        handleMediaCardClick(intent)
         // 耗电优化：不再在 onCreate 无条件持有 Wi-Fi 高性能锁。改由 Dart 侧
         // 按播放态经 PLAYBACK_WIFI_CHANNEL 驱动（起播 acquire / 暂停停止后
         // 延迟 3s release），闲置与熄屏时不再阻止 Wi-Fi 省电。
@@ -240,6 +253,34 @@ class MainActivity : AudioServiceActivity() {
         // 浮窗 ⚙ 设置键的热启动转发（通知点击/胶囊单击进软件由 Receiver
         // 直接拉起 Activity，无需额外动作）。
         handleDesktopLyricsIntent(intent)
+        // 系统媒体卡片/播控胶囊点击的来源标记（热启动）。见 handleMediaCardClick。
+        handleMediaCardClick(intent)
+    }
+
+    /// XY Music 本地补丁：系统媒体卡片/播控胶囊点击的识别入口。
+    ///
+    /// vivo OriginOS（Android 16）实测：暂停后点播控卡片的「播放」，系统按
+    /// 暂停帧的 actions 把这次点击解析成「展开应用」——拉起 Activity，却一个
+    /// 媒体键都不派发，Dart 侧连 `[通知栏按键] 桥收到 play` 都没有，用户看到
+    /// 的就是「只能暂停、不能播放」。这里改走一条不依赖媒体键的链路：
+    /// AudioService 给 MediaSession 的 sessionActivity 打了来源标记
+    /// （EXTRA_MEDIA_CARD_CLICK），点到这里就记下时刻，Dart 回前台后主动
+    /// 消费一次，把「点了播控卡片」还原成一次播放请求。
+    ///
+    /// 只记录时刻、不在此刻经通道投递：冷启动时 onCreate 早于 Dart 侧
+    /// setMethodCallHandler，invoke 会静默丢失；且点击与 resumed 的先后
+    /// 顺序在各 ROM 上不一致。时刻戳让 Dart 自行择机读取，天然免疫时序问题。
+    ///
+    /// 标记只加在 sessionActivity 上，不加在通知 contentIntent 上：用户点
+    /// 通知主体/桌面图标只想看应用，不应擅自起播。
+    private fun handleMediaCardClick(intent: Intent?) {
+        if (intent?.getBooleanExtra(EXTRA_MEDIA_CARD_CLICK, false) != true) {
+            return
+        }
+        // singleTop 复用同一 Intent 时 onCreate/onNewIntent 会重复拿到，
+        // 清掉标记避免一次点击被记成多次。
+        intent.removeExtra(EXTRA_MEDIA_CARD_CLICK)
+        lastMediaCardClickAt = SystemClock.elapsedRealtime()
     }
 
     /// 分发桌面歌词相关的启动意图：
@@ -678,7 +719,27 @@ class MainActivity : AudioServiceActivity() {
         mediaButtonChannel = MethodChannel(
             flutterEngine.dartExecutor.binaryMessenger,
             MEDIA_BUTTON_CHANNEL,
-        )
+        ).also { channel ->
+            channel.setMethodCallHandler { call, result ->
+                when (call.method) {
+                    // Dart 回前台主动拉取「距上次播控卡片点击」的毫秒数。
+                    // 读后即清：一次点击只允许驱动一次恢复，避免后续任何
+                    // 一次 resumed（解锁、切回应用）都把已暂停的歌推起来。
+                    // 返回 -1 表示无记录或已过期（>10s，视为无关动作）。
+                    "consumeMediaCardClick" -> {
+                        val at = lastMediaCardClickAt
+                        lastMediaCardClickAt = -1L
+                        if (at < 0L) {
+                            result.success(-1L)
+                        } else {
+                            val elapsed = SystemClock.elapsedRealtime() - at
+                            result.success(if (elapsed in 0L..10_000L) elapsed else -1L)
+                        }
+                    }
+                    else -> result.notImplemented()
+                }
+            }
+        }
         volumeKeyChannel = MethodChannel(
             flutterEngine.dartExecutor.binaryMessenger,
             VOLUME_KEY_CHANNEL,

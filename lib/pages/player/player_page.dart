@@ -30,6 +30,7 @@ import '../../src/logging/error_context.dart';
 import '../../src/lyrics/lyrics_models.dart';
 import '../../src/navigation/animated_page_route.dart';
 import '../../src/navigation/player_sheet_morph.dart';
+import '../../src/player/lyrics_offset.dart';
 import '../../src/player/player_provider.dart';
 import '../../src/player/artist_avatar_preload.dart';
 import '../../src/player/player_ui_activity.dart';
@@ -2440,6 +2441,9 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
         return;
       }
       setState(() => _lyricsOffsetTenths = clampLyricsOffsetTenths(tenths));
+      // 底栏迷你歌词读的是同一份偏移（lyricsOffsetTenthsProvider），这里让
+      // 它立即失效重读，避免「居中歌词已按新偏移换行、迷你歌词还按旧偏移」。
+      ref.invalidate(lyricsOffsetTenthsProvider(item.path));
     } catch (_) {
       // 保存失败保持现状：子面板展示的值可能与持久化值短暂不一致，
       // 下次重进弹窗会从页面状态重新读取。
@@ -3676,11 +3680,22 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
         onPointerCancel: current == null
             ? null
             : (event) => _finishDetailSwipe(event, constraints.maxWidth),
-        // 封面 ↔ 歌词分页：切换效果跟随全局「页面切换动画」设置，
-        // 不再固定为水平推移。
+        // 封面 ↔ 歌词分页：固定走原生水平滑动，不跟随全局「页面切换动画」。
+        //
+        // 淡化模式下每页要套 Opacity + 抵消分页位移的 Transform：整页因此
+        // 变成离屏合成层，正文（歌词/制作信息）在过渡期间是半透明叠加在
+        // 背景渐变上的，观感就是「整块内容发虚」；过渡收尾还有一帧整页
+        // 空白的图层重建（录屏逐帧可复现：文字层边缘能量掉到 1）。而这两
+        // 页本就是同一首歌的两种形态，参考实现（原生 PageView）一直是横滑，
+        // 滑动期间文本由滚动层平移完成、不重采样，全程清晰。
         child: XyPageView(
           controller: _detailPageController,
+          transitionMode: PageTransitionMode.slide,
           physics: const NeverScrollableScrollPhysics(),
+          // 提前构建相邻页（与参考实现一致）：否则歌词页整棵子树要在
+          // 翻页动画第一帧才开始 build/layout/首次栅格化，和过渡层
+          // 的合成叠在同一帧，表现为切页瞬间内容发虚一跳。
+          allowImplicitScrolling: true,
           onPageChanged: (page) {
             final showLyrics = page == 1;
             if (_showLyrics != showLyrics) {
@@ -8521,6 +8536,10 @@ class _VinylSheenPainter extends CustomPainter {
   bool shouldRepaint(covariant _VinylSheenPainter oldDelegate) => false;
 }
 
+/// 歌词换行提前量：进度 tick 与滚动动画叠加会造成视觉滞后，
+/// 居中歌词与迷你歌词共用同一提前量保证换行同步。
+const double kLyricLeadSeconds = .22;
+
 class _MiniLyrics extends ConsumerWidget {
   const _MiniLyrics({
     required this.item,
@@ -8621,7 +8640,9 @@ class _MiniLyrics extends ConsumerWidget {
           playerProvider.select(
             (state) => lines.lastIndexWhere(
               (line) =>
-                  line.time <= applyLyricsOffset(state.position, offsetTenths),
+                  line.time <=
+                  applyLyricsOffset(state.position, offsetTenths) +
+                      kLyricLeadSeconds,
             ),
           ),
         );
@@ -8633,40 +8654,22 @@ class _MiniLyrics extends ConsumerWidget {
             duration: const Duration(milliseconds: 260),
             curve: Curves.easeOutCubic,
             alignment: Alignment.center,
-            child: AnimatedSwitcher(
-              duration: const Duration(milliseconds: 280),
-              switchInCurve: Curves.easeOutCubic,
-              switchOutCurve: Curves.easeInCubic,
-              transitionBuilder: (child, animation) {
-                return FadeTransition(
-                  opacity: animation,
-                  child: SlideTransition(
-                    position: Tween<Offset>(
-                      begin: const Offset(0, .22),
-                      end: Offset.zero,
-                    ).animate(animation),
-                    child: child,
-                  ),
-                );
-              },
-              // 当前行推进或行数变化（沉浸模式播放栏弹出/隐藏）时都重建，
-              // 由 AnimatedSize 平滑收放行数。
-              child: Column(
-                key: ValueKey('${item.path}:${lines[active].time}:$maxRows'),
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  for (var i = 0; i < rows.length; i++) ...[
-                    if (i > 0) const SizedBox(height: 3),
-                    _rowText(
-                      rows[i],
-                      fontSize,
-                      effectMode: effectMode,
-                      playedColor: playedColor,
-                      unplayedColor: unplayedColor,
-                      glow: glow,
-                    ),
-                  ],
-                ],
+            // 换行＝整块歌词向上滚动一行（旧行从上边界滑出、新行从下边界
+            // 滑入）。此前用 AnimatedSwitcher + SlideTransition 表达滚动，
+            // 但 transitionBuilder 只在 child 入场时求值一次（那时
+            // animation.status 恒为 forward），退出方向永远判断不到：
+            // 新旧两段同向下移，旧首行被下一行硬切顶替。录屏逐帧即
+            // 「先整块下顿约一行、再缓出上滑归位，旧行瞬间消失」。
+            child: _MiniLyricRoller(
+              contentKey: '${item.path}:$maxRows',
+              rows: rows,
+              rowBuilder: (row) => _rowText(
+                row,
+                fontSize,
+                effectMode: effectMode,
+                playedColor: playedColor,
+                unplayedColor: unplayedColor,
+                glow: glow,
               ),
             ),
           ),
@@ -8839,6 +8842,291 @@ class _MiniLyrics extends ConsumerWidget {
   }
 }
 
+/// 迷你歌词的整块滚动：换行时把「上一窗口」整体上推一步——旧首行从上边界
+/// 滑出、新行从下边界滑入，与列表滚动一格的观感一致。
+///
+/// 不再用 [AnimatedSwitcher]：它的 `transitionBuilder` 在每个 child 入场时
+/// 只求值一次，那一刻 `animation.status` 恒为 forward，「退出方向」永远拿不到
+/// reverse，新旧两段因此同向位移，旧首行被下一行直接顶替（硬切）。录屏逐帧
+/// 即「先整块下顿约一行、再缓出上滑归位，旧行瞬间消失」——方向与真实滚动
+/// 相反，且滚完还有残余位移没归零。
+class _MiniLyricRoller extends StatefulWidget {
+  const _MiniLyricRoller({
+    required this.contentKey,
+    required this.rows,
+    required this.rowBuilder,
+  });
+
+  /// 换歌 / 窗口行数变化：内容整体换掉，不做滚动动画。
+  final String contentKey;
+  final List<_MiniLyricRow> rows;
+  final Widget Function(_MiniLyricRow row) rowBuilder;
+
+  @override
+  State<_MiniLyricRoller> createState() => _MiniLyricRollerState();
+}
+
+class _MiniLyricRollerState extends State<_MiniLyricRoller>
+    with SingleTickerProviderStateMixin {
+  static const double _rowGap = 3;
+  static const Duration _rollDuration = Duration(milliseconds: 260);
+  static const Curve _rollCurve = Curves.easeOutCubic;
+
+  late final AnimationController _controller = AnimationController(
+    vsync: this,
+    duration: _rollDuration,
+  );
+
+  /// 滚动中的「被推出段」：只保留旧窗口最前面的一两步，用来把旧内容
+  /// 送出上边界，滚完即丢（非空即处于滚动过程）。
+  ///
+  /// 滚动内容＝旧窗口被推出的前几步 + 新窗口全部，绝不能拼「旧窗口全部 +
+  /// 新窗口全部」：两个窗口是同一份歌词的滑动窗口，重叠部分会被渲染两遍，
+  /// 视口里同一句歌词同时占两行（滚完再被顶掉），逐帧看就是「两句一样的
+  /// 歌词一起往上挤、到位后又跳成下一句」，是迷你歌词滚动的抖动来源。
+  List<_MiniLyricRow>? _previous;
+
+  /// 上推距离＝被推出行的实测总高。
+  double _pushDistance = 0;
+
+  /// 稳态内容高度：滚动期间拿它当视口高度，前后不跳。
+  double _steadyHeight = 0;
+
+  bool _rolling = false;
+  late List<_MiniLyricRow> _lastRows = widget.rows;
+  late String _lastKey = widget.contentKey;
+
+  /// 稳态逐行的实测高度（按行身份缓存）：换行当帧即可算出上推距离并启动
+  /// 动画。若等 postFrame 回调再启动，「新窗口内容已就位、位移仍是 0」的
+  /// 中间态会先渲染一帧——录屏里每次换行前的那一下闪烁就是这么来的。
+  final Map<Object, double> _rowHeights = <Object, double>{};
+
+  /// 行身份：歌词行对象在同一份歌词里唯一，跨窗口复用同一实例；
+  /// 必须连 [isActive] 一起作为身份——同一句歌词「活动态」与「非活动态」
+  /// 字号不同、行高也不同，只按行对象缓存会互相覆盖。
+  Object _rowId(_MiniLyricRow row) => row.line == null
+      ? '${row.text}|${row.translation}|${row.isActive}'
+      : (row.line!, row.isActive);
+
+  /// 上推距离＝被推出各行的实测高度之和（含行间距）。
+  double _distanceFor(List<_MiniLyricRow> rows, int steps) {
+    var sum = 0.0;
+    for (var i = 0; i < steps && i < rows.length; i++) {
+      final height = _rowHeights[_rowId(rows[i])];
+      if (height == null) return 0;
+      sum += height + _rowGap;
+    }
+    return sum;
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    _lastRows = widget.rows;
+    _lastKey = widget.contentKey;
+    _controller.addStatusListener(_onStatus);
+  }
+
+  @override
+  void dispose() {
+    _controller.removeStatusListener(_onStatus);
+    _controller.dispose();
+    super.dispose();
+  }
+
+  void _onStatus(AnimationStatus status) {
+    if (status != AnimationStatus.completed || !mounted) return;
+    _rolling = false;
+    setState(() {
+      _previous = null;
+      _pushDistance = 0;
+    });
+  }
+
+  @override
+  void didUpdateWidget(_MiniLyricRoller oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    final previous = _lastRows;
+    final contentChanged = widget.contentKey != _lastKey;
+    _lastRows = widget.rows;
+    _lastKey = widget.contentKey;
+    if (contentChanged) _rowHeights.clear();
+    // 滚动过程中又换行（极少数短句）：让本步走完，结束后按最新窗口收敛。
+    if (_rolling) return;
+    final steps = contentChanged
+        ? 0
+        : _stepsFor(previous, widget.rows);
+    if (steps <= 0) {
+      _previous = null;
+      _pushDistance = 0;
+      return;
+    }
+    _previous = steps >= previous.length
+        ? previous
+        : previous.sublist(0, steps);
+    // 行高已缓存（稳态期测过）：本帧直接给出位移并起动画，不经历位移为 0
+    // 的中间帧；测不到时才退回 postFrame 兜底（[_onHeadMeasured]）。
+    final distance = _distanceFor(previous, steps);
+    if (distance > .5) {
+      _pushDistance = distance;
+      _rolling = true;
+      _controller.forward(from: 0);
+    } else {
+      _pushDistance = 0;
+    }
+  }
+
+  /// 新窗口首行落在上一窗口的第几行（1..3）；对不上说明是跳转/回退，不滚动。
+  int _stepsFor(List<_MiniLyricRow> previous, List<_MiniLyricRow> next) {
+    if (previous.length < 2 || next.isEmpty) return 0;
+    for (var i = 1; i <= 3 && i < previous.length; i++) {
+      if (_sameRow(previous[i], next.first)) return i;
+    }
+    return 0;
+  }
+
+  bool _sameRow(_MiniLyricRow a, _MiniLyricRow b) =>
+      a.text == b.text && a.translation == b.translation;
+
+  /// 推出段实测完成：拿到位移再开动画，避免用估算值跳动。
+  void _onHeadMeasured(double height) {
+    if (!mounted || _rolling || _previous == null) return;
+    if (height <= .5) {
+      _rolling = false;
+      setState(() {
+        _previous = null;
+        _pushDistance = 0;
+      });
+      return;
+    }
+    _rolling = true;
+    // 上推段高度不含它自己末尾的行间距，补上 [_rowGap] 才能让新窗口首行
+    // 精确落到视口顶部（少算这一段，收尾会整体错位 3dp 再跳一下）。
+    setState(() => _pushDistance = height + _rowGap);
+    _controller.forward(from: 0);
+  }
+
+  List<Widget> _rows(
+    List<_MiniLyricRow> rows,
+    String tag, {
+    int start = 0,
+    int? end,
+    bool leadingGap = false,
+    bool measure = false,
+  }) {
+    final widgets = <Widget>[];
+    final stop = end ?? rows.length;
+    for (var i = start; i < stop; i++) {
+      if (i > start || leadingGap) {
+        widgets.add(const SizedBox(height: _rowGap));
+      }
+      Widget child = widget.rowBuilder(rows[i]);
+      if (measure) {
+        final id = _rowId(rows[i]);
+        child = _HeightProbe(
+          onHeight: (height) {
+            if (height > .5) _rowHeights[id] = height;
+          },
+          child: child,
+        );
+      }
+      widgets.add(
+        KeyedSubtree(
+          key: ValueKey('$tag:$i:${rows[i].text}:${rows[i].isActive}'),
+          child: child,
+        ),
+      );
+    }
+    return widgets;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final previous = _previous;
+    if (previous == null) {
+      return _HeightProbe(
+        onHeight: (height) => _steadyHeight = height,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: _rows(widget.rows, 'n', measure: true),
+        ),
+      );
+    }
+    // 上推段只有被推出视口的那几步，新窗口整体接在它后面：位移走完后，
+    // 视口顶部正好是新窗口首行，与稳态像素一致，收尾不会再有一下位移动画。
+    Widget head = Column(
+      mainAxisSize: MainAxisSize.min,
+      children: _rows(previous, 'p'),
+    );
+    if (_pushDistance <= 0) {
+      // 行高缓存缺失时的兜底：测完当帧再起动画。
+      head = _HeightProbe(onHeight: _onHeadMeasured, child: head);
+    }
+    return ClipRect(
+      child: SizedBox(
+        height: _steadyHeight > 0 ? _steadyHeight : null,
+        child: OverflowBox(
+          alignment: Alignment.topCenter,
+          minHeight: 0,
+          maxHeight: double.infinity,
+          child: AnimatedBuilder(
+            animation: _controller,
+            builder: (context, _) {
+              final t = _rollCurve.transform(_controller.value);
+              return Transform.translate(
+                offset: Offset(0, -_pushDistance * t),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    head,
+                    ..._rows(widget.rows, 'n', leadingGap: true),
+                  ],
+                ),
+              );
+            },
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// 帧末回传子树高度：滚动位移按实测行高计算，不依赖字号/翻译行数推算。
+class _HeightProbe extends StatefulWidget {
+  const _HeightProbe({required this.onHeight, required this.child});
+
+  final ValueChanged<double> onHeight;
+  final Widget child;
+
+  @override
+  State<_HeightProbe> createState() => _HeightProbeState();
+}
+
+class _HeightProbeState extends State<_HeightProbe> {
+  @override
+  void initState() {
+    super.initState();
+    _schedule();
+  }
+
+  @override
+  void didUpdateWidget(_HeightProbe oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    _schedule();
+  }
+
+  void _schedule() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      final box = context.findRenderObject();
+      if (box is RenderBox && box.hasSize) widget.onHeight(box.size.height);
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) => widget.child;
+}
+
 /// 迷你歌词单行数据：一行歌词，可携带随行小字翻译（翻译另占一行）。
 /// [line] 保留原始行引用：活动行逐字渲染需要词级时间轴（words）。
 class _MiniLyricRow {
@@ -8880,45 +9168,108 @@ class _LyricsView extends ConsumerStatefulWidget {
 }
 
 class _LyricsViewState extends ConsumerState<_LyricsView>
-    with AutomaticKeepAliveClientMixin<_LyricsView> {
+    with
+        AutomaticKeepAliveClientMixin<_LyricsView>,
+        SingleTickerProviderStateMixin {
   final ScrollController _scrollController = ScrollController();
   final Map<int, GlobalKey> _lineKeys = {};
   bool _scrollScheduled = false;
-  int _coarseScrollTarget = -1;
-  int _lastScrollTarget = -1;
   int _pendingScrollTarget = -1;
   bool _userScrolling = false;
   Timer? _resumeAutoScrollTimer;
   List<LyricLine> _latestLines = const [];
 
+  /// 行位置实测表：`index -> (行内容顶端相对滚动内容坐标, 行高)`。
+  /// 由 [_MeasuredLyricLine] 在帧末测量后回填，滚动落位一律以此为准
+  /// （不再依赖 GlobalKey + getOffsetToReveal）。
+  final Map<int, (double, double)> _lineLayouts = {};
+
+  /// 上一次已发起滚动的活动行：用于判断换行方向（只有下行才做拽动跟随）。
+  int _lastScrolledActive = -1;
+
+  /// 上一次已知的播放进度：与本次差值 > 1.2s 视为 seek / 切歌跳变，
+  /// 此时瞬时重排，不做滚动动画。
+  double _lastPosition = 0;
+
+  /// 下一次落位跳过动画（瞬时跳转），用于 seek / 切歌的跳变。
+  bool _skipAnimationOnce = false;
+
+  // ---- 换行「拽动跟随」（下行时逐行延迟追随，避免整块硬移）----
+  bool _pullActive = false;
+  int _pullAnchor = 0;
+  double _pullDistance = 0;
+  int _pullDelayMs = 50;
+  final Map<int, double> _pullOffsets = {};
+  final ValueNotifier<int> _pullRevision = ValueNotifier<int>(0);
+  late final Ticker _pullTicker;
+
+  /// 目标行尚未构建（[ListView.builder] 懒构建，换歌/首次进入时远处目标行
+  /// 还没布局）时先按整首比例落位，随后重试精确校正的次数上限，防止极端
+  /// 情况下每帧无限重试。
+  int _alignRetry = 0;
+
+  /// 尚未完成首次落位：此时整层不可见。
+  ///
+  /// 首次进入歌词页、换歌（外层按曲目换 key，state 会重建）时，列表首帧
+  /// 必然停在 offset 0（顶部），要等下一帧才落到当前行；这段「从顶部跳到
+  /// 中部」的中间态如果可见，就是用户看到的瞬间闪屏。落位完成前保持透明，
+  /// 落位后一次性揭示，中间态永远不呈现。
+  bool _awaitingAlign = true;
+  Timer? _alignFallbackTimer;
+
   @override
   bool get wantKeepAlive => true;
 
   @override
+  void initState() {
+    super.initState();
+    _pullTicker = createTicker(_onPullTick);
+    // 兜底：极端情况下（列表迟迟拿不到 clients、目标行始终未构建）也必须
+    // 把歌词露出来，不能一直透明。
+    _alignFallbackTimer = Timer(const Duration(milliseconds: 400), () {
+      if (!mounted) return;
+      _finishAlign();
+    });
+  }
+
+  @override
   void didUpdateWidget(_LyricsView oldWidget) {
     super.didUpdateWidget(oldWidget);
+    if (!oldWidget.showLyrics && widget.showLyrics) {
+      // 封面页 → 歌词页：视口可能还停在旧位置，重新对齐一次。
+      _alignRetry = 0;
+      _align();
+    }
     if (oldWidget.item.path != widget.item.path) {
-      _coarseScrollTarget = -1;
-      _lastScrollTarget = -1;
       _pendingScrollTarget = -1;
       _userScrolling = false;
+      _alignRetry = 0;
+      _skipAnimationOnce = false;
+      _lastScrolledActive = -1;
+      _lastPosition = 0;
+      _cancelPull();
+      _lineLayouts.clear();
       _resumeAutoScrollTimer?.cancel();
       _lineKeys.clear();
+      // 换歌：先把视口拉回顶部，新歌词到达后的本帧 [build] 里 [_syncScroll]
+      // 会瞬时落到新歌词的当前行（同样的跳转之前会先看到「从顶部滚到中部」）。
       WidgetsBinding.instance.addPostFrameCallback((_) {
-        if (mounted && _scrollController.hasClients) {
-          _scrollController.jumpTo(0);
-        }
+        if (!mounted || !_scrollController.hasClients) return;
+        _scrollController.jumpTo(0);
       });
     } else if (oldWidget.offsetTenths != widget.offsetTenths) {
-      // 偏移变化（含恢复同步）会移动活动行；重置滚动目标，强制
-      // 下一帧重新同步滚动，确保歌词能滚回正确行而不是停留在原处。
-      _lastScrollTarget = -1;
+      // 偏移变化（含恢复同步）会移动活动行；重置重试计数，让下一次对齐
+      // 重新按比例落位。
+      _alignRetry = 0;
     }
   }
 
   @override
   void dispose() {
+    _pullTicker.dispose();
+    _pullRevision.dispose();
     _resumeAutoScrollTimer?.cancel();
+    _alignFallbackTimer?.cancel();
     _scrollController.dispose();
     super.dispose();
   }
@@ -8938,7 +9289,8 @@ class _LyricsViewState extends ConsumerState<_LyricsView>
         (state) => lines.lastIndexWhere(
           (line) =>
               line.time <=
-              applyLyricsOffset(state.position, widget.offsetTenths) + .22,
+              applyLyricsOffset(state.position, widget.offsetTenths) +
+                  kLyricLeadSeconds,
         ),
       ),
     );
@@ -8948,6 +9300,20 @@ class _LyricsViewState extends ConsumerState<_LyricsView>
   @override
   Widget build(BuildContext context) {
     super.build(context);
+    // 进度跳变检测（seek / 切歌）：位置与上一帧差值 > 1.2s 说明不是自然
+    // 推进，此时瞬时重排到活动行，不做 550ms 滚动动画，避免「从远处滚过来」。
+    ref.listen(playerProvider.select((s) => s.position), (_, next) {
+      final jumped = (next - _lastPosition).abs() > 1.2;
+      _lastPosition = next;
+      if (jumped && !_awaitingAlign) {
+        _skipAnimationOnce = true;
+        _cancelPull();
+        final target = _pendingScrollTarget;
+        if (target >= 0 && target < _latestLines.length) {
+          _scrollToActiveLine(target);
+        }
+      }
+    });
     final effectMode =
         ref.watch(settingsProvider).valueOrNull?.lyricWordEffectMode ??
         LyricWordEffectMode.progressive;
@@ -9070,132 +9436,160 @@ class _LyricsViewState extends ConsumerState<_LyricsView>
                   ],
                   stops: [0, .28, .72, 1],
                 ).createShader(rect),
-                child: NotificationListener<ScrollNotification>(
-                  onNotification: _handleScrollNotification,
-                  child: ListView.builder(
-                    controller: _scrollController,
-                    padding: EdgeInsets.fromLTRB(
-                      26,
-                      compactVertical ? 28 : 124,
-                      26,
-                      compactVertical ? 28 : 124,
+                // 落位完成前整层透明（见 [_awaitingAlign]）：首次进入歌词页
+                // 与换歌时列表首帧都停在顶部，那一帧若可见就是用户看到的
+                // 「瞬间闪屏 / 跳一下」；用不带动画的 Opacity 一次性揭示，
+                // AnimatedOpacity 反倒会多出「先透明再淡入」的二次闪。
+                child: Opacity(
+                  opacity: _awaitingAlign ? 0 : 1,
+                  child: NotificationListener<ScrollNotification>(
+                    onNotification: _handleScrollNotification,
+                    child: ListView.builder(
+                      controller: _scrollController,
+                      padding: EdgeInsets.fromLTRB(
+                        26,
+                        compactVertical ? 28 : 124,
+                        26,
+                        compactVertical ? 28 : 124,
+                      ),
+                      itemCount: lines.length,
+                      itemBuilder: (context, index) {
+                        final line = lines[index];
+                        final selected = index == active;
+                        // 本行基色：已播/未播由歌词设置的两色表达。
+                        final lineColor = selected
+                            ? playedColor
+                            : unplayedColor;
+                        // 行内容本体（InkWell + 逐字文本 + 翻译/罗马音）保持原样，
+                        // 只在最外层套「实测行位置」与「换行拽动位移」两层：
+                        // 位移走 ValueNotifier 局部重建，不整页 setState。
+                        final row = InkWell(
+                          key: _lineKeys.putIfAbsent(index, GlobalKey.new),
+                          // 设置关闭“单击歌词调整进度”时禁用点击跳转。
+                          onTap: tapSeek
+                              ? () => ref
+                                    .read(playerProvider.notifier)
+                                    .seek(
+                                      playbackPositionForLyric(
+                                        line.time,
+                                        widget.offsetTenths,
+                                      ),
+                                    )
+                              : null,
+                          borderRadius: BorderRadius.circular(12),
+                          child: AnimatedContainer(
+                            duration: const Duration(milliseconds: 220),
+                            curve: Curves.easeOutCubic,
+                            padding: EdgeInsets.fromLTRB(
+                              selected && !indicatorOnRight ? 14 : 8,
+                              10,
+                              selected && indicatorOnRight ? 14 : 8,
+                              10,
+                            ),
+                            decoration: BoxDecoration(
+                              border: selected
+                                  ? Border(
+                                      // 当前歌词指示线跟随主题色；歌词靠右时
+                                      // 指示线同步移动到右侧。
+                                      left: indicatorOnRight
+                                          ? BorderSide.none
+                                          : BorderSide(
+                                              color: Theme.of(
+                                                context,
+                                              ).colorScheme.primary,
+                                              width: 3,
+                                            ),
+                                      right: indicatorOnRight
+                                          ? BorderSide(
+                                              color: Theme.of(
+                                                context,
+                                              ).colorScheme.primary,
+                                              width: 3,
+                                            )
+                                          : BorderSide.none,
+                                    )
+                                  : null,
+                            ),
+                            // 行内颜色即状态：已播/未播由歌词设置的两色表达
+                            // （默认=历史观感：纯白 / 白 55%）。不再用
+                            // AnimatedOpacity 调透明度——自定义颜色会被
+                            // 二次衰减导致选色失真；翻译/罗马音按行基色的
+                            // alpha 比例派生，保持原层次。
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.stretch,
+                              children: [
+                                _TimedLyricText(
+                                  line: line,
+                                  offsetTenths: widget.offsetTenths,
+                                  selected: selected,
+                                  effectMode: effectMode,
+                                  textAlign: textAlign,
+                                  baseFontSize: baseFontSize,
+                                  playedColor: playedColor,
+                                  unplayedColor: unplayedColor,
+                                  glow: glow,
+                                  active: widget.showLyrics,
+                                ),
+                                if (line.translation.isNotEmpty &&
+                                    showTranslation) ...[
+                                  const SizedBox(height: 4),
+                                  Text(
+                                    line.translation,
+                                    textAlign: textAlign,
+                                    style: TextStyle(
+                                      // 主歌词的一半（约 9sp）在手机上
+                                      // 几乎不可见，用户反馈“翻译不见了”，
+                                      // 恢复 baseFontSize - 5；字重用
+                                      // ExtraBold 强化加粗观感。
+                                      fontSize: (baseFontSize - 5).clamp(
+                                        10.0,
+                                        26.0,
+                                      ),
+                                      fontWeight: FontWeight.w800,
+                                      color: lineColor.withValues(
+                                        alpha: lineColor.a * .68,
+                                      ),
+                                    ),
+                                  ),
+                                ],
+                                if (line.romaji.isNotEmpty && showRomaji) ...[
+                                  const SizedBox(height: 3),
+                                  Text(
+                                    line.romaji,
+                                    textAlign: textAlign,
+                                    style: TextStyle(
+                                      fontSize: (baseFontSize - 6).clamp(
+                                        9.0,
+                                        24.0,
+                                      ),
+                                      color: lineColor.withValues(
+                                        alpha: lineColor.a * .48,
+                                      ),
+                                    ),
+                                  ),
+                                ],
+                              ],
+                            ),
+                          ),
+                        );
+                        return _MeasuredLyricLine(
+                          index: index,
+                          onMeasured: _onLineMeasured,
+                          child: ListenableBuilder(
+                            listenable: _pullRevision,
+                            builder: (context, child) {
+                              final dy = _pullOffsets[index] ?? 0.0;
+                              if (dy == 0) return child!;
+                              return Transform.translate(
+                                offset: Offset(0, dy),
+                                child: child,
+                              );
+                            },
+                            child: row,
+                          ),
+                        );
+                      },
                     ),
-                    itemCount: lines.length,
-                    itemBuilder: (context, index) {
-                      final line = lines[index];
-                      final selected = index == active;
-                      // 本行基色：已播/未播由歌词设置的两色表达。
-                      final lineColor = selected ? playedColor : unplayedColor;
-                      return InkWell(
-                        key: _lineKeys.putIfAbsent(index, GlobalKey.new),
-                        // 设置关闭“单击歌词调整进度”时禁用点击跳转。
-                        onTap: tapSeek
-                            ? () => ref
-                                  .read(playerProvider.notifier)
-                                  .seek(
-                                    playbackPositionForLyric(
-                                      line.time,
-                                      widget.offsetTenths,
-                                    ),
-                                  )
-                            : null,
-                        borderRadius: BorderRadius.circular(12),
-                        child: AnimatedContainer(
-                          duration: const Duration(milliseconds: 220),
-                          curve: Curves.easeOutCubic,
-                          padding: EdgeInsets.fromLTRB(
-                            selected && !indicatorOnRight ? 14 : 8,
-                            10,
-                            selected && indicatorOnRight ? 14 : 8,
-                            10,
-                          ),
-                          decoration: BoxDecoration(
-                            border: selected
-                                ? Border(
-                                    // 当前歌词指示线跟随主题色；歌词靠右时
-                                    // 指示线同步移动到右侧。
-                                    left: indicatorOnRight
-                                        ? BorderSide.none
-                                        : BorderSide(
-                                            color: Theme.of(
-                                              context,
-                                            ).colorScheme.primary,
-                                            width: 3,
-                                          ),
-                                    right: indicatorOnRight
-                                        ? BorderSide(
-                                            color: Theme.of(
-                                              context,
-                                            ).colorScheme.primary,
-                                            width: 3,
-                                          )
-                                        : BorderSide.none,
-                                  )
-                                : null,
-                          ),
-                          // 行内颜色即状态：已播/未播由歌词设置的两色表达
-                          // （默认=历史观感：纯白 / 白 55%）。不再用
-                          // AnimatedOpacity 调透明度——自定义颜色会被
-                          // 二次衰减导致选色失真；翻译/罗马音按行基色的
-                          // alpha 比例派生，保持原层次。
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.stretch,
-                            children: [
-                              _TimedLyricText(
-                                line: line,
-                                offsetTenths: widget.offsetTenths,
-                                selected: selected,
-                                effectMode: effectMode,
-                                textAlign: textAlign,
-                                baseFontSize: baseFontSize,
-                                playedColor: playedColor,
-                                unplayedColor: unplayedColor,
-                                glow: glow,
-                                active: widget.showLyrics,
-                              ),
-                              if (line.translation.isNotEmpty &&
-                                  showTranslation) ...[
-                                const SizedBox(height: 4),
-                                Text(
-                                  line.translation,
-                                  textAlign: textAlign,
-                                  style: TextStyle(
-                                    // 主歌词的一半（约 9sp）在手机上
-                                    // 几乎不可见，用户反馈“翻译不见了”，
-                                    // 恢复 baseFontSize - 5；字重用
-                                    // ExtraBold 强化加粗观感。
-                                    fontSize: (baseFontSize - 5).clamp(
-                                      10.0,
-                                      26.0,
-                                    ),
-                                    fontWeight: FontWeight.w800,
-                                    color: lineColor.withValues(
-                                      alpha: lineColor.a * .68,
-                                    ),
-                                  ),
-                                ),
-                              ],
-                              if (line.romaji.isNotEmpty && showRomaji) ...[
-                                const SizedBox(height: 3),
-                                Text(
-                                  line.romaji,
-                                  textAlign: textAlign,
-                                  style: TextStyle(
-                                    fontSize: (baseFontSize - 6).clamp(
-                                      9.0,
-                                      24.0,
-                                    ),
-                                    color: lineColor.withValues(
-                                      alpha: lineColor.a * .48,
-                                    ),
-                                  ),
-                                ),
-                              ],
-                            ],
-                          ),
-                        ),
-                      );
-                    },
                   ),
                 ),
               ),
@@ -9206,108 +9600,270 @@ class _LyricsViewState extends ConsumerState<_LyricsView>
     );
   }
 
+  /// 换行滚动入口。
+  ///
+  /// - 首次进入 / 换歌走 [_align]：瞬时落位，整个过程在 [_awaitingAlign] 的
+  ///   不可见状态内完成；
+  /// - 正常换行走 [_scrollToActiveLine]：550ms 缓动滚动，下行且活动行位置
+  ///   已知时叠加「拽动跟随」，后续行逐行延迟追随，观感是歌词稳定上移；
+  /// - seek / 切歌的跳变（见 [build] 中的位置监听）走一次瞬时跳转。
   void _syncScroll(int active, List<LyricLine> lines) {
+    _latestLines = lines;
     _pendingScrollTarget = active;
-    if (_userScrolling || _lastScrollTarget == active) return;
+    if (_awaitingAlign) {
+      _align();
+    } else {
+      _scrollToActiveLine(active);
+    }
+  }
+
+  /// 把活动行滚到视口 42% 处：换行用动画，跳变用瞬时跳转。
+  void _scrollToActiveLine(int active) {
+    if (!mounted || !_scrollController.hasClients) return;
+    if (_userScrolling) return;
+    final position = _scrollController.position;
+    final viewport = position.viewportDimension;
+    final exact = _centerOffsetFor(active, viewport);
+    final target = (exact ?? _proportionalOffset(active, _latestLines)).clamp(
+      position.minScrollExtent,
+      position.maxScrollExtent,
+    );
+    final delta = target - position.pixels;
+    if (_skipAnimationOnce) {
+      _skipAnimationOnce = false;
+      _cancelPull();
+      _lastScrolledActive = active;
+      if (delta.abs() >= .5) _scrollController.jumpTo(target);
+      return;
+    }
+    if (delta.abs() < .5) return;
+    final playing = ref.read(playerProvider).isPlaying;
+    if (playing && active > _lastScrolledActive && exact != null) {
+      _beginPull(active, delta, viewport);
+    } else {
+      _cancelPull();
+    }
+    _lastScrolledActive = active;
+    _scrollController.animateTo(
+      target,
+      duration: const Duration(milliseconds: 550),
+      curve: _pullActive
+          ? Curves.easeOutQuad
+          : const Cubic(0.40, 0.10, 0.00, 1.00),
+    );
+  }
+
+  // ==================== 换行拽动跟随 ====================
+
+  static double _pullEase(double p) {
+    p = p.clamp(0.0, 1.0);
+    return 1.0 - (1.0 - p) * (1.0 - p);
+  }
+
+  /// 开始一次拽动：后续行位移延迟随滚动距离占比收缩（滚得远延迟更短）。
+  void _beginPull(int anchor, double distancePx, double viewport) {
+    if (distancePx <= 1 || viewport <= 0) {
+      _cancelPull();
+      return;
+    }
+    _pullActive = true;
+    _pullAnchor = anchor;
+    _pullDistance = distancePx;
+    _pullOffsets.clear();
+    final ratio = (distancePx.abs() / viewport).clamp(0.0, 1.0);
+    _pullDelayMs = (50 + ratio * (4 - 50)).round();
+    if (_pullTicker.isActive) _pullTicker.stop();
+    _pullTicker.start();
+  }
+
+  void _cancelPull() {
+    if (_pullTicker.isActive) _pullTicker.stop();
+    if (!_pullActive && _pullOffsets.isEmpty) return;
+    _pullActive = false;
+    _pullOffsets.clear();
+    _notifyPull();
+  }
+
+  /// 通知各行的位移刷新；若正处在 build 阶段（provider 回调触发）则推迟到
+  /// 帧末，避免在 build 期间 markNeedsBuild 触发框架断言。
+  void _notifyPull() {
+    if (!mounted) return;
+    if (SchedulerBinding.instance.schedulerPhase ==
+        SchedulerPhase.persistentCallbacks) {
+      SchedulerBinding.instance.addPostFrameCallback((_) {
+        if (mounted) _pullRevision.value++;
+      });
+      return;
+    }
+    _pullRevision.value++;
+  }
+
+  /// 拽动推进：活动行之后最多 16 行按 [_pullDelayMs] 逐行延迟追随，
+  /// 位移量单调不减，保证行序不错乱；视口滚动动画结束后自然收敛。
+  void _onPullTick(Duration elapsed) {
+    if (!_pullActive) return;
+    const durationMs = 550;
+    final t = elapsed.inMilliseconds;
+    final globalE = _pullEase(t / durationMs);
+    final contribution = _pullDistance * globalE;
+    var changed = _pullOffsets.isNotEmpty;
+    var previous = 0.0;
+    for (var i = _pullAnchor + 1; i <= _pullAnchor + 16; i++) {
+      if (i >= _latestLines.length) break;
+      final startMs = _pullDelayMs * (i - _pullAnchor);
+      double offset;
+      if (t < startMs) {
+        offset = contribution;
+      } else {
+        final itemE = _pullEase((t - startMs) / durationMs);
+        offset = (contribution - _pullDistance * itemE).clamp(
+          0.0,
+          double.infinity,
+        );
+      }
+      final clamped = math.max(offset, previous);
+      previous = clamped;
+      if (_pullOffsets[i] != clamped) {
+        _pullOffsets[i] = clamped;
+        changed = true;
+      }
+    }
+    if (t >= durationMs + _pullDelayMs * 16) {
+      _pullActive = false;
+      _pullOffsets.clear();
+      _pullTicker.stop();
+      changed = true;
+    }
+    if (changed && mounted) _notifyPull();
+  }
+
+  /// 行实测回调：把行顶端换算成滚动内容坐标缓存，供落位直接取用。
+  void _onLineMeasured(int index, double viewportDy, double height) {
+    if (!mounted || !_scrollController.hasClients) return;
+    _lineLayouts[index] = (viewportDy + _scrollController.offset, height);
+    if (_awaitingAlign && !_userScrolling && index == _pendingScrollTarget) {
+      // 首次进入 / 换歌时目标行刚被测到：立刻精确落位，仍在 [_awaitingAlign]
+      // 的不可见阶段内完成，用户看不到中间态。
+      _alignRetry = 0;
+      _align();
+    }
+  }
+
+  /// 活动行落在视口 42% 处所需的滚动偏移；行尚未实测到返回 null。
+  double? _centerOffsetFor(int index, double viewport) {
+    final layout = _lineLayouts[index];
+    if (layout == null || viewport <= 0) return null;
+    return layout.$1 - (viewport - layout.$2) * .42;
+  }
+
+  /// 排到帧末执行一次对齐：行位置只有布局完成后才拿得到。
+  ///
+  /// 每次 build（换行、歌词重新布局、字号变化）都会调一次；对齐是幂等的，
+  /// 视口已在位时 [_jumpToOffset] 直接返回，不会产生额外抖动。
+  void _align() {
     if (_scrollScheduled) return;
-    _lastScrollTarget = active;
     _scrollScheduled = true;
     WidgetsBinding.instance.addPostFrameCallback((_) {
       _scrollScheduled = false;
       if (!mounted) return;
+      final active = _pendingScrollTarget;
+      final lines = _latestLines;
+      if (active < 0 || lines.isEmpty) {
+        _finishAlign();
+        return;
+      }
       if (!_scrollController.hasClients) {
-        // 歌词页未挂载（如用户停留在封面页调偏移）时无法执行滚动；
-        // 不能让 _lastScrollTarget 停留在"已同步"状态，否则重新挂载后
-        // 永远不会再滚回正确行。
-        _lastScrollTarget = -1;
+        _retryAlignOrFinish();
+        return;
+      }
+      if (_userScrolling) {
+        _finishAlign();
         return;
       }
 
-      final currentOffset = _revealOffset(active);
-      if (currentOffset == null) {
-        _coarseScrollTo(active, lines);
+      final exact = _centerOffsetFor(
+        active,
+        _scrollController.position.viewportDimension,
+      );
+      if (exact != null) {
+        _alignRetry = 0;
+        _jumpToOffset(exact);
+        _finishAlign();
         return;
       }
-
-      _coarseScrollTarget = -1;
-      _animateToOffset(currentOffset);
+      // 目标行还没实测到（[ListView.builder] 懒构建、刚切歌等）：先按整首
+      // 比例落位，随后重试，拿到真实行位置后再精确校正一次。两次落位都在
+      // [_awaitingAlign] 的不可见状态内完成。
+      _jumpToOffset(_proportionalOffset(active, lines));
+      _retryAlignOrFinish();
     });
   }
 
-  bool _handleScrollNotification(ScrollNotification notification) {
-    if (notification is ScrollStartNotification &&
-        notification.dragDetails != null) {
-      _resumeAutoScrollTimer?.cancel();
-      _userScrolling = true;
-    } else if (notification is ScrollEndNotification && _userScrolling) {
-      _resumeAutoScrollTimer?.cancel();
-      _resumeAutoScrollTimer = Timer(const Duration(seconds: 3), () {
-        if (!mounted) return;
-        _userScrolling = false;
-        _lastScrollTarget = -1;
-        final active = _pendingScrollTarget;
-        if (active >= 0 && active < _latestLines.length) {
-          _syncScroll(active, _latestLines);
-        }
-      });
+  /// 本轮没落到位：还能重试就再排一帧，否则直接揭示（宁可位置差一点，
+  /// 也不能让歌词一直不显示）。
+  void _retryAlignOrFinish() {
+    if (_alignRetry >= 6) {
+      _finishAlign();
+      return;
     }
-    return false;
+    _alignRetry++;
+    _align();
   }
 
-  void _animateToOffset(double rawTarget) {
+  /// 落位完成，揭示歌词列表。
+  void _finishAlign() {
+    _alignFallbackTimer?.cancel();
+    _alignFallbackTimer = null;
+    if (!mounted || !_awaitingAlign) return;
+    // 揭示时刻的进度即新的基准，避免下一 tick 被误判为 seek 跳变。
+    _lastPosition = ref.read(playerProvider).position;
+    setState(() => _awaitingAlign = false);
+  }
+
+  /// 与 [_centerOffsetFor] 目标同为「行落视口 42%」，只是行未实测时按整首比例估算。
+  double _proportionalOffset(int index, List<LyricLine> lines) {
+    final position = _scrollController.position;
+    final ratio = lines.length <= 1 ? 0.0 : index / (lines.length - 1);
+    return (position.maxScrollExtent * ratio).clamp(
+      position.minScrollExtent,
+      position.maxScrollExtent,
+    );
+  }
+
+  /// 瞬时落到目标偏移（无滚动动画），并 clamp 到可滚动范围。
+  void _jumpToOffset(double rawTarget) {
     if (!mounted || !_scrollController.hasClients) return;
+    _cancelPull();
     final position = _scrollController.position;
     final target = rawTarget.clamp(
       position.minScrollExtent,
       position.maxScrollExtent,
     );
-    final distance = (target - position.pixels).abs();
-    if (distance < .75) return;
-    final milliseconds = (300 + distance * 1.7).round().clamp(340, 620);
-    unawaited(
-      _scrollController.animateTo(
-        target,
-        duration: Duration(milliseconds: milliseconds),
-        curve: Curves.easeOutCubic,
-      ),
-    );
+    if ((target - position.pixels).abs() < .5) return;
+    _scrollController.jumpTo(target);
   }
 
-  double? _revealOffset(int index) {
-    final renderObject = _lineKeys[index]?.currentContext?.findRenderObject();
-    if (renderObject == null || !renderObject.attached) return null;
-    final viewport = RenderAbstractViewport.of(renderObject);
-    return viewport.getOffsetToReveal(renderObject, .42).offset;
-  }
-
-  void _coarseScrollTo(int active, List<LyricLine> lines) {
-    if (_coarseScrollTarget == active) return;
-    _coarseScrollTarget = active;
-
-    // 大幅拖动进度时目标行可能还没有构建，先按整首歌词比例平滑接近。
-    final ratio = lines.length <= 1 ? 0.0 : active / (lines.length - 1);
-    final position = _scrollController.position;
-    final target = (position.maxScrollExtent * ratio).clamp(
-      position.minScrollExtent,
-      position.maxScrollExtent,
-    );
-    unawaited(
-      _scrollController
-          .animateTo(
-            target,
-            duration: const Duration(milliseconds: 360),
-            curve: Curves.easeOutCubic,
-          )
-          .whenComplete(() {
-            if (!mounted || _coarseScrollTarget != active) return;
-            _coarseScrollTarget = -1;
-            WidgetsBinding.instance.addPostFrameCallback((_) {
-              if (!mounted || _userScrolling) return;
-              final exactOffset = _revealOffset(active);
-              if (exactOffset != null) _animateToOffset(exactOffset);
-            });
-          }),
-    );
+  /// 用户手动拖动歌词：拖动期间停掉拽动跟随，松手 1.8s 后自动滚回活动行。
+  bool _handleScrollNotification(ScrollNotification notification) {
+    if (notification is ScrollStartNotification &&
+        notification.dragDetails != null) {
+      _resumeAutoScrollTimer?.cancel();
+      _cancelPull();
+      _userScrolling = true;
+    } else if (notification is ScrollEndNotification && _userScrolling) {
+      _resumeAutoScrollTimer?.cancel();
+      _resumeAutoScrollTimer = Timer(const Duration(milliseconds: 1800), () {
+        if (!mounted) return;
+        _userScrolling = false;
+        final active = _pendingScrollTarget;
+        if (active >= 0 && active < _latestLines.length) {
+          // 走换行滚动入口（而非 _syncScroll）：此时不重新落位，
+          // 只把视口平滑滚回当前活动行。
+          _scrollToActiveLine(active);
+        }
+      });
+    }
+    return false;
   }
 
   /// 空态文案；传入 [onLinkLyrics] 时（暂无歌词）不显示 logo，
@@ -9348,6 +9904,38 @@ class _LyricsViewState extends ConsumerState<_LyricsView>
       ],
     ),
   );
+}
+
+/// 行位置实测包装：帧末把行相对视口的 dy 与行高回传给歌词页，
+/// 滚动落位据此精确计算，不依赖 GlobalKey 的 getOffsetToReveal。
+class _MeasuredLyricLine extends StatefulWidget {
+  const _MeasuredLyricLine({
+    required this.index,
+    required this.onMeasured,
+    required this.child,
+  });
+
+  final int index;
+  final void Function(int index, double viewportDy, double height) onMeasured;
+  final Widget child;
+
+  @override
+  State<_MeasuredLyricLine> createState() => _MeasuredLyricLineState();
+}
+
+class _MeasuredLyricLineState extends State<_MeasuredLyricLine> {
+  @override
+  Widget build(BuildContext context) {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      final box = context.findRenderObject() as RenderBox?;
+      if (box == null || !box.attached || box.hasSize == false) return;
+      final viewport = RenderAbstractViewport.of(box);
+      final dy = box.localToGlobal(Offset.zero, ancestor: viewport).dy;
+      widget.onMeasured(widget.index, dy, box.size.height);
+    });
+    return widget.child;
+  }
 }
 
 class _TimedLyricText extends ConsumerStatefulWidget {
@@ -9463,11 +10051,16 @@ class _TimedLyricTextState extends ConsumerState<_TimedLyricText>
     // 重置，防止旧 position 污染新行首帧（久播跨曲累积漂移）。
     if (oldWidget.line != widget.line ||
         oldWidget.offsetTenths != widget.offsetTenths) {
-      _basePositionMs = 0;
+      // 但也不能把进度留在 0 等下一次采样：position 只有 10Hz，重建出来
+      // 的行会先以「全未播色」渲染两三帧——迷你歌词每次换行时字先灰掉
+      // 再亮起来、旧活动行被推走时突然褪色，都是这一下。这里直接用当前
+      // 播放快照落定，行一出现就是它该有的进度。
+      final pos = ref.read(playerProvider).position;
+      _basePositionMs = pos * 1000.0;
       _baseClock = Duration.zero;
       _lastElapsed = Duration.zero;
-      _calibratedOnce = false;
-      _positionNotifier.value = 0;
+      _calibratedOnce = true;
+      _positionNotifier.value = applyLyricsOffset(pos, widget.offsetTenths);
       return;
     }
     // 行恢复为活动行（selected false→true，同歌上下行切换）：立即用

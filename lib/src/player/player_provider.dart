@@ -1344,6 +1344,7 @@ class PlayerNotifier extends SafeStateNotifier<PlaybackState>
     });
     _init();
     _installCarMediaButtonChannel();
+    _installNativeMediaLogChannel();
     _installVolumeKeyChannel();
     // 媒体会话音量模式（远程/本地）随设置开关与音量变化同步。
     _subscribeAndroidPlaybackInfo();
@@ -1476,6 +1477,10 @@ class PlayerNotifier extends SafeStateNotifier<PlaybackState>
     // 手动暂停都不该继续压制恢复（旧实现在这里不清，探活与重建的
     // `_manualPause` 守卫会把整条恢复链静默吃掉，用户点多少次都没反应）。
     _manualPause = false;
+    // 播放键同样占一次「外部按键」名额：恢复链耗时可能到 1s 以上，期间
+    // ROM 会重复派发同一次点击，不记录就会出现同一串点击反复驱动恢复链。
+    _lastExternalStalePauseAt = DateTime.now();
+    _lastExternalKeyStateAtPress = _player.playing || state.isPlaying;
     AppLogStore.instance.add(
       '[通知栏按键] 播放键：进入宿主恢复链（'
       'current=${state.current?.path ?? "null"}，'
@@ -1696,10 +1701,14 @@ class PlayerNotifier extends SafeStateNotifier<PlaybackState>
   ///
   /// 【统一防抖】2026-11-12 X100s 二次实测：暂停/播放**所有**按键都以
   /// pause 形态到达（含反转恢复成功的播放键），于是「每次按键 = 取反当前
-  /// 状态」，双击任何按钮都会切两次——用户实测：双击暂停变成暂停→播放，
-  /// 双击播放变成播放→暂停。修复：外部按键统一为取反 + 3s 防抖，3s 内的
-  /// 连按视为同一次操作的重按/回声直接忽略；单击（距上次外部按键 ≥3s）
-  /// 语义不变（在播→暂停，已停→反转播放）。
+  /// 状态」，双击任何按钮都会切两次。
+  ///
+  /// 【2026-11-20 V2359A 收紧】固定 3s 窗口在真机上过宽：149 条日志里
+  /// 11 次点击有 4 次是间隔 1~2s 的真实重按，被当作回声直接丢弃（用户侧
+  /// 表现就是「连点没反应」）。现在改为双判据：
+  /// 1. 时间窗收到 1200ms（ROM 的按键回声实测都在 300ms 内）；
+  /// 2. 窗口内还要求**播放状态与上次按键时一致**——状态已经变了说明上次
+  ///    按键生效，本次是用户的新操作，一律放行。
   Future<void> _handleExternalPausePressed() async {
     // 暂停必须作废在飞的恢复探活：否则探活到点后会把刚暂停的播放重新推起来
     // （或被误判成「无声假播」而触发 AudioSink 重建，用户听到一次爆音）。
@@ -1707,13 +1716,23 @@ class PlayerNotifier extends SafeStateNotifier<PlaybackState>
     _externalResumeProbeTimer = null;
     _externalResumeProbeToken++;
     final now = DateTime.now();
+    // 「用户感知在播」：引擎与 UI 任一说在播即算在播（两者背离时以更乐观
+    // 的一方为准，用于判断上一次按键是否已经生效）。
+    final playingNow = _player.playing || state.isPlaying;
     final last = _lastExternalStalePauseAt;
-    if (last != null && now.difference(last) < const Duration(seconds: 3)) {
-      playbackChainLog('[通知栏按键] 距上次外部按键 <3s，视为重按/回声忽略');
+    if (last != null &&
+        now.difference(last) < _externalKeyDedupWindow &&
+        _lastExternalKeyStateAtPress == playingNow) {
+      playbackChainLog(
+        '[通知栏按键] 距上次外部按键 ${now.difference(last).inMilliseconds}ms'
+        '（<${_externalKeyDedupWindow.inMilliseconds}ms）且状态未变化'
+        '（playing=$playingNow），视为重按/回声忽略',
+      );
       _scheduleMediaSessionRefreshAfterPause();
       return;
     }
     _lastExternalStalePauseAt = now;
+    _lastExternalKeyStateAtPress = playingNow;
     if (_player.playing) {
       await toggle();
       _scheduleMediaSessionRefreshAfterPause();
@@ -1729,6 +1748,13 @@ class PlayerNotifier extends SafeStateNotifier<PlaybackState>
       return;
     }
     if (state.isPlaying || state.isLoading) {
+      // 兜底分支不再静默：2026-11-20 日志里出现过「桥收到 pause 之后无任何
+      // 判定分支输出」的记录（起播中 isLoading 且引擎未在播），当时无法
+      // 判断是被防抖吞掉还是落到这里。
+      playbackChainLog(
+        '[通知栏按键] 暂停键：落兜底分支（state.isPlaying=${state.isPlaying}，'
+        'isLoading=${state.isLoading}，enginePlaying=${_player.playing}），清播放标志',
+      );
       state = state.copyWith(isPlaying: false, isLoading: false);
     }
     _scheduleMediaSessionRefreshAfterPause();
@@ -1763,6 +1789,81 @@ class PlayerNotifier extends SafeStateNotifier<PlaybackState>
   /// 上一次车机/方向盘按键的触发时间（节流用）。
   DateTime? _lastCarMediaButtonAt;
 
+  /// 媒体按键通道：原生 → Dart 的车机媒体键事件（onMediaButton），
+  /// Dart → 原生的播控卡片点击消费（consumeMediaCardClick）。
+  static const MethodChannel _mediaButtonChannel = MethodChannel(
+    'com.xymusic.mobile/media_buttons',
+  );
+
+  /// 消费一次「系统媒体卡片/播控胶囊被点击」的来源标记（见
+  /// MainActivity.handleMediaCardClick）。
+  ///
+  /// vivo OriginOS（Android 16）实测：暂停后点播控卡片的「播放」，系统按暂停
+  /// 帧的 actions 把这次点击解析成「展开应用」——拉起 Activity，却一个媒体键
+  /// 都不派发。Dart 侧连 `[通知栏按键] 桥收到 play` 锚点都没有，原生侧也没有
+  /// onMediaButton 记录，用户看到的就是「只能暂停、不能播放」。
+  ///
+  /// 这条链路不依赖 ROM 是否派发媒体键：原生侧给 MediaSession 的
+  /// sessionActivity 打了来源标记，点击即记时刻；这里回前台时主动拉取一次，
+  /// 命中就把这次点击还原成一次播放请求。原生侧读后即清，一次点击只驱动一次。
+  ///
+  /// 只在「引擎与状态双双不在播放」时才恢复：卡片点击本身也包含「进应用
+  /// 看看」的语义，正在出声时不得打断播放。
+  Future<void> _consumeMediaCardClick() async {
+    if (kIsWeb || defaultTargetPlatform != TargetPlatform.android) return;
+    int elapsedMs;
+    try {
+      elapsedMs = await _mediaButtonChannel.invokeMethod<int>(
+            'consumeMediaCardClick',
+          ) ??
+          -1;
+    } catch (_) {
+      // 通道未就绪（极早期的 resumed）/原生未实现时静默跳过。
+      return;
+    }
+    if (elapsedMs < 0) return;
+    final enginePlaying = _player.playing;
+    final statePlaying = state.isPlaying;
+    AppLogStore.instance.add(
+      '[播控卡片] 回前台命中媒体卡片点击（${elapsedMs}ms 前），'
+      'enginePlaying=$enginePlaying，state.isPlaying=$statePlaying，'
+      'current=${state.current?.path ?? "null"}',
+      level: AppLogLevel.info,
+    );
+    if (enginePlaying || statePlaying) {
+      AppLogStore.instance.add(
+        '[播控卡片] 当前在播，卡片点击按「进应用查看」处理，不打断播放',
+        level: AppLogLevel.info,
+      );
+      return;
+    }
+    // 冷启动时序：resumed 可能早于 _init() 的会话持久化恢复完成，此刻队列
+    // 还是空的，直接调恢复链只会打一条「队列为空，无法恢复」然后放弃——
+    // 用户侧依旧「点了没反应」。这里给队列最多 2s 的填充窗口（250ms 一探），
+    // 超时后再交给恢复链做最终判定（它自己会记日志说明为什么没起来）。
+    for (var i = 0; i < 8; i++) {
+      if (state.current != null || state.queue.isNotEmpty) break;
+      await Future<void>.delayed(const Duration(milliseconds: 250));
+    }
+    await _handleExternalPlayPressed();
+  }
+
+  /// 原生媒体事件日志回流（见 AudioService.btnLog）。
+  ///
+  /// 现场拿不到 adb，反查「事件死在原生还是死在 Dart」只能依赖 App 内导出
+  /// 的日志。把原生的 onStartCommand / onMediaButtonEvent / onPlay / onPause /
+  /// onCustomAction 锚点同步进 AppLogStore，导出的日志里就能直接看出断点。
+  void _installNativeMediaLogChannel() {
+    if (kIsWeb || defaultTargetPlatform != TargetPlatform.android) return;
+    const channel = MethodChannel('com.xymusic.mobile/native_media_log');
+    channel.setMethodCallHandler((call) async {
+      if (call.method != 'log') return;
+      final msg = call.arguments as String?;
+      if (msg == null || msg.isEmpty) return;
+      AppLogStore.instance.add(msg, level: AppLogLevel.info);
+    });
+  }
+
   /// 车机/方向盘媒体按键兜底通道（见 MainActivity.dispatchKeyEvent）：
   /// 部分车机 ROM 不把媒体键交给 MediaSession，而是直接注入前台
   /// Activity。原生层拦截后经此通道转发到 Flutter，路由到播放控制。
@@ -1770,8 +1871,7 @@ class PlayerNotifier extends SafeStateNotifier<PlaybackState>
   /// 不会走到这里，因此不会重复触发。
   void _installCarMediaButtonChannel() {
     if (kIsWeb || defaultTargetPlatform != TargetPlatform.android) return;
-    const channel = MethodChannel('com.xymusic.mobile/media_buttons');
-    channel.setMethodCallHandler((call) async {
+    _mediaButtonChannel.setMethodCallHandler((call) async {
       if (call.method != 'onMediaButton') return;
       final action = call.arguments as String?;
       if (action == null) return;
@@ -1808,11 +1908,18 @@ class PlayerNotifier extends SafeStateNotifier<PlaybackState>
           // toggle()` 有一个静默黑洞：AudioSink 失活假播时 state.isPlaying
           // 仍为 true（推算时钟照走、playing 事件未清），此时 isPlaying
           // 恒为 true、连日志都没有；而同通道的暂停走 toggle 暂停分支
-          // （无日志但能响）——正是 vivo「暂停可以、播放没反应、日志零
-          // 痕迹」的组合。按按键语义与引擎真实状态分派，不再信 UI 状态。
+          // （无响但能停）——正是 vivo「暂停可以、播放没反应、日志零
+          // 痕迹」的组合。
+          //
+          // 2026-11-20 起改为意图直通：原生 dispatchKeyEvent 已经把标准键码
+          // 正向翻译成语义（126→play、127→pause、85/79→playPause），
+          // action=='play' 就是「用户要播放」，不能再因为 enginePlaying
+          // 为真就翻成暂停（引擎自报在播的无声假播恰恰需要走播放链重建）。
           final wantsPause = action == 'pause' || action == 'stop';
-          final enginePlaying = _player.playing;
-          if (wantsPause || enginePlaying) {
+          final wantsPlay = action == 'play';
+          if (wantsPlay) {
+            await _handleExternalPlayPressed();
+          } else if (wantsPause || _player.playing) {
             await _handleExternalPausePressed();
           } else {
             await _handleExternalPlayPressed();
@@ -3207,6 +3314,14 @@ class PlayerNotifier extends SafeStateNotifier<PlaybackState>
   /// 同时刻 setAudioSource，表现为「点了没反应，进软件再点才行」。
   int? _pendingPlayAtIndex;
   double _pendingPlayAtSecs = 0;
+  /// 外部媒体按键去重窗口（见 [_handleExternalPausePressed]）。
+  ///
+  /// 2026-11-20 vivo V2359A 实测：vivo/OriginOS 的按键回声与重复广播都在
+  /// 300ms 内，而用户真实连按的间隔普遍 ≥800ms。原 3s 窗口过宽，把 11 次
+  /// 点击里的 4 次真实重按当回声吞掉；取 1200ms 并在窗口内追加「播放状态
+  /// 是否变化」判据，既能挡住回声，又不会吃掉用户的新按键。
+  static const Duration _externalKeyDedupWindow = Duration(milliseconds: 1200);
+
   /// 外部（通知栏/锁屏/耳机）播放键恢复后的无声探活计时器与令牌。
   ///
   /// 非久置场景（只是暂停了一会儿）在部分 ROM 上 ExoPlayer 的 AudioSink 已经
@@ -3217,9 +3332,17 @@ class PlayerNotifier extends SafeStateNotifier<PlaybackState>
   Timer? _externalResumeProbeTimer;
   int _externalResumeProbeToken = 0;
   /// 最近一次外部媒体按键（含播放/暂停，X100s 上两者都以 pause 形态到达）
-  /// 被受理的时刻。距此时刻 <3s 的后续按键视为重按/回声忽略，≥3s 才按
-  /// 取反语义处理（见 [_handleExternalPausePressed] 的统一防抖）。
+  /// 被受理的时刻。窗口内且播放状态未变化才视为重按/回声忽略
+  /// （见 [_handleExternalPausePressed] 的统一防抖）。
   DateTime? _lastExternalStalePauseAt;
+
+  /// 最近一次外部媒体按键被受理时的「用户感知在播」快照。
+  ///
+  /// 2026-11-20 vivo V2359A 实测：固定 3s 时间窗会把间隔 1~2s 的真实重按
+  /// 当成回声吞掉（149 条日志里 11 次点击有 4 次被忽略）。改为「时间窗 +
+  /// 状态是否变化」双判据——上次按键之后播放状态已经变了，说明那一次生效
+  /// 了，本次是用户的新操作，必须放行。
+  bool? _lastExternalKeyStateAtPress;
   /// 暂停后补推播放状态的计时器与令牌（见
   /// [_scheduleMediaSessionRefreshAfterPause]）。
   Timer? _mediaSessionRefreshTimer;
@@ -4144,6 +4267,13 @@ class PlayerNotifier extends SafeStateNotifier<PlaybackState>
       _syncPositionFromEngine();
       _schedulePersistSession();
     } else {
+      // 【播控卡片】vivo OriginOS（Android 16）会把「暂停后点播放」解析成
+      // 「展开应用」：拉起 Activity 但一个媒体键都不派发，Dart 侧连
+      // `[通知栏按键] 桥收到 play` 都没有。原生侧给 sessionActivity 打了
+      // 来源标记，回前台先消费一次，命中即还原成一次播放请求。
+      // 必须放在 resumed 分支最前：后续的 AudioSink 惰性探测/重建都要先有
+      // 「用户想播放」这个前提。
+      unawaited(_consumeMediaCardClick());
       // 【核心修复③】回前台：若本次后台停留已超过阈值且仍处于播放态，
       // 强制重建 AudioSink（pause→seek→play），修复「切后台再回来没声音、
       // 进度条却还在走」的 AudioTrack 静默失活（详见 [_reattachAudioSink]）。

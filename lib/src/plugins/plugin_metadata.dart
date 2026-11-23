@@ -1169,3 +1169,46 @@ class _StaticNode {
   final String? value;
   final String? text;
 }
+
+/// 插件分类的**唯一**判定入口。
+///
+/// 插件管理页的分栏（`_rowFromMeta`）与搜索页的来源 Tab 顺序
+///（`musicPluginKindKeyOf`）都走这里：此前两处各写一份规则，管理页带
+/// [PluginMetadata.isBakaSourceUrl] 兜底与「musicfree 提示不压回 baka」的
+/// 压制逻辑，搜索页只看运行时契约标记，于是同一个插件在管理页归入
+/// BakaMusic 分栏、在搜索页却被当成 MusicFree，两边顺序自然对不上。
+///
+/// 返回分类标识 `lx` / `baka` / `animemusic` / `musicfree` / `other`
+///（取值与 plugin_runtime.dart 的 `pluginKind*` 常量一致）。优先级：
+/// 用户手动归入「其他」> LX 契约 > BakaMusic 契约 > animemusic 后端 >
+/// 标准 MusicFree；内容识别不中时由订阅类型提示 [kindHint] 与来源 URL
+/// [sourceUrl] 兜底。
+String resolvePluginKindKey({
+  required bool isLx,
+  required bool isBaka,
+  required bool isAnimemusic,
+  String? kindHint,
+  String? sourceUrl,
+}) {
+  var kind = isLx
+      ? 'lx'
+      : isBaka
+      ? 'baka'
+      : isAnimemusic
+      ? 'animemusic'
+      : 'musicfree';
+  final hint = kindHint?.trim().toLowerCase();
+  if (hint == 'other') return 'other';
+  if (kind == 'musicfree' || kind == 'baka') {
+    if (hint == 'baka') {
+      kind = 'baka';
+    } else if (hint == 'musicfree') {
+      // 内容已判定为 BakaMusic 契约时不被 musicfree 提示压回。
+      if (kind != 'baka') kind = 'musicfree';
+    } else if (PluginMetadata.isBakaSourceUrl(sourceUrl ?? '')) {
+      kind = 'baka';
+    }
+  }
+  return kind;
+}
+

@@ -10,6 +10,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import '../../src/core/db_path.dart';
 import '../../src/core/settings.dart';
 import '../../src/favorites/favorites_provider.dart';
+import '../../src/logging/app_log_store.dart';
 import '../../src/player/player_provider.dart';
 import '../../src/playlists/playlists_provider.dart';
 import '../../src/plugins/plugin_metadata.dart';
@@ -932,7 +933,9 @@ class _PluginsNotifier extends AsyncNotifier<List<_PluginInfo>> {
     ref.invalidate(enabledMusicPluginsProvider);
   }
 
-  /// 拖拽排序：同步更新列表并持久化顺序，该顺序即搜索页插件 Tab 优先级。
+  /// 拖拽排序：同步更新列表并持久化顺序，该顺序即插件列表默认展示顺序；
+  /// 搜索页音源 Tab 另有一份独立顺序（设置 › 布局 › 搜索页音源排序），
+  /// 未自定义时沿用本顺序。
   /// 注意：onReorderItem 回调的 newIndex 已为移除 oldIndex 项后的目标位置，
   /// 无需手动减一。
   Future<void> reorder(int oldIndex, int newIndex) async {
@@ -1030,6 +1033,59 @@ class _PluginsNotifier extends AsyncNotifier<List<_PluginInfo>> {
     return summary.freeze();
   }
 
+  /// 检测在线音源是否有新版本：只从来源地址拉取比对，**不写盘不安装**。
+  ///
+  /// 判定口径与安装链路保持一致——双方版本号都可比较时按版本号比大小；
+  /// 版本号缺失或为描述性文案时退回内容比对（内容确实变了才算更新），
+  /// 避免作者忘改版本号导致「明明更新了却检测不到」。
+  /// 单个音源拉取失败只跳过自身，不阻断其余音源的检测。
+  Future<List<_PluginUpdate>> checkUpdates() async {
+    // 自动检测在启动早期触发，首次加载可能尚未完成，这里等一次 future。
+    final plugins = await future;
+    final online = plugins
+        .where((plugin) => plugin.isOnline)
+        .toList(growable: false);
+    if (online.isEmpty) return const <_PluginUpdate>[];
+
+    final found = <_PluginUpdate>[];
+    for (final plugin in online) {
+      try {
+        final content = await _downloadText(plugin.sourceUrl!.trim());
+        final remoteVersion =
+            PluginMetadata.parse(content).version?.trim() ?? '';
+        final localVersion = plugin.version.trim();
+        var newer = false;
+        if (remoteVersion.isNotEmpty &&
+            PluginMetadata.isComparableVersion(remoteVersion) &&
+            PluginMetadata.isComparableVersion(localVersion)) {
+          newer =
+              PluginMetadata.compareVersions(remoteVersion, localVersion) > 0;
+        } else {
+          final file = File(plugin.path);
+          final localContent = file.existsSync()
+              ? await file.readAsString()
+              : null;
+          newer = localContent == null
+              ? false
+              : localContent.trim() != content.trim();
+        }
+        if (newer) {
+          found.add(
+            _PluginUpdate(
+              plugin: plugin,
+              remoteVersion: remoteVersion,
+              contentHash: content.hashCode,
+            ),
+          );
+        }
+      } catch (_) {
+        // 断网、源站改版、脚本被墙都只影响单个音源，静默跳过。
+      }
+      await _yieldToUi();
+    }
+    return found;
+  }
+
   Future<void> remove(_PluginInfo plugin) async {
     await removeMany([plugin]);
   }
@@ -1101,7 +1157,9 @@ class _PluginsPageState extends ConsumerState<PluginsPage> {
   bool _selectionMode = false;
   final Set<String> _selectedIds = <String>{};
 
-  /// 分页 Tab：0 = 普通插件（MusicFree/星海），1 = LX 音源。
+  /// 当前选中分栏在「分栏顺序」中的下标。分栏顺序由用户拖动页签自定义
+  /// （见 [pluginKindOrderProvider]，缺省回落 [kMusicPluginKindDefaultOrder]），
+  /// 因此该下标只相对当前顺序有效，顺序变化后需按分栏标识重新定位。
   int _tabIndex = 0;
 
   @override
@@ -1650,30 +1708,37 @@ class _PluginsPageState extends ConsumerState<PluginsPage> {
               (id) => !items.any((plugin) => plugin.id == id),
             );
             // 各分类分页计数：BakaMusic/MusicFree/LX/animemusic/其他。
+            // 分栏顺序由用户拖动页签自定义并独立持久化（[pluginKindOrderProvider]），
+            // 缺失或非法时回落内置顺序 [kMusicPluginKindDefaultOrder]。
+            final scheme = Theme.of(context).colorScheme;
+            final kinds = [
+              for (final key in normalizePluginKindOrder(
+                ref.watch(pluginKindOrderProvider).valueOrNull,
+              ))
+                _kindOfKey(key),
+            ];
             final kindCounts = {
-              for (final kind in _PluginKind.values)
+              for (final kind in kinds)
                 kind: items.where((item) => item.kind == kind).length,
             };
             // 当前分类为空时回退到第一个非空分类，避免停留空页。
-            var tabIndex = _tabIndex;
-            if (kindCounts[_PluginKind.values[tabIndex]] == 0) {
-              final fallback = _PluginKind.values
+            var tabIndex = _tabIndex.clamp(0, kinds.length - 1);
+            if (kindCounts[kinds[tabIndex]] == 0) {
+              final fallback = kinds
                   .where((kind) => kindCounts[kind]! > 0)
                   .firstOrNull;
               if (fallback != null) {
-                tabIndex = _PluginKind.values.indexOf(fallback);
+                tabIndex = kinds.indexOf(fallback);
               }
             }
             // 只显示有插件的分类；全部为空（首次安装、清空插件）时保留
             // 完整分类展示，避免页签整体消失。
-            final nonEmptyKinds = _PluginKind.values
+            final nonEmptyKinds = kinds
                 .where((kind) => kindCounts[kind]! > 0)
                 .toList();
-            final shownKinds = nonEmptyKinds.isEmpty
-                ? _PluginKind.values
-                : nonEmptyKinds;
+            final shownKinds = nonEmptyKinds.isEmpty ? kinds : nonEmptyKinds;
             final visible = items
-                .where((item) => item.kind == _PluginKind.values[tabIndex])
+                .where((item) => item.kind == kinds[tabIndex])
                 .toList();
             return Stack(
               children: [
@@ -1711,35 +1776,70 @@ class _PluginsPageState extends ConsumerState<PluginsPage> {
                             Row(
                               children: [
                                 Expanded(
-                                  // 分类页签横向排布，窄屏放不下时滚动；
-                                  // 空分类不显示（见 shownKinds）。
-                                  child: SingleChildScrollView(
-                                    scrollDirection: Axis.horizontal,
-                                    child: SegmentedButton<int>(
-                                      segments: [
-                                        for (final kind in shownKinds)
-                                          ButtonSegment(
-                                            value: _PluginKind.values.indexOf(
-                                              kind,
-                                            ),
-                                            icon: Icon(
-                                              _kindIcon(kind),
-                                              size: 16,
-                                            ),
-                                            label: Text(
-                                              '${_kindLabel(kind)} ${kindCounts[kind]}',
-                                            ),
+                                  // 分类页签横向排布，窄屏放不下时滚动；空分类
+                                  // 不显示（见 shownKinds）。页签支持长按拖动
+                                  // 排序，顺序写入 pluginKindOrderProvider。
+                                  child: SizedBox(
+                                    height: 40,
+                                    child: ReorderableListView.builder(
+                                      scrollDirection: Axis.horizontal,
+                                      buildDefaultDragHandles: false,
+                                      padding: EdgeInsets.zero,
+                                      itemCount: shownKinds.length,
+                                      onReorderItem: _busy
+                                          ? (_, _) {}
+                                          : _reorderKindTabs,
+                                      proxyDecorator:
+                                          (child, index, animation) => Material(
+                                            color: Colors.transparent,
+                                            child: child,
                                           ),
-                                      ],
-                                      selected: {tabIndex},
-                                      onSelectionChanged: _busy
-                                          ? null
-                                          : (selection) => setState(() {
-                                              _tabIndex = selection.first;
-                                            }),
+                                      itemBuilder: (context, index) {
+                                        final kind = shownKinds[index];
+                                        return _KindTab(
+                                          key: ValueKey(_kindKey(kind)),
+                                          index: index,
+                                          icon: _kindIcon(kind),
+                                          label:
+                                              '${_kindLabel(kind)} ${kindCounts[kind]}',
+                                          selected: kinds[tabIndex] == kind,
+                                          onTap: _busy
+                                              ? null
+                                              : () => setState(() {
+                                                  _tabIndex = kinds.indexOf(
+                                                    kind,
+                                                  );
+                                                }),
+                                        );
+                                      },
                                     ),
                                   ),
                                 ),
+                                if (shownKinds.length > 1)
+                                  Padding(
+                                    padding: const EdgeInsets.only(left: 4),
+                                    child: Column(
+                                      mainAxisAlignment:
+                                          MainAxisAlignment.center,
+                                      children: [
+                                        Icon(
+                                          Icons.drag_indicator_rounded,
+                                          size: 15,
+                                          color: scheme.onSurfaceVariant
+                                              .withValues(alpha: 0.7),
+                                        ),
+                                        Text(
+                                          '长按拖动',
+                                          style: TextStyle(
+                                            fontSize: 9,
+                                            height: 1.1,
+                                            color: scheme.onSurfaceVariant
+                                                .withValues(alpha: 0.7),
+                                          ),
+                                        ),
+                                      ],
+                                    ),
+                                  ),
                               ],
                             ),
                             if (visible.isNotEmpty) ...[
@@ -1814,7 +1914,7 @@ class _PluginsPageState extends ConsumerState<PluginsPage> {
                               ),
                               const SizedBox(height: 8),
                               Text(
-                                '拖动插件左侧的手柄排序，从上到下即搜索页插件 Tab 的优先级。',
+                                '拖动插件左侧的手柄排序，从上到下即插件列表顺序；分类 Tab 的左右顺序可在 设置 › 布局 中调整。',
                                 style: TextStyle(
                                   fontSize: 11,
                                   color: Theme.of(
@@ -1845,7 +1945,7 @@ class _PluginsPageState extends ConsumerState<PluginsPage> {
                             onLocal: _importLocal,
                             hint: items.isEmpty
                                 ? '还没有安装插件'
-                                : '还没有${_kindLabel(_PluginKind.values[tabIndex])}音源',
+                                : '还没有${_kindLabel(kinds[tabIndex])}音源',
                             actionLabel: items.isEmpty ? '输入插件地址' : '安装到当前分类',
                           ),
                         ),
@@ -1971,11 +2071,68 @@ class _PluginsPageState extends ConsumerState<PluginsPage> {
     _PluginKind.other => pluginKindOther,
   };
 
+  /// 分栏标识 → 枚举（把 [normalizePluginKindOrder] 的结果转成页签用的枚举）。
+  static _PluginKind _kindOfKey(String key) => switch (key) {
+    pluginKindBaka => _PluginKind.baka,
+    pluginKindMusicFree => _PluginKind.musicfree,
+    pluginKindLx => _PluginKind.lx,
+    pluginKindAnimemusic => _PluginKind.animemusic,
+    _ => _PluginKind.other,
+  };
+
+  /// 当前分栏顺序对应的枚举列表（读 [pluginKindOrderProvider]，缺失或非法
+  /// 时由 [normalizePluginKindOrder] 回落内置顺序）。
+  List<_PluginKind> _orderedKinds() => [
+    for (final key in normalizePluginKindOrder(
+      ref.read(pluginKindOrderProvider).valueOrNull,
+    ))
+      _kindOfKey(key),
+  ];
+
+  /// 页签拖动排序：只在「当前显示的分栏」（空分类不显示）之间重排，隐藏的
+  /// 空分栏保持它在完整顺序里的槽位不动；写盘后把 [_tabIndex] 重新指向
+  /// 拖动前的选中分栏，避免顺序变化把选中项挪到别的分类上。
+  ///
+  /// [newIndex] 来自 `ReorderableListView.onReorderItem`，已是「移除源项后」
+  /// 的目标位置，无需再修正。
+  Future<void> _reorderKindTabs(int oldIndex, int newIndex) async {
+    final plugins = ref.read(_pluginsProvider).valueOrNull;
+    if (plugins == null) return;
+    final kinds = _orderedKinds();
+    final nonEmpty = [
+      for (final kind in kinds)
+        if (plugins.any((item) => item.kind == kind)) kind,
+    ];
+    final shown = nonEmpty.isEmpty ? kinds : nonEmpty;
+    if (oldIndex < 0 || oldIndex >= shown.length) return;
+    final target = newIndex;
+    if (target < 0 || target >= shown.length || target == oldIndex) return;
+    final reordered = [...shown];
+    final moved = reordered.removeAt(oldIndex);
+    reordered.insert(target, moved);
+    // 显示分栏在完整顺序里的槽位：把重排结果按槽位写回，空分栏原位保留。
+    final slots = [
+      for (var i = 0; i < kinds.length; i++)
+        if (shown.contains(kinds[i])) i,
+    ];
+    final next = [...kinds];
+    for (var i = 0; i < slots.length && i < reordered.length; i++) {
+      next[slots[i]] = reordered[i];
+    }
+    final selectedKind = kinds[_tabIndex.clamp(0, kinds.length - 1)];
+    await ref.read(pluginKindOrderProvider.notifier).setOrder([
+      for (final kind in next) _kindKey(kind),
+    ]);
+    if (!mounted) return;
+    setState(() => _tabIndex = next.indexOf(selectedKind));
+  }
+
   /// 当前分栏的分类标识：单文件安装（直链/本地文件）无法从脚本内容区分
   /// BakaMusic 与 MusicFree，用用户所在分栏作为分类提示。
   String _currentKindHint() {
-    final index = _tabIndex.clamp(0, _PluginKind.values.length - 1);
-    return _kindKey(_PluginKind.values[index]);
+    final kinds = _orderedKinds();
+    final index = _tabIndex.clamp(0, kinds.length - 1);
+    return _kindKey(kinds[index]);
   }
 
   /// 手动更改插件分类：多契约插件（同时兼容 BakaMusic/MusicFree/LX）
@@ -1986,7 +2143,7 @@ class _PluginsPageState extends ConsumerState<PluginsPage> {
       builder: (dialogContext) => SimpleDialog(
         title: Text('${plugin.name} 的分类'),
         children: [
-          for (final kind in _PluginKind.values)
+          for (final kind in _orderedKinds())
             SimpleDialogOption(
               onPressed: () => Navigator.pop(dialogContext, kind),
               child: Row(
@@ -2018,6 +2175,75 @@ class _PluginsPageState extends ConsumerState<PluginsPage> {
     if (!mounted) return;
     await ref.read(_pluginsProvider.notifier).reload();
     ref.invalidate(enabledMusicPluginsProvider);
+  }
+}
+
+/// 分类页签：外观与此前的分段按钮一致（图标 + 名称 + 插件数），但承载
+/// 「点击切换分栏 + 长按拖动排序」两种交互。SegmentedButton 的段是纯数据，
+/// 无法挂拖动监听，故改用自绘胶囊 + [ReorderableDelayedDragStartListener]。
+class _KindTab extends StatelessWidget {
+  const _KindTab({
+    super.key,
+    required this.index,
+    required this.icon,
+    required this.label,
+    required this.selected,
+    required this.onTap,
+  });
+
+  /// 在可重排列表中的下标（拖动监听按它定位）。
+  final int index;
+  final IconData icon;
+  final String label;
+  final bool selected;
+  final VoidCallback? onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final foreground = selected
+        ? scheme.onSecondaryContainer
+        : scheme.onSurfaceVariant;
+    return ReorderableDelayedDragStartListener(
+      index: index,
+      child: Padding(
+        padding: const EdgeInsets.only(right: 8),
+        child: Material(
+          color: selected
+              ? scheme.secondaryContainer
+              : scheme.surfaceContainerHighest.withValues(alpha: 0.45),
+          shape: StadiumBorder(
+            side: BorderSide(
+              color: selected
+                  ? scheme.secondary.withValues(alpha: 0.45)
+                  : scheme.outlineVariant.withValues(alpha: 0.7),
+            ),
+          ),
+          clipBehavior: Clip.antiAlias,
+          child: InkWell(
+            onTap: onTap,
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 12),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(icon, size: 16, color: foreground),
+                  const SizedBox(width: 6),
+                  Text(
+                    label,
+                    style: TextStyle(
+                      fontSize: 13,
+                      fontWeight: selected ? FontWeight.w700 : FontWeight.w500,
+                      color: foreground,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
   }
 }
 
@@ -2506,4 +2732,186 @@ class _PluginInfoRow extends StatelessWidget {
       ),
     );
   }
+}
+
+/// 自动检测音源更新的忽略表键：记录用户点过「取消」的音源版本，
+/// 同一版本不再重复弹窗；源站再出新版本时照常提示。
+const _autoUpdateIgnoredKey = 'pluginAutoUpdateIgnoredVersions';
+
+/// 自动检测在单次进程内只跑一次（根节点可能因主题/背景切换重建）。
+bool _autoUpdateStarted = false;
+
+/// 自动检测发现的待更新音源。
+class _PluginUpdate {
+  const _PluginUpdate({
+    required this.plugin,
+    required this.remoteVersion,
+    required this.contentHash,
+  });
+
+  final _PluginInfo plugin;
+  final String remoteVersion;
+  final int contentHash;
+
+  /// 用户「取消」后用于去重的指纹：有版本号用版本号，否则用内容指纹，
+  /// 这样作者忘升版本号时也不会每次启动都弹。
+  String get fingerprint =>
+      remoteVersion.isNotEmpty ? remoteVersion : 'content-$contentHash';
+
+  /// 弹窗中的一行描述：`QQ音乐 1.0.0 → 1.1.0`。
+  String get description {
+    final local = plugin.version.trim();
+    final remote = remoteVersion.isNotEmpty ? remoteVersion : '新内容';
+    if (local.isEmpty) return '${plugin.name} → $remote';
+    return '${plugin.name} $local → $remote';
+  }
+}
+
+/// 读取「取消过的版本」表；损坏或缺失时按空表处理。
+Map<String, String> _readAutoUpdateIgnored(SharedPreferences prefs) {
+  final raw = prefs.getString(_autoUpdateIgnoredKey);
+  if (raw == null || raw.trim().isEmpty) return <String, String>{};
+  try {
+    final decoded = jsonDecode(raw);
+    if (decoded is! Map) return <String, String>{};
+    return <String, String>{
+      for (final entry in decoded.entries)
+        if (entry.value is String) entry.key.toString(): entry.value as String,
+    };
+  } catch (_) {
+    return <String, String>{};
+  }
+}
+
+/// 等待可用的弹窗 context：自动检测在启动早期触发，路由/Overlay 可能
+/// 尚未挂载完成，这里最多等约 6 秒，期间每 300ms 重试一次。
+Future<BuildContext?> _waitDialogContext(
+  BuildContext? Function() contextOf,
+) async {
+  for (var attempt = 0; attempt < 20; attempt++) {
+    final ctx = contextOf();
+    if (ctx != null && ctx.mounted) return ctx;
+    await Future<void>.delayed(const Duration(milliseconds: 300));
+  }
+  return null;
+}
+
+/// 启动后自动检测音源更新：发现新版本时弹窗（「更新」「取消」两个按钮）。
+///
+/// 「更新」按钮**不跳转任何网页**，直接复用音源栏更新按钮的同一条链路
+/// （`updatePlugin` → 从来源地址重新拉取 → 版本校验/去重合并 → 刷新列表
+/// 与启用列表），因此行为与手动更新完全一致。
+/// 「取消」只记下当前版本指纹，同一版本不再打扰。
+///
+/// [contextOf] 延迟取弹窗用的 context：根节点自身位于 MaterialApp 之上，
+/// 没有 Navigator，必须由调用方提供路由内的 context。
+Future<void> autoCheckSourceUpdates(
+  BuildContext? Function() contextOf,
+  WidgetRef ref,
+) async {
+  if (_autoUpdateStarted) return;
+  _autoUpdateStarted = true;
+
+  List<_PluginUpdate> updates;
+  try {
+    updates = await ref.read(_pluginsProvider.notifier).checkUpdates();
+  } catch (error) {
+    AppLogStore.instance.add(
+      '[音源自动更新] 检测失败：$error',
+      level: AppLogLevel.warning,
+    );
+    return;
+  }
+  if (updates.isEmpty) return;
+
+  final prefs = await SharedPreferences.getInstance();
+  final ignored = _readAutoUpdateIgnored(prefs);
+  final pending = updates
+      .where((update) => ignored[update.plugin.id] != update.fingerprint)
+      .toList(growable: false);
+  if (pending.isEmpty) return;
+
+  final dialogContext = await _waitDialogContext(contextOf);
+  if (dialogContext == null || !dialogContext.mounted) return;
+
+  final confirmed = await showDialog<bool>(
+    context: dialogContext,
+    builder: (popContext) => AlertDialog(
+      title: const Text('发现音源更新'),
+      content: SingleChildScrollView(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              pending.length == 1
+                  ? '检测到 1 个音源有新版本，是否立即更新？'
+                  : '检测到 ${pending.length} 个音源有新版本，是否立即更新？',
+            ),
+            const SizedBox(height: 12),
+            for (final update in pending)
+              Padding(
+                padding: const EdgeInsets.only(bottom: 6),
+                child: Text(
+                  update.description,
+                  style: const TextStyle(fontSize: 13),
+                ),
+              ),
+          ],
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(popContext).pop(false),
+          child: const Text('取消'),
+        ),
+        FilledButton(
+          onPressed: () => Navigator.of(popContext).pop(true),
+          child: const Text('更新'),
+        ),
+      ],
+    ),
+  );
+
+  if (confirmed != true) {
+    for (final update in pending) {
+      ignored[update.plugin.id] = update.fingerprint;
+    }
+    await prefs.setString(_autoUpdateIgnoredKey, jsonEncode(ignored));
+    return;
+  }
+
+  // 与音源栏「更新」按钮同一链路：逐个更新，单个失败不中断其余。
+  final summary = _MutableInstallSummary();
+  for (final update in pending) {
+    try {
+      final result = await ref
+          .read(_pluginsProvider.notifier)
+          .updatePlugin(update.plugin);
+      summary.installed += result.installed;
+      summary.skipped += result.skipped;
+      summary.failed += result.failed;
+      summary.names.addAll(result.names);
+      summary.errors.addAll(result.errors);
+    } catch (error) {
+      summary.failed++;
+      summary.errors.add('${update.plugin.name}：$error');
+    }
+  }
+  // 更新完成后清掉这些音源的忽略记录，后续新版本可继续提示。
+  for (final update in pending) {
+    ignored.remove(update.plugin.id);
+  }
+  await prefs.setString(_autoUpdateIgnoredKey, jsonEncode(ignored));
+
+  final noticeContext = await _waitDialogContext(contextOf);
+  if (noticeContext == null || !noticeContext.mounted) return;
+  final frozen = summary.freeze();
+  XyNotice.show(
+    noticeContext,
+    message: frozen.errors.isEmpty
+        ? frozen.message
+        : '${frozen.message}；${frozen.errors.first}',
+    type: frozen.errors.isEmpty ? XyNoticeType.success : XyNoticeType.warning,
+  );
 }

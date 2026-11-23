@@ -62,6 +62,18 @@ public class AudioService extends MediaBrowserServiceCompat {
 
     private static final int NOTIFICATION_ID = 1124;
     private static final int REQUEST_CONTENT_INTENT = 1000;
+    // XY Music 本地补丁：媒体会话 sessionActivity 专用 requestCode。
+    // 必须与 REQUEST_CONTENT_INTENT 不同——PendingIntent 的去重键是
+    // (requestCode, intent filterEquals)，复用同一 requestCode 会让
+    // 带标记版本被无标记版本覆盖（FLAG_UPDATE_CURRENT），来源标记随之丢失。
+    private static final int REQUEST_MEDIA_CARD_INTENT = 1001;
+    // XY Music 本地补丁：媒体卡片/播控点击的来源标记 extra。
+    // MainActivity 读到它即记录点击时刻，Dart 回前台主动消费一次。
+    public static final String EXTRA_MEDIA_CARD_CLICK = "xymusic_media_card_click";
+    // XY Music 本地补丁：原生媒体事件回传 Dart 的通道名（只用于打日志，
+    // 让「事件死在原生层」与「事件到 Dart 没处理」可在导出的 App 日志里
+    // 直接二分，不依赖 adb logcat）。
+    public static final String NATIVE_MEDIA_LOG_CHANNEL = "com.xymusic.mobile/native_media_log";
     public static final String NOTIFICATION_CLICK_ACTION = "com.ryanheise.audioservice.NOTIFICATION_CLICK";
     public static final String CUSTOM_ACTION_STOP = "com.ryanheise.audioservice.action.STOP";
     public static final String CUSTOM_ACTION_FAST_FORWARD = "com.ryanheise.audioservice.action.FAST_FORWARD";
@@ -102,6 +114,10 @@ public class AudioService extends MediaBrowserServiceCompat {
 
     static AudioService instance;
     private static PendingIntent contentIntent;
+    // XY Music 本地补丁：媒体会话 sessionActivity（带 EXTRA_MEDIA_CARD_CLICK 标记）。
+    // Android 13+ 的系统媒体卡片（含 OriginOS 播控胶囊）点击「展开/主体」走的是
+    // MediaSession 的 sessionActivity，而非通知自身 contentIntent。
+    private static PendingIntent mediaCardIntent;
     private static ServiceListener listener;
     private static List<MediaSessionCompat.QueueItem> queue = new ArrayList<>();
     private static final Map<String, MediaMetadataCompat> mediaMetadataCache = new HashMap<>();
@@ -265,6 +281,8 @@ public class AudioService extends MediaBrowserServiceCompat {
     }
 
     private FlutterEngine flutterEngine;
+    // XY Music 本地补丁：原生媒体事件日志回传通道（见 btnLog）。
+    private io.flutter.plugin.common.MethodChannel nativeLogChannel;
     private AudioServiceConfig config;
     private PowerManager.WakeLock wakeLock;
     private MediaSessionCompat mediaSession;
@@ -367,14 +385,56 @@ public class AudioService extends MediaBrowserServiceCompat {
         // 才会经 handleIntent → MediaSession 回调 → Dart 桥接；用 adb logcat
         // 过滤 XYMediaBtn 即可二分「事件没送达」和「送达没处理」（排查
         // vivo/OriginOS 通知栏按键丢失用，Dart 侧日志看不到这一层）。
+        final KeyEvent event = intent == null
+            ? null : (KeyEvent) intent.getParcelableExtra(Intent.EXTRA_KEY_EVENT);
         if (intent != null) {
-            final KeyEvent event = intent.getParcelableExtra(Intent.EXTRA_KEY_EVENT);
-            android.util.Log.i("XYMediaBtn",
-                "onStartCommand action=" + intent.getAction()
-                + " keyCode=" + (event == null ? -1 : event.getKeyCode()));
+            btnLog("onStartCommand action=" + intent.getAction()
+                + " keyCode=" + (event == null ? -1 : event.getKeyCode())
+                + " listener=" + (listener != null));
+        }
+        // XY Music 本地补丁：厂商私有媒体键拦截（vivo V2359A / Android 16 实测）。
+        // 暂停态点通知栏「播放」，系统投递的是 keyCode=91 的非标准键：
+        // 它能到 onStartCommand，但 MediaButtonReceiver.handleIntent 只认标准
+        // 白名单键码，事件在原生层就被丢弃，MediaSession 回调不触发、Dart 侧
+        // 一句日志都没有——用户看到的就是「点播放完全没反应」，与防抖窗口无关。
+        // 这里把这类键转成 MediaSession 的 pause 语义，由 Dart 侧
+        // 「在播→暂停 / 已停→反转播放」的状态判定兜底出正确意图。
+        if (intent != null && event != null
+                && event.getAction() == KeyEvent.ACTION_DOWN
+                && !isWhitelistedMediaKey(event.getKeyCode())) {
+            btnLog("[厂商媒体键] keyCode=" + event.getKeyCode()
+                + " 不在 MediaSession 白名单，转交 Dart 按播放状态定档");
+            try {
+                mediaSession.getController().getTransportControls().pause();
+            } catch (final Throwable t) {
+                btnLog("[厂商媒体键] 转交失败：" + t.getClass().getSimpleName());
+                MediaButtonReceiver.handleIntent(mediaSession, intent);
+            }
+            return START_NOT_STICKY;
         }
         MediaButtonReceiver.handleIntent(mediaSession, intent);
         return START_NOT_STICKY;
+    }
+
+    /**
+     * XY Music 本地补丁：MediaButtonReceiver.handleIntent 实际会派发的标准媒体键。
+     * 不在此列的键码（如 vivo 的 91）会被它静默丢弃，必须自行接管。
+     */
+    private static boolean isWhitelistedMediaKey(final int keyCode) {
+        switch (keyCode) {
+            case KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE:
+            case KeyEvent.KEYCODE_HEADSETHOOK:
+            case KeyEvent.KEYCODE_MEDIA_PLAY:
+            case KeyEvent.KEYCODE_MEDIA_PAUSE:
+            case KeyEvent.KEYCODE_MEDIA_NEXT:
+            case KeyEvent.KEYCODE_MEDIA_PREVIOUS:
+            case KeyEvent.KEYCODE_MEDIA_STOP:
+            case KeyEvent.KEYCODE_MEDIA_FAST_FORWARD:
+            case KeyEvent.KEYCODE_MEDIA_REWIND:
+                return true;
+            default:
+                return false;
+        }
     }
 
     public void stop() {
@@ -452,6 +512,77 @@ public class AudioService extends MediaBrowserServiceCompat {
         }
         if (!config.androidResumeOnClick) {
             mediaSession.setMediaButtonReceiver(null);
+        }
+        // XY Music 本地补丁：给媒体会话单独绑一份「带来源标记」的
+        // sessionActivity，同时覆盖暂停态（configure 在 onCreate 时执行一次，
+        // enterPlayingState 每轮播放会再覆盖一次，两处都指向同一 PendingIntent）。
+        mediaCardIntent = buildMediaCardIntent();
+        if (mediaCardIntent != null) {
+            mediaSession.setSessionActivity(mediaCardIntent);
+        }
+    }
+
+    /// XY Music 本地补丁：构建媒体卡片/播控胶囊点击用的 Activity PendingIntent。
+    ///
+    /// 与 contentIntent 的差别只有两处：requestCode 不同（不去重覆盖），
+    /// 以及携带 EXTRA_MEDIA_CARD_CLICK 来源标记。用途是让 MainActivity
+    /// 精确区分「用户点了系统媒体卡片/播控」和「用户点了普通通知/桌面图标」：
+    /// 前者应还原成一次播放请求，后者不应擅自起播。
+    ///
+    /// vivo OriginOS 实测（Android 16）：暂停后播控卡片的「播放」点击会被
+    /// 系统按暂停帧的 actions 解析成「展开应用」——拉起 Activity 但不派发
+    /// 任何媒体键，Dart 侧连 `桥收到 play` 锚点都没有，表现为「只能暂停、
+    /// 不能播放」。这条链路是唯一不依赖 ROM 是否派发媒体键的恢复入口。
+    private PendingIntent buildMediaCardIntent() {
+        Context context = getApplicationContext();
+        Intent intent = new Intent((String) null);
+        if (config.activityClassName != null) {
+            intent.setComponent(new ComponentName(context, config.activityClassName));
+        } else {
+            intent.setClassName(context, context.getPackageName() + ".MainActivity");
+        }
+        intent.setAction(Intent.ACTION_MAIN);
+        intent.addCategory(Intent.CATEGORY_LAUNCHER);
+        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_SINGLE_TOP);
+        intent.putExtra(EXTRA_MEDIA_CARD_CLICK, true);
+        int flags = PendingIntent.FLAG_UPDATE_CURRENT;
+        if (Build.VERSION.SDK_INT >= 23) {
+            flags |= PendingIntent.FLAG_IMMUTABLE;
+        }
+        try {
+            return PendingIntent.getActivity(context, REQUEST_MEDIA_CARD_INTENT, intent, flags);
+        } catch (Throwable t) {
+            Log.w("AudioService", "buildMediaCardIntent failed", t);
+            return null;
+        }
+    }
+
+    /// XY Music 本地补丁：原生媒体事件回传 Dart 日志。
+    ///
+    /// 现场无法用 adb（用户侧只有 App 内导出的日志），此前「事件到底有没有
+    /// 到原生」只能靠猜。这里把原生层媒体键锚点同步投递到 Dart 的
+    /// AppLogStore，导出的日志里就能直接看到 onStartCommand →
+    /// onMediaButtonEvent → onPlay/onPause 的完整链路，或是断在哪一环。
+    /// 任何异常都必须吞掉：日志通道绝不能影响播放。
+    void btnLog(final String msg) {
+        Log.i("XYMediaBtn", msg);
+        try {
+            handler.post(new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        if (nativeLogChannel == null) {
+                            if (flutterEngine == null) return;
+                            nativeLogChannel = new io.flutter.plugin.common.MethodChannel(
+                                    flutterEngine.getDartExecutor().getBinaryMessenger(),
+                                    NATIVE_MEDIA_LOG_CHANNEL);
+                        }
+                        nativeLogChannel.invokeMethod("log", "[原生媒体键] " + msg);
+                    } catch (Throwable ignored) {
+                    }
+                }
+            });
+        } catch (Throwable ignored) {
         }
     }
 
@@ -993,7 +1124,11 @@ public class AudioService extends MediaBrowserServiceCompat {
             mediaSession.setActive(true);
 
         acquireWakeLock();
-        mediaSession.setSessionActivity(contentIntent);
+        // XY Music 本地补丁：sessionActivity 改用带来源标记的 mediaCardIntent
+        // （供 MainActivity 区分「点媒体卡片」与「点通知/图标」）。未构建成功
+        // 时回落 contentIntent，保证「点卡片能进应用」这一基础能力不退化。
+        mediaSession.setSessionActivity(
+                mediaCardIntent != null ? mediaCardIntent : contentIntent);
         internalStartForeground();
     }
 
@@ -1221,6 +1356,7 @@ public class AudioService extends MediaBrowserServiceCompat {
 
         @Override
         public void onPlay() {
+            btnLog("onPlay listener=" + (listener != null));
             if (listener == null) return;
             listener.onPlay();
         }
@@ -1245,10 +1381,20 @@ public class AudioService extends MediaBrowserServiceCompat {
 
         @Override
         public boolean onMediaButtonEvent(Intent mediaButtonEvent) {
-            if (listener == null) return false;
+            // XY Music 本地补丁：媒体键是否到达回调的唯一原生锚点。
+            // listener 为 null 时旧实现直接 return false（事件被系统丢弃，
+            // Dart 侧完全无痕），这里先记一笔再判空。
             // TODO: use typesafe version once SDK 33 is released.
             @SuppressWarnings("deprecation")
             final KeyEvent event = (KeyEvent)mediaButtonEvent.getExtras().getParcelable(Intent.EXTRA_KEY_EVENT);
+            // XY Music 本地补丁：把 keyCode 原样打进锚点日志。此前只有
+            // 「onMediaButtonEvent 被调用」一条，无法判断来的是标准播放/
+            // 暂停键还是通知栏按钮的 BYPASS 键码，排查 vivo 只能靠猜。
+            btnLog("onMediaButtonEvent listener=" + (listener != null)
+                + " keyCode=" + (event == null ? -1 : event.getKeyCode())
+                + " action=" + (event == null ? -1 : event.getAction()));
+            if (listener == null) return false;
+            if (event == null) return false;
             if (event.getAction() == KeyEvent.ACTION_DOWN) {
                 switch (event.getKeyCode()) {
                 case KEYCODE_BYPASS_PLAY:
@@ -1266,6 +1412,22 @@ public class AudioService extends MediaBrowserServiceCompat {
                 case KeyEvent.KEYCODE_MEDIA_REWIND:
                     onRewind();
                     break;
+                // XY Music 本地补丁：标准播放/暂停键码正向识别。
+                // 旧实现把 126/127 与 85/79 混在一起交给 onClick，Dart 侧
+                // 只能靠「已暂停时收到 pause 就当成播放」的反转兜底推断，
+                // 该推断在状态切换瞬间（isLoading / 假播）会判错。这里直接
+                // 读 keyCode 判定意图：126=播放、127=暂停各自直通对应回调，
+                // 只有 85(PLAY_PAUSE)/79(HEADSETHOOK) 才是真正的切换键。
+                // 注意：通知栏 action 用的是 BYPASS 键码（164/130），不会
+                // 落到这里，因此不会把「通知栏暂停按钮」误判成播放。
+                case KeyEvent.KEYCODE_MEDIA_PLAY:
+                    btnLog("媒体键正向识别 MEDIA_PLAY(126) → onPlay");
+                    onPlay();
+                    break;
+                case KeyEvent.KEYCODE_MEDIA_PAUSE:
+                    btnLog("媒体键正向识别 MEDIA_PAUSE(127) → onPause");
+                    onPause();
+                    break;
                 // Android unfortunately reroutes media button clicks to
                 // KEYCODE_MEDIA_PLAY/PAUSE instead of the expected KEYCODE_HEADSETHOOK
                 // or KEYCODE_MEDIA_PLAY_PAUSE. As a result, we can't genuinely tell if
@@ -1276,11 +1438,9 @@ public class AudioService extends MediaBrowserServiceCompat {
                 // we know it is actually a media button press.
                 case KeyEvent.KEYCODE_MEDIA_NEXT:
                 case KeyEvent.KEYCODE_MEDIA_PREVIOUS:
-                case KeyEvent.KEYCODE_MEDIA_PLAY:
-                case KeyEvent.KEYCODE_MEDIA_PAUSE:
-                    // These are the "genuine" media button click events
                 case KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE:
                 case KeyEvent.KEYCODE_HEADSETHOOK:
+                    btnLog("媒体键切换键(" + event.getKeyCode() + ") → onClick");
                     listener.onClick(eventToButton(event));
                     break;
                 }
@@ -1304,6 +1464,7 @@ public class AudioService extends MediaBrowserServiceCompat {
 
         @Override
         public void onPause() {
+            btnLog("onPause listener=" + (listener != null));
             if (listener == null) return;
             listener.onPause();
         }
@@ -1382,6 +1543,9 @@ public class AudioService extends MediaBrowserServiceCompat {
 
         @Override
         public void onCustomAction(String action, Bundle extras) {
+            // XY Music 本地补丁：通知栏自定义按钮（含播放/暂停控件）点击的
+            // 原生锚点。若 ROM 把播放键当自定义 action 派发，会落在这里。
+            btnLog("onCustomAction action=" + action + " listener=" + (listener != null));
             if (listener == null) return;
             if (CUSTOM_ACTION_STOP.equals(action)) {
                 listener.onStop();

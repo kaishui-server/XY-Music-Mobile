@@ -1515,6 +1515,29 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
             builder: (_) => const _HomeModulesSheet(),
           ),
         ),
+        Padding(
+          padding: const EdgeInsets.fromLTRB(16, 20, 16, 4),
+          child: Text(
+            '插件分类显示',
+            style: TextStyle(
+              fontSize: 13,
+              fontWeight: FontWeight.w700,
+              color: Theme.of(context).colorScheme.primary,
+            ),
+          ),
+        ),
+        // 分类管理总开关：关闭后搜索页插件 Tab 不再按分类分栏重排，
+        // 完全跟随插件管理页里的插件拖动顺序。
+        _switchTile(
+          context,
+          icon: Icons.category_outlined,
+          title: '插件分类管理',
+          subtitle: '开启时搜索页插件按内置分类顺序分栏排列；关闭则完全跟随插件管理页的拖动顺序',
+          value: settings?.pluginKindGroupingEnabled ?? true,
+          onChanged: (value) => unawaited(
+            notifier.setPluginKindGroupingEnabled(value),
+          ),
+        ),
       ],
       SettingsSection.sidebarLayout => [
         _SidebarLayoutEditor(

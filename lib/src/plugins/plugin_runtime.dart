@@ -1265,6 +1265,140 @@ final enabledMusicPluginsProvider = FutureProvider<List<EnabledMusicPlugin>>(
   loadEnabledMusicPlugins,
 );
 
+/// 插件 → 分类标识的覆盖表（安装时按订阅结构记录、用户手动归位后更新），
+/// 与插件管理页分栏显示保持一致；缺省时按运行时契约标记推断。
+final pluginKindOverridesProvider = FutureProvider<Map<String, String>>((
+  ref,
+) async {
+  final prefs = await SharedPreferences.getInstance();
+  return readPluginKinds(prefs);
+});
+
+/// 已启用插件所属的分类标识（baka / musicfree / lx / animemusic / other），
+/// 与插件管理页分栏判定使用同一套标识。
+///
+/// [overrides] 传 [pluginKindOverridesProvider] 的值时以覆盖表为准（用户
+/// 手动归位到「其他」也能被搜索页识别），否则回落到运行时契约标记。
+String musicPluginKindKeyOf(
+  EnabledMusicPlugin plugin, [
+  Map<String, String>? overrides,
+]) {
+  // 与插件管理页分栏共用 [resolvePluginKindKey]：管理页会按订阅提示与来源
+  // URL 把「BakaMusic 订阅里的插件」兜底归入 BakaMusic，搜索页此前只看
+  // 运行时契约标记，同一插件两边分类不同，导致搜索来源 Tab 顺序与管理页
+  // 分栏顺序对不上。
+  return resolvePluginKindKey(
+    isLx: plugin.isLx,
+    isBaka: plugin.isBaka,
+    isAnimemusic: plugin.isAnimemusic,
+    kindHint: overrides?[plugin.id],
+    sourceUrl: plugin.sourceUrl,
+  );
+}
+
+/// 插件分类的内置分栏顺序（与插件管理页未自定义时的分栏左右顺序一致）。
+const kMusicPluginKindDefaultOrder = <String>[
+  pluginKindBaka,
+  pluginKindMusicFree,
+  pluginKindLx,
+  pluginKindAnimemusic,
+  pluginKindOther,
+];
+
+/// SharedPreferences 中持久化插件分栏（分类页签）左右顺序的键。
+///
+/// 与 [pluginKindsKey]（插件 → 分类的归属覆盖表）分开存：分栏顺序只决定
+/// 页签从左到右的排列，归属表只决定某个插件落在哪一栏，两者互不影响。
+const pluginKindOrderKey = 'mobilePluginKindOrderV1';
+
+/// 归一化分栏顺序：丢弃空串 / 非法标识 / 重复项，缺失的分栏按内置顺序
+/// [kMusicPluginKindDefaultOrder] 补到末尾；全部非法（含空输入）时直接回落
+/// 内置顺序。新增分栏不会因为旧存档缺少它而消失。
+List<String> normalizePluginKindOrder([Iterable<String>? stored]) {
+  final normalized = <String>[];
+  for (final raw in stored ?? const <String>[]) {
+    final key = raw.trim().toLowerCase();
+    if (!kMusicPluginKindDefaultOrder.contains(key)) continue;
+    if (normalized.contains(key)) continue;
+    normalized.add(key);
+  }
+  // 返回可分配的副本：调用方可能就地修改，避免动到 const 常量。
+  if (normalized.isEmpty) return [...kMusicPluginKindDefaultOrder];
+  for (final key in kMusicPluginKindDefaultOrder) {
+    if (!normalized.contains(key)) normalized.add(key);
+  }
+  return normalized;
+}
+
+/// 读取插件分栏顺序（缺失或非法时回落 [kMusicPluginKindDefaultOrder]）。
+List<String> readPluginKindOrder(SharedPreferences prefs) =>
+    normalizePluginKindOrder(prefs.getStringList(pluginKindOrderKey));
+
+/// 写入插件分栏顺序（写入前先归一化，避免脏值落盘）。
+Future<void> writePluginKindOrder(
+  SharedPreferences prefs,
+  Iterable<String> order,
+) =>
+    prefs.setStringList(pluginKindOrderKey, normalizePluginKindOrder(order));
+
+/// 插件分栏顺序（插件管理页页签顺序 + 搜索页分栏顺序共用同一份）。
+final pluginKindOrderProvider =
+    AsyncNotifierProvider<PluginKindOrderNotifier, List<String>>(
+  PluginKindOrderNotifier.new,
+);
+
+class PluginKindOrderNotifier extends AsyncNotifier<List<String>> {
+  @override
+  Future<List<String>> build() async {
+    final prefs = await SharedPreferences.getInstance();
+    return readPluginKindOrder(prefs);
+  }
+
+  /// 保存新的分栏顺序：先更新内存状态让界面立即重排，再落盘。
+  Future<void> setOrder(Iterable<String> order) async {
+    final next = normalizePluginKindOrder(order);
+    state = AsyncData(next);
+    final prefs = await SharedPreferences.getInstance();
+    await writePluginKindOrder(prefs, next);
+  }
+}
+
+/// 按分类顺序重排插件列表：**整类前移**——分类顺序依次前置，同分类内的
+/// 插件整体前移并保持它们在传入列表里的相对顺序（即插件管理页该分栏内
+/// 从上到下的顺序）。
+///
+/// [kindOrder] 为 [pluginKindOrderProvider] 的值（插件管理页页签的左到右
+/// 顺序）：传空或非法时回落内置顺序 [kMusicPluginKindDefaultOrder]。
+/// [overrides] 仍只决定插件归属哪一栏，不影响分栏顺序。
+///
+/// 最终顺序 = 分类顺序 + 每栏插件顺序，因此搜索栏里同一分类的插件总是
+/// 连续排在一起，而不是按加载顺序平铺。
+List<EnabledMusicPlugin> applyMusicPluginKindOrder(
+  List<EnabledMusicPlugin> plugins, {
+  Map<String, String>? overrides,
+  Iterable<String>? kindOrder,
+}) {
+  if (plugins.length < 2) return plugins;
+  final effective = normalizePluginKindOrder(kindOrder);
+  final rank = <String, int>{};
+  for (var i = 0; i < effective.length; i++) {
+    final key = effective[i].trim().toLowerCase();
+    if (key.isNotEmpty) rank.putIfAbsent(key, () => i);
+  }
+  if (rank.isEmpty) return plugins;
+  final tail = effective.length;
+  final indexed = <(int, EnabledMusicPlugin)>[
+    for (var i = 0; i < plugins.length; i++) (i, plugins[i]),
+  ];
+  indexed.sort((a, b) {
+    final rankA = rank[musicPluginKindKeyOf(a.$2, overrides)] ?? tail;
+    final rankB = rank[musicPluginKindKeyOf(b.$2, overrides)] ?? tail;
+    final byKind = rankA.compareTo(rankB);
+    return byKind != 0 ? byKind : a.$1.compareTo(b.$1);
+  });
+  return [for (final entry in indexed) entry.$2];
+}
+
 final pluginRuntimeProvider = Provider<PluginRuntimeService>((ref) {
   final service = PluginRuntimeService();
   ref.onDispose(service.dispose);

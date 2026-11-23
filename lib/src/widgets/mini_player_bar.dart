@@ -12,6 +12,7 @@ import '../library/online_cover_overrides.dart';
 import '../lyrics/lyrics_models.dart';
 import '../navigation/animated_page_route.dart';
 import '../navigation/player_sheet_morph.dart';
+import '../player/lyrics_offset.dart';
 import '../player/player_provider.dart';
 import '../player/video_playback_session.dart';
 import '../ui/xy_theme.dart';
@@ -529,9 +530,6 @@ class MiniBarLyrics extends ConsumerWidget {
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
-    final position = ref.watch(
-      playerProvider.select((state) => state.position),
-    );
     // 跟随迷你歌词字号设置；底栏高度有限（64dp，标题行外仅余约 29dp），
     // 上限收紧到 15 防止撑破布局。
     final fontSize =
@@ -552,6 +550,26 @@ class MiniBarLyrics extends ConsumerWidget {
       lyrics = const AsyncData(<LyricLine>[]);
     }
     const fallback = '暂无歌词';
+    // 歌词偏移与居中歌词页同源（同一份持久化），偏移一改两处同时生效。
+    final offsetTenths =
+        ref.watch(lyricsOffsetTenthsProvider(item.path)).valueOrNull ?? 0;
+    // 活动行与居中歌词页共用 [lyricActiveIndexAt]：同一行轴、同一播放位置、
+    // 同一歌词偏移，换行发生在同一个进度 tick 上，不会出现「底栏先换行、
+    // 居中歌词还停在上一行」。用 select 返回索引，10Hz 的进度刷新只在换行
+    // 时触发本组件重建。
+    final data = lyrics.valueOrNull;
+    var active = 0;
+    if (data != null && data.isNotEmpty) {
+      active = ref.watch(
+        playerProvider.select(
+          (state) => lyricActiveIndexAt(
+            data,
+            state.position,
+            offsetTenths: offsetTenths,
+          ),
+        ),
+      );
+    }
     var lineTime = -1.0;
     var text = lyrics.when(
       // 加载期间保持空白占位，避免「暂无歌词」与歌词间的占位闪烁。
@@ -559,7 +577,6 @@ class MiniBarLyrics extends ConsumerWidget {
       error: (_, _) => fallback,
       data: (lines) {
         if (lines.isEmpty) return fallback;
-        var active = lyricActiveIndex(lines, position);
         lineTime = lines[active].time;
         final line = lines[active].text.trim();
         return line.isEmpty ? fallback : line;
@@ -567,7 +584,9 @@ class MiniBarLyrics extends ConsumerWidget {
     );
     if (text == fallback) lineTime = -1.0;
     return AnimatedSwitcher(
-      duration: const Duration(milliseconds: 280),
+      // 与居中歌词同一 tick 换行，过渡只做一次短交叉淡入即可；过长会让
+      // 底栏文字看起来比居中歌词「慢半拍」。
+      duration: const Duration(milliseconds: 150),
       child: Text(
         text,
         key: ValueKey('bar:${item.path}:$lineTime'),

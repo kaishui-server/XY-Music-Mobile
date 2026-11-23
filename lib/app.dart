@@ -9,6 +9,7 @@ import 'package:flutter/services.dart';
 import 'package:dynamic_color/dynamic_color.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import 'pages/settings/plugins_page.dart';
 import 'src/core/rust_init.dart';
 import 'src/deeplink/deep_link_handler.dart';
 import 'src/core/settings.dart';
@@ -153,6 +154,19 @@ class _XyMusicAppState extends ConsumerState<XyMusicApp>
     );
     // 分享深链（xymusic://song?...）：注册原生回调 + 取回冷启动深链。
     Future.microtask(() => XyDeepLink.init(ref, appRouter));
+    // 音源自动更新检测：启动 6 秒后的空闲期后台拉取一次各在线音源的来源
+    // 脚本，有新版本则弹「更新/取消」弹窗。弹窗的「更新」直接复用音源栏
+    // 更新按钮的同一链路（updatePlugin），不做跳转网页式的更新。
+    // 弹窗 context 从路由里取：根节点自身在 MaterialApp 之上，没有 Navigator。
+    Future.delayed(const Duration(seconds: 6), () {
+      if (!mounted) return;
+      unawaited(
+        autoCheckSourceUpdates(
+          () => appRouter.routerDelegate.navigatorKey.currentContext,
+          ref,
+        ),
+      );
+    });
     // 迷你播放器悬浮窗桥：接收原生按钮/进度条操作与通知栏单击回调。
     MiniPlayerOverlayBridge.init(ref);
     // 原生闪退补录提示：上次闪退的日志（crash-exit-*.txt）由原生侧在

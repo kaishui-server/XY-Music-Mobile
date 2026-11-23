@@ -104,11 +104,26 @@ String _lxSourceDisplayName(String source) =>
     _lxSourceNames[source] ?? source.toUpperCase();
 
 /// 把已启用插件列表转换成搜索 Tab 列表：一插件一 Tab。
+///
+/// [groupByKind] 为「设置 › 布局 › 插件分类显示 › 插件分类管理」开关：开启时
+/// 按分类顺序重排（[kindOrder] 即插件管理页页签的自定义顺序，缺失/非法时
+/// 回落内置顺序；同类插件内部保持原有顺序），关闭时 Tab 顺序完全跟随插件
+/// 管理页里的插件拖动顺序。
 List<_SearchSourceTab> _buildSearchSourceTabs(
-  List<EnabledMusicPlugin> plugins,
-) {
+  List<EnabledMusicPlugin> plugins, {
+  Map<String, String> kindOverrides = const <String, String>{},
+  List<String>? kindOrder,
+  bool groupByKind = true,
+}) {
+  final ordered = groupByKind
+      ? applyMusicPluginKindOrder(
+          plugins,
+          overrides: kindOverrides,
+          kindOrder: kindOrder,
+        )
+      : plugins;
   return [
-    for (final plugin in plugins)
+    for (final plugin in ordered)
       _SearchSourceTab(
         plugin: plugin,
         name: plugin.name,
@@ -140,6 +155,10 @@ class _SearchPageState extends ConsumerState<SearchPage>
   final Map<String, String> _lxChoice = {};
   late final TabController _categoryController;
   int _selectedPluginIndex = 0;
+
+  /// 当前选中的来源插件 id：Tab 顺序会随分类重排/开关变化，只按
+  /// 下标记录会把选中项挪到别的插件上，故以 id 为准（下标仅作当前帧索引）。
+  String? _selectedPluginId;
   _SearchCategory _selectedCategory = _SearchCategory.songs;
   List<String> _history = const [];
   late final Future<void> _historyReady;
@@ -344,7 +363,19 @@ class _SearchPageState extends ConsumerState<SearchPage>
     final token = ++_queryToken;
     final plugins = await ref.read(enabledMusicPluginsProvider.future);
     if (!mounted || token != _queryToken) return;
-    final tabs = _buildSearchSourceTabs(plugins);
+    final kindOverrides = await ref.read(pluginKindOverridesProvider.future);
+    // 分类页签顺序（插件管理页拖动排序后持久化），分类管理关闭时不参与重排。
+    final kindOrder = await ref.read(pluginKindOrderProvider.future);
+    final groupByKind =
+        ref.read(settingsProvider).valueOrNull?.pluginKindGroupingEnabled ??
+        true;
+    if (!mounted || token != _queryToken) return;
+    final tabs = _buildSearchSourceTabs(
+      plugins,
+      kindOverrides: kindOverrides,
+      kindOrder: kindOrder,
+      groupByKind: groupByKind,
+    );
     setState(() {
       for (final tab in tabs) {
         _states[_stateKey(_tabKeyFor(tab), _SearchCategory.songs)] =
@@ -952,9 +983,33 @@ class _SearchPageState extends ConsumerState<SearchPage>
   Widget build(BuildContext context) {
     final pluginsValue = ref.watch(enabledMusicPluginsProvider);
     final plugins = pluginsValue.valueOrNull ?? const <EnabledMusicPlugin>[];
-    // 插件列表先按 LX 平台拆分成搜索 Tab：多平台 LX 插件每个平台
-    // 一个 Tab，其余插件一个插件一个 Tab（仿电脑版行为）。
-    final tabs = _buildSearchSourceTabs(plugins);
+    final kindOverrides =
+        ref.watch(pluginKindOverridesProvider).valueOrNull ??
+        const <String, String>{};
+    // 分类页签顺序：插件管理页拖动排序后写入 pluginKindOrderProvider，
+    // 搜索页分栏模式读同一份顺序（缺失/非法时回落内置顺序）。
+    final kindOrder = ref.watch(pluginKindOrderProvider).valueOrNull;
+    // 分类管理开关（设置 › 布局 › 插件分类管理）：关闭时插件列表不再按
+    // 分类重排，直接用插件管理页的拖动顺序。
+    final groupByKind = ref.watch(
+      settingsProvider.select(
+        (value) => value.valueOrNull?.pluginKindGroupingEnabled ?? true,
+      ),
+    );
+    // 插件列表按分类顺序重排（可关闭），再一插件一个搜索 Tab。
+    final tabs = _buildSearchSourceTabs(
+      plugins,
+      kindOverrides: kindOverrides,
+      kindOrder: kindOrder,
+      groupByKind: groupByKind,
+    );
+    // 分类顺序变化会让同一个插件换到下标记：按插件 id 校准当前选中项。
+    if (_selectedPluginId != null) {
+      final selected = tabs.indexWhere(
+        (tab) => tab.plugin.id == _selectedPluginId,
+      );
+      if (selected >= 0) _selectedPluginIndex = selected;
+    }
     final showingHistory = _controller.text.trim().isEmpty;
     final showMiniPlayer =
         ref.watch(playerProvider.select((state) => state.current != null)) &&
@@ -1015,7 +1070,12 @@ class _SearchPageState extends ConsumerState<SearchPage>
                       isScrollable: true,
                       tabAlignment: TabAlignment.start,
                       onTap: (index) {
-                        setState(() => _selectedPluginIndex = index);
+                        setState(() {
+                          _selectedPluginIndex = index;
+                          if (index >= 0 && index < tabs.length) {
+                            _selectedPluginId = tabs[index].plugin.id;
+                          }
+                        });
                         _ensureCategorySearch(tabs, pluginIndex: index);
                       },
                       tabs: [for (final tab in tabs) _buildSourceTab(tab)],

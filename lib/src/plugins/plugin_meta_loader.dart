@@ -159,32 +159,18 @@ Map<String, Object?> _rowFromMeta({
   final isLx = meta['isLx'] == true;
   final isBaka = meta['isBaka'] == true;
   final isAnimemusic = meta['isAnimemusic'] == true;
-  // 分类优先级：LX 契约 > BakaMusic 契约 > animemusic 后端 > 标准
-  // MusicFree。与迁移前的 _load 判定一致（v2 洛雪版虽直连 animemusic
-  // 后端但属 LX 契约；baka 版兜底地址同样指向 animemusic 域名，需先判
-  // Baka）。内容识别不中时用订阅类型提示与来源 URL 兜底；手动归入
-  // 「其他」是明确用户意图，优先于自动识别。详见 plugin_metadata.dart
-  // 的 _detectBaka / isBakaSourceUrl 注释。
-  var kind = isLx
-      ? 'lx'
-      : isBaka
-      ? 'baka'
-      : isAnimemusic
-      ? 'animemusic'
-      : 'musicfree';
-  final kindHint = kinds[id];
-  if (kindHint == 'other') {
-    kind = 'other';
-  } else if (kind == 'musicfree' || kind == 'baka') {
-    if (kindHint == 'baka') {
-      kind = 'baka';
-    } else if (kindHint == 'musicfree') {
-      // 内容已判定为 Baka 契约时不被 musicfree 提示压回。
-      if (kind != 'baka') kind = 'musicfree';
-    } else if (PluginMetadata.isBakaSourceUrl(sourceUrl ?? '')) {
-      kind = 'baka';
-    }
-  }
+  // 分类判定走 [resolvePluginKindKey]：搜索页的来源 Tab 顺序也用同一函数，
+  // 两处口径必须一致，否则管理页分栏顺序改了、搜索页顺序却不符。
+  // 优先级：用户归入「其他」> LX 契约 > BakaMusic 契约 > animemusic 后端
+  // > 标准 MusicFree；内容识别不中时由订阅类型提示与来源 URL 兜底。详见
+  // plugin_metadata.dart 的 _detectBaka / isBakaSourceUrl 注释。
+  final kind = resolvePluginKindKey(
+    isLx: isLx,
+    isBaka: isBaka,
+    isAnimemusic: isAnimemusic,
+    kindHint: kinds[id],
+    sourceUrl: sourceUrl,
+  );
 
   final userVariables = <Map<String, String>>[
     for (final raw in (meta['userVariables'] as List? ?? const []))

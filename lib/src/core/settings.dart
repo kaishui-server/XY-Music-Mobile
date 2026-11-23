@@ -368,6 +368,7 @@ class AppSettings {
     this.downloadQuality = '320k',
     this.askDownloadDetails = true,
     this.pluginInstallSkipVersionCheck = false,
+    this.pluginKindGroupingEnabled = true,
     this.downloadLyrics = true,
     this.downloadWriteMetadata = true,
     this.downloadFilenameTemplate = '{artist} - {title}',
@@ -564,6 +565,10 @@ class AppSettings {
   /// 安装插件时不校验版本：同名（同 ID）插件来自不同订阅源时也直接覆盖，
   /// 不做版本高低比较。默认关闭（校验版本），避免多个订阅源互相覆盖。
   final bool pluginInstallSkipVersionCheck;
+
+  /// 插件分类管理：搜索页插件 Tab 是否按「插件管理」里的分类分栏顺序重排。
+  /// 关闭时搜索页插件顺序完全跟随插件管理页的插件拖动顺序。
+  final bool pluginKindGroupingEnabled;
   final bool downloadLyrics;
 
   /// 下载后向音频文件写入元数据标签（标题/艺术家/专辑/歌词/封面）。
@@ -683,6 +688,7 @@ class AppSettings {
     String? downloadQuality,
     bool? askDownloadDetails,
     bool? pluginInstallSkipVersionCheck,
+    bool? pluginKindGroupingEnabled,
     bool? downloadLyrics,
     bool? downloadWriteMetadata,
     String? downloadFilenameTemplate,
@@ -813,6 +819,8 @@ class AppSettings {
       askDownloadDetails: askDownloadDetails ?? this.askDownloadDetails,
       pluginInstallSkipVersionCheck:
           pluginInstallSkipVersionCheck ?? this.pluginInstallSkipVersionCheck,
+      pluginKindGroupingEnabled:
+          pluginKindGroupingEnabled ?? this.pluginKindGroupingEnabled,
       downloadLyrics: downloadLyrics ?? this.downloadLyrics,
       downloadWriteMetadata:
           downloadWriteMetadata ?? this.downloadWriteMetadata,
@@ -1004,6 +1012,8 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
       askDownloadDetails: prefs.getBool('askDownloadDetails') ?? true,
       pluginInstallSkipVersionCheck:
           prefs.getBool('pluginInstallSkipVersionCheck') ?? false,
+      pluginKindGroupingEnabled:
+          prefs.getBool('pluginKindGroupingEnabled') ?? true,
       downloadLyrics: prefs.getBool('downloadLyrics') ?? true,
       downloadWriteMetadata: prefs.getBool('downloadWriteMetadata') ?? true,
       downloadFilenameTemplate:
@@ -1294,6 +1304,7 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
         'pluginInstallSkipVersionCheck',
         next.pluginInstallSkipVersionCheck,
       ),
+      prefs.setBool('pluginKindGroupingEnabled', next.pluginKindGroupingEnabled),
       prefs.setBool('downloadLyrics', next.downloadLyrics),
       prefs.setBool('downloadWriteMetadata', next.downloadWriteMetadata),
       prefs.setString(
@@ -1787,6 +1798,13 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
   Future<void> setPluginInstallSkipVersionCheck(bool value) => _save(
     (state.valueOrNull ?? const AppSettings()).copyWith(
       pluginInstallSkipVersionCheck: value,
+    ),
+  );
+
+  /// 插件分类管理（默认开启）：关闭后搜索页插件顺序跟随插件拖动顺序。
+  Future<void> setPluginKindGroupingEnabled(bool value) => _save(
+    (state.valueOrNull ?? const AppSettings()).copyWith(
+      pluginKindGroupingEnabled: value,
     ),
   );
   Future<void> setDownloadLyrics(bool v) => _save(

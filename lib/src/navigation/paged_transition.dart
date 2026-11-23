@@ -27,10 +27,15 @@ class XyPagedPage extends StatelessWidget {
     required this.animation,
     required this.pageValue,
     required this.child,
+    this.transitionMode,
   });
 
   /// 本页在分页中的下标。
   final int index;
+
+  /// 局部覆盖全局「页面切换动画」：为空时跟随 [xyPageTransitionMode]。
+  /// 个别分页（如播放页封面/歌词）需要独立观感时使用。
+  final PageTransitionMode? transitionMode;
 
   /// 分页进度的通知源；分页控制器尚未挂载时为 null。
   final Listenable? animation;
@@ -44,11 +49,22 @@ class XyPagedPage extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final listenable = animation;
+    // 本页生效的切换模式：局部覆盖优先，未指定时跟随全局设置。
+    final mode = transitionMode ?? xyPageTransitionMode;
     // 平移模式：原生滑动即目标效果，不加任何装饰层。
-    if (xyPageTransitionMode == PageTransitionMode.slide || listenable == null) {
+    if (mode == PageTransitionMode.slide || listenable == null) {
       return child;
     }
     final width = MediaQuery.sizeOf(context).width;
+    // 过渡位移对齐到整数设备像素。
+    //
+    // [Transform.translate] 的分数像素位移会由合成器对子树纹理做一次
+    // 重采样（双线性插值）：淡入/层叠模式下整页文字因此发虚，表现为
+    // 「切页时整块内容模糊一两帧再变锐利」，而位置和亮度都不变（因为
+    // 位移被淡入抵消、alpha 过渡本身不改亮度）。对齐到物理像素后位移
+    // 不再产生重采样，淡入仍由 [Opacity] 单独负责，观感与设置语义不变。
+    final dpr = MediaQuery.devicePixelRatioOf(context);
+    double snap(double v) => (v * dpr).roundToDouble() / dpr;
     return AnimatedBuilder(
       animation: listenable,
       child: child,
@@ -64,15 +80,15 @@ class XyPagedPage extends StatelessWidget {
         // 非当前页不接收指针：过渡期间相邻页可能被过渡公式拉进视口，
         // 若参与命中测试会盖住并抢走当前页的点击与滚动。
         final ignorePointer = distance > 0.001;
-        final Widget transformed = switch (xyPageTransitionMode) {
+        final Widget transformed = switch (mode) {
           // 完全抵消原生位移：视觉上原地交叉淡化。
           PageTransitionMode.fade => Transform.translate(
-            offset: Offset(-delta * width, 0),
+            offset: Offset(snap(-delta * width), 0),
             child: Opacity(opacity: opacity, child: child!),
           ),
           // 保留三成位移：入场页滑入渐显，离场页同向滑出并轻微缩小。
           PageTransitionMode.stack => Transform.translate(
-            offset: Offset(-delta * width * .7, 0),
+            offset: Offset(snap(-delta * width * .7), 0),
             child: Transform.scale(
               scale: 1 - (delta < 0 ? .05 * distance : 0.0),
               child: Opacity(opacity: opacity, child: child!),
@@ -147,6 +163,7 @@ class XyPageView extends StatelessWidget {
     this.pageSnapping = true,
     this.padEnds = true,
     this.clipBehavior = Clip.hardEdge,
+    this.transitionMode,
     required this.children,
   });
 
@@ -158,6 +175,9 @@ class XyPageView extends StatelessWidget {
   final bool pageSnapping;
   final bool padEnds;
   final Clip clipBehavior;
+
+  /// 局部覆盖全局「页面切换动画」：为空时跟随 [xyPageTransitionMode]。
+  final PageTransitionMode? transitionMode;
   final List<Widget> children;
 
   @override
@@ -177,6 +197,7 @@ class XyPageView extends StatelessWidget {
           XyPagedPage(
             index: index,
             animation: pager,
+            transitionMode: transitionMode,
             pageValue: () {
               if (pager == null || !pager.hasClients) return null;
               try {
