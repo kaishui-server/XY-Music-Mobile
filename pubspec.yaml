@@ -16,7 +16,7 @@ publish_to: 'none' # Remove this line if you wish to publish to pub.dev
 # https://developer.apple.com/library/archive/documentation/General/Reference/InfoPlistKeyReference/Articles/CoreFoundationKeys.html
 # In Windows, build-name is used as the major, minor, and patch parts
 # of the product and file versions while build-number is used as the build suffix.
-version: 2.8.0+5710
+version: 2.8.0+5714
 
 dependency_overrides:
   just_audio_background:
@@ -128,6 +128,13 @@ flutter:
     - assets/icon/app_icon.png
     - assets/plugin_runtime.js
     - assets/lx_plugin_runtime.js
+    - assets/baka_v2_adapter.js
+    # AV3A 解码参数资产（hyper model + LSF 码本）：声明进 Flutter 资产包，
+    # 首次播放 AV3A 音质时解到应用私有目录后把绝对路径传给 Rust。
+    # 注意：只放 assets/av3a/ 一份——若同时放 android/app/src/main/assets/
+    # 会被 Android assets 再打一份进 APK（5712 曾因此重复 ~245KB 超体积红线）。
+    - assets/av3a/model.bin
+    - assets/av3a/lsf.bin
     - assets/share_qq.png
     - assets/share_qzone.jpg
     - assets/creators/kaishui.jpg

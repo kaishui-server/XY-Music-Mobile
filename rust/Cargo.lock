@@ -153,6 +153,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "baka-ac4-cli"
+version = "0.2.2"
+dependencies = [
+ "baka-ac4-core",
+]
+
+[[package]]
+name = "baka-ac4-core"
+version = "0.2.2"
+dependencies = [
+ "rustfft",
+ "thiserror",
+]
+
+[[package]]
+name = "baka-av3a-container"
+version = "0.1.2"
+dependencies = [
+ "baka-av3a-core",
+]
+
+[[package]]
+name = "baka-av3a-core"
+version = "0.1.2"
+
+[[package]]
 name = "base64"
 version = "0.22.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2552,6 +2578,10 @@ version = "0.1.0"
 dependencies = [
  "aes",
  "amll-lyric",
+ "baka-ac4-cli",
+ "baka-ac4-core",
+ "baka-av3a-container",
+ "baka-av3a-core",
  "base64 0.22.1",
  "cc",
  "encoding_rs",

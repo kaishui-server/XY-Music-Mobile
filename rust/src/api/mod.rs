@@ -13,6 +13,10 @@ use crate::player::sound_effect::{SoundEffectBlockProcessor, SoundEffectSettings
 use crate::player::spectrum::build_frequency_bands;
 use flutter_rust_bridge::frb;
 
+// 空间音频本地解码（AC-4/AV3A，空间音质档播放支持）：独立子模块，
+// FRB 扫描后生成独立 Dart 绑定。
+pub mod decode_audio;
+
 // =========================================================================
 // QMC 解密 / 频谱（第一批）
 // =========================================================================

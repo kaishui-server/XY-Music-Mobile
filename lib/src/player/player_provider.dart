@@ -6,6 +6,7 @@ import 'dart:math';
 
 import 'package:audio_service/audio_service.dart' as audio_service;
 import 'package:audio_session/audio_session.dart';
+import 'package:crypto/crypto.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -34,6 +35,7 @@ import '../plugins/plugin_runtime.dart';
 import '../recent/recent_store.dart';
 import '../recognize/recognize_source.dart';
 import '../rust/api.dart';
+import '../rust/api/decode_audio.dart' as decode_audio;
 import '../rust/music/types.dart';
 import '../widgets/cover_image.dart';
 import 'downloaded_song_store.dart';
@@ -5875,6 +5877,9 @@ class PlayerNotifier extends SafeStateNotifier<PlaybackState>
           );
         }
         final runtime = _ref.read(pluginRuntimeProvider);
+        // 空间音频档（dolby/dts/atmos 系）本地解码尝试开关：插件明确降级
+        // 320k（当前歌曲不支持空间档）时置否，避免白下载一遍普通有损流。
+        var spatialAllowed = true;
         // 各阶段计时日志：真机上排查“加载慢”时通过 logcat 观察是插件
         // 解析（getMusicUrl 网络请求）慢还是 setUrl（CDN 连接）慢。
         final resolveStopwatch = Stopwatch()..start();
@@ -5901,6 +5906,7 @@ class PlayerNotifier extends SafeStateNotifier<PlaybackState>
             pluginData,
             preferredQuality: '320k',
           );
+          spatialAllowed = false;
           state = state.copyWith(currentQuality: '320k');
         }
         playbackChainLog(
@@ -5929,8 +5935,24 @@ class PlayerNotifier extends SafeStateNotifier<PlaybackState>
           dedupKey: resolved.url,
           origin: 'playAt:plugin',
         );
+        // 空间音频档（dolby/dts/atmos 系）返回的 AC-4/AV3A 编码流 Android
+        // 播放器解不了：先整曲下载进 Rust 流缓存并本地解码成 WAV 再播放；
+        // 探测不是空间格式或解码链路任何一步失败都静默回退原直链，
+        // 保证空间音质「能试」不会变成「必挂」。
+        Future<void> submitResolved(PluginMediaSource resolved) async {
+          if (spatialAllowed &&
+              await _tryPlaySpatialDecoded(
+                resolved,
+                quality: preferredQuality,
+                mediaItem: mediaItem,
+                requestId: requestId,
+              )) {
+            return;
+          }
+          await submitUrl(resolved);
+        }
         try {
-          await submitUrl(source);
+          await submitResolved(source);
         } catch (error) {
           if (requestId != null && requestId != _playRequestId) rethrow;
           // 短时缓存（预取/切歌回切）的地址可能已过 CDN 时效：失效缓存
@@ -5946,7 +5968,7 @@ class PlayerNotifier extends SafeStateNotifier<PlaybackState>
             preferredQuality: preferredQuality,
             bypassCache: true,
           );
-          await submitUrl(source);
+          await submitResolved(source);
         }
         playbackChainLog(
           '[播放链路] ${item.path} setUrl ${setUrlStopwatch.elapsedMilliseconds}ms',
@@ -7482,6 +7504,198 @@ class PlayerNotifier extends SafeStateNotifier<PlaybackState>
     }
   }
 
+  // =========================================================================
+  // 空间音频档本地解码播放（AC-4 / AV3A → WAV）
+  //
+  // Baka[T] 等插件在 dolby/dts 返回 AC-4 流、atmos 系返回 AV3A 流（多为
+  // MP4 容器），Android 播放器（ExoPlayer）没有这两种编码的软解器。播放
+  // 时先整曲下载进 Rust 流缓存，probe 确认编码后交给 Rust 解码成 f32
+  // WAV，再由 just_audio 直接播本地文件；任何失败静默回退原直链。
+  // =========================================================================
+
+  /// 走本地解码链路的音质档位（Baka 系插件声明的空间音频档）。
+  static const _spatialDecodeQualities = <String>{
+    'dolby',
+    'dts',
+    'atmos',
+    'atmos_plus',
+    'atmos_pro',
+  };
+
+  bool _isSpatialDecodeQuality(String quality) =>
+      _spatialDecodeQualities.contains(quality.trim().toLowerCase());
+
+  /// AV3A 解码参数资产的 sha256（与打包进 APK 的 android assets 一致，
+  /// 运行时解压副本据此校验，损坏即重解）。
+  static const _av3aAssetSha256 = <String, String>{
+    'model.bin': '55d56a17dbfa22da21f2fa945ebe13824d246fe8b2669a63e0440316282ae068',
+    'lsf.bin': '684bd1e6450d240aed9e0621d9bbb3306ffff454d251cfc73610f84e751afd80',
+  };
+
+  /// 空间音频档解码播放入口。
+  ///
+  /// 返回 true 表示已把解码出的 WAV 提交给播放器（跳过原 setUrl 直链）；
+  /// 返回 false 表示不适用或任何一步失败，调用方回退直链播放。所有异常
+  /// 都在本方法内消化，不向上抛——空间音质「能试」不能变成「必挂」。
+  Future<bool> _tryPlaySpatialDecoded(
+    PluginMediaSource resolved, {
+    required String quality,
+    required MediaItem mediaItem,
+    int? requestId,
+  }) async {
+    String? wavPath;
+    try {
+      // 首道门禁：仅 Baka 系插件声明的空间音频档尝试本地解码。普通音质
+      // 直接回退直链，避免每首歌都被整曲下载一遍再探测。
+      if (!_isSpatialDecodeQuality(quality)) return false;
+      // QMC 加密流（*.mflac）与非 http 地址不可能是空间音频编码流。
+      if (resolved.ekey != null) return false;
+      final url = resolved.url.trim();
+      if (!url.startsWith('http')) return false;
+      final stopwatch = Stopwatch()..start();
+      // ① 整曲下载进 Rust 流式缓存（与 DSP 接管共用同一缓存设施）。
+      final snapshotJson = await startStreamingDownload(
+        url: url,
+        headersJson: resolved.headers.isEmpty ? '' : jsonEncode(resolved.headers),
+      );
+      final snapshot = jsonDecode(snapshotJson) as Map<String, dynamic>;
+      final cachedPath = (snapshot['path'] as String?) ?? '';
+      if (cachedPath.isEmpty) return false;
+      final finished = await waitUrlComplete(
+        url: url,
+        timeoutSecs: BigInt.from(120),
+      );
+      if (!finished) {
+        playbackChainLog(
+          '[空间音频] 下载未在 120s 内完成，回退直链 '
+          '耗时${stopwatch.elapsedMilliseconds}ms',
+        );
+        return false;
+      }
+      // ② 探测真实编码：插件标的档位未必真是 AC-4/AV3A（可能是普通
+      // 有损流的改名档），非空间格式直接回退直链。
+      final format = await decode_audio.probeSpatialFormat(path: cachedPath);
+      if (format != 'ac4' && format != 'av3a') return false;
+      // ③ 解码（产物按直链 hash 缓存复用；先写 .part 再落位，避免上次
+      // 解码中断留下的半成品被误复用）。
+      final cacheDir = await getStreamCacheDir();
+      final key = sha256.convert(utf8.encode(url)).toString().substring(0, 16);
+      wavPath = p.join(cacheDir, 'xy-spatial-$key.wav');
+      final wavFile = File(wavPath);
+      final reusable =
+          await wavFile.exists() && await wavFile.length() > 44;
+      if (reusable) {
+        playbackChainLog('[空间音频] 复用已解码 WAV（$key）');
+      } else {
+        final partPath = '$wavPath.part';
+        if (format == 'ac4') {
+          final result = await decode_audio.decodeAc4ToWav(
+            inputPath: cachedPath,
+            outputPath: partPath,
+            render: 'stereo',
+          );
+          playbackChainLog(
+            '[空间音频] AC-4 解码完成 ${result.sampleRate}Hz/'
+            '${result.channels}ch/${result.durationMs}ms '
+            '耗时${stopwatch.elapsedMilliseconds}ms',
+          );
+        } else {
+          final (modelPath, lsfPath) = await _ensureAv3aAssets();
+          final result = await decode_audio.decodeAv3AToWav(
+            inputPath: cachedPath,
+            outputPath: partPath,
+            modelPath: modelPath,
+            lsfPath: lsfPath,
+          );
+          playbackChainLog(
+            '[空间音频] AV3A 解码完成 ${result.sampleRate}Hz/'
+            '${result.channels}ch/${result.durationMs}ms '
+            '耗时${stopwatch.elapsedMilliseconds}ms',
+          );
+        }
+        try {
+          if (await wavFile.exists()) await wavFile.delete();
+        } catch (_) {}
+        await File(partPath).rename(wavPath);
+        _sweepStaleSpatialWavs(cacheDir, keep: wavPath);
+      }
+      // ④ 提交本地 WAV：DSP 接管源置空（解码产物不经 Rust 流直读链路，
+      // 也不与空间解码双重处理音效）。
+      var applied = false;
+      await _enqueueSourceOperation(() async {
+        if (requestId != null && requestId != _playRequestId) return;
+        _dspStreamUrl = null;
+        _dspStreamHeaders = null;
+        _dspLocalPath = null;
+        await _player.setFilePath(wavPath!, tag: mediaItem);
+        applied = true;
+      });
+      if (!applied) return false;
+      playbackChainLog(
+        '[空间音频] ${format.toUpperCase()} 本地解码播放 '
+        '耗时${stopwatch.elapsedMilliseconds}ms',
+      );
+      return true;
+    } catch (error) {
+      playbackChainLog('[空间音频] 解码播放失败，回退直链: $error');
+      // 清理可能残留的半成品（完整产物按上面的原子落位保证只存在整文件）。
+      if (wavPath != null) {
+        try {
+          final part = File('$wavPath.part');
+          if (await part.exists()) await part.delete();
+        } catch (_) {}
+      }
+      return false;
+    }
+  }
+
+  /// 把 APK 内置的 AV3A 参数资产（hyper model / LSF 码本）解到流缓存目录
+  /// 并做 sha256 校验，返回 (model 路径, lsf 路径)。副本已校验通过时直接
+  /// 复用；系统清理缓存目录后下次调用自动重新解压。
+  Future<(String, String)> _ensureAv3aAssets() async {
+    final dir = Directory(p.join(await getStreamCacheDir(), 'av3a'));
+    await dir.create(recursive: true);
+    final paths = <String>[];
+    for (final entry in _av3aAssetSha256.entries) {
+      final file = File(p.join(dir.path, entry.key));
+      var valid = false;
+      if (await file.exists()) {
+        valid =
+            sha256.convert(await file.readAsBytes()).toString() == entry.value;
+      }
+      if (!valid) {
+        final data = await rootBundle.load('assets/av3a/${entry.key}');
+        final bytes = data.buffer
+            .asUint8List(data.offsetInBytes, data.lengthInBytes);
+        final digest = sha256.convert(bytes).toString();
+        if (digest != entry.value) {
+          throw Exception('AV3A 资产校验失败: ${entry.key}');
+        }
+        await file.writeAsBytes(bytes, flush: true);
+      }
+      paths.add(file.path);
+    }
+    return (paths[0], paths[1]);
+  }
+
+  /// 清扫其他歌曲遗留的空间音频 WAV 产物（每曲数 MB，只保留当前一首，
+  /// 避免缓存目录无限膨胀）。删除失败（文件被占用）静默跳过。
+  void _sweepStaleSpatialWavs(String cacheDir, {required String keep}) {
+    try {
+      final dir = Directory(cacheDir);
+      if (!dir.existsSync()) return;
+      for (final entity in dir.listSync()) {
+        if (entity is! File) continue;
+        final name = p.basename(entity.path);
+        if (!name.startsWith('xy-spatial-') || !name.endsWith('.wav')) continue;
+        if (entity.path == keep) continue;
+        try {
+          entity.deleteSync();
+        } catch (_) {}
+      }
+    } catch (_) {}
+  }
+
   Future<void> _requestAndroidAudioPermission() async {
     if (await Permission.audio.isGranted ||
         await Permission.storage.isGranted ||
@@ -8573,9 +8787,11 @@ class PlayerNotifier extends SafeStateNotifier<PlaybackState>
   String? _nextLowerQualityTier() {
     const tiersByRankDesc = <String>[
       'master',
+      'atmos_pro',
       'atmos_plus',
       'atmos',
       'dolby',
+      'dts',
       'vinyl',
       'hires',
       'flac24bit',

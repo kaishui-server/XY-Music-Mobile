@@ -1,0 +1,18 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/baka-ac4-core",
+    "crates/baka-ac4-cli",
+]
+
+[workspace.package]
+version = "0.2.2"
+edition = "2024"
+rust-version = "1.100.0"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/Zencok/baka-ac4"
+
+[profile.release]
+debug = true
+lto = "thin"
+codegen-units = 1

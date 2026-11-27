@@ -148,6 +148,35 @@ module.exports = {
     expect(metadata.userVariables[0].name, 'Cookie [完整]');
   });
 
+  test('订阅源 X-API-KEY 变量被彻底剔除（含各种写法）', () {
+    const script = r'''
+module.exports = {
+  platform: "网易云音乐[T]",
+  userVariables: [
+    { key: "wy_user_id", name: "网易云连接码", hint: "在 /connect 选择登录" },
+    { key: "SOURCE_API_KEY", name: "X-API-KEY", hint: "用于本站取链" },
+    { key: "source_api_key", name: "重复写法", hint: "" },
+    { key: "sourceApiKey", name: "Source API Key", hint: "驼峰写法" },
+    { key: "X-API-KEY", name: "X-API-KEY", hint: "把显示名当键" },
+    { key: "SOURCE_API_URL", name: "取链接口（可选）", hint: "留空跟随" },
+  ],
+  search: async () => ({ data: [] }),
+};
+''';
+
+    final metadata = PluginMetadata.parse(script);
+    expect(
+      metadata.userVariables.map((v) => v.key).toList(),
+      ['wy_user_id', 'SOURCE_API_URL'],
+    );
+    expect(
+      metadata.userVariables.any(
+        (v) => isPluginRetiredUserVariable(v.key),
+      ),
+      isFalse,
+    );
+  });
+
   test('未声明 userVariables 时为空列表', () {
     final metadata = PluginMetadata.parse(
       'module.exports = { platform: "x" };',
@@ -293,5 +322,245 @@ module.exports = {
     expect(PluginMetadata.normalizePluginId(' My Plugin '), 'my-plugin');
     // 全部为非法字符时归一化为空，由调用方回退到内容哈希。
     expect(PluginMetadata.normalizePluginId('（（））'), isEmpty);
+  });
+
+  test('v2 manifest：显示名取 name，platform 仅作平台标识', () {
+    // 与订阅源 qq-l1.js 同构：manifest 内 platform 是「QQ音乐[H]」（音质/接口
+    // 变体），name 才是「QQ音乐[T]」。同时含 appVersion，版本号不能被它顶替。
+    const script = r'''
+const SOURCE_API_KEY = "3ccnt-secret";
+module.exports = {
+  manifest: {
+    platform: "QQ音乐[H]",
+    author: "Toskysun",
+    hints: {"importMusicSheet": ["复制链接并粘贴即可"]},
+    apiVersion: 2,
+    id: "org.lyramesh.qq.l1",
+    name: "QQ音乐[T]",
+    version: "2.0.1",
+    appVersion: ">0.1.0-alpha.0",
+    capabilities: ["search", "entities.get", "media.resolve"],
+    userVariables: [
+      {"key": "qq_user_id", "name": "用户 ID", "hint": "在 /connect 扫码"},
+      {"key": "SOURCE_API_KEY", "name": "X-API-KEY", "hint": "取链密钥"},
+      {"key": "SOURCE_API_URL", "name": "接口地址(可选)", "hint": "留空跟随"}
+    ]
+  },
+  handlers: {},
+};
+function createProvider(sdk, request = {}) {
+  return { search: () => ({}) };
+}
+''';
+
+    final metadata = PluginMetadata.parse(script);
+    expect(metadata.name, 'QQ音乐[T]');
+    expect(metadata.platform, 'QQ音乐[H]');
+    // 版本号不能被 apiVersion / appVersion 抢占（此前解析成 2 和 >0.1.0-alpha.0）。
+    expect(metadata.version, '2.0.1');
+    expect(metadata.apiVersion, 2);
+    expect(metadata.providerId, 'org.lyramesh.qq.l1');
+    expect(metadata.id, 'org.lyramesh.qq.l1');
+    expect(metadata.author, 'Toskysun');
+    expect(metadata.isBakaV2, isTrue);
+    expect(
+      metadata.capabilities,
+      ['search', 'entities.get', 'media.resolve'],
+    );
+    // 变量键是纯字面量时不得拼接同名常量（否则键变成 SOURCE_API_KEY3ccnt-secret，
+    // 停用过滤失配，X-API-KEY 又会冒出来）。
+    expect(
+      metadata.userVariables.map((v) => v.key).toList(),
+      ['qq_user_id', 'SOURCE_API_URL'],
+    );
+  });
+
+  test('v2 manifest：JSON 风格键与 userVariables 也能解析', () {
+    const script = r'''
+const manifest = {
+  "platform": "酷狗音乐[T]",
+  "author": "Toskysun",
+  "appVersion": ">0.1.0-alpha.0",
+  "apiVersion": 2,
+  "id": "org.lyramesh.kg",
+  "name": "酷狗音乐[T]",
+  "version": "3.0.1",
+  "userVariables": [
+    {"key": "kg_user_id", "name": "用户 ID", "hint": "复制连接码"},
+    {"key": "SOURCE_API_KEY", "name": "X-API-KEY", "hint": "取链"},
+    {"key": "SOURCE_API_URL", "name": "取链接口（可选）", "hint": "留空跟随"}
+  ],
+  "capabilities": ["search", "media.resolve"]
+};
+function createProvider(sdk) { return {}; }
+''';
+
+    final metadata = PluginMetadata.parse(script);
+    // 键带引号时 userVariables 不能再整体漏掉（酷狗/酷我原本解析为空列表）。
+    expect(
+      metadata.userVariables.map((v) => v.key).toList(),
+      ['kg_user_id', 'SOURCE_API_URL'],
+    );
+    expect(metadata.name, '酷狗音乐[T]');
+    expect(metadata.version, '3.0.1');
+    expect(metadata.providerId, 'org.lyramesh.kg');
+    expect(metadata.apiVersion, 2);
+  });
+
+  test('v2 manifest：providerId 写法同样可取稳定标识', () {
+    const script = r'''
+module.exports = {
+  manifest: {
+    providerId: "org.lyramesh.joox",
+    name: "JOOX",
+    platform: "JOOX",
+    version: "4.0.1",
+    author: "Toskysun",
+    apiVersion: 2,
+    capabilities: ["search"]
+  },
+  handlers: {},
+};
+function createProvider(sdk) { return {}; }
+''';
+
+    final metadata = PluginMetadata.parse(script);
+    expect(metadata.providerId, 'org.lyramesh.joox');
+    expect(metadata.id, 'org.lyramesh.joox');
+    expect(metadata.name, 'JOOX');
+    expect(metadata.platform, 'JOOX');
+  });
+
+  test('停用变量键按前缀判定：常量拼接残留也不复活', () {
+    expect(isPluginRetiredUserVariable('SOURCE_API_KEY'), isTrue);
+    expect(isPluginRetiredUserVariable('sourceApiKey'), isTrue);
+    expect(isPluginRetiredUserVariable('SOURCE_API_KEY3ccnt-secret'), isTrue);
+    // 相邻但未被停用的键必须保留。
+    expect(isPluginRetiredUserVariable('SOURCE_API_URL'), isFalse);
+    expect(isPluginRetiredUserVariable('qq_user_id'), isFalse);
+  });
+
+  test('插件契约：kindKey/label 映射与判定优先级', () {
+    // kindKey 是分栏/分组共用的分类标识，bakaV2 与旧 baka 同栏但显示名不同。
+    expect(PluginContract.lx.kindKey, 'lx');
+    expect(PluginContract.bakaV2.kindKey, 'baka');
+    expect(PluginContract.baka.kindKey, 'baka');
+    expect(PluginContract.animemusic.kindKey, 'animemusic');
+    expect(PluginContract.musicfree.kindKey, 'musicfree');
+    expect(PluginContract.lx.label, 'LX');
+    expect(PluginContract.bakaV2.label, 'BakaMusic v2');
+    expect(PluginContract.baka.label, 'BakaMusic');
+    expect(PluginContract.animemusic.label, '惜梦');
+    expect(PluginContract.musicfree.label, 'MusicFree');
+
+    // 优先级：lx > bakaV2 > baka > animemusic > musicfree。
+    expect(
+      pluginContractOf(
+        isLx: true,
+        isBakaV2: true,
+        isBaka: true,
+        isAnimemusic: true,
+      ),
+      PluginContract.lx,
+    );
+    expect(
+      pluginContractOf(
+        isLx: false,
+        isBakaV2: true,
+        isBaka: true,
+        isAnimemusic: false,
+      ),
+      PluginContract.bakaV2,
+    );
+    expect(
+      pluginContractOf(
+        isLx: false,
+        isBakaV2: false,
+        isBaka: true,
+        isAnimemusic: false,
+      ),
+      PluginContract.baka,
+    );
+    expect(
+      pluginContractOf(
+        isLx: false,
+        isBakaV2: false,
+        isBaka: false,
+        isAnimemusic: true,
+      ),
+      PluginContract.animemusic,
+    );
+    expect(
+      pluginContractOf(
+        isLx: false,
+        isBakaV2: false,
+        isBaka: false,
+        isAnimemusic: false,
+      ),
+      PluginContract.musicfree,
+    );
+  });
+
+  test('分类统一入口：契约优先，提示与来源 URL 只兜底 MusicFree/Baka', () {
+    // 契约明确的类目不受分栏提示影响（避免粘贴到 BakaMusic 分栏就变 baka）。
+    expect(
+      resolvePluginKindKey(contract: PluginContract.lx, kindHint: 'baka'),
+      'lx',
+    );
+    expect(
+      resolvePluginKindKey(contract: PluginContract.animemusic, kindHint: 'baka'),
+      'animemusic',
+    );
+    // BakaMusic 契约不会被 musicfree 提示压回。
+    expect(
+      resolvePluginKindKey(contract: PluginContract.baka, kindHint: 'musicfree'),
+      'baka',
+    );
+    expect(
+      resolvePluginKindKey(contract: PluginContract.bakaV2, kindHint: 'baka'),
+      'baka',
+    );
+    // MusicFree 契约可被 baka 提示或已知 Baka 订阅源提升到 baka 分栏。
+    expect(
+      resolvePluginKindKey(
+        contract: PluginContract.musicfree,
+        kindHint: 'baka',
+      ),
+      'baka',
+    );
+    expect(
+      resolvePluginKindKey(
+        contract: PluginContract.musicfree,
+        sourceUrl: 'https://music.cwo.cc.cd/subscription.json',
+      ),
+      'baka',
+    );
+    // 用户手动归入「其他」优先级最高。
+    expect(
+      resolvePluginKindKey(contract: PluginContract.baka, kindHint: 'other'),
+      'other',
+    );
+    expect(
+      resolvePluginKindKey(contract: PluginContract.musicfree),
+      'musicfree',
+    );
+  });
+
+  test('分类判定不读插件显示名/作者名', () {
+    const script = r'''
+module.exports = {
+  platform: "baka 音乐聚合",
+  author: "baka作者",
+  version: "2.0.0",
+  search: async () => ({ data: [] }),
+  getTopLists: async () => ({ data: [] }),
+  getTopListDetail: async () => ({ data: [] }),
+};
+''';
+    final metadata = PluginMetadata.parse(script);
+    // 名称/作者含 baka，但脚本内容是普通 MusicFree 契约 → 仍归 MusicFree。
+    expect(metadata.isBaka, isFalse);
+    expect(metadata.contract, PluginContract.musicfree);
+    expect(resolvePluginKindKey(contract: metadata.contract), 'musicfree');
   });
 }

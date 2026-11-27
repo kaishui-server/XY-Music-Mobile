@@ -1,0 +1,18 @@
+[package]
+name = "baka-av3a-container"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "MP4 demuxing, progressive input and range playback for AV3A audio"
+readme = "README.md"
+keywords = ["av3a", "audio", "decoder", "codec", "pcm"]
+categories = ["multimedia::audio", "multimedia::encoding"]
+include = ["src/**", "tests/**", "examples/**", "Cargo.toml", "README.md", "LICENSE", "NOTICE"]
+
+[dependencies]
+baka-av3a-core = { version = "0.1.2", path = "../baka-av3a-core" }
+
+[lints]
+workspace = true

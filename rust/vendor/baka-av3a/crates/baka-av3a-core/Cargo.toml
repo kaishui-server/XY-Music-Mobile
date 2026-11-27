@@ -1,0 +1,15 @@
+[package]
+name = "baka-av3a-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Pure Rust AV3A audio decoder with multichannel PCM output"
+readme = "README.md"
+keywords = ["av3a", "audio", "decoder", "codec", "pcm"]
+categories = ["multimedia::audio", "multimedia::encoding"]
+include = ["src/**", "tests/**", "examples/**", "Cargo.toml", "README.md", "LICENSE", "NOTICE"]
+
+[lints]
+workspace = true

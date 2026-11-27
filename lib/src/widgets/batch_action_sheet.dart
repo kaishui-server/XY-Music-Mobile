@@ -29,9 +29,11 @@ const List<String> kBatchDownloadQualities = [
   'flac24bit',
   'hires',
   'vinyl',
+  'dts',
   'dolby',
   'atmos',
   'atmos_plus',
+  'atmos_pro',
   'master',
 ];
 

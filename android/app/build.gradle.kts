@@ -25,6 +25,10 @@ android {
         targetSdk = flutter.targetSdkVersion
         versionCode = flutter.versionCode
         versionName = flutter.versionName
+        // 资源 locale 裁剪：第三方 SDK（微信/微博/QQ 等）带几十个语言的
+        // res 变体，App 本身只用中文，保留中英即可。resources.arsc 以
+        // 不压缩方式入库，此项直接减小 APK 体积。
+        resourceConfigurations.addAll(listOf("zh", "zh-rCN", "en"))
         // 只交付 arm64：脚本用 --split-per-abi 按 ABI 拆包，arm64 分包天然
         // 只含 arm64-v8a 的 jniLibs/AAR 原生库。这里不能再设 ndk abiFilters，
         // 否则与 splits abi 配置冲突（Gradle 直接报错）。
@@ -79,6 +83,10 @@ android {
             excludes += "kotlin/**"
             excludes += "DebugProbesKt.bin"
             excludes += "kotlin-tooling-metadata.json"
+            // flutter_inappwebview 自带的离线小恐龙游戏页（加载失败彩蛋），
+            // 产品不使用；含图片共约 96KB 原始 / 30KB 压缩，剔除以满足 20MiB 上限。
+            // （AGP 9 已移除 packaging.assets，assets 类剔除归入 resources.excludes）
+            excludes += "assets/flutter_assets/packages/flutter_inappwebview/assets/t_rex_runner/**"
         }
     }
 }

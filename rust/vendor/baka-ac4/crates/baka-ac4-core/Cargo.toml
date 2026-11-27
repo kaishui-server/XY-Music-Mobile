@@ -1,0 +1,19 @@
+[package]
+name = "baka-ac4-core"
+description = "Pure Rust Dolby AC-4 audio decoder"
+version.workspace = true
+edition.workspace = true
+# XY 最小修改：上游声明 rust-version 1.100（继承 workspace），宿主工程本机
+# 与沙盒工具链均为 1.98.x；代码仅依赖 edition 2024 + let-chains（1.88 即可），
+# 此处降为 1.88 以允许 1.98 工具链编译，避免无谓的全局工具链升级。
+rust-version = "1.88"
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+keywords = ["ac4", "audio", "decoder", "codec", "pcm"]
+categories = ["multimedia::audio", "multimedia::encoding"]
+include = ["src/**", "tests/**", "examples/**", "Cargo.toml", "README.md", "LICENSE", "NOTICE"]
+
+[dependencies]
+thiserror = "2"
+rustfft = "6"

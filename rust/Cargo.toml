@@ -39,6 +39,14 @@ walkdir = "2"
 symphonia = { version = "0.5.5", default-features = false, features = ["aac", "adpcm", "aiff", "alac", "flac", "isomp4", "mp3", "ogg", "pcm", "vorbis", "wav"] }
 uuid = { version = "1", features = ["v4"] }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+# AC-4 本地解码（vendored baka-ac4，GPL-3.0-or-later，与本项目 AGPL-3.0 兼容）：
+# core 为纯解码器，cli 提供 MP4/裸流 demux 与 WavWriter（wav 模块为 XY 导出）。
+baka-ac4-core = { path = "vendor/baka-ac4/crates/baka-ac4-core" }
+baka-ac4-cli = { path = "vendor/baka-ac4/crates/baka-ac4-cli" }
+# AV3A 本地解码（vendored baka-av3a，同 GPL-3.0-or-later）：core 为解码器
+# （需运行时传入 model/lsf 参数资产路径），container 提供 MP4 demux。
+baka-av3a-core = { path = "vendor/baka-av3a/crates/baka-av3a-core" }
+baka-av3a-container = { path = "vendor/baka-av3a/crates/baka-av3a-container" }
 
 [build-dependencies]
 # 编译 anime 音效引擎（src/player/animefx.c，官方开放平台源码）
@@ -89,3 +97,7 @@ opt-level = 3
 
 [profile.release.package.miniz_oxide]
 opt-level = 3
+
+# AC-4/AV3A 解码器统一走通配档 "s"：opt-level=3 曾让 arm64 .so 膨胀，
+# APK 顶破 20MiB 红线。解码带超时回退直链，"s" 下速度可接受。
+# （ac4/av3a 若未来需要提速再单独评估，优先保体积红线。）

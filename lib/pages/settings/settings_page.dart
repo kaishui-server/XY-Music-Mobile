@@ -3778,8 +3778,9 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
     final cur = isOnline
         ? s?.onlineDefaultQuality ?? '320k'
         : s?.downloadQuality ?? '320k';
-    // 音质档位对齐 MusicFree（低 → 高），完整 12 档；实际能否取到
-    // 该档位取决于插件支持，播放时会自动降级。
+    // 音质档位对齐 MusicFree（低 → 高），完整 14 档（含 Baka[T] 插件
+    // 声明的 dts / atmos_pro）；实际能否取到该档位取决于插件支持，
+    // 播放时会自动降级。
     const qualityKeys = [
       '96k',
       '128k',
@@ -3789,9 +3790,11 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
       'flac24bit',
       'hires',
       'vinyl',
+      'dts',
       'dolby',
       'atmos',
       'atmos_plus',
+      'atmos_pro',
       'master',
     ];
     final choice = await showModalBottomSheet<_Choice>(

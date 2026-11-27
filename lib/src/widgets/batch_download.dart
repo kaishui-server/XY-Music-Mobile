@@ -64,8 +64,9 @@ class _BatchDownloadOptionsDialogState
   String? _error;
   bool _choosing = false;
 
-  /// 音质档位与设置页“下载音质”一致（低 → 高，共 12 档，最高为超清
-  /// 母带）；实际能否下载到该档位取决于插件支持，失败时自动降级。
+  /// 音质档位与设置页“下载音质”一致（低 → 高，共 14 档，含 Baka[T]
+  /// 插件声明的 dts / atmos_pro）；实际能否下载到该档位取决于插件支持，
+  /// 失败时自动降级。
   static const _qualities = [
     '96k',
     '128k',
@@ -75,9 +76,11 @@ class _BatchDownloadOptionsDialogState
     'flac24bit',
     'hires',
     'vinyl',
+    'dts',
     'dolby',
     'atmos',
     'atmos_plus',
+    'atmos_pro',
     'master',
   ];
 
@@ -259,9 +262,11 @@ class _BatchDownloadOptionsDialogState
     'flac24bit' => 'flac24bit',
     'hires' || 'hi-res' => 'hires',
     'vinyl' => 'vinyl',
+    'dts' || 'dtshd' => 'dts',
     'dolby' => 'dolby',
     'atmos' => 'atmos',
     'atmos_plus' => 'atmos_plus',
+    'atmos_pro' => 'atmos_pro',
     'master' => 'master',
     _ => '320k',
   };

@@ -1,0 +1,17 @@
+/target/
+/.local/
+*.wav
+*.mp4
+*.av3a
+__pycache__/
+*.pyc
+
+# Local development and research helpers
+/AGENTS.md
+/tools/
+*.apk
+*.so
+*.dll
+*.exe
+*.sofa
+*.bhrir

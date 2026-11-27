@@ -1,0 +1,24 @@
+[package]
+name = "baka-ac4-cli"
+description = "AC-4 decoding command line tool"
+version.workspace = true
+edition.workspace = true
+# XY 最小修改：同 baka-ac4-core，MSRV 声明降为 1.88 以匹配宿主工程工具链。
+rust-version = "1.88"
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+keywords = ["ac4", "audio", "decoder", "wav"]
+categories = ["command-line-utilities", "multimedia::audio"]
+include = ["src/**", "tests/**", "Cargo.toml", "README.md", "LICENSE", "NOTICE"]
+
+[lib]
+name = "baka_ac4_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "baka-ac4"
+path = "src/main.rs"
+
+[dependencies]
+baka-ac4-core = { version = "0.2.2", path = "../baka-ac4-core" }

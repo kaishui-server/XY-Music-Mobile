@@ -1,0 +1,12 @@
+baka-ac4
+SPDX-License-Identifier: GPL-3.0-or-later
+
+The AC-4 decoding algorithm and tables are derived from the LibreMPEG
+AC-4 decoder, including libavcodec/ac4dec.c and associated data tables.
+Original decoder copyright: (c) 2019 Paul B Mahol.
+Upstream: https://github.com/librempeg/librempeg
+
+The derived Rust implementation is distributed under GPL-3.0-or-later.
+The full license text is provided in LICENSE.
+
+RustFFT is used as a dependency under its own license terms.

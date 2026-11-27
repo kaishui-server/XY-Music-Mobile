@@ -26,6 +26,24 @@ pub struct PluginHttpBinaryResponse {
 const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
 /// 异步 HTTP 请求 —— 使用 reqwest 异步客户端，不阻塞调用线程。
+/// QuickJS XHR 链路只能安全传输 ASCII 文本，二进制请求体由 JS 侧包装成
+/// `__XY_HTTP_BODY_BASE64__` + base64（baka_v2_adapter.js 的 bodyHex /
+/// joox protobuf 通道），这里还原成原始字节，避免 UTF-8 再编码损坏内容。
+const REQUEST_BODY_BASE64_PREFIX: &str = "__XY_HTTP_BODY_BASE64__";
+
+fn decode_plugin_request_body(body: Option<String>) -> Option<Vec<u8>> {
+    use base64::{engine::general_purpose, Engine as _};
+    body.map(|text| {
+        if let Some(payload) = text.strip_prefix(REQUEST_BODY_BASE64_PREFIX) {
+            general_purpose::STANDARD
+                .decode(payload.trim())
+                .unwrap_or_else(|_| text.into_bytes())
+        } else {
+            text.into_bytes()
+        }
+    })
+}
+
 pub async fn plugin_http_request(
     method: String,
     url: String,
@@ -63,7 +81,7 @@ pub async fn plugin_http_request(
             request = request.header(key, value);
         }
     }
-    if let Some(body) = body {
+    if let Some(body) = decode_plugin_request_body(body) {
         request = request.body(body);
     }
 
@@ -142,7 +160,7 @@ pub async fn plugin_http_request_binary(
             request = request.header(key, value);
         }
     }
-    if let Some(body) = body {
+    if let Some(body) = decode_plugin_request_body(body) {
         request = request.body(body);
     }
 

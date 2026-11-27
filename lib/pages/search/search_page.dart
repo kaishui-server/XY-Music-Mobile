@@ -86,9 +86,10 @@ class _SearchSourceTab {
 
 /// LX 平台显示名，使用各平台的直接名称。
 ///
-/// 未登记的代号不再被过滤掉（订阅源可以自行扩展平台，如 ikun 的 git、
-/// lx-cit 的 qs/jo）：走 [_lxSourceDisplayName] 兜底显示代号本身，保证
-/// 「订阅源声明多少平台，搜索页就展示多少平台」。
+/// 下拉只展示宿主有搜索实现的平台（[kHostLxSearchSources]）：插件可能
+/// 声明宿主搜不了的平台（如 lx-cit v1.5.2 新增的 bili/bd、ikun 的 git），
+/// 展示出来只会「选了就报错」，因此直接过滤掉，不留无效站点。
+/// 未登记的代号走 [_lxSourceDisplayName] 兜底显示代号本身。
 const _lxSourceNames = <String, String>{
   'kw': '酷我音乐',
   'kg': '酷狗音乐',
@@ -130,7 +131,12 @@ List<_SearchSourceTab> _buildSearchSourceTabs(
         lxSources: plugin.isLx
             ? (plugin.lxSources.isEmpty
                   ? kHostLxSearchSources
-                  : plugin.lxSources)
+                  // 只保留宿主有搜索实现的平台：插件声明的 bili/bd/git 等
+                  // 平台没有宿主搜索，展示出来选了必报错（用户反馈「凭空
+                  // 多了 BILI、BD 两个新站点」）。
+                  : plugin.lxSources
+                        .where(kHostLxSearchSources.contains)
+                        .toList(growable: false))
             : const [],
       ),
   ];

@@ -1,0 +1,23 @@
+[package]
+name = "baka-av3a-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Command-line AV3A inspection, extraction and PCM WAV decoding"
+readme = "README.md"
+keywords = ["av3a", "audio", "decoder", "codec", "pcm"]
+categories = ["multimedia::audio", "multimedia::encoding"]
+include = ["src/**", "tests/**", "examples/**", "Cargo.toml", "README.md", "LICENSE", "NOTICE"]
+
+[[bin]]
+name = "baka-av3a"
+path = "src/main.rs"
+
+[dependencies]
+baka-av3a-core = { version = "0.1.2", path = "../baka-av3a-core" }
+baka-av3a-container = { version = "0.1.2", path = "../baka-av3a-container" }
+
+[lints]
+workspace = true

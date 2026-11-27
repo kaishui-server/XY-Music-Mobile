@@ -82,21 +82,10 @@ class _PluginInfo {
   bool get isOnline => sourceUrl?.trim().isNotEmpty == true;
 }
 
-/// 「用户变量」弹窗中不展示的变量键（全部小写比较，忽略大小写与首尾空白）。
-///
-/// - `source_api_key`（显示名 X-API-KEY）：订阅源（mc.vsaa.cn）的 Baka
-///   音源插件历史鉴权项，插件在安装时已由订阅链接自动下发密钥，用户无需
-///   再手工填写（2026-11 插件侧确认）。兼容 `SOURCE_API_KEY` /
-///   `source_api_key` 等写法；JOOX 的 `sourceApiKey` 驼峰键归一化后为
-///   `sourceapikey`，与之下划线形式不同，保持原样展示。
-/// - `x-api-key`：早期把显示名当键的写法，一并兼容。
-///
-/// 仅作用于弹窗展示这一层：脚本里的 `userVariables` 声明与运行时
-/// `env.getUserVariables()` 读取完全不变，存量值也不会被保存逻辑清空。
-const _hiddenUserVariableKeys = {'source_api_key', 'x-api-key'};
-
-bool _isHiddenUserVariable(String rawKey) =>
-    _hiddenUserVariableKeys.contains(rawKey.trim().toLowerCase());
+// 已停用的插件用户变量（如订阅源的 X-API-KEY）不再由本页处理：
+// plugin_metadata.dart 的 [isPluginRetiredUserVariable] 在解析阶段就把
+// 这类键剔除，因此 [_PluginInfo.userVariables] 里不会出现它们，弹窗、
+// 保存、持久化、运行时注入全链路都拿不到该变量。
 
 class _InstallSummary {
   const _InstallSummary({
@@ -404,6 +393,20 @@ class _PluginsNotifier extends AsyncNotifier<List<_PluginInfo>> {
               ? metadata.name!.trim()
               : id);
 
+    // 分类标识：写入订阅类型表的值必须经统一入口 [resolvePluginKindKey]
+    // 归一化——脚本契约（LX / BakaMusic v2 / BakaMusic / 惜梦 / MusicFree）
+    // 优先，调用方给的分栏/索引族提示与来源 URL 只在契约无法区分
+    // MusicFree 与 BakaMusic 时兜底。调用方没给提示时不写入，避免把
+    // 「内容层暂未识别」固化成分类，后续插件更新后仍能按契约重新归类。
+    final hintValue = kindHint?.trim() ?? '';
+    final resolvedKind = hintValue.isEmpty
+        ? ''
+        : resolvePluginKindKey(
+            contract: metadata.contract,
+            kindHint: hintValue,
+            sourceUrl: origin,
+          );
+
     final dataDir = await ref.read(appDataDirProvider.future);
     // 本地导入不依赖 Rust bridge。插件管理页可能在应用启动初始化 bridge
     // 完成前就被打开，直接调用 RustLib.instance 会触发
@@ -461,7 +464,7 @@ class _PluginsNotifier extends AsyncNotifier<List<_PluginInfo>> {
         summary,
         session,
         displayName: indexName.isNotEmpty ? name : null,
-        kindHint: kindHint,
+        kindHint: resolvedKind.isEmpty ? null : resolvedKind,
       );
     }
 
@@ -480,8 +483,8 @@ class _PluginsNotifier extends AsyncNotifier<List<_PluginInfo>> {
     if (indexName.isNotEmpty) {
       await _saveDisplayName(prefs, id, name);
     }
-    if (kindHint != null && kindHint.isNotEmpty) {
-      await _savePluginKind(prefs, id, kindHint);
+    if (resolvedKind.isNotEmpty) {
+      await _savePluginKind(prefs, id, resolvedKind);
     }
     summary.installed++;
     // 星海格式插件在安装提示中标注，让用户知道这是聚合变体。
@@ -812,7 +815,9 @@ class _PluginsNotifier extends AsyncNotifier<List<_PluginInfo>> {
                 base,
               );
               // 单条插件脚本托管在已知 Baka 域名时以 Baka 为准
-              // （MusicFree 索引里也可能挂 baka 系插件）。
+              // （MusicFree 索引里也可能挂 baka 系插件）。此处只给「提示」，
+              // 最终分类由 _persistScript 走统一入口判定：脚本契约优先，
+              // 索引族与单条 URL 仅作契约无法区分时的兜底。
               final pluginKind =
                   indexKind == pluginKindBaka ||
                       PluginMetadata.isBakaSourceUrl(effectiveUrl)
@@ -973,21 +978,16 @@ class _PluginsNotifier extends AsyncNotifier<List<_PluginInfo>> {
     final prefs = await SharedPreferences.getInstance();
     final stored = readPluginUserVariables(prefs);
     // 只保留插件当前声明的变量键，卸载或插件更新后消失的键会被清理。
+    // 已停用的键（如订阅源的 X-API-KEY）不在声明里，因此存量值也一并
+    // 被清掉——不再像以前那样“隐藏但仍保留注入”。
     final declared = plugin.userVariables.map((v) => v.key).toSet();
     final filtered = {
       for (final entry in values.entries)
-        if (declared.contains(entry.key) && entry.value.isNotEmpty)
+        if (declared.contains(entry.key) &&
+            !isPluginRetiredUserVariable(entry.key) &&
+            entry.value.isNotEmpty)
           entry.key: entry.value,
     };
-    // 弹窗里不展示的变量（如 X-API-KEY）不会出现在 values 中，若直接按
-    // values 覆盖会把历史已保存的值清空，导致插件取链失效。这里沿用存量
-    // 值：只是界面不展示、不可编辑，运行时仍能照读。
-    final previous = stored[plugin.id] ?? const <String, String>{};
-    for (final entry in previous.entries) {
-      if (entry.value.trim().isEmpty) continue;
-      if (!_isHiddenUserVariable(entry.key)) continue;
-      filtered.putIfAbsent(entry.key, () => entry.value);
-    }
     if (filtered.isEmpty) {
       stored.remove(plugin.id);
     } else {
@@ -1460,16 +1460,13 @@ class _PluginsPageState extends ConsumerState<PluginsPage> {
     // 30 首必要变量，三家插件共用同一个变量键：非 Baka 协议插件即使
     // 脚本声明了该变量也隐藏输入行，避免误导。保存时该键随过滤后的
     // variables 一起被清理，不会残留在其它插件上。
-    // 「X-API-KEY」（脚本变量键为 SOURCE_API_KEY）是订阅源 Baka 音源插件
-    // 的历史鉴权变量：插件在安装时已由订阅链接自动下发密钥，脚本里残留
-    // 的声明不再需要填写（2026-11 插件侧确认），该行整行不展示，不留空行、
-    // 不显示灰态或占位；已保存的值由 saveUserVariables 原样保留，脚本照读。
+    // 订阅源的 X-API-KEY 变量已彻底移除（解析阶段即剔除），不会出现在
+    // plugin.userVariables 里，这里无需再额外过滤。
     final variables = plugin.userVariables
         .where(
           (variable) =>
               !(variable.key == 'qq_user_id' &&
-                  plugin.kind != _PluginKind.baka) &&
-              !_isHiddenUserVariable(variable.key),
+                  plugin.kind != _PluginKind.baka),
         )
         .toList();
     if (variables.isEmpty) return;
@@ -2767,6 +2764,12 @@ class _PluginUpdate {
   }
 }
 
+/// 更新弹窗的用户选择：
+/// - [update] 立即更新（沿用音源栏更新链路）；
+/// - [later] 下次再说——不记录任何状态，只要没更新，下次启动继续弹；
+/// - [ignore] 忽略此版本——记下当前版本指纹，同一版本不再提醒。
+enum _AutoUpdateChoice { update, later, ignore }
+
 /// 读取「取消过的版本」表；损坏或缺失时按空表处理。
 Map<String, String> _readAutoUpdateIgnored(SharedPreferences prefs) {
   final raw = prefs.getString(_autoUpdateIgnoredKey);
@@ -2796,12 +2799,14 @@ Future<BuildContext?> _waitDialogContext(
   return null;
 }
 
-/// 启动后自动检测音源更新：发现新版本时弹窗（「更新」「取消」两个按钮）。
+/// 启动后自动检测音源更新：发现新版本时弹窗，三个按钮：
+/// 「更新」直接复用音源栏更新按钮的同一条链路；「忽略此版本」记下当前
+/// 版本指纹，同一版本不再打扰；「下次再说」不记录状态，只要没更新，
+/// 下次启动继续弹窗提醒。
 ///
 /// 「更新」按钮**不跳转任何网页**，直接复用音源栏更新按钮的同一条链路
 /// （`updatePlugin` → 从来源地址重新拉取 → 版本校验/去重合并 → 刷新列表
 /// 与启用列表），因此行为与手动更新完全一致。
-/// 「取消」只记下当前版本指纹，同一版本不再打扰。
 ///
 /// [contextOf] 延迟取弹窗用的 context：根节点自身位于 MaterialApp 之上，
 /// 没有 Navigator，必须由调用方提供路由内的 context。
@@ -2834,7 +2839,7 @@ Future<void> autoCheckSourceUpdates(
   final dialogContext = await _waitDialogContext(contextOf);
   if (dialogContext == null || !dialogContext.mounted) return;
 
-  final confirmed = await showDialog<bool>(
+  final choice = await showDialog<_AutoUpdateChoice>(
     context: dialogContext,
     builder: (popContext) => AlertDialog(
       title: const Text('发现音源更新'),
@@ -2862,22 +2867,32 @@ Future<void> autoCheckSourceUpdates(
       ),
       actions: [
         TextButton(
-          onPressed: () => Navigator.of(popContext).pop(false),
-          child: const Text('取消'),
+          // 「下次再说」不写忽略表：未更新则下次启动继续提醒。
+          onPressed: () => Navigator.of(popContext).pop(_AutoUpdateChoice.later),
+          child: const Text('下次再说'),
+        ),
+        TextButton(
+          onPressed: () =>
+              Navigator.of(popContext).pop(_AutoUpdateChoice.ignore),
+          child: const Text('忽略此版本'),
         ),
         FilledButton(
-          onPressed: () => Navigator.of(popContext).pop(true),
+          onPressed: () => Navigator.of(popContext).pop(_AutoUpdateChoice.update),
           child: const Text('更新'),
         ),
       ],
     ),
   );
 
-  if (confirmed != true) {
+  if (choice == _AutoUpdateChoice.ignore) {
     for (final update in pending) {
       ignored[update.plugin.id] = update.fingerprint;
     }
     await prefs.setString(_autoUpdateIgnoredKey, jsonEncode(ignored));
+    return;
+  }
+  if (choice != _AutoUpdateChoice.update) {
+    // 「下次再说」：什么都不记，下次启动只要音源仍未更新就继续弹窗。
     return;
   }
 

@@ -1,0 +1,20 @@
+[workspace]
+resolver = "2"
+members = ["crates/baka-av3a-core", "crates/baka-av3a-container", "crates/baka-av3a-cli"]
+
+[workspace.package]
+version = "0.1.2"
+edition = "2024"
+# XY Music 最小修改：上游声明 1.100.0，本工程工具链为 1.98.x。代码实际
+# 只依赖 edition 2024（rustc >= 1.85）与 `is_multiple_of`（>= 1.87），
+# 已在 1.98 下完成 cargo check/test 验证，故下调声明下限（勿同步回上游）。
+rust-version = "1.87.0"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/Zencok/baka-av3a"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

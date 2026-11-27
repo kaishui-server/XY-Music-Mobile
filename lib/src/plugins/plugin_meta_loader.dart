@@ -24,7 +24,11 @@ const _metaCacheFileName = 'meta_cache.json';
 
 /// 解析逻辑升级（支持平台名间接取值）后提升版本，使已装插件的旧
 /// meta_cache.json 失效并重新解析，否则列表仍显示缓存里的旧名称。
-const _metaCacheVersion = 2;
+///
+/// v3：新增 Baka provider v2 契约识别与 manifest 解析（显示名取
+/// manifest.name、platform 仅作平台标识、能力枚举入缓存），旧缓存不含
+/// 这些字段，必须整体重算一次。
+const _metaCacheVersion = 3;
 
 /// 后台加载全部插件行（plain map，可跨 isolate 传输）。
 /// 返回的行字段见 [_rowFromMeta]；kind 为分类标识字符串
@@ -158,23 +162,30 @@ Map<String, Object?> _rowFromMeta({
 }) {
   final isLx = meta['isLx'] == true;
   final isBaka = meta['isBaka'] == true;
+  final isBakaV2 = meta['isBakaV2'] == true;
   final isAnimemusic = meta['isAnimemusic'] == true;
-  // 分类判定走 [resolvePluginKindKey]：搜索页的来源 Tab 顺序也用同一函数，
-  // 两处口径必须一致，否则管理页分栏顺序改了、搜索页顺序却不符。
-  // 优先级：用户归入「其他」> LX 契约 > BakaMusic 契约 > animemusic 后端
-  // > 标准 MusicFree；内容识别不中时由订阅类型提示与来源 URL 兜底。详见
-  // plugin_metadata.dart 的 _detectBaka / isBakaSourceUrl 注释。
-  final kind = resolvePluginKindKey(
+  final contract = pluginContractOf(
     isLx: isLx,
     isBaka: isBaka,
+    isBakaV2: isBakaV2,
     isAnimemusic: isAnimemusic,
+  );
+  // 分类判定走 [resolvePluginKindKey]：搜索页的来源 Tab、运行时分组也用同一
+  // 函数，各处口径必须一致。判定只依赖契约内容，不看显示名/作者名；排序先后
+  // 由用户自定义（见 plugin_runtime.dart 的 pluginKindOrderKey）。详见
+  // plugin_metadata.dart 的 _detectBaka / _detectBakaV2 / isBakaSourceUrl 注释。
+  final kind = resolvePluginKindKey(
+    contract: contract,
     kindHint: kinds[id],
     sourceUrl: sourceUrl,
   );
 
+  // 已停用的变量键（订阅源的 X-API-KEY）在此再过滤一次：老版本写入的
+  // meta_cache.json 里可能还留着这条，不能让它跟着缓存复活。
   final userVariables = <Map<String, String>>[
     for (final raw in (meta['userVariables'] as List? ?? const []))
-      if (raw is Map)
+      if (raw is Map &&
+          !isPluginRetiredUserVariable(raw['key']?.toString() ?? ''))
         {
           'key': raw['key']?.toString() ?? '',
           'name': raw['name']?.toString() ?? '',
@@ -187,6 +198,13 @@ Map<String, Object?> _rowFromMeta({
     'path': path,
     'enabled': enabled,
     'kind': kind,
+    // 契约与能力对外暴露：安装/订阅导入/备份导入的格式标签、音源兜底开关
+    // 的可用源清单都据此判定，不再各自嗅探脚本内容。
+    'contract': contract,
+    'capabilities': meta['capabilities'] ?? const <String>[],
+    'apiVersion': meta['apiVersion'],
+    'providerId': meta['providerId'],
+    'platform': meta['platform'],
     'name': (displayName?.trim().isNotEmpty == true
             ? displayName
             : meta['name']?.toString()) ??
@@ -209,10 +227,17 @@ Map<String, Object?> _metaToJson(PluginMetadata m) => {
   'remark': m.remark,
   'userVariables': [
     for (final v in m.userVariables)
-      {'key': v.key, 'name': v.name, 'hint': v.hint},
+      if (!isPluginRetiredUserVariable(v.key))
+        {'key': v.key, 'name': v.name, 'hint': v.hint},
   ],
   'isStarSea': m.isStarSea,
   'isLx': m.isLx,
   'isBaka': m.isBaka,
+  'isBakaV2': m.isBakaV2,
   'isAnimemusic': m.isAnimemusic,
+  // v2 契约字段一并缓存：显示名与平台标识分开存，避免把 platform 当显示名。
+  'apiVersion': m.apiVersion,
+  'providerId': m.providerId,
+  'platform': m.platform,
+  'capabilities': m.capabilities,
 };

@@ -38,7 +38,8 @@ bool isLosslessQuality(String quality) => _isLosslessQuality(quality);
 
 /// 播放页音质按钮的缩写标签（对齐 MusicFree builtinQualityAbbr）：
 /// 96k/128k→LQ、192k→MQ、320k→HQ、flac→SQ、flac24bit/hires→HR、
-/// vinyl→VN、dolby→DB、atmos→AT、atmos_plus→A+、master→MS。
+/// vinyl→VN、dts→DX、dolby→DB、atmos→AT、atmos_plus→A+、
+/// atmos_pro→AP、master→MS。
 /// 同组别名（flac/lossless/sq/super 等）映射到同一缩写；未知档位
 /// 回退前两字符大写；无音质信息（本地/未知）时回退 HQ。
 String qualityShortLabel(String quality) {
@@ -67,12 +68,17 @@ String qualityShortLabel(String quality) {
       return 'HR';
     case 'vinyl':
       return 'VN';
+    case 'dts':
+    case 'dtshd':
+      return 'DX';
     case 'dolby':
       return 'DB';
     case 'atmos':
       return 'AT';
     case 'atmos_plus':
       return 'A+';
+    case 'atmos_pro':
+      return 'AP';
     case 'ape':
       return 'APE';
     case 'wav':

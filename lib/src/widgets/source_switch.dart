@@ -19,17 +19,12 @@ import '../navigation/paged_transition.dart';
 /// 单曲换源弹出一体化底部面板（搜索框 + 音源 tab + 候选列表，
 /// 排版与关联歌词面板一致），批量换源自动取最高分。
 
-/// 插件类型标记：BakaMusic 系 / MusicFree / 洛雪 / animemusic（与歌单
-/// 网络导入对话框、插件管理页分栏一致）。分类只认插件已解析的类型，
-/// 不再按名称包含 "baka" 兜底——MusicFree 通用插件也可能带 Baka 兼容
-/// 分支或名称中含 baka 字样，按名称判定会与分栏不一致。
-String sourcePluginTag(EnabledMusicPlugin plugin) => plugin.isLx
-    ? '洛雪'
-    : plugin.isAnimemusic
-    ? 'animemusic'
-    : plugin.isBaka
-    ? 'BakaMusic'
-    : 'MusicFree';
+/// 插件类型标记：LX / BakaMusic（含 v2） / 惜梦 / MusicFree，与插件管理页
+/// 分栏、搜索来源 Tab、歌单网络导入对话框同一口径——直接取插件契约
+/// （`PluginContract.label`）的显示名，只依赖内容契约（含订阅提示与来源 URL
+/// 兜底），不按名称包含 "baka" 之类字样兜底：MusicFree 通用插件也可能带
+/// Baka 兼容分支或名称中含 baka，按名称判定会与分栏不一致。
+String sourcePluginTag(EnabledMusicPlugin plugin) => plugin.contract.label;
 
 /// 选择换源目标插件的底部菜单（批量换源用）。洛雪插件内含多个平台
 /// （kw/kg/tx/wy/mg），选中后追加二级菜单选择具体平台（或全部）；

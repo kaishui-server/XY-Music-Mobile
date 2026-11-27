@@ -316,6 +316,9 @@ class AccountPluginSync {
     final sourceUrls = _readSourceUrls(prefs);
     // 上传时携带用户变量，供其它设备云同步后恢复（账号云同步-插件）。
     final userVariables = readPluginUserVariables(prefs);
+    // 分类判定与管理页分栏/搜索来源 Tab/运行时分组同一入口：内容契约 +
+    // 订阅类型提示 + 来源 URL 兜底，不读插件显示名/作者名。
+    final kinds = readPluginKinds(prefs);
     final result = <Map<String, dynamic>>[];
     for (final file in directory.listSync().whereType<File>()) {
       if (p.extension(file.path).toLowerCase() != '.js') continue;
@@ -324,11 +327,22 @@ class AccountPluginSync {
         if (utf8.encode(script).length > _maxPluginBytes) continue;
         final metadata = PluginMetadata.parse(script);
         final id = p.basenameWithoutExtension(file.path);
-        final lower = script.toLowerCase();
+        final kind = resolvePluginKindKey(
+          contract: pluginContractOf(
+            isLx: metadata.isLx,
+            isBaka: metadata.isBaka,
+            isBakaV2: metadata.isBakaV2,
+            isAnimemusic: metadata.isAnimemusic,
+          ),
+          kindHint: kinds[id],
+          sourceUrl: sourceUrls[id] ?? '',
+        );
+        final isLxKind = kind == pluginKindLx;
         result.add({
           'id': id,
           'name': metadata.name ?? id,
-          'format': _isLx(script) ? 'lx' : 'musicfree',
+          // 云端 format 字段只区分 LX / 其它（服务端与其它端按二值读取）。
+          'format': isLxKind ? 'lx' : 'musicfree',
           'version': metadata.version ?? '0',
           'author': metadata.author ?? '',
           'description': '',
@@ -340,7 +354,7 @@ class AccountPluginSync {
           'userVariables': userVariables[id] ?? const <String, String>{},
           'script': _encodeScript(script),
           'scriptEncoded': true,
-          if (lower.contains('lx.event')) 'isLx': true,
+          if (isLxKind) 'isLx': true,
         });
       } catch (_) {
         // 单个损坏插件不应阻止其它插件同步。
@@ -414,13 +428,6 @@ class AccountPluginSync {
       if (av != bv) return av.compareTo(bv);
     }
     return 0;
-  }
-
-  static bool _isLx(String script) {
-    final lower = script.toLowerCase();
-    return lower.contains('lx.event') ||
-        lower.contains('globalthis.lx') ||
-        lower.contains('server_script_config');
   }
 
   static String _accountId(AuthNotifier auth) {

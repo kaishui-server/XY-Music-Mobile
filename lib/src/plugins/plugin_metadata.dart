@@ -17,6 +17,87 @@ class PluginUserVariable {
       name?.trim().isNotEmpty == true ? name!.trim() : key;
 }
 
+/// 已停用的插件用户变量键（归一化后：全小写、去掉非字母数字字符）。
+///
+/// 订阅源（mc.vsaa.cn）下发的 Baka 音源插件历史声明过 `SOURCE_API_KEY`
+/// 变量（显示名 X-API-KEY）。密钥在安装时已随订阅链接写进脚本自带的
+/// 常量（脚本内 `const SOURCE_API_KEY = '...'`），这一栏只是多余地把
+/// 密钥再暴露成可编辑输入框。此前仅在弹窗展示层隐藏、已保存的值仍继续
+/// 保留并注入，现改为**彻底移除**：解析阶段即剔除，不进元数据、不进
+/// 元数据缓存、不写入持久化、也不注入插件运行时环境。
+const pluginRetiredUserVariableKeys = {'sourceapikey', 'xapikey'};
+
+String _normalizeUserVariableKey(String rawKey) =>
+    rawKey.toLowerCase().replaceAll(RegExp(r'[^a-z0-9]'), '');
+
+/// 该变量键是否已被停用（兼容 `SOURCE_API_KEY` / `source_api_key` /
+/// `sourceApiKey` / `X-API-KEY` / `x-api-key` 等各种写法）。
+///
+/// 除了精确匹配，还按**前缀**判定：解析脚本时若键表达式被常量拼接污染
+/// （如 `SOURCE_API_KEY3ccnt...`），精确匹配会漏掉，停用变量就会重新
+/// 出现在设置页。停用键全部是 API Key 类，前缀命中即可判定为同一条。
+bool isPluginRetiredUserVariable(String rawKey) {
+  final normalized = _normalizeUserVariableKey(rawKey);
+  if (normalized.isEmpty) return false;
+  for (final retired in pluginRetiredUserVariableKeys) {
+    if (normalized == retired || normalized.startsWith(retired)) return true;
+  }
+  return false;
+}
+
+/// 插件**契约**类型：完全由脚本内容（契约标记/导出结构）判定，不依赖
+/// 插件显示名、备注或作者名。
+///
+/// - [lx]：洛雪 `globalThis.lx` 契约；
+/// - [bakaV2]：Baka provider v2 —— `module.exports = {manifest, handlers}`
+///   嵌套 handler 表，入口 `createProvider(sdk, request)`，manifest 声明
+///   `apiVersion: 2` 与 `capabilities`；
+/// - [baka]：旧 BakaMusic（MusicFree 协议 + Baka 私有标记）；
+/// - [animemusic]：惜梦 animemusic 后端插件；
+/// - [musicfree]：标准 MusicFree `module.exports` 契约。
+enum PluginContract {
+  lx,
+  bakaV2,
+  baka,
+  animemusic,
+  musicfree;
+
+  /// 分栏归属标识（取值与 plugin_runtime.dart 的 `pluginKind*` 常量一致）。
+  /// v2 与旧 BakaMusic 同属 BakaMusic 分栏。
+  String get kindKey => switch (this) {
+    PluginContract.lx => 'lx',
+    PluginContract.bakaV2 || PluginContract.baka => 'baka',
+    PluginContract.animemusic => 'animemusic',
+    PluginContract.musicfree => 'musicfree',
+  };
+
+  /// 格式标签（插件管理页展示，与分栏归属同源，避免两处口径不一）。
+  String get label => switch (this) {
+    PluginContract.lx => 'LX',
+    PluginContract.bakaV2 => 'BakaMusic v2',
+    PluginContract.baka => 'BakaMusic',
+    PluginContract.animemusic => '惜梦',
+    PluginContract.musicfree => 'MusicFree',
+  };
+}
+
+/// 由三个内容标记还原契约（缓存/跨 isolate 传输后只剩布尔标记时使用）。
+///
+/// v2 优先于旧 BakaMusic：v2 的 manifest 与 MusicFree 不同构，运行时路由
+/// 必须走专用适配层，不能被旧标记抢先。
+PluginContract pluginContractOf({
+  required bool isLx,
+  required bool isBaka,
+  required bool isBakaV2,
+  required bool isAnimemusic,
+}) {
+  if (isLx) return PluginContract.lx;
+  if (isBakaV2) return PluginContract.bakaV2;
+  if (isBaka) return PluginContract.baka;
+  if (isAnimemusic) return PluginContract.animemusic;
+  return PluginContract.musicfree;
+}
+
 class PluginMetadata {
   const PluginMetadata({
     this.id,
@@ -28,7 +109,12 @@ class PluginMetadata {
     this.isStarSea = false,
     this.isLx = false,
     this.isBaka = false,
+    this.isBakaV2 = false,
     this.isAnimemusic = false,
+    this.apiVersion = 0,
+    this.providerId,
+    this.platform,
+    this.capabilities = const [],
     this.availableMethods = const [],
   });
 
@@ -59,10 +145,45 @@ class PluginMetadata {
   /// 中时再由订阅类型提示与 [isBakaSourceUrl] 兜底。
   final bool isBaka;
 
+  /// Baka provider **v2** 插件：脚本带 `@baka-provider 2` 标记，或同时
+  /// 具备 `createProvider(` 工厂、manifest `apiVersion: 2` 与
+  /// `capabilities` 声明（见 [_detectBakaV2]）。v2 的 manifest 是
+  /// `{manifest, handlers}` 嵌套 handler 表，与 MusicFree 的扁平
+  /// `module.exports` 不同构，运行时必须走专用适配层。
+  final bool isBakaV2;
+
   /// animemusic 后端插件：直连 animemusic.bzxhkj.com（惜梦 v3/v4、
   /// animemusic/1 新格式等）。baka 版的 FALLBACK_BASE 也指向该域名，
   /// 分类时需先判 isBaka 再判本标记。
   final bool isAnimemusic;
+
+  /// 插件自述的契约版本（v2 插件为 `manifest.apiVersion`，其余为 0）。
+  final int apiVersion;
+
+  /// provider 唯一标识（v2 插件为 `manifest.id`，如 `org.lyramesh.qq.l1`）。
+  final String? providerId;
+
+  /// 插件声明的平台标识（v2 为 `manifest.platform`，如 `QQ音乐[H]`）。
+  /// **仅作平台标识**使用，不能当作显示名——v2 的显示名以
+  /// `manifest.name`（如「QQ音乐[T]」）为准。
+  final String? platform;
+
+  /// v2 manifest 声明的能力枚举（`search` / `media.resolve` /
+  /// `lyrics.get` / `comments.list` / `collections.members` 等）。
+  final List<String> capabilities;
+
+  /// 插件契约（内容判定结果，分类与运行时路由的唯一依据）。
+  PluginContract get contract {
+    if (isLx) return PluginContract.lx;
+    if (isBakaV2) return PluginContract.bakaV2;
+    if (isBaka) return PluginContract.baka;
+    if (isAnimemusic) return PluginContract.animemusic;
+    return PluginContract.musicfree;
+  }
+
+  /// 是否声明了某项 v2 能力（非 v2 插件恒为 false）。
+  bool hasCapability(String capability) =>
+      isBakaV2 && capabilities.contains(capability);
 
   /// 静态扫描出的 MusicFree 契约方法名（不执行脚本）。参照 XianYu 的
   /// `_availableMethods`：未适配/精简插件只实现 search + getMediaSource，
@@ -78,8 +199,11 @@ class PluginMetadata {
     final exported = _parseExportedObject(script, constants, bindings);
     final json = _parseJsonObject(script);
     final constMeta = _parseConstMeta(script);
+    final manifest = _parseProviderManifest(script);
+    final isBakaV2 = _detectBakaV2(script, manifest);
     final author = _clean(
-      header['author'] ??
+      manifest['author'] ??
+          header['author'] ??
           exported['author'] ??
           json['author'] ??
           constMeta['author'],
@@ -87,10 +211,21 @@ class PluginMetadata {
     final methods = _parseExportedMethods(script);
 
     return PluginMetadata(
-      id: _clean(header['id'] ?? exported['id'] ?? json['id']),
-      // MusicFree 使用 platform 作为插件显示名；LX 常用 @name。
+      id: _clean(
+        // manifest 只写 providerId 时，插件 ID 也应取它，否则会回退到显示名
+        // 归一化，同平台不同变体（qq.l1 / qq.l2）会互相覆盖。
+        manifest['id'] ??
+            manifest['providerId'] ??
+            header['id'] ??
+            exported['id'] ??
+            json['id'],
+      ),
+      // v2 的显示名以 manifest.name 为准（「QQ音乐[T]」），platform 只是
+      // 平台标识（「QQ音乐[H]」，带音质/接口变体后缀），不能顶替显示名；
+      // MusicFree 用 platform 作为插件显示名；LX 常用 @name。
       name: _clean(
-        header['name'] ??
+        manifest['name'] ??
+            header['name'] ??
             exported['platform'] ??
             exported['name'] ??
             json['platform'] ??
@@ -98,7 +233,8 @@ class PluginMetadata {
             constMeta['name'],
       ),
       version: _clean(
-        header['version'] ??
+        manifest['version'] ??
+            header['version'] ??
             exported['version'] ??
             json['version'] ??
             constMeta['version'],
@@ -118,8 +254,19 @@ class PluginMetadata {
       userVariables: _parseUserVariables(script, constants),
       isStarSea: _detectStarSea(script),
       isLx: _detectLx(script),
-      isBaka: _detectBaka(script, author: author),
+      // v2 与旧 BakaMusic 互斥：v2 已由 [_detectBakaV2] 单独识别，避免
+      // 同时置位导致运行时路由摇摆。
+      isBaka: !isBakaV2 && _detectBaka(script),
+      isBakaV2: isBakaV2,
       isAnimemusic: _detectAnimemusic(script),
+      apiVersion: int.tryParse((manifest['apiVersion'] ?? '').trim()) ?? 0,
+      providerId: _clean(manifest['providerId'] ?? manifest['id']),
+      // platform 只作平台标识（可含音质/接口变体后缀，如「QQ音乐[H]」），
+      // 不参与显示名，也不参与分类判定。
+      platform: _clean(
+        manifest['platform'] ?? exported['platform'] ?? json['platform'],
+      ),
+      capabilities: _parseProviderCapabilities(script),
       availableMethods: methods,
     );
   }
@@ -259,31 +406,186 @@ class PluginMetadata {
             ));
   }
 
+  /// Baka provider **v2** 静态识别（不执行脚本）。
+  ///
+  /// v2 与 MusicFree 的导出不同构：MusicFree 把方法平铺在
+  /// `module.exports` 上，v2 只导出 `{manifest, handlers}`，handler 表按
+  /// `'entities.get'` / `'media.resolve'` 之类的点号键嵌套声明，并通过
+  /// `createProvider(sdk, request)` 工厂拿 sdk 与请求。因此不能只看
+  /// `module.exports`，必须同时命中工厂与 manifest 版本声明：
+  ///
+  /// 1. 显式标记 `// @baka-provider 2`（订阅源打包时注入，最可靠）；
+  /// 2. 或 `createProvider(` + `apiVersion: 2` + `capabilities` 三者齐备。
+  ///
+  /// 判定完全不读取显示名/作者名，避免上游改名（如 QQ音乐[L1] →
+  /// QQ音乐[T]）或作者变更导致分栏与运行时路由漂移。
+  static bool _detectBakaV2(String script, Map<String, String> manifest) {
+    if (_providerVersionMarker.hasMatch(script)) return true;
+    final lower = script.toLowerCase();
+    if (!lower.contains('createprovider(') && !lower.contains('createprovider =')) {
+      return false;
+    }
+    if (!lower.contains('capabilities')) return false;
+    final version = (manifest['apiVersion'] ?? '').trim();
+    if (version.isNotEmpty) return version == '2';
+    return _manifestApiVersion2.hasMatch(script);
+  }
+
+  static final RegExp _providerVersionMarker = RegExp(
+    r'''@baka-provider\s*[:=]?\s*2\b''',
+    caseSensitive: false,
+  );
+
+  static final RegExp _manifestApiVersion2 = RegExp(
+    r'''["']?apiVersion["']?\s*:\s*2\b''',
+  );
+
+  /// 提取 v2 manifest 的标量字段（name/platform/id/version/author）。
+  ///
+  /// manifest 是脚本顶部的对象字面量（`const manifest = {...}` 或
+  /// `module.exports = { manifest: {...} }`），这里只做**静态切片**：先定位
+  /// 字面量起点，再按大括号配平截取，最后逐键取字符串值。取不到时返回空
+  /// 表，调用方按其他契约的取值链回退，不影响旧插件解析。
+  static Map<String, String> _parseProviderManifest(String script) {
+    final slice = _manifestObjectSlice(script);
+    if (slice == null) return const {};
+    final result = <String, String>{};
+    for (final key in const [
+      'name',
+      'platform',
+      'id',
+      // v2 契约的稳定标识既能写成 `id` 也能写成 `providerId`，两种都要取。
+      'providerId',
+      'version',
+      'author',
+      'apiVersion',
+    ]) {
+      final value = _manifestScalar(slice, key);
+      if (value != null && value.isNotEmpty) result[key] = value;
+    }
+    return result;
+  }
+
+  /// 提取 v2 manifest 声明的 `capabilities` 枚举。
+  static List<String> _parseProviderCapabilities(String script) {
+    final slice = _manifestObjectSlice(script);
+    if (slice == null) return const [];
+    final match = RegExp(
+      r'''["']?capabilities["']?\s*:\s*\[([^\]]*)\]''',
+      caseSensitive: false,
+    ).firstMatch(slice);
+    if (match == null) return const [];
+    final body = match.group(1) ?? '';
+    final capabilities = <String>[];
+    for (final raw in body.split(',')) {
+      final value = raw
+          .trim()
+          .replaceAll(RegExp(r'''^["']|["']$'''), '')
+          .trim();
+      if (value.isEmpty || capabilities.contains(value)) continue;
+      capabilities.add(value);
+    }
+    return List<String>.unmodifiable(capabilities);
+  }
+
+  /// 截取 manifest 对象字面量原文（含大括号），找不到则返回 null。
+  static String? _manifestObjectSlice(String script) {
+    final patterns = <RegExp>[
+      RegExp(r'''\bmanifest\s*[:=]\s*\{'''),
+      RegExp(r'''["']manifest["']\s*:\s*\{'''),
+    ];
+    for (final pattern in patterns) {
+      final match = pattern.firstMatch(script);
+      if (match == null) continue;
+      final start = script.indexOf('{', match.start);
+      if (start < 0) continue;
+      var depth = 0;
+      var quote = '';
+      for (var i = start; i < script.length; i++) {
+        final char = script[i];
+        if (quote.isNotEmpty) {
+          if (char == r'\') {
+            i++;
+            continue;
+          }
+          if (char == quote) quote = '';
+          continue;
+        }
+        if (char == '"' || char == "'" || char == '`') {
+          quote = char;
+          continue;
+        }
+        if (char == '{') {
+          depth++;
+        } else if (char == '}') {
+          depth--;
+          if (depth == 0) return script.substring(start, i + 1);
+        }
+      }
+    }
+    return null;
+  }
+
+  /// 在 manifest 切片中读取键的标量值（字符串或数字），失败返回 null。
+  ///
+  /// 先按**顶层键**取值（嵌套对象/数组整体跳过），取不到再回退到全切片
+  /// 正则。两步都必须加键名左边界，否则子串会互相污染——实测上游 manifest
+  /// 同时含 `apiVersion` / `appVersion` / `version`，不加边界时：
+  /// `version: 2` 会命中 `apiVersion:2`、`version: ">0.1.0-alpha.0"` 会命中
+  /// `appVersion`，导致版本号被解析成 `2` / `>0.1.0-alpha.0`，进而让升级
+  /// 判定（[compareVersions]）失效。同理 `id` 不能命中 `providerId`。
+  static String? _manifestScalar(String slice, String key) {
+    final topLevel = _manifestTopLevelValue(slice, key);
+    if (topLevel != null) return topLevel;
+    final match = RegExp(
+      '(?<![\\w\$.])["\']?$key["\']?\\s*:\\s*("[^"]*"|\'[^\']*\'|[^,}\\]\\s]+)',
+      caseSensitive: false,
+    ).firstMatch(slice);
+    if (match == null) return null;
+    return _clean(
+      match.group(1)?.replaceAll(RegExp(r'''^["']|["']$'''), ''),
+    );
+  }
+
+  /// 读取 manifest 顶层键 [key] 的标量值；值不是标量（对象/数组）或键
+  /// 不存在时返回 null，交由 [_manifestScalar] 的正则回退处理。
+  ///
+  /// 顶层扫描的意义在于 `name`：manifest 的 `userVariables` 里也带 `name`
+  /// 字段（如「用户 ID」），全切片正则一旦顺序变化就会把变量显示名当成
+  /// 插件显示名。
+  static String? _manifestTopLevelValue(String slice, String key) {
+    if (slice.length < 2) return null;
+    final String? raw;
+    try {
+      raw = _topLevelValue(slice.substring(1, slice.length - 1), key);
+    } catch (_) {
+      return null;
+    }
+    if (raw == null) return null;
+    final trimmed = raw.trim();
+    if (trimmed.isEmpty ||
+        trimmed.startsWith('{') ||
+        trimmed.startsWith('[')) {
+      return null;
+    }
+    if (trimmed.startsWith('"') || trimmed.startsWith("'")) {
+      final literal = _readStringLiteral(trimmed, 0);
+      if (literal == null) return null;
+      return _clean(literal.$1);
+    }
+    return _clean(trimmed);
+  }
+
   /// BakaMusic 契约静态识别（用于区分 MusicFree 与 BakaMusic）。
   ///
-  /// [nonBakaAuthors] 命中的作者先排除，再按两条内容特征判定：
-  /// 1. `animeSrc` 歌曲来源标记；
-  /// 2. MV 组合标记 `getMvSource` + `supportedVideoQualities`。
-  ///
-  /// 第 2 条用于覆盖只具备 BakaMusic 官方订阅特征、没有 `animeSrc` 的插件，
-  /// 实测命中：BakaMusic 官方订阅（animemusic.bzxhkj.com/baka）全部 6 个插件，
-  /// 以及 Toskysun 的 QQ音乐[L1]/[L2]（此前只认 animeSrc 时被误分到
-  /// MusicFree 分栏）。全量 95 个 MusicFree 订阅脚本中只有万象API 的 qq/bili
-  /// 两个脚本同时导出这两个标记，已由 [nonBakaAuthors] 排除。
-  ///
-  /// 刻意不用以下特征，它们都会把 MusicFree 插件误分类到 Baka 分栏：
-  /// - `author == toskysun`：MusicFree 源里的「GD音乐台」同样是 Toskysun 作品
-  ///   （实测无 getMvSource/supportedVideoQualities），仅按作者判会误伤；
-  /// - `getMusicComments`、`supportedQualities` 单独出现：万象API 等
-  ///   MusicFree 系插件同样声明，单独用会大面积误伤。
+  /// 判定**只看脚本内容**，不读取作者名或显示名（上游改名/换作者不再影响
+  /// 分栏）：命中 `animeSrc`，或同时具备 MV 组合标记 `getMvSource` +
+  /// `supportedVideoQualities`。v2 插件由 [_detectBakaV2] 先行截获，
+  /// 不会进入这里。
   ///
   /// 内容识别不中时，再由订阅类型提示（索引含 `yourinfo`、URL 含 `baka`）与
   /// [isBakaSourceUrl] 兜底。
-  static bool _detectBaka(String script, {String? author}) {
-    final authorLower = (author ?? '').toLowerCase();
-    for (final name in nonBakaAuthors) {
-      if (authorLower.contains(name.toLowerCase())) return false;
-    }
+  static bool _detectBaka(String script) {
     final lower = script.toLowerCase();
     if (lower.contains('animesrc')) return true;
     return lower.contains('getmvsource') &&
@@ -426,7 +728,9 @@ class PluginMetadata {
   ) {
     final result = <PluginUserVariable>[];
     final seen = <String>{};
-    final arrayPattern = RegExp(r'''userVariables\s*:\s*\[''');
+    // manifest 的对象字面量可能是 JSON 风格，键带引号（`"userVariables": [`）。
+    // 不兼容引号时，酷狗/酷我这批 v2 插件的变量声明会被整体漏掉。
+    final arrayPattern = RegExp(r'''["']?userVariables["']?\s*:\s*\[''');
     for (final match in arrayPattern.allMatches(script)) {
       final arrayText = _extractBalanced(script, match.end - 1, '[', ']');
       if (arrayText == null) continue;
@@ -443,9 +747,10 @@ class PluginMetadata {
           _fieldValue(objectText, 'key') ?? '',
           constants,
         );
-        if (key == null || key.trim().isEmpty || !seen.add(key.trim())) {
-          continue;
-        }
+        if (key == null || key.trim().isEmpty) continue;
+        // 已停用的变量（如订阅源的 X-API-KEY）连元数据都不进。
+        if (isPluginRetiredUserVariable(key)) continue;
+        if (!seen.add(key.trim())) continue;
         result.add(
           PluginUserVariable(
             key: key.trim(),
@@ -803,6 +1108,20 @@ class PluginMetadata {
 
     final quoted = RegExp(r'''["']([^"']*)["']''').firstMatch(expression);
     String? result = quoted?.group(1);
+
+    // 表达式本身就是一个完整字符串字面量时直接返回，不能再去拼接同名常量：
+    // 订阅源脚本里常写 `const SOURCE_API_KEY = '3ccnt...'`，键却声明成
+    // `{ key: "SOURCE_API_KEY" }`；按常量名拼接会把键变成
+    // `SOURCE_API_KEY3ccnt...`，导致停用键过滤（[isPluginRetiredUserVariable]）
+    // 失配，X-API-KEY 这一栏又会被加到设置页。
+    final trimmedExpression = expression.trim();
+    if (trimmedExpression.isNotEmpty &&
+        (trimmedExpression.startsWith('"') || trimmedExpression.startsWith("'"))) {
+      final literal = _readStringLiteral(trimmedExpression, 0);
+      if (literal != null && literal.$2 == trimmedExpression.length) {
+        return literal.$1;
+      }
+    }
 
     // version: VERSION / platform: "网易云音乐" + (IS_PAID ? IS_PAID : "")
     // 均可通过顶层字符串常量静态还原，无需执行不受信任的插件脚本。
@@ -1172,33 +1491,28 @@ class _StaticNode {
 
 /// 插件分类的**唯一**判定入口。
 ///
-/// 插件管理页的分栏（`_rowFromMeta`）与搜索页的来源 Tab 顺序
-///（`musicPluginKindKeyOf`）都走这里：此前两处各写一份规则，管理页带
-/// [PluginMetadata.isBakaSourceUrl] 兜底与「musicfree 提示不压回 baka」的
-/// 压制逻辑，搜索页只看运行时契约标记，于是同一个插件在管理页归入
-/// BakaMusic 分栏、在搜索页却被当成 MusicFree，两边顺序自然对不上。
+/// 插件管理页的分栏（`_rowFromMeta`）、运行时分组（`musicPluginKindKeyOf`）、
+/// 安装/订阅导入/备份导入的格式标签、音源兜底开关的可用源清单，全部走
+/// 这一个函数，避免多处各写一份规则导致同一插件在不同链路归类不一致。
+///
+/// 判定只依赖 [contract]（脚本内容识别出的契约）与订阅元信息，**不读取
+/// 插件显示名、备注或作者名**：上游改名（QQ音乐[L1] → QQ音乐[T]）或换作者
+/// 都不会改变归类。
 ///
 /// 返回分类标识 `lx` / `baka` / `animemusic` / `musicfree` / `other`
-///（取值与 plugin_runtime.dart 的 `pluginKind*` 常量一致）。优先级：
-/// 用户手动归入「其他」> LX 契约 > BakaMusic 契约 > animemusic 后端 >
-/// 标准 MusicFree；内容识别不中时由订阅类型提示 [kindHint] 与来源 URL
-/// [sourceUrl] 兜底。
+///（取值与 plugin_runtime.dart 的 `pluginKind*` 常量一致）。这里**不含任何
+/// 固定格式优先级**：类别只由插件自身契约决定，展示先后顺序交给用户自定义
+/// 排序（`pluginKindOrderKey`）。[kindHint] 与 [sourceUrl] 仅在契约无法区分
+/// MusicFree / BakaMusic 时兜底。
 String resolvePluginKindKey({
-  required bool isLx,
-  required bool isBaka,
-  required bool isAnimemusic,
+  required PluginContract contract,
   String? kindHint,
   String? sourceUrl,
 }) {
-  var kind = isLx
-      ? 'lx'
-      : isBaka
-      ? 'baka'
-      : isAnimemusic
-      ? 'animemusic'
-      : 'musicfree';
   final hint = kindHint?.trim().toLowerCase();
+  // 用户手动归入「其他」优先级最高，避免手动整理被内容识别覆盖。
   if (hint == 'other') return 'other';
+  var kind = contract.kindKey;
   if (kind == 'musicfree' || kind == 'baka') {
     if (hint == 'baka') {
       kind = 'baka';

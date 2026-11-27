@@ -1,0 +1,10 @@
+baka-av3a
+SPDX-License-Identifier: GPL-3.0-or-later
+Copyright (c) 2026 baka-av3a contributors.
+
+This software is distributed under the GNU General Public License,
+version 3 or (at your option) any later version. See LICENSE.
+
+Trained model weights, external LSF/MCR codebooks, HOA basis assets,
+measured HRIR datasets and audio recordings are not included in this
+distribution. The software license does not grant rights to those assets.

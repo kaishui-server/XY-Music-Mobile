@@ -57,6 +57,7 @@ class EnabledMusicPlugin {
     this.isLx = false,
     this.lxSources = const [],
     this.isBaka = false,
+    this.isBakaV2 = false,
     this.isAnimemusic = false,
     this.animemusicApi = '',
     this.animemusicPlatform = 'wy',
@@ -76,6 +77,13 @@ class EnabledMusicPlugin {
   /// BakaMusic 契约插件（getMvSource 方法 / animeSrc 来源标记），优先级
   /// 低于 LX、高于 animemusic，与插件管理页的分类规则一致。
   final bool isBaka;
+
+  /// Baka provider **v2** 契约（`{manifest, handlers}` + `createProvider`）：
+  /// 由 [PluginMetadata.isBakaV2] 内容识别，与旧 BakaMusic 互斥。v2 与旧
+  /// BakaMusic 同属 BakaMusic 分栏（见 [PluginContract.kindKey]），但运行时
+  /// 走各自适配层，所以单独保留一个标记；[isBaka] 仍只表示旧契约，避免旧
+  /// Baka 私有接口（animeSrc / getDailyRecommendations）被误用到 v2 插件上。
+  final bool isBakaV2;
 
   /// animemusic/1 自有格式插件：CommonJS Node 模块，QuickJS 无法直接
   /// 执行（没有 http/https/zlib 内置模块），宿主按其 REST 契约直连。
@@ -112,6 +120,18 @@ class EnabledMusicPlugin {
   /// isolate 调用与错误日志。仅对 MusicFree 族插件有意义。
   bool mayHaveMethod(String method) =>
       availableMethods.isEmpty || availableMethods.contains(method);
+
+  /// 插件契约（分类与格式标签的唯一依据，见 [PluginContract]）。
+  /// 只由内容识别出的标记决定，不读插件显示名/备注/作者名。
+  PluginContract get contract => pluginContractOf(
+    isLx: isLx,
+    isBaka: isBaka,
+    isBakaV2: isBakaV2,
+    isAnimemusic: isAnimemusic,
+  );
+
+  /// 分类归属标识（`lx` / `baka` / `animemusic` / `musicfree`）。
+  String get kindKey => contract.kindKey;
 }
 
 class PluginSearchSong {
@@ -279,8 +299,10 @@ typedef _QualityProbeOutcome = ({List<String> qualities, bool complete});
 
 /// 音质档位的展示标签（设置页、播放页音质选择器共用）。
 /// 档位集合对齐 MusicFree：96k / 128k / 192k / 320k / flac / flac24bit /
-/// hires / vinyl / dolby / atmos / atmos_plus / master，另兼容插件侧
-/// 仍会返回的 lossless / sq / ape / wav / hi-res / standard / high 等别名。
+/// hires / vinyl / dts / dolby / atmos / atmos_plus / atmos_pro / master，
+/// 另兼容插件侧仍会返回的 lossless / sq / ape / wav / hi-res / standard /
+/// high 等别名。dts 与 atmos_pro 是 Baka[T] 插件声明的档位（QQ 的
+/// galaxy916 空间音频、各平台 DTS:X），此前未登记导致显示原始代号。
 /// 注意同组别名（如 flac / lossless / sq）必须映射到同一标签，播放页
 /// 依赖标签去重；dolby 与 atmos 是两档不同音质，标签必须可区分。
 String qualityDisplayLabel(String quality) {
@@ -300,9 +322,13 @@ String qualityDisplayLabel(String quality) {
     return 'Hi-Res 无损';
   }
   if (lower == 'vinyl') return '黑胶转录';
-  if (lower == 'atmos_plus') return '全景声 2.0';
-  if (lower == 'atmos') return '全景声';
-  if (lower == 'dolby') return '杜比全景声';
+  // 空间音频五档：菜单里带「空间音质」前缀标记分组（对齐 BakaMusic），
+  // master 恒为最高档（qualityTierRank 12 > atmos_pro 11）。
+  if (lower == 'atmos_pro') return '空间音质 Pro';
+  if (lower == 'atmos_plus') return '空间音质 Plus';
+  if (lower == 'atmos') return '空间音质 Atmos';
+  if (lower == 'dolby') return '空间音质 Dolby';
+  if (lower == 'dts' || lower == 'dtshd') return '空间音质 DTS:X';
   if (lower.contains('master')) return '超清母带';
   if (lower == 'ape') return 'APE 无损';
   if (lower == 'wav') return 'WAV 无损';
@@ -336,12 +362,13 @@ int qualityTierRank(String quality) {
     'dolby': 8,
     'atmos': 9,
     'atmos_plus': 10,
-    'master': 11,
+    'atmos_pro': 11,
+    'master': 12,
   };
   if (ranks.containsKey(lower)) return ranks[lower]!;
-  if (lower.contains('master')) return 11;
+  if (lower.contains('master')) return 12;
   if (lower.contains('24bit')) return 5;
-  return 12;
+  return 13;
 }
 
 const _qualityDiscoveryFallback = [
@@ -356,8 +383,11 @@ const _qualityDiscoveryFallback = [
   'sq',
   'ape',
   'wav',
+  'dts',
   'dolby',
   'atmos',
+  'atmos_plus',
+  'atmos_pro',
 ];
 
 /// 同步读取插件歌曲快照中声明的音质标识（公开包装）。
@@ -611,6 +641,7 @@ Future<List<EnabledMusicPlugin>> loadEnabledMusicPlugins(Ref ref) async {
         isLx: m['isLx']! as bool,
         lxSources: (m['lxSources'] as List).cast<String>(),
         isBaka: m['isBaka']! as bool,
+        isBakaV2: m['isBakaV2'] as bool? ?? false,
         isAnimemusic: m['isAnimemusic']! as bool,
         sourceLabel: m['sourceLabel'] as String?,
         animemusicApi: m['animemusicApi']! as String,
@@ -659,26 +690,26 @@ Future<List<Map<String, Object?>>> _loadEnabledMusicPluginsInIsolate({
       // 订阅索引声明的显示名优先：脚本混淆/无元信息时也能显示正确名称。
       final overrideName = displayNames[id]?.trim() ?? '';
       if (overrideName.isNotEmpty) pluginName = overrideName;
-      // 分类优先级与插件管理页一致：LX > BakaMusic > animemusic。BakaMusic
-      // 兼容 MusicFree 协议，先看内容证据（metadata.isBaka），不中时用订阅类型
-      // 提示，再兜底来源 URL——同 ID 插件被另一族覆盖时来源 URL 会从旧插件
-      // 继承，若 URL 优先会把 MusicFree 插件误标成 BakaMusic。
-      var isBaka = !isLx && !isAnimemusic && metadata.isBaka;
-      if (!isLx && !isAnimemusic) {
-        final kindHint = kinds[id];
-        if (kindHint == pluginKindBaka) {
-          isBaka = true;
-        } else if (kindHint == pluginKindOther) {
-          // 手动归入「其他」的插件按 MusicFree 族处理，不强制 Baka 契约。
-          isBaka = false;
-        } else if (kindHint == pluginKindMusicFree) {
-          // 内容已判定为 Baka 契约时不采纳 musicfree 提示（同插件管理页）：
-          // 该提示多半只是「导入时所在分栏」，压不住内容证据。
-          if (!metadata.isBaka) isBaka = false;
-        } else if (PluginMetadata.isBakaSourceUrl(sourceUrls[id] ?? '')) {
-          isBaka = true;
-        }
-      }
+      // 分类判定统一走 [resolvePluginKindKey]（与插件管理页分栏、搜索页
+      // 来源 Tab 同一入口）：只依赖内容契约 + 订阅提示 + 来源 URL，不读
+      // 显示名/作者名。BakaMusic 兼容 MusicFree 协议，内容证据优先，提示与
+      // 来源 URL 仅在契约无法区分时兜底（同 ID 插件被另一族覆盖时来源 URL
+      // 会从旧插件继承，URL 优先会把 MusicFree 插件误标成 BakaMusic）。
+      final isBakaV2 = metadata.isBakaV2;
+      final kind = resolvePluginKindKey(
+        contract: pluginContractOf(
+          isLx: isLx,
+          isBaka: metadata.isBaka,
+          isBakaV2: isBakaV2,
+          isAnimemusic: isAnimemusic,
+        ),
+        kindHint: kinds[id],
+        sourceUrl: sourceUrls[id] ?? '',
+      );
+      // v2 与旧 BakaMusic 同属 baka 分栏，但运行时旧 Baka 私有接口
+      // （animeSrc / getDailyRecommendations）只对旧契约开放，v2 走自己的
+      // 适配层，故 [EnabledMusicPlugin.isBaka] 不随分栏置位。
+      final isBaka = kind == pluginKindBaka && !isBakaV2;
       plugins.add(<String, Object?>{
         'id': id,
         'name': pluginName,
@@ -688,6 +719,7 @@ Future<List<Map<String, Object?>>> _loadEnabledMusicPluginsInIsolate({
             ? _detectLxSources(source, name: pluginName)
             : const <String>[],
         'isBaka': isBaka,
+        'isBakaV2': isBakaV2,
         'isAnimemusic': isAnimemusic,
         'sourceLabel': sourceLabels[id],
         'animemusicApi':
@@ -855,6 +887,11 @@ Map<String, String> readPluginSourceLabels(SharedPreferences prefs) {
 }
 
 /// 读取全部插件的用户变量，只保留合法的字符串键值。
+///
+/// 已停用的变量键（订阅源的 X-API-KEY，见 [isPluginRetiredUserVariable]）
+/// 在这里就被丢弃：老版本写进 SharedPreferences 的存量值即使还在磁盘上，
+/// 也不会进入 `env.getUserVariables()`，不会再被任何插件读到。任意一次
+/// 变量保存都会把净化后的整表写回，顺带完成磁盘清理。
 Map<String, Map<String, String>> readPluginUserVariables(
   SharedPreferences prefs,
 ) {
@@ -868,7 +905,8 @@ Map<String, Map<String, String>> readPluginUserVariables(
         if (entry.value is Map)
           entry.key.toString(): {
             for (final variable in (entry.value as Map).entries)
-              if (variable.value is String)
+              if (variable.value is String &&
+                  !isPluginRetiredUserVariable(variable.key.toString()))
                 variable.key.toString(): variable.value as String,
           },
     };
@@ -933,7 +971,11 @@ bool _looksLikeLxPlugin(String source) {
 /// 取流仍由订阅源（lx-cit 的 `source=qs`）按 `musicUrl` 动作解析。
 /// `jo`（JOOX）同理由 Rust `search_jo` 直连官方搜索接口，歌词走
 /// `fetch_jo_lyric`，取流仍由订阅源按 `musicUrl` 解析。
-const kHostLxSearchSources = ['kw', 'kg', 'tx', 'wy', 'mg', 'qs', 'jo'];
+// 宿主内置搜索（Rust `lx_search`）支持的平台。汽水（qs）此前接入过
+// 匿名 PC 接口，2026-11 上游全面启用应用级签名门禁（HTTP 200 + 空 body），
+// 匿名搜索已不可用，平台从宿主搜索列表移除；汽水歌曲仍可经插件
+// musicUrl 播放，只是不再提供宿主搜索入口。
+const kHostLxSearchSources = ['kw', 'kg', 'tx', 'wy', 'mg', 'jo'];
 
 /// 宿主内置**歌单**搜索（Rust `lx_search_playlists`）真正实现的平台。
 /// 汽水只做了单曲搜索，歌单侧未实现，单独成表以免选到汽水歌单时
@@ -1288,9 +1330,7 @@ String musicPluginKindKeyOf(
   // 运行时契约标记，同一插件两边分类不同，导致搜索来源 Tab 顺序与管理页
   // 分栏顺序对不上。
   return resolvePluginKindKey(
-    isLx: plugin.isLx,
-    isBaka: plugin.isBaka,
-    isAnimemusic: plugin.isAnimemusic,
+    contract: plugin.contract,
     kindHint: overrides?[plugin.id],
     sourceUrl: plugin.sourceUrl,
   );
@@ -1480,12 +1520,17 @@ class PluginRuntimeService {
     this.httpClient,
     this.runtimeBootstrap,
     this.runtimeLxBootstrap,
+    this.runtimeV2Bootstrap,
     this.pluginSources = const {},
   });
 
   final http.BaseClient? httpClient;
   final String? runtimeBootstrap;
   final String? runtimeLxBootstrap;
+
+  /// BakaMusic provider apiVersion 2 适配层源码（assets/baka_v2_adapter.js）。
+  /// 后台 isolate 无法读 rootBundle，必须由主 isolate 解析后随 bootstrap 传入。
+  final String? runtimeV2Bootstrap;
   final Map<String, String> pluginSources;
   JavascriptRuntime? _runtime;
   // 常驻插件工作 isolate：QuickJS 运行时与已加载插件全程复用，
@@ -1498,8 +1543,10 @@ class PluginRuntimeService {
   int _activeRuntimeOperations = 0;
   bool _disposeRequested = false;
   Future<String>? _runtimeBootstrapTask;
+  Future<String>? _v2BootstrapTask;
   final Set<String> _loaded = {};
   final Set<String> _loadedLx = {};
+  final Set<String> _loadedV2 = {};
   final Map<String, Future<void>> _loadTasks = {};
   final Map<String, Future<String>> _pluginSourceTasks = {};
   final Map<String, _NeteaseTrackMeta> _neteaseTrackMetaCache = {};
@@ -1912,6 +1959,17 @@ class PluginRuntimeService {
         sourceUrl: 'xy_lx_plugin_runtime.js',
       );
       if (lxResult.isError) throw Exception(lxResult.stringResult);
+      // v2 适配层必须早于任何插件加载：它把 apiVersion 2 插件包成 MusicFree
+      // 形状的门面并注册进 __xyLoadMusicFreePlugin 的实例表，后续调用复用
+      // 既有的 __xyCallMusicFreePlugin 通道。
+      final v2Bootstrap =
+          runtimeV2Bootstrap ??
+          await rootBundle.loadString('assets/baka_v2_adapter.js');
+      final v2Result = runtime.evaluate(
+        v2Bootstrap,
+        sourceUrl: 'xy_v2_plugin_adapter.js',
+      );
+      if (v2Result.isError) throw Exception(v2Result.stringResult);
       _runtime = runtime;
     } catch (_) {
       runtime.dispose();
@@ -1921,6 +1979,11 @@ class PluginRuntimeService {
   }
 
   Future<void> _ensurePlugin(EnabledMusicPlugin plugin) {
+    // apiVersion 2 插件（module.exports={manifest,handlers} + createProvider）
+    // 由适配层加载：适配层按 manifest.capabilities 裁剪出方法集后注册成
+    // MusicFree 形状的门面，因此下面的 __xyCallMusicFreePlugin 调用链不用
+    // 感知契约差异，既有 lx / musicfree / 旧 baka / 惜梦 插件行为不变。
+    if (plugin.isBakaV2) return _ensureV2Plugin(plugin);
     if (_loaded.contains(plugin.id)) return Future.value();
     return _loadTasks
         .putIfAbsent(plugin.id, () async {
@@ -1942,6 +2005,40 @@ class PluginRuntimeService {
           _loaded.add(plugin.id);
         })
         .whenComplete(() => _loadTasks.remove(plugin.id));
+  }
+
+  /// 加载 BakaMusic provider apiVersion 2 插件。
+  ///
+  /// 适配层负责解析 manifest / handlers / createProvider，按
+  /// `manifest.capabilities` 裁剪可用方法（未声明的能力不生成门面方法，调用时
+  /// 直接报「插件未提供 X() 方法」，与既有契约的降级语义一致），并把用户变量
+  /// 与 sdk（request / storage / env）注入插件。
+  Future<void> _ensureV2Plugin(EnabledMusicPlugin plugin) {
+    if (_loadedV2.contains(plugin.id)) return Future.value();
+    return _loadTasks
+        .putIfAbsent('${plugin.id}:v2', () async {
+          await _ensureRuntime();
+          final source = await _loadPluginSource(plugin);
+          final result = _runtime!.evaluate(
+            '__xyLoadV2Plugin(${jsonEncode(plugin.id)},'
+            '${jsonEncode(source)},'
+            '${jsonEncode(jsonEncode(plugin.userVariables))})',
+            sourceUrl: p.basename(plugin.path),
+          );
+          if (result.isError) {
+            throw Exception(_friendlyError(result.stringResult));
+          }
+          final decoded = _decodeResult(result.stringResult);
+          if (decoded is! Map || decoded['ok'] != true) {
+            final reason = decoded is Map ? decoded['error'] : null;
+            final detail = reason == null
+                ? '适配层返回格式无效'
+                : _friendlyError('$reason');
+            throw Exception('插件「${plugin.name}」初始化失败：$detail');
+          }
+          _loadedV2.add(plugin.id);
+        })
+        .whenComplete(() => _loadTasks.remove('${plugin.id}:v2'));
   }
 
   Future<String> _loadPluginSource(EnabledMusicPlugin plugin) {
@@ -2120,6 +2217,9 @@ class PluginRuntimeService {
         'pluginName': plugin.name,
         'pluginPath': plugin.path,
         'pluginSource': sourceAlreadySynced ? '' : pluginSource,
+        // 后台 isolate 里的 EnabledMusicPlugin 需重建，契约标记必须随请求带过去，
+        // 否则 v2 插件会被当成 MusicFree 插件加载而报「未提供 search() 方法」。
+        'isBakaV2': plugin.isBakaV2,
         'userVariables': jsonEncode(plugin.userVariables),
         'payload': jsonEncode(payload),
       });
@@ -2154,6 +2254,9 @@ class PluginRuntimeService {
     final lxBootstrap = await rootBundle.loadString(
       'assets/lx_plugin_runtime.js',
     );
+    final v2Bootstrap = await (_v2BootstrapTask ??= rootBundle.loadString(
+      'assets/baka_v2_adapter.js',
+    ));
     final request = <String, String>{
       'operation': operation,
       'pluginId': plugin.id,
@@ -2162,6 +2265,8 @@ class PluginRuntimeService {
       'pluginSource': pluginSource,
       'bootstrap': bootstrap,
       'lxBootstrap': lxBootstrap,
+      'v2Bootstrap': v2Bootstrap,
+      'isBakaV2': plugin.isBakaV2 ? '1' : '0',
       'userVariables': jsonEncode(plugin.userVariables),
       'payload': jsonEncode(payload),
     };
@@ -3609,13 +3714,16 @@ class PluginRuntimeService {
   }) async {
     var sources = plugin.lxSources.isEmpty
         ? kHostLxSearchSources
-        : plugin.lxSources;
+        : plugin.lxSources
+              .where(kHostLxSearchSources.contains)
+              .toList(growable: false);
     if (onlySource != null && onlySource.isNotEmpty) {
       sources = sources.contains(onlySource) ? [onlySource] : const [];
     }
     // 宿主内置搜索（Rust `lx_search`）只实现了 kHostLxSearchSources 内的
-    // 平台，其余平台（ikun 的 git、lx-cit 的 jo 等）只在取播放链接时由订阅
-    // 源解析，搜索没有宿主实现。这里先剥离：
+    // 平台，其余平台（ikun 的 git、lx-cit 的 qs/bili/bd 等）只在取播放
+    // 链接时由订阅源解析，搜索没有宿主实现。插件声明了但宿主搜不了的
+    // 平台已在上方剥离（搜索页下拉也不展示），这里兜底防御：
     //  - 单平台选中时给出明确提示，避免「Unknown LX source: git」这种内部
     //    报错直接甩到界面上；
     //  - 「全部平台」时跳过未接入平台继续搜已验证平台，不让一个平台把整轮
@@ -3634,7 +3742,7 @@ class PluginRuntimeService {
       if (sources.isEmpty) {
         throw Exception(
           '${plugin.name} 声明的平台（${unsupported.join('/')}）暂无搜索能力：'
-          '宿主当前仅支持酷我/酷狗/QQ音乐/网易云/咪咕/汽水',
+          '宿主当前仅支持酷我/酷狗/QQ音乐/网易云/咪咕/JOOX',
         );
       }
     }
@@ -9230,6 +9338,7 @@ class PluginRuntimeService {
     _disposeRequested = false;
     _loaded.clear();
     _loadedLx.clear();
+    _loadedV2.clear();
     _loadTasks.clear();
     _lxCallQueue.clear();
     _pluginSourceTasks.clear();
@@ -9263,6 +9372,7 @@ class PluginRuntimeService {
     _initializing = null;
     _loaded.clear();
     _loadedLx.clear();
+    _loadedV2.clear();
     _loadTasks.clear();
     _lxCallQueue.clear();
     _pluginSourceTasks.clear();
@@ -9289,29 +9399,14 @@ class PluginRuntimeService {
 bool isBilibiliPluginSource(EnabledMusicPlugin plugin) =>
     PluginRuntimeService._isBilibiliPlugin(plugin);
 
-/// 识别音源类别（歌单导入页、换源面板等处的分类标记）：
-/// - BakaMusic：由 [EnabledMusicPlugin.isBaka] 判定，其中已包含契约特征
-///   （animeSrc）、订阅类型提示与来源 URL 兜底，此处不再重复按 URL 判定，
-///   否则会在「提示为 MusicFree 但来源 URL 仍是旧 Baka 订阅」时与插件
-///   管理页分栏不一致。
-/// - `animemusic.bzxhkj.com/animemusic*` / `/v2` / `/v3` →「惜梦」
-/// - 无来源记录时回退旧规则：名称含 baka →「BakaMusic」；animemusic/1
-///   格式 →「惜梦」；其余 →「MusicFree」。
-String pluginSourceTag(EnabledMusicPlugin plugin) {
-  // 契约特征最准：优先于 URL 前缀（BakaMusic 契约插件可能托管在
-  // 任意订阅源上，如 QQ音乐[L1]）。
-  if (plugin.isBaka) return 'BakaMusic';
-  final url = plugin.sourceUrl.trim().toLowerCase();
-  if (url.isNotEmpty &&
-      RegExp(
-        r'^https?://animemusic\.bzxhkj\.com/(animemusic|v\d+)',
-      ).hasMatch(url)) {
-    return '惜梦';
-  }
-  if (plugin.name.toLowerCase().contains('baka')) return 'BakaMusic';
-  if (plugin.isAnimemusic) return '惜梦';
-  return 'MusicFree';
-}
+/// 识别音源类别（歌单导入页、换源面板等处的分类标记）。
+///
+/// 与插件管理页分栏、搜索页来源 Tab、运行时分组同一口径：直接取
+/// [EnabledMusicPlugin.contract] 的显示名（见 [PluginContract.label]），
+/// 只依赖内容契约（含订阅提示与来源 URL 兜底），**不读插件显示名/作者名**，
+/// 也不再单独按来源 URL 嗅探，避免「名称含 baka 的 MusicFree 插件」「托管在
+/// animemusic 域名下的 MusicFree 插件」被打上错误标签。
+String pluginSourceTag(EnabledMusicPlugin plugin) => plugin.contract.label;
 
 class _NeteaseTrackMeta {
   const _NeteaseTrackMeta({required this.coverUrl, required this.durationMs});
@@ -9351,6 +9446,7 @@ Future<String> _executePluginOperationInBackground(
     httpClient: client,
     runtimeBootstrap: request['bootstrap'],
     runtimeLxBootstrap: request['lxBootstrap'],
+    runtimeV2Bootstrap: request['v2Bootstrap'],
     pluginSources: {request['pluginId'] ?? '': request['pluginSource'] ?? ''},
   );
   try {
@@ -9358,6 +9454,7 @@ Future<String> _executePluginOperationInBackground(
       id: request['pluginId'] ?? '',
       name: request['pluginName'] ?? '',
       path: request['pluginPath'] ?? '',
+      isBakaV2: request['isBakaV2'] == '1',
       userVariables: _decodeUserVariables(request['userVariables']),
     );
     final payload = jsonDecode(request['payload'] ?? 'null');
@@ -9408,12 +9505,16 @@ class _PluginWorker {
     final lxBootstrap = await rootBundle.loadString(
       'assets/lx_plugin_runtime.js',
     );
+    final v2Bootstrap = await rootBundle.loadString(
+      'assets/baka_v2_adapter.js',
+    );
     final ready = ReceivePort();
     final isolate = await Isolate.spawn(
       _pluginWorkerEntry,
       <String, Object?>{
         'bootstrap': bootstrap,
         'lxBootstrap': lxBootstrap,
+        'v2Bootstrap': v2Bootstrap,
         'ready': ready.sendPort,
       },
       debugName: 'music-plugin-worker',
@@ -9477,6 +9578,7 @@ void _pluginWorkerEntry(Map<String, Object?> init) {
     httpClient: _PluginBackgroundHttpClient(),
     runtimeBootstrap: init['bootstrap'] as String?,
     runtimeLxBootstrap: init['lxBootstrap'] as String?,
+    runtimeV2Bootstrap: init['v2Bootstrap'] as String?,
     pluginSources: <String, String>{},
   );
   final requests = ReceivePort();
@@ -9513,6 +9615,9 @@ Future<dynamic> _runPluginWorkerRequest(
     id: pluginId,
     name: message['pluginName']?.toString() ?? '',
     path: message['pluginPath']?.toString() ?? '',
+    // 契约标记由主 isolate 随请求下发（worker 内无法读插件元数据缓存），
+    // v2 插件在 worker 里必须同样走适配层加载路径。
+    isBakaV2: message['isBakaV2'] == true,
     userVariables: _decodeUserVariables(message['userVariables']?.toString()),
   );
   final payload = jsonDecode(message['payload']?.toString() ?? 'null');
@@ -9550,6 +9655,19 @@ class _PluginBackgroundHttpClient extends http.BaseClient {
   Future<http.StreamedResponse> _sendThrottled(
     http.BaseRequest request,
   ) async {
+    // 二进制请求体：JS 侧包装成 `__XY_HTTP_BODY_BASE64__` + base64
+    // （baka_v2_adapter.js 的 bodyHex / joox protobuf 通道）。XHR 链路
+    // 只能安全传 ASCII 文本，这里在发往上游前还原原始字节。
+    if (request is http.Request &&
+        request.body.startsWith('__XY_HTTP_BODY_BASE64__')) {
+      try {
+        request.bodyBytes = base64Decode(
+          request.body.substring('__XY_HTTP_BODY_BASE64__'.length),
+        );
+      } catch (_) {
+        // 非法标记按原文发送，与 Rust 侧 decode_plugin_request_body 一致。
+      }
+    }
     request.headers.putIfAbsent('user-agent', () => _desktopUserAgent);
     // 该客户端由常驻 worker isolate 长期持有，默认复用 keep-alive 连接。
     // 手机在 Wi-Fi/蜂窝间切换或 CDN 静默断开空闲连接后，复用旧 socket 会
