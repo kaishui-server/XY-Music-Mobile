@@ -13,9 +13,9 @@ const kLxSourceIds = ['kw', 'kg', 'tx', 'wy', 'mg'];
 
 /// 洛雪音源 ID → 展示名。
 ///
-/// 除内置五平台外，订阅源可自行扩展平台（ikun 的 git、lx-cit 的 qs/jo），
-/// 这里补上已知的扩展代号；未登记代号直接显示大写代号，避免在来源切换等
-/// 入口被隐藏。
+/// 除内置五平台外，订阅源可自行扩展平台（ikun 的 git、lx-cit 的 qs/jo/
+/// bili），这里补上已知的扩展代号；未登记代号直接显示大写代号，避免在
+/// 来源切换等入口被隐藏。
 String lxSourceLabel(String source) => switch (source) {
   'kw' => '酷我',
   'kg' => '酷狗',
@@ -25,6 +25,8 @@ String lxSourceLabel(String source) => switch (source) {
   'git' => 'Gitcode',
   'qs' => '汽水音乐',
   'jo' => 'JOOX',
+  'bili' => '哔哩哔哩',
+  'bilibili' => '哔哩哔哩',
   _ => source.toUpperCase(),
 };
 

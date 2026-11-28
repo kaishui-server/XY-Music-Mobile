@@ -87,8 +87,9 @@ class _SearchSourceTab {
 /// LX 平台显示名，使用各平台的直接名称。
 ///
 /// 下拉只展示宿主有搜索实现的平台（[kHostLxSearchSources]）：插件可能
-/// 声明宿主搜不了的平台（如 lx-cit v1.5.2 新增的 bili/bd、ikun 的 git），
-/// 展示出来只会「选了就报错」，因此直接过滤掉，不留无效站点。
+/// 声明宿主搜不了的平台（如 lx-cit 的 bd、ikun 的 git），展示出来只会
+/// 「选了就报错」，因此直接过滤掉，不留无效站点。汽水（qs）与哔哩哔哩
+/// （bili）现已由宿主接入搜索，会正常出现在下拉里。
 /// 未登记的代号走 [_lxSourceDisplayName] 兜底显示代号本身。
 const _lxSourceNames = <String, String>{
   'kw': '酷我音乐',
@@ -99,6 +100,7 @@ const _lxSourceNames = <String, String>{
   'git': 'Gitcode',
   'qs': '汽水音乐',
   'jo': 'JOOX',
+  'bili': '哔哩哔哩',
 };
 
 String _lxSourceDisplayName(String source) =>
@@ -131,9 +133,10 @@ List<_SearchSourceTab> _buildSearchSourceTabs(
         lxSources: plugin.isLx
             ? (plugin.lxSources.isEmpty
                   ? kHostLxSearchSources
-                  // 只保留宿主有搜索实现的平台：插件声明的 bili/bd/git 等
+                  // 只保留宿主有搜索实现的平台：插件声明的 bd/git/qs 等
                   // 平台没有宿主搜索，展示出来选了必报错（用户反馈「凭空
-                  // 多了 BILI、BD 两个新站点」）。
+                  // 多了 BD 这类新站点」）。bili 已由 Rust `search_bili`
+                  // 接入，所以会正常出现在这里。
                   : plugin.lxSources
                         .where(kHostLxSearchSources.contains)
                         .toList(growable: false))

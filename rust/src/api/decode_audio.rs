@@ -1,13 +1,21 @@
-//! 空间音频本地解码（AC-4 / AV3A 编码流 → WAV），供 Flutter 播放空间音质档时调用。
+//! 空间音频本地解码（AC-4 / AV3A / 多声道 OGG-Vorbis 编码流 → WAV），供 Flutter
+//! 播放空间音质档时调用。
 //!
 //! 背景：Baka[T] 等插件在 dolby/dts 档位返回 AC-4 编码流、atmos 系档位返回
 //! AV3A 编码流（多为 MP4 容器），Android 平台播放器（ExoPlayer）不具备这两
-//! 种编码的软解能力。播放前把整条流交给本模块转成交错 f32 WAV，再由
+//! 种编码的软解能力。QQ 系网关（vsaa 等）的 atmos_pro（galaxy916/galaxy714）
+//! 档则是 QMC 加密的 OGG-Vorbis 多声道流（9.1.6=16ch / 7.1.4=12ch）——
+//! Android 平台 Vorbis 解码器只支持 ≤2 声道，直链播放必然失败。播放前把
+//! 整条流交给本模块转成交错 f32 WAV（多声道按 ITU 系数下混立体声），再由
 //! just_audio 播放本地文件。解码器均为纯 Rust 实现（GPL-3.0-or-later，与
 //! 本项目 AGPL-3.0 兼容），vendored 于 `rust/vendor/`：
 //! - baka-ac4：AC-4 解码 + MP4/裸流 demux + WavWriter（wav 模块为 XY 导出）。
 //! - baka-av3a：AV3A 解码（需外置 model/lsf 参数资产，由 Flutter 打包并在
 //!   运行时解到应用私有目录后传入路径）。
+//! - 多声道 Vorbis：symphonia（ogg+vorbis feature）解码 + channel_downmix。
+//!
+//! DTS:X（dtsx = DTS Express LBR）本机无解码器：probe 识别返回 "dtsx"，
+//! Dart 侧据此直接回退其他音质档，避免无声空走。
 //!
 //! 错误约定：所有可预期失败一律返回 `Err(String)`，探测识别不了返回
 //! `"other"`，不 panic、不抛异常；Dart 侧捕获任何异常后回退直连播放，
@@ -25,15 +33,21 @@ use baka_av3a_core::decoder::Decoder as Av3aDecoder;
 use baka_av3a_core::model::HyperModel;
 use baka_av3a_core::shaping::LsfCodebooks;
 
+use crate::player::channel_downmix::downmix_block;
+
 // =========================================================================
 // 格式探测
 // =========================================================================
 
-/// 探测文件的空间音频编码格式，返回 `"ac4"` | `"av3a"` | `"other"`。
+/// 探测文件的空间音频编码格式，返回 `"ac4"` | `"av3a"` | `"vorbis"` |
+/// `"dtsx"` | `"other"`。
 ///
-/// MP4：扫顶层 box，找 stsd 里的 'ac-4'（或 'AC-4'）/'av3a' 采样入口；
-/// 裸流：按 AC-4 同步字（0xAC 0x40/0x41）判断；识别不了返回 `"other"`，
-/// 不抛异常（Dart 侧拿到 "other" 或错误时回退直连播放）。
+/// MP4：扫顶层 box，找 stsd 里的 'ac-4'（或 'AC-4'）/'av3a'/'dtsx' 采样入口；
+/// OGG：`OggS` 魔数 + `\x01vorbis` 识别头且声道数 > 2（>2 才是本模块要下混
+/// 的多声道流，立体声 Vorbis 交回正常播放链路）；
+/// 裸流：按 AC-4 同步字（0xAC 0x40/0x41）或 DTS Express LBR 同步字
+/// （0x40 0x41 0x1B 0xF2）判断；识别不了返回 `"other"`，不抛异常
+/// （Dart 侧拿到 "other" 或错误时回退直连播放）。
 pub fn probe_spatial_format(path: String) -> Result<String, String> {
     let data = std::fs::read(&path).map_err(|e| format!("读取文件失败 {path}: {e}"))?;
     Ok(probe_format_bytes(&data))
@@ -44,18 +58,60 @@ fn is_sync_word(d: &[u8], off: usize) -> bool {
     d.len() > off + 1 && d[off] == 0xAC && (d[off + 1] == 0x40 || d[off + 1] == 0x41)
 }
 
+/// DTS Express LBR 帧同步字（DTS:X 网关流实测）。
+fn is_lbr_sync_word(d: &[u8], off: usize) -> bool {
+    d.len() > off + 3
+        && d[off] == 0x40
+        && d[off + 1] == 0x41
+        && d[off + 2] == 0x1B
+        && d[off + 3] == 0xF2
+}
+
 fn probe_format_bytes(data: &[u8]) -> String {
     if data.len() >= 12 && &data[4..8] == b"ftyp" {
         return probe_mp4(data);
     }
-    // 裸流：帧头附近出现 AC-4 同步字即认为裸 AC-4（容忍少量前导填充）。
+    if data.len() >= 4 && &data[0..4] == b"OggS" {
+        return probe_ogg(data);
+    }
+    // 裸流：帧头附近出现同步字即认为对应裸流（容忍少量前导填充）。
     let head = &data[..data.len().min(4096)];
-    for off in 0..head.len().saturating_sub(1) {
+    for off in 0..head.len().saturating_sub(3) {
         if is_sync_word(head, off) {
             return "ac4".to_string();
         }
+        if is_lbr_sync_word(head, off) {
+            return "dtsx".to_string();
+        }
     }
     "other".to_string()
+}
+
+/// OGG 容器探测：要求 `\x01vorbis` 识别头且声道数 > 2。
+/// 立体声/单声道 Vorbis 返回 "other"（正常播放链路原生支持）。
+fn probe_ogg(data: &[u8]) -> String {
+    let head_end = data.len().min(4096);
+    let head = &data[..head_end];
+    let Some(idx) = find_subslice(head, b"\x01vorbis") else {
+        return "other".to_string();
+    };
+    // 识别头布局：\x01 + "vorbis"(6) + version(4) + channels(1) + rate(4)…
+    if idx + 12 >= head.len() {
+        return "other".to_string();
+    }
+    let channels = head[idx + 11];
+    if channels > 2 {
+        "vorbis".to_string()
+    } else {
+        "other".to_string()
+    }
+}
+
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.len() > haystack.len() {
+        return None;
+    }
+    haystack.windows(needle.len()).position(|w| w == needle)
 }
 
 /// 遍历 `[start, end)` 内的顶层子 box，回调 (类型, 内容起始, box 结束)。
@@ -120,6 +176,7 @@ fn find_boxes_path(
 fn probe_mp4(data: &[u8]) -> String {
     let mut found_ac4 = false;
     let mut found_av3a = false;
+    let mut found_dtsx = false;
     for (moov_s, moov_e) in find_boxes_path(data, 0, data.len(), &["moov"]) {
         for (stsd_s, stsd_e) in
             find_boxes_path(data, moov_s, moov_e, &["trak", "mdia", "minf", "stbl", "stsd"])
@@ -139,6 +196,8 @@ fn probe_mp4(data: &[u8]) -> String {
                         found_ac4 = true;
                     } else if entry.eq_ignore_ascii_case("av3a") {
                         found_av3a = true;
+                    } else if entry.eq_ignore_ascii_case("dtsx") {
+                        found_dtsx = true;
                     }
                 }
                 off += size;
@@ -149,6 +208,8 @@ fn probe_mp4(data: &[u8]) -> String {
         "ac4".to_string()
     } else if found_av3a {
         "av3a".to_string()
+    } else if found_dtsx {
+        "dtsx".to_string()
     } else {
         "other".to_string()
     }
@@ -358,6 +419,147 @@ fn decode_av3a_sync(
     finish_wav_and_result(wav, ok_frames, total_samples, sample_rate, channels)
 }
 
+/// 把 OGG-Vorbis 多声道文件（QQ 系网关 galaxy714/916 的空间音质流）解码为
+/// 交错 f32 立体声 WAV。
+///
+/// Android 平台 Vorbis 解码器只支持 ≤2 声道，9.1.6（16ch）/7.1.4（12ch）
+/// 流直链播放必然失败。这里用 symphonia（ogg+vorbis feature，纯 Rust）解出
+/// 全部声道，再按 ITU 系数下混成立体声写入 WAV（与 DSP 共享管线共用
+/// channel_downmix）。个别坏包忽略；只要解出至少一帧就算成功。
+pub fn decode_ogg_vorbis_to_wav(
+    input_path: String,
+    output_path: String,
+) -> Result<AudioDecodeResult, String> {
+    run_on_decode_thread("ogg-vorbis-decode", move || {
+        decode_ogg_vorbis_sync(input_path, output_path)
+    })
+}
+
+/// OGG-Vorbis 解码主体（运行在专用大栈线程上）。
+fn decode_ogg_vorbis_sync(
+    input_path: String,
+    output_path: String,
+) -> Result<AudioDecodeResult, String> {
+    use symphonia::core::audio::SampleBuffer;
+    use symphonia::core::codecs::{DecoderOptions, CODEC_TYPE_VORBIS};
+    use symphonia::core::errors::Error as SymphoniaError;
+    use symphonia::core::formats::FormatOptions;
+    use symphonia::core::io::MediaSourceStream;
+    use symphonia::core::meta::MetadataOptions;
+    use symphonia::core::probe::Hint;
+
+    let data = std::fs::read(&input_path).map_err(|e| format!("读取输入失败: {e}"))?;
+    let mss = MediaSourceStream::new(Box::new(std::io::Cursor::new(data)), Default::default());
+    let mut hint = Hint::new();
+    hint.with_extension("ogg");
+
+    let probed = symphonia::default::get_probe()
+        .format(&hint, mss, &FormatOptions::default(), &MetadataOptions::default())
+        .map_err(|e| format!("OGG 容器解析失败: {e}"))?;
+    let mut format_reader = probed.format;
+
+    let track = format_reader
+        .tracks()
+        .iter()
+        .find(|t| t.codec_params.codec == CODEC_TYPE_VORBIS)
+        .ok_or("OGG 容器内未找到 Vorbis 音轨")?;
+    let track_id = track.id;
+    let mut decoder = symphonia::default::get_codecs()
+        .make(&track.codec_params, &DecoderOptions::default())
+        .map_err(|e| format!("Vorbis 解码器初始化失败: {e}"))?;
+
+    let out = File::create(&output_path).map_err(|e| format!("创建输出文件失败: {e}"))?;
+    // 与 AC-4/AV3A 路径统一：float WAV。
+    let mut wav = WavWriter::start_fmt(BufWriter::new(out), true)
+        .map_err(|e| format!("WAV 初始化失败: {e}"))?;
+
+    let mut ok_frames: i64 = 0;
+    let mut total_stereo_samples: u64 = 0;
+    let mut sample_rate = 0i32;
+    let mut channels = 0i32;
+    let mut sample_buf: Option<SampleBuffer<f32>> = None;
+    let mut sample_buf_frames: u64 = 0;
+
+    loop {
+        let packet = match format_reader.next_packet() {
+            Ok(p) => p,
+            Err(SymphoniaError::ResetRequired) => {
+                decoder.reset();
+                continue;
+            }
+            Err(SymphoniaError::IoError(ref e))
+                if e.kind() == std::io::ErrorKind::UnexpectedEof =>
+            {
+                break;
+            }
+            Err(_) => break,
+        };
+        if packet.track_id() != track_id {
+            continue;
+        }
+        let decoded = match decoder.decode(&packet) {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+        let frames = decoded.frames();
+        if frames == 0 {
+            continue;
+        }
+        let spec = *decoded.spec();
+        if ok_frames == 0 {
+            channels = spec.channels.count() as i32;
+            sample_rate = spec.rate as i32;
+        }
+        if sample_buf.is_none() || sample_buf_frames < frames as u64 {
+            sample_buf = Some(SampleBuffer::<f32>::new(frames as u64, spec));
+            sample_buf_frames = frames as u64;
+        }
+        let interleaved = {
+            let buf = sample_buf.as_mut().unwrap();
+            buf.copy_interleaved_ref(decoded);
+            buf.samples().to_vec()
+        };
+        // 多声道下混成立体声（stereo 原样拷贝、mono 上混均在 downmix 内处理）。
+        let stereo = downmix_block(&interleaved, channels.max(1) as u16);
+        if stereo.is_empty() {
+            continue;
+        }
+        // WavWriter 按声道平面写入：交错立体声 → [L, R] 平面，立体声掩码 3。
+        // WavWriter 拒绝非有限样本，坏样本清零而不是中断整首歌。
+        let n = stereo.len() / 2;
+        let mut l = Vec::with_capacity(n);
+        let mut r = Vec::with_capacity(n);
+        for (i, v) in stereo.iter().enumerate() {
+            let x = if v.is_finite() { *v } else { 0.0 };
+            if i % 2 == 0 {
+                l.push(x);
+            } else {
+                r.push(x);
+            }
+        }
+        if let Err(e) = wav.write_frame_planar(&[l, r], sample_rate.max(1) as u32, 3) {
+            return Err(format!("WAV 写入失败（第 {ok_frames} 帧后）: {e}"));
+        }
+        total_stereo_samples += stereo.len() as u64;
+        ok_frames += 1;
+    }
+
+    if ok_frames == 0 {
+        return Err("未能从输入解出任何 Vorbis 音频帧（流可能已损坏）".into());
+    }
+    let duration_ms = if sample_rate > 0 {
+        (total_stereo_samples as f64 / 2.0 / f64::from(sample_rate) * 1000.0).round() as i64
+    } else {
+        0
+    };
+    wav.finish().map_err(|e| format!("WAV 收尾失败: {e}"))?;
+    Ok(AudioDecodeResult {
+        sample_rate,
+        channels,
+        frames: ok_frames,
+        duration_ms,
+    })
+}
 /// 统一收尾：校验至少解出一帧、写 WAV 头、按总采样数折算时长。
 /// `finish(self)` 按值消费 writer，这里直接接管所有权。
 fn finish_wav_and_result<W: std::io::Write + std::io::Seek>(
@@ -459,6 +661,64 @@ mod tests {
         let mut raw41 = vec![0xAC, 0x41, 0x00, 0x12];
         raw41.extend_from_slice(&[0u8; 18]);
         assert_eq!(probe_format_bytes(&raw41), "ac4");
+    }
+
+    /// 构造最小 OGG：27 字节页头（0 段）+ 识别头体。
+    fn ogg_with_vorbis_id(channels: u8, rate: u32) -> Vec<u8> {
+        let mut ogg = b"OggS".to_vec();
+        ogg.push(0); // version
+        ogg.push(2); // header_type: BOS
+        ogg.extend_from_slice(&0u64.to_le_bytes()); // granule
+        ogg.extend_from_slice(&1u32.to_le_bytes()); // serial
+        ogg.extend_from_slice(&0u32.to_le_bytes()); // seq
+        ogg.extend_from_slice(&0u32.to_le_bytes()); // crc
+        ogg.push(0); // segment count
+        // Vorbis 识别头：\x01 + "vorbis" + version + channels + rate。
+        ogg.push(1);
+        ogg.extend_from_slice(b"vorbis");
+        ogg.extend_from_slice(&0u32.to_le_bytes()); // version
+        ogg.push(channels);
+        ogg.extend_from_slice(&rate.to_le_bytes());
+        ogg
+    }
+
+    #[test]
+    fn probe_detects_ogg_multichannel_vorbis() {
+        // QQ 空间音质档：9.1.6 = 16ch / 7.1.4 = 12ch，识别为 "vorbis"。
+        assert_eq!(probe_format_bytes(&ogg_with_vorbis_id(16, 48000)), "vorbis");
+        assert_eq!(probe_format_bytes(&ogg_with_vorbis_id(12, 44100)), "vorbis");
+        // 立体声 Vorbis 不是本模块的职责（正常链路原生支持）。
+        assert_eq!(probe_format_bytes(&ogg_with_vorbis_id(2, 48000)), "other");
+    }
+
+    #[test]
+    fn probe_detects_dtsx() {
+        // QQ 网关 dts 档 = MP4(dtsx 采样入口)，本机无解码器但需识别出来回退。
+        assert_eq!(probe_format_bytes(&mp4_with_stsd_entry(b"dtsx")), "dtsx");
+        // DTS Express LBR 帧同步字（裸流变体）。
+        let mut raw = vec![0x40, 0x41, 0x1B, 0xF2];
+        raw.extend_from_slice(&[0u8; 16]);
+        assert_eq!(probe_format_bytes(&raw), "dtsx");
+    }
+
+    /// 真实流端到端冒烟：由本地调试脚本解密 galaxy916 样本后设
+    /// XY_TEST_OGG_WAV 再跑 `cargo test decode_ogg_vorbis_real_stream`。
+    #[test]
+    fn decode_ogg_vorbis_real_stream() {
+        let Some(input) = std::env::var_os("XY_TEST_OGG_WAV") else {
+            return; // 未提供样本时跳过
+        };
+        let out = std::env::temp_dir().join("xy_ogg_vorbis_test_out.wav");
+        let result = decode_ogg_vorbis_to_wav(
+            input.to_string_lossy().into_owned(),
+            out.to_string_lossy().into_owned(),
+        )
+        .expect("真实 galaxy916 样本应成功解码为 WAV");
+        assert!(result.frames > 0, "至少解出一帧");
+        assert!(result.duration_ms > 0, "时长应为正");
+        assert_eq!(result.channels, 16, "galaxy916 应为 16 声道输入");
+        // 3MB 样本约 20+ 秒音频（1.28Mbps ≈ 160KB/s）。
+        assert!(result.duration_ms > 5000, "3MB 样本应解出 >5 秒音频");
     }
 
     #[test]

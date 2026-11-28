@@ -6,14 +6,18 @@
 import '../frb_generated.dart';
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
-// These functions are ignored because they are not marked as `pub`: `decode_ac4_sync`, `decode_av3a_sync`, `find_boxes_path`, `finish_wav_and_result`, `for_each_box`, `is_sync_word`, `probe_format_bytes`, `probe_mp4`, `run_on_decode_thread`
+// These functions are ignored because they are not marked as `pub`: `decode_ac4_sync`, `decode_av3a_sync`, `decode_ogg_vorbis_sync`, `find_boxes_path`, `find_subslice`, `finish_wav_and_result`, `for_each_box`, `is_lbr_sync_word`, `is_sync_word`, `probe_format_bytes`, `probe_mp4`, `probe_ogg`, `run_on_decode_thread`
 // These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `clone`, `fmt`
 
-/// 探测文件的空间音频编码格式，返回 `"ac4"` | `"av3a"` | `"other"`。
+/// 探测文件的空间音频编码格式，返回 `"ac4"` | `"av3a"` | `"vorbis"` |
+/// `"dtsx"` | `"other"`。
 ///
-/// MP4：扫顶层 box，找 stsd 里的 'ac-4'（或 'AC-4'）/'av3a' 采样入口；
-/// 裸流：按 AC-4 同步字（0xAC 0x40/0x41）判断；识别不了返回 `"other"`，
-/// 不抛异常（Dart 侧拿到 "other" 或错误时回退直连播放）。
+/// MP4：扫顶层 box，找 stsd 里的 'ac-4'（或 'AC-4'）/'av3a'/'dtsx' 采样入口；
+/// OGG：`OggS` 魔数 + `\x01vorbis` 识别头且声道数 > 2（>2 才是本模块要下混
+/// 的多声道流，立体声 Vorbis 交回正常播放链路）；
+/// 裸流：按 AC-4 同步字（0xAC 0x40/0x41）或 DTS Express LBR 同步字
+/// （0x40 0x41 0x1B 0xF2）判断；识别不了返回 `"other"`，不抛异常
+/// （Dart 侧拿到 "other" 或错误时回退直连播放）。
 Future<String> probeSpatialFormat({required String path}) =>
     RustLib.instance.api.crateApiDecodeAudioProbeSpatialFormat(path: path);
 
@@ -55,6 +59,21 @@ Future<AudioDecodeResult> decodeAv3AToWav({
   outputPath: outputPath,
   modelPath: modelPath,
   lsfPath: lsfPath,
+);
+
+/// 把 OGG-Vorbis 多声道文件（QQ 系网关 galaxy714/916 的空间音质流）解码为
+/// 交错 f32 立体声 WAV。
+///
+/// Android 平台 Vorbis 解码器只支持 ≤2 声道，9.1.6（16ch）/7.1.4（12ch）
+/// 流直链播放必然失败。这里用 symphonia（ogg+vorbis feature，纯 Rust）解出
+/// 全部声道，再按 ITU 系数下混成立体声写入 WAV（与 DSP 共享管线共用
+/// channel_downmix）。个别坏包忽略；只要解出至少一帧就算成功。
+Future<AudioDecodeResult> decodeOggVorbisToWav({
+  required String inputPath,
+  required String outputPath,
+}) => RustLib.instance.api.crateApiDecodeAudioDecodeOggVorbisToWav(
+  inputPath: inputPath,
+  outputPath: outputPath,
 );
 
 /// 解码结果信息：采样率 / 声道数 / 解出的帧数 / 总时长（毫秒）。

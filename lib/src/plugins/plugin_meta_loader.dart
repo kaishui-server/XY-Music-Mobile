@@ -28,7 +28,11 @@ const _metaCacheFileName = 'meta_cache.json';
 /// v3：新增 Baka provider v2 契约识别与 manifest 解析（显示名取
 /// manifest.name、platform 仅作平台标识、能力枚举入缓存），旧缓存不含
 /// 这些字段，必须整体重算一次。
-const _metaCacheVersion = 3;
+///
+/// v4：移除 BakaMusic V1 契约，v2 判定兜底规则不再要求 `createProvider`
+/// 工厂（cwo 订阅插件按 `(request, sdk)` 直接声明 handler）。旧缓存里
+/// cwo 插件可能被标成 isBakaV2:false，必须整体重算。
+const _metaCacheVersion = 4;
 
 /// 后台加载全部插件行（plain map，可跨 isolate 传输）。
 /// 返回的行字段见 [_rowFromMeta]；kind 为分类标识字符串
@@ -161,23 +165,19 @@ Map<String, Object?> _rowFromMeta({
   required Map<String, String> kinds,
 }) {
   final isLx = meta['isLx'] == true;
-  final isBaka = meta['isBaka'] == true;
   final isBakaV2 = meta['isBakaV2'] == true;
   final isAnimemusic = meta['isAnimemusic'] == true;
   final contract = pluginContractOf(
     isLx: isLx,
-    isBaka: isBaka,
     isBakaV2: isBakaV2,
     isAnimemusic: isAnimemusic,
   );
   // 分类判定走 [resolvePluginKindKey]：搜索页的来源 Tab、运行时分组也用同一
-  // 函数，各处口径必须一致。判定只依赖契约内容，不看显示名/作者名；排序先后
-  // 由用户自定义（见 plugin_runtime.dart 的 pluginKindOrderKey）。详见
-  // plugin_metadata.dart 的 _detectBaka / _detectBakaV2 / isBakaSourceUrl 注释。
+  // 函数，各处口径必须一致。判定只依赖契约内容与手动「其他」归位，不看
+  // 显示名/作者名；详见 plugin_metadata.dart 的 _detectBakaV2 注释。
   final kind = resolvePluginKindKey(
     contract: contract,
     kindHint: kinds[id],
-    sourceUrl: sourceUrl,
   );
 
   // 已停用的变量键（订阅源的 X-API-KEY）在此再过滤一次：老版本写入的
@@ -232,7 +232,6 @@ Map<String, Object?> _metaToJson(PluginMetadata m) => {
   ],
   'isStarSea': m.isStarSea,
   'isLx': m.isLx,
-  'isBaka': m.isBaka,
   'isBakaV2': m.isBakaV2,
   'isAnimemusic': m.isAnimemusic,
   // v2 契约字段一并缓存：显示名与平台标识分开存，避免把 platform 当显示名。

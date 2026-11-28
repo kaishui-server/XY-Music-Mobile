@@ -5935,10 +5935,12 @@ class PlayerNotifier extends SafeStateNotifier<PlaybackState>
           dedupKey: resolved.url,
           origin: 'playAt:plugin',
         );
-        // 空间音频档（dolby/dts/atmos 系）返回的 AC-4/AV3A 编码流 Android
-        // 播放器解不了：先整曲下载进 Rust 流缓存并本地解码成 WAV 再播放；
-        // 探测不是空间格式或解码链路任何一步失败都静默回退原直链，
-        // 保证空间音质「能试」不会变成「必挂」。
+        // 空间音频档（dolby/dts/atmos 系）返回的 AC-4/AV3A/多声道 OGG-
+        // Vorbis 编码流（含 QMC 加密流，vsaa 等网关空间档全部带 ekey）
+        // Android 播放器解不了：先整曲下载进 Rust 流缓存（加密流经本地
+        // 代理解密）并本地解码成 WAV 再播放；探测不是空间格式（dtsx 等
+        // 本机无解码器的编码也识别出来回退）或解码链路任何一步失败都
+        // 静默回退原直链，保证空间音质「能试」不会变成「必挂」。
         Future<void> submitResolved(PluginMediaSource resolved) async {
           if (spatialAllowed &&
               await _tryPlaySpatialDecoded(
@@ -7548,21 +7550,36 @@ class PlayerNotifier extends SafeStateNotifier<PlaybackState>
       // 首道门禁：仅 Baka 系插件声明的空间音频档尝试本地解码。普通音质
       // 直接回退直链，避免每首歌都被整曲下载一遍再探测。
       if (!_isSpatialDecodeQuality(quality)) return false;
-      // QMC 加密流（*.mflac）与非 http 地址不可能是空间音频编码流。
-      if (resolved.ekey != null) return false;
       final url = resolved.url.trim();
       if (!url.startsWith('http')) return false;
+      // QMC 加密流（*.mflac/*.mgg/*.mmp4）也可以是空间音频编码流（vsaa
+      // 等网关的空间档全部带 ekey 加密）：经 CloudPlaybackProxy 逐块解密
+      // 后让 Rust 下载明文。代理 token 每次登记随机，缓存键随之变化会重
+      // 下载整曲——但解码产物 WAV 按**原始直链** hash 缓存，切回同曲不
+      // 重复解码，重下成本可接受。
+      var downloadUrl = url;
+      if (resolved.ekey != null && resolved.ekey!.trim().isNotEmpty) {
+        downloadUrl = await CloudPlaybackProxy.instance.register(
+          url,
+          resolved.headers,
+          Uri.tryParse(url)?.host ?? '空间音频',
+          ekey: resolved.ekey!.trim(),
+        );
+      }
       final stopwatch = Stopwatch()..start();
       // ① 整曲下载进 Rust 流式缓存（与 DSP 接管共用同一缓存设施）。
       final snapshotJson = await startStreamingDownload(
-        url: url,
-        headersJson: resolved.headers.isEmpty ? '' : jsonEncode(resolved.headers),
+        url: downloadUrl,
+        headersJson:
+            downloadUrl == url && resolved.headers.isEmpty
+                ? ''
+                : jsonEncode(resolved.headers),
       );
       final snapshot = jsonDecode(snapshotJson) as Map<String, dynamic>;
       final cachedPath = (snapshot['path'] as String?) ?? '';
       if (cachedPath.isEmpty) return false;
       final finished = await waitUrlComplete(
-        url: url,
+        url: downloadUrl,
         timeoutSecs: BigInt.from(120),
       );
       if (!finished) {
@@ -7572,10 +7589,16 @@ class PlayerNotifier extends SafeStateNotifier<PlaybackState>
         );
         return false;
       }
-      // ② 探测真实编码：插件标的档位未必真是 AC-4/AV3A（可能是普通
-      // 有损流的改名档），非空间格式直接回退直链。
+      // ② 探测真实编码：插件标的档位未必真是空间音频编码（可能是普通
+      // 有损流的改名档），非空间格式直接回退直链；dtsx（DTS Express
+      // LBR）本机无解码器，识别出来也回退交由音质降级链处理。
       final format = await decode_audio.probeSpatialFormat(path: cachedPath);
-      if (format != 'ac4' && format != 'av3a') return false;
+      if (format != 'ac4' && format != 'av3a' && format != 'vorbis') {
+        if (format == 'dtsx') {
+          playbackChainLog('[空间音频] DTS:X（LBR）本机无解码器，回退降级链');
+        }
+        return false;
+      }
       // ③ 解码（产物按直链 hash 缓存复用；先写 .part 再落位，避免上次
       // 解码中断留下的半成品被误复用）。
       final cacheDir = await getStreamCacheDir();
@@ -7599,7 +7622,7 @@ class PlayerNotifier extends SafeStateNotifier<PlaybackState>
             '${result.channels}ch/${result.durationMs}ms '
             '耗时${stopwatch.elapsedMilliseconds}ms',
           );
-        } else {
+        } else if (format == 'av3a') {
           final (modelPath, lsfPath) = await _ensureAv3aAssets();
           final result = await decode_audio.decodeAv3AToWav(
             inputPath: cachedPath,
@@ -7609,6 +7632,19 @@ class PlayerNotifier extends SafeStateNotifier<PlaybackState>
           );
           playbackChainLog(
             '[空间音频] AV3A 解码完成 ${result.sampleRate}Hz/'
+            '${result.channels}ch/${result.durationMs}ms '
+            '耗时${stopwatch.elapsedMilliseconds}ms',
+          );
+        } else {
+          // QQ 系网关空间音质档 = QMC 加密的 OGG-Vorbis 多声道流
+          // （galaxy916=16ch / galaxy714=12ch），symphonia 解码后按
+          // ITU 系数下混立体声。
+          final result = await decode_audio.decodeOggVorbisToWav(
+            inputPath: cachedPath,
+            outputPath: partPath,
+          );
+          playbackChainLog(
+            '[空间音频] OGG-Vorbis 解码完成 ${result.sampleRate}Hz/'
             '${result.channels}ch/${result.durationMs}ms '
             '耗时${stopwatch.elapsedMilliseconds}ms',
           );

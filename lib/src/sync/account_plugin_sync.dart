@@ -317,7 +317,7 @@ class AccountPluginSync {
     // 上传时携带用户变量，供其它设备云同步后恢复（账号云同步-插件）。
     final userVariables = readPluginUserVariables(prefs);
     // 分类判定与管理页分栏/搜索来源 Tab/运行时分组同一入口：内容契约 +
-    // 订阅类型提示 + 来源 URL 兜底，不读插件显示名/作者名。
+    // 手动「其他」归位覆盖，不读插件显示名/作者名。
     final kinds = readPluginKinds(prefs);
     final result = <Map<String, dynamic>>[];
     for (final file in directory.listSync().whereType<File>()) {
@@ -330,12 +330,10 @@ class AccountPluginSync {
         final kind = resolvePluginKindKey(
           contract: pluginContractOf(
             isLx: metadata.isLx,
-            isBaka: metadata.isBaka,
             isBakaV2: metadata.isBakaV2,
             isAnimemusic: metadata.isAnimemusic,
           ),
           kindHint: kinds[id],
-          sourceUrl: sourceUrls[id] ?? '',
         );
         final isLxKind = kind == pluginKindLx;
         result.add({

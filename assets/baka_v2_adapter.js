@@ -40,6 +40,177 @@
   var states = new Map(); // pluginId -> state
 
   // ---------------------------------------------------------------------------
+  // URL / URLSearchParams 最小 polyfill：QuickJS 不带 WHATWG URL，部分
+  // v2 插件（如惜梦 CIT v2）用 `new URL(api)` + `url.search = qs` 组装
+  // 请求。仅覆盖绝对 URL 解析与 search/searchParams 读写，与插件常规
+  // 用法对齐；宿主原生环境（fetch/XHR 桥）不受影响。
+  // ---------------------------------------------------------------------------
+  // 变动通知钩子绑定：URL 实例把 searchParams 的修改写回自身 search
+  //（注意保留 WHATWG search 的 '?' 前缀）。声明在 ensureUrlPolyfills
+  // 顶层（strict 模式下块内函数声明是块级作用域，SimpleURL 块引用不到）。
+  function bindParamsToUrl(params, url) {
+    params._onChange = function () {
+      var text = this.toString();
+      url._search = text ? '?' + text : '';
+    };
+  }
+
+  function ensureUrlPolyfills() {
+    if (typeof globalThis.URLSearchParams !== 'function') {
+      function decodeParam(value) {
+        try {
+          return decodeURIComponent(String(value).replace(/\+/g, ' '));
+        } catch (_) {
+          return value;
+        }
+      }
+      function URLSearchParams(init) {
+        this._pairs = [];
+        if (typeof init === 'string') {
+          var clean = init.replace(/^\?/, '');
+          var parts = clean ? clean.split('&') : [];
+          for (var i = 0; i < parts.length; i++) {
+            if (!parts[i]) continue;
+            var kv = parts[i].split('=');
+            this._pairs.push([
+              decodeParam(kv[0]),
+              decodeParam(kv.slice(1).join('=')),
+            ]);
+          }
+        }
+      }
+      URLSearchParams.prototype.append = function (key, value) {
+        this._pairs.push([String(key), String(value)]);
+        this._notify();
+      };
+      URLSearchParams.prototype.set = function (key, value) {
+        key = String(key);
+        value = String(value);
+        for (var i = 0; i < this._pairs.length; i++) {
+          if (this._pairs[i][0] === key) {
+            this._pairs[i][1] = value;
+            this._notify();
+            return;
+          }
+        }
+        this._pairs.push([key, value]);
+        this._notify();
+      };
+      URLSearchParams.prototype.get = function (key) {
+        key = String(key);
+        for (var i = 0; i < this._pairs.length; i++) {
+          if (this._pairs[i][0] === key) return this._pairs[i][1];
+        }
+        return null;
+      };
+      URLSearchParams.prototype.has = function (key) {
+        return this.get(key) !== null;
+      };
+      URLSearchParams.prototype.delete = function (key) {
+        key = String(key);
+        var kept = [];
+        for (var i = 0; i < this._pairs.length; i++) {
+          if (this._pairs[i][0] !== key) kept.push(this._pairs[i]);
+        }
+        this._pairs = kept;
+        this._notify();
+      };
+      URLSearchParams.prototype.forEach = function (fn, thisArg) {
+        for (var i = 0; i < this._pairs.length; i++) {
+          fn.call(thisArg || null, this._pairs[i][1], this._pairs[i][0], this);
+        }
+      };
+      URLSearchParams.prototype.toString = function () {
+        var out = [];
+        for (var i = 0; i < this._pairs.length; i++) {
+          out.push(
+            encodeURIComponent(this._pairs[i][0]).replace(/%20/g, '+') +
+              '=' +
+              encodeURIComponent(this._pairs[i][1]).replace(/%20/g, '+'),
+          );
+        }
+        return out.join('&');
+      };
+      // 变动通知钩子：URL 实例把 searchParams 的修改写回自身 search。
+      URLSearchParams.prototype._notify = function () {
+        if (typeof this._onChange === 'function') this._onChange();
+      };
+      globalThis.URLSearchParams = URLSearchParams;
+    }
+    if (typeof globalThis.URL !== 'function') {
+      var URL_RE = /^([a-zA-Z][a-zA-Z0-9+.-]*:)\/\/([^/?#]*)([^?#]*)(\?[^#]*)?(#.*)?$/;
+      function SimpleURL(input) {
+        var match = URL_RE.exec(String(input));
+        if (!match) throw new Error('Invalid URL: ' + input);
+        this.protocol = match[1];
+        var host = match[2];
+        var atIndex = host.lastIndexOf('@');
+        if (atIndex >= 0) host = host.slice(atIndex + 1);
+        var portMatch = /:(\d+)$/.exec(host);
+        this.hostname = portMatch
+          ? host.slice(0, -portMatch[0].length)
+          : host;
+        this.port = portMatch ? portMatch[1] : '';
+        this.host = host;
+        this.pathname = match[3] || '/';
+        this.hash = match[5] || '';
+        var self = this;
+        this.searchParams = new globalThis.URLSearchParams(match[4] || '');
+        bindParamsToUrl(this.searchParams, this);
+        this._search = match[4] || '';
+      }
+      Object.defineProperty(SimpleURL.prototype, 'search', {
+        get: function () {
+          return this._search;
+        },
+        set: function (value) {
+          var text = String(value == null ? '' : value);
+          this._search = text ? (text.charAt(0) === '?' ? text : '?' + text) : '';
+          this.searchParams = new globalThis.URLSearchParams(
+            this._search.replace(/^\?/, ''),
+          );
+          bindParamsToUrl(this.searchParams, this);
+        },
+      });
+      Object.defineProperty(SimpleURL.prototype, 'href', {
+        get: function () {
+          return (
+            this.protocol + '//' + this.host + this.pathname + this._search + this.hash
+          );
+        },
+      });
+      Object.defineProperty(SimpleURL.prototype, 'origin', {
+        get: function () {
+          return this.protocol + '//' + this.host;
+        },
+      });
+      // 规范接口：宿主运行时（Node/undici 等）会按 WHATWG 语义调用
+      // toString / toStringTag，缺失时请求 URL 会被降级成坏串。
+      SimpleURL.prototype.toString = function () {
+        return this.href;
+      };
+      SimpleURL.prototype.toJSON = function () {
+        return this.href;
+      };
+      try {
+        Object.defineProperty(SimpleURL.prototype, Symbol.toStringTag, {
+          value: 'URL',
+          configurable: true,
+        });
+        Object.defineProperty(
+          globalThis.URLSearchParams.prototype,
+          Symbol.toStringTag,
+          { value: 'URLSearchParams', configurable: true },
+        );
+      } catch (_) {
+        /* 老运行时无 Symbol 时忽略 */
+      }
+      globalThis.URL = SimpleURL;
+    }
+  }
+  ensureUrlPolyfills();
+
+  // ---------------------------------------------------------------------------
   // 内置依赖：宿主 MusicFree 运行时的 require 表里有 crypto-js / he / pako，
   // 通过加载一个一次性假插件把三者取到 globalThis 上，供 sdk 桥使用。
   // ---------------------------------------------------------------------------
@@ -241,6 +412,32 @@
 
   var BODY_BASE64_PREFIX = '__XY_HTTP_BODY_BASE64__';
 
+  // 插件侧 HTTP 串行队列：部分网关（如惜梦 CIT v2）对并发突发直接回
+  // nginx 404（插件内 Promise.all 5 平台并行搜索全部失败），串行化既
+  // 不改变插件逻辑又对全部 v2 插件生效。请求间隔 120ms 抖动，兼顾
+  // 上游限流（「N 秒后再试」类）。
+  var _httpQueue = Promise.resolve();
+
+  function enqueueHttp(task) {
+    var run = _httpQueue.then(function () {
+      return task();
+    });
+    // 队列链永远向前：失败不阻断后续请求。
+    _httpQueue = run.then(
+      function () {
+        return new Promise(function (resolve) {
+          setTimeout(resolve, 120);
+        });
+      },
+      function () {
+        return new Promise(function (resolve) {
+          setTimeout(resolve, 120);
+        });
+      },
+    );
+    return run;
+  }
+
   function createHttpBridge() {
     return function httpRequest(options) {
       var opts = options || {};
@@ -260,20 +457,22 @@
       }
       var responseType = String(opts.responseType || 'json').toLowerCase();
       var timeoutMs = Number(opts.timeoutMs) || 20000;
-      return Promise.resolve()
-        .then(function () {
-          var init = { method: method, headers: headers };
-          if (body != null && method !== 'GET' && method !== 'HEAD') {
-            init.body = body;
-          }
-          if (typeof globalThis.fetch !== 'function') {
-            throw new Error('插件运行时未提供 fetch');
-          }
-          return timeoutCall(globalThis.fetch(url, init), timeoutMs);
-        })
-        .then(function (response) {
-          return decodeResponse(response, responseType);
-        });
+      return enqueueHttp(function () {
+        return Promise.resolve()
+          .then(function () {
+            var init = { method: method, headers: headers };
+            if (body != null && method !== 'GET' && method !== 'HEAD') {
+              init.body = body;
+            }
+            if (typeof globalThis.fetch !== 'function') {
+              throw new Error('插件运行时未提供 fetch');
+            }
+            return timeoutCall(globalThis.fetch(url, init), timeoutMs);
+          })
+          .then(function (response) {
+            return decodeResponse(response, responseType);
+          });
+      });
     };
   }
 
@@ -470,6 +669,28 @@
           if (enc === 'hex') {
             return bytesToHex(bytes);
           }
+          // GBK 系编码（酷我/咪咕歌词等中文二进制接口）：交由宿主 bootstrap
+          // （plugin_runtime.js）注入的 TextDecoder polyfill 解码，其内置
+          // XY_GBK 码表。注意失败必须抛错，让插件按自身回退链处理；按
+          // utf-8 强解 GBK 字节只会产出乱码。
+          if (
+            enc === 'gb18030' ||
+            enc === 'gbk' ||
+            enc === 'gb2312' ||
+            enc === 'cp936' ||
+            enc === 'chs'
+          ) {
+            var Decoder =
+              typeof globalThis.TextDecoder === 'function'
+                ? globalThis.TextDecoder
+                : null;
+            if (!Decoder) {
+              throw new Error('bytes.decode 不支持的编码: ' + encoding);
+            }
+            // hexToBytes 产出普通数组，原生 TextDecoder 只接受
+            // TypedArray，这里统一转 Uint8Array（宿主 polyfill 两者兼容）。
+            return new Decoder('gb18030').decode(new Uint8Array(bytes));
+          }
           throw new Error('bytes.decode 不支持的编码: ' + encoding);
         },
         decompress: function (hexInput, algo) {
@@ -550,6 +771,12 @@
   }
 
   function digHandler(table, path) {
+    if (table == null || typeof table !== 'object') return null;
+    // 两种合法声明风格：扁平 dotted key（如 CIT v2 的
+    // handlers["media.resolve"]）优先；再回退嵌套树（如 vsaa 的
+    // handlers.media.resolve）。
+    var direct = table[String(path)];
+    if (typeof direct === 'function') return direct;
     var current = table;
     var parts = String(path).split('.');
     for (var i = 0; i < parts.length; i++) {
@@ -808,6 +1035,9 @@
       facade.getTopLists = function () {
         var collected = [];
         var fetchRecursively = function (page) {
+          // 榜单目录是发现页的点缀能力：部分插件（如 CIT v2）声明了
+          // capability 但实现有缺陷（toplist 不支持聚合平台），失败时
+          // 优雅降级为空列表，不让整页报错。
           return pagedCall(state, 'discovery.charts', {
             limit: SMALL_PAGE_SIZE,
           }, page).then(function (result) {
@@ -815,6 +1045,11 @@
             if (result && result.nextCursor && page < MAX_REPLAY_PAGES) {
               return fetchRecursively(page + 1);
             }
+            return null;
+          }).catch(function (error) {
+            try {
+              console.log('[baka_v2] 榜单目录拉取失败，降级为空：' + errorMessage(error));
+            } catch (_) {}
             return null;
           });
         };

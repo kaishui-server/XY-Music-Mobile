@@ -26,7 +26,7 @@ import '../../src/navigation/sidebar_controller.dart';
 
 /// 插件分类：按契约与后端分为四页展示。
 enum _PluginKind {
-  /// BakaMusic 契约插件（animeSrc 来源标记）。
+  /// BakaMusic v2 契约插件（`@baka-provider 2`，旧 V1 契约已移除）。
   baka,
 
   /// 标准 MusicFree 插件（module.exports 契约、无特殊后端标记）。
@@ -394,17 +394,16 @@ class _PluginsNotifier extends AsyncNotifier<List<_PluginInfo>> {
               : id);
 
     // 分类标识：写入订阅类型表的值必须经统一入口 [resolvePluginKindKey]
-    // 归一化——脚本契约（LX / BakaMusic v2 / BakaMusic / 惜梦 / MusicFree）
-    // 优先，调用方给的分栏/索引族提示与来源 URL 只在契约无法区分
-    // MusicFree 与 BakaMusic 时兜底。调用方没给提示时不写入，避免把
-    // 「内容层暂未识别」固化成分类，后续插件更新后仍能按契约重新归类。
+    // 归一化——脚本契约（LX / BakaMusic v2 / 惜梦 / MusicFree）判定优先，
+    // 调用方给的提示仅保留手动「其他」归位语义。调用方没给提示时不写入，
+    // 避免把「内容层暂未识别」固化成分类，后续插件更新后仍能按契约重新
+    // 归类。
     final hintValue = kindHint?.trim() ?? '';
     final resolvedKind = hintValue.isEmpty
         ? ''
         : resolvePluginKindKey(
             contract: metadata.contract,
             kindHint: hintValue,
-            sourceUrl: origin,
           );
 
     final dataDir = await ref.read(appDataDirProvider.future);
@@ -542,42 +541,11 @@ class _PluginsNotifier extends AsyncNotifier<List<_PluginInfo>> {
     await prefs.setString(pluginKindsKey, jsonEncode(kinds));
   }
 
-  /// 从订阅源响应推断插件类型提示。
-  ///
-  /// 实测三类源的差异：
-  /// - MusicFree 索引：`{plugins:[{name,url,version}]}`（部分含 desc）；
-  /// - BakaMusic 订阅：同为 `{plugins:[...]}`，但额外带 `yourinfo`
-  ///   （{ip,ua}）字段，URL 亦常为 `subscription.json`；
-  /// - 洛雪源：返回**纯 JS 脚本**（非 JSON），由脚本内容判定，无提示。
-  ///
-  /// BakaMusic 与 MusicFree 插件脚本同构，内容层无法可靠区分，故用订阅
-  /// 结构判定；无法判定时归 MusicFree（默认家族）。
-  String _subscriptionKindHint(String url, Object? decoded) {
-    final lower = url.toLowerCase();
-    // MusicFree 索引特征优先：`mf.json` 文件名、`musicfree` 字样、或命中
-    // 已知 MusicFree 源域名。时迁酱等 MusicFree 源（如 source.shiqianjiang.cn
-    // 的 mf.json）响应同样带 yourinfo（{ip,ua}）字段，不能再仅凭该字段
-    // 判 Baka——否则整批 MusicFree 插件会被误分进 BakaMusic 分栏。
-    if (lower.contains('mf.json') ||
-        lower.contains('musicfree') ||
-        PluginMetadata.isKnownMusicFreeSourceUrl(url)) {
-      return pluginKindMusicFree;
-    }
-    if (lower.contains('baka') || lower.contains('subscription.json')) {
-      return pluginKindBaka;
-    }
-    // 已知 BakaMusic 域名（music.cwo.cc.cd / bakp.netlify.app /
-    // animemusic.bzxhkj.com/baka）的索引，即使文件名不是 subscription.json
-    // 也判 Baka——否则这类订阅只能靠「当前分栏」兜底，粘贴位置一变就归错。
-    if (PluginMetadata.isBakaSourceUrl(url)) {
-      return pluginKindBaka;
-    }
-    // URL 无明确 MusicFree 特征时的辅助兜底：保留对 BakaMusic 订阅的兼容。
-    if (decoded is Map && decoded.containsKey('yourinfo')) {
-      return pluginKindBaka;
-    }
-    return pluginKindMusicFree;
-  }
+  // 订阅源类型提示已随 BakaMusic V1 契约一并移除：旧 V1 订阅靠
+  // yourinfo / subscription.json / baka URL 结构判定家族，v2 体系（vsaa
+  // 与 cwo 订阅）下所有契约（BakaMusic v2 / LX / 惜梦 / MusicFree）都能
+  // 由脚本内容可靠识别（见 PluginMetadata._detectBakaV2），订阅导入不再
+  // 需要家族提示，分类统一在 _persistScript 走 resolvePluginKindKey 判定。
 
   /// 从插件脚本 URL 提取多租户订阅源标识（`?source=ikun`）。
   ///
@@ -773,9 +741,9 @@ class _PluginsNotifier extends AsyncNotifier<List<_PluginInfo>> {
     }
   }
 
-  /// [kindHint] 为安装时用户所在分栏的分类标识：单文件插件（直链/本地）
-  /// 的脚本内容无法区分 BakaMusic 与 MusicFree（多契约插件字段完全重叠），
-  /// 只能靠用户所在分栏兜底，否则一律落进 MusicFree 分栏。
+  /// [kindHint] 为安装时用户所在分栏的分类标识：当前仅「其他」分栏的
+  /// 手动归位语义生效（见 resolvePluginKindKey），其余分栏一律以脚本
+  /// 内容契约判定归类。
   Future<_InstallSummary> installFromUrl(String url, {String? kindHint}) async {
     final summary = _MutableInstallSummary();
     final content = await _downloadText(url);
@@ -790,17 +758,9 @@ class _PluginsNotifier extends AsyncNotifier<List<_PluginInfo>> {
             : null;
         if (rawItems is List && rawItems.isNotEmpty) {
           final base = Uri.parse(url);
-          // 订阅源类型提示：Baka 订阅索引与 MusicFree 索引结构相同，
-          // 靠索引 URL（含 baka/subscription.json 或已知 Baka 域名）与
-          // 索引内的 yourinfo 字段把整批插件归入正确分栏。
-          //
-          // 订阅索引的家族由索引自身决定，**不采用「当前分栏」提示**：
-          // 分栏只说明粘贴订阅地址时页面停在哪儿（插件管理页会默认停在
-          // 首个非空分栏），与索引内容无关。实测把 MusicFree 订阅地址粘在
-          // BakaMusic 分栏时，整批 MusicFree 插件会被打上 baka 提示并长期
-          // 留在 BakaMusic 分栏；提示还会在后续每次导入时继续沿用。
-          // （单文件插件无结构可依，仍按所在分栏兜底，见下方分支。）
-          final indexKind = _subscriptionKindHint(url, decoded);
+          // 订阅索引不再携带家族提示（旧 V1 的 yourinfo / baka URL 判族
+          // 已移除）：每条插件下载后由 _persistScript 按脚本契约统一判定
+          // 分栏，vsaa / cwo 的 v2 订阅与 MusicFree 索引同一套规则。
           // 整批共用一份目录索引，且每装完一个让出一次事件循环。
           final index = await _newInstallIndex();
           for (final raw in rawItems.take(_maxIndexItems)) {
@@ -814,21 +774,11 @@ class _PluginsNotifier extends AsyncNotifier<List<_PluginInfo>> {
                 pluginUrl,
                 base,
               );
-              // 单条插件脚本托管在已知 Baka 域名时以 Baka 为准
-              // （MusicFree 索引里也可能挂 baka 系插件）。此处只给「提示」，
-              // 最终分类由 _persistScript 走统一入口判定：脚本契约优先，
-              // 索引族与单条 URL 仅作契约无法区分时的兜底。
-              final pluginKind =
-                  indexKind == pluginKindBaka ||
-                      PluginMetadata.isBakaSourceUrl(effectiveUrl)
-                  ? pluginKindBaka
-                  : indexKind;
               await _persistScript(
                 script,
                 effectiveUrl,
                 summary,
                 displayName: item['name']?.toString(),
-                kindHint: pluginKind,
                 // 多租户订阅：按脚本 URL 的 source 区分同一插件的不同授权，
                 // 避免 IKUN / 聆澜 等来源互相覆盖。
                 subscriptionSource: _subscriptionSourceTag(effectiveUrl),

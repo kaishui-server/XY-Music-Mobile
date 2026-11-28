@@ -48,6 +48,13 @@ baka-ac4-cli = { path = "vendor/baka-ac4/crates/baka-ac4-cli" }
 baka-av3a-core = { path = "vendor/baka-av3a/crates/baka-av3a-core" }
 baka-av3a-container = { path = "vendor/baka-av3a/crates/baka-av3a-container" }
 
+# symphonia-utils-xiph 本地补丁（MPL-2.0，上游 0.5.5 + XY 扩展）：Vorbis
+# >8 声道流（QQ 空间音质 galaxy714/916 的 12/16ch OGG-Vorbis）在声道映射
+# 表里返回 None 导致解码器拒绝初始化；按声位占位扩展到 16ch，配合
+# channel_downmix 泛化下混。补丁仅扩展 9..=16 声道，1..=8 行为不变。
+[patch.crates-io]
+symphonia-utils-xiph = { path = "vendor/symphonia-utils-xiph" }
+
 [build-dependencies]
 # 编译 anime 音效引擎（src/player/animefx.c，官方开放平台源码）
 cc = "1"

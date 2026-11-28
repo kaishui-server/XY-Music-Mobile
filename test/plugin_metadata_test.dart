@@ -206,27 +206,36 @@ module.exports = {
     expect(PluginMetadata.parse(script).isStarSea, isFalse);
   });
 
-  test('插件分类识别：baka/animemusic/lx/musicfree 四类标记', () {
-    // BakaMusic 契约：getMvSource 方法与 animeSrc 来源标记。
-    const baka = '''
+  test('插件分类识别：bakaV2/animemusic/lx/musicfree 四类标记', () {
+    // BakaMusic v2 契约（V1 已下线）：manifest 声明 apiVersion 2 与 capabilities。
+    const bakaV2 = '''
 const FALLBACK_BASE = "https://animemusic.bzxhkj.com";
 module.exports = {
-  platform: "animemusic",
-  async getMvSource(musicItem, quality) { return null; },
-  async search() { return { data: [{ id: "1", animeSrc: "wy" }] }; },
+  manifest: {
+    id: "cn.demo.am",
+    name: "animemusic v2",
+    platform: "animemusic",
+    version: "2.0.0",
+    author: "demo",
+    apiVersion: 2,
+    capabilities: ["search", "media.video"],
+  },
+  handlers: {},
 };
+function createProvider(sdk) { return { search: () => ({}) }; }
 ''';
-    final bakaMeta = PluginMetadata.parse(baka);
-    expect(bakaMeta.isBaka, isTrue);
-    expect(bakaMeta.isAnimemusic, isTrue); // 域名命中，分类时 baka 优先
+    final bakaV2Meta = PluginMetadata.parse(bakaV2);
+    expect(bakaV2Meta.isBakaV2, isTrue);
+    expect(bakaV2Meta.isAnimemusic, isTrue); // 域名命中，分类时 v2 优先
+    expect(bakaV2Meta.contract, PluginContract.bakaV2);
 
-    // animemusic 后端（v3/v4）：域名命中、无 Baka 标记。
+    // animemusic 后端（v3/v4）：域名命中、无 v2 标记。
     const am = '''
 const API_URL = "https://animemusic.bzxhkj.com/v1/index.php";
 module.exports = { platform: "musicfree-animemusic" };
 ''';
     final amMeta = PluginMetadata.parse(am);
-    expect(amMeta.isBaka, isFalse);
+    expect(amMeta.isBakaV2, isFalse);
     expect(amMeta.isAnimemusic, isTrue);
 
     // LX 契约（v2 洛雪版）：isLx 命中，同样含 animemusic 域名但归 LX。
@@ -244,33 +253,24 @@ module.exports = { platform: "示例音乐" };
 ''';
     final mfMeta = PluginMetadata.parse(mf);
     expect(mfMeta.isLx, isFalse);
-    expect(mfMeta.isBaka, isFalse);
+    expect(mfMeta.isBakaV2, isFalse);
     expect(mfMeta.isAnimemusic, isFalse);
   });
 
-  test('MusicFree 源域名白名单：shiqianjiang.cn 判 MusicFree 源', () {
+  test('订阅源域名不再参与分类：MusicFree 契约不被 Baka 订阅源提升', () {
+    // BakaMusic V1 下线后，来源 URL 白名单（shiqianjiang.cn / cwo.cc.cd 等）
+    // 已从分类链路移除：分栏只由脚本契约决定，URL 不再作为判定依据。
     expect(
-      PluginMetadata.isKnownMusicFreeSourceUrl(
-        'https://source.shiqianjiang.cn/api/script/mf.json?key=CERU_KEY-x.json',
-      ),
-      isTrue,
+      resolvePluginKindKey(contract: PluginContract.musicfree),
+      'musicfree',
     );
-    // 同域脚本托管地址也应命中（订阅与脚本同域分发）。
     expect(
-      PluginMetadata.isKnownMusicFreeSourceUrl(
-        'https://source.shiqianjiang.cn/api/script/mf/qq.js',
+      resolvePluginKindKey(
+        contract: PluginContract.musicfree,
+        kindHint: 'baka',
       ),
-      isTrue,
+      'musicfree',
     );
-    // Baka 域名不应被误判为 MusicFree 源。
-    expect(
-      PluginMetadata.isKnownMusicFreeSourceUrl(
-        'https://animemusic.bzxhkj.com/baka/subscription.json',
-      ),
-      isFalse,
-    );
-    // 空串/非法输入不误判。
-    expect(PluginMetadata.isKnownMusicFreeSourceUrl(''), isFalse);
   });
 
   test('platform 经配置表与数字常量间接取值时仍能解析名称', () {
@@ -441,24 +441,21 @@ function createProvider(sdk) { return {}; }
   });
 
   test('插件契约：kindKey/label 映射与判定优先级', () {
-    // kindKey 是分栏/分组共用的分类标识，bakaV2 与旧 baka 同栏但显示名不同。
+    // kindKey 是分栏/分组共用的分类标识；baka 分栏只承载 v2 契约。
     expect(PluginContract.lx.kindKey, 'lx');
     expect(PluginContract.bakaV2.kindKey, 'baka');
-    expect(PluginContract.baka.kindKey, 'baka');
     expect(PluginContract.animemusic.kindKey, 'animemusic');
     expect(PluginContract.musicfree.kindKey, 'musicfree');
     expect(PluginContract.lx.label, 'LX');
     expect(PluginContract.bakaV2.label, 'BakaMusic v2');
-    expect(PluginContract.baka.label, 'BakaMusic');
     expect(PluginContract.animemusic.label, '惜梦');
     expect(PluginContract.musicfree.label, 'MusicFree');
 
-    // 优先级：lx > bakaV2 > baka > animemusic > musicfree。
+    // 优先级：lx > bakaV2 > animemusic > musicfree。
     expect(
       pluginContractOf(
         isLx: true,
         isBakaV2: true,
-        isBaka: true,
         isAnimemusic: true,
       ),
       PluginContract.lx,
@@ -467,7 +464,6 @@ function createProvider(sdk) { return {}; }
       pluginContractOf(
         isLx: false,
         isBakaV2: true,
-        isBaka: true,
         isAnimemusic: false,
       ),
       PluginContract.bakaV2,
@@ -476,16 +472,6 @@ function createProvider(sdk) { return {}; }
       pluginContractOf(
         isLx: false,
         isBakaV2: false,
-        isBaka: true,
-        isAnimemusic: false,
-      ),
-      PluginContract.baka,
-    );
-    expect(
-      pluginContractOf(
-        isLx: false,
-        isBakaV2: false,
-        isBaka: false,
         isAnimemusic: true,
       ),
       PluginContract.animemusic,
@@ -494,14 +480,13 @@ function createProvider(sdk) { return {}; }
       pluginContractOf(
         isLx: false,
         isBakaV2: false,
-        isBaka: false,
         isAnimemusic: false,
       ),
       PluginContract.musicfree,
     );
   });
 
-  test('分类统一入口：契约优先，提示与来源 URL 只兜底 MusicFree/Baka', () {
+  test('分类统一入口：契约优先，提示仅保留「其他」覆盖', () {
     // 契约明确的类目不受分栏提示影响（避免粘贴到 BakaMusic 分栏就变 baka）。
     expect(
       resolvePluginKindKey(contract: PluginContract.lx, kindHint: 'baka'),
@@ -511,33 +496,26 @@ function createProvider(sdk) { return {}; }
       resolvePluginKindKey(contract: PluginContract.animemusic, kindHint: 'baka'),
       'animemusic',
     );
-    // BakaMusic 契约不会被 musicfree 提示压回。
+    // BakaMusic v2 契约不会被 musicfree 提示压回。
     expect(
-      resolvePluginKindKey(contract: PluginContract.baka, kindHint: 'musicfree'),
+      resolvePluginKindKey(contract: PluginContract.bakaV2, kindHint: 'musicfree'),
       'baka',
     );
     expect(
       resolvePluginKindKey(contract: PluginContract.bakaV2, kindHint: 'baka'),
       'baka',
     );
-    // MusicFree 契约可被 baka 提示或已知 Baka 订阅源提升到 baka 分栏。
+    // MusicFree 契约不会因 baka 分栏提示被提升（提示与来源 URL 均不参与分类）。
     expect(
       resolvePluginKindKey(
         contract: PluginContract.musicfree,
         kindHint: 'baka',
       ),
-      'baka',
-    );
-    expect(
-      resolvePluginKindKey(
-        contract: PluginContract.musicfree,
-        sourceUrl: 'https://music.cwo.cc.cd/subscription.json',
-      ),
-      'baka',
+      'musicfree',
     );
     // 用户手动归入「其他」优先级最高。
     expect(
-      resolvePluginKindKey(contract: PluginContract.baka, kindHint: 'other'),
+      resolvePluginKindKey(contract: PluginContract.bakaV2, kindHint: 'other'),
       'other',
     );
     expect(
@@ -559,7 +537,7 @@ module.exports = {
 ''';
     final metadata = PluginMetadata.parse(script);
     // 名称/作者含 baka，但脚本内容是普通 MusicFree 契约 → 仍归 MusicFree。
-    expect(metadata.isBaka, isFalse);
+    expect(metadata.isBakaV2, isFalse);
     expect(metadata.contract, PluginContract.musicfree);
     expect(resolvePluginKindKey(contract: metadata.contract), 'musicfree');
   });

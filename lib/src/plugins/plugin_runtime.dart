@@ -56,10 +56,11 @@ class EnabledMusicPlugin {
     required this.path,
     this.isLx = false,
     this.lxSources = const [],
-    this.isBaka = false,
     this.isBakaV2 = false,
     this.isAnimemusic = false,
     this.animemusicApi = '',
+    this.animemusicApiKey = '',
+    this.animemusicActApi = false,
     this.animemusicPlatform = 'wy',
     this.animemusicQualities = const ['128k', '192k', '320k', 'flac'],
     this.userVariables = const {},
@@ -74,15 +75,11 @@ class EnabledMusicPlugin {
   final bool isLx;
   final List<String> lxSources;
 
-  /// BakaMusic 契约插件（getMvSource 方法 / animeSrc 来源标记），优先级
-  /// 低于 LX、高于 animemusic，与插件管理页的分类规则一致。
-  final bool isBaka;
-
-  /// Baka provider **v2** 契约（`{manifest, handlers}` + `createProvider`）：
-  /// 由 [PluginMetadata.isBakaV2] 内容识别，与旧 BakaMusic 互斥。v2 与旧
-  /// BakaMusic 同属 BakaMusic 分栏（见 [PluginContract.kindKey]），但运行时
-  /// 走各自适配层，所以单独保留一个标记；[isBaka] 仍只表示旧契约，避免旧
-  /// Baka 私有接口（animeSrc / getDailyRecommendations）被误用到 v2 插件上。
+  /// Baka provider **v2** 契约（`{manifest, handlers}`，handler 按
+  /// `(request, sdk)` 直接声明或经 `createProvider` 工厂）：由
+  /// [PluginMetadata.isBakaV2] 内容识别，运行时走专用适配层
+  /// （assets/baka_v2_adapter.js）。旧 BakaMusic V1 契约已移除，
+  /// BakaMusic 分栏只承载 v2 插件。
   final bool isBakaV2;
 
   /// animemusic/1 自有格式插件：CommonJS Node 模块，QuickJS 无法直接
@@ -91,6 +88,14 @@ class EnabledMusicPlugin {
 
   /// 从插件 META 提取的后端接口地址（可被用户变量 api 覆盖）。
   final String animemusicApi;
+
+  /// 从脚本 `const API_KEY` 提取的网关密钥（惜梦 CIT v2 等 act 风格
+  /// 网关要求 `?key=cit_xxx` 鉴权；path 风格网关为空）。
+  final String animemusicApiKey;
+
+  /// 后端为 act 风格网关（`?act=search&key=…`，惜梦 CIT v2）：
+  /// 路由与参数名与 path 风格不同，由 [_callAnimemusicApi] 统一映射。
+  final bool animemusicActApi;
 
   /// 后端音源平台（wy/kg/…）。
   final String animemusicPlatform;
@@ -125,7 +130,6 @@ class EnabledMusicPlugin {
   /// 只由内容识别出的标记决定，不读插件显示名/备注/作者名。
   PluginContract get contract => pluginContractOf(
     isLx: isLx,
-    isBaka: isBaka,
     isBakaV2: isBakaV2,
     isAnimemusic: isAnimemusic,
   );
@@ -617,7 +621,6 @@ Future<List<EnabledMusicPlugin>> loadEnabledMusicPlugins(Ref ref) async {
   final sourceUrls = _readPluginSourceUrls(prefs, sourceUrlsKey);
   final displayNames = readPluginDisplayNames(prefs);
   final sourceLabels = readPluginSourceLabels(prefs);
-  final kinds = readPluginKinds(prefs);
   final orderedIds = prefs.getStringList(pluginOrderKey) ?? const [];
   // 解析（同步 IO + 多条正则全文扫描）整体移入后台 isolate：导入/切换插件
   // 后 invalidate 触发全量重载时，主线程不再执行同步正则解析，避免阻塞 UI
@@ -629,7 +632,6 @@ Future<List<EnabledMusicPlugin>> loadEnabledMusicPlugins(Ref ref) async {
     sourceUrls: sourceUrls,
     displayNames: displayNames,
     sourceLabels: sourceLabels,
-    kinds: kinds,
     orderedIds: orderedIds,
   );
   return [
@@ -640,11 +642,12 @@ Future<List<EnabledMusicPlugin>> loadEnabledMusicPlugins(Ref ref) async {
         path: m['path']! as String,
         isLx: m['isLx']! as bool,
         lxSources: (m['lxSources'] as List).cast<String>(),
-        isBaka: m['isBaka']! as bool,
         isBakaV2: m['isBakaV2'] as bool? ?? false,
         isAnimemusic: m['isAnimemusic']! as bool,
         sourceLabel: m['sourceLabel'] as String?,
         animemusicApi: m['animemusicApi']! as String,
+        animemusicApiKey: m['animemusicApiKey'] as String? ?? '',
+        animemusicActApi: m['animemusicActApi'] as bool? ?? false,
         animemusicPlatform: m['animemusicPlatform']! as String,
         animemusicQualities: (m['animemusicQualities'] as List).cast<String>(),
         userVariables: (m['userVariables'] as Map).cast<String, String>(),
@@ -664,7 +667,6 @@ Future<List<Map<String, Object?>>> _loadEnabledMusicPluginsInIsolate({
   required Map<String, String> sourceUrls,
   required Map<String, String> displayNames,
   required Map<String, String> sourceLabels,
-  required Map<String, String> kinds,
   required List<String> orderedIds,
 }) {
   return Isolate.run(() {
@@ -681,6 +683,13 @@ Future<List<Map<String, Object?>>> _loadEnabledMusicPluginsInIsolate({
       final animemusicMeta = isAnimemusic
           ? _extractAnimemusicMeta(source)
           : const <String, String>{};
+      // act 风格网关（惜梦 CIT v2）：脚本以 `{ act: act, key: … }` 构造
+      // 请求，且密钥为脚本内 `const API_KEY` 常量（path 风格网关不携带）。
+      final animemusicActApi =
+          isAnimemusic && _looksLikeAnimemusicActGateway(source);
+      final animemusicApiKey = isAnimemusic
+          ? _extractAnimemusicApiKey(source)
+          : '';
       final metadata = PluginMetadata.parse(source);
       // animemusic 的 module.exports 导出的是变量而非对象字面量，
       // PluginMetadata 取不到名称时回退 META.name。
@@ -690,26 +699,12 @@ Future<List<Map<String, Object?>>> _loadEnabledMusicPluginsInIsolate({
       // 订阅索引声明的显示名优先：脚本混淆/无元信息时也能显示正确名称。
       final overrideName = displayNames[id]?.trim() ?? '';
       if (overrideName.isNotEmpty) pluginName = overrideName;
-      // 分类判定统一走 [resolvePluginKindKey]（与插件管理页分栏、搜索页
-      // 来源 Tab 同一入口）：只依赖内容契约 + 订阅提示 + 来源 URL，不读
-      // 显示名/作者名。BakaMusic 兼容 MusicFree 协议，内容证据优先，提示与
-      // 来源 URL 仅在契约无法区分时兜底（同 ID 插件被另一族覆盖时来源 URL
-      // 会从旧插件继承，URL 优先会把 MusicFree 插件误标成 BakaMusic）。
+      // 分类判定统一走 EnabledMusicPlugin.contract / kindKey（与插件管理页
+      // 分栏、搜索页来源 Tab 同一入口 resolvePluginKindKey）：只依赖内容
+      // 契约与手动「其他」归位，不读显示名/作者名。BakaMusic 分栏只承载
+      // v2 契约插件（旧 V1 契约已移除），由 [PluginMetadata.isBakaV2]
+      // 内容判定，契约标记随 map 传回主 isolate 重建。
       final isBakaV2 = metadata.isBakaV2;
-      final kind = resolvePluginKindKey(
-        contract: pluginContractOf(
-          isLx: isLx,
-          isBaka: metadata.isBaka,
-          isBakaV2: isBakaV2,
-          isAnimemusic: isAnimemusic,
-        ),
-        kindHint: kinds[id],
-        sourceUrl: sourceUrls[id] ?? '',
-      );
-      // v2 与旧 BakaMusic 同属 baka 分栏，但运行时旧 Baka 私有接口
-      // （animeSrc / getDailyRecommendations）只对旧契约开放，v2 走自己的
-      // 适配层，故 [EnabledMusicPlugin.isBaka] 不随分栏置位。
-      final isBaka = kind == pluginKindBaka && !isBakaV2;
       plugins.add(<String, Object?>{
         'id': id,
         'name': pluginName,
@@ -718,7 +713,6 @@ Future<List<Map<String, Object?>>> _loadEnabledMusicPluginsInIsolate({
         'lxSources': isLx
             ? _detectLxSources(source, name: pluginName)
             : const <String>[],
-        'isBaka': isBaka,
         'isBakaV2': isBakaV2,
         'isAnimemusic': isAnimemusic,
         'sourceLabel': sourceLabels[id],
@@ -737,6 +731,8 @@ Future<List<Map<String, Object?>>> _loadEnabledMusicPluginsInIsolate({
             animemusicMeta['platform']?.trim().isNotEmpty == true
             ? animemusicMeta['platform']!.trim()
             : 'wy',
+        'animemusicApiKey': animemusicApiKey,
+        'animemusicActApi': animemusicActApi,
         'animemusicQualities':
             animemusicMeta['qualities']?.trim().isNotEmpty == true
             ? (animemusicMeta['qualities']!
@@ -808,14 +804,13 @@ const pluginDisplayNamesKey = 'mobilePluginDisplayNamesV1';
 /// SharedPreferences 中持久化插件订阅来源类型的键：
 /// {pluginId: 'baka'|'musicfree'|'lx'|'animemusic'|'other'}。
 ///
-/// BakaMusic 是 MusicFree 的衍生契约，两者脚本同构（都导出
-/// module.exports + search/getMediaSource，第三方 MusicFree 通用插件
-/// 还可能为兼容 Baka 而附带 getMvSource），**内容层无法可靠区分**。
-/// 因此在导入时按订阅源响应结构记录类型，分类时优先于内容静态检测，
-/// 使在线导入的 baka / 洛雪 / musicfree 分栏不再出错。
+/// 分类以脚本内容契约判定为主（见 [resolvePluginKindKey]）；本表当前只
+/// 服务于用户手动归入「其他」的覆盖，历史写入的 baka/musicfree 值不影响
+/// 内容判定结果。
 const pluginKindsKey = 'mobilePluginKindsV1';
 
 /// 订阅类型标识（与插件管理页 _PluginKind 的分栏名对齐）。
+/// `baka` 分栏只承载 BakaMusic v2 契约插件（旧 V1 契约已移除）。
 const pluginKindBaka = 'baka';
 const pluginKindMusicFree = 'musicfree';
 const pluginKindLx = 'lx';
@@ -964,18 +959,29 @@ bool _looksLikeLxPlugin(String source) {
 /// 宿主内置搜索（Rust `lx_search` / `lx_search_playlists`）真正实现的平台。
 ///
 /// 注意：这只是「宿主能搜哪些平台」的能力边界，**不是**插件平台声明的
-/// 白名单。订阅源可能声明更多平台（git/qs/jo 等），UI 必须按声明展示，
-/// 搜索阶段再按这里降级。
+/// 白名单。订阅源可能声明更多平台（git/bd 等），UI 只展示这里列出的
+/// 平台，搜索阶段再按这里降级。
 ///
-/// `qs`（汽水音乐）已接入 Rust `lx_search` 的 `search_qs`，因此进入本表；
-/// 取流仍由订阅源（lx-cit 的 `source=qs`）按 `musicUrl` 动作解析。
-/// `jo`（JOOX）同理由 Rust `search_jo` 直连官方搜索接口，歌词走
+/// `jo`（JOOX）由 Rust `search_jo` 直连官方搜索接口，歌词走
 /// `fetch_jo_lyric`，取流仍由订阅源按 `musicUrl` 解析。
-// 宿主内置搜索（Rust `lx_search`）支持的平台。汽水（qs）此前接入过
-// 匿名 PC 接口，2026-11 上游全面启用应用级签名门禁（HTTP 200 + 空 body），
-// 匿名搜索已不可用，平台从宿主搜索列表移除；汽水歌曲仍可经插件
-// musicUrl 播放，只是不再提供宿主搜索入口。
-const kHostLxSearchSources = ['kw', 'kg', 'tx', 'wy', 'mg', 'jo'];
+/// `bili`（哔哩哔哩）由 Rust `search_bili` 直连 web 端综合搜索（搜视频，
+/// 视频音轨即音频，songmid 存 bvid），取流同样由订阅源（lx-cit 的
+/// `source=bili`）按 `musicUrl` 解析。
+///
+/// 汽水（qs）由 Rust `search_qs` 直连 luna PC 综合搜索：2026-11 复测匿名
+/// 请求仍返回完整 `result_groups`（tracks 分组可用），此前判定的「上游
+/// 全面签名门禁」已不成立，故恢复为宿主可搜平台；取流仍由订阅源按
+/// `musicUrl` 解析（lx-cit / ceru 的 qs 分支）。
+const kHostLxSearchSources = [
+  'kw',
+  'kg',
+  'tx',
+  'wy',
+  'mg',
+  'qs',
+  'jo',
+  'bili',
+];
 
 /// 宿主内置**歌单**搜索（Rust `lx_search_playlists`）真正实现的平台。
 /// 汽水只做了单曲搜索，歌单侧未实现，单独成表以免选到汽水歌单时
@@ -1257,6 +1263,20 @@ bool _looksLikeAnimemusicPlugin(String source) =>
     RegExp(r'''module\.exports\s*=\s*\w+''').hasMatch(source) &&
         source.contains('animemusic/1');
 
+/// act 风格网关识别（惜梦 CIT v2 等）：插件以 `{ act: act, key: … }`
+/// 构造请求查询串（path 风格插件走 `/<route>` 或 `?route=`）。
+bool _looksLikeAnimemusicActGateway(String source) =>
+    RegExp(r'''act:\s*act\b''').hasMatch(source);
+
+/// 提取 animemusic/1 插件的网关密钥（`const API_KEY = "cit_…"`）。
+/// act 风格网关要求每次调用携带 `?key=`；path 风格网关无此常量，返回空。
+String _extractAnimemusicApiKey(String source) {
+  final match = RegExp(
+    r'''const\s+API_KEY\s*=\s*["']([^"']+)["']''',
+  ).firstMatch(source);
+  return match?.group(1)?.trim() ?? '';
+}
+
 /// 提取 animemusic/1 插件 `const META = { ... }` 中的关键字段。
 /// META 由分发端点实时生成、保证是单行合法 JSON，这里按行截取后解码；
 /// 解码失败时退回逐字段正则，尽量拿到 api/platform/qualities。
@@ -1325,14 +1345,12 @@ String musicPluginKindKeyOf(
   EnabledMusicPlugin plugin, [
   Map<String, String>? overrides,
 ]) {
-  // 与插件管理页分栏共用 [resolvePluginKindKey]：管理页会按订阅提示与来源
-  // URL 把「BakaMusic 订阅里的插件」兜底归入 BakaMusic，搜索页此前只看
-  // 运行时契约标记，同一插件两边分类不同，导致搜索来源 Tab 顺序与管理页
-  // 分栏顺序对不上。
+  // 与插件管理页分栏共用 [resolvePluginKindKey]：分类只由契约内容决定
+  // （加手动「其他」归位），同一插件两边分类必然一致，搜索来源 Tab 顺序
+  // 与管理页分栏顺序对得上。
   return resolvePluginKindKey(
     contract: plugin.contract,
     kindHint: overrides?[plugin.id],
-    sourceUrl: plugin.sourceUrl,
   );
 }
 
@@ -1982,7 +2000,7 @@ class PluginRuntimeService {
     // apiVersion 2 插件（module.exports={manifest,handlers} + createProvider）
     // 由适配层加载：适配层按 manifest.capabilities 裁剪出方法集后注册成
     // MusicFree 形状的门面，因此下面的 __xyCallMusicFreePlugin 调用链不用
-    // 感知契约差异，既有 lx / musicfree / 旧 baka / 惜梦 插件行为不变。
+    // 感知契约差异，既有 lx / musicfree / 惜梦插件行为不变。
     if (plugin.isBakaV2) return _ensureV2Plugin(plugin);
     if (_loaded.contains(plugin.id)) return Future.value();
     return _loadTasks
@@ -3721,7 +3739,7 @@ class PluginRuntimeService {
       sources = sources.contains(onlySource) ? [onlySource] : const [];
     }
     // 宿主内置搜索（Rust `lx_search`）只实现了 kHostLxSearchSources 内的
-    // 平台，其余平台（ikun 的 git、lx-cit 的 qs/bili/bd 等）只在取播放
+    // 平台，其余平台（ikun 的 git、lx-cit 的 bd 等）只在取播放
     // 链接时由订阅源解析，搜索没有宿主实现。插件声明了但宿主搜不了的
     // 平台已在上方剥离（搜索页下拉也不展示），这里兜底防御：
     //  - 单平台选中时给出明确提示，避免「Unknown LX source: git」这种内部
@@ -3742,7 +3760,7 @@ class PluginRuntimeService {
       if (sources.isEmpty) {
         throw Exception(
           '${plugin.name} 声明的平台（${unsupported.join('/')}）暂无搜索能力：'
-          '宿主当前仅支持酷我/酷狗/QQ音乐/网易云/咪咕/JOOX',
+          '宿主当前仅支持酷我/酷狗/QQ音乐/网易云/咪咕/汽水/JOOX/哔哩哔哩',
         );
       }
     }
@@ -6641,11 +6659,8 @@ class PluginRuntimeService {
   // ==================== animemusic/1 REST 直连 ====================
   // 插件本体是 CommonJS Node 模块，QuickJS 没有其依赖的 http/https/zlib
   // 内置模块；但插件契约只是对后端 REST 的薄封装（{api}/music/search
-  // 等，含 PATH_INFO / ?route= 两种路由风格自适应），宿主直接实现等价
-  // 调用，插件文件仍保留在磁盘上以便后续更新与配置管理。
-
-  /// 每个插件已确认可用的路由风格：false = PATH_INFO，true = ?route=。
-  final Map<String, bool> _animemusicQueryRoute = {};
+  // 等，含 PATH_INFO / ?route= / ?act= 三种路由风格自适应），宿主直接
+  // 实现等价调用，插件文件仍保留在磁盘上以便后续更新与配置管理。
 
   /// 每个插件的限流/故障退避截止时间：窗口内所有后端调用直接快速
   /// 失败，不再发网络请求。播放器的换源重试会放大请求频率，把
@@ -6661,14 +6676,74 @@ class PluginRuntimeService {
       .replaceFirst(RegExp(r'/index\.php(\?.*)?$', caseSensitive: false), '')
       .replaceFirst(RegExp(r'/+$'), '');
 
+  /// animemusic 后端路由风格（按插件记忆，探测成功后优先复用）：
+  /// `path` = `<base>/<route>`；`query` = `<base>/index.php?route=<route>`；
+  /// `act` = `<base>/index.php?act=<act>&key=…`（惜梦 CIT v2 网关，
+  /// 参数名与 path 风格另有差异，见 [_animemusicActParams]）。
+  final Map<String, String> _animemusicRouteStyle = {};
+
+  /// act 网关的路由名映射（path 风格调用点 → act 名；未列出的按
+  /// `music/` 前缀剥离 + `/`→`_` 兜底）。
+  static const Map<String, String> _animemusicActNames = {
+    'music/search': 'search',
+    'music/url': 'url',
+    'music/lyric': 'lyric',
+    'music/lyric/word': 'lyric_word',
+    'music/toplist': 'toplist',
+    'music/toplist/detail': 'toplist_songs',
+    'music/album': 'album',
+    'music/artist': 'artist',
+    'music/artist_desc': 'artist_desc',
+    'music/artist_albums': 'artist_albums',
+    'music/suggest': 'suggest',
+    'music/import': 'import',
+    'music/comment': 'comment',
+    'music/mv/search': 'mv_search',
+    'music/mv/url': 'mv_url',
+    'music/hotsearch': 'hotsearch',
+    'music/recommend': 'recommend',
+    'music/discover': 'discover',
+    'music/playlist': 'playlist',
+  };
+
+  /// act 网关参数名映射：`source`→`platform`、`musicId`→`id`（取流/
+  /// MV/歌词等 act 侧统一用 platform+id）；歌单导入 act 侧只认数字
+  /// `id`，从 `url` 参数提取不出数字时保留原值让后端显式报错。
+  static Map<String, String> _animemusicActParams(Map<String, String> params) {
+    final mapped = <String, String>{};
+    params.forEach((key, value) {
+      if (key == 'source') {
+        mapped['platform'] = value;
+      } else if (key == 'musicId') {
+        mapped['id'] = value;
+      } else {
+        mapped[key] = value;
+      }
+    });
+    final urlValue = mapped['url'];
+    if (urlValue != null && mapped['id'] == null) {
+      final digits = RegExp(r'\d{5,}').firstMatch(urlValue)?.group(0);
+      mapped['id'] = digits ?? urlValue;
+    }
+    return mapped;
+  }
+
   Uri _animemusicUri(
     EnabledMusicPlugin plugin,
     String path,
     Map<String, String> params, {
-    required bool queryRoute,
+    required String style,
   }) {
     final base = _animemusicApiBase(plugin);
-    if (queryRoute) {
+    if (style == 'act') {
+      return Uri.parse('$base/index.php').replace(queryParameters: {
+        'act': _animemusicActNames[path] ??
+            path.replaceFirst(RegExp(r'^music/'), '').replaceAll('/', '_'),
+        if (plugin.animemusicApiKey.isNotEmpty) 'key': plugin.animemusicApiKey,
+        ..._animemusicActParams(params),
+      });
+    }
+    if (style == 'query') {
       return Uri.parse('$base/index.php').replace(
         queryParameters: {'route': path, ...params},
       );
@@ -6676,7 +6751,22 @@ class PluginRuntimeService {
     return Uri.parse('$base/$path').replace(queryParameters: params);
   }
 
-  /// 调用 animemusic 后端：自动探测并记忆路由风格，404 时换另一种重试。
+  /// 插件的路由探测顺序：act 网关插件（惜梦 CIT v2）先 act；其余维持
+  /// path → query 的既有顺序。已确认风格的插件把确认值排在最前，
+  /// 404 时仍允许换风格重试（与旧探测语义一致）。
+  List<String> _animemusicRouteAttempts(EnabledMusicPlugin plugin) {
+    final confirmed = _animemusicRouteStyle[plugin.id];
+    final defaults = plugin.animemusicActApi
+        ? const ['act', 'path', 'query']
+        : const ['path', 'query'];
+    if (confirmed == null) return defaults;
+    return [
+      confirmed,
+      ...defaults.where((style) => style != confirmed),
+    ];
+  }
+
+  /// 调用 animemusic 后端：自动探测并记忆路由风格，404 时换下一种重试。
   Future<Map<String, dynamic>> _callAnimemusicApi(
     EnabledMusicPlugin plugin,
     String path,
@@ -6696,16 +6786,14 @@ class PluginRuntimeService {
         throw Exception('音源后端限流中，请 ${remaining.inSeconds + 1} 秒后再试');
       }
     }
-    final confirmed = _animemusicQueryRoute[plugin.id];
-    final attempts =
-        confirmed == null ? [false, true] : [confirmed, !confirmed];
+    final attempts = _animemusicRouteAttempts(plugin);
     Object? lastError;
-    for (final useQuery in attempts) {
+    for (final style in attempts) {
       final uri = _animemusicUri(
         plugin,
         path,
         params,
-        queryRoute: useQuery,
+        style: style,
       );
       try {
         final response = await _rawGet(uri, headers: const {
@@ -6756,7 +6844,7 @@ class PluginRuntimeService {
             message.isNotEmpty ? message : '接口返回失败（$code）',
           );
         }
-        _animemusicQueryRoute[plugin.id] = useQuery;
+        _animemusicRouteStyle[plugin.id] = style;
         return Map<String, dynamic>.from(decoded);
       } catch (error) {
         // 业务错误（限流/参数错/后端 5xx）与路由风格无关，换路由重试
@@ -8878,6 +8966,9 @@ class PluginRuntimeService {
     'mg' => '咪咕',
     'qs' => '汽水',
     'jo' => 'JOOX',
+    // 订阅源（lx-cit / ceru）里 bili 就是平台代号，B 站原生接口侧写作
+    // bilibili，两个都映射到同一展示名，避免搜索结果里露出原始代号
+    'bili' => 'B站',
     'bilibili' => 'B站',
     _ => code.toUpperCase(),
   };

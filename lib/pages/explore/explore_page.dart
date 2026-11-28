@@ -793,15 +793,16 @@ class _RecommendationTabsState extends ConsumerState<_RecommendationTabs>
     super.didChangeDependencies();
     // 插件列表异步加载完成前 valueOrNull 为 null，按无每日推荐处理；
     // 数据到达后本回调会再次触发，届时再补齐第三个 Tab。
-    // 与 dailyRecommendationsProvider 的选型条件保持一致：Baka 协议
-    // 插件，或静态扫描确认实现了 getDailyRecommendations 的 MusicFree
-    // 订阅插件才显示入口；LX/未识别插件不显示（无此能力）。
+    // 与 dailyRecommendationsProvider 的选型条件保持一致：BakaMusic v2
+    // 插件（适配层暴露 getDailyRecommendations 门面），或静态扫描确认实现
+    // 了 getDailyRecommendations 的 MusicFree 订阅插件才显示入口；
+    // LX/未识别插件不显示（无此能力）。
     final hasDaily30 = ref
             .watch(enabledMusicPluginsProvider)
             .valueOrNull
             ?.any(
               (plugin) =>
-                  plugin.isBaka ||
+                  plugin.isBakaV2 ||
                   (!plugin.isLx &&
                       plugin.availableMethods
                           .contains('getDailyRecommendations')),

@@ -435,10 +435,11 @@ class RecommendedPlaylist {
   final bool isChart;
 }
 
-/// Baka 插件的每日 30 首推荐状态（多音源：QQ 音乐 / 酷狗 / 酷我）。
+/// BakaMusic v2 插件的每日 30 首推荐状态（多音源：QQ 音乐 / 酷狗 / 酷我 /
+/// 网易云）。
 ///
-/// [result] 为插件 getDailyRecommendations 的原始结果；ready 且歌单数据
-/// 完整时额外构造 [playlist]，探索页直接复用它进入歌单详情/播放。
+/// [result] 为适配层门面 getDailyRecommendations 的原始结果；ready 且歌单
+/// 数据完整时额外构造 [playlist]，探索页直接复用它进入歌单详情/播放。
 class DailyRecommendationState {
   const DailyRecommendationState({
     required this.plugin,
@@ -456,7 +457,7 @@ class DailyRecommendationState {
   final String sourceLabel;
   final RecommendedPlaylist? playlist;
 
-  /// 是否允许在探索页展示该来源插件名与歌单。Baka 插件未填写
+  /// 是否允许在探索页展示该来源插件名与歌单。BakaMusic v2 插件未填写
   /// 「用户 ID / 连接码」用户变量时为 false：即使插件返回了歌曲，
   /// 也不输出来源与歌单（不占位、不灰态），由页面直接跳过该来源。
   final bool sourceVisible;
@@ -491,12 +492,13 @@ bool _isUserSourceVariableKey(String rawKey) {
       key.endsWith('_connect_code');
 }
 
-/// 每日30首的来源展示门禁：只有 Baka 插件且用户已填写「用户 ID / 连接码」
-/// 类用户变量时，才允许展示该插件的来源名与歌单；未填写（变量缺失或值为
-/// 空/纯空白）时即使插件返回了歌曲也不展示。非 Baka 音源（MusicFree /
-/// 洛雪 / animemusic）的每日30首行为保持原样，不受此门禁影响。
+/// 每日30首的来源展示门禁：只有 BakaMusic v2 插件且用户已填写
+/// 「用户 ID / 连接码」类用户变量时，才允许展示该插件的来源名与歌单；
+/// 未填写（变量缺失或值为空/纯空白）时即使插件返回了歌曲也不展示。
+/// 非 v2 音源（MusicFree / 洛雪 / animemusic）的每日30首行为保持原样，
+/// 不受此门禁影响。
 bool dailyRecommendationSourceVisible(EnabledMusicPlugin plugin) {
-  if (!plugin.isBaka) return true;
+  if (!plugin.isBakaV2) return true;
   for (final entry in plugin.userVariables.entries) {
     if (entry.value.trim().isEmpty) continue;
     if (_isUserSourceVariableKey(entry.key)) return true;
@@ -529,9 +531,9 @@ String dailyRecommendationSourceLabel(EnabledMusicPlugin plugin) {
 
 /// 拉取**所有**支持每日推荐的音源插件（QQ 音乐 / 酷狗 / 酷我 / 网易云[T]）
 /// 的今日 30 首歌单，按音源优先级（QQ → 酷狗 → 酷我 → 其它）稳定排序返回。
-/// Baka 协议插件与声明了 getDailyRecommendations 的 MusicFree 订阅插件
-/// 均会命中；无插件或插件不支持时返回空列表，探索页据此隐藏「每日30首」
-/// Tab 或显示引导提示。
+/// BakaMusic v2 插件（经适配层门面调用）与声明了 getDailyRecommendations
+/// 的 MusicFree 订阅插件均会命中；无插件或插件不支持时返回空列表，
+/// 探索页据此隐藏「每日30首」Tab 或显示引导提示。
 ///
 /// 各音源的用户 ID 仍由各插件自行从自己的设置读取（酷狗/酷我/网易云的
 /// 用户 ID 形如 kg_xxx / kw_xxx / wy_xxx，密钥由订阅下发），宿主只负责
@@ -539,14 +541,15 @@ String dailyRecommendationSourceLabel(EnabledMusicPlugin plugin) {
 final dailyRecommendationsProvider =
     FutureProvider<List<DailyRecommendationState>>((ref) async {
   final plugins = await ref.read(enabledMusicPluginsProvider.future);
-  // 门禁收紧：每日30首只有 Baka 协议插件（QQ[L1]/酷狗[T]/酷我[T]/网易云[T]
-  // 等 baka 订阅源插件）与**静态扫描确认**实现了 getDailyRecommendations 的
-  // MusicFree 插件支持。LX 音源与 availableMethods 未识别（压缩/混淆）
-  // 的插件一律不进——mayHaveMethod 对未识别集合恒返回 true，放进来只会
-  // 让无此能力的插件也出现在「每日30首」里，点进去全是报错。
+  // 门禁收紧：每日30首只有 BakaMusic v2 插件（适配层暴露
+  // getDailyRecommendations 门面）与**静态扫描确认**实现了
+  // getDailyRecommendations 的 MusicFree 插件支持。LX 音源与
+  // availableMethods 未识别（压缩/混淆）的插件一律不进——mayHaveMethod
+  // 对未识别集合恒返回 true，放进来只会让无此能力的插件也出现在
+  // 「每日30首」里，点进去全是报错。
   final targets = <EnabledMusicPlugin>[
     for (final plugin in plugins)
-      if (plugin.isBaka ||
+      if (plugin.isBakaV2 ||
           (!plugin.isLx &&
               plugin.availableMethods.contains('getDailyRecommendations')))
         plugin,
@@ -555,7 +558,7 @@ final dailyRecommendationsProvider =
 
   final runtime = ref.read(pluginRuntimeProvider);
   final tasks = targets.map((plugin) => () async {
-    // 来源门禁：Baka 插件未填写「用户 ID / 连接码」时不构造歌单，也不展示
+    // 来源门禁：v2 插件未填写「用户 ID / 连接码」时不构造歌单，也不展示
     // 来源插件名（结果本身照常拉取，供页面区分 unconfigured 等状态）。
     final sourceVisible = dailyRecommendationSourceVisible(plugin);
     final result = await runtime.getDailyRecommendations(plugin);

@@ -26,9 +26,23 @@ lx.send(lx.EVENT_NAMES.inited, { status: true, name: item, sources: musicSources
 const MUSIC_QUALITY = JSON.parse('{"kg":["128k","320k"],"kw":["128k","320k"],"tx":["128k"],"wy":["128k"],"mg":["128k"],"qs":["128k","320k"],"jo":["128k","320k"]}')
 ''';
     final sources = debugDetectLxSources(source);
+    // qs 与 jo 都已是宿主可搜平台，按宿主固定顺序排列
     expect(sources, ['kw', 'kg', 'tx', 'wy', 'mg', 'qs', 'jo']);
     expect(sources.contains('qs'), isTrue);
     expect(sources.contains('jo'), isTrue);
+  });
+
+  test('lx-cit 的 bili 是宿主可搜索平台，bd 仍不可搜', () {
+    const source = '''
+const MUSIC_QUALITY = JSON.parse('{"kw":["128k","320k"],"bili":["128k","320k","flac"],"bd":["128k"]}')
+''';
+    final sources = debugDetectLxSources(source);
+    expect(sources.contains('bili'), isTrue);
+    // 宿主已由 Rust `search_bili` 实现 B 站搜索，`search_qs` 实现汽水搜索
+    expect(kHostLxSearchSources.contains('bili'), isTrue);
+    expect(kHostLxSearchSources.contains('qs'), isTrue);
+    // 百度（bd）没有宿主搜索实现，搜索页下拉不能展示
+    expect(kHostLxSearchSources.contains('bd'), isFalse);
   });
 
   test('音质数组常量不被误判为平台', () {
@@ -37,7 +51,14 @@ const extra_qualitys = ["128k", "320k"]
 const actions = ["musicUrl"]
 ''';
     final sources = debugDetectLxSources(source);
-    expect(sources, ['kw', 'kg', 'tx', 'wy', 'mg']);
+    expect(sources, ['kw', 'kg', 'tx', 'wy', 'mg', 'qs', 'jo', 'bili']);
+  });
+
+  test('宿主可搜平台清单覆盖汽水与哔哩哔哩', () {
+    expect(kHostLxSearchSources, ['kw', 'kg', 'tx', 'wy', 'mg', 'qs', 'jo', 'bili']);
+    // 歌单导入侧汽水没有接口，不能混进歌单平台表
+    expect(kHostLxPlaylistSources.contains('qs'), isFalse);
+    expect(kHostLxPlaylistSources.contains('bili'), isFalse);
   });
 
   test('sources 字面量声明优先且保留扩展平台', () {

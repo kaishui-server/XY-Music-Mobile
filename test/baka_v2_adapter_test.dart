@@ -55,17 +55,19 @@ void main() {
 
   test('能力分组覆盖 search/entities/media/collections/lyrics/comments', () {
     final source = adapter.readAsStringSync();
+    // v2 能力名是命名空间点分写法（entities.get / media.resolve …），
+    // 断言必须用完整能力名，用旧的分组前缀找不到带引号的字面量。
     for (final group in const [
       "'search'",
-      "'entities'",
-      "'media'",
-      "'collections'",
-      "'lyrics'",
-      "'comments'",
+      "'entities.get'",
+      "'media.resolve'",
+      "'collections.members'",
+      "'lyrics.get'",
+      "'comments.list'",
     ]) {
       expect(source.contains(group), isTrue, reason: '缺少能力分组 $group');
     }
     // 能力为空时不裁剪（部分订阅源不带 capabilities 字段）。
-    expect(source.contains('if (!state.capabilities.length) return true;'), isTrue);
+    expect(source.contains('!state.capabilities.length ||'), isTrue);
   });
 }

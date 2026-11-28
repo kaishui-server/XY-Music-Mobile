@@ -1598,7 +1598,12 @@ async fn search_mg(keyword: &str, limit: u32) -> Result<Vec<LxSearchItem>, Strin
 // 端点为「综合搜索」（歌曲/歌单/歌手/专辑混排），此处只取 tracks 分组；
 // cursor 是全局流偏移而非页码，需滚动取数凑满 limit。
 // UA 或 device_* 参数缺失时上游直接返回 ERR_INVALID_PARAM。
-const QS_PC_QUERY: &str = "aid=386088&app_name=luna_pc&region=cn&geo_region=cn&os_region=cn&sim_region=&device_id=3753066532709850&cdid=&iid=3753066532713946&version_name=3.5.2&version_code=30050200&channel=official&build_mode=master&network_carrier=&ac=wifi&tz_name=Asia/Shanghai&resolution=&device_platform=windows&device_type=Windows&os_version=Windows%2010&fp=3753066532709850";
+//
+// 2026-11 起 `device_platform` 必须为 `web`：桌面端取值（windows/pc）上游仍回
+// HTTP 200 + status_info，但 `result_groups` 是空数组，表现为「搜不到任何歌」，
+// 与「关键词无版权」不可区分。其余指纹（aid/device_id/fp/version_*）保持 PC 端
+// 形态，`web` 只切换取数渠道，不影响曲库。
+const QS_PC_QUERY: &str = "aid=386088&app_name=luna_pc&region=cn&geo_region=cn&os_region=cn&sim_region=&device_id=3753066532709850&cdid=&iid=3753066532713946&version_name=3.5.2&version_code=30050200&channel=official&build_mode=master&network_carrier=&ac=wifi&tz_name=Asia/Shanghai&resolution=&device_platform=web&device_type=Windows&os_version=Windows%2010&fp=3753066532709850";
 const QS_UA: &str = "LunaPC/3.5.2(412998333)";
 /// 单次取数的全局流窗口
 const QS_CURSOR_STEP: u32 = 20;
@@ -2369,6 +2374,211 @@ async fn search_jo(keyword: &str, limit: u32) -> Result<Vec<LxSearchItem>, Strin
     jo_search_legacy(keyword, want).await
 }
 
+// ==================== 哔哩哔哩（bili） ====================
+// lx-cit / ceru 等订阅源声明了 bili 平台（`MUSIC_QUALITY` 里带 "bili"），
+// 取流由插件 `musicUrl` 完成（插件取 songId = hash ?? songmid，所以
+// songmid 必须存 bvid）。宿主此前没有 bili 搜索实现，搜索页把 bili 整段
+// 过滤掉，用户侧表现就是「订阅源声明了 B 站/汽水，搜索里却看不到这两个
+// 平台」。
+// 宿主的补法是直连 B 站 web 端综合搜索（只搜视频，视频音轨即音频）：
+//   GET api.bilibili.com/x/web-interface/search/type?search_type=video
+// 该接口不带 wbi 签名也能返回结果；不带 buvid3 Cookie 时更容易触发
+// -412（请求被风控），所以先向 finger/spi 取一次性 buvid3 再携带 Cookie。
+const BILI_SPI_URL: &str = "https://api.bilibili.com/x/frontend/finger/spi";
+const BILI_SEARCH_URL: &str = "https://api.bilibili.com/x/web-interface/search/type";
+const BILI_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+const BILI_REFERER: &str = "https://www.bilibili.com/";
+/// 搜索结果每页 20 条，翻两页足够凑满宿主默认 30 条
+const BILI_MAX_PAGES: u32 = 2;
+
+/// B 站搜索结果的标题带 `<em class="keyword">` 高亮标签，需要先剥标签
+/// 再解 HTML 实体，否则歌名里会残留 `<em class="keyword">` 字样
+static BILI_TAG_RE: OnceLock<Regex> = OnceLock::new();
+
+fn bili_clean_text(raw: &str) -> String {
+    let re = BILI_TAG_RE.get_or_init(|| Regex::new(r"(?s)<[^>]*>").unwrap());
+    decode_name(re.replace_all(raw, "").trim()).trim().to_string()
+}
+
+/// B 站 duration 形如 `419:2`（分:秒，均不补零，不是标准 mm:ss）；
+/// 超过一小时的合集格式化为 hh:mm:ss，避免出现 `419:02` 这种读不出来的时长
+fn bili_interval(raw: &str) -> String {
+    let mut parts = raw.trim().split(':');
+    let minutes: u64 = parts
+        .next()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(0);
+    let seconds: u64 = parts
+        .next()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(0);
+    let total = minutes * 60 + seconds;
+    if total == 0 {
+        return "00:00".to_string();
+    }
+    if total >= 3600 {
+        format!(
+            "{:02}:{:02}:{:02}",
+            total / 3600,
+            (total % 3600) / 60,
+            total % 60
+        )
+    } else {
+        format!("{:02}:{:02}", total / 60, total % 60)
+    }
+}
+
+fn bili_item_from_video(raw: &serde_json::Value) -> Option<LxSearchItem> {
+    let bvid = raw
+        .get("bvid")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if bvid.is_empty() {
+        return None;
+    }
+    let name = bili_clean_text(raw.get("title").and_then(|v| v.as_str()).unwrap_or(""));
+    if name.is_empty() {
+        return None;
+    }
+    let singer = bili_clean_text(raw.get("author").and_then(|v| v.as_str()).unwrap_or(""));
+    let pic = raw.get("pic").and_then(|v| v.as_str()).unwrap_or("").trim();
+    let img = if pic.is_empty() {
+        None
+    } else if let Some(rest) = pic.strip_prefix("//") {
+        Some(format!("https://{}", rest))
+    } else {
+        Some(pic.replacen("http://", "https://", 1))
+    };
+
+    // cit / ceru 的 bili 分支只返回未加密 m4s 的 128k/320k 两档，高码率档
+    // 未验证前不写，避免「显示有 flac 点了取不到流」的假音质
+    let mut types = Vec::new();
+    let mut lx_types = HashMap::new();
+    for quality in ["128k", "320k"] {
+        types.push(LxTypeTuple {
+            quality_type: quality.into(),
+            size: None,
+            hash: None,
+        });
+        lx_types.insert(
+            quality.into(),
+            LxTypeEntry {
+                size: None,
+                hash: None,
+            },
+        );
+    }
+
+    Some(LxSearchItem {
+        name,
+        singer,
+        // 视频没有专辑字段：留空由 UI 兜底显示，不要拿 UP 主/分区名冒充专辑
+        album_name: String::new(),
+        album_id: serde_json::Value::Null,
+        songmid: bvid,
+        source: "bili".into(),
+        interval: bili_interval(raw.get("duration").and_then(|v| v.as_str()).unwrap_or("")),
+        img,
+        hash: None,
+        str_media_mid: None,
+        song_id: None,
+        album_mid: None,
+        copyright_id: None,
+        types,
+        lx_types: Some(lx_types),
+    })
+}
+
+/// 取一次性 buvid3（B 站风控指纹 Cookie）；失败不影响搜索，只是更容易被
+/// -412 拦，因此返回 Option 而不是把整个搜索判失败
+async fn bili_fetch_buvid3() -> Option<String> {
+    let result = http_get_json(
+        BILI_SPI_URL,
+        &[("User-Agent", BILI_UA), ("Referer", BILI_REFERER)],
+    )
+    .await
+    .ok()?;
+    result
+        .pointer("/data/b_3")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// B 站综合搜索：视频条目的 bvid 即取流标识，直接映射成 LX 歌曲条目
+async fn search_bili(keyword: &str, limit: u32) -> Result<Vec<LxSearchItem>, String> {
+    let want = limit.max(1) as usize;
+    let cookie = bili_fetch_buvid3()
+        .await
+        .map(|b3| format!("buvid3={}", b3))
+        .unwrap_or_default();
+
+    let mut collected: Vec<LxSearchItem> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut last_error: Option<String> = None;
+
+    for page in 1..=BILI_MAX_PAGES {
+        let url = format!(
+            "{}?search_type=video&keyword={}&page={}&order=totalrank",
+            BILI_SEARCH_URL,
+            urlencoding::encode(keyword),
+            page,
+        );
+        let mut headers: Vec<(&str, &str)> = vec![
+            ("User-Agent", BILI_UA),
+            ("Referer", BILI_REFERER),
+            ("Accept", "application/json"),
+        ];
+        if !cookie.is_empty() {
+            headers.push(("Cookie", cookie.as_str()));
+        }
+        let result = match http_get_json(&url, &headers).await {
+            Ok(v) => v,
+            Err(e) => {
+                last_error = Some(e);
+                break;
+            }
+        };
+        let code = result.get("code").and_then(|v| v.as_i64()).unwrap_or(-1);
+        if code != 0 {
+            let message = result
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            last_error = Some(format!("BILI search: code {} {}", code, message));
+            break;
+        }
+        let Some(items) = result.pointer("/data/result").and_then(|v| v.as_array()) else {
+            break;
+        };
+        if items.is_empty() {
+            break;
+        }
+        for item in items {
+            // data.result 里可能混有番剧/影视条目（type 非 video），只留视频
+            if item.get("type").and_then(|v| v.as_str()).unwrap_or("video") != "video" {
+                continue;
+            }
+            if let Some(song) = bili_item_from_video(item) {
+                if seen.insert(song.songmid.clone()) {
+                    collected.push(song);
+                }
+            }
+        }
+        if collected.len() >= want {
+            break;
+        }
+    }
+
+    if collected.is_empty() {
+        return Err(last_error.unwrap_or_else(|| "BILI search: no results".to_string()));
+    }
+    collected.truncate(want);
+    Ok(collected)
+}
+
 /// 搜索 LX 音源
 ///
 /// 优先查询缓存，缓存未命中时执行实际搜索。
@@ -2420,6 +2630,7 @@ pub async fn lx_search(
         // JOOX：宿主原生搜索（插件 search 走同一 commonCgi，宿主直连省一层
         // JS 沙箱；曲库与插件一致，均为 HK 后端 + en）
         "jo" => search_jo(keyword, actual_limit).await,
+        "bili" => search_bili(keyword, actual_limit).await,
         _ => Err(format!("Unknown LX source: {}", source)),
     };
 
@@ -3063,5 +3274,57 @@ mod tests {
         let it = &items[0];
         let types: Vec<&str> = it.types.iter().map(|t| t.quality_type.as_str()).collect();
         assert_eq!(types, vec!["320k", "flac24bit"]);
+    }
+}
+
+#[cfg(test)]
+mod bili_tests {
+    use super::*;
+
+    #[test]
+    fn test_bili_clean_text_strips_em_and_entities() {
+        let raw = "\u{3010}\u{65e0}\u{635f}\u{97f3}\u{8d28}\u{3011}<em class=\"keyword\">\u{5468}\u{6770}\u{4f26}</em>\u{7cbe}\u{9009} &amp; \u{7ffb}\u{5531}";
+        let cleaned = bili_clean_text(raw);
+        assert!(!cleaned.contains("<em"));
+        assert!(!cleaned.contains("&amp;"));
+        assert!(cleaned.contains("\u{5468}\u{6770}\u{4f26}"));
+    }
+
+    #[test]
+    fn test_bili_interval_formats() {
+        // B \u7ad9 duration \u662f\u300c\u5206:\u79d2\u300d\u4e14\u4e0d\u8865\u96f6\uff0c419:2 \u8868\u793a 419 \u5206 2 \u79d2
+        assert_eq!(bili_interval("419:2"), "06:59:02");
+        assert_eq!(bili_interval("4:20"), "04:20");
+        assert_eq!(bili_interval(""), "00:00");
+    }
+
+    #[test]
+    fn test_bili_item_from_video_maps_bvid_and_cover() {
+        let raw = serde_json::json!({
+            "type": "video",
+            "bvid": "BV1q4FTeBEMj",
+            "title": "<em class=\"keyword\">\u{6674}\u{5929}</em>",
+            "author": "UP",
+            "pic": "//i0.hdslb.com/bfs/archive/cover.jpg",
+            "duration": "4:20"
+        });
+        let item = bili_item_from_video(&raw).expect("video item");
+        assert_eq!(item.source, "bili");
+        assert_eq!(item.songmid, "BV1q4FTeBEMj");
+        assert_eq!(item.name, "\u{6674}\u{5929}");
+        assert_eq!(item.singer, "UP");
+        assert_eq!(item.interval, "04:20");
+        assert_eq!(
+            item.img.as_deref(),
+            Some("https://i0.hdslb.com/bfs/archive/cover.jpg")
+        );
+        let types: Vec<&str> = item.types.iter().map(|t| t.quality_type.as_str()).collect();
+        assert_eq!(types, vec!["128k", "320k"]);
+    }
+
+    #[test]
+    fn test_bili_item_requires_bvid() {
+        let raw = serde_json::json!({"type": "video", "title": "no bvid"});
+        assert!(bili_item_from_video(&raw).is_none());
     }
 }

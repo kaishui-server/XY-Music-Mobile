@@ -50,23 +50,21 @@ bool isPluginRetiredUserVariable(String rawKey) {
 ///
 /// - [lx]：洛雪 `globalThis.lx` 契约；
 /// - [bakaV2]：Baka provider v2 —— `module.exports = {manifest, handlers}`
-///   嵌套 handler 表，入口 `createProvider(sdk, request)`，manifest 声明
-///   `apiVersion: 2` 与 `capabilities`；
-/// - [baka]：旧 BakaMusic（MusicFree 协议 + Baka 私有标记）；
+///   嵌套 handler 表，manifest 声明 `apiVersion: 2` 与 `capabilities`
+///   （旧 BakaMusic V1 契约已移除，不再作为独立契约识别）；
 /// - [animemusic]：惜梦 animemusic 后端插件；
 /// - [musicfree]：标准 MusicFree `module.exports` 契约。
 enum PluginContract {
   lx,
   bakaV2,
-  baka,
   animemusic,
   musicfree;
 
   /// 分栏归属标识（取值与 plugin_runtime.dart 的 `pluginKind*` 常量一致）。
-  /// v2 与旧 BakaMusic 同属 BakaMusic 分栏。
+  /// BakaMusic 分栏只承载 v2 契约插件。
   String get kindKey => switch (this) {
     PluginContract.lx => 'lx',
-    PluginContract.bakaV2 || PluginContract.baka => 'baka',
+    PluginContract.bakaV2 => 'baka',
     PluginContract.animemusic => 'animemusic',
     PluginContract.musicfree => 'musicfree',
   };
@@ -75,7 +73,6 @@ enum PluginContract {
   String get label => switch (this) {
     PluginContract.lx => 'LX',
     PluginContract.bakaV2 => 'BakaMusic v2',
-    PluginContract.baka => 'BakaMusic',
     PluginContract.animemusic => '惜梦',
     PluginContract.musicfree => 'MusicFree',
   };
@@ -83,17 +80,15 @@ enum PluginContract {
 
 /// 由三个内容标记还原契约（缓存/跨 isolate 传输后只剩布尔标记时使用）。
 ///
-/// v2 优先于旧 BakaMusic：v2 的 manifest 与 MusicFree 不同构，运行时路由
-/// 必须走专用适配层，不能被旧标记抢先。
+/// v2 优先：v2 的 manifest 与 MusicFree 不同构，运行时路由必须走专用
+/// 适配层，不能被其他标记抢先。
 PluginContract pluginContractOf({
   required bool isLx,
-  required bool isBaka,
   required bool isBakaV2,
   required bool isAnimemusic,
 }) {
   if (isLx) return PluginContract.lx;
   if (isBakaV2) return PluginContract.bakaV2;
-  if (isBaka) return PluginContract.baka;
   if (isAnimemusic) return PluginContract.animemusic;
   return PluginContract.musicfree;
 }
@@ -108,7 +103,6 @@ class PluginMetadata {
     this.userVariables = const [],
     this.isStarSea = false,
     this.isLx = false,
-    this.isBaka = false,
     this.isBakaV2 = false,
     this.isAnimemusic = false,
     this.apiVersion = 0,
@@ -138,23 +132,14 @@ class PluginMetadata {
   /// module.exports。规则与 plugin_runtime 的 _looksLikeLxPlugin 一致。
   final bool isLx;
 
-  /// BakaMusic 契约插件：靠 `animeSrc` 来源标记，或
-  /// `getMvSource` + `supportedVideoQualities` MV 组合标记识别
-  /// （见 [_detectBaka]）。作者签名（toskysun）与 getMusicComments /
-  /// supportedQualities 单独出现都不是 Baka 独有特征，不能用。内容识别不
-  /// 中时再由订阅类型提示与 [isBakaSourceUrl] 兜底。
-  final bool isBaka;
-
-  /// Baka provider **v2** 插件：脚本带 `@baka-provider 2` 标记，或同时
-  /// 具备 `createProvider(` 工厂、manifest `apiVersion: 2` 与
-  /// `capabilities` 声明（见 [_detectBakaV2]）。v2 的 manifest 是
-  /// `{manifest, handlers}` 嵌套 handler 表，与 MusicFree 的扁平
+  /// Baka provider **v2** 插件：脚本带 `@baka-provider 2` 标记，或 manifest
+  /// 同时声明 `apiVersion: 2` 与 `capabilities`（见 [_detectBakaV2]）。v2 的
+  /// manifest 是 `{manifest, handlers}` 嵌套 handler 表，与 MusicFree 的扁平
   /// `module.exports` 不同构，运行时必须走专用适配层。
   final bool isBakaV2;
 
   /// animemusic 后端插件：直连 animemusic.bzxhkj.com（惜梦 v3/v4、
-  /// animemusic/1 新格式等）。baka 版的 FALLBACK_BASE 也指向该域名，
-  /// 分类时需先判 isBaka 再判本标记。
+  /// animemusic/1 新格式等）。分类时 isLx / isBakaV2 优先级更高。
   final bool isAnimemusic;
 
   /// 插件自述的契约版本（v2 插件为 `manifest.apiVersion`，其余为 0）。
@@ -176,7 +161,6 @@ class PluginMetadata {
   PluginContract get contract {
     if (isLx) return PluginContract.lx;
     if (isBakaV2) return PluginContract.bakaV2;
-    if (isBaka) return PluginContract.baka;
     if (isAnimemusic) return PluginContract.animemusic;
     return PluginContract.musicfree;
   }
@@ -208,7 +192,12 @@ class PluginMetadata {
           json['author'] ??
           constMeta['author'],
     );
-    final methods = _parseExportedMethods(script);
+    final capabilities = _parseProviderCapabilities(script);
+    final methods = _bakaV2Methods(
+      isBakaV2: isBakaV2,
+      capabilities: capabilities,
+      staticMethods: _parseExportedMethods(script),
+    );
 
     return PluginMetadata(
       id: _clean(
@@ -254,9 +243,6 @@ class PluginMetadata {
       userVariables: _parseUserVariables(script, constants),
       isStarSea: _detectStarSea(script),
       isLx: _detectLx(script),
-      // v2 与旧 BakaMusic 互斥：v2 已由 [_detectBakaV2] 单独识别，避免
-      // 同时置位导致运行时路由摇摆。
-      isBaka: !isBakaV2 && _detectBaka(script),
       isBakaV2: isBakaV2,
       isAnimemusic: _detectAnimemusic(script),
       apiVersion: int.tryParse((manifest['apiVersion'] ?? '').trim()) ?? 0,
@@ -266,7 +252,7 @@ class PluginMetadata {
       platform: _clean(
         manifest['platform'] ?? exported['platform'] ?? json['platform'],
       ),
-      capabilities: _parseProviderCapabilities(script),
+      capabilities: capabilities,
       availableMethods: methods,
     );
   }
@@ -410,22 +396,19 @@ class PluginMetadata {
   ///
   /// v2 与 MusicFree 的导出不同构：MusicFree 把方法平铺在
   /// `module.exports` 上，v2 只导出 `{manifest, handlers}`，handler 表按
-  /// `'entities.get'` / `'media.resolve'` 之类的点号键嵌套声明，并通过
-  /// `createProvider(sdk, request)` 工厂拿 sdk 与请求。因此不能只看
-  /// `module.exports`，必须同时命中工厂与 manifest 版本声明：
+  /// `'entities.get'` / `'media.resolve'` 之类的点号键嵌套声明。因此不能只看
+  /// `module.exports`，判定依据：
   ///
   /// 1. 显式标记 `// @baka-provider 2`（订阅源打包时注入，最可靠）；
-  /// 2. 或 `createProvider(` + `apiVersion: 2` + `capabilities` 三者齐备。
+  /// 2. 或 manifest 同时声明 `apiVersion: 2` 与 `capabilities`（旧兜底规则
+  ///    还要求 `createProvider(` 工厂，但 cwo 订阅的插件把 handler 直接声明
+  ///    为 `(request, sdk)` 函数、没有工厂，故去掉该依赖）。
   ///
-  /// 判定完全不读取显示名/作者名，避免上游改名（如 QQ音乐[L1] →
-  /// QQ音乐[T]）或作者变更导致分栏与运行时路由漂移。
+  /// 判定完全不读取显示名/作者名，避免上游改名或作者变更导致分栏与
+  /// 运行时路由漂移。
   static bool _detectBakaV2(String script, Map<String, String> manifest) {
     if (_providerVersionMarker.hasMatch(script)) return true;
-    final lower = script.toLowerCase();
-    if (!lower.contains('createprovider(') && !lower.contains('createprovider =')) {
-      return false;
-    }
-    if (!lower.contains('capabilities')) return false;
+    if (!script.toLowerCase().contains('capabilities')) return false;
     final version = (manifest['apiVersion'] ?? '').trim();
     if (version.isNotEmpty) return version == '2';
     return _manifestApiVersion2.hasMatch(script);
@@ -576,28 +559,6 @@ class PluginMetadata {
     return _clean(trimmed);
   }
 
-  /// BakaMusic 契约静态识别（用于区分 MusicFree 与 BakaMusic）。
-  ///
-  /// 判定**只看脚本内容**，不读取作者名或显示名（上游改名/换作者不再影响
-  /// 分栏）：命中 `animeSrc`，或同时具备 MV 组合标记 `getMvSource` +
-  /// `supportedVideoQualities`。v2 插件由 [_detectBakaV2] 先行截获，
-  /// 不会进入这里。
-  ///
-  /// 内容识别不中时，再由订阅类型提示（索引含 `yourinfo`、URL 含 `baka`）与
-  /// [isBakaSourceUrl] 兜底。
-  static bool _detectBaka(String script) {
-    final lower = script.toLowerCase();
-    if (lower.contains('animesrc')) return true;
-    return lower.contains('getmvsource') &&
-        lower.contains('supportedvideoqualities');
-  }
-
-  /// 已知的非 BakaMusic（MusicFree 系）作者白名单：其插件内嵌 BakaMusic
-  /// 兼容标记（万象API 同时导出 getMvSource / supportedVideoQualities /
-  /// supportedQualities），但按 MusicFree 契约分发，需在内容判定前先排除。
-  /// （同 XianYu 的 `nonBakaAuthors`。）
-  static const List<String> nonBakaAuthors = ['时迁酱', '万象api'];
-
   /// 歌词接口的方法别名，按宿主尝试顺序排列。LX 系插件（酷狗等）导出的是
   /// 单数 `getLyric`，部分 MusicFree 插件用 `getLrc`/`getSongLyric`/
   /// `getMusicLyric`；静态扫描与运行时门控必须共用这一份清单，只认
@@ -631,6 +592,57 @@ class PluginMetadata {
     ...lyricMethodNames,
   };
 
+  /// v2 capability → MusicFree 契约方法名。
+  ///
+  /// 与 `assets/baka_v2_adapter.js` 的 `FACADE_MAP` 一一对应（适配层按
+  /// capability 裁剪并挂载门面方法），两处口径必须一致，否则 Dart 侧门控
+  /// 与运行时实际能力会对不上。
+  ///
+  /// 为什么需要这张表：v2 插件的能力写在 manifest.capabilities 里，键名是
+  /// 命名空间形式（`lyrics.get`、`media.resolve`、`comments.list`…）；而
+  /// [_parseExportedMethods] 只静态扫描扁平的 MusicFree 方法名（`getLyric`、
+  /// `getMediaSource`…），一个都扫不到。若不反查，v2 插件的
+  /// [availableMethods] 只剩脚本里顺带出现的名字，门控会把歌词/榜单/评论
+  /// 等能力一律判成「不具备」而跳过调用——惜梦 CIT 这批单平台 v2 插件
+  /// 全平台取不到歌词即由此引起。
+  static final Map<String, List<String>> capabilityMethods = {
+    'search': const ['search'],
+    'entities.get': const ['getMusicInfo'],
+    'collections.get': const ['getMusicSheetInfo'],
+    'collections.members': const [
+      'getTopListDetail',
+      'getMusicSheetInfo',
+      'getAlbumInfo',
+      'getArtistWorks',
+    ],
+    'discovery.charts': const ['getTopLists'],
+    'discovery.daily': const ['getDailyRecommendations'],
+    'media.resolve': const ['getMediaSource'],
+    'media.video': const ['getMvSource'],
+    'lyrics.get': lyricMethodNames,
+    'comments.list': const ['getMusicComments'],
+    'links.resolve': const ['importMusicSheet'],
+  };
+
+  /// v2 插件的能力方法集：静态扫描结果 ∪ 由 capabilities 反查出的方法名。
+  ///
+  /// `capabilities` 为空时不门控（返回空集合，语义同 [_parseExportedMethods]
+  /// 的「扫不出结果就不拦」）：适配层的 `has()` 在 manifest 未声明能力时
+  /// 会挂载全部门面方法，此时任何门控都会比实际能力更窄。
+  static List<String> _bakaV2Methods({
+    required bool isBakaV2,
+    required List<String> capabilities,
+    required List<String> staticMethods,
+  }) {
+    if (!isBakaV2) return staticMethods;
+    if (capabilities.isEmpty) return const [];
+    final methods = <String>{...staticMethods};
+    for (final capability in capabilities) {
+      methods.addAll(capabilityMethods[capability] ?? const []);
+    }
+    return methods.toList();
+  }
+
   /// 静态扫描插件实现了哪些 MusicFree 契约方法（不执行脚本）。
   ///
   /// 参照 XianYu 的 `_availableMethods`（其从加载后的引擎元数据读取）：
@@ -661,43 +673,13 @@ class PluginMetadata {
     return methods;
   }
 
-  /// 订阅来源 URL 判定 BakaMusic 音源。
-  ///
-  /// BakaMusic 官方订阅及其镜像固定把插件脚本托管在这些域名下，插件脚本
-  /// URL 命中即视为 BakaMusic。BakaMusic 只是「兼容」MusicFree 协议（实测
-  /// 其官方插件既无 `animeSrc`，内容与 MusicFree 脚本也完全同构），因此
-  /// 不能靠脚本内容区分；订阅类型提示只在本次导入有效，旧版本安装的插件
-  /// 没有提示，且提示会被后续 MusicFree 导入覆盖。此函数依据持久化的
-  /// 来源 URL 兜底，保证 BakaMusic 插件稳定归入 BakaMusic 分栏。
-  static bool isBakaSourceUrl(String url) {
-    final lower = url.trim().toLowerCase();
-    if (lower.isEmpty) return false;
-    return RegExp(
-      r'^https?://(music\.cwo\.cc\.cd|bakp\.netlify\.app|'
-      r'animemusic\.bzxhkj\.com/baka)',
-    ).hasMatch(lower);
-  }
-
-  /// 已知 MusicFree 系源域名白名单：这些域名托管 MusicFree 官方/社区订阅
-  /// 索引（如 source.shiqianjiang.cn 的 mf.json），其响应可能带 `yourinfo`
-  /// 等 Baka 特征字段，但整批插件应归 MusicFree 分栏。与 [isBakaSourceUrl]
-  /// 对称，供订阅索引类型提示优先判定使用。
-  static bool isKnownMusicFreeSourceUrl(String url) {
-    final lower = url.trim().toLowerCase();
-    if (lower.isEmpty) return false;
-    return RegExp(
-      r'^https?://source\.shiqianjiang\.cn',
-    ).hasMatch(lower);
-  }
-
   /// animemusic（惜梦动画音乐）插件识别：
   /// - 老站点域名 `animemusic.bzxhkj.com`；
   /// - 新插件（如 qishui，API 域名为 `anime.bzxhkj.com`）不再包含老域名，
   ///   但在 META 中声明 `format: "animemusic/1"` 规范，与运行时
   ///   `_looksLikeAnimemusicPlugin` 的判定对齐，避免被误分类到
   ///   MusicFree 插件页。
-  /// baka 版兜底地址也指向老域名，分类时先判 isBaka；v2 洛雪版同样
-  /// 命中，但分类时 isLx 优先级更高。
+  /// isLx 与 bakaV2 的分类优先级更高，先于本标记判定。
   static bool _detectAnimemusic(String script) {
     if (script.contains('animemusic.bzxhkj.com')) return true;
     return RegExp(
@@ -1495,34 +1477,23 @@ class _StaticNode {
 /// 安装/订阅导入/备份导入的格式标签、音源兜底开关的可用源清单，全部走
 /// 这一个函数，避免多处各写一份规则导致同一插件在不同链路归类不一致。
 ///
-/// 判定只依赖 [contract]（脚本内容识别出的契约）与订阅元信息，**不读取
-/// 插件显示名、备注或作者名**：上游改名（QQ音乐[L1] → QQ音乐[T]）或换作者
-/// 都不会改变归类。
+/// 判定只依赖 [contract]（脚本内容识别出的契约），**不读取插件显示名、
+/// 备注或作者名**：上游改名（QQ音乐[L1] → QQ音乐[T]）或换作者都不会改变
+/// 归类。
 ///
 /// 返回分类标识 `lx` / `baka` / `animemusic` / `musicfree` / `other`
 ///（取值与 plugin_runtime.dart 的 `pluginKind*` 常量一致）。这里**不含任何
 /// 固定格式优先级**：类别只由插件自身契约决定，展示先后顺序交给用户自定义
-/// 排序（`pluginKindOrderKey`）。[kindHint] 与 [sourceUrl] 仅在契约无法区分
-/// MusicFree / BakaMusic 时兜底。
+/// 排序（`pluginKindOrderKey`）。旧 V1 契约（MusicFree 同构 + yourinfo/
+/// baka URL 提示兜底）已随 BakaMusic V1 下线一并移除：`baka` 分栏只承载
+/// 内容判定为 v2 的插件，[kindHint] 仅用于保留用户手动归入「其他」的结果。
 String resolvePluginKindKey({
   required PluginContract contract,
   String? kindHint,
-  String? sourceUrl,
 }) {
   final hint = kindHint?.trim().toLowerCase();
   // 用户手动归入「其他」优先级最高，避免手动整理被内容识别覆盖。
   if (hint == 'other') return 'other';
-  var kind = contract.kindKey;
-  if (kind == 'musicfree' || kind == 'baka') {
-    if (hint == 'baka') {
-      kind = 'baka';
-    } else if (hint == 'musicfree') {
-      // 内容已判定为 BakaMusic 契约时不被 musicfree 提示压回。
-      if (kind != 'baka') kind = 'musicfree';
-    } else if (PluginMetadata.isBakaSourceUrl(sourceUrl ?? '')) {
-      kind = 'baka';
-    }
-  }
-  return kind;
+  return contract.kindKey;
 }
 
